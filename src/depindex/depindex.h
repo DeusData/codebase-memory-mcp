@@ -1,0 +1,185 @@
+/*
+ * depindex.h — Dependency/reference API indexing.
+ *
+ * Provides package resolution, ecosystem detection, and auto-indexing
+ * for dependency source code. Dependencies are stored in the SAME db
+ * as project code with "{project}.dep.{package}" project names.
+ *
+ * Primary interface: source_paths[] (works for all 78 languages).
+ * Convenience shortcuts: package_manager for uv/cargo/npm/bun.
+ *
+ * Depends on: pipeline, store, foundation
+ */
+#ifndef CBM_DEPINDEX_H
+#define CBM_DEPINDEX_H
+
+#include <stdbool.h>
+#include <stddef.h>
+
+/* Forward declarations */
+typedef struct cbm_store cbm_store_t;
+typedef struct cbm_config cbm_config_t;
+
+/* ── Constants ─────────────────────────────────────────────────── */
+
+#define CBM_DEP_PATH_MAX \
+    4096 /* renamed: avoids collision with constants.h enum CBM_PATH_MAX (1024) */
+#define CBM_NAME_MAX 512
+#define CBM_DEP_SEPARATOR ".dep."
+#define CBM_DEP_SEPARATOR_LEN 5
+
+/* DRY manifest file list — used by depindex, pass_configlink, and dep discovery.
+ * These are the basenames of files that declare project dependencies.
+ * When adding a new manifest file, add it in depindex.c — all consumers pick it up. */
+extern const char *const CBM_MANIFEST_FILES[];
+
+/* Configuration defaults: auto_index_deps=false disables automation;
+ * configured auto_dep_limit=0 is unlimited and positive values are caps.
+ * Internal effective limits use 0=disabled, <0=unlimited, and >0=cap. */
+#define CBM_DEFAULT_AUTO_INDEX_DEPS false
+#define CBM_DEFAULT_AUTO_INDEX_DEPS_STR "false"
+#define CBM_DEFAULT_AUTO_DEP_LIMIT 20
+#define CBM_MAX_AUTO_DEP_LIMIT 10000
+#define CBM_DEFAULT_DEP_MAX_FILES 1000
+#define CBM_MAX_DEP_MAX_FILES 1000000
+
+/* Config key strings */
+#define CBM_CONFIG_AUTO_INDEX_DEPS "auto_index_deps"
+#define CBM_CONFIG_AUTO_DEP_LIMIT "auto_dep_limit"
+#define CBM_CONFIG_DEP_MAX_FILES "dep_max_files"
+
+/* ── Package Manager Enum ──────────────────────────────────────── */
+
+typedef enum {
+    CBM_PKG_UV =
+        0, /* Python: uv/pip/poetry/pdm (pyproject.toml, setup.py, requirements.txt, Pipfile) */
+    CBM_PKG_CARGO,  /* Rust: cargo (Cargo.toml) */
+    CBM_PKG_NPM,    /* Node.js: npm/yarn/pnpm (package.json) */
+    CBM_PKG_BUN,    /* Bun: (bun.lockb) */
+    CBM_PKG_GO,     /* Go modules: (go.mod) */
+    CBM_PKG_JVM,    /* JVM: Maven/Gradle (pom.xml, build.gradle, build.gradle.kts) */
+    CBM_PKG_DOTNET, /* .NET: NuGet (*.csproj, *.fsproj, global.json, Directory.Build.props) */
+    CBM_PKG_RUBY,   /* Ruby: Bundler (Gemfile) */
+    CBM_PKG_PHP,    /* PHP: Composer (composer.json) */
+    CBM_PKG_SWIFT,  /* Swift: SPM (Package.swift) */
+    CBM_PKG_DART,   /* Dart: pub (pubspec.yaml) */
+    CBM_PKG_MIX,    /* Elixir: Mix (mix.exs) */
+    CBM_PKG_MAKE,   /* C/C++: Make (Makefile, GNUmakefile) */
+    CBM_PKG_CMAKE,  /* C/C++: CMake (CMakeLists.txt, vcpkg.json) */
+    CBM_PKG_MESON,  /* C/C++: Meson (meson.build) */
+    CBM_PKG_CONAN,  /* C/C++: Conan (conanfile.txt, conanfile.py) */
+    CBM_PKG_CUSTOM, /* Generic: vendored deps (vendor/, vendored/, third_party/, deps/, etc.) */
+    CBM_PKG_COUNT   /* sentinel / invalid */
+} cbm_pkg_manager_t;
+
+/* Parse "uv"/"cargo"/"npm"/"bun"/etc → enum. Returns CBM_PKG_COUNT if unknown. */
+cbm_pkg_manager_t cbm_parse_pkg_manager(const char *s);
+
+/* Manager enum → short string ("uv", "cargo", etc.) */
+const char *cbm_pkg_manager_str(cbm_pkg_manager_t mgr);
+
+/* ── Dep Naming Helpers ────────────────────────────────────────── */
+
+/* Build dep project name: "{project}.dep.{package}". Caller must free(). */
+char *cbm_dep_project_name(const char *project, const char *package_name);
+
+/* Check if a project name is a dependency.
+ * session_project non-NULL: precise prefix check "{session}.dep.".
+ * session_project NULL: fallback strstr check. */
+bool cbm_is_dep_project(const char *project_name, const char *session_project);
+
+/* Check if a file path contains a known manifest file name.
+ * Uses the shared CBM_MANIFEST_FILES list. */
+bool cbm_is_manifest_path(const char *file_path);
+
+/* ── Ecosystem Detection ───────────────────────────────────────── */
+
+/* Detect ecosystem from project root by checking marker files.
+ * Returns CBM_PKG_COUNT if no ecosystem detected. */
+cbm_pkg_manager_t cbm_detect_ecosystem(const char *project_root);
+
+/* ── Package Resolution ────────────────────────────────────────── */
+
+typedef struct {
+    const char *path;    /* absolute path to package source (heap) */
+    const char *version; /* detected version, or NULL (heap) */
+} cbm_dep_resolved_t;
+
+void cbm_dep_resolved_free(cbm_dep_resolved_t *r);
+
+/* Resolve package source directory and version on disk.
+ * Returns 0 on success, -1 if package source not found. */
+int cbm_resolve_pkg_source(cbm_pkg_manager_t mgr, const char *package_name,
+                           const char *project_root, cbm_dep_resolved_t *out);
+
+/* ── Dep Discovery ─────────────────────────────────────────────── */
+
+typedef struct {
+    const char *package; /* package name (heap) */
+    const char *path;    /* absolute source path (heap) */
+    const char *version; /* version or NULL (heap) */
+} cbm_dep_discovered_t;
+
+typedef struct {
+    int effective_package_limit; /* 0=disabled, <0=unlimited, >0=cap */
+    int candidates_observed;     /* resolved candidates seen before package-cap truncation */
+    int packages_selected;
+    int packages_current;
+    int packages_reindexed;
+    int packages_failed;
+    bool package_limit_hit;
+    int dependency_file_limit; /* 0=unlimited */
+    int packages_skipped_file_limit;
+} cbm_dep_auto_index_stats_t;
+
+/* Discover installed deps by querying the indexed graph.
+ * store: open store with freshly indexed project.
+ * Returns 0 on success. Caller must call cbm_dep_discovered_free(). */
+int cbm_discover_installed_deps(cbm_pkg_manager_t mgr, const char *project_root, cbm_store_t *store,
+                                const char *project_name, cbm_dep_discovered_t **out, int *count,
+                                int max_results);
+void cbm_dep_discovered_free(cbm_dep_discovered_t *deps, int count);
+
+/* ── Auto-Index (DRY helper for all 3 re-index paths) ──────────── */
+
+/* Detect ecosystem, discover deps from fresh graph, index via flush.
+ * Called AFTER dump_to_sqlite by index_repository, watcher, autoindex.
+ * cfg may be NULL; when present, dependency pipelines use the same indexing
+ * thresholds as the parent project pipeline and max_deps is the fallback
+ * configured package cap. Without cfg, max_deps is already effective.
+ * Returns number of deps indexed, or 0 if none. */
+int cbm_dep_auto_index(const char *project_name, const char *project_root, cbm_store_t *store,
+                       int max_deps, cbm_config_t *cfg);
+
+/* Same as cbm_dep_auto_index(), but the package limit is already effective:
+ * 0 disables, <0 is unlimited, >0 caps packages. cfg still configures each
+ * dependency pipeline for non-limit settings. */
+int cbm_dep_auto_index_effective(const char *project_name, const char *project_root,
+                                 cbm_store_t *store, int effective_max_deps, cbm_config_t *cfg);
+
+/* Observable variant used by MCP responses and logs. The legacy return value
+ * remains the number of dependency projects reindexed in this call. */
+int cbm_dep_auto_index_effective_with_stats(const char *project_name, const char *project_root,
+                                            cbm_store_t *store, int effective_max_deps,
+                                            cbm_config_t *cfg, cbm_dep_auto_index_stats_t *stats);
+
+/* ── Cross-Boundary Edges ──────────────────────────────────────── */
+
+/* Create IMPORTS edges from project code to dep modules.
+ * Called AFTER all dep flushes complete.
+ * Returns number of edges created. */
+int cbm_dep_link_cross_edges(cbm_store_t *store, const char *project_name);
+
+/* Effective dependency auto-index limit from config.
+ * Return 0 to disable, -1 for unlimited, or a positive package count. */
+int cbm_dep_auto_index_effective_limit(cbm_config_t *cfg, int default_limit);
+
+/* Normalize an enabled auto_dep_limit value: 0 is unlimited, valid positive
+ * values are retained, and out-of-range values fall back to a bounded default. */
+int cbm_dep_normalize_configured_limit(int limit, int default_limit);
+
+/* Normalize dep_max_files: 0 is unlimited, valid positive values are retained,
+ * and out-of-range values fall back to the bounded default. */
+int cbm_dep_normalize_file_limit(int limit);
+
+#endif /* CBM_DEPINDEX_H */

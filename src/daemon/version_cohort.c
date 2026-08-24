@@ -47,6 +47,7 @@ static const char VERSION_COHORT_ADMISSION_FILE[] = "cbm-version-cohort-admissio
 static const char VERSION_COHORT_LIFETIME_FILE[] = "cbm-version-cohort-lifetime-v1.lock";
 static const char VERSION_COHORT_MAINTENANCE_FILE[] = "cbm-version-cohort-maintenance-v1.lock";
 static const char VERSION_COHORT_DAEMON_FILE[] = "cbm-version-cohort-daemon-v1.lock";
+static const char VERSION_COHORT_BOOTSTRAP_FILE[] = "cbm-version-cohort-bootstrap-v1.lock";
 
 struct cbm_version_cohort_manager {
     cbm_private_lock_directory_t *directory;
@@ -61,6 +62,7 @@ struct cbm_version_cohort_lease {
     cbm_private_file_lock_t *maintenance;
     cbm_private_file_lock_t *admission;
     cbm_private_file_lock_t *lifetime;
+    cbm_private_file_lock_t *bootstrap;
     bool registered;
 };
 
@@ -320,6 +322,15 @@ cbm_private_file_lock_status_t cbm_version_cohort_lease_release(
     }
     cbm_version_cohort_lease_t *lease = *lease_io;
     cbm_private_file_lock_status_t result = CBM_PRIVATE_FILE_LOCK_OK;
+    if (lease->bootstrap) {
+        cbm_private_file_lock_status_t status = cbm_private_file_lock_release(&lease->bootstrap);
+        if (status != CBM_PRIVATE_FILE_LOCK_OK) {
+            result = status;
+        }
+    }
+    if (lease->bootstrap) {
+        return CBM_PRIVATE_FILE_LOCK_IO;
+    }
     if (lease->lifetime) {
         cbm_private_file_lock_status_t status = cbm_private_file_lock_release(&lease->lifetime);
         if (status != CBM_PRIVATE_FILE_LOCK_OK) {
@@ -414,11 +425,18 @@ static cbm_version_cohort_status_t version_cohort_claim_new(
                                   CBM_PRIVATE_FILE_LOCK_SH, deadline_ms, &lease->lifetime));
 }
 
-cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
-                                                       const cbm_daemon_build_identity_t *identity,
-                                                       uint64_t deadline_ms,
-                                                       cbm_version_cohort_lease_t **lease_out,
-                                                       cbm_daemon_conflict_t *conflict_out) {
+static cbm_version_cohort_status_t version_cohort_bootstrap_activity_lock(
+    cbm_version_cohort_manager_t *manager, uint64_t deadline_ms,
+    cbm_version_cohort_lease_t *lease) {
+    return version_cohort_status_from_lock(
+        version_cohort_lock_until(manager, VERSION_COHORT_BOOTSTRAP_FILE, CBM_PRIVATE_FILE_LOCK_SH,
+                                  deadline_ms, &lease->bootstrap));
+}
+
+static cbm_version_cohort_status_t version_cohort_acquire_internal(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out, bool bootstrap) {
     if (lease_out) {
         *lease_out = NULL;
     }
@@ -432,6 +450,16 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
     cbm_version_cohort_lease_t *lease = version_cohort_lease_new(manager);
     if (!lease) {
         return CBM_VERSION_COHORT_IO;
+    }
+    if (bootstrap) {
+        /* Mark the attempt before it can wait behind another admission. The
+         * daemon's EX drain probe is nonblocking, so activity -> maintenance
+         * -> admission -> lifetime cannot create a cross-process wait cycle. */
+        cbm_version_cohort_status_t bootstrap_status =
+            version_cohort_bootstrap_activity_lock(manager, deadline_ms, lease);
+        if (bootstrap_status != CBM_VERSION_COHORT_OK) {
+            return version_cohort_failed(lease, bootstrap_status, lease_out);
+        }
     }
     /* Global order is maintenance -> admission -> lifetime. Retaining SH
      * through admission closes the probe/admission race: an activation cannot
@@ -560,6 +588,68 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
         cbm_private_file_lock_release(&lease->maintenance);
     if (maintenance_release != CBM_PRIVATE_FILE_LOCK_OK) {
         return version_cohort_failed(lease, CBM_VERSION_COHORT_IO, lease_out);
+    }
+    *lease_out = lease;
+    return CBM_VERSION_COHORT_OK;
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manager_t *manager,
+                                                       const cbm_daemon_build_identity_t *identity,
+                                                       uint64_t deadline_ms,
+                                                       cbm_version_cohort_lease_t **lease_out,
+                                                       cbm_daemon_conflict_t *conflict_out) {
+    return version_cohort_acquire_internal(manager, identity, deadline_ms, lease_out, conflict_out,
+                                           false);
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_bootstrap_acquire(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out) {
+    return version_cohort_acquire_internal(manager, identity, deadline_ms, lease_out, conflict_out,
+                                           true);
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_bootstrap_activity_acquire(
+    cbm_version_cohort_manager_t *manager, uint64_t deadline_ms,
+    cbm_version_cohort_lease_t **lease_out) {
+    if (lease_out) {
+        *lease_out = NULL;
+    }
+    if (!manager || !lease_out) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    cbm_version_cohort_lease_t *lease = version_cohort_lease_new(manager);
+    if (!lease) {
+        return CBM_VERSION_COHORT_IO;
+    }
+    cbm_version_cohort_status_t status =
+        version_cohort_bootstrap_activity_lock(manager, deadline_ms, lease);
+    if (status != CBM_VERSION_COHORT_OK) {
+        return version_cohort_failed(lease, status, lease_out);
+    }
+    *lease_out = lease;
+    return CBM_VERSION_COHORT_OK;
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_bootstrap_drain_try_acquire(
+    cbm_version_cohort_manager_t *manager, cbm_version_cohort_lease_t **lease_out) {
+    if (lease_out) {
+        *lease_out = NULL;
+    }
+    if (!manager || !lease_out) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    cbm_version_cohort_lease_t *lease = version_cohort_lease_new(manager);
+    if (!lease) {
+        return CBM_VERSION_COHORT_IO;
+    }
+    cbm_private_file_lock_status_t lock_status =
+        cbm_private_file_lock_try_acquire(manager->directory, VERSION_COHORT_BOOTSTRAP_FILE,
+                                          CBM_PRIVATE_FILE_LOCK_EX, &lease->bootstrap);
+    cbm_version_cohort_status_t status = version_cohort_status_from_lock(lock_status);
+    if (status != CBM_VERSION_COHORT_OK) {
+        return version_cohort_failed(lease, status, lease_out);
     }
     *lease_out = lease;
     return CBM_VERSION_COHORT_OK;

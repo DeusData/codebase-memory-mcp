@@ -5,9 +5,9 @@
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE)
 [![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
+**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the self-contained native executable for the current platform.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 158 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 43 automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 158 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. Streamlined MCP tools are the default; classic mode exposes all 16. No hosted service or API key; this package requires Node.js to manage and launch the cached self-contained native executable. Plug and play across 43 automatic/conditional client surfaces.
 
 ## Installation
 
@@ -28,7 +28,7 @@ Restart your agent. Say **"Index this project"** — done.
 ## Why codebase-memory-mcp
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
-- **Plug and play** — verified native runtime sets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker or API keys; Node.js owns package download, cache repair, and launch.
+- **Plug and play** — one verified self-contained native executable for each macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64) target. No Docker or API keys; Node.js owns package download, cache repair, and launch.
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
 - **43 supported automatic/conditional client surfaces** — `install` configures the appropriate MCP, durable-context, and documented hook surfaces without widening client permissions.
@@ -38,7 +38,7 @@ Restart your agent. Say **"Index this project"** — done.
 - **Lifecycle hooks stay conservative** — Kimi uses `UserPromptSubmit`; on macOS/Linux, GitLab Duo gets a fail-open user `SessionStart`, while Devin gets `UserPromptSubmit`, `PostCompaction`, and a deduplicated `SessionStart` when Claude does not already provide it. Qoder, GitLab Duo, Devin, and Factory hooks are withheld on Windows without a documented shell/executor contract. Cline's auto-activating file hooks are withheld because their context output is not reliably consumed, CodeBuddy beta hooks are not auto-installed, and Cursor context hooks remain withheld.
 - **Subagent access is explicit** — Claude, Gemini, Kiro, Qwen, CodeBuddy, KiloCode, Mistral Vibe, Qoder, Junie, and Factory get documented graph profiles with the narrowest tool/server filters their schemas support. KiloCode and Vibe enumerate read-only query tools rather than using server wildcards. Cursor, Rovo, Pochi, and Cline use explicit parent handoff where child MCP is unavailable or unsafe; IBM Bob receives no invented hook or agent.
 - **Manual, UI, cloud, or repository-managed (not counted)** — Qodo, Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI, Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection remains manual.
-- **15 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, dependency indexing, and more.
 
 ## Supported Platforms
 
@@ -54,7 +54,7 @@ Restart your agent. Say **"Index this project"** — done.
 codebase-memory-mcp install          # configure all detected coding agents
 codebase-memory-mcp --version
 codebase-memory-mcp --help
-codebase-memory-mcp update           # update to latest release
+codebase-memory-mcp update           # print the platform installer handoff
 codebase-memory-mcp uninstall        # remove agent configs
 ```
 
@@ -65,7 +65,7 @@ Every MCP tool is also available directly from the command line:
 ```bash
 codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
 codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_call_path '{"function_name": "main", "direction": "both"}'
+codebase-memory-mcp cli trace_path '{"function_name": "main", "direction": "both"}'
 codebase-memory-mcp cli get_architecture '{}'
 ```
 
@@ -74,9 +74,9 @@ codebase-memory-mcp cli get_architecture '{}'
 | Category | Tools |
 |----------|-------|
 | **Indexing** | `index_repository`, `list_projects`, `delete_project`, `index_status` |
-| **Querying** | `search_graph`, `trace_call_path`, `detect_changes`, `query_graph` |
+| **Querying** | `search_graph`, `trace_path`, `detect_changes`, `query_graph` |
 | **Analysis** | `get_architecture`, `get_graph_schema`, `get_code_snippet`, `search_code` |
-| **Advanced** | `manage_adr`, `ingest_traces` |
+| **Advanced** | `manage_adr`, `ingest_traces`, `index_dependencies` |
 
 ## Performance
 

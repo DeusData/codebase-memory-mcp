@@ -14,14 +14,18 @@
 
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
 #include "../src/foundation/platform.h"
 
 #include <stdio.h>
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #ifdef _WIN32
 #include "../src/foundation/win_utf8.h"
+#else
+#include <fcntl.h>
 #endif
 
 /* ── Path building ────────────────────────────────────────────── */
@@ -80,6 +84,34 @@ static inline int th_append_file(const char *path, const char *content) {
     }
     fclose(f);
     return 0;
+}
+
+/* Write a config row without public-setter validation. Tests use this only to
+ * model retained databases from older builds or manual edits. */
+static inline int th_set_raw_config_value(const char *cache_dir, const char *key,
+                                          const char *value) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/_config.db", cache_dir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    sqlite3 *db = NULL;
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_open(path, &db);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_prepare_v2(db, "INSERT OR REPLACE INTO config (key, value) VALUES (?1, ?2)",
+                                -1, &stmt, NULL);
+    }
+    if (rc == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, value, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(stmt) == SQLITE_DONE ? SQLITE_OK : sqlite3_errcode(db);
+    }
+    sqlite3_finalize(stmt);
+    if (db && sqlite3_close(db) != SQLITE_OK) {
+        rc = SQLITE_BUSY;
+    }
+    return rc == SQLITE_OK ? 0 : -1;
 }
 
 /* ── Directory creation ───────────────────────────────────────── */
@@ -151,6 +183,70 @@ static inline int th_rmtree(const char *path) {
         rc = -1;
     }
     return rc;
+}
+
+/* Put a fixture's write time unambiguously before or after the current wall
+ * clock. This avoids sleeps and remains deterministic on coarse-timestamp
+ * filesystems used by containers and Windows test environments. */
+static inline bool th_shift_file_time_for_cache_test(const char *path, bool future) {
+    enum {
+        TH_CACHE_TIMESTAMP_SETTLE_SECONDS = 2,
+        TH_WINDOWS_FILETIME_TICKS_PER_SECOND = 10000000,
+    };
+    if (!path) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide = cbm_path_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE file = CreateFileW(wide, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE |
+                                                               FILE_SHARE_DELETE,
+                              NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(wide);
+    FILETIME now;
+    GetSystemTimeAsFileTime(&now);
+    uint64_t ticks = ((uint64_t)now.dwHighDateTime << 32U) | now.dwLowDateTime;
+    uint64_t delta = (uint64_t)TH_CACHE_TIMESTAMP_SETTLE_SECONDS *
+                     TH_WINDOWS_FILETIME_TICKS_PER_SECOND;
+    bool ok = file != INVALID_HANDLE_VALUE &&
+              (future ? ticks <= UINT64_MAX - delta : ticks > delta);
+    if (ok) {
+        ticks = future ? ticks + delta : ticks - delta;
+        FILETIME shifted = {
+            .dwLowDateTime = (DWORD)ticks,
+            .dwHighDateTime = (DWORD)(ticks >> 32U),
+        };
+        ok = SetFileTime(file, NULL, NULL, &shifted) != 0;
+    }
+    if (file != INVALID_HANDLE_VALUE && CloseHandle(file) == 0) {
+        ok = false;
+    }
+    return ok;
+#else
+    struct timespec now;
+    if (clock_gettime(CLOCK_REALTIME, &now) != 0 ||
+        (!future && now.tv_sec <= TH_CACHE_TIMESTAMP_SETTLE_SECONDS)) {
+        return false;
+    }
+    time_t shifted_sec =
+        now.tv_sec + (future ? TH_CACHE_TIMESTAMP_SETTLE_SECONDS
+                             : -TH_CACHE_TIMESTAMP_SETTLE_SECONDS);
+    struct timespec times[2] = {
+        {.tv_sec = shifted_sec, .tv_nsec = now.tv_nsec},
+        {.tv_sec = shifted_sec, .tv_nsec = now.tv_nsec},
+    };
+    return utimensat(AT_FDCWD, path, times, 0) == 0;
+#endif
+}
+
+static inline bool th_backdate_file_for_cache_test(const char *path) {
+    return th_shift_file_time_for_cache_test(path, false);
+}
+
+static inline bool th_futuredate_file_for_cache_test(const char *path) {
+    return th_shift_file_time_for_cache_test(path, true);
 }
 
 /* ── Temp directory creation ──────────────────────────────────── */

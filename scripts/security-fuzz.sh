@@ -29,7 +29,6 @@ FUZZ_TMPDIR="$CBM_TEST_RUNTIME_ROOT"
 trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 FUZZ_HOME="$FUZZ_TMPDIR/home"
 mkdir "$FUZZ_HOME"
-export HOME="$FUZZ_HOME"
 
 # Helper: send a payload to the MCP server and check it doesn't crash.
 # Uses temp file + perl alarm for portable timeout (works on macOS + Linux).
@@ -52,9 +51,9 @@ test_payload() {
     # Run with 10s timeout: GNU timeout → perl alarm fallback
     local ec=0
     if command -v timeout &>/dev/null; then
-        timeout 10 "$BINARY" < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
+        HOME="$FUZZ_HOME" timeout 10 "$BINARY" < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
     else
-        perl -e 'alarm(10); exec @ARGV' -- "$BINARY" \
+        HOME="$FUZZ_HOME" perl -e 'alarm(10); exec @ARGV' -- "$BINARY" \
             < "$tmpinput" > "$tmpoutput" 2>&1 || ec=$?
     fi
 
@@ -89,7 +88,7 @@ test_invalid_index_interactive() {
     local tmpoutput="$FUZZ_TMPDIR/output_${TOTAL}.jsonl"
     local ec=0
 
-    python3 "$(dirname "$0")/test_mcp_interactive.py" "$BINARY" \
+    HOME="$FUZZ_HOME" python3 "$(dirname "$0")/test_mcp_interactive.py" "$BINARY" \
         --scenario invalid-index --repo-path /nonexistent/path/abc123 \
         --response-timeout 45 --exit-timeout 15 > "$tmpoutput" 2>&1 || ec=$?
 

@@ -42,10 +42,9 @@ mkdir -p "$(dirname "$OUT")"
         cat "$f"
     done
 
-    # With-ui packaging path: node_modules exists (make frontend ran npm ci),
-    # so append the license texts of the npm packages compiled into the
-    # external UI pack. Standard archives carry no pack — the section is
-    # skipped.
+    # When the frontend was built, append the license texts of the npm packages
+    # compiled into the executable. Development builds without node_modules
+    # skip this generated section.
     if [ -d "$ROOT/graph-ui/node_modules" ]; then
         echo
         echo "---"

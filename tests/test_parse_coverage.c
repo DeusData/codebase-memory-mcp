@@ -198,12 +198,11 @@ TEST(py_clean_file_not_flagged) {
     PASS();
 }
 
-TEST(error_region_cap_is_honored) {
+TEST(error_regions_are_not_silently_capped) {
     /* Pathological input: many separate unrecoverable garbage blocks
-     * interleaved with valid defs. The collector must stay bounded by its
-     * 64-region cap (matches CBM_MAX_ERROR_REGIONS in cbm.c) — pathological
-     * input can't blow up the report, and the flag itself still fires. */
-    enum { GARBAGE_BLOCKS = 200, LINE_CAP = 64 };
+     * interleaved with valid defs. Every detected region must be reported;
+     * storage remains bounded by the already-materialized parse tree. */
+    enum { GARBAGE_BLOCKS = 200, FORMER_REGION_CAP = 64 };
     char *src = (char *)malloc(GARBAGE_BLOCKS * 96 + 1);
     ASSERT_NOT_NULL(src);
     size_t off = 0;
@@ -215,9 +214,15 @@ TEST(error_region_cap_is_honored) {
     free(src);
     ASSERT_NOT_NULL(r);
     ASSERT_TRUE(r->parse_incomplete);
-    ASSERT_GTE(r->error_region_count, 1);
-    ASSERT_LTE(r->error_region_count, LINE_CAP);
+    ASSERT_GT(r->error_region_count, FORMER_REGION_CAP);
     ASSERT_NOT_NULL(r->error_ranges);
+    int serialized_regions = 1;
+    for (const char *p = r->error_ranges; *p; p++) {
+        if (*p == ',') {
+            serialized_regions++;
+        }
+    }
+    ASSERT_EQ(serialized_regions, r->error_region_count);
     cbm_free_result(r);
     PASS();
 }
@@ -377,7 +382,7 @@ SUITE(parse_coverage) {
     RUN_TEST(py_unrecovered_garbage_sets_parse_incomplete);
     RUN_TEST(py_recovered_def_not_flagged);
     RUN_TEST(py_clean_file_not_flagged);
-    RUN_TEST(error_region_cap_is_honored);
+    RUN_TEST(error_regions_are_not_silently_capped);
     RUN_TEST(c_trailing_recovered_defs_keep_flag);
     RUN_TEST(dockerfile_missing_final_newline_not_flagged_issue1610);
     RUN_TEST(dockerfile_with_final_newline_still_clean_issue1610);

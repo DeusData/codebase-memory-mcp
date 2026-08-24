@@ -10,6 +10,7 @@
 #define CBM_GRAPH_BUFFER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdatomic.h>
 
@@ -57,7 +58,8 @@ cbm_gbuf_t *cbm_gbuf_new_shared_ids(const char *project, const char *root_path,
 void cbm_gbuf_free(cbm_gbuf_t *gb);
 
 /* Merge all nodes and edges from src into dst.
- * Nodes are merged by QN: on collision, src wins (updates dst node fields).
+ * Nodes are merged by QN: on collision, matching source locations take the
+ * later update, while duplicate code definitions keep the richer source span.
  * New nodes are inserted with their original IDs (from shared ID source).
  * Edges are remapped for any QN-colliding nodes, then inserted with dedup.
  * After merge, src can be safely freed (all data is copied).
@@ -104,6 +106,17 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label);
  * Used by incremental indexing to remove stale nodes before re-extraction. */
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path);
 
+/* Batch purge: delete every node whose file_path is in `paths` in a SINGLE pass
+ * (O(N+E) total) instead of one scan per file (O(C·(N+E))). NULL paths skipped.
+ * Keys borrowed (not freed). Returns total nodes deleted, or negative on setup failure. */
+int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count);
+
+/* Iteratively remove Folder nodes with no outgoing file or child-folder
+ * containment edge. Returns the number of pruned nodes, or a negative error.
+ * Used after incremental file deletion so in-memory containment matches a
+ * clean structure rebuild, including nested folders that become empty. */
+int cbm_gbuf_prune_orphan_folders(cbm_gbuf_t *gb);
+
 /* Bulk-load all nodes and edges for a project from an existing SQLite DB
  * into this graph buffer. Returns 0 on success. */
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project);
@@ -115,6 +128,10 @@ void cbm_gbuf_foreach_node(const cbm_gbuf_t *gb, cbm_gbuf_node_visitor_fn fn, vo
 /* Iterate all edges. */
 typedef void (*cbm_gbuf_edge_visitor_fn)(const cbm_gbuf_edge_t *edge, void *userdata);
 void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, void *userdata);
+
+/* Validate structural invariants before handing dump rows to the SQLite writer.
+ * On failure, writes a concise diagnostic into err when provided. */
+int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz);
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 
@@ -146,6 +163,18 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type);
 /* Delete all edges of a type. */
 int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type);
 
+/* Delete edges of a type whose properties contain prop_substr.
+ * Returns the number of deleted edges, or CBM_NOT_FOUND on invalid input. */
+int cbm_gbuf_delete_edges_by_type_matching_props(cbm_gbuf_t *gb, const char *type,
+                                                 const char *prop_substr);
+
+/* HC-1: DRY helper for name+label+file resolution fallback.
+ * Extracts short name via strrchr('.'), uses nodes_by_name hash (O(1)),
+ * filters by file_path and label_filter set. Used by pass_calls and pass_normalize. */
+const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(const cbm_gbuf_t *gb, const char *qn,
+                                                        const char *file_path,
+                                                        const char **label_filter, int label_count);
+
 /* ── Vector storage (for semantic embeddings) ───────────────────── */
 
 /* Store an int8-quantized vector for a node. The vector data is copied.
@@ -161,18 +190,27 @@ int cbm_gbuf_store_token_vector(cbm_gbuf_t *gb, const char *token, const uint8_t
 
 /* ── Dump to SQLite ──────────────────────────────────────────────── */
 
+/* Test-only fault injection for cbm_gbuf_dump_to_sqlite(): fail after temp DB
+ * verification and before atomic replacement. Used to prove publish failures
+ * leave the previous DB intact. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+#define CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE "CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE"
+#define CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT "CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT"
+#endif
+
 /* Dump the entire buffer to a SQLite file using the direct page writer.
  * Assigns sequential final IDs and remaps edge references.
  * Returns 0 on success, -1 on error. */
 int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path);
 
 /* Flush the buffer to an existing store via the store API.
- * Deletes existing project data first. Returns 0 on success. */
+ * Transactionally replaces one project and preserves other projects. */
 int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
-/* Merge the buffer into an existing store WITHOUT deleting existing data.
- * Upserts nodes, inserts edges. Used for incremental indexing.
- * Returns 0 on success. */
+/* Merge nodes and edges from gb into an already-open store WITHOUT wiping
+ * the project first. Used by incremental reindex to insert changed-file
+ * symbols into the live DB alongside unchanged-file nodes.
+ * Returns 0 on success, -1 on error. */
 int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store);
 
 #endif /* CBM_GRAPH_BUFFER_H */

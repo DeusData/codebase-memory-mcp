@@ -14,6 +14,31 @@ GEN="$ROOT/scripts/ci/gen-mcpb-registry-entries.sh"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cbm-mcpb-entries.XXXXXX")"
 trap 'rm -rf "$FIX"' EXIT
 
+if grep -Fq 'releases/latest/download/mcp-publisher_' "$ROOT/.github/workflows/release.yml"; then
+    echo "FAIL: MCP Registry publisher download floats on releases/latest" >&2
+    exit 1
+fi
+grep -Eq 'MCP_PUBLISHER_VERSION: v[0-9]+\.[0-9]+\.[0-9]+' \
+    "$ROOT/.github/workflows/release.yml" || {
+    echo "FAIL: MCP Registry publisher version is not pinned" >&2
+    exit 1
+}
+grep -Eq 'MCP_PUBLISHER_CHECKSUMS_SHA256: [0-9a-f]{64}' \
+    "$ROOT/.github/workflows/release.yml" || {
+    echo "FAIL: MCP Registry publisher checksums file sha256 is not pinned" >&2
+    exit 1
+}
+for required in \
+    'echo "$MCP_PUBLISHER_CHECKSUMS_SHA256  $sums" | sha256sum -c -' \
+    'awk -v a="$asset" '\''$2 == a'\'' "$sums" > expected.sha256' \
+    'test -s expected.sha256' \
+    'sha256sum -c expected.sha256'; do
+    grep -Fq "$required" "$ROOT/.github/workflows/release.yml" || {
+        echo "FAIL: MCP Registry publisher verification is missing: $required" >&2
+        exit 1
+    }
+done
+
 # "$BASH" by explicit argv — on native Windows a bare "bash" resolves to the
 # WSL stub (same trap the extractor contract documents).
 python3 - "$ROOT" "$FIX" "$BASH" <<'PY'
@@ -41,8 +66,12 @@ def fresh_fixture():
     shutil.copy(root / "server.json", fix / "server.json")
     (fix / "checksums.txt").write_text(
         f"{SHA_B}  codebase-memory-mcp-windows-amd64.zip\n"
+        f"{SHA_A}  codebase-memory-mcp-darwin-amd64.mcpb\n"
+        f"{SHA_A}  codebase-memory-mcp-darwin-arm64.mcpb\n"
+        f"{SHA_A}  codebase-memory-mcp-linux-amd64-portable.mcpb\n"
+        f"{SHA_B}  codebase-memory-mcp-linux-arm64-portable.mcpb\n"
         f"{SHA_B}  codebase-memory-mcp-windows-amd64.mcpb\n"
-        f"{SHA_A}  codebase-memory-mcp-darwin-arm64.mcpb\n",
+        f"{SHA_B}  codebase-memory-mcp-windows-arm64.mcpb\n",
         encoding="utf-8",
     )
 
@@ -72,12 +101,12 @@ manifest, mcpb = mcpb_packages()
 kinds = [p.get("registryType") for p in manifest.get("packages", [])]
 if kinds[:2] != ["npm", "pypi"]:
     fail(f"npm/pypi entries must survive, in order, ahead of mcpb: {kinds}")
-if len(mcpb) != 2:
-    fail(f"expected 2 mcpb entries (only .mcpb lines count), got {len(mcpb)}")
+if len(mcpb) != 6:
+    fail(f"expected 6 canonical mcpb entries, got {len(mcpb)}")
 else:
     first = mcpb[0]
     wanted_url = ("https://github.com/DeusData/codebase-memory-mcp/releases/"
-                  "download/v9.9.9/codebase-memory-mcp-darwin-arm64.mcpb")
+                  "download/v9.9.9/codebase-memory-mcp-darwin-amd64.mcpb")
     if first.get("identifier") != wanted_url:
         fail(f"darwin identifier wrong: {first.get('identifier')}")
     if first.get("version") != "9.9.9":
@@ -100,7 +129,7 @@ result = run()
 if result.returncode != 0:
     fail(f"re-run failed: {result.stderr[-300:]}")
 _, mcpb = mcpb_packages()
-if len(mcpb) != 2:
+if len(mcpb) != 6:
     fail(f"re-run duplicated mcpb entries: {len(mcpb)}")
 
 # ── fail-closed: zero bundles, malformed hash ───────────────────────────────

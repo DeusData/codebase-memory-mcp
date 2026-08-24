@@ -581,8 +581,8 @@ async function main() {
   // have no such variant. Keep in sync with install.sh / pypi _cli.py / cli.c.
   const variant = platform === 'linux' ? '-portable' : '';
   // No UI/standard split since v0.10.0: one archive per platform, graph UI
-  // always embedded. The old CBM_VARIANT=ui opt-in pointed at ui-* archives
-  // that no longer exist, so honoring it could only 404 (#1538).
+  // always embedded. The retired UI opt-in pointed at archives that no longer
+  // exist, so honoring it could only 404 (#1538).
   const archive = `codebase-memory-mcp-${platform}-${arch}${variant}.${ext}`;
   const url = `https://github.com/${REPO}/releases/download/v${VERSION}/${archive}`;
 
@@ -622,7 +622,7 @@ async function main() {
     }
 
     if (platform === 'windows') {
-      // The launcher resolves the adjacent portable payload in this directory.
+      // Windows ships one executable, so the extracted file is the candidate.
       verifyCandidate(extractedPaths.get(WINDOWS_BINARY_NAME));
     } else {
       verifyCandidate(extractedPaths.get(binName));

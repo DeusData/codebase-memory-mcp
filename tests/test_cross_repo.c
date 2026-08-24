@@ -236,9 +236,13 @@ TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens) {
     PASS();
 }
 
-static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
-                                         const char *source_project, const char *target_project) {
-    enum { TEST_SCAN_ROWS = 4097 };
+static bool cross_repo_seed_scan_past_former_caps(const cross_repo_fixture_t *fixture,
+                                                  const char *source_project,
+                                                  const char *target_project) {
+    enum {
+        FORMER_SCAN_CAP = 4096,
+        TEST_SCAN_ROWS = FORMER_SCAN_CAP + 1
+    };
     char source_path[512];
     char target_path[512];
     if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path)) ||
@@ -279,7 +283,7 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
             .target_id = route_id,
             .type = "HTTP_CALLS",
             .properties_json = i == TEST_SCAN_ROWS - 1
-                                   ? "{\"url_path\":\"/after-bound\",\"method\":\"GET\"}"
+                                   ? "{\"url_path\":\"/after/bound\",\"method\":\"GET\"}"
                                    : "{}",
         };
         ok = route_id > 0 && cbm_store_insert_edge(source, &edge) > 0;
@@ -290,10 +294,24 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
         (void)sqlite3_exec(cbm_store_get_db(source), "ROLLBACK", NULL, NULL, NULL);
     }
 
+    ok = ok &&
+         sqlite3_exec(cbm_store_get_db(target), "BEGIN IMMEDIATE", NULL, NULL, NULL) == SQLITE_OK;
+    for (int i = 0; ok && i < FORMER_SCAN_CAP; i++) {
+        char name[64];
+        char qn[128];
+        snprintf(name, sizeof(name), "ignored_route_%d", i);
+        snprintf(qn, sizeof(qn), "__route__GET__/ignored/%d", i);
+        cbm_node_t ignored_route = {.project = target_project,
+                                    .label = "Route",
+                                    .name = name,
+                                    .qualified_name = qn,
+                                    .file_path = "server.c"};
+        ok = cbm_store_upsert_node(target, &ignored_route) > 0;
+    }
     cbm_node_t target_route = {.project = target_project,
                                .label = "Route",
-                               .name = "GET /after-bound",
-                               .qualified_name = "__route__GET__/after-bound",
+                               .name = "GET /after/{}",
+                               .qualified_name = "__route__GET__/after/{}",
                                .file_path = "server.c"};
     cbm_node_t handler = {.project = target_project,
                           .label = "Function",
@@ -307,15 +325,20 @@ static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
                           .target_id = target_route_id,
                           .type = "HANDLES"};
     ok = ok && target_route_id > 0 && handler_id > 0 && cbm_store_insert_edge(target, &handles) > 0;
+    if (ok) {
+        ok = sqlite3_exec(cbm_store_get_db(target), "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    } else {
+        (void)sqlite3_exec(cbm_store_get_db(target), "ROLLBACK", NULL, NULL, NULL);
+    }
     cbm_store_close(source);
     cbm_store_close(target);
     return ok;
 }
 
-TEST(cross_repo_scan_bound_counts_examined_rows_not_matches) {
+TEST(cross_repo_scans_edges_and_fuzzy_routes_past_former_prefix_cap) {
     cross_repo_fixture_t fixture;
     bool setup = cross_repo_fixture_begin(&fixture) &&
-                 cross_repo_seed_bounded_scan(&fixture, "bounded-source", "bounded-target");
+                 cross_repo_seed_scan_past_former_caps(&fixture, "bounded-source", "bounded-target");
     if (!setup) {
         cross_repo_fixture_end(&fixture);
         FAIL("failed to seed bounded scan fixture");
@@ -326,7 +349,7 @@ TEST(cross_repo_scan_bound_counts_examined_rows_not_matches) {
 
     ASSERT_FALSE(result.failed);
     ASSERT_EQ(result.projects_scanned, 1);
-    ASSERT_EQ(result.http_edges, 0);
+    ASSERT_EQ(result.http_edges, 1);
     PASS();
 }
 
@@ -523,7 +546,7 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
-    RUN_TEST(cross_repo_scan_bound_counts_examined_rows_not_matches);
+    RUN_TEST(cross_repo_scans_edges_and_fuzzy_routes_past_former_prefix_cap);
     RUN_TEST(cross_repo_propagates_delete_failure);
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);
     RUN_TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_target);

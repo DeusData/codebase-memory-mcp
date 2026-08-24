@@ -24,10 +24,29 @@
 int tf_pass_count = 0;
 int tf_fail_count = 0;
 int tf_skip_count = 0;
+int tf_filter_count = 0;
 
 #include "test_framework.h"
+#include "test_helpers.h"
 #include "repro_runner.h"
 #include "foundation/compat.h" /* cbm_setenv — #845 supervisor kill switch */
+
+static char repro_cache_dir[CBM_PATH_MAX];
+static char *saved_cache_dir;
+
+static void cleanup_repro_cache(void) {
+    if (repro_cache_dir[0]) {
+        th_rmtree(repro_cache_dir);
+        repro_cache_dir[0] = '\0';
+    }
+    if (saved_cache_dir) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_dir, 1);
+        free(saved_cache_dir);
+        saved_cache_dir = NULL;
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+}
 
 /* Per-suite summary + filter. RUN_SUITE prints a one-line
  * "[SUITE] <name> P passed, F failed" report (greppable for which suites still
@@ -124,6 +143,21 @@ extern void suite_repro_lsp_java_cs(void);
 extern void suite_repro_lsp_kt_php_rust(void);
 
 int main(void) {
+    const char *existing_cache_dir = getenv("CBM_CACHE_DIR");
+    saved_cache_dir = existing_cache_dir ? strdup(existing_cache_dir) : NULL;
+    snprintf(repro_cache_dir, sizeof(repro_cache_dir), "%s/cbm-repro-cache-XXXXXX",
+             cbm_tmpdir());
+    if (!cbm_mkdtemp(repro_cache_dir)) {
+        free(saved_cache_dir);
+        saved_cache_dir = NULL;
+        return 1;
+    }
+    cbm_setenv("CBM_CACHE_DIR", repro_cache_dir, 1);
+    if (atexit(cleanup_repro_cache) != 0) {
+        cleanup_repro_cache();
+        return 1;
+    }
+
     /* #845 belt-and-suspenders: this binary EMBEDS cbm_mcp_handle_tool and its
      * main() IGNORES argv — spawned as `<self> cli --index-worker …` it would
      * re-run EVERY repro suite recursively (the observed 11-min hangs). The

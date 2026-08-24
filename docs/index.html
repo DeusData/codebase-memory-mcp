@@ -4,7 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents</title>
-    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. Native executable with verified assets and no language runtime. One command configures 43 automatic/conditional client surfaces.">
+    <meta name="description" content="codebase-memory-mcp is an open-source MCP server that indexes any codebase into a persistent knowledge graph so AI coding agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP type resolution, local semantic vector search, code-clone detection, sub-1ms queries, Linux kernel indexed in 3 minutes. One verified self-contained native executable per target and no language runtime. One command configures 43 automatic/conditional client surfaces.">
     <meta name="keywords" content="MCP server, code intelligence, knowledge graph, tree-sitter, Hybrid LSP, semantic code search, code embeddings, code clone detection, cross-repo analysis, data-flow analysis, Claude Code, Codex CLI, Gemini CLI, Cursor, Zed, code exploration, token reduction, call graph, dead code detection">
     <meta name="author" content="DeusData">
     <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
@@ -12,7 +12,7 @@
 
     <!-- Open Graph -->
     <meta property="og:title" content="codebase-memory-mcp — Code Intelligence Knowledge Graph for AI Coding Agents">
-    <meta property="og:description" content="Index any codebase into a persistent knowledge graph. AI agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP, sub-1ms queries, native executable with verified assets.">
+    <meta property="og:description" content="Index any codebase into a persistent knowledge graph. AI agents answer structural questions with ~120x fewer tokens. 158 languages, Hybrid LSP, sub-1ms queries, self-contained native executable.">
     <meta property="og:type" content="website">
     <meta property="og:url" content="https://deusdata.github.io/codebase-memory-mcp/">
     <meta property="og:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
@@ -24,7 +24,7 @@
     <!-- Twitter Card -->
     <meta name="twitter:card" content="summary_large_image">
     <meta name="twitter:title" content="codebase-memory-mcp — Code Intelligence for AI Coding Agents">
-    <meta name="twitter:description" content="Index any codebase into a knowledge graph. ~120x fewer tokens for AI code exploration. 158 languages, Hybrid LSP, sub-1ms queries, native executable with verified assets.">
+    <meta name="twitter:description" content="Index any codebase into a knowledge graph. ~120x fewer tokens for AI code exploration. 158 languages, Hybrid LSP, sub-1ms queries, self-contained native executable.">
     <meta name="twitter:image" content="https://deusdata.github.io/codebase-memory-mcp/graph-ui-screenshot.png">
 
     <link rel="canonical" href="https://deusdata.github.io/codebase-memory-mcp/">
@@ -41,7 +41,7 @@
       "applicationSubCategory": "Model Context Protocol (MCP) server",
       "operatingSystem": "macOS, Linux, Windows",
       "softwareVersion": "0.8.1",
-      "description": "An open-source MCP server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links, so AI coding agents answer structural questions with roughly 120x fewer tokens than file-by-file search. Parses 158 languages via tree-sitter with Hybrid LSP semantic type resolution for 9 language families. Ships as a native executable with authenticated release-owned assets; the native install needs no language runtime.",
+      "description": "An open-source MCP server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links, so AI coding agents answer structural questions with roughly 120x fewer tokens than file-by-file search. Parses 158 languages via tree-sitter with Hybrid LSP semantic type resolution for 9 language families. Ships as one self-contained native executable per target; the native install needs no language runtime.",
       "url": "https://deusdata.github.io/codebase-memory-mcp/",
       "downloadUrl": "https://github.com/DeusData/codebase-memory-mcp/releases/latest",
       "codeRepository": "https://github.com/DeusData/codebase-memory-mcp",
@@ -56,7 +56,7 @@
       "featureList": [
         "Indexes 158 programming languages via vendored tree-sitter grammars",
         "Hybrid LSP semantic type resolution for Python, TypeScript/JavaScript, PHP, C#, Go, C/C++, Java, Kotlin, and Rust",
-        "15 MCP tools for structural search, call-path tracing, targeted coverage checks, and Cypher graph queries",
+        "Streamlined MCP tools plus 15 classic tools for structural search, call-path tracing, and Cypher graph queries",
         "Semantic vector code search via bundled nomic-embed-code embeddings (no API key, fully local)",
         "Semantic graph edges (SEMANTICALLY_RELATED) and near-clone detection (SIMILAR_TO, MinHash + LSH)",
         "Cross-service linking for HTTP, gRPC, GraphQL, tRPC, and pub/sub channels with confidence scoring",
@@ -67,7 +67,7 @@
         "Dead-code detection with entry-point filtering",
         "Infrastructure-as-code indexing for Dockerfiles, Kubernetes, and Kustomize",
         "Built-in 3D graph visualization UI",
-        "Auto-sync background watcher for incremental re-indexing",
+        "Auto-sync background watcher with configurable reindex policy",
         "One command configures 43 automatic/conditional client surfaces"
       ],
       "author": {
@@ -125,7 +125,7 @@
           "name": "What is codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as a native executable with authenticated release-owned assets; the native install needs no language runtime."
+            "text": "codebase-memory-mcp is an open-source Model Context Protocol (MCP) server that indexes a codebase into a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. AI coding agents query that graph instead of reading files one by one, answering structural questions with roughly 120x fewer tokens. It parses 158 languages and ships as one self-contained native executable per target; the native install needs no language runtime."
           }
         },
         {
@@ -157,7 +157,7 @@
           "name": "Which AI coding agents work with codebase-memory-mcp?",
           "acceptedAnswer": {
             "@type": "Answer",
-            "text": "A single install command configures 43 automatic/conditional client surfaces. The 37 detected surfaces are Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi. Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody are conditional or explicit integrations. Qodo, Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI, Plandex, and SWE-agent require manual, UI, cloud, or repository-managed setup and are not counted among the 43."
+            "text": "A single install command configures 43 automatic/conditional client surfaces. The 37 detected surfaces are Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi. Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE, and Sourcegraph Cody are conditional or explicit integrations."
           }
         },
         {
@@ -444,7 +444,7 @@
             The fastest, most efficient code intelligence engine for AI coding agents. It indexes any
             repository into a persistent knowledge graph — full-indexing an average repo in seconds and the
             Linux kernel in 3 minutes — so your agent answers structural questions with ~120x fewer tokens.
-            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, native executable with verified assets.
+            Tree-sitter parsing across 158 languages, Hybrid LSP type resolution, and one self-contained native executable per target.
         </p>
         <div>
             <div class="stat"><div class="number">~120x</div><div class="label">fewer tokens</div></div>
@@ -461,7 +461,7 @@
     <div class="screenshot">
         <img src="graph-ui-screenshot.png" width="1538" height="932" loading="lazy" decoding="async"
              alt="3D knowledge-graph visualization of the codebase-memory-mcp graph showing thousands of nodes and edges">
-        <p class="caption">Built-in 3D graph visualization (UI variant) — explore your knowledge graph at <code>localhost:9749</code>.</p>
+        <p class="caption">Built-in 3D graph visualization — explore your knowledge graph at <code>localhost:9749</code>.</p>
     </div>
 
     <aside class="research" aria-label="Research">
@@ -483,7 +483,7 @@
             Protocol (MCP)</a> server that indexes a codebase into a persistent knowledge graph of functions,
             classes, call chains, HTTP routes, and cross-service links. Instead of reading files one at a time,
             an AI coding agent queries the graph — answering structural questions with roughly 120x fewer
-            tokens. It parses 158 languages and ships as a native executable with authenticated release-owned assets;
+            tokens. It parses 158 languages and ships as one self-contained native executable per target;
             the native install needs no language runtime.
         </p>
         <p class="muted">
@@ -516,60 +516,22 @@
     <section id="install">
         <h2>How do I install codebase-memory-mcp?</h2>
         <p class="lead">
-            Install with a single command, then tell your agent to index the project. The native runtime set contains
-            an executable with verified assets for macOS, Linux, and Windows — no Docker, language runtime, or API key.
+            Install with a single command, then tell your agent to index the project. Each macOS, Linux, and Windows
+            target is one verified self-contained executable — no Docker, language runtime, or API key.
         </p>
         <div class="install-block">
-            <span class="comment"># 1. One-line install (macOS / Linux). Add --ui for the 3D graph UI.</span><br>
+            <span class="comment"># 1. One-line install (macOS / Linux). The graph UI is embedded.</span><br>
             <span class="cmd">curl -fsSL https://raw.githubusercontent.com/DeusData/codebase-memory-mcp/main/install.sh | bash</span><br><br>
             <span class="comment"># 2. The installer configures detected clients; explicit flags cover conditional clients.</span><br><br>
             <span class="comment"># 3. Restart your agent, then say:</span><br>
             <span class="cmd">"Index this project"</span>
         </div>
         <p class="muted">
-            One command configures 43 automatic/conditional client surfaces. <strong>Detected automatically (37):</strong>
-            Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor,
-            Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code,
-            GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI,
-            GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE,
-            CodeBuddy Code CLI, IBM Bob Shell, Pochi, and Pi.
-        </p>
-        <p class="muted">
-            <strong>Conditional or explicit (6):</strong> Continue / cn, Visual Studio, TRAE, Roo Code, IBM Bob IDE,
-            and Sourcegraph Cody. <strong>Manual, UI, cloud, or repository-managed (not counted):</strong> Qodo,
-            Warp MCP, JetBrains AI/ACP, GitHub Copilot coding agent, Jules, CodeRabbit, Replit, BLACKBOX AI,
-            Plandex, and SWE-agent. Warp is counted above for its detected skill installation; its MCP connection
-            remains manual. Windows users run <code>install.ps1</code>. Also available via <code>npm</code>,
-            <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
-        </p>
-        <p class="muted">
-            Lifecycle installation follows documented context contracts: Qoder uses <code>SessionStart</code>,
-            <code>SubagentStart</code>, and post-<code>Read</code> coverage, including its documented Windows
-            PowerShell executor. Kimi uses <code>UserPromptSubmit</code>;
-            on macOS/Linux, GitLab Duo gets a fail-open user <code>SessionStart</code>, while Devin gets
-            <code>UserPromptSubmit</code>, <code>PostCompaction</code>, and a deduplicated <code>SessionStart</code>
-            when Claude does not already provide it. GitLab Duo, Devin, and Factory hooks are withheld on
-            Windows where no deterministic shell/executor contract is documented. Cline's auto-activating file hooks
-            are withheld because their context output is not reliably consumed; CodeBuddy's beta hooks are not
-            auto-installed; Junie's EAP
-            <code>SessionStart</code> output is documented as ignored; and Cursor context hooks are withheld because
-            the documented events cannot safely provide race-free MCP context to read-only subagents.
-        </p>
-        <p class="muted">
-            Documented custom-agent formats receive three exact-owned evidence tiers: Scout for narrow provisional
-            discovery, Verify as the task-directed default, and Auditor for bounded, paginated, current-generation
-            verification. Every direct tier calls <code>check_index_coverage</code> for cited paths and relevant scopes,
-            then reads flagged ranges or skipped files directly. Kiro and Junie use positive-allowlist
-            <code>--tool-profile scout</code> and <code>--tool-profile analysis</code> server surfaces;
-            Junie selects dedicated named aliases because its subagent schema filters by server.
-            Qoder combines named-server selection with exact tier-specific MCP tool IDs. Factory uses
-            exact registered tool IDs without its additive whole-server <code>mcpServers</code> field.
-            A foreign Junie alias is preserved and causes the installed profiles to fail closed to parent handoff.
-            Cursor, Rovo, Augment, Pochi, and Cline use explicit
-            parent handoff where direct child MCP is unavailable or unsafe; Pochi is limited to <code>readFile</code>.
-            Neither IBM Bob surface receives an invented hook or custom agent. Amazon Q Developer
-            IDE defaults to <code>~/.aws/amazonq/default.json</code> while preserving either existing documented
-            alternative.
+            One command configures 43 automatic/conditional client surfaces. Detected clients receive only
+            their documented MCP, instruction, skill, agent, and fail-open context-hook surfaces; conditional
+            clients are written only when their platform, marker, or explicit existing config proves activation.
+            Windows users run <code>install.ps1</code>. Also available via
+            <code>npm</code>, <code>pip</code>, Homebrew, Scoop, Winget, Chocolatey, AUR, and <code>go install</code>.
         </p>
     </section>
 
@@ -708,7 +670,7 @@
             </div>
             <div class="feature">
                 <h3>Pure C, no language runtime</h3>
-                <p>A native executable with authenticated release-owned assets for macOS, Linux, and Windows. The native install needs no Docker, language runtime, or API keys; fully static Linux builds are available in the <code>-portable</code> archives.</p>
+                <p>One self-contained native executable per macOS, Linux, and Windows target, with the graph UI and integration templates embedded. The native install needs no Docker, language runtime, or API keys; fully static Linux builds are available in the <code>-portable</code> archives.</p>
             </div>
             <div class="feature">
                 <h3>Call-graph tracing</h3>
@@ -728,19 +690,19 @@
             </div>
             <div class="feature">
                 <h3>Auto-sync</h3>
-                <p>A background watcher detects changes and re-indexes incrementally. No manual reindex after editing files.</p>
+                <p>A background watcher detects git changes and re-indexes when configured. The reindex policy controls whether refreshes use full or incremental indexing.</p>
             </div>
             <div class="feature">
                 <h3>Team-shared graph artifact</h3>
-                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates bootstrap from it and skip the full reindex.</p>
+                <p>Commit one zstd-compressed snapshot (<code>.codebase-memory/graph.db.zst</code>); teammates can bootstrap from it before any configured refresh.</p>
             </div>
             <div class="feature">
                 <h3>3D graph visualization</h3>
-                <p>The optional UI variant adds one verified, content-addressed frontend pack and serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
+                <p>The executable embeds the frontend and serves an interactive 3D graph at <code>localhost:9749</code> to explore nodes, edges, and clusters visually.</p>
             </div>
             <div class="feature">
-                <h3>15 MCP tools</h3>
-                <p><code>search_graph</code>, <code>trace_path</code>, <code>detect_changes</code>, <code>query_graph</code> (Cypher), <code>get_architecture</code>, <code>get_code_snippet</code>, <code>check_index_coverage</code>, <code>manage_adr</code>, and 7 more.</p>
+                <h3>Streamlined + classic MCP tools</h3>
+                <p>Default tools include <code>search_graph</code>, <code>trace_path</code>, <code>query_graph</code>, <code>search_code</code>, and <code>get_code</code>. Classic mode exposes 15 individual tools including <code>index_repository</code>, <code>get_architecture</code>, <code>get_code_snippet</code>, and <code>manage_adr</code>.</p>
             </div>
             <div class="feature">
                 <h3>Cypher graph queries</h3>
@@ -809,9 +771,9 @@
            installations naturally use their package runtime.</p>
 
         <h3>How does it stay up to date as I edit code?</h3>
-        <p>A background watcher detects file changes and re-indexes incrementally — typically a sub-millisecond
-           no-op when nothing changed. You only run a manual index for the first build or after a large
-           <code>git pull</code>.</p>
+        <p>A background watcher detects git changes and can re-index automatically when configured.
+           The default refresh path favors correctness with a full atomic rebuild; incremental reindexing
+           remains an explicit policy setting.</p>
 
         <h3>Why is there no built-in LLM?</h3>
         <p>Other code-graph tools embed an LLM to translate natural language into graph queries, which means

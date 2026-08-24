@@ -103,6 +103,30 @@ TEST(agent_profiles_direct_dialects_are_coverage_aware_and_read_only) {
     PASS();
 }
 
+TEST(agent_profiles_codex_embeds_valid_mcp_transport_and_server_profile) {
+    char *profile = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_SCOUT,
+                                             CBM_GRAPH_ACCESS_DIRECT, "/opt/codebase memory/cbm");
+    ASSERT_NOT_NULL(profile);
+    ASSERT_NOT_NULL(strstr(profile, "[mcp_servers.codebase-memory-mcp]\n"));
+    ASSERT_NOT_NULL(strstr(profile, "command = \"/opt/codebase memory/cbm\"\n"));
+    ASSERT_NOT_NULL(strstr(profile, "args = [\"--tool-profile\", \"scout\"]\n"));
+    ASSERT_NOT_NULL(strstr(profile, "enabled_tools = ["));
+    ASSERT_NULL(strstr(profile, "transport ="));
+    free(profile);
+
+    char *legacy = cbm_render_legacy_codex_graph_profile(CBM_GRAPH_TIER_SCOUT);
+    ASSERT_NOT_NULL(legacy);
+    ASSERT_NOT_NULL(strstr(legacy, "[mcp_servers.codebase-memory-mcp]\n"));
+    ASSERT_NOT_NULL(strstr(legacy, "enabled_tools = ["));
+    ASSERT_NULL(strstr(legacy, "command ="));
+    ASSERT_NULL(strstr(legacy, "args ="));
+    free(legacy);
+
+    ASSERT_NULL(cbm_render_graph_profile(CBM_GRAPH_DIALECT_CODEX, CBM_GRAPH_TIER_SCOUT,
+                                         CBM_GRAPH_ACCESS_DIRECT, NULL));
+    PASS();
+}
+
 TEST(agent_profiles_tiers_encode_distinct_evidence_budgets) {
     char *scout = cbm_render_graph_profile(CBM_GRAPH_DIALECT_CLAUDE, CBM_GRAPH_TIER_SCOUT,
                                            CBM_GRAPH_ACCESS_DIRECT, NULL);
@@ -237,10 +261,10 @@ TEST(agent_profiles_codex_declares_transport_and_escapes_binary_path) {
     ASSERT_NOT_NULL(verify);
     int valid = strstr(scout, "[mcp_servers.codebase-memory-mcp]\n"
                               "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp.exe\"\n"
-                              "args = [\"--tool-profile=scout\"]\n"
+                              "args = [\"--tool-profile\", \"scout\"]\n"
                               "enabled_tools = [") != NULL &&
                 strstr(verify, "command = \"C:\\\\cbm bin\\\\codebase-memory-mcp.exe\"\n"
-                               "args = [\"--tool-profile=analysis\"]\n") != NULL;
+                               "args = [\"--tool-profile\", \"analysis\"]\n") != NULL;
     free(scout);
     free(verify);
     ASSERT_TRUE(valid);
@@ -305,6 +329,7 @@ TEST(agent_profiles_render_deterministically_and_reject_invalid_inputs) {
 SUITE(agent_profiles) {
     RUN_TEST(agent_profiles_stable_tier_identity);
     RUN_TEST(agent_profiles_direct_dialects_are_coverage_aware_and_read_only);
+    RUN_TEST(agent_profiles_codex_embeds_valid_mcp_transport_and_server_profile);
     RUN_TEST(agent_profiles_tiers_encode_distinct_evidence_budgets);
     RUN_TEST(agent_profiles_handoff_requires_parent_evidence_without_child_mcp);
     RUN_TEST(agent_profiles_handoff_only_dialects_fail_closed_for_direct_access);

@@ -21,11 +21,27 @@
  *   TestIsTestFilePath
  */
 #include "test_framework.h"
+#include <foundation/constants.h>
 #include <store/store.h>
+#include <pagerank/pagerank.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <time.h>
+
+enum {
+    TEST_ARCH_PATH_BUF = 512,
+    TEST_ARCH_LONG_PATH_BUF = 1024,
+    TEST_ARCH_NO_COMMUNITY = -1,
+    TEST_ARCH_FALLBACK_DISTINCT_PACKAGES = 64,
+    TEST_ARCH_FALLBACK_WINNER_NODES = 20,
+    TEST_ARCH_FALLBACK_NAME_BUF = 64,
+    TEST_ARCH_FILE_TREE_DISTINCT_DIRS = 70,
+    TEST_ARCH_FILE_TREE_LONG_COMPONENT = 600,
+    TEST_ARCH_CLUSTER_BUDGET_NODES = CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET + 1,
+    TEST_ARCH_CLUSTER_DISTRACTOR_CONTEXTS = 5,
+    TEST_ARCH_CLUSTER_WINNER_MEMBERS = 10
+};
 
 /* ── Helper: create architecture test store ──────────────────────── */
 
@@ -143,7 +159,7 @@ static cbm_store_t *setup_arch_test_store(void) {
 TEST(arch_get_all) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, NULL, 0, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, 0, &info, 0, 1.0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.language_count > 0);
     ASSERT_TRUE(info.package_count > 0);
@@ -157,51 +173,58 @@ TEST(arch_get_all) {
     PASS();
 }
 
+TEST(arch_package_fallback_ranks_all_qualified_names_before_preview) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "package-fallback", "/tmp/package-fallback"),
+              CBM_STORE_OK);
+
+    /* Fill the former fixed working set with singleton packages first. */
+    for (int i = 0; i < TEST_ARCH_FALLBACK_DISTINCT_PACKAGES; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_FALLBACK_NAME_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "singleton%03d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "package-fallback.root.pkg%03d.%s", i, name) > 0);
+        cbm_node_t node = {
+            .project = "package-fallback", .label = "Function", .name = name, .qualified_name = qn};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+    }
+
+    /* A later package must still win the exact count-based ranking. */
+    for (int i = 0; i < TEST_ARCH_FALLBACK_WINNER_NODES; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_FALLBACK_NAME_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "winner%03d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "package-fallback.root.winner.%s", name) > 0);
+        cbm_node_t node = {
+            .project = "package-fallback", .label = "Function", .name = name, .qualified_name = qn};
+        ASSERT_TRUE(cbm_store_upsert_node(s, &node) > 0);
+    }
+
+    const char *aspects[] = {"packages"};
+    cbm_architecture_info_t info = {0};
+    ASSERT_EQ(cbm_store_get_architecture(s, "package-fallback", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+    ASSERT_TRUE(info.package_count > 0);
+    ASSERT_STR_EQ(info.packages[0].name, "winner");
+    ASSERT_EQ(info.packages[0].node_count, TEST_ARCH_FALLBACK_WINNER_NODES);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_entry_points_exclude_tests) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"entry_points"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     for (int i = 0; i < info.entry_point_count; i++) {
         ASSERT_TRUE(strstr(info.entry_points[i].file, "test") == NULL);
     }
     ASSERT_EQ(info.entry_point_count, 2); /* main, HandleRequest */
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-TEST(arch_hotspots_exclude_tests) {
-    cbm_store_t *s = setup_arch_test_store();
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
-
-    for (int i = 0; i < info.hotspot_count; i++) {
-        ASSERT_TRUE(strstr(info.hotspots[i].name, "Test") == NULL);
-    }
-
-    cbm_store_architecture_free(&info);
-    cbm_store_close(s);
-    PASS();
-}
-
-TEST(arch_specific_aspects) {
-    cbm_store_t *s = setup_arch_test_store();
-    cbm_architecture_info_t info;
-    const char *aspects[] = {"languages", "hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 2, &info), CBM_STORE_OK);
-
-    ASSERT_TRUE(info.language_count > 0);
-    ASSERT_TRUE(info.hotspot_count > 0);
-    /* Not requested: should be zero */
-    ASSERT_EQ(info.package_count, 0);
-    ASSERT_EQ(info.entry_point_count, 0);
-    ASSERT_EQ(info.route_count, 0);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
@@ -240,13 +263,13 @@ TEST(arch_path_scoping) {
     cbm_store_upsert_node(s, &fn_other);
 
     const char *aspects[] = {"languages", "packages"};
-    cbm_architecture_info_t whole;
-    memset(&whole, 0, sizeof(whole));
-    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", NULL, aspects, 2, &whole), CBM_STORE_OK);
+    cbm_architecture_info_t whole = {0};
+    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", aspects, 2, &whole, 0, 1.0),
+              CBM_STORE_OK);
 
-    cbm_architecture_info_t scoped;
-    memset(&scoped, 0, sizeof(scoped));
-    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo", aspects, 2, &scoped),
+    cbm_architecture_info_t scoped = {0};
+    ASSERT_EQ(cbm_store_get_architecture_scoped(s, "pscope", "apps/foo", aspects, 2, &scoped,
+                                                0, 1.0),
               CBM_STORE_OK);
 
     int whole_go = 0;
@@ -274,12 +297,15 @@ TEST(arch_path_scoping) {
     }
     ASSERT_TRUE(whole_pkg_nodes > scoped_pkg_nodes);
     ASSERT_EQ(scoped_pkg_nodes, 1);
+    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") >
+                cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
+    char norm_path[TEST_ARCH_PATH_BUF];
+    ASSERT_TRUE(cbm_store_normalize_arch_path(".\\apps\\foo\\", norm_path, sizeof(norm_path)));
+    ASSERT_STR_EQ(norm_path, "apps/foo");
 
-    ASSERT_TRUE(cbm_store_count_nodes(s, "pscope") > cbm_store_count_nodes_scoped(s, "pscope", "apps/foo"));
-
-    cbm_architecture_info_t scoped_slash;
-    memset(&scoped_slash, 0, sizeof(scoped_slash));
-    ASSERT_EQ(cbm_store_get_architecture(s, "pscope", "apps/foo/", aspects, 2, &scoped_slash),
+    cbm_architecture_info_t scoped_slash = {0};
+    ASSERT_EQ(cbm_store_get_architecture_scoped(s, "pscope", "apps/foo/", aspects, 2,
+                                                &scoped_slash, 0, 1.0),
               CBM_STORE_OK);
     int slash_go = 0;
     for (int i = 0; i < scoped_slash.language_count; i++) {
@@ -296,6 +322,40 @@ TEST(arch_path_scoping) {
     PASS();
 }
 
+TEST(arch_hotspots_exclude_tests) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"hotspots"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    for (int i = 0; i < info.hotspot_count; i++) {
+        ASSERT_TRUE(strstr(info.hotspots[i].name, "Test") == NULL);
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_specific_aspects) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_architecture_info_t info;
+    const char *aspects[] = {"languages", "hotspots"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 2, &info, 0, 1.0), CBM_STORE_OK);
+
+    ASSERT_TRUE(info.language_count > 0);
+    ASSERT_TRUE(info.hotspot_count > 0);
+    /* Not requested: should be zero */
+    ASSERT_EQ(info.package_count, 0);
+    ASSERT_EQ(info.entry_point_count, 0);
+    ASSERT_EQ(info.route_count, 0);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(arch_empty_project) {
     cbm_store_t *s = cbm_store_open_memory();
     ASSERT_NOT_NULL(s);
@@ -303,7 +363,7 @@ TEST(arch_empty_project) {
 
     cbm_architecture_info_t info;
     const char *aspects[] = {"all"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "empty", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "empty", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
     /* All should be empty but no errors */
 
     cbm_store_architecture_free(&info);
@@ -316,7 +376,7 @@ TEST(arch_languages) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"languages"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     /* Check Go=3, Python=1, JavaScript=1 */
     int go_count = 0, py_count = 0, js_count = 0;
@@ -337,20 +397,158 @@ TEST(arch_languages) {
     PASS();
 }
 
-TEST(arch_routes) {
-    cbm_store_t *s = setup_arch_test_store();
-    cbm_architecture_info_t info;
-    memset(&info, 0, sizeof(info));
-    const char *aspects[] = {"routes"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+TEST(arch_file_summaries_use_overlay_active_tombstones) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "overlay-files", "/tmp/overlay-files"), CBM_STORE_OK);
 
-    ASSERT_EQ(info.route_count, 1);
-    ASSERT_STR_EQ(info.routes[0].method, "POST");
-    ASSERT_STR_EQ(info.routes[0].path, "/api/orders");
-    ASSERT_STR_EQ(info.routes[0].handler, "HandleRequest");
+    cbm_node_t stale_file = {.project = "overlay-files",
+                             .label = "File",
+                             .name = "stale.py",
+                             .qualified_name = "overlay-files.src.stale",
+                             .file_path = "src/stale.py",
+                             .properties_json = "{}"};
+    cbm_node_t live_file = {.project = "overlay-files",
+                            .label = "File",
+                            .name = "live.go",
+                            .qualified_name = "overlay-files.src.live",
+                            .file_path = "src/live.go",
+                            .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &stale_file), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &live_file), 0);
+
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_store_reserve_overlay_generation(s, "overlay-files", 1, &overlay_generation),
+              CBM_STORE_OK);
+    cbm_store_file_delta_t delete_delta = {.project = "overlay-files",
+                                           .rel_path = "src/stale.py",
+                                           .generation = 1};
+    ASSERT_EQ(cbm_store_publish_overlay_file_delta(s, &delete_delta, overlay_generation),
+              CBM_STORE_OK);
+
+    const char *aspects[] = {"languages", "file_tree"};
+    cbm_architecture_info_t info = {0};
+    ASSERT_EQ(cbm_store_get_architecture_scoped(s, "overlay-files", "src", aspects, 2, &info, 0,
+                                                1.0),
+              CBM_STORE_OK);
+
+    int go_count = 0;
+    int py_count = 0;
+    for (int i = 0; i < info.language_count; i++) {
+        if (strcmp(info.languages[i].language, "Go") == 0) {
+            go_count = info.languages[i].file_count;
+        }
+        if (strcmp(info.languages[i].language, "Python") == 0) {
+            py_count = info.languages[i].file_count;
+        }
+    }
+    ASSERT_EQ(go_count, 1);
+    ASSERT_EQ(py_count, 0);
+
+    bool saw_live = false;
+    bool saw_stale = false;
+    for (int i = 0; i < info.file_tree_count; i++) {
+        if (strcmp(info.file_tree[i].path, "src/live.go") == 0) {
+            saw_live = true;
+        }
+        if (strcmp(info.file_tree[i].path, "src/stale.py") == 0) {
+            saw_stale = true;
+        }
+    }
+    ASSERT_TRUE(saw_live);
+    ASSERT_TRUE(!saw_stale);
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_routes) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_node_t infra_url = {
+        .project = "test",
+        .label = "Route",
+        .name = "https://example.com/api/orders",
+        .qualified_name = "__route__infra__https://example.com/api/orders",
+        .properties_json = "{\"source\":\"infra\",\"key_path\":\"ServiceUrl\"}"};
+    cbm_store_upsert_node(s, &infra_url);
+    cbm_node_t code_url = {
+        .project = "test",
+        .label = "Route",
+        .name = "https://api.example.com/v1/orders",
+        .qualified_name = "__route__GET__https://api.example.com/v1/orders",
+        .properties_json =
+            "{\"method\":\"GET\",\"path\":\"https://api.example.com/v1/orders\"}"};
+    cbm_store_upsert_node(s, &code_url);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"routes"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    ASSERT_EQ(info.route_count, 2);
+    bool saw_app_route = false;
+    bool saw_code_url = false;
+    for (int i = 0; i < info.route_count; i++) {
+        if (strcmp(info.routes[i].path, "/api/orders") == 0) {
+            saw_app_route = true;
+            ASSERT_STR_EQ(info.routes[i].method, "POST");
+            ASSERT_STR_EQ(info.routes[i].handler, "HandleRequest");
+        }
+        if (strcmp(info.routes[i].path, "https://api.example.com/v1/orders") == 0) {
+            saw_code_url = true;
+            ASSERT_STR_EQ(info.routes[i].method, "GET");
+        }
+        ASSERT_STR_NEQ(info.routes[i].path, "https://example.com/api/orders");
+    }
+    ASSERT_TRUE(saw_app_route);
+    ASSERT_TRUE(saw_code_url);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_routes_selects_result_limit_after_filtering) {
+    enum { REJECTED_ROUTE_PREFIX_COUNT = 256 };
+    cbm_store_t *s = setup_arch_test_store();
+
+    for (int i = 0; i < REJECTED_ROUTE_PREFIX_COUNT; i++) {
+        char name[TEST_ARCH_PATH_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        snprintf(name, sizeof(name), "https://infra-%03d.example.invalid/service", i);
+        snprintf(qn, sizeof(qn), "__route__infra__%s", name);
+        cbm_node_t infra_route = {.project = "test",
+                                  .label = "Route",
+                                  .name = name,
+                                  .qualified_name = qn,
+                                  .properties_json = "{\"source\":\"infra\"}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &infra_route), 0);
+    }
+
+    cbm_node_t late_route = {.project = "test",
+                             .label = "Route",
+                             .name = "/late-route",
+                             .qualified_name = "__route__GET__/late-route",
+                             .properties_json = "{\"method\":\"GET\",\"path\":\"/late-route\"}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &late_route), 0);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"routes"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    bool saw_late_route = false;
+    for (int i = 0; i < info.route_count; i++) {
+        if (strcmp(info.routes[i].path, "/late-route") == 0) {
+            saw_late_route = true;
+            break;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_TRUE(saw_late_route);
     PASS();
 }
 
@@ -359,7 +557,7 @@ TEST(arch_hotspots) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"hotspots"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.hotspot_count > 0);
     /* ProcessOrder should be a hotspot (called by HandleRequest) */
@@ -383,7 +581,7 @@ TEST(arch_boundaries) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"boundaries"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.boundary_count > 0);
     /* server → handler and handler → service should be present */
@@ -401,6 +599,73 @@ TEST(arch_boundaries) {
 
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
+    PASS();
+}
+
+/* SQL/dbt relations are architecture nodes only when their lineage edges are
+ * analyzed too; admitting Table/View/Model while scanning CALLS alone produces
+ * isolated nodes and silently drops the intended package coupling. */
+TEST(arch_relation_lineage_contributes_boundaries_and_clusters) {
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    const char *project = "relation-architecture";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/relation-architecture"),
+              CBM_STORE_OK);
+
+    cbm_node_t table = {.project = project,
+                        .label = "Table",
+                        .name = "users",
+                        .qualified_name = "relation-architecture.raw.users",
+                        .file_path = "raw/schema.sql"};
+    cbm_node_t view = {.project = project,
+                       .label = "View",
+                       .name = "active_users",
+                       .qualified_name = "relation-architecture.marts.active_users",
+                       .file_path = "marts/views.sql"};
+    cbm_node_t model = {.project = project,
+                        .label = "Model",
+                        .name = "user_report",
+                        .qualified_name = "relation-architecture.analytics.user_report",
+                        .file_path = "analytics/user_report.sql"};
+    int64_t table_id = cbm_store_upsert_node(store, &table);
+    int64_t view_id = cbm_store_upsert_node(store, &view);
+    int64_t model_id = cbm_store_upsert_node(store, &model);
+    ASSERT_GT(table_id, 0);
+    ASSERT_GT(view_id, 0);
+    ASSERT_GT(model_id, 0);
+    cbm_edge_t view_table = {
+        .project = project, .source_id = view_id, .target_id = table_id, .type = "USAGE"};
+    cbm_edge_t model_view = {
+        .project = project, .source_id = model_id, .target_id = view_id, .type = "USAGE"};
+    ASSERT_GT(cbm_store_insert_edge(store, &view_table), 0);
+    ASSERT_GT(cbm_store_insert_edge(store, &model_view), 0);
+
+    const char *aspects[] = {"boundaries", "clusters"};
+    cbm_architecture_info_t info = {0};
+    ASSERT_EQ(cbm_store_get_architecture(store, project, aspects, 2, &info, 0, 1.0),
+              CBM_STORE_OK);
+    bool saw_marts_raw = false;
+    bool saw_analytics_marts = false;
+    for (int i = 0; i < info.boundary_count; i++) {
+        saw_marts_raw |= strcmp(info.boundaries[i].from, "marts") == 0 &&
+                         strcmp(info.boundaries[i].to, "raw") == 0;
+        saw_analytics_marts |= strcmp(info.boundaries[i].from, "analytics") == 0 &&
+                               strcmp(info.boundaries[i].to, "marts") == 0;
+    }
+    ASSERT_TRUE(saw_marts_raw);
+    ASSERT_TRUE(saw_analytics_marts);
+    ASSERT_EQ(info.cluster_nodes_total, 3);
+    ASSERT_TRUE(info.cluster_count > 0);
+    bool cluster_reports_usage = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        for (int j = 0; j < info.clusters[i].edge_type_count; j++) {
+            cluster_reports_usage |= strcmp(info.clusters[i].edge_types[j], "USAGE") == 0;
+        }
+    }
+    ASSERT_TRUE(cluster_reports_usage);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(store);
     PASS();
 }
 
@@ -449,7 +714,7 @@ static double timed_boundaries_ms(int n_nodes, int n_edges, int n_pkgs) {
     const char *aspects[] = {"boundaries"};
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
-    int rc = cbm_store_get_architecture(s, "perf", NULL, aspects, 1, &info);
+    int rc = cbm_store_get_architecture(s, "perf", aspects, 1, &info, 0, 1.0);
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms =
         (double)(t1.tv_sec - t0.tv_sec) * 1000.0 + (double)(t1.tv_nsec - t0.tv_nsec) / 1000000.0;
@@ -497,7 +762,7 @@ TEST(arch_layers) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"layers"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.layer_count > 0);
     /* Handler package has routes, should be "api" */
@@ -512,12 +777,194 @@ TEST(arch_layers) {
     PASS();
 }
 
+TEST(arch_layers_filter_infra_routes_and_use_route_file_package) {
+    cbm_store_t *s = setup_arch_test_store();
+    cbm_node_t modern_route = {
+        .project = "test",
+        .label = "Route",
+        .name = "/api/status",
+        .qualified_name = "__route__ANY__/api/status",
+        .file_path = "graph-ui/src/components/StatsTab.tsx",
+        .properties_json = "{\"method\":\"ANY\",\"path\":\"/api/status\"}"};
+    cbm_store_upsert_node(s, &modern_route);
+    cbm_node_t infra_url = {
+        .project = "test",
+        .label = "Route",
+        .name = "https://github.com/DeusData/codebase-memory-mcp/issues",
+        .qualified_name = "__route__infra__https://github.com/DeusData/codebase-memory-mcp/issues",
+        .file_path = "pkg/winget/manifest.yaml",
+        .properties_json = "{\"source\":\"infra\",\"key_path\":\"PackageUrl\"}"};
+    cbm_store_upsert_node(s, &infra_url);
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    bool saw_components_api = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        ASSERT_STR_NEQ(info.layers[i].name, "");
+        ASSERT_STR_NEQ(info.layers[i].name, "com/DeusData");
+        ASSERT_STR_NEQ(info.layers[i].name, "com/DeusData/codebase-memory-mcp/issues");
+        if (strcmp(info.layers[i].name, "components") == 0) {
+            saw_components_api = true;
+            ASSERT_STR_EQ(info.layers[i].layer, "api");
+            ASSERT_STR_EQ(info.layers[i].reason, "has HTTP route definitions");
+        }
+    }
+    ASSERT_TRUE(saw_components_api);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_layers_collects_route_and_entry_packages_beyond_32) {
+    enum { LAYER_MARKED_PACKAGE_COUNT = 40 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "layer-marked", "/tmp/layer-marked"), CBM_STORE_OK);
+
+    for (int i = 0; i < LAYER_MARKED_PACKAGE_COUNT; i++) {
+        char route_name[TEST_ARCH_PATH_BUF];
+        char route_qn[TEST_ARCH_PATH_BUF];
+        char route_file[TEST_ARCH_PATH_BUF];
+        snprintf(route_name, sizeof(route_name), "/route-%03d", i);
+        snprintf(route_qn, sizeof(route_qn), "__route__GET__%s", route_name);
+        snprintf(route_file, sizeof(route_file), "pkg%03d/routes.c", i);
+        cbm_node_t route = {.project = "layer-marked",
+                            .label = "Route",
+                            .name = route_name,
+                            .qualified_name = route_qn,
+                            .file_path = route_file,
+                            .properties_json = "{\"method\":\"GET\"}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &route), 0);
+
+        char entry_name[TEST_ARCH_PATH_BUF];
+        char entry_qn[TEST_ARCH_PATH_BUF];
+        snprintf(entry_name, sizeof(entry_name), "entry%03d", i);
+        snprintf(entry_qn, sizeof(entry_qn), "layer-marked.pkg%03d.%s", i, entry_name);
+        cbm_node_t entry = {.project = "layer-marked",
+                            .label = "Function",
+                            .name = entry_name,
+                            .qualified_name = entry_qn,
+                            .file_path = route_file,
+                            .properties_json = "{\"is_entry_point\":true}"};
+        ASSERT_GT(cbm_store_upsert_node(s, &entry), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "layer-marked", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_late_api_package = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        if (strcmp(info.layers[i].name, "pkg039") == 0) {
+            saw_late_api_package = strcmp(info.layers[i].layer, "api") == 0;
+            break;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_TRUE(saw_late_api_package);
+    PASS();
+}
+
+TEST(arch_layers_collects_boundary_packages_beyond_64) {
+    enum { LAYER_BOUNDARY_TARGET_COUNT = 70 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "layer-boundaries", "/tmp/layer-boundaries"),
+              CBM_STORE_OK);
+
+    cbm_node_t hub = {.project = "layer-boundaries",
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "layer-boundaries.hub.call",
+                      .file_path = "hub/call.c"};
+    int64_t hub_id = cbm_store_upsert_node(s, &hub);
+    ASSERT_GT(hub_id, 0);
+
+    int64_t last_target_id = 0;
+    for (int i = 0; i < LAYER_BOUNDARY_TARGET_COUNT; i++) {
+        char name[TEST_ARCH_PATH_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        char file_path[TEST_ARCH_PATH_BUF];
+        snprintf(name, sizeof(name), "target%03d", i);
+        snprintf(qn, sizeof(qn), "layer-boundaries.pkg%03d.%s", i, name);
+        snprintf(file_path, sizeof(file_path), "pkg%03d/target.c", i);
+        cbm_node_t target = {.project = "layer-boundaries",
+                             .label = "Function",
+                             .name = name,
+                             .qualified_name = qn,
+                             .file_path = file_path};
+        int64_t target_id = cbm_store_upsert_node(s, &target);
+        ASSERT_GT(target_id, 0);
+        last_target_id = target_id;
+        cbm_edge_t edge = {.project = "layer-boundaries",
+                           .source_id = hub_id,
+                           .target_id = target_id,
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    for (int i = 0; i < 4; i++) {
+        char name[TEST_ARCH_PATH_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        snprintf(name, sizeof(name), "extra_hub%03d", i);
+        snprintf(qn, sizeof(qn), "layer-boundaries.hub.%s", name);
+        cbm_node_t extra_hub = {.project = "layer-boundaries",
+                                .label = "Function",
+                                .name = name,
+                                .qualified_name = qn,
+                                .file_path = "hub/call.c"};
+        int64_t extra_hub_id = cbm_store_upsert_node(s, &extra_hub);
+        ASSERT_GT(extra_hub_id, 0);
+        cbm_edge_t edge = {.project = "layer-boundaries",
+                           .source_id = extra_hub_id,
+                           .target_id = last_target_id,
+                           .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &edge), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"boundaries", "layers"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "layer-boundaries", aspects, 2, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    int layer_count = info.layer_count;
+    bool saw_last_package = false;
+    bool saw_high_count_boundary = false;
+    for (int i = 0; i < info.layer_count; i++) {
+        if (strcmp(info.layers[i].name, "pkg069") == 0) {
+            saw_last_package = true;
+            break;
+        }
+    }
+    for (int i = 0; i < info.boundary_count; i++) {
+        if (strcmp(info.boundaries[i].from, "hub") == 0 &&
+            strcmp(info.boundaries[i].to, "pkg069") == 0 && info.boundaries[i].call_count == 5) {
+            saw_high_count_boundary = true;
+            break;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_EQ(layer_count, LAYER_BOUNDARY_TARGET_COUNT + 1);
+    ASSERT_TRUE(saw_last_package);
+    ASSERT_TRUE(saw_high_count_boundary);
+    PASS();
+}
+
 TEST(arch_file_tree) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"file_tree"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     ASSERT_TRUE(info.file_tree_count > 0);
     /* Check that entries have valid types */
@@ -531,12 +978,102 @@ TEST(arch_file_tree) {
     PASS();
 }
 
+TEST(arch_file_tree_keeps_directories_beyond_former_working_set) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "file-tree-scale", "/tmp/file-tree-scale"), CBM_STORE_OK);
+
+    for (int i = 0; i < TEST_ARCH_FILE_TREE_DISTINCT_DIRS; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        char file_path[TEST_ARCH_PATH_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "file%03d.c", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "file-tree-scale.root%03d.file", i) > 0);
+        ASSERT_TRUE(snprintf(file_path, sizeof(file_path), "root%03d/%s", i, name) > 0);
+        cbm_node_t file = {.project = "file-tree-scale",
+                           .label = "File",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = file_path};
+        ASSERT_GT(cbm_store_upsert_node(s, &file), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"file_tree"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "file-tree-scale", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_last_dir = false;
+    bool saw_last_file = false;
+    for (int i = 0; i < info.file_tree_count; i++) {
+        if (strcmp(info.file_tree[i].path, "root069") == 0 &&
+            strcmp(info.file_tree[i].type, "dir") == 0 && info.file_tree[i].children == 1) {
+            saw_last_dir = true;
+        }
+        if (strcmp(info.file_tree[i].path, "root069/file069.c") == 0 &&
+            strcmp(info.file_tree[i].type, "file") == 0) {
+            saw_last_file = true;
+        }
+    }
+
+    int file_tree_count = info.file_tree_count;
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_EQ(file_tree_count, TEST_ARCH_FILE_TREE_DISTINCT_DIRS * 2);
+    ASSERT_TRUE(saw_last_dir);
+    ASSERT_TRUE(saw_last_file);
+    PASS();
+}
+
+TEST(arch_file_tree_keeps_paths_longer_than_split_scratch_buffer) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "file-tree-long-path", "/tmp/file-tree-long-path"),
+              CBM_STORE_OK);
+
+    char component[TEST_ARCH_FILE_TREE_LONG_COMPONENT + 1];
+    memset(component, 'a', TEST_ARCH_FILE_TREE_LONG_COMPONENT);
+    component[TEST_ARCH_FILE_TREE_LONG_COMPONENT] = '\0';
+    char file_path[TEST_ARCH_LONG_PATH_BUF];
+    ASSERT_TRUE(snprintf(file_path, sizeof(file_path), "%s/file.c", component) > 0);
+    cbm_node_t file = {.project = "file-tree-long-path",
+                       .label = "File",
+                       .name = "file.c",
+                       .qualified_name = "file-tree-long-path.long.file",
+                       .file_path = file_path};
+    ASSERT_GT(cbm_store_upsert_node(s, &file), 0);
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"file_tree"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "file-tree-long-path", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_exact_dir = false;
+    bool saw_exact_file = false;
+    for (int i = 0; i < info.file_tree_count; i++) {
+        if (strcmp(info.file_tree[i].path, component) == 0 &&
+            strcmp(info.file_tree[i].type, "dir") == 0 && info.file_tree[i].children == 1) {
+            saw_exact_dir = true;
+        }
+        if (strcmp(info.file_tree[i].path, file_path) == 0 &&
+            strcmp(info.file_tree[i].type, "file") == 0) {
+            saw_exact_file = true;
+        }
+    }
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    ASSERT_TRUE(saw_exact_dir);
+    ASSERT_TRUE(saw_exact_file);
+    PASS();
+}
+
 TEST(arch_clusters) {
     cbm_store_t *s = setup_arch_test_store();
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
 
     /* With 5 functions and 4 edges, Louvain should find at least 1 cluster */
     if (info.cluster_count == 0) {
@@ -552,6 +1089,190 @@ TEST(arch_clusters) {
         ASSERT_TRUE(info.clusters[i].label[0] != '\0');
     }
 
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_clusters_reports_budget_exhaustion_without_prefix_results) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "cluster-budget", "/tmp/cluster-budget"), CBM_STORE_OK);
+
+    for (int i = 0; i < TEST_ARCH_CLUSTER_BUDGET_NODES; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        ASSERT_TRUE(snprintf(name, sizeof(name), "function%04d", i) > 0);
+        ASSERT_TRUE(snprintf(qn, sizeof(qn), "cluster-budget.pkg.%s", name) > 0);
+        cbm_node_t node = {.project = "cluster-budget",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "cluster.c"};
+        ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    }
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "cluster-budget", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+    ASSERT_TRUE(info.clusters_omitted_for_budget);
+    ASSERT_EQ(info.cluster_nodes_total, TEST_ARCH_CLUSTER_BUDGET_NODES);
+    ASSERT_EQ(info.cluster_node_budget, CBM_DEFAULT_ARCH_CLUSTER_NODE_BUDGET);
+    ASSERT_EQ(info.cluster_count, 0);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_clusters_selects_dominant_context_and_package_after_first_five) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "cluster-ranking", "/tmp/cluster-ranking"), CBM_STORE_OK);
+
+    int total_nodes = TEST_ARCH_CLUSTER_DISTRACTOR_CONTEXTS + TEST_ARCH_CLUSTER_WINNER_MEMBERS;
+    int64_t *ids = calloc((size_t)total_nodes, sizeof(*ids));
+    ASSERT_NOT_NULL(ids);
+    for (int i = 0; i < total_nodes; i++) {
+        char name[TEST_ARCH_FALLBACK_NAME_BUF];
+        char qn[TEST_ARCH_PATH_BUF];
+        bool winner = i >= TEST_ARCH_CLUSTER_DISTRACTOR_CONTEXTS;
+        if (i == 0) {
+            ASSERT_TRUE(snprintf(name, sizeof(name), "get") > 0);
+        } else {
+            ASSERT_TRUE(snprintf(name, sizeof(name), "member%02d", i) > 0);
+        }
+        if (winner) {
+            ASSERT_TRUE(snprintf(qn, sizeof(qn), "cluster-ranking.winner.context.%s", name) > 0);
+        } else {
+            ASSERT_TRUE(
+                snprintf(qn, sizeof(qn), "cluster-ranking.distractor%d.context.%s", i, name) > 0);
+        }
+        cbm_node_t node = {.project = "cluster-ranking",
+                           .label = "Function",
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = "cluster.c"};
+        ids[i] = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    for (int i = 1; i < total_nodes; i++) {
+        cbm_edge_t outward = {.project = "cluster-ranking",
+                              .source_id = ids[0],
+                              .target_id = ids[i],
+                              .type = "CALLS"};
+        cbm_edge_t inward = {.project = "cluster-ranking",
+                             .source_id = ids[i],
+                             .target_id = ids[0],
+                             .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &outward), 0);
+        ASSERT_GT(cbm_store_insert_edge(s, &inward), 0);
+    }
+    free(ids);
+
+    cbm_architecture_info_t info = {0};
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "cluster-ranking", aspects, 1, &info, 0, 1.0),
+              CBM_STORE_OK);
+
+    bool saw_winner_package = false;
+    bool saw_winner_context = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        const cbm_cluster_info_t *cluster = &info.clusters[i];
+        for (int j = 0; j < cluster->package_count; j++) {
+            if (strcmp(cluster->packages[j], "winner") == 0) {
+                saw_winner_package = true;
+            }
+        }
+        if (cluster->label && strstr(cluster->label, "@winner.context")) {
+            saw_winner_context = true;
+        }
+    }
+    ASSERT_TRUE(saw_winner_package);
+    ASSERT_TRUE(saw_winner_context);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #41: Leiden resolution (gamma) is now a config-tunable param on
+ * cbm_store_get_architecture (default 1.0). Verify the knob is threaded:
+ * non-default resolutions are accepted, succeed, and yield valid cluster
+ * output. (The small 5-node setup is too coarse to assert a cluster-count
+ * difference reliably; this is a contract test that the param flows through to
+ * cbm_leiden without error and that NaN/non-positive clamps to the default.) */
+TEST(arch_clusters_resolution_knob) {
+    cbm_store_t *s = setup_arch_test_store();
+    const char *aspects[] = {"clusters"};
+    double resolutions[] = {0.5, 1.0, 2.0, 10.0};
+    for (size_t i = 0; i < sizeof(resolutions) / sizeof(resolutions[0]); i++) {
+        cbm_architecture_info_t info;
+        memset(&info, 0, sizeof(info));
+        ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0,
+                                             resolutions[i]),
+                  CBM_STORE_OK);
+        ASSERT_TRUE(info.cluster_count >= 0);
+        cbm_store_architecture_free(&info);
+    }
+    /* NaN must clamp to the default (1.0), not corrupt — same hardening as the
+     * PageRank NaN fix (#44). */
+    cbm_architecture_info_t nan_info;
+    memset(&nan_info, 0, sizeof(nan_info));
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &nan_info, 0,
+                                         (double)(0.0 / 0.0)),
+              CBM_STORE_OK);
+    cbm_store_architecture_free(&nan_info);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* #36: graph analytics (PageRank + architecture) are LANGUAGE-AGNOSTIC — they
+ * operate on the graph, not source. Contract: a graph built from multiple
+ * "languages" (file extensions) yields non-trivial PageRank ranks AND a
+ * successful architecture computation, confirming the analytics chain works
+ * across the polyglot case (not just single-language). Complements the
+ * language-agnostic pagerank/arch unit tests + the per-language LSP tests. */
+TEST(analytics_work_across_languages) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_EQ(cbm_store_upsert_project(s, "poly", "/tmp/poly"), CBM_STORE_OK);
+    /* Nodes from 3 different "languages" (file extensions). */
+    const char *exts[] = {"py", "ts", "go"};
+    int64_t ids[6];
+    int k = 0;
+    for (int e = 0; e < 3; e++) {
+        for (int i = 0; i < 2; i++) {
+            char name[64], qn[96], fp[96];
+            snprintf(name, sizeof(name), "fn_%s_%d", exts[e], i);
+            snprintf(qn, sizeof(qn), "poly.%s", name);
+            snprintf(fp, sizeof(fp), "src/mod.%s", exts[e]);
+            cbm_node_t n = {.project = "poly", .label = "Function", .name = name,
+                            .qualified_name = qn, .file_path = fp};
+            ids[k] = cbm_store_upsert_node(s, &n);
+            ASSERT_GT(ids[k], 0);
+            k++;
+        }
+    }
+    /* Cross-language call edges so PageRank has structure. */
+    for (int i = 0; i < 5; i++) {
+        cbm_edge_t ed = {.project = "poly", .source_id = ids[i], .target_id = ids[i + 1],
+                         .type = "CALLS"};
+        ASSERT_GT(cbm_store_insert_edge(s, &ed), 0);
+    }
+
+    /* PageRank must rank nodes (>0 rows) regardless of source language. */
+    ASSERT_EQ(cbm_pagerank_compute_default(s, "poly"), 6);
+
+    /* Architecture must succeed on the polyglot node set (language metadata is
+     * populated at real-index time, so we don't assert language_count here —
+     * the contract is that the analytics CHAIN runs across a multi-"language"
+     * graph, not the language detector). */
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"languages", "entry_points"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "poly", aspects, 2, &info, 0, 1.0),
+              CBM_STORE_OK);
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
     PASS();
@@ -972,6 +1693,44 @@ TEST(louvain_single_node) {
     PASS();
 }
 
+TEST(louvain_normalizes_duplicate_unsorted_edges) {
+    int64_t nodes[] = {30, 10, 40, 20};
+    cbm_louvain_edge_t edges[] = {
+        {10, 20}, {20, 10}, {10, 20}, {20, 10}, {10, 20},
+        {30, 40}, {40, 30}, {30, 40}, {40, 30}, {30, 40},
+        {20, 30}, {10, 10}, {10, 999},
+    };
+    cbm_louvain_result_t *result = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_louvain(nodes, 4, edges, (int)(sizeof(edges) / sizeof(edges[0])), &result,
+                          &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 4);
+
+    int c10 = TEST_ARCH_NO_COMMUNITY;
+    int c20 = TEST_ARCH_NO_COMMUNITY;
+    int c30 = TEST_ARCH_NO_COMMUNITY;
+    int c40 = TEST_ARCH_NO_COMMUNITY;
+    for (int i = 0; i < count; i++) {
+        if (result[i].node_id == 10) {
+            c10 = result[i].community;
+        } else if (result[i].node_id == 20) {
+            c20 = result[i].community;
+        } else if (result[i].node_id == 30) {
+            c30 = result[i].community;
+        } else if (result[i].node_id == 40) {
+            c40 = result[i].community;
+        }
+    }
+    ASSERT_EQ(c10, c20);
+    ASSERT_EQ(c30, c40);
+    ASSERT_TRUE(c10 != TEST_ARCH_NO_COMMUNITY);
+    ASSERT_TRUE(c30 != TEST_ARCH_NO_COMMUNITY);
+
+    free(result);
+    PASS();
+}
+
 TEST(louvain_converges) {
     /* Two fully connected clusters of 10 nodes each, bridged by one edge */
     int64_t nodes[20];
@@ -1240,7 +1999,7 @@ TEST(arch_clusters_basic) {
     cbm_architecture_info_t info;
     memset(&info, 0, sizeof(info));
     const char *aspects[] = {"clusters"};
-    ASSERT_EQ(cbm_store_get_architecture(s, "test", NULL, aspects, 1, &info), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
     ASSERT_TRUE(info.cluster_count >= 2); /* two dense communities */
     for (int i = 0; i < info.cluster_count; i++) {
         ASSERT_TRUE(info.clusters[i].members >= 2);
@@ -1249,6 +2008,189 @@ TEST(arch_clusters_basic) {
         ASSERT_EQ(info.clusters[i].edge_type_count, 1);
         ASSERT_TRUE(info.clusters[i].top_node_count > 0);
     }
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_cluster_generic_labels_include_package_context) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    const char *names[] = {"get", "load", "save", "list"};
+    int64_t id[8];
+    for (int g = 0; g < 2; g++) {
+        for (int i = 0; i < 4; i++) {
+            char qn[96];
+            snprintf(qn, sizeof(qn), "test.pkg%d.mod.%s%d", g, names[i], g);
+            cbm_node_t node = {.project = "test",
+                               .label = "Function",
+                               .name = names[i],
+                               .qualified_name = qn,
+                               .file_path = "f.go"};
+            id[(g * 4) + i] = cbm_store_upsert_node(s, &node);
+        }
+    }
+
+    /* Two get-centered stars. `get` is intentionally generic and appears in
+     * both clusters, so package context is needed to keep labels distinct. */
+    for (int g = 0; g < 2; g++) {
+        int base = g * 4;
+        for (int i = 1; i < 4; i++) {
+            cbm_edge_t e1 = {.project = "test",
+                             .source_id = id[base],
+                             .target_id = id[base + i],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e1);
+            cbm_edge_t e2 = {.project = "test",
+                             .source_id = id[base + i],
+                             .target_id = id[base],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e2);
+        }
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    bool pkg0 = false;
+    bool pkg1 = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        if (info.clusters[i].label && strstr(info.clusters[i].label, "get/") == info.clusters[i].label) {
+            if (strstr(info.clusters[i].label, "@pkg0")) {
+                pkg0 = true;
+            }
+            if (strstr(info.clusters[i].label, "@pkg1")) {
+                pkg1 = true;
+            }
+        }
+    }
+    ASSERT_TRUE(pkg0);
+    ASSERT_TRUE(pkg1);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_cluster_generic_labels_include_namespace_context) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    const char *names[] = {"get", "load", "save", "list"};
+    const char *contexts[] = {"orders", "billing"};
+    int64_t id[8];
+    for (int g = 0; g < 2; g++) {
+        for (int i = 0; i < 4; i++) {
+            char qn[128];
+            int n = snprintf(qn, sizeof(qn), "test.app.%s.%s%d", contexts[g], names[i], g);
+            ASSERT_TRUE(n > 0 && (size_t)n < sizeof(qn));
+            cbm_node_t node = {.project = "test",
+                               .label = "Function",
+                               .name = names[i],
+                               .qualified_name = qn,
+                               .file_path = "f.go"};
+            id[(g * 4) + i] = cbm_store_upsert_node(s, &node);
+        }
+    }
+
+    for (int g = 0; g < 2; g++) {
+        int base = g * 4;
+        for (int i = 1; i < 4; i++) {
+            cbm_edge_t e1 = {.project = "test",
+                             .source_id = id[base],
+                             .target_id = id[base + i],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e1);
+            cbm_edge_t e2 = {.project = "test",
+                             .source_id = id[base + i],
+                             .target_id = id[base],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e2);
+        }
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    bool orders = false;
+    bool billing = false;
+    for (int i = 0; i < info.cluster_count; i++) {
+        if (info.clusters[i].label &&
+            strstr(info.clusters[i].label, "get/") == info.clusters[i].label) {
+            if (strstr(info.clusters[i].label, "@app.orders")) {
+                orders = true;
+            }
+            if (strstr(info.clusters[i].label, "@app.billing")) {
+                billing = true;
+            }
+        }
+    }
+    ASSERT_TRUE(orders);
+    ASSERT_TRUE(billing);
+
+    cbm_store_architecture_free(&info);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(arch_cluster_duplicate_nongeneric_labels_are_disambiguated) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    int64_t id[8];
+    for (int g = 0; g < 2; g++) {
+        for (int i = 0; i < 4; i++) {
+            char qn[128];
+            int n = snprintf(qn, sizeof(qn), "test.pkg%d.installer.download%d", g, i);
+            ASSERT_TRUE(n > 0 && (size_t)n < sizeof(qn));
+            cbm_node_t node = {.project = "test",
+                               .label = "Function",
+                               .name = "download",
+                               .qualified_name = qn,
+                               .file_path = "install.go"};
+            id[(g * 4) + i] = cbm_store_upsert_node(s, &node);
+        }
+    }
+
+    for (int g = 0; g < 2; g++) {
+        int base = g * 4;
+        for (int i = 1; i < 4; i++) {
+            cbm_edge_t e1 = {.project = "test",
+                             .source_id = id[base],
+                             .target_id = id[base + i],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e1);
+            cbm_edge_t e2 = {.project = "test",
+                             .source_id = id[base + i],
+                             .target_id = id[base],
+                             .type = "CALLS"};
+            cbm_store_insert_edge(s, &e2);
+        }
+    }
+
+    cbm_architecture_info_t info;
+    memset(&info, 0, sizeof(info));
+    const char *aspects[] = {"clusters"};
+    ASSERT_EQ(cbm_store_get_architecture(s, "test", aspects, 1, &info, 0, 1.0), CBM_STORE_OK);
+
+    const char *download_labels[2] = {NULL, NULL};
+    int seen = 0;
+    for (int i = 0; i < info.cluster_count && seen < 2; i++) {
+        const char *label = info.clusters[i].label;
+        if (label && strstr(label, "download") == label) {
+            download_labels[seen++] = label;
+        }
+    }
+    ASSERT_EQ(seen, 2);
+    ASSERT_TRUE(strcmp(download_labels[0], download_labels[1]) != 0);
+    ASSERT_TRUE(strcmp(download_labels[0], "download") != 0);
+    ASSERT_TRUE(strcmp(download_labels[1], "download") != 0);
+
     cbm_store_architecture_free(&info);
     cbm_store_close(s);
     PASS();
@@ -1410,19 +2352,33 @@ TEST(search_case_sensitive_explicit) {
 SUITE(store_arch) {
     /* Architecture */
     RUN_TEST(arch_get_all);
+    RUN_TEST(arch_package_fallback_ranks_all_qualified_names_before_preview);
     RUN_TEST(arch_entry_points_exclude_tests);
+    RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_hotspots_exclude_tests);
     RUN_TEST(arch_specific_aspects);
     RUN_TEST(arch_path_scoping);
     RUN_TEST(arch_empty_project);
     RUN_TEST(arch_languages);
+    RUN_TEST(arch_file_summaries_use_overlay_active_tombstones);
     RUN_TEST(arch_routes);
+    RUN_TEST(arch_routes_selects_result_limit_after_filtering);
     RUN_TEST(arch_hotspots);
     RUN_TEST(arch_boundaries);
+    RUN_TEST(arch_relation_lineage_contributes_boundaries_and_clusters);
     RUN_TEST(arch_boundaries_no_quadratic_scan);
     RUN_TEST(arch_layers);
+    RUN_TEST(arch_layers_filter_infra_routes_and_use_route_file_package);
+    RUN_TEST(arch_layers_collects_route_and_entry_packages_beyond_32);
+    RUN_TEST(arch_layers_collects_boundary_packages_beyond_64);
     RUN_TEST(arch_file_tree);
+    RUN_TEST(arch_file_tree_keeps_directories_beyond_former_working_set);
+    RUN_TEST(arch_file_tree_keeps_paths_longer_than_split_scratch_buffer);
     RUN_TEST(arch_clusters);
+    RUN_TEST(arch_clusters_reports_budget_exhaustion_without_prefix_results);
+    RUN_TEST(arch_clusters_selects_dominant_context_and_package_after_first_five);
+    RUN_TEST(arch_clusters_resolution_knob);
+    RUN_TEST(analytics_work_across_languages);
 
     /* ADR */
     RUN_TEST(adr_store_and_retrieve);
@@ -1455,10 +2411,14 @@ SUITE(store_arch) {
     RUN_TEST(louvain_basic);
     RUN_TEST(louvain_empty);
     RUN_TEST(louvain_single_node);
+    RUN_TEST(louvain_normalizes_duplicate_unsorted_edges);
     RUN_TEST(louvain_converges);
     RUN_TEST(leiden_multilevel_collapses_noise);
     RUN_TEST(leiden_resolution_controls_granularity);
     RUN_TEST(arch_clusters_basic);
+    RUN_TEST(arch_cluster_generic_labels_include_package_context);
+    RUN_TEST(arch_cluster_generic_labels_include_namespace_context);
+    RUN_TEST(arch_cluster_duplicate_nongeneric_labels_are_disambiguated);
 
     /* Helpers */
     RUN_TEST(qn_to_package);

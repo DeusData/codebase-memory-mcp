@@ -28,6 +28,7 @@
 #endif
 /* pipeline.h no longer needed — indexing runs as subprocess */
 #include "foundation/log.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
@@ -35,8 +36,9 @@
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 #include "foundation/compat_thread.h"
-#include "foundation/subprocess.h" /* cbm_build_win_cmdline — shared MS-CRT arg quoting */
-#include "foundation/win_utf8.h"   /* cbm_utf8_to_wide — CreateProcessW wide cmdline (#423/#20) */
+#include "foundation/win_utf8.h" /* cbm_utf8_to_wide, cbm_wide_to_utf8 — Windows path resolution */
+#include "foundation/subprocess.h" /* supervised spawn and Windows command-line quoting */
+#include "mcp/index_supervisor.h"  /* cbm_index_worker_quiet_timeout_ms — shared knob */
 #include "foundation/workspace.h"
 
 #include <sqlite3/sqlite3.h>
@@ -68,6 +70,17 @@
 
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
+
+/* Poll interval for child-indexer log tailing in the UI background job. */
+#define UI_INDEX_LOG_POLL_MS 500L
+#define UI_INDEX_LOG_POLL_NS (UI_INDEX_LOG_POLL_MS * (long)CBM_NSEC_PER_MSEC)
+
+static const char UI_PROJECT_HEALTH_DIRTY_WARNING[] =
+    "project-health counts canonical graph rows; dirty file changes may be absent until "
+    "overlay or reindex completes.";
+static const char UI_LAYOUT_DIRTY_WARNING[] =
+    "layout reads canonical graph rows; dirty file changes may be absent until overlay "
+    "or reindex completes.";
 
 /* ── CORS: only allow localhost origins (blocks remote website attacks) ────── */
 
@@ -147,6 +160,13 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
                     lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
+/* Capacity for a cbm_json_escape() destination, derived from the SOURCE buffer so
+ * it tracks that buffer's declaration instead of restating a size. Escaping " \ \n
+ * \r \t doubles at worst; control characters expand further and cbm_json_escape
+ * then truncates, always NUL-terminated (src/foundation/str_util.h). Pass the field
+ * itself, not a pointer: sizeof(char *) would silently size to 8 or 16. */
+#define JSON_ESC_CAP(src_field) (sizeof(src_field) * 2)
+
 /* ── Server state ─────────────────────────────────────────────── */
 
 #define MAX_INDEX_JOBS 4
@@ -221,6 +241,9 @@ static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
 
 /* Build DB path for a project: <cache_dir>/<project>.db */
 static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) {
+        return;
+    }
     if (!cbm_validate_project_name(project)) {
         buf[0] = '\0';
         return;
@@ -229,7 +252,10 @@ static void db_path_for_project(const char *project, char *buf, size_t bufsz) {
     if (!dir) {
         dir = cbm_tmpdir();
     }
-    snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    int n = snprintf(buf, bufsz, "%s/%s.db", dir, project);
+    if (n <= 0 || (size_t)n >= bufsz) {
+        buf[0] = '\0';
+    }
 }
 
 /* ── Git remote → GitHub deep-link base (/api/repo-info) ───────── */
@@ -339,7 +365,7 @@ static void handle_repo_info(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    char db_path[1024];
+    char db_path[CBM_PATH_MAX];
     db_path_for_project(project, db_path, sizeof(db_path));
     if (db_path[0] == '\0' || !cbm_file_exists(db_path)) {
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
@@ -628,7 +654,7 @@ static void handle_processes(cbm_http_conn_t *c) {
                     }
 
                     if (proc_count > 0)
-                        buf[pos++] = ',';
+                        http_appendf(buf, sizeof(buf), &pos, ",");
                     http_appendf(buf, sizeof(buf), &pos,
                                  "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
                                  "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
@@ -642,9 +668,6 @@ static void handle_processes(cbm_http_conn_t *c) {
                                  elapsed_sec % 60,
                                  pe.th32ProcessID == (DWORD)_getpid()
                                      ? "true" : "false");
-                    if (pos >= (int)sizeof(buf)) {
-                        pos = (int)sizeof(buf) - 1;
-                    }
                     proc_count++;
                     CloseHandle(hProc);
                 }
@@ -683,15 +706,12 @@ static void handle_processes(cbm_http_conn_t *c) {
 
             if (sscanf(line, "%d %f %ld %63s %255s", &pid, &cpu, &rss, elapsed, comm) >= 4) {
                 if (proc_count > 0)
-                    buf[pos++] = ',';
+                    http_appendf(buf, sizeof(buf), &pos, ",");
                 http_appendf(buf, sizeof(buf), &pos,
                              "{\"pid\":%d,\"cpu\":%.1f,\"rss_mb\":%.1f,"
                              "\"elapsed\":\"%s\",\"command\":\"%s\",\"is_self\":%s}",
                              pid, (double)cpu, (double)rss / 1024.0, elapsed, comm,
                              pid == (int)getpid() ? "true" : "false");
-                if (pos >= (int)sizeof(buf)) {
-                    pos = (int)sizeof(buf) - 1;
-                }
                 proc_count++;
             }
         }
@@ -699,6 +719,13 @@ static void handle_processes(cbm_http_conn_t *c) {
     }
     http_appendf(buf, sizeof(buf), &pos, "]}");
 #endif
+
+    if ((size_t)pos >= sizeof(buf)) {
+        cbm_log_warn("ui.processes.failed", "reason", "response_limit");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":\"process list exceeds response limit\"}");
+        return;
+    }
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -766,10 +793,15 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    /* Build JSON response */
+    /* Build JSON response. The caller-supplied path lands inside a JSON string, so
+     * it needs the same escaping this function already applies to d_name and parent
+     * below; a Windows path's backslashes alone would otherwise emit malformed JSON
+     * under a 200 status, which parses as a transport error rather than a bad path. */
     char buf[32768];
     int pos = 0;
-    http_appendf(buf, sizeof(buf), &pos, "{\"path\":\"%s\",\"dirs\":[", path);
+    char esc_path[JSON_ESC_CAP(path)];
+    cbm_json_escape(esc_path, (int)sizeof(esc_path), path);
+    http_appendf(buf, sizeof(buf), &pos, "{\"path\":\"%s\",\"dirs\":[", esc_path);
 
     struct dirent *ent;
     int count = 0;
@@ -785,15 +817,12 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             continue;
 
         if (count > 0)
-            buf[pos++] = ',';
+            http_appendf(buf, sizeof(buf), &pos, ",");
         /* Escape directory name to prevent XSS (e.g., names with quotes/angle brackets) */
         {
             char esc[512];
             cbm_json_escape(esc, (int)sizeof(esc), ent->d_name);
             http_appendf(buf, sizeof(buf), &pos, "\"%s\"", esc);
-        }
-        if (pos >= (int)sizeof(buf)) {
-            pos = (int)sizeof(buf) - 1;
         }
         count++;
 
@@ -825,6 +854,12 @@ static void handle_browse(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         http_appendf(buf, sizeof(buf), &pos, "],\"parent\":\"%s\"", esc_parent);
         append_roots_json(buf, sizeof(buf), &pos);
         http_appendf(buf, sizeof(buf), &pos, "}");
+    }
+    if ((size_t)pos >= sizeof(buf)) {
+        cbm_log_warn("ui.browse.failed", "reason", "response_limit");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":\"directory listing exceeds response limit\"}");
+        return;
     }
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
@@ -1131,14 +1166,17 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
      * over resolved paths, and a symlink would otherwise launder the verdict. */
     char canonical_root[4096];
     char boundary_err[1024];
+    char configured_allowed_root[CBM_PATH_MAX];
     if (!cbm_canonical_path(rpath, canonical_root, sizeof(canonical_root))) {
         yyjson_doc_free(doc);
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"cannot resolve root_path\"}");
         return;
     }
+    const char *allowed_root = cbm_safe_getenv("CBM_ALLOWED_ROOT", configured_allowed_root,
+                                               sizeof(configured_allowed_root), NULL);
     if (!cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
-                                    cbm_workspace_cache_dir(), getenv("CBM_ALLOWED_ROOT"),
-                                    boundary_err, sizeof(boundary_err))) {
+                                    cbm_workspace_cache_dir(), allowed_root, boundary_err,
+                                    sizeof(boundary_err))) {
         yyjson_doc_free(doc);
         char escaped[1024];
         cbm_json_escape(escaped, (int)sizeof(escaped), boundary_err);
@@ -1190,8 +1228,10 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
     }
     job->thread_started = true;
 
+    char esc_started_path[JSON_ESC_CAP(job->root_path)];
+    cbm_json_escape(esc_started_path, (int)sizeof(esc_started_path), job->root_path);
     cbm_http_replyf(c, 202, g_cors_json, "{\"status\":\"indexing\",\"slot\":%d,\"path\":\"%s\"}",
-                    slot, job->root_path);
+                    slot, esc_started_path);
 }
 
 /* GET /api/index-status — returns status of all index jobs */
@@ -1205,27 +1245,25 @@ static void handle_index_status(cbm_http_server_t *server, cbm_http_conn_t *c) {
         if (pos > 1)
             http_appendf(buf, sizeof(buf), &pos, ",");
         const char *ss = st == 1 ? "indexing" : st == 2 ? "done" : "error";
-        /* root_path comes from POST /api/index and is up to 1023 bytes, so four
-         * occupied slots exceed this buffer. http_appendf pins pos to
-         * sizeof(buf) on truncation, so the separator and the close have to go
-         * through it as well rather than indexing raw. Both fields are free-form,
-         * so escape them — a quote in a path would otherwise end its JSON string
-         * early. */
-        /* Escaping can double each byte: root_path is 1024, error_msg 256. */
-        char esc_path[2048];
-        char esc_error[512];
-        cbm_json_escape(esc_path, (int)sizeof(esc_path), server->index_jobs[i].root_path);
-        cbm_json_escape(esc_error, (int)sizeof(esc_error),
+        /* Both fields are free-form (a filesystem path and an error message) and are
+         * interpolated into JSON strings, so both must be escaped. Unescaped, a
+         * Windows path or an error message quoting a path breaks the response. */
+        char esc_job_path[JSON_ESC_CAP(server->index_jobs[i].root_path)];
+        char esc_job_error[JSON_ESC_CAP(server->index_jobs[i].error_msg)];
+        cbm_json_escape(esc_job_path, (int)sizeof(esc_job_path), server->index_jobs[i].root_path);
+        cbm_json_escape(esc_job_error, (int)sizeof(esc_job_error),
                         st == 3 ? server->index_jobs[i].error_msg : "");
         http_appendf(buf, sizeof(buf), &pos,
                      "{\"slot\":%d,\"status\":\"%s\",\"path\":\"%s\",\"error\":\"%s\"}", i, ss,
-                     esc_path, esc_error);
+                     esc_job_path, esc_job_error);
     }
     http_appendf(buf, sizeof(buf), &pos, "]");
     if ((size_t)pos >= sizeof(buf)) {
-        pos = (int)sizeof(buf) - 1;
+        cbm_log_warn("ui.index_status.failed", "reason", "response_limit");
+        cbm_http_replyf(c, 500, g_cors_json,
+                        "{\"error\":\"index status exceeds response limit\"}");
+        return;
     }
-    buf[pos] = '\0';
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
 }
 
@@ -1243,14 +1281,23 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
         cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing name\"}");
         return;
     }
-
-    char db_path[1024];
-    db_path_for_project(name, db_path, sizeof(db_path));
-    if (db_path[0] == '\0') {
+    if (!cbm_validate_project_name(name)) {
+        /* Treat unsafe/non-project identifiers as absent without touching a
+         * watcher entry. db_path_for_project() also rejects them, but its empty
+         * sentinel otherwise gets misreported as an internal path-length error. */
         cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
         return;
     }
 
+    char db_path[1024];
+    db_path_for_project(name, db_path, sizeof(db_path));
+    if (db_path[0] == '\0') {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"project path too long\"}");
+        return;
+    }
+
+    /* Path resolution is pure and its early return precedes the guard, so no
+     * failure path here leaves a mutation claim held. */
     if (srv->mutation_begin && !srv->mutation_begin(srv->mutation_context, name)) {
         cbm_http_replyf(c, 423, g_cors_json,
                         "{\"error\":\"project is busy; retry after indexing\"}");
@@ -1258,7 +1305,7 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
     }
     bool mutation_held = srv->mutation_begin != NULL;
 
-    if (unlink(db_path) != 0) {
+    if (cbm_unlink(db_path) != 0) {
         if (errno == ENOENT) {
             unwatch_project(srv, name);
             if (mutation_held) {
@@ -1274,12 +1321,7 @@ static void handle_delete_project(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
-    /* Also remove WAL and SHM files if they exist */
-    char wal_path[1040], shm_path[1040];
-    snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
-    snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
-    (void)unlink(wal_path);
-    (void)unlink(shm_path);
+    cbm_remove_db_sidecars(db_path);
 
     unwatch_project(srv, name);
     cbm_log_info("ui.project.deleted", "name", name);
@@ -1313,13 +1355,18 @@ static void handle_project_health(cbm_http_conn_t *c, const cbm_http_req_t *req)
 
     int node_count = cbm_store_count_nodes(store, name);
     int edge_count = cbm_store_count_edges(store, name);
-    cbm_store_close(store);
 
     int64_t size = cbm_file_size(db_path);
 
-    cbm_http_replyf(c, 200, g_cors_json,
-                    "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}",
-                    node_count, edge_count, (long long)size);
+    char base_json[256];
+    snprintf(base_json, sizeof(base_json),
+             "{\"status\":\"healthy\",\"nodes\":%d,\"edges\":%d,\"size_bytes\":%lld}", node_count,
+             edge_count, (long long)size);
+    char *fresh_json = cbm_mcp_add_dirty_file_freshness_to_json(base_json, store, name,
+                                                                UI_PROJECT_HEALTH_DIRTY_WARNING);
+    cbm_store_close(store);
+    cbm_http_replyf(c, 200, g_cors_json, "%s", fresh_json ? fresh_json : base_json);
+    free(fresh_json);
 }
 
 /* ── Handle GET /api/layout ───────────────────────────────────── */
@@ -1512,13 +1559,24 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
-    /* Fast path: no satellites to attach. The missed skeleton only decorates
-     * the CODE graph — a graph=missed request already IS the miss graph. */
+    /* A missed-graph request already is the miss graph; with no satellites,
+     * only freshness metadata remains to decorate before returning. */
     if (linked_count == 0 && missed_graph) {
+        char *fresh_json = cbm_mcp_add_dirty_file_freshness_to_json(primary_json, store, project,
+                                                                    UI_LAYOUT_DIRTY_WARNING);
         cbm_store_close(store);
-        cbm_http_replyf(c, 200, g_cors_json, "%s", primary_json);
+        cbm_http_replyf(c, 200, g_cors_json, "%s", fresh_json ? fresh_json : primary_json);
+        free(fresh_json);
         free(primary_json);
         return;
+    }
+
+    int dirty_pending = 0;
+    int dirty_overlay_ready = 0;
+    if (cbm_store_count_dirty_files(store, project, &dirty_pending, &dirty_overlay_ready) !=
+        CBM_STORE_OK) {
+        dirty_pending = 0;
+        dirty_overlay_ready = 0;
     }
 
     /* Parse primary JSON and append missed_graph + linked_projects */
@@ -1678,6 +1736,8 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     cbm_store_close(store);
     yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
+    cbm_mcp_add_dirty_file_freshness_counts(mdoc, mroot, dirty_pending, dirty_overlay_ready,
+                                            UI_LAYOUT_DIRTY_WARNING);
 
     size_t len = 0;
     char *final_json = yyjson_mut_write(mdoc, 0, &len);

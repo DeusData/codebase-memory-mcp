@@ -14,7 +14,7 @@ Usage: scripts/test.sh [--suites LIST] [--arch ARCH] [VAR=VAL ...]
 
 The canonical test entry: identical in local CI, PR CI, dry run and release.
 DEFAULT (no --suites) is exactly what CI runs: static contract checks
-(Step 0a-0t), a CLEAN sanitizer build, every suite via the parallel harness,
+(Step 0a-0w), a CLEAN sanitizer build, every suite via the parallel harness,
 then the prod-binary regression guards (Steps 4-6).
 
 Modes:
@@ -218,49 +218,55 @@ bash "$ROOT/tests/test_windows_bundle_contract.sh"
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
-echo "=== Step 0g: security fuzz harness self-test ==="
+echo "=== Step 0g: portable Makefile logged-command status ==="
+bash "$ROOT/tests/test_makefile_logged_command.sh"
+
+echo "=== Step 0h: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
-echo "=== Step 0h: smoke release-fixture contract ==="
+echo "=== Step 0i: smoke release-fixture contract ==="
 bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 
-echo "=== Step 0i: parallel suite scheduler contract ==="
+echo "=== Step 0j: parallel suite scheduler contract ==="
 bash "$ROOT/tests/test_parallel_harness_contract.sh"
 
-echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
+echo "=== Step 0k: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
 
-echo "=== Step 0k: spawn console-window contract (#1427) ==="
+echo "=== Step 0l: spawn console-window contract (#1427) ==="
 bash "$ROOT/tests/test_spawn_no_window_contract.sh"
 
-echo "=== Step 0l: release archive extractor contract ==="
+echo "=== Step 0m: complete vendored-integrity contract ==="
+bash "$ROOT/tests/test_vendored_integrity_contract.sh"
+
+echo "=== Step 0n: release archive extractor contract ==="
 bash "$ROOT/tests/test_release_archive_extractor_contract.sh"
 
-echo "=== Step 0m: VirusTotal release-notes + evidence contract ==="
+echo "=== Step 0o: VirusTotal release-notes + evidence contract ==="
 bash "$ROOT/tests/test_vt_release_notes_contract.sh"
 
-echo "=== Step 0n: VirusTotal gate policy contract ==="
+echo "=== Step 0p: VirusTotal gate policy contract ==="
 bash "$ROOT/tests/test_vt_gate_policy_contract.sh"
 
-echo "=== Step 0o: MCPB bundle contract (#1246) ==="
+echo "=== Step 0q: MCPB bundle contract (#1246) ==="
 bash "$ROOT/tests/test_mcpb_bundle_contract.sh"
 
-echo "=== Step 0p: MCPB registry entries contract (#1246) ==="
+echo "=== Step 0r: MCPB registry entries contract (#1246) ==="
 bash "$ROOT/tests/test_mcpb_registry_entries_contract.sh"
 
-echo "=== Step 0q: release candidate derivation contract ==="
+echo "=== Step 0s: release candidate derivation contract ==="
 bash "$ROOT/tests/test_release_candidate_derivation_contract.sh"
 
-echo "=== Step 0r: VirusTotal candidate-selection contract ==="
+echo "=== Step 0t: VirusTotal candidate-selection contract ==="
 bash "$ROOT/tests/test_vt_candidate_selection_contract.sh"
 
-echo "=== Step 0s: release gate-chain ordering contract ==="
+echo "=== Step 0u: release gate-chain ordering contract ==="
 bash "$ROOT/tests/test_release_gate_chain_contract.sh"
 
-echo "=== Step 0t: test runtime isolation contract (#1691) ==="
+echo "=== Step 0v: test runtime isolation contract (#1691) ==="
 bash "$ROOT/tests/test_runtime_isolation_contract.sh"
 
-echo "=== Step 0u: shell line-ending contract ==="
+echo "=== Step 0w: shell line-ending contract ==="
 bash "$ROOT/tests/test_shell_line_endings.sh"
 
 echo "=== Step 0v: nomic blob generator contract ==="
@@ -318,7 +324,12 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_watchdog.sh"
 echo "=== Step 5c: worker error-response transport regression ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.sh"
 
-# Step 5d (#1388) is DELIBERATELY NOT GATING HERE — see
+# Step 5d: failures before an MCP request exists still need a JSON-RPC error on
+# stdout, while hook-augment must remain fail-open and never emit MCP framing.
+echo "=== Step 5d: client startup failure protocol regression (#1582) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_client_startup_failure.sh"
+
+# Step 5e (#1388) is DELIBERATELY NOT GATING HERE — see
 # tests/test_hook_conflict_notice.sh for the full what-was-tried record.
 # Summary: the test forces a client/daemon build mismatch via the
 # CBM_TEST_HOOK_CLIENT_BUILD seam and asserts the stdout systemMessage. It is
@@ -330,6 +341,17 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 # admission path is understood, gating on it would make an unexplained red, and
 # skipping it silently would hide the gap. Run it by hand:
 #   make -f Makefile.cbm cbm TEST_SEAMS=1 && bash tests/test_hook_conflict_notice.sh
+
+# Step 5f: `daemon start --open` is the only UI startup operation that waits
+# synchronously. Build the embedded UI with test seams and prove that readiness
+# is generation-bound, rejects a foreign occupied port, and is identical for a
+# newly started or already-active daemon.
+echo "=== Step 5f: embedded daemon UI --open readiness ==="
+UI_OPEN_BUILD_DIR="${BUILD_DIR}-ui-open"
+make -j"$NPROC" -f Makefile.cbm cbm-with-ui TEST_SEAMS=1 BUILD_DIR="$UI_OPEN_BUILD_DIR" \
+    ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
+python3 "$ROOT/tests/test_daemon_open_readiness.py" \
+    "$ROOT/$UI_OPEN_BUILD_DIR/codebase-memory-mcp"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

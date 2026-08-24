@@ -40,10 +40,9 @@ typedef struct {
     bool has_wildcard;   /* true when the alias pattern contained '*'      */
 } cbm_path_alias_t;
 
-/* Alias map for a single config source (one tsconfig.json, one webpack
- * alias block, ...). Entries are sorted by alias_prefix length descending
- * so longer (more specific) prefixes are matched first, matching the
- * resolution semantics of every build tool we know of. */
+/* Alias map for a single config source. Entries are sorted by alias-prefix
+ * length descending so the longest prefix before a wildcard is considered
+ * first, matching TypeScript paths resolution precedence. */
 typedef struct {
     cbm_path_alias_t *entries;
     int count;
@@ -92,5 +91,19 @@ const cbm_path_alias_map_t *cbm_path_alias_find_for_file(const cbm_path_alias_co
  * .jsx) are stripped from the resolved path so the existing module-FQN
  * pipeline can consume it. */
 char *cbm_path_alias_resolve(const cbm_path_alias_map_t *map, const char *module_path);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef enum {
+    CBM_PATH_ALIAS_TEST_ALLOC_NONE = 0,
+    CBM_PATH_ALIAS_TEST_ALLOC_CONFIG_HIT,
+    CBM_PATH_ALIAS_TEST_ALLOC_SCOPE_PREFIX,
+} cbm_path_alias_test_alloc_site_t;
+
+/* Fail one loader allocation at `site` after `successful_before` successful
+ * allocations at that site. The calling thread owns and consumes the seam; a
+ * negative count disables it. */
+void cbm_path_alias_test_fail_allocation(cbm_path_alias_test_alloc_site_t site,
+                                         int successful_before);
+#endif
 
 #endif /* CBM_PATH_ALIAS_H */

@@ -50,12 +50,16 @@ const char *cbm_graph_tier_display_name(cbm_graph_tier_t tier);
 bool cbm_graph_dialect_direct_capable(cbm_graph_profile_dialect_t dialect);
 
 /* Returns malloc-owned profile content, or NULL for invalid/unsafe combinations.
- * binary_path is required for direct Kiro and Codex profiles and ignored otherwise. */
+ * binary_path is required for direct Codex and Kiro profiles and ignored otherwise. */
 char *cbm_render_graph_profile(cbm_graph_profile_dialect_t dialect, cbm_graph_tier_t tier,
                                cbm_graph_access_t access, const char *binary_path);
 
+/* Exact transport-less Codex document emitted before direct role files became
+ * self-contained. This is only an ownership identity for upgrade/uninstall. */
+char *cbm_render_legacy_codex_graph_profile(cbm_graph_tier_t tier);
+
 /* v0.9.1-rc.1 direct Codex rendering (server table without a transport), kept
- * so install/uninstall can recognize and migrate those files. */
+ * as an API alias for callers using the release-specific name. */
 char *cbm_render_graph_profile_codex_rc1(cbm_graph_tier_t tier);
 
 /* Vibe stores the behavioral prompt separately from its TOML agent definition.

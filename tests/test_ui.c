@@ -259,6 +259,33 @@ TEST(config_missing_fields) {
     PASS();
 }
 
+TEST(config_cli_values_fail_closed) {
+    bool enabled = false;
+    int port = 0;
+    ASSERT_TRUE(cbm_ui_parse_enabled("true", &enabled));
+    ASSERT_TRUE(enabled);
+    ASSERT_TRUE(cbm_ui_parse_enabled("false", &enabled));
+    ASSERT_FALSE(enabled);
+    enabled = true;
+    ASSERT_FALSE(cbm_ui_parse_enabled("maybe", &enabled));
+    ASSERT_TRUE(enabled);
+    ASSERT_FALSE(cbm_ui_parse_enabled("TRUE", &enabled));
+    ASSERT_FALSE(cbm_ui_parse_enabled("", &enabled));
+
+    ASSERT_TRUE(cbm_ui_parse_port("1", &port));
+    ASSERT_EQ(port, 1);
+    ASSERT_TRUE(cbm_ui_parse_port("65535", &port));
+    ASSERT_EQ(port, 65535);
+    port = 1234;
+    ASSERT_FALSE(cbm_ui_parse_port("0", &port));
+    ASSERT_EQ(port, 1234);
+    ASSERT_FALSE(cbm_ui_parse_port("65536", &port));
+    ASSERT_FALSE(cbm_ui_parse_port(" 9749", &port));
+    ASSERT_FALSE(cbm_ui_parse_port("9749x", &port));
+    ASSERT_FALSE(cbm_ui_parse_port("", &port));
+    PASS();
+}
+
 /* ── Embedded asset tests ─────────────────────────────────────── */
 
 TEST(embedded_lookup_not_found) {
@@ -271,6 +298,22 @@ TEST(embedded_lookup_not_found) {
 TEST(embedded_stub_count) {
     /* Stub should have 0 files */
     ASSERT_EQ(CBM_EMBEDDED_FILE_COUNT, 0);
+    PASS();
+}
+
+TEST(embedded_lookup_sorted_table) {
+    static const unsigned char bytes[] = {0};
+    const cbm_embedded_file_t files[] = {
+        {"/assets/a.css", bytes, 1, "text/css"},
+        {"/assets/b.js", bytes, 1, "application/javascript"},
+        {"/assets/c.svg", bytes, 1, "image/svg+xml"},
+        {"/index.html", bytes, 1, "text/html"},
+    };
+    ASSERT_TRUE(cbm_embedded_lookup_sorted(files, 4, "/assets/a.css") == &files[0]);
+    ASSERT_TRUE(cbm_embedded_lookup_sorted(files, 4, "/assets/c.svg") == &files[2]);
+    ASSERT_TRUE(cbm_embedded_lookup_sorted(files, 4, "/index.html") == &files[3]);
+    ASSERT_NULL(cbm_embedded_lookup_sorted(files, 4, "/assets/b.css"));
+    ASSERT_NULL(cbm_embedded_lookup_sorted(files, 4, NULL));
     PASS();
 }
 
@@ -869,10 +912,12 @@ SUITE(ui) {
     RUN_TEST(config_overwrite);
     RUN_TEST(config_corrupt_file);
     RUN_TEST(config_missing_fields);
+    RUN_TEST(config_cli_values_fail_closed);
 
     /* Embedded assets (stub) */
     RUN_TEST(embedded_lookup_not_found);
     RUN_TEST(embedded_stub_count);
+    RUN_TEST(embedded_lookup_sorted_table);
 
     /* Layout engine */
     RUN_TEST(layout_empty_graph);

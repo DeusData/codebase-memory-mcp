@@ -12,6 +12,7 @@
 
 enum {
     GB_ERR = -1,
+    GB_INVALID_ID = 0,
     GB_COL_2 = 2,
     GB_COL_3 = 3,
     GB_COL_4 = 4,
@@ -27,23 +28,52 @@ enum {
  * blob that states one outranks a blob that does not. */
 #define CBM_EDGE_CONF_ABSENT (-1.0)
 #include "graph_buffer/graph_buffer.h"
+#include "cbm.h"
 #include <yyjson/yyjson.h> // url_path extraction must match json_extract semantics
 #include "store/store.h"
 #include "sqlite_writer.h"
 #include "foundation/hash_table.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/log.h"
 #include "foundation/dyn_array.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/platform.h"
 #include <sqlite3.h>
 
 #include <stdatomic.h>
+#include <stdarg.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h> // strdup
 #include <time.h>
+
+/* Test-only fault injection for the atomic publish boundary. It lets the suite
+ * prove a failed replace leaves the previously published DB untouched. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+static const char cbm_test_env_disabled[] = "0";
+
+static bool cbm_gbuf_test_fail_before_replace_enabled(void) {
+    char buf[CBM_SZ_16];
+    const char *val =
+        cbm_safe_getenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
+}
+
+static bool cbm_gbuf_test_fail_before_flush_commit_enabled(void) {
+    char buf[CBM_SZ_16];
+    const char *val =
+        cbm_safe_getenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, buf, sizeof(buf), NULL);
+    return val && val[0] != '\0' && strcmp(val, cbm_test_env_disabled) != 0;
+}
+#else
+/* Keep release builds structurally incapable of environment-driven publish
+ * failure. Constant false lets the compiler erase the guarded branch. */
+#define cbm_gbuf_test_fail_before_replace_enabled() false
+#define cbm_gbuf_test_fail_before_flush_commit_enabled() false
+#endif
 
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
@@ -298,6 +328,37 @@ static void remove_node_from_ptr_array(node_ptr_array_t *arr, int64_t node_id) {
     }
 }
 
+static void index_node_in_ptr_array(CBMHashTable *ht, const char *key, cbm_gbuf_node_t *node) {
+    node_ptr_array_t *arr = get_or_create_node_array(ht, key ? key : "");
+    if (!arr) {
+        return;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->items[i]->id == node->id) {
+            return;
+        }
+    }
+    cbm_da_push(arr, (const cbm_gbuf_node_t *)node);
+}
+
+static void update_node_secondary_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node,
+                                          const char *old_label, const char *old_name,
+                                          const char *new_label, const char *new_name) {
+    const char *old_label_key = old_label ? old_label : "";
+    const char *new_label_key = new_label ? new_label : "";
+    if (strcmp(old_label_key, new_label_key) != 0) {
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, old_label_key), node->id);
+        index_node_in_ptr_array(gb->nodes_by_label, new_label_key, node);
+    }
+
+    const char *old_name_key = old_name ? old_name : "";
+    const char *new_name_key = new_name ? new_name : "";
+    if (strcmp(old_name_key, new_name_key) != 0) {
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, old_name_key), node->id);
+        index_node_in_ptr_array(gb->nodes_by_name, new_name_key, node);
+    }
+}
+
 /* Remove an edge from all indexes (dedup + source_type + target_type + type). */
 static void unindex_edge(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *e) {
     char key[EDGE_KEY_BUF];
@@ -337,6 +398,34 @@ static void cascade_delete_edges(cbm_gbuf_t *gb, CBMHashTable *deleted_set) {
     gb->edges.count = write_idx;
 }
 
+static int gbuf_ht_set_flag_checked(CBMHashTable *set, const char *key) {
+    if (!set || !key) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_ht_set(set, key, intptr_to_ptr(SKIP_ONE));
+    return cbm_ht_has(set, key) ? 0 : CBM_NOT_FOUND;
+}
+
+static int gbuf_deleted_set_add_node_id(cbm_gbuf_t *gb, CBMHashTable *deleted_set,
+                                        const cbm_gbuf_node_t *node) {
+    if (!gb || !deleted_set || !node) {
+        return CBM_NOT_FOUND;
+    }
+
+    char id_buf[CBM_SZ_32];
+    make_id_key(id_buf, sizeof(id_buf), node->id);
+    char *owned_key = heap_strdup(id_buf);
+    if (!owned_key) {
+        return CBM_NOT_FOUND;
+    }
+    cbm_ht_set(deleted_set, owned_key, intptr_to_ptr(SKIP_ONE));
+    if (!cbm_ht_has(deleted_set, owned_key)) {
+        free(owned_key);
+        return CBM_NOT_FOUND;
+    }
+    return 0;
+}
+
 /* Register a node in primary (QN, ID) and secondary (label, name) indexes. */
 static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
     cbm_ht_set(gb->node_by_qn, node->qualified_name, node);
@@ -357,13 +446,8 @@ static void register_node_in_indexes(cbm_gbuf_t *gb, cbm_gbuf_node_t *node) {
         gb->by_id[node->id] = node;
     }
 
-    node_ptr_array_t *by_label =
-        get_or_create_node_array(gb->nodes_by_label, node->label ? node->label : "");
-    cbm_da_push(by_label, (const cbm_gbuf_node_t *)node);
-
-    node_ptr_array_t *by_name =
-        get_or_create_node_array(gb->nodes_by_name, node->name ? node->name : "");
-    cbm_da_push(by_name, (const cbm_gbuf_node_t *)node);
+    index_node_in_ptr_array(gb->nodes_by_label, node->label, node);
+    index_node_in_ptr_array(gb->nodes_by_name, node->name, node);
 }
 
 /* Push an edge pointer into a dynamic array (wraps macro to reduce CC contribution). */
@@ -406,6 +490,116 @@ static void rebuild_edge_secondary_indexes(cbm_gbuf_t *gb) {
     for (int i = 0; i < gb->edges.count; i++) {
         register_edge_in_indexes(gb, gb->edges.items[i]);
     }
+}
+
+static int gbuf_invariant_error(char *err, size_t err_sz, const char *fmt, ...) {
+    if (err && err_sz > 0) {
+        va_list ap;
+        va_start(ap, fmt);
+        vsnprintf(err, err_sz, fmt, ap);
+        va_end(ap);
+    }
+    return GB_ERR;
+}
+
+static bool gbuf_node_is_live(const cbm_gbuf_t *gb, const cbm_gbuf_node_t *node) {
+    if (!gb || !gb->node_by_qn || !node || !node->qualified_name) {
+        return false;
+    }
+    return cbm_ht_get(gb->node_by_qn, node->qualified_name) == node;
+}
+
+static bool edge_index_has_id(const edge_ptr_array_t *arr, int64_t edge_id) {
+    if (!arr) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        if (arr->items[i] && arr->items[i]->id == edge_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int cbm_gbuf_validate_invariants(const cbm_gbuf_t *gb, char *err, size_t err_sz) {
+    if (err && err_sz > 0) {
+        err[0] = '\0';
+    }
+    if (!gb) {
+        return gbuf_invariant_error(err, err_sz, "graph buffer is NULL");
+    }
+    if (!gb->project || !gb->root_path) {
+        return gbuf_invariant_error(err, err_sz, "missing project or root_path");
+    }
+    if (!gb->node_by_qn || !gb->by_id || !gb->edge_by_key || !gb->edges_by_source_type ||
+        !gb->edges_by_target_type || !gb->edges_by_type) {
+        return gbuf_invariant_error(err, err_sz, "lookup indexes are unavailable");
+    }
+    if (gb->next_id <= GB_INVALID_ID) {
+        return gbuf_invariant_error(err, err_sz, "invalid next_id=%lld", (long long)gb->next_id);
+    }
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        const cbm_gbuf_node_t *node = gb->nodes.items[i];
+        if (!node) {
+            return gbuf_invariant_error(err, err_sz, "node[%d] is NULL", i);
+        }
+        if (!gbuf_node_is_live(gb, node)) {
+            continue;
+        }
+        if (node->id <= GB_INVALID_ID || node->id >= gb->next_id) {
+            return gbuf_invariant_error(err, err_sz, "node id out of range id=%lld next_id=%lld",
+                                        (long long)node->id, (long long)gb->next_id);
+        }
+        if (node->id >= gb->by_id_cap || gb->by_id[node->id] != node) {
+            return gbuf_invariant_error(err, err_sz, "by_id mismatch id=%lld qn=%s",
+                                        (long long)node->id,
+                                        node->qualified_name ? node->qualified_name : "");
+        }
+    }
+
+    for (int i = 0; i < gb->edges.count; i++) {
+        const cbm_gbuf_edge_t *edge = gb->edges.items[i];
+        if (!edge) {
+            return gbuf_invariant_error(err, err_sz, "edge[%d] is NULL", i);
+        }
+        if (edge->id <= GB_INVALID_ID || edge->source_id <= GB_INVALID_ID ||
+            edge->target_id <= GB_INVALID_ID || !edge->type || edge->type[0] == '\0') {
+            return gbuf_invariant_error(
+                err, err_sz, "invalid edge fields edge_id=%lld src=%lld tgt=%lld",
+                (long long)edge->id, (long long)edge->source_id, (long long)edge->target_id);
+        }
+        const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gb, edge->source_id);
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, edge->target_id);
+        if (!gbuf_node_is_live(gb, source) || !gbuf_node_is_live(gb, target)) {
+            return gbuf_invariant_error(
+                err, err_sz, "edge endpoint missing edge_id=%lld src=%lld tgt=%lld",
+                (long long)edge->id, (long long)edge->source_id, (long long)edge->target_id);
+        }
+
+        char key[EDGE_KEY_BUF];
+        make_edge_key(key, sizeof(key), edge->source_id, edge->target_id, edge->type,
+                      edge->properties_json);
+        if (cbm_ht_get(gb->edge_by_key, key) != edge) {
+            return gbuf_invariant_error(err, err_sz, "edge_by_key mismatch edge_id=%lld",
+                                        (long long)edge->id);
+        }
+        make_src_type_key(key, sizeof(key), edge->source_id, edge->type);
+        if (!edge_index_has_id(cbm_ht_get(gb->edges_by_source_type, key), edge->id)) {
+            return gbuf_invariant_error(err, err_sz, "edges_by_source_type missing edge_id=%lld",
+                                        (long long)edge->id);
+        }
+        make_src_type_key(key, sizeof(key), edge->target_id, edge->type);
+        if (!edge_index_has_id(cbm_ht_get(gb->edges_by_target_type, key), edge->id)) {
+            return gbuf_invariant_error(err, err_sz, "edges_by_target_type missing edge_id=%lld",
+                                        (long long)edge->id);
+        }
+        if (!edge_index_has_id(cbm_ht_get(gb->edges_by_type, edge->type), edge->id)) {
+            return gbuf_invariant_error(err, err_sz, "edges_by_type missing edge_id=%lld",
+                                        (long long)edge->id);
+        }
+    }
+    return 0;
 }
 
 /* Release all lookup hash tables (used by dump after building arrays). */
@@ -640,6 +834,129 @@ void cbm_gbuf_set_next_id(cbm_gbuf_t *gb, int64_t next_id) {
 
 /* ── Node operations ─────────────────────────────────────────────── */
 
+static bool uses_deterministic_source_hint(const char *label) {
+    return label && (strcmp(label, "Route") == 0 || strcmp(label, "Section") == 0);
+}
+
+static bool uses_source_span_selection(const char *label) {
+    return cbm_label_uses_source_span_selection(label);
+}
+
+static int source_span_lines(int start_line, int end_line) {
+    if (start_line <= 0 || end_line < start_line) {
+        return 0;
+    }
+    return end_line - start_line + SKIP_ONE;
+}
+
+static int cmp_bool_int(bool lhs, bool rhs) {
+    return (int)lhs - (int)rhs;
+}
+
+static int compare_source_location(const char *lhs_path, int lhs_start, int lhs_end,
+                                   const char *rhs_path, int rhs_start, int rhs_end) {
+    const char *lhs = lhs_path ? lhs_path : "";
+    const char *rhs = rhs_path ? rhs_path : "";
+    int diff = cmp_bool_int(lhs[0] != '\0', rhs[0] != '\0');
+    if (diff != 0) {
+        return diff;
+    }
+    diff = source_span_lines(lhs_start, lhs_end) - source_span_lines(rhs_start, rhs_end);
+    if (diff != 0) {
+        return diff;
+    }
+    diff = rhs_start - lhs_start;
+    if (diff != 0) {
+        return diff;
+    }
+    diff = lhs_end - rhs_end;
+    if (diff != 0) {
+        return diff;
+    }
+    diff = strcmp(rhs, lhs);
+    return diff;
+}
+
+static bool same_source_location(const cbm_gbuf_node_t *existing, const char *file_path,
+                                 int start_line, int end_line) {
+    const char *cur = existing && existing->file_path ? existing->file_path : "";
+    const char *next = file_path ? file_path : "";
+    return strcmp(cur, next) == 0 && existing->start_line == start_line &&
+           existing->end_line == end_line;
+}
+
+static const char *select_upsert_file_path(const cbm_gbuf_node_t *existing, const char *label,
+                                           const char *file_path) {
+    const char *next = file_path ? file_path : "";
+    if (!existing || !uses_deterministic_source_hint(label)) {
+        return next;
+    }
+    const char *cur = existing->file_path ? existing->file_path : "";
+    if (cur[0] == '\0') {
+        return next;
+    }
+    if (next[0] == '\0') {
+        return cur;
+    }
+    return strcmp(next, cur) < 0 ? next : cur;
+}
+
+static bool select_source_span_from_next(const cbm_gbuf_node_t *existing, const char *label,
+                                         const char *file_path, int start_line, int end_line) {
+    if (!existing || same_source_location(existing, file_path, start_line, end_line)) {
+        return true;
+    }
+    if (!uses_source_span_selection(existing->label) && !uses_source_span_selection(label)) {
+        return true;
+    }
+    int cmp = compare_source_location(file_path, start_line, end_line, existing->file_path,
+                                      existing->start_line, existing->end_line);
+    return cmp >= 0;
+}
+
+static const char *select_upsert_name(const cbm_gbuf_node_t *existing, const char *label,
+                                      const char *name) {
+    const char *next = name ? name : "";
+    if (!existing || !label || strcmp(label, "Route") != 0) {
+        return next;
+    }
+    const char *cur = existing->name ? existing->name : "";
+    if (cur[0] == '\0') {
+        return next;
+    }
+    if (next[0] == '\0') {
+        return cur;
+    }
+    return strcmp(next, cur) < 0 ? next : cur;
+}
+
+static bool json_props_empty(const char *props) {
+    return !props || props[0] == '\0' || strcmp(props, "{}") == 0;
+}
+
+static const char *select_upsert_properties_json(const cbm_gbuf_node_t *existing, const char *label,
+                                                 const char *properties_json) {
+    if (!existing || !label || strcmp(label, "Route") != 0) {
+        return properties_json;
+    }
+    const char *cur = existing->properties_json;
+    const char *next = properties_json;
+    bool cur_empty = json_props_empty(cur);
+    bool next_empty = json_props_empty(next);
+    if (next_empty) {
+        return cur_empty ? next : cur;
+    }
+    if (cur_empty) {
+        return next;
+    }
+    size_t cur_len = strlen(cur);
+    size_t next_len = strlen(next);
+    if (cur_len != next_len) {
+        return next_len > cur_len ? next : cur;
+    }
+    return strcmp(next, cur) < 0 ? next : cur;
+}
+
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json) {
@@ -650,95 +967,64 @@ int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name
     /* Check if node already exists */
     cbm_gbuf_node_t *existing = cbm_ht_get(gb->node_by_qn, qualified_name);
     if (existing) {
-        /* Don't let a per-file "Module" def touch a structural directory node
-         * ("Project" root or "Folder"). In a directory-based-module language
-         * (Go/Java) a file's module_qn equals its directory QN: a root file →
-         * the project name (== the "Project" node's QN); a file in pkg/ →
-         * proj.pkg (== the "pkg/" Folder node's QN). Its always-emitted Module
-         * def collides here; the directory node is the package/module container
-         * and must keep its structural label AND its own name/file_path/range.
-         * Updating those in place set the shared node's file_path to whichever
-         * same-package file happened to be processed LAST (worker-order
-         * dependent) — the nondeterministic file attribution behind #787 — and
-         * left the Folder node exposed to delete-nodes-by-file on incremental
-         * reindex of that file. Skip the update entirely. (Both the sequential
-         * upsert and the parallel local-gbuf merge route through this function.) */
+        /* A per-file Module in a directory-module language shares its QN with
+         * the structural Project/Folder container. Never let extraction relabel
+         * or attach a file path to that shared structural node (#787). */
         if (existing->label && label && strcmp(label, "Module") == 0 &&
             (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0)) {
             return existing->id;
         }
-        /* Same-QN arrival: distinct source entities can share a QN (C: a
-         * struct, a function and a macro with one name), and the same entity
-         * can be re-upserted with fresh content. The old code let the LAST
-         * arrival overwrite — under parallel extraction the merge order
-         * varies run to run, so WHICH entity survived flickered (xfs:
-         * Function-node count 4998 vs 5015 across two runs) and every
-         * order-sensitive consumer downstream inherited it. Pick the
-         * survivor by a canonical CONTENT rule instead, a pure function of
-         * the two candidates: smallest file_path, then LARGEST start_line,
-         * then largest name/label (a mixed-direction composite is still a
-         * total order, so the pick is commutative and scheduling-free).
-         * Line-descending within a file keeps the classic upsert contract —
-         * a later definition in the same file (macro redefinition, refresh
-         * of the same entity with new content) replaces the earlier one,
-         * deterministically, because intra-file arrival order is fixed. A
-         * full tie is the same entity re-upserted → refresh in place.
-         * Kind-disambiguated QNs (the real cure) remain a follow-up. */
-        int c = strcmp(file_path ? file_path : "", existing->file_path ? existing->file_path : "");
-        if (c == 0) {
-            c = existing->start_line - start_line;
-        }
-        if (c == 0) {
-            c = strcmp(existing->name ? existing->name : "", name ? name : "");
-        }
-        if (c == 0) {
-            c = strcmp(existing->label ? existing->label : "", label ? label : "");
-        }
-        if (c > 0) {
-            return existing->id; /* existing entity is the canonical winner */
-        }
+
+        /* Same-QN entities use the richer deterministic source order: prefer
+         * concrete locations and larger spans, then stable line/path ties. This
+         * preserves implementations over declarations and is independent of
+         * parallel worker merge order. */
+        bool use_next_source_span =
+            select_source_span_from_next(existing, label, file_path, start_line, end_line);
+        const char *selected_label = use_next_source_span ? label : existing->label;
+        const char *selected_name =
+            use_next_source_span ? select_upsert_name(existing, label, name) : existing->name;
+        const char *selected_file_path = use_next_source_span
+                                             ? select_upsert_file_path(existing, label, file_path)
+                                             : (existing->file_path ? existing->file_path : "");
+        int selected_start_line = use_next_source_span ? start_line : existing->start_line;
+        int selected_end_line = use_next_source_span ? end_line : existing->end_line;
+        const char *selected_props =
+            use_next_source_span ? select_upsert_properties_json(existing, label, properties_json)
+                                 : existing->properties_json;
         /* Update in-place. name/properties are strdup'd BEFORE freeing old ones
          * (callers may pass existing->name as an argument). label/file_path are
          * interned: gb_intern returns a stable pool pointer (idempotent even when
          * label == existing->label), so the old value is replaced, never freed.
-         * When the surviving label/name changes, keep the secondary indexes
-         * consistent (the old code left the node listed under its ORIGINAL
-         * label/name — cbm_gbuf_find_by_label/name then missed or mis-listed it,
-         * which is how the flickering Function set reached the semantic pass). */
-        char *new_name = heap_strdup(name);
-        char *new_props = properties_json ? heap_strdup(properties_json) : NULL;
-        const char *new_label_interned = gb_intern(gb, label);
-        bool label_changed = !existing->label || !new_label_interned ||
-                             strcmp(existing->label, new_label_interned) != 0;
-        bool name_changed = !existing->name || !new_name || strcmp(existing->name, new_name) != 0;
-        if (label_changed) {
-            remove_node_from_ptr_array(
-                cbm_ht_get(gb->nodes_by_label, existing->label ? existing->label : ""),
-                existing->id);
+         * Route and Section nodes can intentionally collapse multiple concrete
+         * source paths into one QN, so pick display/source hints/properties
+         * deterministically where those fields are only representative hints.
+         * Code definitions may also collide between declarations and concrete
+         * definitions; keep the richer source tuple so parallel worker order
+         * cannot decide whether a forward declaration hides the implementation. */
+        char *new_name = heap_strdup(selected_name);
+        char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
+        const char *new_label = gb_intern(gb, selected_label);
+        const char *new_file_path = gb_intern(gb, selected_file_path);
+        if ((selected_name && !new_name) || (selected_label && !new_label) ||
+            (selected_file_path && !new_file_path)) {
+            free(new_name);
+            free(new_props);
+            return existing->id;
         }
-        if (name_changed) {
-            remove_node_from_ptr_array(
-                cbm_ht_get(gb->nodes_by_name, existing->name ? existing->name : ""), existing->id);
-        }
-        existing->label = (char *)new_label_interned;
+        const char *old_label = existing->label;
+        const char *old_name = existing->name;
+        update_node_secondary_indexes(gb, existing, old_label, old_name, selected_label,
+                                      selected_name);
+        existing->label = (char *)new_label;
         free(existing->name);
         existing->name = new_name;
-        existing->file_path = (char *)gb_intern(gb, file_path);
-        existing->start_line = start_line;
-        existing->end_line = end_line;
+        existing->file_path = (char *)new_file_path;
+        existing->start_line = selected_start_line;
+        existing->end_line = selected_end_line;
         if (new_props) {
             free(existing->properties_json);
             existing->properties_json = new_props;
-        }
-        if (label_changed) {
-            node_ptr_array_t *by_label = get_or_create_node_array(
-                gb->nodes_by_label, existing->label ? existing->label : "");
-            cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
-        }
-        if (name_changed) {
-            node_ptr_array_t *by_name =
-                get_or_create_node_array(gb->nodes_by_name, existing->name ? existing->name : "");
-            cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
         }
         return existing->id;
     }
@@ -812,6 +1098,37 @@ int cbm_gbuf_find_by_name(const cbm_gbuf_t *gb, const char *name, const cbm_gbuf
     return 0;
 }
 
+/* HC-1: DRY helper for name+label+file resolution fallback.
+ * Used by pass_calls.c (B2) and pass_normalize.c (B17).
+ * Runtime: O(1) hash + O(k) filter where k = name matches (~1-3). */
+const cbm_gbuf_node_t *cbm_gbuf_resolve_by_name_in_file(const cbm_gbuf_t *gb, const char *qn,
+                                                        const char *file_path,
+                                                        const char **label_filter,
+                                                        int label_count) {
+    if (!gb || !qn || !file_path)
+        return NULL;
+    const char *dot = strrchr(qn, '.');
+    const char *short_name = dot ? dot + 1 : qn;
+    if (!short_name[0])
+        return NULL;
+
+    const cbm_gbuf_node_t **matches = NULL;
+    int match_count = 0;
+    cbm_gbuf_find_by_name(gb, short_name, &matches, &match_count);
+
+    for (int m = 0; m < match_count; m++) {
+        if (!matches[m]->file_path || strcmp(matches[m]->file_path, file_path) != 0)
+            continue;
+        if (!matches[m]->label)
+            continue;
+        for (int l = 0; l < label_count; l++) {
+            if (strcmp(matches[m]->label, label_filter[l]) == 0)
+                return matches[m];
+        }
+    }
+    return NULL;
+}
+
 int cbm_gbuf_node_count(const cbm_gbuf_t *gb) {
     /* Use QN hash table count since it's authoritative (handles deletes) */
     return gb ? (int)cbm_ht_count(gb->node_by_qn) : 0;
@@ -827,20 +1144,29 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
         return 0;
     }
 
-    /* Build hash set of deleted node IDs for O(1) lookup */
-    CBMHashTable *deleted_set = cbm_ht_create(arr->count);
+    CBMHashTable *deleted_set = cbm_ht_create((uint32_t)arr->count);
+    if (!deleted_set) {
+        return CBM_NOT_FOUND;
+    }
+
     for (int i = 0; i < arr->count; i++) {
-        const cbm_gbuf_node_t *n = arr->items[i];
+        if (gbuf_deleted_set_add_node_id(gb, deleted_set, arr->items[i]) != 0) {
+            cbm_ht_free(deleted_set);
+            return CBM_NOT_FOUND;
+        }
+    }
 
-        char id_buf[CBM_SZ_32];
-        make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+    for (int i = 0; i < arr->count; i++) {
+        cbm_gbuf_node_t *n = (cbm_gbuf_node_t *)arr->items[i];
 
-        /* Remove from primary indexes */
+        /* Remove every lookup path and invalidate QN-based liveness. */
+        remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
         }
+        free(n->qualified_name);
+        n->qualified_name = NULL;
     }
 
     /* Clear the label array */
@@ -855,52 +1181,102 @@ int cbm_gbuf_delete_by_label(cbm_gbuf_t *gb, const char *label) {
 }
 
 int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
+    /* Single-file purge delegates to the batch path (paths=[file_path], count=1)
+     * so there is ONE implementation of the node-scan + edge cascade — no
+     * duplicated loop (DRY; the batch version does the same work in O(N+E)
+     * regardless of path count). */
     if (!gb || !file_path) {
         return CBM_NOT_FOUND;
     }
+    return cbm_gbuf_delete_by_paths(gb, &file_path, 1);
+}
 
-    /* Collect IDs of nodes in this file */
+/* Batch purge: delete every node whose file_path is in `paths`, in a SINGLE
+ * pass over gb->nodes + a single edge cascade — O(N+E) total regardless of how
+ * many paths are given. Replaces the old loop of cbm_gbuf_delete_by_file calls
+ * (one full nodes+edges scan PER file = O(C·(N+E))) in the incremental engine
+ * (perf fork-origin #3). Behaviorally identical to calling delete_by_file once
+ * per path; just without the repeated full scans. NULL entries in paths are
+ * skipped. Keys (paths) are borrowed — not freed by the internal path set. */
+int cbm_gbuf_delete_by_paths(cbm_gbuf_t *gb, const char *const *paths, int count) {
+    if (!gb) {
+        return CBM_NOT_FOUND;
+    }
+    if (count <= 0 || !paths) {
+        return 0;
+    }
+
+    CBMHashTable *path_set = cbm_ht_create((uint32_t)count);
+    if (!path_set) {
+        return CBM_NOT_FOUND;
+    }
+
+    for (int i = 0; i < count; i++) {
+        if (paths[i] && gbuf_ht_set_flag_checked(path_set, paths[i]) != 0) {
+            cbm_ht_free(path_set);
+            return CBM_NOT_FOUND;
+        }
+    }
+
     CBMHashTable *deleted_set = cbm_ht_create(CBM_SZ_64);
+    if (!deleted_set) {
+        cbm_ht_free(path_set);
+        return CBM_NOT_FOUND;
+    }
+
     int deleted_count = 0;
     int scanned = 0;
 
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
         scanned++;
-        if (!n->file_path || strcmp(n->file_path, file_path) != 0) {
+        if (!n->file_path || !cbm_ht_get(path_set, n->file_path)) {
             continue;
         }
         if (!n->qualified_name || !cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
             continue;
         }
 
-        char id_buf[CBM_SZ_32];
-        make_id_key(id_buf, sizeof(id_buf), n->id);
-        cbm_ht_set(deleted_set, strdup(id_buf), intptr_to_ptr(SKIP_ONE));
+        if (gbuf_deleted_set_add_node_id(gb, deleted_set, n) != 0) {
+            cbm_ht_free(path_set);
+            cbm_ht_free(deleted_set);
+            return CBM_NOT_FOUND;
+        }
+        deleted_count++;
+    }
 
-        /* Remove from secondary indexes */
+    if (deleted_count == 0) {
+        cbm_ht_free(path_set);
+        cbm_ht_free(deleted_set);
+        return 0;
+    }
+
+    for (int i = 0; i < gb->nodes.count; i++) {
+        cbm_gbuf_node_t *n = gb->nodes.items[i];
+        if (!n->qualified_name) {
+            continue;
+        }
+
+        char id_key[CBM_SZ_32];
+        make_id_key(id_key, sizeof(id_key), n->id);
+        if (!cbm_ht_get(deleted_set, id_key)) {
+            continue;
+        }
+
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_label, n->label), n->id);
         remove_node_from_ptr_array(cbm_ht_get(gb->nodes_by_name, n->name), n->id);
 
-        /* Remove from primary indexes */
         cbm_ht_delete(gb->node_by_qn, n->qualified_name);
         if (n->id >= 0 && n->id < gb->by_id_cap) {
             gb->by_id[n->id] = NULL;
         }
 
-        /* NULL out QN so dump's liveness check (cbm_ht_get by QN) fails
-         * even if a new node with the same QN is inserted later via merge. */
         free(n->qualified_name);
         n->qualified_name = NULL;
-        deleted_count++;
     }
 
-    if (deleted_count == 0) {
-        cbm_ht_free(deleted_set);
-        return 0;
-    }
+    cbm_ht_free(path_set); /* keys borrowed from caller — not freed here */
 
-    /* Cascade-delete edges referencing deleted nodes */
     cascade_delete_edges(gb, deleted_set);
 
     cbm_ht_foreach(deleted_set, free_key_only, NULL);
@@ -908,11 +1284,71 @@ int cbm_gbuf_delete_by_file(cbm_gbuf_t *gb, const char *file_path) {
     {
         char s_buf[CBM_SZ_16];
         char d_buf[CBM_SZ_16];
+        char p_buf[CBM_SZ_16];
         snprintf(s_buf, sizeof(s_buf), "%d", scanned);
         snprintf(d_buf, sizeof(d_buf), "%d", deleted_count);
-        cbm_log_info("gbuf.delete_by_file", "file", file_path, "scanned", s_buf, "deleted", d_buf);
+        snprintf(p_buf, sizeof(p_buf), "%d", count);
+        cbm_log_info("gbuf.delete_by_paths", "paths", p_buf, "scanned", s_buf, "deleted", d_buf);
     }
     return deleted_count;
+}
+
+int cbm_gbuf_prune_orphan_folders(cbm_gbuf_t *gb) {
+    static const char folder_label[] = "Folder";
+    static const char contains_file_edge[] = "CONTAINS_FILE";
+    static const char contains_folder_edge[] = "CONTAINS_FOLDER";
+    if (!gb) {
+        return GB_ERR;
+    }
+
+    int total_pruned = 0;
+    for (;;) {
+        const cbm_gbuf_node_t **folders = NULL;
+        int folder_count = 0;
+        if (cbm_gbuf_find_by_label(gb, folder_label, &folders, &folder_count) != 0) {
+            return GB_ERR;
+        }
+        if (folder_count == 0) {
+            return total_pruned;
+        }
+
+        const char **orphan_folder_paths =
+            malloc((size_t)folder_count * sizeof(*orphan_folder_paths));
+        if (!orphan_folder_paths) {
+            return GB_ERR;
+        }
+        int orphan_folder_count = 0;
+        for (int i = 0; i < folder_count; i++) {
+            const cbm_gbuf_node_t *folder = folders[i];
+            if (!folder || !folder->file_path || folder->file_path[0] == '\0') {
+                continue;
+            }
+            const cbm_gbuf_edge_t **edges = NULL;
+            int contained_file_count = 0;
+            int contained_folder_count = 0;
+            if (cbm_gbuf_find_edges_by_source_type(gb, folder->id, contains_file_edge, &edges,
+                                                   &contained_file_count) != 0 ||
+                cbm_gbuf_find_edges_by_source_type(gb, folder->id, contains_folder_edge, &edges,
+                                                   &contained_folder_count) != 0) {
+                free(orphan_folder_paths);
+                return GB_ERR;
+            }
+            if (contained_file_count == 0 && contained_folder_count == 0) {
+                orphan_folder_paths[orphan_folder_count++] = folder->file_path;
+            }
+        }
+        if (orphan_folder_count == 0) {
+            free(orphan_folder_paths);
+            return total_pruned;
+        }
+
+        int pruned = cbm_gbuf_delete_by_paths(gb, orphan_folder_paths, orphan_folder_count);
+        free(orphan_folder_paths);
+        if (pruned <= 0) {
+            return pruned < 0 ? pruned : GB_ERR;
+        }
+        total_pruned += pruned;
+    }
 }
 
 int cbm_gbuf_load_from_db(cbm_gbuf_t *gb, const char *db_path, const char *project) {
@@ -1033,19 +1469,21 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
 
 /* ── Edge operations ─────────────────────────────────────────────── */
 
-/* Read "confidence":<double> out of an edge property blob. Absent/unparseable
- * reads as -1 so any edge that carries a confidence outranks one that does
- * not. */
-static double edge_props_confidence(const char *props_json) {
-    if (!props_json) {
-        return CBM_EDGE_CONF_ABSENT;
+/* Parse the numeric confidence property as JSON. Byte slicing misclassified
+ * valid whitespace and occurrences inside strings, breaking the total order. */
+static bool edge_props_confidence(const char *props_json, double *out) {
+    if (!props_json || !out) {
+        return false;
     }
-    static const char conf_key[] = "\"confidence\":";
-    const char *p = strstr(props_json, conf_key);
-    if (!p) {
-        return CBM_EDGE_CONF_ABSENT;
+    yyjson_doc *doc = yyjson_read(props_json, strlen(props_json), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *confidence = yyjson_is_obj(root) ? yyjson_obj_get(root, "confidence") : NULL;
+    bool found = yyjson_is_num(confidence);
+    if (found) {
+        *out = yyjson_get_real(confidence);
     }
-    return strtod(p + sizeof(conf_key) - SKIP_ONE, NULL);
+    yyjson_doc_free(doc);
+    return found;
 }
 
 /* Decide whether an incoming property blob replaces the stored one on a
@@ -1072,9 +1510,14 @@ static bool edge_props_should_replace(const char *existing_json, const char *inc
     if (!existing_json || strcmp(existing_json, "{}") == 0) {
         return true;
     }
-    double inc = edge_props_confidence(incoming_json);
-    double cur = edge_props_confidence(existing_json);
-    if (inc != cur) {
+    double inc = CBM_EDGE_CONF_ABSENT;
+    double cur = CBM_EDGE_CONF_ABSENT;
+    bool inc_has_confidence = edge_props_confidence(incoming_json, &inc);
+    bool cur_has_confidence = edge_props_confidence(existing_json, &cur);
+    if (inc_has_confidence != cur_has_confidence) {
+        return inc_has_confidence;
+    }
+    if (inc_has_confidence && inc != cur) {
         return inc > cur;
     }
     return strcmp(incoming_json, existing_json) > 0;
@@ -1092,9 +1535,15 @@ int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_i
 
     cbm_gbuf_edge_t *existing = cbm_ht_get(gb->edge_by_key, key);
     if (existing) {
-        if (edge_props_should_replace(existing->properties_json, properties_json)) {
-            free(existing->properties_json);
-            existing->properties_json = heap_strdup(properties_json);
+        bool replace = strcmp(type, "CALLS") == 0
+                           ? edge_props_should_replace(existing->properties_json, properties_json)
+                           : properties_json != NULL;
+        if (replace) {
+            char *replacement = heap_strdup(properties_json);
+            if (replacement) {
+                free(existing->properties_json);
+                existing->properties_json = replacement;
+            }
         }
         return existing->id;
     }
@@ -1188,16 +1637,21 @@ int cbm_gbuf_edge_count_by_type(const cbm_gbuf_t *gb, const char *type) {
     return arr ? arr->count : 0;
 }
 
-int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
+static int delete_edges_by_type_filtered(cbm_gbuf_t *gb, const char *type,
+                                         const char *prop_substr) {
     if (!gb || !type) {
         return CBM_NOT_FOUND;
     }
 
     /* Remove edges of the given type from array and dedup index */
+    int deleted = 0;
     int write_idx = 0;
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
-        if (strcmp(e->type, type) == 0) {
+        int type_matches = (strcmp(e->type, type) == 0);
+        int props_match =
+            (!prop_substr || (e->properties_json && strstr(e->properties_json, prop_substr)));
+        if (type_matches && props_match) {
             char key[EDGE_KEY_BUF];
             make_edge_key(key, sizeof(key), e->source_id, e->target_id, e->type,
                           e->properties_json);
@@ -1206,6 +1660,7 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
             free((void *)ekey);
             free_edge_strings(e);
             free(e);
+            deleted++;
         } else {
             gb->edges.items[write_idx++] = gb->edges.items[i];
         }
@@ -1215,7 +1670,20 @@ int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
     /* Rebuild edge secondary indexes */
     rebuild_edge_secondary_indexes(gb);
 
-    return 0;
+    return deleted;
+}
+
+int cbm_gbuf_delete_edges_by_type(cbm_gbuf_t *gb, const char *type) {
+    int rc = delete_edges_by_type_filtered(gb, type, NULL);
+    return rc < 0 ? rc : 0;
+}
+
+int cbm_gbuf_delete_edges_by_type_matching_props(cbm_gbuf_t *gb, const char *type,
+                                                 const char *prop_substr) {
+    if (!prop_substr) {
+        return CBM_NOT_FOUND;
+    }
+    return delete_edges_by_type_filtered(gb, type, prop_substr);
 }
 
 /* ── Merge ───────────────────────────────────────────────────────── */
@@ -1227,96 +1695,92 @@ static void free_remap_entry(const char *key, void *val, void *ud) {
     free(val);
 }
 
-/* Handle QN collision: update dst node fields (src wins), record remap if IDs differ.
- * label/file_path are re-interned into dst's pool (sn's pointers belong to src). */
-static void merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
+/* Handle QN collision: update dst node fields, record remap if IDs differ.
+ * Representative source hints are chosen deterministically for labels that can
+ * collapse multiple paths into one QN, and duplicate code definitions keep the
+ * richer source tuple. Worker merge order is intentionally not part of the
+ * graph contract. label/file_path are re-interned into dst's pool (sn's
+ * pointers belong to src). */
+static bool merge_update_existing(cbm_gbuf_t *dst, cbm_gbuf_node_t *existing,
                                   const cbm_gbuf_node_t *sn, CBMHashTable **remap) {
-    /* Same guard as cbm_gbuf_upsert_node: a per-file "Module" def coming from a
-     * worker-local gbuf must not touch the structural directory node ("Project"
-     * root or "Folder") that shares its QN in a directory-based-module language
-     * (Java/Go). pass_structure seeds Folder/Project nodes on the MAIN gbuf
-     * before the parallel extract, so every worker's always-emitted Module def
-     * for that package collides here; unconditional "src wins" relabelled the
-     * directory node to Module and set its file_path to whichever worker merged
-     * LAST — the nondeterministic USAGE-source misattribution of #787. Keep the
-     * structural node intact; the ID remap below still redirects the worker's
-     * edges onto the canonical node. */
+    /* Worker-local Modules must not mutate a structural Project/Folder sharing
+     * the same directory-module QN. The remap below still redirects their edges
+     * to the canonical container (#787). */
     bool module_on_container =
         existing->label && sn->label && strcmp(sn->label, "Module") == 0 &&
         (strcmp(existing->label, "Project") == 0 || strcmp(existing->label, "Folder") == 0);
     if (!module_on_container) {
-        /* Canonical collision winner (determinism) — mirrors
-         * cbm_gbuf_upsert_node exactly. Distinct source entities can share a
-         * QN (C: struct/function/macro with one name); unconditional "src
-         * wins" made the survivor depend on worker merge order, flickering
-         * the node set (and every downstream consumer) run to run. Winner =
-         * smallest file_path, then LARGEST start_line, then largest
-         * name/label — one total order, commutative, scheduling-free; a full
-         * tie is the same entity → refresh from src. */
-        int c = strcmp(sn->file_path ? sn->file_path : "",
-                       existing->file_path ? existing->file_path : "");
-        if (c == 0) {
-            c = existing->start_line - sn->start_line;
+        /* Mirror upsert's richer deterministic source-span selection so the
+         * sequential and parallel paths choose the same representative node. */
+        bool use_next_source_span = select_source_span_from_next(existing, sn->label, sn->file_path,
+                                                                 sn->start_line, sn->end_line);
+        const char *selected_label = use_next_source_span ? sn->label : existing->label;
+        const char *selected_name = use_next_source_span
+                                        ? select_upsert_name(existing, sn->label, sn->name)
+                                        : existing->name;
+        const char *selected_file_path =
+            use_next_source_span ? select_upsert_file_path(existing, sn->label, sn->file_path)
+                                 : (existing->file_path ? existing->file_path : "");
+        int selected_start_line = use_next_source_span ? sn->start_line : existing->start_line;
+        int selected_end_line = use_next_source_span ? sn->end_line : existing->end_line;
+        const char *selected_props =
+            use_next_source_span
+                ? select_upsert_properties_json(existing, sn->label, sn->properties_json)
+                : existing->properties_json;
+        char *new_name = heap_strdup(selected_name);
+        if (selected_name && !new_name) {
+            goto record_remap;
         }
-        if (c == 0) {
-            c = strcmp(existing->name ? existing->name : "", sn->name ? sn->name : "");
+        char *new_props = selected_props ? heap_strdup(selected_props) : NULL;
+        const char *new_label = gb_intern(dst, selected_label);
+        const char *new_file_path = gb_intern(dst, selected_file_path);
+        if ((selected_label && !new_label) || (selected_file_path && !new_file_path)) {
+            free(new_name);
+            free(new_props);
+            goto record_remap;
         }
-        if (c == 0) {
-            c = strcmp(existing->label ? existing->label : "", sn->label ? sn->label : "");
-        }
-        bool sn_wins = c <= 0;
-        if (sn_wins) {
-            /* Keep the secondary indexes consistent when the surviving
-             * label/name changes (the old code left the node listed under its
-             * original label/name, so find_by_label/name mis-listed it). */
-            const char *new_label = gb_intern(dst, sn->label);
-            bool label_changed =
-                !existing->label || !new_label || strcmp(existing->label, new_label) != 0;
-            bool name_changed =
-                !existing->name || !sn->name || strcmp(existing->name, sn->name) != 0;
-            if (label_changed) {
-                remove_node_from_ptr_array(
-                    cbm_ht_get(dst->nodes_by_label, existing->label ? existing->label : ""),
-                    existing->id);
-            }
-            if (name_changed) {
-                remove_node_from_ptr_array(
-                    cbm_ht_get(dst->nodes_by_name, existing->name ? existing->name : ""),
-                    existing->id);
-            }
-            existing->label = (char *)new_label;
-            free(existing->name);
-            existing->name = heap_strdup(sn->name);
-            existing->file_path = (char *)gb_intern(dst, sn->file_path);
-            existing->start_line = sn->start_line;
-            existing->end_line = sn->end_line;
-            if (sn->properties_json) {
-                free(existing->properties_json);
-                existing->properties_json = heap_strdup(sn->properties_json);
-            }
-            if (label_changed) {
-                node_ptr_array_t *by_label = get_or_create_node_array(
-                    dst->nodes_by_label, existing->label ? existing->label : "");
-                cbm_da_push(by_label, (const cbm_gbuf_node_t *)existing);
-            }
-            if (name_changed) {
-                node_ptr_array_t *by_name = get_or_create_node_array(
-                    dst->nodes_by_name, existing->name ? existing->name : "");
-                cbm_da_push(by_name, (const cbm_gbuf_node_t *)existing);
-            }
+        const char *old_label = existing->label;
+        const char *old_name = existing->name;
+        update_node_secondary_indexes(dst, existing, old_label, old_name, selected_label,
+                                      selected_name);
+        existing->label = (char *)new_label;
+        free(existing->name);
+        existing->name = new_name;
+        existing->file_path = (char *)new_file_path;
+        existing->start_line = selected_start_line;
+        existing->end_line = selected_end_line;
+        if (new_props) {
+            free(existing->properties_json);
+            existing->properties_json = new_props;
         }
     }
 
+record_remap:
     if (sn->id != existing->id) {
         if (!*remap) {
             *remap = cbm_ht_create(CBM_SZ_32);
+            if (!*remap) {
+                return false;
+            }
         }
         char key[CBM_SZ_32];
         make_id_key(key, sizeof(key), sn->id);
         int64_t *val = malloc(sizeof(int64_t));
+        char *owned_key = heap_strdup(key);
+        if (!val || !owned_key) {
+            free(val);
+            free(owned_key);
+            return false;
+        }
         *val = existing->id;
-        cbm_ht_set(*remap, strdup(key), val);
+        cbm_ht_set(*remap, owned_key, val);
+        if (cbm_ht_get(*remap, key) != val) {
+            free(owned_key);
+            free(val);
+            return false;
+        }
     }
+    return true;
 }
 
 /* Copy a non-colliding src node into dst with its original ID. */
@@ -1395,7 +1859,13 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src) {
 
         cbm_gbuf_node_t *existing = cbm_ht_get(dst->node_by_qn, sn->qualified_name);
         if (existing) {
-            merge_update_existing(dst, existing, sn, &remap);
+            if (!merge_update_existing(dst, existing, sn, &remap)) {
+                if (remap) {
+                    cbm_ht_foreach(remap, free_remap_entry, NULL);
+                    cbm_ht_free(remap);
+                }
+                return CBM_NOT_FOUND;
+            }
         } else {
             merge_copy_new_node(dst, sn);
         }
@@ -1632,7 +2102,7 @@ static int count_live_nodes(cbm_gbuf_t *gb) {
     int count = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
-        if (n->qualified_name && cbm_ht_get(gb->node_by_qn, n->qualified_name)) {
+        if (gbuf_node_is_live(gb, n)) {
             count++;
         }
     }
@@ -1660,7 +2130,24 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     if (!gb || !path) {
         return CBM_NOT_FOUND;
     }
-
+    char invariant_err[CBM_SZ_512];
+    if (cbm_gbuf_validate_invariants(gb, invariant_err, sizeof(invariant_err)) != 0) {
+        cbm_log_error("gbuf.dump.invalid_graph", "error", invariant_err);
+        return GB_ERR;
+    }
+    char tmp_path[CBM_SZ_1K];
+    int tmp_len = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.XXXXXX", path);
+    if (tmp_len <= 0 || (size_t)tmp_len >= sizeof(tmp_path)) {
+        return CBM_NOT_FOUND;
+    }
+    char wal_path[CBM_SZ_1K];
+    char shm_path[CBM_SZ_1K];
+    int wal_len = snprintf(wal_path, sizeof(wal_path), "%s-wal", path);
+    int shm_len = snprintf(shm_path, sizeof(shm_path), "%s-shm", path);
+    if (wal_len <= 0 || (size_t)wal_len >= sizeof(wal_path) || shm_len <= 0 ||
+        (size_t)shm_len >= sizeof(shm_path)) {
+        return CBM_NOT_FOUND;
+    }
     CBM_PROF_START(t_count);
     int live_count = count_live_nodes(gb);
     CBM_PROF_END_N("dump", "1_count_live_nodes", t_count, live_count);
@@ -1691,14 +2178,24 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     char indexed_at[CBM_SZ_64];
     generate_iso_timestamp(indexed_at, sizeof(indexed_at));
 
-    /* Stream node rows to the DB in partitions. Under memory pressure, free each
+    int tmp_fd = cbm_mkstemp_s(tmp_path, sizeof(tmp_path));
+    if (tmp_fd < 0) {
+        free(src_nodes);
+        free(dump_nodes);
+        free(temp_to_final);
+        return CBM_NOT_FOUND;
+    }
+    cbm_close_fd(tmp_fd);
+
+    /* Stream node rows to the unique temp DB in partitions. Under memory pressure, free each
      * partition's heavy properties_json once persisted — the heavy column is
      * write-once and never read again, so this bounds the dump/finalize peak.
      * The DB output is identical whether or not freeing engages, so non-pressure
      * runs (and tests) leave the gbuf intact (the budget>0 guard keeps an
      * uninitialized budget from ever triggering the free). */
-    cbm_db_writer_t *w = cbm_writer_open(path);
+    cbm_db_writer_t *w = cbm_writer_open(tmp_path);
     if (!w) {
+        cbm_unlink(tmp_path);
         free(src_nodes);
         free(dump_nodes);
         free(temp_to_final);
@@ -1753,6 +2250,59 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         rc = frc;
     }
 
+    /* Post-write integrity verification (B1 mitigation): verify the temp DB
+     * before the atomic rename. A corrupt or unopenable temp file is deleted;
+     * the previously published DB, if any, remains in place for readers.
+     *
+     * Use the _full variant so a path-only defect (root_path the check considers
+     * non-absolute, e.g. a relative repo_path like ".") is RETAINED, not deleted
+     * — the node/edge data is intact and queries key off project name, not
+     * root_path. Deleting on path-only would drop valid DBs whenever a relative
+     * path is indexed (caught by self-indexing the repo with repo_path=".").
+     * Consistent with #557 resolve_store. */
+    if (rc == 0) {
+        cbm_store_t *verify = cbm_store_open_path((const char *)tmp_path);
+        if (verify) {
+            bool path_only = false;
+            bool intact = cbm_store_check_integrity_full(verify, &path_only);
+            cbm_store_close(verify);
+            if (!intact && !path_only) { /* genuine structural corruption only */
+                char nodes_str[CBM_SZ_16];
+                char edges_str[CBM_SZ_16];
+                snprintf(nodes_str, sizeof(nodes_str), "%d", node_idx);
+                snprintf(edges_str, sizeof(edges_str), "%d", edge_idx);
+                cbm_log_error("dump.verify_corrupt", "path", tmp_path, "action",
+                              "deleting corrupt temp db; re-index required", "nodes", nodes_str,
+                              "edges", edges_str);
+                cbm_unlink(tmp_path);
+                rc = GB_ERR;
+            }
+        } else {
+            cbm_log_error("dump.verify_open_failed", "path", tmp_path, "action",
+                          "deleting unverified temp db");
+            cbm_unlink(tmp_path);
+            rc = GB_ERR;
+        }
+    }
+    if (rc == 0) {
+        if (cbm_gbuf_test_fail_before_replace_enabled()) {
+            cbm_log_error("dump.test_fail_before_replace", "tmp", tmp_path, "path", path);
+            cbm_unlink(tmp_path);
+            rc = GB_ERR;
+        }
+    }
+    if (rc == 0) {
+        cbm_unlink(wal_path);
+        cbm_unlink(shm_path);
+        if (cbm_replace_file(tmp_path, path) != 0) {
+            cbm_log_error("dump.rename_failed", "tmp", tmp_path, "path", path);
+            cbm_unlink(tmp_path);
+            rc = GB_ERR;
+        }
+    } else {
+        cbm_unlink(tmp_path);
+    }
+
     log_dump_summary(node_idx, edge_idx);
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     free(src_nodes);
@@ -1764,24 +2314,87 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return CBM_NOT_FOUND;
     }
 
-    /* Upsert project */
-    cbm_store_upsert_project(store, gb->project, gb->root_path);
+    CBM_PROF_START(t_flush_total);
+    int64_t *temp_to_real = NULL;
+    int64_t *temp_node_ids = NULL;
+    int64_t *store_node_ids = NULL;
+    cbm_node_t *store_nodes = NULL;
+    cbm_edge_t *store_edges = NULL;
+    CBM_PROF_START(t_begin_bulk);
+    int rc = cbm_store_begin_bulk(store);
+    CBM_PROF_END("gbuf_flush", "0_begin_bulk", t_begin_bulk);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
 
-    /* Begin bulk mode */
-    cbm_store_begin_bulk(store);
-    cbm_store_drop_indexes(store);
-    cbm_store_begin(store);
+    CBM_PROF_START(t_begin);
+    rc = cbm_store_begin(store);
+    CBM_PROF_END("gbuf_flush", "1_begin", t_begin);
+    if (rc != CBM_STORE_OK) {
+        (void)cbm_store_end_bulk(store);
+        return rc;
+    }
 
-    /* Delete existing project data */
-    cbm_store_delete_edges_by_project(store, gb->project);
-    cbm_store_delete_nodes_by_project(store, gb->project);
+    /* Delete the project row so ON DELETE CASCADE clears graph and freshness
+     * tables owned by this project before the replacement graph is inserted.
+     * This preserves sibling projects, including dependency subprojects; caller
+     * code still owns contentless FTS rebuilds and user-authored project memory. */
+    const char *phase = "delete_project";
+    CBM_PROF_START(t_delete_project);
+    rc = cbm_store_delete_project(store, gb->project);
+    CBM_PROF_END("gbuf_flush", "2_delete_project", t_delete_project);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+
+    /* Keep indexes during the cascade delete above: SQLite uses the child-table
+     * FK indexes to avoid scanning the whole graph. Drop them only for inserts. */
+    phase = "drop_indexes";
+    CBM_PROF_START(t_drop_indexes);
+    rc = cbm_store_drop_indexes(store);
+    CBM_PROF_END("gbuf_flush", "3_drop_indexes", t_drop_indexes);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+
+    phase = "upsert_project";
+    CBM_PROF_START(t_upsert_project);
+    rc = cbm_store_upsert_project(store, gb->project, gb->root_path);
+    CBM_PROF_END("gbuf_flush", "4_upsert_project", t_upsert_project);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
 
     /* Build temp_id → real_id map.
      * Temp IDs start at 1 and are sequential, but can have gaps from edge inserts.
      * Use max_id as size. */
     int64_t max_temp_id = gb->next_id;
-    int64_t *temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+    temp_to_real = calloc(max_temp_id, sizeof(int64_t));
+    if (!temp_to_real) {
+        phase = "alloc_temp_map";
+        rc = CBM_NOT_FOUND;
+        goto fail;
+    }
 
+    if (gb->nodes.count > 0) {
+        if ((size_t)gb->nodes.count > SIZE_MAX / sizeof(*store_nodes) ||
+            (size_t)gb->nodes.count > SIZE_MAX / sizeof(*store_node_ids) ||
+            (size_t)gb->nodes.count > SIZE_MAX / sizeof(*temp_node_ids)) {
+            phase = "alloc_node_batch";
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        store_nodes = malloc((size_t)gb->nodes.count * sizeof(*store_nodes));
+        store_node_ids = malloc((size_t)gb->nodes.count * sizeof(*store_node_ids));
+        temp_node_ids = malloc((size_t)gb->nodes.count * sizeof(*temp_node_ids));
+        if (!store_nodes || !store_node_ids || !temp_node_ids) {
+            phase = "alloc_node_batch";
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+    }
+
+    int valid_node_count = 0;
     for (int i = 0; i < gb->nodes.count; i++) {
         cbm_gbuf_node_t *n = gb->nodes.items[i];
 
@@ -1790,7 +2403,7 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             continue;
         }
 
-        cbm_node_t sn = {
+        store_nodes[valid_node_count] = (cbm_node_t){
             .project = gb->project,
             .label = n->label,
             .name = n->name,
@@ -1800,13 +2413,46 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .end_line = n->end_line,
             .properties_json = n->properties_json,
         };
-        int64_t real_id = cbm_store_upsert_node(store, &sn);
-        if (real_id > 0 && n->id < max_temp_id) {
-            temp_to_real[n->id] = real_id;
-        }
+        temp_node_ids[valid_node_count] = n->id;
+        valid_node_count++;
     }
 
+    phase = "upsert_nodes";
+    CBM_PROF_START(t_upsert_nodes);
+    rc = cbm_store_upsert_node_batch_in_transaction(store, store_nodes, valid_node_count,
+                                                    store_node_ids);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    for (int i = 0; i < valid_node_count; i++) {
+        int64_t real_id = store_node_ids[i];
+        if (real_id <= 0) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        if (temp_node_ids[i] <= 0 || temp_node_ids[i] >= max_temp_id) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        temp_to_real[temp_node_ids[i]] = real_id;
+    }
+    CBM_PROF_END_N("gbuf_flush", "5_upsert_nodes", t_upsert_nodes, valid_node_count);
+
     /* Insert all edges with remapped IDs */
+    phase = "insert_edges";
+    CBM_PROF_START(t_insert_edges);
+    int valid_edge_count = 0;
+    if (gb->edges.count > 0) {
+        if ((size_t)gb->edges.count > SIZE_MAX / sizeof(*store_edges)) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+        store_edges = malloc((size_t)gb->edges.count * sizeof(*store_edges));
+        if (!store_edges) {
+            rc = CBM_STORE_ERR;
+            goto fail;
+        }
+    }
     for (int i = 0; i < gb->edges.count; i++) {
         cbm_gbuf_edge_t *e = gb->edges.items[i];
         int64_t real_src = (e->source_id < max_temp_id) ? temp_to_real[e->source_id] : 0;
@@ -1822,15 +2468,59 @@ int cbm_gbuf_flush_to_store(cbm_gbuf_t *gb, cbm_store_t *store) {
             .type = e->type,
             .properties_json = e->properties_json,
         };
-        cbm_store_insert_edge(store, &se);
+        store_edges[valid_edge_count++] = se;
     }
+    rc = cbm_store_insert_edge_batch_in_transaction(store, store_edges, valid_edge_count);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    CBM_PROF_END_N("gbuf_flush", "6_insert_edges", t_insert_edges, valid_edge_count);
 
-    cbm_store_commit(store);
-    cbm_store_create_indexes(store);
-    cbm_store_end_bulk(store);
+    phase = "create_indexes";
+    CBM_PROF_START(t_create_indexes);
+    rc = cbm_store_create_indexes(store);
+    CBM_PROF_END("gbuf_flush", "7_create_indexes", t_create_indexes);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    if (cbm_gbuf_test_fail_before_flush_commit_enabled()) {
+        phase = "test_fail_before_commit";
+        rc = GB_ERR;
+        goto fail;
+    }
+    phase = "commit";
+    CBM_PROF_START(t_commit);
+    rc = cbm_store_commit(store);
+    CBM_PROF_END("gbuf_flush", "8_commit", t_commit);
+    if (rc != CBM_STORE_OK) {
+        goto fail;
+    }
+    CBM_PROF_START(t_end_bulk);
+    int end_bulk_rc = cbm_store_end_bulk(store);
+    CBM_PROF_END("gbuf_flush", "9_end_bulk", t_end_bulk);
+    CBM_PROF_END_N("gbuf_flush", "TOTAL", t_flush_total, gb->nodes.count + gb->edges.count);
 
     free(temp_to_real);
-    return 0;
+    free(temp_node_ids);
+    free(store_node_ids);
+    free(store_nodes);
+    free(store_edges);
+    return end_bulk_rc == CBM_STORE_OK ? 0 : end_bulk_rc;
+
+fail: {
+    char rc_str[CBM_SZ_32];
+    snprintf(rc_str, sizeof(rc_str), "%d", rc);
+    cbm_log_error("gbuf.flush.err", "phase", phase, "project", gb->project, "rc", rc_str,
+                  "store_error", cbm_store_error(store));
+}
+    (void)cbm_store_rollback(store);
+    (void)cbm_store_end_bulk(store);
+    free(temp_to_real);
+    free(temp_node_ids);
+    free(store_node_ids);
+    free(store_nodes);
+    free(store_edges);
+    return rc;
 }
 
 int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
@@ -1838,7 +2528,7 @@ int cbm_gbuf_merge_into_store(cbm_gbuf_t *gb, cbm_store_t *store) {
         return CBM_NOT_FOUND;
     }
 
-    /* Begin bulk mode — no project wipe */
+    /* Begin bulk mode — no project wipe (unlike flush_to_store) */
     cbm_store_begin(store);
 
     /* Build temp_id → real_id map */

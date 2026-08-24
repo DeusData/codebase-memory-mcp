@@ -20,8 +20,10 @@
 #ifndef CBM_SUBPROCESS_H
 #define CBM_SUBPROCESS_H
 
+#include <stdatomic.h> /* _Atomic long child_pid_out publication */
 #include <stdbool.h>
 #include <stddef.h> /* size_t (cbm_build_win_cmdline) */
+#include <stdint.h> /* uint64_t (cbm_subprocess_poll_interval_ms) */
 
 /* How a supervised child ended. */
 typedef enum {
@@ -61,7 +63,16 @@ typedef struct {
                                       * NULL. The fixed /D /S /V:OFF /C prefix is added while
                                       * this payload is copied verbatim for cmd.exe to parse. */
     const char *log_file;            /* child stdout+stderr are redirected here and tailed;
-                                      * NULL => discard child output, no tailing */
+                                      * NULL => discard child output, no tailing.
+                                      * Set discard_stderr to send stdout only. */
+    bool discard_stderr;             /* true => the child's stderr goes to the null device and
+                                      * only its stdout reaches log_file and on_log_line.
+                                      * Callers that PARSE child output need this: with the
+                                      * default merged stream a diagnostic written to stderr is
+                                      * delivered as an ordinary line and can be mistaken for a
+                                      * result (a git warning read as a rev-parse value, say).
+                                      * Leave false to keep diagnostics, which is what log
+                                      * tailing wants. */
     cbm_proc_log_cb on_log_line;     /* optional per-line callback */
     void *log_ud;                    /* user data for on_log_line */
     int quiet_timeout_ms;            /* <= 0 => no timeout; else kill+HANG after this many
@@ -69,6 +80,15 @@ typedef struct {
     int cancel_grace_ms;             /* graceful tree-termination window; <= 0 uses the finite
                                       * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
     bool delete_log_on_exit;         /* unlink log_file after reaping */
+    _Atomic long *child_pid_out;     /* optional: the live child's pid is published here
+                                      * right after a successful fork/CreateProcess and
+                                      * reset to 0 once the child is reaped, so another
+                                      * thread (e.g. the UI kill endpoint) can validate a pid
+                                      * against a child that is actually still alive.
+                                      * 0 = no live child. NULL => not published.
+                                      * Cancellation itself belongs to the owned handle
+                                      * (cbm_subprocess_request_cancel); this field only
+                                      * publishes identity. */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
@@ -148,6 +168,34 @@ cbm_proc_outcome_t cbm_proc_classify(bool exited_normally, int exit_code, int te
 
 /* Stable lowercase name for an outcome (for structured logs / skip reasons). */
 const char *cbm_proc_outcome_str(cbm_proc_outcome_t o);
+
+enum { CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL = 0 };
+
+/* Select the child-reap polling interval. Short-lived workers are polled more
+ * frequently during a bounded startup window. After that window, a positive
+ * steady_interval_ms preserves a caller-specific cadence;
+ * CBM_SUBPROCESS_USE_PLATFORM_POLL_INTERVAL selects the shared platform
+ * cadence. Exposed as a pure function so both policies are testable without
+ * claiming cross-platform execution. */
+int cbm_subprocess_poll_interval_ms(uint64_t elapsed_ms, int steady_interval_ms);
+
+#if defined(CBM_ENABLE_TEST_SEAMS) && defined(__APPLE__)
+/* Run synchronously after posix_spawnp has created a contained child and before
+ * the parent publishes it. Tests use this to hold an immediate-exit child as a
+ * zombie without adding timing sleeps to production code. */
+typedef void (*cbm_subprocess_darwin_post_spawn_test_hook_t)(long pid);
+void cbm_subprocess_set_darwin_post_spawn_hook_for_testing(
+    cbm_subprocess_darwin_post_spawn_test_hook_t hook);
+#endif
+
+#ifndef _WIN32
+/* Pre-exec descriptor hygiene shared by every POSIX child launcher. Resolve the
+ * finite fallback bound before fork, then close descriptors in the child.
+ * Linux close_range and F_CLOSEM platforms use O(1) user-space calls and O(1)
+ * memory; other POSIX targets retain the bounded O(max_fd) fallback. */
+long cbm_subprocess_posix_fd_close_limit(void);
+void cbm_subprocess_posix_close_nonstdio(long max_fd);
+#endif
 
 /* Build a Windows CreateProcess command line from a NULL-terminated argv, applying
  * the Microsoft C runtime quoting rules (quote-wrap + escape embedded quotes and

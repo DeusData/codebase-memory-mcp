@@ -31,11 +31,8 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
-#ifdef _WIN32
-#include "foundation/win_utf8.h"
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
+#include "git/git_command.h"
+#include "git/git_snapshot.h" /* cbm_git_snapshot_path_supported */
 
 #include <errno.h>
 #include <limits.h>
@@ -89,6 +86,15 @@ struct cbm_watcher {
     void *user_data;
     CBMHashTable *projects; /* name → project_state_t* */
     cbm_mutex_t projects_lock;
+    /* The run loop parks on this condition between polls. stop publishes its
+     * predicate and broadcasts under the same mutex, eliminating lost wakeups
+     * and the former O(poll-chunk) shutdown delay. This adds O(1) memory and
+     * O(1) wake work without periodic CPU polling on every platform. */
+    cbm_mutex_t wait_lock;
+    cbm_thread_condition_t wait_condition;
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+    atomic_int waiters;
+#endif
     /* Serializes callback replacement with the entire destructive prune
      * transaction so a borrowed daemon context cannot be freed mid-callback. */
     cbm_mutex_t coordination_lock;
@@ -97,6 +103,11 @@ struct cbm_watcher {
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
     atomic_int stopped;
+    /* Configured poll cadence (watcher_poll_base_ms / watcher_poll_max_ms);
+     * 0 selects the built-in default for that bound. Published by
+     * cbm_watcher_run() and read when computing each project's interval. */
+    int poll_base_ms;
+    int poll_max_ms;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
     int pending_free_count;
@@ -122,9 +133,6 @@ struct cbm_watcher {
 #define MISSING_ROOT_DELETE_AFTER 3
 #define PRUNE_GRACE_DEFAULT_S 600 /* 10 min; override: CBM_WATCHER_PRUNE_GRACE_S */
 
-/* Sleep chunk for responsive shutdown (ms) */
-#define SLEEP_CHUNK_MS 500
-
 /* Git is external and repository-controlled configuration may activate slow
  * helpers (for example fsmonitor). Every invocation therefore has both a hard
  * wall-clock deadline and a finite capture budget. */
@@ -143,10 +151,18 @@ static int64_t now_ns(void) {
 
 /* ── Adaptive interval ──────────────────────────────────────────── */
 
-int cbm_watcher_poll_interval_ms(int file_count) {
-    int ms = POLL_BASE_MS + ((file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
-    if (ms > POLL_MAX_MS) {
-        ms = POLL_MAX_MS;
+int cbm_watcher_poll_interval_ms(int file_count, int base_ms, int max_ms) {
+    /* base_ms / max_ms are the configured cadence (watcher_poll_base_ms and
+     * watcher_poll_max_ms); 0 selects the built-in default for that bound. The
+     * per-project interval scales with file count and is capped by max_ms. */
+    int base = base_ms > 0 ? base_ms : POLL_BASE_MS;
+    int cap = max_ms > 0 ? max_ms : POLL_MAX_MS;
+    if (cap < base) {
+        cap = base;
+    }
+    int ms = base + ((file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
+    if (ms > cap) {
+        ms = cap;
     }
     return ms;
 }
@@ -202,120 +218,6 @@ static bool watcher_git_output_create(watcher_git_output_t *output) {
     return closed;
 }
 
-#ifdef _WIN32
-/* CreateProcessW does not search PATH when lpApplicationName is non-NULL.
- * Resolve Git ourselves, and deliberately accept only absolute PATH entries:
- * empty/relative entries would reintroduce Windows' current-directory search. */
-static bool watcher_windows_path_absolute(const wchar_t *path) {
-    if (!path || wcslen(path) < 3U) {
-        return false;
-    }
-    bool drive = ((path[0] >= L'A' && path[0] <= L'Z') || (path[0] >= L'a' && path[0] <= L'z')) &&
-                 path[1] == L':' && (path[2] == L'\\' || path[2] == L'/');
-    bool unc = (path[0] == L'\\' || path[0] == L'/') && (path[1] == L'\\' || path[1] == L'/') &&
-               path[2] != L'\0' && path[2] != L'\\' && path[2] != L'/';
-    return drive || unc;
-}
-
-static bool watcher_windows_git_candidate(const wchar_t *entry, size_t entry_length,
-                                          char output[CBM_SZ_4K]) {
-    while (entry_length > 0U && (entry[0] == L' ' || entry[0] == L'\t')) {
-        entry++;
-        entry_length--;
-    }
-    while (entry_length > 0U &&
-           (entry[entry_length - 1U] == L' ' || entry[entry_length - 1U] == L'\t')) {
-        entry_length--;
-    }
-    if (entry_length >= 2U && entry[0] == L'"' && entry[entry_length - 1U] == L'"') {
-        entry++;
-        entry_length -= 2U;
-    }
-    while (entry_length > 0U && (entry[0] == L' ' || entry[0] == L'\t')) {
-        entry++;
-        entry_length--;
-    }
-    while (entry_length > 0U &&
-           (entry[entry_length - 1U] == L' ' || entry[entry_length - 1U] == L'\t')) {
-        entry_length--;
-    }
-    if (entry_length == 0U || entry_length >= CBM_SZ_4K) {
-        return false;
-    }
-    wchar_t directory[CBM_SZ_4K];
-    memcpy(directory, entry, entry_length * sizeof(*directory));
-    directory[entry_length] = L'\0';
-    if (!watcher_windows_path_absolute(directory) || wcschr(directory, L'"') != NULL) {
-        return false;
-    }
-
-    bool separator = directory[entry_length - 1U] == L'\\' || directory[entry_length - 1U] == L'/';
-    wchar_t candidate[CBM_SZ_4K];
-    int written =
-        swprintf(candidate, CBM_SZ_4K, separator ? L"%lsgit.exe" : L"%ls\\git.exe", directory);
-    if (written <= 0 || written >= CBM_SZ_4K) {
-        return false;
-    }
-    DWORD required = GetFullPathNameW(candidate, 0U, NULL, NULL);
-    wchar_t *normalized =
-        required > 0U ? malloc(((size_t)required + 1U) * sizeof(*normalized)) : NULL;
-    DWORD normalized_length =
-        normalized ? GetFullPathNameW(candidate, required + 1U, normalized, NULL) : 0U;
-    if (!normalized || normalized_length == 0U || normalized_length > required ||
-        !watcher_windows_path_absolute(normalized)) {
-        free(normalized);
-        return false;
-    }
-    HANDLE file = CreateFileW(normalized, GENERIC_READ | FILE_READ_ATTRIBUTES,
-                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
-                              OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    BY_HANDLE_FILE_INFORMATION information;
-    bool regular = file != INVALID_HANDLE_VALUE && GetFileType(file) == FILE_TYPE_DISK &&
-                   GetFileInformationByHandle(file, &information) != 0 &&
-                   (information.dwFileAttributes &
-                    (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0;
-    if (file != INVALID_HANDLE_VALUE) {
-        (void)CloseHandle(file);
-    }
-    char *utf8 = regular ? cbm_wide_to_utf8(normalized) : NULL;
-    size_t utf8_length = utf8 ? strlen(utf8) : 0U;
-    bool valid = utf8 && utf8_length > 0U && utf8_length < CBM_SZ_4K;
-    if (valid) {
-        memcpy(output, utf8, utf8_length + 1U);
-    }
-    free(utf8);
-    free(normalized);
-    return valid;
-}
-
-static bool watcher_resolve_git_executable(char output[CBM_SZ_4K]) {
-    output[0] = '\0';
-    DWORD required = GetEnvironmentVariableW(L"PATH", NULL, 0U);
-    wchar_t *path = required > 0U ? malloc((size_t)required * sizeof(*path)) : NULL;
-    DWORD length = path ? GetEnvironmentVariableW(L"PATH", path, required) : 0U;
-    if (!path || length == 0U || length >= required) {
-        free(path);
-        return false;
-    }
-    const wchar_t *entry = path;
-    for (const wchar_t *cursor = path;; cursor++) {
-        if (*cursor != L';' && *cursor != L'\0') {
-            continue;
-        }
-        if (watcher_windows_git_candidate(entry, (size_t)(cursor - entry), output)) {
-            free(path);
-            return true;
-        }
-        if (*cursor == L'\0') {
-            break;
-        }
-        entry = cursor + 1;
-    }
-    free(path);
-    return false;
-}
-#endif
-
 /* Run one literal argv vector in a contained process tree. active_git is
  * published under projects_lock before supervision starts, so stop/unwatch can
  * request cancellation without racing destruction of the handle. */
@@ -334,7 +236,7 @@ static watcher_git_status_t watcher_git_run(cbm_watcher_t *w, project_state_t *s
 
 #ifdef _WIN32
     char git_executable[CBM_SZ_4K];
-    if (!watcher_resolve_git_executable(git_executable)) {
+    if (!cbm_git_resolve_executable(git_executable)) {
         watcher_git_output_cleanup(output);
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
@@ -580,17 +482,6 @@ static uint64_t sig_fold(uint64_t h, const void *data, size_t len) {
     return h;
 }
 
-/* Platform-portable mtime_ns (mirrors pipeline_incremental.c). */
-static int64_t sig_stat_mtime_ns(const struct stat *st) {
-#ifdef __APPLE__
-    return ((int64_t)st->st_mtimespec.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    return (int64_t)st->st_mtime * NS_PER_SEC;
-#else
-    return ((int64_t)st->st_mtim.tv_sec * NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
-#endif
-}
-
 /* Fold a listed path's (size, mtime) into the signature so an in-place edit
  * of an already-dirty file still produces a new signature. A failed stat
  * (deleted file, quoting artifact) degrades to the entry text alone — the
@@ -604,13 +495,102 @@ static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char
     char abs[CBM_SZ_4K];
     snprintf(abs, sizeof(abs), "%s/%s%s", root_path, cdup ? cdup : "", rel);
     struct stat st;
-    if (stat(abs, &st) == 0) {
-        int64_t mt = sig_stat_mtime_ns(&st);
+    if (cbm_stat(abs, &st) == 0) {
+        int64_t mt = cbm_stat_mtime_ns(&st);
         int64_t sz = (int64_t)st.st_size;
         h = sig_fold(h, &mt, sizeof(mt));
         h = sig_fold(h, &sz, sizeof(sz));
     }
     return h;
+}
+
+/* Dirty-file ledger, carried over from api-consolidation. Upstream main tracks
+ * the dirty SIGNATURE (to decide whether to reindex) but never persists WHICH
+ * files are dirty; that ledger is what feeds cbm_store_count_dirty_files and the
+ * MCP dirty-file freshness warnings, and it is asserted by
+ * TEST(watcher_marks_dirty_file_before_failed_index_callback).
+ *
+ * It is recorded during the signature walk rather than by a second
+ * `git status` run (which is what the branch did), so the ledger costs no extra
+ * child process. */
+/* Reject a root path the watcher cannot safely hand to git, BEFORE registering
+ * it. Both guards are still load-bearing in the merged tree:
+ *
+ *  - Shell metacharacters: src/git/git_command.c still builds quoted shell
+ *    command strings (it calls cbm_git_validate_repo_path itself at :39 and
+ *    :50), so the argv-based execution that would make this redundant is not
+ *    in place yet.
+ *  - Path length: cbm_git_snapshot_path_supported bounds the path against the
+ *    git command buffer. This one is independent of shell-versus-argv — an
+ *    overlong path overruns a fixed command buffer either way.
+ *
+ * Rejecting at registration rather than at poll time is what keeps the failure
+ * loud and cheap: an unregistered project reports once here, instead of every
+ * poll cycle silently producing an empty git result that reads as "no changes".
+ * cbm_watcher_mark_indexed is covered transitively because it registers through
+ * cbm_watcher_watch. */
+static bool watcher_validate_path(const char *event, const char *project_name,
+                                  const char *root_path) {
+    if (!cbm_git_validate_repo_path(root_path)) {
+        cbm_log_warn(event, "project", project_name, "reason",
+                     "path contains shell metacharacters");
+        return false;
+    }
+    if (!cbm_git_snapshot_path_supported(root_path)) {
+        cbm_log_warn(event, "project", project_name, "reason", "path too long for git command");
+        return false;
+    }
+    return true;
+}
+
+static bool watcher_store_has_project(cbm_store_t *store, const char *project_name) {
+    if (!store || !project_name) {
+        return false;
+    }
+    cbm_project_t project = {0};
+    int rc = cbm_store_get_project(store, project_name, &project);
+    if (rc == CBM_STORE_OK) {
+        cbm_project_free_fields(&project);
+        return true;
+    }
+    if (rc != CBM_STORE_NOT_FOUND) {
+        cbm_log_warn("watcher.dirty_ledger.warn", "project", project_name, "phase", "get_project");
+    }
+    return false;
+}
+
+static void watcher_record_dirty_path(cbm_watcher_t *w, const project_state_t *state,
+                                      const char *rel_path) {
+    if (!w || !w->store || !state || !rel_path || !rel_path[0]) {
+        return;
+    }
+    char observed_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    int64_t observed_mtime_ns = 0;
+    int64_t observed_size = 0;
+    char abs_path[CBM_PATH_MAX];
+    int n = snprintf(abs_path, sizeof(abs_path), "%s/%s", state->root_path, rel_path);
+    if (n >= 0 && (size_t)n < sizeof(abs_path)) {
+        (void)cbm_file_content_hash(abs_path, observed_hash, sizeof(observed_hash));
+        struct stat st;
+        if (cbm_stat(abs_path, &st) == 0) {
+            observed_mtime_ns = cbm_stat_mtime_ns(&st);
+            observed_size = (int64_t)st.st_size;
+        }
+    }
+    cbm_dirty_file_state_t dirty = {
+        .project = state->project_name,
+        .rel_path = rel_path,
+        .observed_hash = observed_hash,
+        .observed_mtime_ns = observed_mtime_ns,
+        .observed_size = observed_size,
+        .observed_generation = 0,
+        .source = CBM_STORE_DIRTY_SOURCE_WATCHER,
+        .status = CBM_STORE_DIRTY_STATUS_PENDING,
+    };
+    if (cbm_store_upsert_dirty_file(w->store, &dirty) != CBM_STORE_OK) {
+        cbm_log_warn("watcher.dirty_ledger.warn", "project", state->project_name, "phase",
+                     "upsert_dirty_file");
+    }
 }
 
 /* Signature of the current dirty state: FNV-1a over the entries of
@@ -621,12 +601,87 @@ static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char
  * untracked directories individually (a nested addition under `?? dir/`
  * would otherwise be invisible); -z gives unquoted NUL-separated paths that
  * hash identically across polls and stat cleanly. */
+typedef struct {
+    char **items;
+    size_t count;
+    size_t capacity;
+} watcher_ledger_paths_t;
+
+/* Geometric growth keeps collection amortized O(N) in the number of dirty
+ * paths and uses O(N + path bytes) memory. Failure is propagated by
+ * git_dirty_signature so a reindex cannot consume a change while publishing
+ * only a prefix of its freshness ledger. */
+static bool watcher_ledger_paths_append(watcher_ledger_paths_t *paths, const char *path) {
+    if (!paths || !path) {
+        return false;
+    }
+    if (paths->count >= paths->capacity) {
+        if (paths->capacity > SIZE_MAX / CBM_SZ_2) {
+            return false;
+        }
+        size_t next_capacity = paths->capacity ? paths->capacity * CBM_SZ_2 : CBM_SZ_64;
+        if (next_capacity > SIZE_MAX / sizeof(*paths->items)) {
+            return false;
+        }
+        char **grown = realloc(paths->items, next_capacity * sizeof(*paths->items));
+        if (!grown) {
+            return false;
+        }
+        paths->items = grown;
+        paths->capacity = next_capacity;
+    }
+    char *copy = cbm_strndup(path, strlen(path));
+    if (!copy) {
+        return false;
+    }
+    paths->items[paths->count++] = copy;
+    return true;
+}
+
+static void watcher_ledger_paths_destroy(watcher_ledger_paths_t *paths) {
+    if (!paths) {
+        return;
+    }
+    for (size_t i = 0; i < paths->count; i++) {
+        free(paths->items[i]);
+    }
+    free(paths->items);
+    *paths = (watcher_ledger_paths_t){0};
+}
+
+/* Convert porcelain's repository-relative path to the watched project's
+ * relative path. --show-cdup is one "../" per project path segment, while
+ * `git status -- .` guarantees every returned path is inside that project. */
+static const char *watcher_project_relative_path(const char *repo_cdup, const char *repo_rel) {
+    if (!repo_cdup || !repo_rel || !repo_rel[0]) {
+        return NULL;
+    }
+    while (strncmp(repo_cdup, "../", 3) == 0) {
+        const char *slash = strchr(repo_rel, '/');
+        if (!slash || !slash[1]) {
+            return NULL;
+        }
+        repo_cdup += 3;
+        repo_rel = slash + 1;
+    }
+    return repo_cdup[0] ? NULL : repo_rel;
+}
+
 static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_t *state,
-                                                uint64_t *signature_out) {
+                                                uint64_t *signature_out, bool record_ledger) {
     if (!signature_out) {
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
     *signature_out = 0;
+    /* Dirty-path ledger. Resolved once per call, not per entry, because
+     * cbm_store_get_project is a query. Paths are buffered during the walk and
+     * written only if the signature actually CHANGED (below): a persistently
+     * dirty tree polled while idle must not re-upsert the same rows every poll,
+     * which is the same waste #937's signature exists to avoid. */
+    bool ledger =
+        record_ledger && w && w->store && watcher_store_has_project(w->store, state->project_name);
+    watcher_ledger_paths_t ledger_paths = {0};
+    bool ledger_failed = false;
     /* `-- .` scopes the report to the watched directory. Without it a project
      * watched at a sub-package of a monorepo reindexes whenever any SIBLING
      * package changes, because git reports the whole repository's dirty state
@@ -647,6 +702,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
     FILE *fp = cbm_fopen(output.path, "rb");
     if (!fp) {
         watcher_git_output_cleanup(&output);
+        watcher_ledger_paths_destroy(&ledger_paths);
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
 
@@ -683,6 +739,16 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
                     origin_token = true;
                 }
                 h = sig_fold_path_stat(h, state->root_path, state->repo_cdup, entry + 3);
+                if (ledger) {
+                    const char *project_rel =
+                        watcher_project_relative_path(state->repo_cdup, entry + 3);
+                    if (!project_rel || !watcher_ledger_paths_append(&ledger_paths, project_rel)) {
+                        ledger = false;
+                        ledger_failed = true;
+                        cbm_log_warn("watcher.dirty_ledger.warn", "project", state->project_name,
+                                     "phase", project_rel ? "buffer_paths" : "normalize_path");
+                    }
+                }
             }
         }
         elen = 0;
@@ -694,6 +760,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
     bool parsed = !ferror(fp) && fclose(fp) == 0;
     watcher_git_output_cleanup(&output);
     if (!parsed) {
+        watcher_ledger_paths_destroy(&ledger_paths);
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
 
@@ -720,6 +787,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
         fp = cbm_fopen(output.path, "rb");
         if (!fp) {
             watcher_git_output_cleanup(&output);
+            watcher_ledger_paths_destroy(&ledger_paths);
             return WATCHER_GIT_SUPERVISION_FAILED;
         }
         char line[CBM_SZ_4K];
@@ -741,14 +809,29 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
         parsed = !ferror(fp) && fclose(fp) == 0;
         watcher_git_output_cleanup(&output);
         if (!parsed) {
+            watcher_ledger_paths_destroy(&ledger_paths);
             return WATCHER_GIT_SUPERVISION_FAILED;
         }
     } else if (submodule_status != WATCHER_GIT_COMMAND_FAILED) {
+        watcher_ledger_paths_destroy(&ledger_paths);
         return submodule_status;
     }
 #endif
 
+    if (ledger_failed) {
+        watcher_ledger_paths_destroy(&ledger_paths);
+        return WATCHER_GIT_SUPERVISION_FAILED;
+    }
     *signature_out = any ? (h ? h : 1) : 0; /* reserve 0 for "clean" */
+    /* Flush only on a CHANGED signature: an idle poll over a persistently
+     * dirty tree must not rewrite the same rows. Recorded before the index
+     * callback runs, so the ledger survives a failed index. */
+    if (ledger && *signature_out != state->last_dirty_sig) {
+        for (size_t i = 0; i < ledger_paths.count; i++) {
+            watcher_record_dirty_path(w, state, ledger_paths.items[i]);
+        }
+    }
+    watcher_ledger_paths_destroy(&ledger_paths);
     return WATCHER_GIT_OK;
 }
 
@@ -867,7 +950,7 @@ static root_status_t root_status(const char *root_path, int *out_errno) {
         return ROOT_UNCERTAIN;
     }
     struct stat st;
-    if (stat(root_path, &st) == 0) {
+    if (cbm_stat(root_path, &st) == 0) {
         /* Exists but is no longer a directory → the root directory is gone. */
         return S_ISDIR(st.st_mode) ? ROOT_PRESENT : ROOT_MISSING;
     }
@@ -980,8 +1063,19 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
         return NULL;
     }
     cbm_mutex_init(&w->projects_lock);
+    cbm_mutex_init(&w->wait_lock);
+    if (cbm_thread_condition_init(&w->wait_condition) != 0) {
+        cbm_mutex_destroy(&w->wait_lock);
+        cbm_mutex_destroy(&w->projects_lock);
+        cbm_ht_free(w->projects);
+        free(w);
+        return NULL;
+    }
     cbm_mutex_init(&w->coordination_lock);
     atomic_init(&w->stopped, 0);
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+    atomic_init(&w->waiters, 0);
+#endif
     return w;
 }
 
@@ -1004,6 +1098,8 @@ void cbm_watcher_free(cbm_watcher_t *w) {
     cbm_mutex_unlock(&w->coordination_lock);
     cbm_mutex_destroy(&w->projects_lock);
     cbm_mutex_destroy(&w->coordination_lock);
+    cbm_thread_condition_destroy(&w->wait_condition);
+    cbm_mutex_destroy(&w->wait_lock);
     free(w);
 }
 
@@ -1028,6 +1124,9 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
 bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *root_path) {
     if (!w || !project_name || !project_name[0] || !root_path || !root_path[0] ||
         atomic_load_explicit(&w->stopped, memory_order_acquire)) {
+        return false;
+    }
+    if (!watcher_validate_path("watcher.watch.reject", project_name, root_path)) {
         return false;
     }
 
@@ -1094,6 +1193,62 @@ bool cbm_watcher_watch(cbm_watcher_t *w, const char *project_name, const char *r
     return true;
 }
 
+/* Defined below, next to the poll path it normally serves. */
+static bool init_baseline(cbm_watcher_t *w, project_state_t *s);
+
+/* Record that `project_name` was just indexed, so the watcher does not
+ * immediately reindex the state that index already captured.
+ *
+ * Carried over from api-consolidation, but reimplemented against upstream's
+ * project_state_t rather than that branch's snapshot layer, which does not exist
+ * here. The one deliberate difference from init_baseline: this commits the
+ * OBSERVED dirty signature instead of leaving last_dirty_sig at 0. init_baseline
+ * leaves it 0 on purpose, so a tree that is already dirty when first watched
+ * reindexes once (at-least-once, because the watcher cannot know whether that
+ * state reached the DB). Here the index demonstrably just ran over this tree, so
+ * committing the signature is correct and is exactly what suppresses the
+ * redundant follow-up reindex this function exists to prevent. */
+void cbm_watcher_mark_indexed(cbm_watcher_t *w, const char *project_name, const char *root_path) {
+    if (!w || !project_name || !project_name[0] || !root_path || !root_path[0] ||
+        atomic_load_explicit(&w->stopped, memory_order_acquire)) {
+        return;
+    }
+    /* Register the watch if it is not already present; an identical
+     * registration is a no-op that preserves the existing baseline. */
+    if (!cbm_watcher_watch(w, project_name, root_path)) {
+        return;
+    }
+
+    /* Take a borrowed reference under the lock, then do the git work outside it:
+     * git_head/git_dirty_signature spawn children and must never run with
+     * projects_lock held. `registered` tells us if the entry was replaced
+     * meanwhile, in which case the result is discarded. */
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s && strcmp(s->root_path, root_path) != 0) {
+        s = NULL;
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    if (!s) {
+        return;
+    }
+
+    if (!init_baseline(w, s)) {
+        cbm_log_warn("watcher.indexed.baseline", "project", project_name, "path", root_path);
+        return;
+    }
+    if (s->is_git) {
+        uint64_t signature = 0;
+        /* record_ledger=false: the index just consumed this dirty state, so
+         * re-marking those files as pending would be wrong. */
+        if (git_dirty_signature(w, s, &signature, false) == WATCHER_GIT_OK) {
+            s->last_dirty_sig = signature;
+            s->pending_dirty_sig = signature;
+        }
+    }
+    cbm_log_info("watcher.indexed", "project", project_name, "path", root_path);
+}
+
 void cbm_watcher_unwatch(cbm_watcher_t *w, const char *project_name) {
     if (!w || !project_name) {
         return;
@@ -1145,7 +1300,7 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 /* Init baseline for a project: check if git, get HEAD, count files */
 static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     struct stat st;
-    if (stat(s->root_path, &st) != 0) {
+    if (cbm_stat(s->root_path, &st) != 0) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;
@@ -1208,7 +1363,8 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
             return false;
         }
         s->file_count = file_count;
-        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+        s->interval_ms =
+            cbm_watcher_poll_interval_ms(s->file_count, w->poll_base_ms, w->poll_max_ms);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
     } else {
@@ -1255,7 +1411,7 @@ static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_ou
      * a persistently dirty tree polled while idle must not re-trigger
      * full reindex/write cycles (#937 write amplification). */
     uint64_t sig = 0;
-    watcher_git_status_t signature_status = git_dirty_signature(w, s, &sig);
+    watcher_git_status_t signature_status = git_dirty_signature(w, s, &sig, true);
     if (signature_status == WATCHER_GIT_COMMAND_FAILED) {
         /* The repository may have been removed between baseline and poll.
          * Preserve committed observations and wait for a later clean probe. */
@@ -1441,7 +1597,8 @@ static void poll_project(const char *key, void *val, void *ud) {
             int file_count = 0;
             if (git_file_count(ctx->w, s, &file_count) == WATCHER_GIT_OK) {
                 s->file_count = file_count;
-                s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+                s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count, ctx->w->poll_base_ms,
+                                                              ctx->w->poll_max_ms);
             }
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
@@ -1524,7 +1681,10 @@ static void cancel_active_git_entry(const char *key, void *value, void *user_dat
 
 void cbm_watcher_stop(cbm_watcher_t *w) {
     if (w) {
+        cbm_mutex_lock(&w->wait_lock);
         atomic_store_explicit(&w->stopped, 1, memory_order_release);
+        cbm_thread_condition_broadcast(&w->wait_condition);
+        cbm_mutex_unlock(&w->wait_lock);
         cbm_mutex_lock(&w->projects_lock);
         cbm_ht_foreach(w->projects, cancel_active_git_entry, NULL);
         for (int i = 0; i < w->pending_free_count; i++) {
@@ -1537,31 +1697,54 @@ void cbm_watcher_stop(cbm_watcher_t *w) {
     }
 }
 
-int cbm_watcher_run(cbm_watcher_t *w, int base_interval_ms) {
+int cbm_watcher_run(cbm_watcher_t *w, int base_ms, int max_ms) {
     if (!w) {
         return CBM_NOT_FOUND;
     }
-    if (base_interval_ms <= 0) {
-        base_interval_ms = POLL_BASE_MS;
-    }
+    /* Publish the configured cadence before the loop so every per-project
+     * interval computed by init_baseline/poll_project honors it. The loop tick
+     * below is deliberately NOT adaptive: it only decides how often the thread
+     * wakes to see which projects are due. */
+    w->poll_base_ms = base_ms > 0 ? base_ms : 0;
+    w->poll_max_ms = max_ms > 0 ? max_ms : 0;
+    int base_interval_ms = base_ms > 0 ? base_ms : POLL_BASE_MS;
 
     cbm_log_info("watcher.start", "interval_ms", base_interval_ms > 999 ? "multi-sec" : "fast");
 
+    int run_status = 0;
     while (!atomic_load(&w->stopped)) {
         cbm_watcher_poll_once(w);
 
-        /* Sleep in small increments to allow responsive shutdown */
-        int slept = 0;
-        while (slept < base_interval_ms && !atomic_load(&w->stopped)) {
-            int chunk = base_interval_ms - slept;
-            if (chunk > SLEEP_CHUNK_MS) {
-                chunk = SLEEP_CHUNK_MS;
+        uint64_t wait_deadline_ms = cbm_now_ms() + (uint64_t)base_interval_ms;
+        cbm_mutex_lock(&w->wait_lock);
+        while (!atomic_load_explicit(&w->stopped, memory_order_acquire) &&
+               cbm_now_ms() < wait_deadline_ms) {
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+            (void)atomic_fetch_add_explicit(&w->waiters, 1, memory_order_release);
+#endif
+            cbm_thread_condition_wait_status_t wait_status = cbm_thread_condition_wait_until(
+                &w->wait_condition, &w->wait_lock, wait_deadline_ms);
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+            (void)atomic_fetch_sub_explicit(&w->waiters, 1, memory_order_release);
+#endif
+            if (wait_status == CBM_THREAD_CONDITION_WAIT_ERROR) {
+                cbm_log_error("watcher.wait_failed", "action", "stop");
+                run_status = CBM_NOT_FOUND;
+                break;
             }
-            cbm_usleep((unsigned)chunk * CBM_MSEC_PER_SEC);
-            slept += chunk;
+        }
+        cbm_mutex_unlock(&w->wait_lock);
+        if (run_status != 0) {
+            break;
         }
     }
 
     cbm_log_info("watcher.stop");
-    return 0;
+    return run_status;
 }
+
+#ifdef CBM_WATCHER_ENABLE_TEST_API
+int cbm_watcher_waiter_count_for_test(const cbm_watcher_t *w) {
+    return w ? atomic_load_explicit(&w->waiters, memory_order_acquire) : 0;
+}
+#endif

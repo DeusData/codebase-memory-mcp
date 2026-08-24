@@ -437,7 +437,16 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
         _exit(0);
     }
     int status = 0;
-    (void)waitpid(pid, &status, 0);
+    /* leaks --atExit (macOS) SIGSTOPs the forked child during heap inspection;
+     * WUNTRACED+SIGCONT avoids the hang (mirrors test_store_bulk.c, b336466). */
+    for (;;) {
+        if (waitpid(pid, &status, WUNTRACED) < 0) break;
+        if (WIFSTOPPED(status)) {
+            kill(pid, SIGCONT);
+            continue;
+        }
+        break;
+    }
     return WIFSIGNALED(status);
 #endif
 }
@@ -585,40 +594,9 @@ TEST(lsp_python_deep_expression_no_crash) {
     PASS();
 }
 
-TEST(lsp_perl_deep_expression_no_crash) {
-    /* Deeply nested Perl call expressions f(f(f(...f(1)...))). Unlike the
-     * Java/C++ cases, the overflow here is NOT in the LSP walk — it is in
-     * tree-sitter's own GLR parser: stack_node_add_link (vendored
-     * ts_runtime/src/stack.c) recurses once per nesting level while merging the
-     * ambiguous parse-stack heads that Perl's `f(...)` grammar produces, blowing
-     * a small (1 MB Windows) stack during the parse, before any LSP walk runs.
-     * The CBM_PERL_MAX_PARSE_NESTING pre-parse guard in cbm_extract_file skips
-     * such input so it never reaches tree-sitter. See
-     * lsp_java_deep_nesting_no_crash on the depth choice. */
-    const int DEPTH = 30000;
-    size_t sz = (size_t)DEPTH * 3 + 256;
-    char *src = malloc(sz);
-    ASSERT_NOT_NULL(src);
-    char *p = src;
-    p += snprintf(p, sz, "sub f { return $_[0]; }\nsub g { return ");
-    for (int i = 0; i < DEPTH; i++) {
-        *p++ = 'f';
-        *p++ = '(';
-    }
-    *p++ = '1';
-    memset(p, ')', DEPTH);
-    p += DEPTH;
-    snprintf(p, sz - (size_t)(p - src), "; }\n");
-    ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_PERL, "deep.pl"));
-    free(src);
-    PASS();
-}
-
 TEST(perl_glr_deep_parse_recursion_capped) {
-    /* Issue #913 — the proper fix for what lsp_perl_deep_expression_no_crash's
-     * pre-parse guard only works around. Parse deeply nested ambiguous Perl
-     * f(f(f(...f(1)...))) DIRECTLY (past the CBM_PERL_MAX_PARSE_NESTING guard,
-     * which would otherwise skip it). Perl's paren-optional call grammar makes
+    /* Issue #913 — parse deeply nested ambiguous Perl f(f(f(...f(1)...)))
+     * directly. Perl's paren-optional call grammar makes
      * each level ambiguous, so tree-sitter's GLR parser merges the ambiguous
      * parse-stack heads recursively — stack_node_add_link in
      * ts_runtime/src/stack.c, once per nesting level — overflowing the native
@@ -626,8 +604,7 @@ TEST(perl_glr_deep_parse_recursion_capped) {
      * during the parse, before any extraction runs. The
      * CBM_TS_STACK_MERGE_MAX_DEPTH cap stops merging past the bound: the
      * ambiguity is left on the GLR stack instead of merged — a valid parse,
-     * never a wrong one — so the parse returns cleanly instead of crashing.
-     * Depth mirrors lsp_perl_deep_expression_no_crash. */
+     * never a wrong one — so the parse returns cleanly instead of crashing. */
     const int DEPTH = 30000;
     size_t sz = (size_t)DEPTH * 3 + 256;
     char *src = malloc(sz);
@@ -789,7 +766,6 @@ SUITE(stack_overflow_a) {
     RUN_TEST(lsp_java_lambda_args_exceed_params_no_crash);
     RUN_TEST(lsp_cpp_deep_expression_no_crash);
     RUN_TEST(lsp_python_deep_expression_no_crash);
-    RUN_TEST(lsp_perl_deep_expression_no_crash);
 
     cbm_shutdown();
 }

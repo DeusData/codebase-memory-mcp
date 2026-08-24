@@ -6,20 +6,22 @@
  */
 #include "foundation/constants.h"
 #include "foundation/compat_thread.h"
-
 #include "foundation/platform.h"
 #include "foundation/sanitized.h" /* CBM_SANITIZED — diagnostic stack floor */
 
-#include <mimalloc.h> /* mi_thread_done at thread exit */
-
-#include <pthread.h>
+#include <errno.h>
 #include <stdlib.h>
+#include <string.h>
+
+#ifdef _WIN32
+#include <mimalloc.h> /* mi_thread_done at thread exit */
+#else
+#include <pthread.h>
+#endif
 
 /* Default 8MB stack for all threads. macOS ARM64 default is only 512KB,
  * which is too small for deep pipeline passes (configlink, etc.). */
 #define CBM_DEFAULT_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
-
-#include <string.h>
 
 /* Thread stacks are sized in code (explicitly by most callers, by the default
  * above otherwise), so RLIMIT_STACK does NOT reach them and a sanitizer lane
@@ -33,7 +35,8 @@
  * binary keeps its fixed, predictable stack sizes. */
 static size_t cbm_thread_stack_floor(size_t requested) {
 #if CBM_SANITIZED
-    const char *env = getenv("CBM_THREAD_STACK_MB");
+    char env_buf[CBM_SZ_64];
+    const char *env = cbm_safe_getenv("CBM_THREAD_STACK_MB", env_buf, sizeof(env_buf), NULL);
     if (env && env[0]) {
         char *end = NULL;
         unsigned long mb = strtoul(env, &end, 10);
@@ -64,12 +67,13 @@ typedef struct {
 /* Release each thread's allocator heap at DLL_THREAD_DETACH.
  *
  * Doing this from the thread wrapper instead crashes: the wrapper returns
- * before the CRT's own thread teardown, and abandoning the heap there raced
- * with frees still in flight (daemon_ipc_wait_forever_is_interruptible
- * segfaulted, rc=139, reproducibly and only with the release enabled). A TLS
- * callback is the mechanism mimalloc itself uses under MSVC and runs after all
- * other thread cleanup, which is the only point where the heap is genuinely
- * unreferenced.
+ * before the platform has finished retiring the thread, and abandoning the
+ * heap there raced with frees still in flight
+ * (daemon_ipc_wait_forever_is_interruptible segfaulted, rc=139, reproducibly
+ * and only with wrapper-side release enabled). A loader TLS callback is the
+ * mechanism mimalloc itself uses under MSVC. It moves the release out of the
+ * user-function wrapper and into Windows' DLL_THREAD_DETACH path, after the
+ * thread entry point has returned.
  *
  * Without any of this, a static MinGW link -- no DllMain, no TLS callback --
  * never releases a thread heap at all: 607 heaps after 300 requests, 170 MiB
@@ -111,16 +115,8 @@ static DWORD WINAPI win_thread_wrapper(LPVOID lpParam) {
     void *arg = a->arg;
     free(a);
     fn(arg);
-    /* Release this thread's allocator heap before the thread dies.
-     *
-     * On POSIX a pthread TSD destructor calls this for us, which is why POSIX
-     * stays flat. A static MinGW link has no DllMain and registers no TLS
-     * callback, so nothing runs at thread exit and every thread leaves its
-     * thread-heap behind for the life of the process: 607 heaps after 300
-     * requests, 170 MiB committed against a live set of ~300 KiB, growing
-     * without bound (#581). The heaps are invisible to mi_heap_visit -- which
-     * only sees the main and calling heaps -- which is why the growth looked
-     * like it belonged to no allocator at all. */
+    /* Keep the allocator live while the thread returns through platform exit
+     * machinery; DLL_THREAD_DETACH owns the eventual release above. */
     return 0;
 }
 
@@ -231,6 +227,101 @@ void cbm_mutex_unlock(cbm_mutex_t *m) {
 
 void cbm_mutex_destroy(cbm_mutex_t *m) {
     pthread_mutex_destroy(&m->mtx);
+}
+
+#endif
+
+/* ── Condition variable ───────────────────────────────────────── */
+
+#ifdef _WIN32
+
+int cbm_thread_condition_init(cbm_thread_condition_t *condition) {
+    InitializeConditionVariable(&condition->condition);
+    return 0;
+}
+
+void cbm_thread_condition_destroy(cbm_thread_condition_t *condition) {
+    (void)condition; /* Win32 condition variables require no destruction. */
+}
+
+void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition) {
+    WakeAllConditionVariable(&condition->condition);
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait(cbm_thread_condition_t *condition,
+                                                             cbm_mutex_t *mutex) {
+    return SleepConditionVariableCS(&condition->condition, &mutex->cs, INFINITE)
+               ? CBM_THREAD_CONDITION_WAIT_SIGNALED
+               : CBM_THREAD_CONDITION_WAIT_ERROR;
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
+    cbm_thread_condition_t *condition, cbm_mutex_t *mutex, uint64_t deadline_ms) {
+    uint64_t now_ms = cbm_now_ms();
+    uint64_t remaining_ms = deadline_ms > now_ms ? deadline_ms - now_ms : 0;
+    DWORD timeout_ms =
+        remaining_ms < (uint64_t)INFINITE ? (DWORD)remaining_ms : (DWORD)(INFINITE - 1U);
+    if (SleepConditionVariableCS(&condition->condition, &mutex->cs, timeout_ms)) {
+        return CBM_THREAD_CONDITION_WAIT_SIGNALED;
+    }
+    return GetLastError() == ERROR_TIMEOUT ? CBM_THREAD_CONDITION_WAIT_TIMEOUT
+                                           : CBM_THREAD_CONDITION_WAIT_ERROR;
+}
+
+#else /* POSIX */
+
+int cbm_thread_condition_init(cbm_thread_condition_t *condition) {
+#ifdef __APPLE__
+    return pthread_cond_init(&condition->condition, NULL);
+#else
+    pthread_condattr_t attributes;
+    int status = pthread_condattr_init(&attributes);
+    if (status != 0) {
+        return status;
+    }
+    status = pthread_condattr_setclock(&attributes, CLOCK_MONOTONIC);
+    if (status == 0) {
+        status = pthread_cond_init(&condition->condition, &attributes);
+    }
+    (void)pthread_condattr_destroy(&attributes);
+    return status;
+#endif
+}
+
+void cbm_thread_condition_destroy(cbm_thread_condition_t *condition) {
+    (void)pthread_cond_destroy(&condition->condition);
+}
+
+void cbm_thread_condition_broadcast(cbm_thread_condition_t *condition) {
+    (void)pthread_cond_broadcast(&condition->condition);
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait(cbm_thread_condition_t *condition,
+                                                             cbm_mutex_t *mutex) {
+    return pthread_cond_wait(&condition->condition, &mutex->mtx) == 0
+               ? CBM_THREAD_CONDITION_WAIT_SIGNALED
+               : CBM_THREAD_CONDITION_WAIT_ERROR;
+}
+
+cbm_thread_condition_wait_status_t cbm_thread_condition_wait_until(
+    cbm_thread_condition_t *condition, cbm_mutex_t *mutex, uint64_t deadline_ms) {
+    struct timespec timeout;
+#ifdef __APPLE__
+    uint64_t now_ms = cbm_now_ms();
+    uint64_t remaining_ms = deadline_ms > now_ms ? deadline_ms - now_ms : 0;
+    timeout.tv_sec = (time_t)(remaining_ms / CBM_MSEC_PER_SEC);
+    timeout.tv_nsec = (long)((remaining_ms % CBM_MSEC_PER_SEC) * CBM_NSEC_PER_MSEC);
+    int status = pthread_cond_timedwait_relative_np(&condition->condition, &mutex->mtx, &timeout);
+#else
+    timeout.tv_sec = (time_t)(deadline_ms / CBM_MSEC_PER_SEC);
+    timeout.tv_nsec = (long)((deadline_ms % CBM_MSEC_PER_SEC) * CBM_NSEC_PER_MSEC);
+    int status = pthread_cond_timedwait(&condition->condition, &mutex->mtx, &timeout);
+#endif
+    if (status == 0) {
+        return CBM_THREAD_CONDITION_WAIT_SIGNALED;
+    }
+    return status == ETIMEDOUT ? CBM_THREAD_CONDITION_WAIT_TIMEOUT
+                               : CBM_THREAD_CONDITION_WAIT_ERROR;
 }
 
 #endif

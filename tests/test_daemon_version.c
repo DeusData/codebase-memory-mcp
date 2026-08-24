@@ -7,6 +7,7 @@
  * tests.
  */
 #include "test_framework.h"
+#include "test_helpers.h"
 
 #include "daemon/daemon.h"
 #include "daemon/service.h"
@@ -240,6 +241,90 @@ TEST(daemon_build_fingerprint_hashes_exact_executable_bytes) {
     ASSERT_STR_NEQ(first, second);
 
     version_test_cleanup(dir, first_path, second_path, NULL);
+    PASS();
+}
+
+TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes) {
+    char dir[VERSION_TEST_PATH_CAP] = {0};
+    char image_path[VERSION_TEST_PATH_CAP] = {0};
+    char second_image_path[VERSION_TEST_PATH_CAP] = {0};
+    char cache_path[VERSION_TEST_PATH_CAP] = {0};
+    char initial[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char cached[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char future_rehashed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char future_recovered[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char second[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char retained[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char strict[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char changed[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char recovered[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    bool cache_hit = true;
+    bool setup_ok = version_test_temp_dir(dir, "fingerprint-cache") &&
+                    version_test_child_path(image_path, dir, "build.bin") &&
+                    version_test_child_path(second_image_path, dir, "second-build.bin") &&
+                    version_test_child_path(cache_path, dir, "fingerprint.cache") &&
+                    version_test_write_file(image_path, "same-version-build-a") &&
+                    version_test_write_file(second_image_path, "other-native-image");
+    if (!setup_ok) {
+        version_test_cleanup(dir, image_path, cache_path, second_image_path);
+        FAIL("could not create fingerprint-cache fixtures");
+    }
+    ASSERT_TRUE(th_backdate_file_for_cache_test(image_path));
+    ASSERT_TRUE(th_backdate_file_for_cache_test(second_image_path));
+
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, initial, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_TRUE(version_test_is_sha256(initial));
+    ASSERT_GT(version_test_file_size(cache_path), 0);
+
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, cached, &cache_hit));
+    ASSERT_TRUE(cache_hit);
+    ASSERT_STR_EQ(initial, cached);
+
+    /* A future cache epoch is ambiguous (clock rollback or a skewed volume),
+     * so it must pay the exact hash once and replace the suspect cache. */
+    ASSERT_TRUE(th_futuredate_file_for_cache_test(cache_path));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, future_rehashed, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_EQ(initial, future_rehashed);
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, future_recovered, &cache_hit));
+    ASSERT_TRUE(cache_hit);
+    ASSERT_STR_EQ(initial, future_recovered);
+
+    /* A managed daemon copy and its invoking CLI have different native file
+     * identities even when their bytes match. Retain both fixed-size records:
+     * alternating between the two steady images must not turn every process
+     * start back into O(executable bytes) hashing. */
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(second_image_path, cache_path,
+                                                                     true, second, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(image_path, cache_path, true,
+                                                                     retained, &cache_hit));
+    ASSERT_TRUE(cache_hit);
+    ASSERT_STR_EQ(initial, retained);
+
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, false, strict, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_EQ(initial, strict);
+
+    ASSERT_TRUE(version_test_write_file(image_path, "same-version-build-z"));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, changed, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_NEQ(initial, changed);
+
+    ASSERT_TRUE(version_test_write_file(cache_path, "corrupt"));
+    ASSERT_TRUE(cbm_daemon_build_fingerprint_file_cached_for_testing(
+        image_path, cache_path, true, recovered, &cache_hit));
+    ASSERT_FALSE(cache_hit);
+    ASSERT_STR_EQ(changed, recovered);
+
+    version_test_cleanup(dir, image_path, cache_path, second_image_path);
     PASS();
 }
 
@@ -611,6 +696,7 @@ TEST(daemon_conflict_log_windows_concurrent_appends_are_not_dropped) {
 SUITE(daemon_version) {
     RUN_TEST(daemon_rendezvous_key_is_stable_and_version_independent);
     RUN_TEST(daemon_build_fingerprint_hashes_exact_executable_bytes);
+    RUN_TEST(daemon_build_fingerprint_cache_reuses_only_unchanged_exact_bytes);
     RUN_TEST(daemon_hello_accepts_only_the_exact_active_build_identity);
     RUN_TEST(daemon_hello_version_conflict_exposes_active_and_requested_builds);
     RUN_TEST(daemon_hello_rejects_each_abi_mismatch);

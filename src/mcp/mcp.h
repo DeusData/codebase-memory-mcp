@@ -2,7 +2,7 @@
  * mcp.h — MCP (Model Context Protocol) server for codebase-memory-mcp.
  *
  * Implements JSON-RPC 2.0 over stdio with the MCP tool calling protocol.
- * Provides 14 graph analysis tools (search, trace, query, index, etc.)
+ * Provides graph analysis tools (search, trace, query, index, etc.)
  */
 #ifndef CBM_MCP_H
 #define CBM_MCP_H
@@ -15,32 +15,82 @@
 
 /* ── Forward declarations ─────────────────────────────────────── */
 
-typedef struct cbm_store cbm_store_t; /* from store/store.h */
-struct cbm_watcher;                   /* from watcher/watcher.h */
-struct cbm_config;                    /* from cli/cli.h */
+typedef struct cbm_store cbm_store_t;           /* from store/store.h */
+typedef struct cbm_mcp_server cbm_mcp_server_t; /* forward decl for tools_list */
+typedef struct yyjson_mut_doc yyjson_mut_doc;   /* from yyjson.h */
+typedef struct yyjson_mut_val yyjson_mut_val;   /* from yyjson.h */
+struct cbm_watcher;                             /* from watcher/watcher.h */
+struct cbm_config;                              /* from cli/cli.h */
+
+#define CBM_MCP_TOOLS_LIST_CHANGED_METHOD "notifications/tools/list_changed"
+#define CBM_MCP_TOOLS_LIST_CHANGED_JSON \
+    "{\"jsonrpc\":\"2.0\",\"method\":\"" CBM_MCP_TOOLS_LIST_CHANGED_METHOD "\"}"
+
+typedef enum {
+    CBM_MCP_TOOL_PROFILE_ALL = 0,
+    /* Restricted agent surfaces advertise and execute only inspection tools.
+     * Cache maintenance may still occur outside these tool calls, so these
+     * profiles are deliberately not named strictly read-only. */
+    CBM_MCP_TOOL_PROFILE_ANALYSIS = 1,
+    CBM_MCP_TOOL_PROFILE_SCOUT = 2,
+} cbm_mcp_tool_profile_t;
+
+int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
+                                    cbm_mcp_tool_profile_t *profile_out);
+bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile);
 
 /* ── JSON-RPC types ───────────────────────────────────────────── */
+
+/* JSON-RPC 2.0 standard error codes shared by parsers, dispatchers, and
+ * transport adapters. Keep protocol constants in the public MCP header so
+ * callers do not duplicate magic values or private aliases. */
+enum {
+    CBM_JSONRPC_PARSE_ERROR = -32700,
+    CBM_JSONRPC_INVALID_REQUEST = -32600,
+    CBM_JSONRPC_METHOD_NOT_FOUND = -32601,
+    CBM_JSONRPC_INVALID_PARAMS = -32602,
+    CBM_JSONRPC_INTERNAL_ERROR = -32603,
+};
+
+/* MCP-defined server error codes layered on JSON-RPC. */
+enum { CBM_MCP_RESOURCE_NOT_FOUND = -32002 };
+
+/* Canonical tool-response encodings. These select serialization only: Cypher
+ * syntax and graph-schema patterns remain content, never a third format.
+ * Keep the wire strings and enum together so handlers, config, CLI, and tests
+ * cannot drift; an explicit tool argument takes precedence over the configured
+ * default. */
+#define CBM_MCP_OUTPUT_FORMAT_TOON "toon"
+#define CBM_MCP_OUTPUT_FORMAT_JSON "json"
+typedef enum {
+    CBM_MCP_OUTPUT_TOON = 0,
+    CBM_MCP_OUTPUT_JSON,
+    CBM_MCP_OUTPUT_INVALID,
+} cbm_mcp_output_format_t;
 
 typedef struct {
     const char *jsonrpc;    /* "2.0" */
     const char *method;     /* e.g. "initialize", "tools/call" */
     int64_t id;             /* request ID (numeric form; -1 if notification) */
     const char *id_str;     /* non-NULL when id is a JSON string (issue #253) */
+    bool id_is_null;        /* true when the request explicitly uses a null id */
     bool has_id;            /* false for notifications */
     const char *params_raw; /* raw JSON string of params */
 } cbm_jsonrpc_request_t;
 
 typedef struct {
     int64_t id;
-    const char *id_str;      /* non-NULL to echo a string id verbatim (issue #253) */
-    const char *result_json; /* JSON string for result (success) */
-    const char *error_json;  /* JSON string for error (failure), NULL on success */
-    int error_code;          /* JSON-RPC error code */
+    const char *id_str;        /* non-NULL to echo a string id verbatim (issue #253) */
+    bool id_is_null;           /* emit JSON null for parse/invalid-request errors */
+    const char *result_json;   /* JSON string for result (success) */
+    const char *error_json;    /* JSON string for error (failure), NULL on success */
+    int error_code;            /* JSON-RPC error code */
+    const char *error_message; /* JSON-RPC error message when error_code is set */
 } cbm_jsonrpc_response_t;
 
 /* ── JSON-RPC parsing / formatting ────────────────────────────── */
 
-/* Parse a JSON-RPC request line. Returns 0 on success, -1 on error.
+/* Parse a JSON-RPC request line. Returns 0 on success or a CBM_JSONRPC_* code.
  * Caller must call cbm_jsonrpc_request_free(). */
 int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out);
 void cbm_jsonrpc_request_free(cbm_jsonrpc_request_t *r);
@@ -56,12 +106,24 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
+/* Add the shared dirty-file freshness object and warning to an existing JSON object.
+ * Used by MCP tools and local HTTP UI endpoints that expose canonical graph-derived data.
+ * Does nothing when both counts are zero. */
+void cbm_mcp_add_dirty_file_freshness_counts(yyjson_mut_doc *doc, yyjson_mut_val *root, int pending,
+                                             int overlay_ready, const char *warning_message);
+
+/* Return a heap JSON copy with dirty freshness added, or NULL if the project is clean,
+ * inputs are invalid, or base_json is not a JSON object. */
+char *cbm_mcp_add_dirty_file_freshness_to_json(const char *base_json, cbm_store_t *store,
+                                               const char *project, const char *warning_message);
+
+/* Format the tools/list response. Filters by tool_mode config.
+ * srv may be NULL (returns all tools). Uses the typedef declared below. */
+char *cbm_mcp_tools_list(cbm_mcp_server_t *srv);
+
 /* Return true when notifications/cancelled params target the active request. */
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
                                     const char *active_id_str);
-
-/* Format the tools/list response. Returns heap-allocated JSON. */
-char *cbm_mcp_tools_list(void);
 
 /* Return a tool's JSON input_schema string by name (static; do not free), or
  * NULL if the tool is unknown. Backs the CLI flag parser + per-tool --help. */
@@ -86,6 +148,9 @@ char *cbm_mcp_tools_help_list(void);
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);
 
+/* Select the tool surface advertised by tools/list and enforced by dispatch. */
+void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv, cbm_mcp_tool_profile_t profile);
+
 /* ── Tool argument helpers ────────────────────────────────────── */
 
 /* Extract a string argument from the tools/call params JSON.
@@ -98,6 +163,9 @@ int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val)
 /* Extract a bool argument. Returns false if not found. */
 bool cbm_mcp_get_bool_arg(const char *args_json, const char *key);
 
+/* Extract a bool argument with explicit default. Returns default_val if key absent. */
+bool cbm_mcp_get_bool_arg_default(const char *args_json, const char *key, bool default_val);
+
 /* Extract the tool name from a tools/call params JSON. Heap-allocated. */
 char *cbm_mcp_get_tool_name(const char *params_json);
 
@@ -106,24 +174,7 @@ char *cbm_mcp_get_arguments(const char *params_json);
 
 /* ── MCP Server ───────────────────────────────────────────────── */
 
-typedef struct cbm_mcp_server cbm_mcp_server_t;
-
-typedef enum {
-    CBM_MCP_TOOL_PROFILE_ALL = 0,
-    /* Agent-facing restricted surfaces: only explicitly allowlisted inspection
-     * tools are advertised or callable. Internal cache maintenance may still
-     * write, so these are intentionally not named strictly read-only modes. */
-    CBM_MCP_TOOL_PROFILE_ANALYSIS = 1,
-    CBM_MCP_TOOL_PROFILE_SCOUT = 2,
-} cbm_mcp_tool_profile_t;
-
-/* Parse the process-level tool-profile flag. Explicit malformed or unknown
- * values fail closed with -1; absence selects the full default surface. */
-int cbm_mcp_parse_tool_profile_args(int argc, const char *const argv[const],
-                                    cbm_mcp_tool_profile_t *profile_out);
-
-/* Restricted servers must not start a second unrestricted HTTP/RPC surface. */
-bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile);
+/* cbm_mcp_server_t forward-declared above in Forward declarations */
 
 /* Optional daemon-owned physical index executor. repo_path is canonical and
  * already authorized against this session; args_json contains that canonical
@@ -147,17 +198,37 @@ typedef bool (*cbm_mcp_project_mutation_try_begin_fn)(void *context, const char 
 /* Create an MCP server. store_path is the SQLite database directory. */
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
-/* Select the tool surface exposed by tools/list and enforced by dispatch. */
-void cbm_mcp_server_set_tool_profile(cbm_mcp_server_t *srv, cbm_mcp_tool_profile_t profile);
-
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);
+
+/* Wait for a launched session auto-index without requesting cancellation.
+ * Returns the thread join status, or 0 when no auto-index is pending. */
+int cbm_mcp_server_join_autoindex(cbm_mcp_server_t *srv);
 
 /* Set external watcher reference (for auto-index registration). Not owned. */
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
+
+/* Detect session root/project from the current working directory.
+ * Stdio MCP calls this during initialize; one-shot CLI calls this before
+ * dispatch so omitted project params use the same auto-index/session context. */
+void cbm_mcp_server_detect_session(cbm_mcp_server_t *srv);
+
+/* Start one bounded background overlay compaction pass for a project.
+ * Returns false if args are invalid, max_generations is negative, or a prior
+ * compaction thread has not been joined yet. This is not an MCP tool. */
+bool cbm_mcp_server_start_overlay_compaction(cbm_mcp_server_t *srv, const char *project,
+                                             int max_generations);
+
+/* Join the overlay compaction thread if one was started. Returns 0 on success,
+ * a negative store-style error code on worker/join failure, or 0 when no worker
+ * is pending. out_compacted may be NULL. */
+int cbm_mcp_server_join_overlay_compaction(cbm_mcp_server_t *srv, int *out_compacted);
+
+/* True while the one-shot compaction thread is still running. */
+bool cbm_mcp_server_overlay_compaction_active(cbm_mcp_server_t *srv);
 
 /* Set an explicit session context for an embedded/daemon-backed server.
  * session_root is copied and its project name is derived using the same naming
@@ -177,6 +248,12 @@ const char *cbm_mcp_server_allowed_root(const cbm_mcp_server_t *srv);
  * default for standalone servers; daemon sessions disable these so the shared
  * coordinator owns background work. */
 void cbm_mcp_server_set_background_tasks(cbm_mcp_server_t *srv, bool enabled);
+
+/* Enable or disable automatic session_project/_context response enrichment.
+ * Enabled by default for client-facing servers. Internal supervised workers
+ * disable it because the requesting parent session owns the single externally
+ * visible context block. */
+void cbm_mcp_server_set_response_context(cbm_mcp_server_t *srv, bool enabled);
 
 void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_executor_fn executor,
                                        void *context);
@@ -206,6 +283,11 @@ int cbm_mcp_read_message(FILE *in, char **message, bool *content_length_framed);
 /* Run the MCP server event loop on the given streams (typically stdin/stdout).
  * Blocks until EOF on input. Returns 0 on success, -1 on error. */
 int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out);
+
+/* Ask a running cbm_mcp_server_run loop to exit at its next poll tick. A single
+ * atomic store — async-signal-safe, so signal handlers and watchdog threads can
+ * call it instead of closing stdio streams out from under a blocked getline. */
+void cbm_mcp_server_request_stop(cbm_mcp_server_t *srv);
 
 /* Process a single JSON-RPC request line and return the response.
  * Returns heap-allocated JSON response string, or NULL for notifications. */
@@ -240,9 +322,21 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
  * parent. Builds {"repo_path": root_path} internally. Returns the worker's
  * response or an explicit contained-error response (caller frees). NULL is
  * reserved for invalid input/request construction failure; a marked host must
- * stop rather than use it as permission to index in-process. This is the shared
- * entry the session auto-index routes through. */
-char *cbm_mcp_index_run_supervised_path(const char *root_path);
+ * stop rather than use it as permission to index in-process. srv supplies the
+ * request-scoped cancellation flag and may be NULL for callers that own no
+ * server. This is the shared entry used by watcher re-index (main.c) and
+ * session auto-index (mcp.c). */
+char *cbm_mcp_index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_path);
+
+/* Return true only when a supervised index tool response reports an indexed or
+ * degraded (partially indexed) publication. Malformed and error responses are
+ * false so watcher baselines remain pending for retry. */
+bool cbm_mcp_index_response_published(const char *response);
+
+/* Notify a long-lived server that an external index publisher replaced its
+ * project database. Thread-safe and non-blocking: the next request reopens the
+ * cached store on the request thread that owns it. */
+void cbm_mcp_server_notify_index_published(cbm_mcp_server_t *srv);
 
 /* ── Idle store eviction ──────────────────────────────────────── */
 
@@ -262,6 +356,9 @@ cbm_store_t *cbm_mcp_server_store(cbm_mcp_server_t *srv);
 /* Set the project name associated with the server's current store (for test setup).
  * This prevents resolve_store() from trying to open a .db file when tools specify a project. */
 void cbm_mcp_server_set_project(cbm_mcp_server_t *srv, const char *project);
+
+/* Set the session project name (for testing and manual override). */
+void cbm_mcp_server_set_session_project(cbm_mcp_server_t *srv, const char *name);
 
 /* ── Cancellation support ─────────────────────────────────────── */
 

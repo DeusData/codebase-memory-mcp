@@ -13,7 +13,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import platform
 import shutil
 import signal
 import socket
@@ -21,7 +20,6 @@ import stat
 import struct
 import subprocess
 import sys
-import tarfile
 import tempfile
 import threading
 import time
@@ -655,31 +653,6 @@ def assert_coordination_idle(socket_path, lock_specs, description):
         check(status == "free", "{} remained {} after {}".format(path, status, description))
 
 
-def create_local_update_release(release_dir, candidate):
-    """Create the exact platform archive/checksum pair consumed by update."""
-    release_dir.mkdir(parents=True, exist_ok=True)
-    release_dir.chmod(0o700)
-    if sys.platform == "darwin":
-        os_name = "darwin"
-        portable = ""
-    else:
-        os_name = "linux"
-        portable = "-portable"
-    machine = platform.machine().lower()
-    arch = "arm64" if machine in ("arm64", "aarch64") else "amd64"
-    asset_name = "codebase-memory-mcp-{}-{}{}.tar.gz".format(
-        os_name, arch, portable
-    )
-    archive = release_dir / asset_name
-    with tarfile.open(archive, "w:gz") as stream:
-        stream.add(str(candidate), arcname="codebase-memory-mcp", recursive=False)
-    digest = sha256_file(archive)
-    (release_dir / "checksums.txt").write_text(
-        "{}  {}\n".format(digest, asset_name), encoding="ascii"
-    )
-    return "file://" + str(release_dir)
-
-
 def assert_no_activation_artifacts(directory, label):
     artifacts = (
         sorted(path.name for path in directory.iterdir() if path.name.startswith(".cbm-"))
@@ -841,12 +814,36 @@ def main():
                 "Completed list_projects" in local_cli.stderr,
                 "local CLI did not emit completion feedback: " + repr(local_cli.stderr),
             )
-            check(not socket_path.exists(), "standalone CLI created a daemon socket")
+            check(
+                "this command started a temporary CBM daemon" in local_cli.stderr,
+                "cold one-shot CLI did not explain its temporary daemon lifecycle: "
+                + repr(local_cli.stderr),
+            )
+            wait_until(
+                lambda: (
+                    daemon_lifecycle_sequence(daemon_log)
+                    == ["daemon.start", "daemon.stop"]
+                    and not socket_path.exists()
+                    and lock_status(lifetime_lock, record_lock=True) == "free"
+                ),
+                SHUTDOWN_TIMEOUT,
+                "one-shot CLI temporary daemon cleanup",
+            )
             check(
                 lock_status(lifetime_lock, record_lock=True) == "free",
-                "standalone CLI retained a daemon lifetime reservation",
+                "one-shot CLI retained a daemon lifetime reservation",
             )
-            check(not daemon_log.exists(), "standalone CLI started the coordination daemon")
+            check(not socket_path.exists(), "one-shot CLI retained a daemon socket")
+            check(
+                daemon_lifecycle_sequence(daemon_log)
+                == ["daemon.start", "daemon.stop"],
+                "one-shot CLI temporary daemon lifecycle was not exactly start then stop",
+            )
+            # The rest of this harness predates daemon-backed CLI execution and
+            # intentionally counts the long-lived MCP generations from one.
+            # The temporary generation is fully quiesced, so remove only its
+            # test-owned log before entering those existing assertions.
+            daemon_log.unlink()
 
             c1 = McpClient(binary, env, tmpdir / "client-1.err")
             clients.append(c1)
@@ -1106,6 +1103,16 @@ def main():
                     "same-build local CLI polluted JSON stdout: "
                     + repr(active_local_cli.stdout)
                 ) from exc
+            check(
+                "mem.allocator." not in active_local_cli.stderr
+                and "mem.init" not in active_local_cli.stderr,
+                "thin CLI repeated daemon-owned allocator initialization: "
+                + repr(active_local_cli.stderr),
+            )
+            check(
+                len(json_events(daemon_log, "mem.init")) == 1,
+                "daemon did not retain exactly one allocator initialization",
+            )
             check(
                 len(json_events(daemon_log, "daemon.start")) == 1,
                 "same-build local CLI restarted the daemon",
@@ -1378,7 +1385,7 @@ def main():
             )
             c1.close_input()
             check(
-                c1.wait(timeout=15) == 0,
+                c1.wait(timeout=OPERATION_TIMEOUT) == 0,
                 "EOF-cancelled frontend exited nonzero",
             )
             wait_until(
@@ -1540,26 +1547,37 @@ def main():
             cli_first_worker_pid, cli_first_worker_pgid = (
                 read_private_pid_fields(cli_first_lock_owner_path, 2)
             )
+            wait_until(
+                lambda: len(json_events(daemon_log, "daemon.start")) == 3,
+                START_TIMEOUT,
+                "CLI-first temporary daemon generation",
+            )
+            cli_first_daemon_pid = int(
+                json_events(daemon_log, "daemon.start")[-1]["pid"]
+            )
             check(
                 cli_first_process.poll() is None
                 and not process_gone_or_zombie(cli_first_descendant_pid)
                 and worker_tree_identity_matches(
-                    cli_first_process.pid,
+                    cli_first_daemon_pid,
                     cli_first_worker_pid,
                     cli_first_worker_pgid,
                     cli_first_descendant_pid,
                 ),
                 "CLI-first worker ownership marker did not identify the "
-                "supervisor's isolated physical worker tree",
+                "daemon supervisor's isolated physical worker tree",
             )
-            check(not socket_path.exists(), "CLI-first operation created a daemon socket")
             check(
-                lock_status(lifetime_lock, True) == "free",
-                "CLI-first operation acquired the daemon lifetime reservation",
+                socket_path.exists(),
+                "CLI-first operation did not publish a daemon socket",
+            )
+            check(
+                lock_status(lifetime_lock, True) == "held",
+                "CLI-first operation did not retain the daemon lifetime reservation",
             )
             check(
                 lock_status(startup_lock, record_lock=False) == "held",
-                "CLI-first operation did not retain the daemon-start transition",
+                "CLI-first physical worker did not retain its local-transition guard",
             )
 
             cli_first_conflicts_before = len(
@@ -1590,8 +1608,8 @@ def main():
                 + repr(cli_first_conflict.stderr),
             )
             check(
-                not socket_path.exists() and lock_status(lifetime_lock, True) == "free",
-                "rejected CLI-first conflict spawned a daemon generation",
+                socket_path.exists() and lock_status(lifetime_lock, True) == "held",
+                "rejected CLI-first conflict disturbed the active daemon generation",
             )
             wait_until(
                 lambda: len(
@@ -1606,10 +1624,9 @@ def main():
                 10,
                 "CLI-first durable conflict log",
             )
-            # A same-build MCP session must still be able to start the shared
-            # daemon while an unrelated one-shot CLI operation is active. The
-            # daemon then stops with its final MCP session; the standalone CLI
-            # neither becomes a daemon session nor keeps that daemon alive.
+            # A same-build MCP session must join the temporary daemon while
+            # the CLI-owned request is active. Closing that overlap session
+            # must not stop the generation or cancel the CLI request.
             overlap_client = McpClient(
                 binary, cli_first_env, tmpdir / "cli-first-overlap-client.err"
             )
@@ -1649,12 +1666,11 @@ def main():
                 lambda: socket_path.exists()
                 and lock_status(lifetime_lock, True) == "held",
                 START_TIMEOUT,
-                "same-build daemon startup during local CLI work",
+                "same-build daemon reuse during CLI work",
             )
-            wait_until(
-                lambda: len(json_events(daemon_log, "daemon.start")) == 3,
-                START_TIMEOUT,
-                "third daemon generation during local CLI work",
+            check(
+                len(json_events(daemon_log, "daemon.start")) == 3,
+                "same-build overlap spawned another daemon generation",
             )
             check(
                 cli_first_process.poll() is None
@@ -1667,29 +1683,11 @@ def main():
                 overlap_client.wait(timeout=15) == 0,
                 "CLI-overlap daemon frontend exited nonzero",
             )
-            wait_until(
-                lambda: not socket_path.exists()
-                and lock_status(lifetime_lock, True) == "free",
-                SHUTDOWN_TIMEOUT,
-                "overlap daemon shutdown after its final MCP session",
-            )
-            wait_until(
-                lambda: len(json_events(daemon_log, "daemon.stop")) == 3,
-                10,
-                "third daemon.stop event",
-            )
             check(
-                daemon_lifecycle_sequence(daemon_log)[:6]
-                == [
-                    "daemon.start",
-                    "daemon.stop",
-                    "daemon.start",
-                    "daemon.stop",
-                    "daemon.start",
-                    "daemon.stop",
-                ],
-                "three daemon generations overlapped or reordered: "
-                + repr(daemon_lifecycle_sequence(daemon_log)),
+                socket_path.exists()
+                and lock_status(lifetime_lock, True) == "held"
+                and len(json_events(daemon_log, "daemon.stop")) == 2,
+                "overlap disconnect stopped the CLI request's daemon generation",
             )
             check(
                 cli_first_process.poll() is None
@@ -1698,7 +1696,7 @@ def main():
             )
             check(
                 lock_status(startup_lock, record_lock=False) == "held",
-                "local CLI lost its legacy compatibility guard after daemon shutdown",
+                "CLI-first physical worker lost its local-transition guard after MCP overlap",
             )
 
             # The owner-only marker was published by the physical worker only
@@ -1710,7 +1708,7 @@ def main():
             check(
                 cli_first_process.poll() is None
                 and worker_tree_identity_matches(
-                    cli_first_process.pid,
+                    cli_first_daemon_pid,
                     cli_first_worker_pid,
                     cli_first_worker_pgid,
                     cli_first_descendant_pid,
@@ -1731,6 +1729,47 @@ def main():
                 5,
                 "verified CLI-first worker to stop",
             )
+
+            # The shared daemon must not turn one project lease into a global
+            # mutation lock. An unrelated project can finish while this worker
+            # is frozen; the same-project request below must remain pending.
+            unrelated_mutation = subprocess.run(
+                [
+                    str(binary),
+                    "cli",
+                    "--json",
+                    "delete_project",
+                    "--project",
+                    "smoke-cli-unrelated",
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                env=cli_first_env,
+                timeout=15,
+                check=False,
+            )
+            try:
+                unrelated_result = json.loads(unrelated_mutation.stdout)
+            except json.JSONDecodeError as exc:
+                raise SmokeFailure(
+                    "unrelated mutation polluted JSON stdout: "
+                    + repr(unrelated_mutation.stdout)
+                ) from exc
+            unrelated_statuses = {
+                payload.get("status")
+                for payload in mcp_result_json_payloads(unrelated_result)
+            }
+            check(
+                "not_found" in unrelated_statuses
+                and unrelated_mutation.returncode != 0,
+                "unrelated project mutation was globally serialized or misreported: "
+                + repr(unrelated_result)
+                + " stderr: "
+                + unrelated_mutation.stderr,
+            )
+
             competitor_stderr_path = tmpdir / "cli-first-competitor.err"
             cli_first_competitor_stderr = competitor_stderr_path.open(
                 "w", encoding="utf-8"
@@ -1752,40 +1791,29 @@ def main():
                 env=cli_first_env,
             )
 
-            def competitor_waiting_or_exited():
-                try:
-                    text = competitor_stderr_path.read_text(
-                        encoding="utf-8", errors="replace"
-                    )
-                except OSError:
-                    text = ""
-                return (
-                    "Waiting for another CBM mutation of smoke-cli-first" in text
-                    or cli_first_competitor.poll() is not None
+            exclusion_deadline = time.monotonic() + 0.5
+            while time.monotonic() < exclusion_deadline:
+                check(
+                    cli_first_competitor.poll() is None,
+                    "same-project mutation bypassed the frozen worker's project lease",
                 )
-
-            wait_until(
-                competitor_waiting_or_exited,
-                15,
-                "same-project competitor to reach worker-owned project lock",
-            )
+                time.sleep(0.02)
             cli_first_competitor_stderr.flush()
             competitor_stderr = competitor_stderr_path.read_text(
                 encoding="utf-8", errors="replace"
             )
             check(
-                cli_first_competitor.poll() is None
-                and "Waiting for another CBM mutation of smoke-cli-first"
-                in competitor_stderr,
+                cli_first_competitor.poll() is None,
                 "worker did not retain same-project exclusion while frozen: "
                 + competitor_stderr,
             )
 
-            # SIGTERM would ask the CLI supervisor to perform an orderly
-            # cancellation. SIGKILL models an abrupt supervisor crash. POSIX
-            # may immediately SIGHUP/SIGCONT the newly orphaned stopped group;
-            # if it has not, resume only the still-verified worker so its parent
-            # watchdog can quiesce the group and release the competitor.
+            # The CLI is now a thin daemon client. SIGKILL models an abrupt
+            # client crash; connection teardown must cancel only that client's
+            # request. POSIX may immediately SIGHUP/SIGCONT the stopped worker
+            # group; if it has not, resume only the still-verified worker so
+            # the daemon-side supervisor can quiesce it and release the
+            # competitor.
             cli_first_process.kill()
             try:
                 cli_first_process.wait(timeout=5)
@@ -1847,13 +1875,18 @@ def main():
             cli_first_competitor_stderr.close()
             cli_first_competitor_stderr = None
             wait_until(
-                lambda: lock_status(startup_lock, record_lock=False) == "free",
-                10,
-                "CLI-first daemon-start transition to release",
+                lambda: (
+                    not socket_path.exists()
+                    and lock_status(lifetime_lock, record_lock=True) == "free"
+                    and lock_status(startup_lock, record_lock=False) == "free"
+                ),
+                SHUTDOWN_TIMEOUT,
+                "CLI-first daemon generation to stop after its final client",
             )
 
             # Once the final participant exits, the cohort is crash-released
-            # and a different exact build may become the next generation.
+            # and a different exact build may become the next temporary
+            # daemon generation.
             turnover = subprocess.run(
                 [str(conflict_binary), "cli", "--json", "list_projects"],
                 stdin=subprocess.DEVNULL,
@@ -1876,19 +1909,31 @@ def main():
                     "post-turnover CLI polluted JSON stdout: " + repr(turnover.stdout)
                 ) from exc
             check(
-                not socket_path.exists()
-                and lock_status(lifetime_lock, record_lock=True) == "free"
-                and lock_status(startup_lock, record_lock=False) == "free",
-                "post-turnover CLI left daemon/startup ownership behind",
+                "this command started a temporary CBM daemon" in turnover.stderr,
+                "post-turnover CLI did not report its temporary daemon: "
+                + repr(turnover.stderr),
+            )
+            wait_until(
+                lambda: (
+                    not socket_path.exists()
+                    and lock_status(lifetime_lock, record_lock=True) == "free"
+                    and lock_status(startup_lock, record_lock=False) == "free"
+                    and len(json_events(daemon_log, "daemon.start")) == 4
+                    and len(json_events(daemon_log, "daemon.stop")) == 4
+                ),
+                SHUTDOWN_TIMEOUT,
+                "post-turnover temporary daemon cleanup",
             )
             check(
-                len(json_events(daemon_log, "daemon.start")) == 3
-                and len(json_events(daemon_log, "daemon.stop")) == 3,
-                "final smoke state did not contain exactly three clean daemon generations",
+                len(json_events(daemon_log, "daemon.start")) == 4
+                and len(json_events(daemon_log, "daemon.stop")) == 4,
+                "final smoke state did not contain exactly four clean daemon generations",
             )
             check(
                 daemon_lifecycle_sequence(daemon_log)
                 == [
+                    "daemon.start",
+                    "daemon.stop",
                     "daemon.start",
                     "daemon.stop",
                     "daemon.start",
@@ -1934,7 +1979,7 @@ def main():
             install_stops = len(json_events(daemon_log, "daemon.stop"))
             install_client = start_ready_mcp_client(
                 binary,
-                env,
+                activation_local_env,
                 tmpdir / "activation-install-client.err",
                 clients,
                 initialize_params,
@@ -1946,6 +1991,9 @@ def main():
                 == install_starts + 1,
                 START_TIMEOUT,
                 "install activation daemon generation",
+            )
+            install_daemon_pid = int(
+                json_events(daemon_log, "daemon.start")[-1]["pid"]
             )
             activation_local_process = subprocess.Popen(
                 [
@@ -1987,12 +2035,12 @@ def main():
             check(
                 activation_local_process.poll() is None
                 and worker_tree_identity_matches(
-                    activation_local_process.pid,
+                    install_daemon_pid,
                     activation_local_worker_pid,
                     activation_local_worker_pgid,
                     activation_local_descendant_pid,
                 ),
-                "activation CLI marker did not identify its isolated worker tree",
+                "activation CLI marker did not identify the daemon's isolated worker tree",
             )
 
             install_activation_records = run_successful_activation(
@@ -2026,9 +2074,11 @@ def main():
                 "maintenance-cancelled local CLI reported success",
             )
             check(
-                "active CLI command is stopping for install/update/uninstall"
-                in local_stderr,
-                "local CLI did not report maintenance cancellation: "
+                "daemon connection closed while this CLI request was active"
+                in local_stderr
+                and "install/update/uninstall may be stopping CBM" in local_stderr
+                and "Retry after activation completes" in local_stderr,
+                "local CLI did not report actionable activation interruption: "
                 + repr(local_stderr),
             )
             wait_until(
@@ -2198,14 +2248,14 @@ def main():
                 "update activation modified a source executable",
             )
 
-            # Launch the activated target itself as the final daemon build,
-            # then uninstall it from the original executable. This is another
+            # Launch the installed target itself as the final daemon build,
+            # then uninstall it from that exact executable. This is another
             # authenticated cross-build drain and proves removal waits until
             # no process is still executing the target.
             uninstall_starts = len(json_events(daemon_log, "daemon.start"))
             uninstall_stops = len(json_events(daemon_log, "daemon.stop"))
             uninstall_client = start_ready_mcp_client(
-                target_binary,
+                install_target,
                 env,
                 tmpdir / "activation-uninstall-client.err",
                 clients,
@@ -2220,14 +2270,14 @@ def main():
                 "uninstall activation daemon generation",
             )
             uninstall_activation_records = run_successful_activation(
-                binary,
+                install_target,
                 env,
                 tmpdir,
                 activation_log,
                 "activation-uninstall",
                 "uninstall",
                 ["uninstall", "--yes"],
-                active_fingerprint,
+                installed_build,
             )
             check(
                 all(
@@ -2251,13 +2301,11 @@ def main():
                 coordination_locks,
                 "uninstall activation coordination cleanup",
             )
-            assert_no_activation_artifacts(target_dir, "uninstall activation")
             assert_no_activation_artifacts(install_dir, "uninstall activation")
-            check(not target_binary.exists(), "uninstall did not remove its target")
+            check(not install_target.exists(), "uninstall did not remove its target")
             check(
-                install_target.exists()
-                and sha256_file(install_target) == installed_build,
-                "uninstall mutated the separate custom-dir installation",
+                target_binary.read_bytes() == b"installed binary sentinel\n",
+                "custom-dir uninstall mutated the canonical binary",
             )
             check(
                 sha256_file(binary) == source_binary_before
@@ -2272,7 +2320,7 @@ def main():
 
             print(
                 "ok: shared daemon lifecycle, bidirectional version conflicts, "
-                "coordinated install/update/uninstall, CLI maintenance cancellation, "
+                "coordinated install/uninstall, CLI maintenance cancellation, "
                 "and session cancellation passed"
             )
             return 0

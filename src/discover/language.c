@@ -4,7 +4,7 @@
  * Maps file extensions and special filenames to CBMLanguage enum values.
  * Handles .m disambiguation (Objective-C vs Magma vs MATLAB).
  * Consults the process-global user config (set via cbm_set_user_lang_config)
- * before the built-in lookup table.
+ * before the built-in tables, allowing custom extension→language mappings.
  */
 #include "discover/discover.h"
 #include "discover/userconfig.h"

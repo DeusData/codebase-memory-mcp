@@ -1357,6 +1357,35 @@ TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot) {
     PASS();
 }
 
+TEST(config_toml_codex_many_foreign_aot_blocks_preserve_owned_reconciliation) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char input[CTE_FILE_CAP] = {0};
+    char actual[CTE_FILE_CAP];
+    size_t used = 0U;
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    for (size_t i = 0U; i < 96U; ++i) {
+        int written = snprintf(input + used, sizeof(input) - used,
+                               "[[hooks.SessionStart]]\nmatcher = \"foreign-%zu\"\n"
+                               "[[hooks.SessionStart.hooks]]\ntype = \"command\"\n"
+                               "command = \"foreign-%zu\"\ntimeout = 9\n",
+                               i, i);
+        ASSERT_TRUE(written > 0 && (size_t)written < sizeof(input) - used);
+        used += (size_t)written;
+    }
+    ASSERT_TRUE(strlen(CTE_CODEX_BLOCK) < sizeof(input) - used);
+    memcpy(input + used, CTE_CODEX_BLOCK, strlen(CTE_CODEX_BLOCK) + 1U);
+
+    ASSERT_EQ(th_write_file(path, input), 0);
+    ASSERT_EQ(cte_codex_edit(path, CBM_TOML_CODEX_HOOK_UPSERT, 0), 0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_EQ(cte_occurrences(actual, "command = \"foreign-"), 96);
+    ASSERT_EQ(cte_occurrences(actual, CTE_CODEX_BEGIN), 1);
+    ASSERT_EQ(cte_occurrences(actual, "[[hooks.SessionStart]]"), 97);
+    th_cleanup(dir);
+    PASS();
+}
+
 /* #1558: a duplicated install left a Codex config.toml carrying a CLOSING
  * managed marker with no opener. Every later install then failed that client
  * with op=legacy_hook_cleanup and aborted the whole activation.
@@ -1445,5 +1474,6 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_codex_rejects_ambiguous_inline_byte_identically);
     RUN_TEST(config_toml_codex_reports_stable_failure_reasons);
     RUN_TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot);
+    RUN_TEST(config_toml_codex_many_foreign_aot_blocks_preserve_owned_reconciliation);
     RUN_TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation);
 }

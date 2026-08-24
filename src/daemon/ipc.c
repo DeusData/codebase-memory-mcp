@@ -868,7 +868,9 @@ static int connection_write_full(cbm_daemon_ipc_connection_t *connection, const 
 
 cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
                                                        const char *runtime_parent) {
+    ipc_validation_detail_buffer[0] = '\0';
     if (!instance_key_valid(instance_key)) {
+        ipc_validation_detail_set("daemon endpoint: invalid instance key");
         return NULL;
     }
 #ifdef __APPLE__
@@ -879,15 +881,21 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     const char *requested_parent = runtime_parent ? runtime_parent : default_parent;
     char canonical_parent[CBM_DAEMON_IPC_PATH_CAP];
     if (!cbm_canonical_path(requested_parent, canonical_parent, sizeof(canonical_parent))) {
+        ipc_validation_detail_set("%s: runtime parent could not be canonicalized (errno %d)",
+                                  requested_parent, errno);
         return NULL;
     }
     const char *parent = canonical_parent;
     if (!runtime_parent_valid(parent)) {
+        ipc_validation_detail_set(
+            "%s: runtime parent is missing, is not a directory, or is a symlink (errno %d)", parent,
+            errno);
         return NULL;
     }
 
     cbm_daemon_ipc_endpoint_t *endpoint = calloc(1, sizeof(*endpoint));
     if (!endpoint) {
+        ipc_validation_detail_set("%s: daemon endpoint allocation failed", parent);
         return NULL;
     }
     endpoint->dir_fd = -1;
@@ -903,9 +911,16 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     endpoint->lifetime_lock_name = string_format("cbm-%s.lifetime.lock", instance_key);
     if (!endpoint->runtime_dir || !endpoint->socket_name || !endpoint->socket_anchor_name ||
         !endpoint->socket_identity_name || !endpoint->socket_pending_name || !endpoint->lock_name ||
-        !endpoint->startup_v2_lock_name || !endpoint->lifetime_lock_name ||
-        !private_runtime_open(endpoint->runtime_dir, &endpoint->dir_fd, &endpoint->dir_device,
+        !endpoint->startup_v2_lock_name || !endpoint->lifetime_lock_name) {
+        ipc_validation_detail_set("%s: daemon endpoint name allocation failed", parent);
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        return NULL;
+    }
+    if (!private_runtime_open(endpoint->runtime_dir, &endpoint->dir_fd, &endpoint->dir_device,
                               &endpoint->dir_inode)) {
+        ipc_validation_detail_set(
+            "%s: owner-private daemon runtime directory could not be secured (errno %d)",
+            endpoint->runtime_dir, errno);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return NULL;
     }
@@ -918,6 +933,8 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
         strlen(endpoint->socket_anchor_name) >= POSIX_SOCKET_ANCHOR_NAME_CAP ||
         !unix_address_set(&address, endpoint->address, &address_length) ||
         !unix_address_set(&address, endpoint->socket_anchor_address, &address_length)) {
+        ipc_validation_detail_set("%s: Unix socket address could not be represented safely",
+                                  endpoint->runtime_dir);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return NULL;
     }
@@ -1320,7 +1337,7 @@ static int posix_startup_lock_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
     return unlock_result == 0 && still_private && close_result == 0 ? 0 : -1;
 }
 
-int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+static int posix_transport_presence_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
     if (!endpoint_runtime_still_valid(endpoint)) {
         return -1;
     }
@@ -1330,6 +1347,14 @@ int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endp
     }
     if (errno != ENOENT) {
         return -1;
+    }
+    return 0;
+}
+
+int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    int transport = posix_transport_presence_probe(endpoint);
+    if (transport != 0) {
+        return transport;
     }
     return posix_startup_lock_probe(endpoint);
 }
@@ -1560,7 +1585,7 @@ static int private_directory_tree_open(const char *directory_path) {
 }
 
 bool cbm_daemon_ipc_private_directory_secure(const char *directory_path) {
-    ipc_validation_detail_set("%s", "");
+    ipc_validation_detail_buffer[0] = '\0';
     int directory_fd = private_directory_tree_open(directory_path);
     if (directory_fd < 0) {
         if (!ipc_validation_detail_buffer[0]) {
@@ -2958,6 +2983,15 @@ int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uin
         return 1;
     }
     return -1;
+}
+
+int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    /* Presence is observed without connecting: a bootstrap caller immediately
+     * follows a positive result with the authenticated runtime connection.
+     * For P endpoint-path bytes this remains O(P) runtime and O(1) auxiliary
+     * memory while avoiding one accepted peer and worker lifecycle per
+     * bootstrap polling attempt. */
+    return posix_transport_presence_probe(endpoint);
 }
 
 cbm_daemon_ipc_connection_t *cbm_daemon_ipc_connect(const cbm_daemon_ipc_endpoint_t *endpoint,
@@ -4713,7 +4747,9 @@ static wchar_t *win_default_runtime_parent(void) {
 
 cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
                                                        const char *runtime_parent) {
+    ipc_validation_detail_set("%s", "");
     if (!instance_key_valid(instance_key)) {
+        ipc_validation_detail_set("daemon endpoint: invalid instance key");
         return NULL;
     }
     char *parent_utf8 = NULL;
@@ -4726,6 +4762,8 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
         parent_utf8 = wide_to_utf8(parent_wide);
     }
     if (!parent_utf8 || !parent_wide) {
+        ipc_validation_detail_set("%s: runtime parent conversion failed",
+                                  runtime_parent ? runtime_parent : "LocalAppData");
         free(parent_utf8);
         free(parent_wide);
         return NULL;
@@ -4734,13 +4772,25 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
 
     char canonical_parent[CBM_DAEMON_IPC_PATH_CAP];
     if (!cbm_canonical_path(parent_utf8, canonical_parent, sizeof(canonical_parent))) {
+        ipc_validation_detail_set("%s: runtime parent could not be canonicalized (error %lu)",
+                                  parent_utf8, (unsigned long)GetLastError());
         free(parent_utf8);
         return NULL;
     }
     free(parent_utf8);
     parent_utf8 = string_copy(canonical_parent);
     parent_wide = utf8_to_wide(parent_utf8);
-    if (!parent_utf8 || !parent_wide || !win_parent_valid(parent_wide)) {
+    if (!parent_utf8 || !parent_wide) {
+        ipc_validation_detail_set("%s: canonical runtime parent conversion failed",
+                                  canonical_parent);
+        free(parent_utf8);
+        free(parent_wide);
+        return NULL;
+    }
+    if (!win_parent_valid(parent_wide)) {
+        ipc_validation_detail_set(
+            "%s: runtime parent is missing, is not a directory, or is a reparse point (error %lu)",
+            parent_utf8, (unsigned long)GetLastError());
         free(parent_utf8);
         free(parent_wide);
         return NULL;
@@ -4752,11 +4802,14 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
                                                parent_utf8[parent_length - 1] == '\\');
     cbm_daemon_ipc_endpoint_t *endpoint = calloc(1, sizeof(*endpoint));
     if (!endpoint) {
+        ipc_validation_detail_set("%s: daemon endpoint allocation failed", parent_utf8);
         free(parent_utf8);
         return NULL;
     }
     win_security_t identity_security;
     if (!win_security_init(&identity_security)) {
+        ipc_validation_detail_set("%s: Windows identity security initialization failed (error %lu)",
+                                  parent_utf8, (unsigned long)GetLastError());
         free(parent_utf8);
         free(endpoint);
         return NULL;
@@ -4771,6 +4824,7 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     }
     win_security_destroy(&identity_security);
     if (!identity_ok) {
+        ipc_validation_detail_set("%s: Windows user SID is unavailable or invalid", parent_utf8);
         free(parent_utf8);
         free(endpoint);
         return NULL;
@@ -4787,10 +4841,27 @@ cbm_daemon_ipc_endpoint_t *cbm_daemon_ipc_endpoint_new(const char *instance_key,
     cbm_mutex_init(&endpoint->generations_lock);
     atomic_init(&endpoint->current_generation, NULL);
     free(parent_utf8);
-    wchar_t *runtime_wide = utf8_to_wide(endpoint->runtime_dir);
-    if (!endpoint->runtime_dir || !runtime_wide || !legacy_names_ok ||
-        !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name ||
-        !win_private_directory_tree_secure(runtime_wide)) {
+    wchar_t *runtime_wide = endpoint->runtime_dir ? utf8_to_wide(endpoint->runtime_dir) : NULL;
+    if (!legacy_names_ok) {
+        ipc_validation_detail_set(
+            "%s: legacy daemon endpoint names could not be represented safely", canonical_parent);
+        free(runtime_wide);
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        return NULL;
+    }
+    if (!endpoint->runtime_dir || !runtime_wide || !endpoint->legacy_pipe_name ||
+        !endpoint->legacy_startup_mutex_name) {
+        ipc_validation_detail_set("%s: daemon endpoint name allocation failed", canonical_parent);
+        free(runtime_wide);
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        return NULL;
+    }
+    if (!win_private_directory_tree_secure(runtime_wide)) {
+        if (!cbm_daemon_ipc_validation_detail()[0]) {
+            ipc_validation_detail_set(
+                "%s: owner-private daemon runtime directory could not be secured (error %lu)",
+                endpoint->runtime_dir, (unsigned long)GetLastError());
+        }
         free(runtime_wide);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return NULL;
@@ -5152,12 +5223,11 @@ int cbm_daemon_ipc_lifetime_reservation_probe(const cbm_daemon_ipc_endpoint_t *e
     return result;
 }
 
-static int win_legacy_pipe_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
-    if (!endpoint || !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name) {
+static int win_named_pipe_presence_probe(const wchar_t *pipe_name) {
+    if (!pipe_name) {
         return -1;
     }
-
-    if (WaitNamedPipeW(endpoint->legacy_pipe_name, 0)) {
+    if (WaitNamedPipeW(pipe_name, 0)) {
         return 1;
     }
     DWORD pipe_error = GetLastError();
@@ -5168,6 +5238,13 @@ static int win_legacy_pipe_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
         return -1;
     }
     return 0;
+}
+
+static int win_legacy_pipe_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    if (!endpoint || !endpoint->legacy_pipe_name || !endpoint->legacy_startup_mutex_name) {
+        return -1;
+    }
+    return win_named_pipe_presence_probe(endpoint->legacy_pipe_name);
 }
 
 int cbm_daemon_ipc_legacy_generation_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
@@ -5781,6 +5858,35 @@ static int win_current_generation_transport_probe(const cbm_daemon_ipc_endpoint_
         return 1;
     }
     return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 0 : -1;
+}
+
+static int win_current_generation_transport_presence_probe(
+    const cbm_daemon_ipc_endpoint_t *endpoint) {
+    win_rendezvous_status_t rendezvous = win_endpoint_refresh_rendezvous(endpoint);
+    if (rendezvous == WIN_RENDEZVOUS_ABSENT) {
+        return 0;
+    }
+    if (rendezvous != WIN_RENDEZVOUS_VALID) {
+        return -1;
+    }
+    win_generation_address_t *generation = win_endpoint_generation_snapshot(endpoint);
+    if (!generation || !generation->pipe_name) {
+        return -1;
+    }
+
+    /* WaitNamedPipeW with a zero timeout observes publication without opening
+     * a server instance. The subsequent runtime connection authenticates the
+     * server. For N rendezvous/pipe-name bytes this is O(N) runtime and O(1)
+     * auxiliary memory, and bootstrap polling creates no probe-only connection
+     * or daemon worker lifecycle. */
+    return win_named_pipe_presence_probe(generation->pipe_name);
+}
+
+int cbm_daemon_ipc_transport_probe(const cbm_daemon_ipc_endpoint_t *endpoint) {
+    if (!endpoint) {
+        return -1;
+    }
+    return win_current_generation_transport_presence_probe(endpoint);
 }
 
 int cbm_daemon_ipc_endpoint_probe(const cbm_daemon_ipc_endpoint_t *endpoint, uint32_t timeout_ms) {

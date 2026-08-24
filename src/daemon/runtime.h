@@ -20,7 +20,7 @@
  * stable endpoint HELLO: an exact executable fingerprint already selects this
  * layout, while conflicting generations must remain able to diagnose each
  * other even when this value and every detailed payload have changed. */
-#define CBM_DAEMON_RUNTIME_WIRE_ABI 1U
+#define CBM_DAEMON_RUNTIME_WIRE_ABI 2U
 
 /* Permanent account-wide rendezvous envelope, generation zero. These numeric
  * capacities and byte sizes are frozen independently of service/runtime data
@@ -121,7 +121,17 @@ typedef enum {
     CBM_DAEMON_RUNTIME_APPLICATION_REJECTED = 4,
     CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR = 5,
     CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED = 6,
+    /* The response is successful and must be written before one coalesced
+     * tools/list_changed notification. This is daemon-internal response
+     * metadata, not a JSON-RPC status exposed to the client. */
+    CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED = 7,
 } cbm_daemon_runtime_application_status_t;
+
+static inline bool cbm_daemon_runtime_application_status_is_success(
+    cbm_daemon_runtime_application_status_t status) {
+    return status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||
+           status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED;
+}
 
 typedef uint64_t cbm_daemon_runtime_application_token_t;
 #define CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID UINT64_C(0)
@@ -137,10 +147,13 @@ typedef void cbm_daemon_runtime_application_session_t;
 typedef cbm_daemon_runtime_application_session_t *(*cbm_daemon_runtime_application_session_open_fn)(
     void *context, cbm_daemon_client_id_t client_id, uint64_t authenticated_process_id);
 
-/* For OK, response_out may receive a malloc-owned binary buffer which the
- * runtime frees after sending; NULL is valid only for a zero-length response.
- * Non-OK results must leave an empty response. The request buffer is an owned
- * runtime copy and remains valid only for the duration of this callback. */
+/* For successful statuses, response_out may receive a malloc-owned binary
+ * buffer which the runtime frees after sending; NULL is valid only for an
+ * ordinary OK with a zero-length response. OK_TOOLS_LIST_CHANGED requires
+ * response bytes so a frontend can preserve response-before-notification
+ * ordering. Non-success results must leave an empty response. The request
+ * buffer is an owned runtime copy and remains valid only for the duration of
+ * this callback. */
 typedef cbm_daemon_runtime_application_status_t (*cbm_daemon_runtime_application_request_fn)(
     void *context, cbm_daemon_runtime_application_session_t *session,
     cbm_daemon_runtime_application_token_t request_token, const uint8_t *request,
@@ -175,11 +188,34 @@ typedef struct {
     cbm_daemon_runtime_application_session_close_fn session_close;
 } cbm_daemon_runtime_application_callbacks_t;
 
+typedef enum {
+    CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_ERROR = -1,
+    CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_DEFER = 0,
+    CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY = 1,
+} cbm_daemon_runtime_ephemeral_stop_result_t;
+
+typedef cbm_daemon_runtime_ephemeral_stop_result_t (*cbm_daemon_runtime_ephemeral_stop_prepare_fn)(
+    void *context);
+
+typedef struct {
+    void *context;
+    /* Called only after an ephemeral service has admitted a client and become
+     * idle. READY commits external authority to stop; the owner must retain it
+     * until service teardown. DEFER is retried after the bounded accept poll;
+     * ERROR is logged and stops fail-loudly. The callback must not block. */
+    cbm_daemon_runtime_ephemeral_stop_prepare_fn prepare;
+} cbm_daemon_runtime_ephemeral_stop_callbacks_t;
+
 typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_build_identity_t identity;
     const char *conflict_log_path;
     size_t conflict_log_cap_bytes;
+    /* cached_exact supplies the owner-private cache path used for both daemon
+     * self identity and kernel-bound peer admission. A NULL path with false
+     * preserves always_rehash. Cache failures remain exact full-hash misses. */
+    const char *build_fingerprint_cache_path;
+    bool build_fingerprint_cache_enabled;
     /* Hard cap on accepted connection threads, including sockets that have not
      * completed HELLO. request_timeout_ms bounds every unauthenticated slot
      * and therefore must be finite, not CBM_DAEMON_IPC_WAIT_FOREVER. */
@@ -193,6 +229,7 @@ typedef struct {
      * required. Function pointers and context are copied; the context's owner
      * must keep it alive until service_free returns true. */
     cbm_daemon_runtime_application_callbacks_t application;
+    cbm_daemon_runtime_ephemeral_stop_callbacks_t ephemeral_stop;
     /* Born via `daemon start`: the service does not begin stopping when its
      * last committed client disconnects; only the stop/drain ops or an
      * explicit process kill end it. */
@@ -242,6 +279,14 @@ bool cbm_daemon_runtime_hello_request_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_R
  * match both the claimed and active build fingerprints. */
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
                                                   char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
+
+/* Resolve the same kernel-bound process image as the strict helper above, but
+ * permit a checksummed exact-digest cache keyed by that native file object's
+ * strong change metadata. Cache misses, corruption, I/O failure, replacement,
+ * or a process-image race fall back to hashing or fail closed. */
+bool cbm_daemon_runtime_process_build_fingerprint_cached(
+    uint64_t process_id, const char *cache_path, bool allow_cache,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out);
 
 /* Ask any current daemon generation to drain before install/update/uninstall.
  * This is not a normal HELLO and never creates an application session. The
@@ -333,6 +378,15 @@ bool cbm_daemon_runtime_service_wait_exited(cbm_daemon_runtime_service_t *servic
  * API. The service cannot exit while a cancelled job remains unreaped. */
 bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service,
                                            const char *project_key);
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+bool cbm_daemon_runtime_service_active_image_cache_hit_for_testing(
+    const cbm_daemon_runtime_service_t *service);
+uint64_t cbm_daemon_runtime_service_peer_cache_hits_for_testing(
+    const cbm_daemon_runtime_service_t *service);
+uint64_t cbm_daemon_runtime_service_application_worker_starts_for_testing(
+    const cbm_daemon_runtime_service_t *service);
+#endif
 
 /* Emergency/test teardown only. Normal lifetime is connection-owned: the
  * final disconnect makes STOPPING terminal, drains/reaps within the configured

@@ -6,10 +6,14 @@
 #include "foundation/constants.h"
 #include <string.h>
 #include <ctype.h>
+#include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 enum {
-    JSON_ESC_LEN = 2,       /* escaped char takes 2 bytes (backslash + char) */
+    JSON_ESC_LEN = 2, /* escaped char takes 2 bytes (backslash + char) */
+    JSON_UNICODE_ESC_LEN = 6,
+    JSON_HEX_MASK = 0x0f,
     JSON_NUL_RESERVE = 1,   /* reserve 1 byte for NUL terminator */
     JSON_CTRL_LIMIT = 0x20, /* ASCII control character upper bound */
 };
@@ -72,6 +76,32 @@ char *cbm_path_join_n(CBMArena *a, const char **parts, int n) {
     return result;
 }
 
+char *cbm_str_join_dotted_temp(const char *left, const char *right, char *inline_storage,
+                               size_t inline_capacity, bool *owned) {
+    if (!left || !right || !inline_storage || !owned) {
+        return NULL;
+    }
+    *owned = false;
+    size_t left_len = strlen(left);
+    size_t right_len = strlen(right);
+    if (left_len > SIZE_MAX - right_len || left_len + right_len > SIZE_MAX - PAIR_LEN) {
+        return NULL;
+    }
+    size_t size = left_len + right_len + PAIR_LEN;
+    char *joined = inline_storage;
+    if (size > inline_capacity) {
+        joined = malloc(size);
+        if (!joined) {
+            return NULL;
+        }
+        *owned = true;
+    }
+    memcpy(joined, left, left_len);
+    joined[left_len] = '.';
+    memcpy(joined + left_len + SKIP_ONE, right, right_len + SKIP_ONE);
+    return joined;
+}
+
 const char *cbm_path_ext(const char *path) {
     if (!path) {
         return "";
@@ -102,7 +132,7 @@ const char *cbm_path_base(const char *path) {
     }
     const char *last_slash = NULL;
     for (const char *p = path; *p; p++) {
-        if (*p == '/') {
+        if (*p == '/' || *p == '\\') {
             last_slash = p;
         }
     }
@@ -153,6 +183,48 @@ bool cbm_str_contains(const char *s, const char *sub) {
         return true;
     }
     return strstr(s, sub) != NULL;
+}
+
+int cbm_str_common_dot_prefix_len(const char *a, const char *b) {
+    if (!a || !b) {
+        return 0;
+    }
+    int count = 0;
+    while (*a && *b) {
+        const char *adot = strchr(a, '.');
+        const char *bdot = strchr(b, '.');
+        size_t alen = adot ? (size_t)(adot - a) : strlen(a);
+        size_t blen = bdot ? (size_t)(bdot - b) : strlen(b);
+        if (alen != blen || memcmp(a, b, alen) != 0) {
+            break;
+        }
+        count++;
+        a += alen + (adot ? SKIP_ONE : 0);
+        b += blen + (bdot ? SKIP_ONE : 0);
+        if (!adot || !bdot) {
+            break;
+        }
+    }
+    return count;
+}
+
+bool cbm_str_copy(char *dst, size_t dst_sz, const char *src) {
+    if (!dst || dst_sz == 0) {
+        return false;
+    }
+    if (!src) {
+        src = "";
+    }
+    size_t len = strlen(src);
+    size_t copy_len = len;
+    if (copy_len >= dst_sz) {
+        copy_len = dst_sz - 1;
+    }
+    if (copy_len > 0) {
+        memcpy(dst, src, copy_len);
+    }
+    dst[copy_len] = '\0';
+    return len < dst_sz;
 }
 
 char *cbm_str_tolower(CBMArena *a, const char *s) {
@@ -310,6 +382,23 @@ bool cbm_validate_project_name(const char *name) {
     return true;
 }
 
+size_t cbm_json_escaped_len(const char *src) {
+    if (!src) {
+        return 0;
+    }
+    size_t len = 0;
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        if (*p == '"' || *p == '\\' || *p == '\n' || *p == '\r' || *p == '\t') {
+            len += JSON_ESC_LEN;
+        } else if (*p < JSON_CTRL_LIMIT) {
+            len += JSON_UNICODE_ESC_LEN;
+        } else {
+            len++;
+        }
+    }
+    return len;
+}
+
 int cbm_json_escape(char *buf, int bufsize, const char *src) {
     if (!buf || bufsize <= 0) {
         return 0;
@@ -346,11 +435,16 @@ int cbm_json_escape(char *buf, int bufsize, const char *src) {
             buf[pos++] = '\\';
             buf[pos++] = 't';
         } else if (c < JSON_CTRL_LIMIT) {
-            /* Other control chars: escape as \u00XX */
-            if (pos + 6 > bufsize - JSON_NUL_RESERVE) {
+            static const char hex[] = "0123456789abcdef";
+            if (pos + JSON_UNICODE_ESC_LEN > bufsize - JSON_NUL_RESERVE) {
                 break;
             }
-            pos += snprintf(buf + pos, 7, "\\u%04x", c);
+            buf[pos++] = '\\';
+            buf[pos++] = 'u';
+            buf[pos++] = '0';
+            buf[pos++] = '0';
+            buf[pos++] = hex[c >> 4];
+            buf[pos++] = hex[c & JSON_HEX_MASK];
         } else {
             buf[pos++] = (char)c;
         }

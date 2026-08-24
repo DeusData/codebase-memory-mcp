@@ -1383,7 +1383,7 @@ def _run_cache_sensitive_mutation(version: str, executable: Path, args) -> int:
         _refresh_runtime_lock(lock)
         if not _runtime_set_ready(version, _verify_candidate):
             raise RuntimeError(
-                "cached runtime assets changed before mutation launch"
+                "cached executable changed before mutation launch"
             )
         thread = threading.Thread(
             name="cbm-cache-lock-heartbeat", target=heartbeat, daemon=True

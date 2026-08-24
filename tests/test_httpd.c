@@ -462,12 +462,27 @@ TEST(httpd_resolves_bare_binary_path_from_path) {
 TEST(httpd_listen_ephemeral_port) {
     cbm_httpd_t *d = cbm_httpd_listen(0);
     ASSERT_NOT_NULL(d);
+    ASSERT_TRUE(cbm_httpd_listener_close_on_exec(d));
     int port = cbm_httpd_port(d);
     ASSERT_GT(port, 0);
     /* accept with a short timeout and no client → NULL, promptly */
     cbm_http_conn_t *c = cbm_httpd_accept(d, 50);
     ASSERT_NULL(c);
     ASSERT_TRUE(cbm_httpd_close(d));
+    PASS();
+}
+
+TEST(httpd_accepted_socket_close_on_exec) {
+    cbm_httpd_t *d = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(d);
+    th_sock_t client = th_connect(cbm_httpd_port(d));
+    ASSERT_TRUE(client != TH_SOCK_BAD);
+    cbm_http_conn_t *c = cbm_httpd_accept(d, 1000);
+    ASSERT_NOT_NULL(c);
+    ASSERT_TRUE(cbm_http_conn_close_on_exec(c));
+    cbm_httpd_conn_close(c);
+    th_sock_close(client);
+    cbm_httpd_close(d);
     PASS();
 }
 
@@ -2041,12 +2056,9 @@ TEST(ui_server_rejects_non_loopback_host) {
 }
 
 /* The directory browser formats readdir() entries into a fixed 32 KB response
- * buffer. The per-entry loop is clamped, but the trailing "parent"/"roots"
- * appends were not — once the entries filled the buffer, pos ran past the end
- * and the next size argument wrapped, writing out of bounds. Fill the buffer
- * with many long-named subdirectories and browse it in a forked child so an
- * overflow surfaces as a killing signal (ASan abort) rather than a clean run. */
-TEST(ui_server_browse_wide_dir_no_overflow) {
+ * buffer. A wide directory must fail explicitly instead of returning a
+ * truncated JSON document under HTTP 200. */
+TEST(ui_server_browse_wide_dir_fails_loudly) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
 #else
@@ -2075,7 +2087,8 @@ TEST(ui_server_browse_wide_dir_no_overflow) {
                  dir, port);
         char *resp = malloc(262144);
         int n = resp ? th_http(port, req, resp, 262144) : 0;
-        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 500") != NULL &&
+                  strstr(resp, "directory listing exceeds response limit") != NULL);
         free(resp);
         th_server_stop(&ts);
         _exit(ok ? 0 : 3);
@@ -2154,14 +2167,10 @@ TEST(ui_server_logs_escape_dense_no_overflow) {
 }
 
 /* The index-status endpoint renders every active job into a fixed 2 KB stack
- * buffer. http_appendf clamps its own writes, but the separator and the closing
- * bracket were raw indexes, so two jobs holding ~1 KB root paths (the field is
- * 1024 bytes and the value comes straight from POST /api/index) pushed pos to
- * the clamp and the close then wrote past the buffer. Drive it through the real
- * endpoint with the index executor stubbed out, in a forked child so the
- * overflow surfaces as a killing signal. */
+ * buffer. A saturated response must fail explicitly instead of returning
+ * truncated JSON under HTTP 200. */
 #define MAX_TEST_INDEX_JOBS 4
-TEST(ui_server_index_status_long_paths_no_overflow) {
+TEST(ui_server_index_status_long_paths_fail_loudly) {
 #ifdef _WIN32
     SKIP_PLATFORM("fork crash-isolation is POSIX-only; the clamp is platform-agnostic");
 #else
@@ -2233,7 +2242,8 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
                  port);
         char resp[8192];
         int n = th_http(port, req, resp, sizeof(resp));
-        int ok = (n > 0 && strstr(resp, "HTTP/1.1 200") != NULL);
+        int ok = (n > 0 && strstr(resp, "HTTP/1.1 500") != NULL &&
+                  strstr(resp, "index status exceeds response limit") != NULL);
         atomic_store(&executor.release, 1);
         th_server_stop(&ts);
         _exit(ok ? 0 : 3);
@@ -2254,12 +2264,207 @@ TEST(ui_server_index_status_long_paths_no_overflow) {
 #endif
 }
 
+/* /api/processes is bounded by an 8 KiB stack buffer. A large process list
+ * must fail explicitly instead of returning truncated, malformed JSON. */
+TEST(ui_server_processes_fails_loudly_when_response_exceeds_buffer) {
+#ifdef _WIN32
+    SKIP_PLATFORM("synthetic ps fixture is POSIX-only; production bound is shared");
+#else
+    char *tmpdir = th_mktempdir("cbm_processes");
+    ASSERT_NOT_NULL(tmpdir);
+    char ps_path[1024];
+    snprintf(ps_path, sizeof(ps_path), "%s/ps", tmpdir);
+    FILE *script = fopen(ps_path, "w");
+    ASSERT_NOT_NULL(script);
+    fputs("#!/bin/sh\n"
+          "i=0\n"
+          "while [ \"$i\" -lt 300 ]; do\n"
+          "  printf '%d 0.0 1 00:01 codebase-memory-mcp\\n' \"$((i + 1000))\"\n"
+          "  i=$((i + 1))\n"
+          "done\n",
+          script);
+    ASSERT_EQ(fclose(script), 0);
+    ASSERT_EQ(chmod(ps_path, 0755), 0);
+
+    const char *current_path = getenv("PATH");
+    char *old_path = current_path ? strdup(current_path) : NULL;
+    char synthetic_path[4096];
+    snprintf(synthetic_path, sizeof(synthetic_path), "%s:%s", tmpdir,
+             old_path ? old_path : "/usr/bin:/bin");
+    ASSERT_EQ(cbm_setenv("PATH", synthetic_path, 1), 0);
+
+    th_server_t server;
+    ASSERT_EQ(th_server_start(&server), 0);
+    int port = cbm_http_server_port(server.srv);
+    char request[256];
+    snprintf(request, sizeof(request),
+             "GET /api/processes HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+    char response[4096];
+    int received = th_http(port, request, response, sizeof(response));
+    th_server_stop(&server);
+
+    if (old_path) {
+        cbm_setenv("PATH", old_path, 1);
+        free(old_path);
+    } else {
+        cbm_unsetenv("PATH");
+    }
+    th_cleanup(tmpdir);
+    ASSERT_GT(received, 0);
+    ASSERT_EQ(th_status(response), 500);
+    ASSERT_NOT_NULL(strstr(response, "process list exceeds response limit"));
+    PASS();
+#endif
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
+/* ── CORS and /rpc coverage restored from the merge base ──────────────────
+ * Upstream deleted ui_server_cors_localhost_reflected,
+ * ui_server_cors_evil_origin_not_reflected and ui_server_rpc_initialize; the
+ * merge base and api-consolidation both had all three, and update_cors() is
+ * still live (src/ui/http_server.c:110). Origin reflection with no test
+ * asserting which origins are refused is exactly the coverage a merge must not
+ * drop silently.
+ *
+ * The localhost case is restored STRENGTHENED rather than verbatim. The old
+ * test asserted that http://localhost:5173 is reflected; the merged
+ * origin_is_same_server() (:89) now reflects only the server's OWN port,
+ * because "a different localhost port is a different principal" (:109).
+ * Restoring the old assertion would pin the looser policy back in place, so it
+ * is replaced by two tests: the same-port origin IS reflected, and a different
+ * localhost port is NOT. */
+TEST(ui_server_cors_same_server_origin_reflected) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    /* Both loopback spellings of this server's own origin are reflected.
+     *
+     * Each spelling is sent with a Host header that AGREES with it, because
+     * request_passes_http_security() (:1716-1721) additionally requires
+     * origin_matches_host(): the origin's loopback spelling must match the
+     * Host's. That is upstream's tightening and it costs nothing here — a
+     * browser always sends Origin and Host consistently for a same-origin
+     * request — while closing the gap where a page could claim the loopback
+     * spelling the Host header does not use. Omitting Host would leave the
+     * helper's fixed "Host: 127.0.0.1" in place and make the localhost
+     * iteration fail 403, testing the policy rather than the reflection. */
+    const char *const hosts[] = {"localhost", "127.0.0.1"};
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++) {
+        char origin[64];
+        snprintf(origin, sizeof(origin), "http://%s:%d", hosts[i], port);
+        char request[256];
+        snprintf(request, sizeof(request),
+                 "OPTIONS /rpc HTTP/1.1\r\nHost: %s:%d\r\nOrigin: %s\r\n\r\n", hosts[i], port,
+                 origin);
+        char resp[4096];
+        int n = th_http(port, request, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 204);
+        char expected[128];
+        snprintf(expected, sizeof(expected), "Access-Control-Allow-Origin: %s", origin);
+        ASSERT_NOT_NULL(strstr(resp, expected));
+    }
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_cors_other_localhost_port_not_reflected) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    /* A different localhost port is a different principal, so it must not be
+     * reflected even though it is loopback. Pick a port that is not ours. */
+    int other = port == 5173 ? 5174 : 5173;
+    char request[256];
+    snprintf(request, sizeof(request),
+             "OPTIONS /rpc HTTP/1.1\r\nOrigin: http://localhost:%d\r\n\r\n", other);
+    char resp[4096];
+    int n = th_http(port, request, resp, sizeof(resp));
+
+    ASSERT_GT(n, 0);
+    /* Refused outright rather than served without a CORS header. Serving a
+     * foreign origin and merely withholding Access-Control-Allow-Origin relies
+     * on the CLIENT to enforce the boundary; 403 enforces it at the server, so
+     * a non-browser caller cannot reach the route either. Withholding the
+     * header is still asserted, so neither half of the contract can regress. */
+    ASSERT_EQ(th_status(resp), 403);
+    ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_cors_evil_origin_not_reflected) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "OPTIONS /rpc HTTP/1.1\r\n"
+                    "Origin: http://evil.example.com\r\n\r\n",
+                    resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    /* Same server-side refusal as the wrong-port case above. */
+    ASSERT_EQ(th_status(resp), 403);
+    ASSERT_NULL(strstr(resp, "Access-Control-Allow-Origin"));
+    th_server_stop(&ts);
+    PASS();
+}
+
+/* /rpc is NOT a general MCP endpoint: rpc_is_allowed_for_ui()
+ * (src/ui/http_server.c:1628-1643) admits only tools/call for list_projects and
+ * get_code_snippet. That matters because this port is reachable from a browser,
+ * where a general endpoint would expose index_repository and delete_project to
+ * any page that got past the origin check. `initialize` is therefore refused.
+ *
+ * Both halves are asserted in one test so neither can regress alone: widening
+ * the allowlist breaks the refusal half, and breaking dispatch breaks the
+ * allowed half. Asserting only the refusal would pass on a server that
+ * refuses everything. */
+TEST(ui_server_rpc_initialize) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\","
+                       "\"params\":{\"protocolVersion\":\"2024-11-05\","
+                       "\"capabilities\":{},"
+                       "\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
+    char req[1024];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    char resp[8192];
+    int n = th_http(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 403);
+    ASSERT_NOT_NULL(strstr(resp, "UI RPC method is not allowed"));
+
+    const char *allowed_body = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                               "\"params\":{\"name\":\"list_projects\",\"arguments\":{}}}";
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(allowed_body), allowed_body);
+    n = th_http(port, req, resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+
+    th_server_stop(&ts);
+    PASS();
+}
+
 SUITE(httpd) {
-    RUN_TEST(ui_server_browse_wide_dir_no_overflow);
+    RUN_TEST(ui_server_browse_wide_dir_fails_loudly);
     RUN_TEST(ui_server_logs_escape_dense_no_overflow);
-    RUN_TEST(ui_server_index_status_long_paths_no_overflow);
+    RUN_TEST(ui_server_index_status_long_paths_fail_loudly);
+    RUN_TEST(ui_server_processes_fails_loudly_when_response_exceeds_buffer);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_security_headers_and_rejects_duplicates);
@@ -2283,6 +2488,7 @@ SUITE(httpd) {
 
     /* Transport */
     RUN_TEST(httpd_listen_ephemeral_port);
+    RUN_TEST(httpd_accepted_socket_close_on_exec);
     RUN_TEST(httpd_listen_port_collision_returns_null);
     RUN_TEST(httpd_close_refuses_while_connection_owns_listener);
 
@@ -2291,6 +2497,11 @@ SUITE(httpd) {
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
+    /* restored from the merge base; localhost case strengthened */
+    RUN_TEST(ui_server_cors_same_server_origin_reflected);
+    RUN_TEST(ui_server_cors_other_localhost_port_not_reflected);
+    RUN_TEST(ui_server_cors_evil_origin_not_reflected);
+    RUN_TEST(ui_server_rpc_initialize);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
     RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);

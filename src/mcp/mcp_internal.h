@@ -16,16 +16,33 @@ void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command
                                           void *context);
 void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit);
 
-/* Release only the constructor-created pristine in-memory store. Public
- * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
- * this immediately before publication so idle sessions retain no SQLite DB. */
-bool cbm_mcp_server_release_pristine_memory_store(cbm_mcp_server_t *srv);
+/* Allocate a server whose store is intentionally absent. Daemon sessions set
+ * their project context before dispatch and must not build a temporary SQLite
+ * memory store merely to close it before publication. Public
+ * cbm_mcp_server_new(NULL) semantics remain unchanged. */
+cbm_mcp_server_t *cbm_mcp_server_new_without_store(void);
+
+/* Inspect, then atomically consume, one coalesced tools/list_changed
+ * notification after a response is ready. Daemon dispatch peeks before its
+ * cancellation linearization point and consumes only after the request wins;
+ * direct stdio consumes after writing its response. Both are O(1) time/memory,
+ * and no background thread writes a protocol stream. */
+bool cbm_mcp_server_tools_list_changed_pending(cbm_mcp_server_t *srv);
+bool cbm_mcp_server_take_tools_list_changed(cbm_mcp_server_t *srv);
+
+/* White-box counter for query-store open attempts made on behalf of this
+ * server. Tests use it to pin one-open validation/dispatch without depending
+ * on wall-clock timing. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+uint64_t cbm_mcp_memory_store_open_count_for_testing(void);
+uint64_t cbm_mcp_server_query_store_open_count_for_testing(const cbm_mcp_server_t *srv);
+uint64_t cbm_mcp_server_request_mem_collect_count_for_testing(const cbm_mcp_server_t *srv);
+void cbm_mcp_test_fail_next_semantic_keyword_allocation(void);
+#endif
 
 /* Prepend one daemon-owned notice to a successful JSON-RPC tool response.
  * On success replaces and frees *response_io; on failure it is unchanged. */
 bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *notice);
-
-enum { CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT = 50000 };
 
 /* Count indexable files with the pipeline's native full-mode discovery policy,
  * without retaining per-file results. A false result means the count exceeded
@@ -44,24 +61,28 @@ const char *cbm_mcp_edge_strategy_class(const char *strategy);
 bool cbm_mcp_auto_index_within_file_limit(const char *root_path, int file_limit,
                                           int *file_count_out);
 
+/* Apply the CONFIGURED auto_index_limit, which is not the same thing as the raw
+ * file limit above. Every limit key in the configuration registry documents 0 as
+ * "unlimited" rather than "allow nothing": auto_index_limit says "0=no limit,
+ * index everything" (src/cli/cli.c), and auto_dep_limit, query_max_output_bytes,
+ * and snippet_max_lines all say "0 = unlimited". Callers holding a value read
+ * from configuration must use this; cbm_mcp_auto_index_within_file_limit is the
+ * mechanism and honors 0 literally as a limit of zero. Keeping the convention in
+ * one place is deliberate: it previously lived only inside the MCP resolve path,
+ * so the daemon admission path read the same key and reached the opposite
+ * conclusion. file_count_out receives -1 when no count was needed. */
+bool cbm_mcp_auto_index_within_configured_limit(const char *root_path, int configured_limit,
+                                                int *file_count_out);
+
 /* detect_changes seed scoping (#1363): does `node`'s line range overlap any
  * recorded hunk for `file`? Exposed for direct unit testing of the overlap
  * logic, independent of the git/subprocess/index plumbing around it. */
 bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *hunks,
                               int hunk_count, const char *file);
 
-/* search_code Windows pre-scan optimization: only simple suffix globs can be
- * moved ahead of
- * Select-String without changing the existing full-path
- * PowerShell -like contract. Exposed for
- * direct boundary tests only. */
-bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern);
-
-/* Internal command builder exposed so tests can pin the PowerShell pipeline
- * ordering without
- * starting an external shell. */
-void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
-                                    const char *file_pattern, const char *tmpfile,
-                                    const char *filelist, const char *root_path);
+/* search_code no longer needs a Windows pre-scan glob filter: when a
+ * file_pattern is given, write_scoped_filelist() narrows the candidate list
+ * from the indexed project's file set BEFORE any shell runs, so PowerShell
+ * never walks non-matching paths and there is nothing left to prefilter. */
 
 #endif

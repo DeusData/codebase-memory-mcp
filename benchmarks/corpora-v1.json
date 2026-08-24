@@ -1,0 +1,301 @@
+{
+  "schema_version": 1,
+  "corpus_set_version": "corpora-v1",
+  "purpose": "Pinned real open-source corpora for the rank-quality campaign. Each entry records why it was chosen, which hardcoded criterion it exercises, and the file loss predicted from the skip lists in src/discover/discover.c before any indexing happens.",
+  "selection_rules": [
+    "Real, popular OSS only for the popularity cohort (>=1k stars), per docs/EVALUATION_PLAN.md:256 upstream.",
+    "Pinned by BOTH commit sha and tree sha; copy_git_revision_to_dir (run_benchmark.py:5055-5121) records and verifies both.",
+    "Every corpus states the hypothesis it discriminates (H4-H7) or the issue it reproduces.",
+    "Predicted losses below are computed from ALWAYS_SKIP_DIRS and FAST_SKIP_DIRS parsed out of src/discover/discover.c, matched against each pinned tree. They are pre-registered predictions, not post-hoc observations."
+  ],
+  "skip_list_source": {
+    "file": "src/discover/discover.c",
+    "always_skip_dirs_entries": 77,
+    "fast_skip_dirs_entries": 36,
+    "mode_gate": "src/discover/discover.c:448-452 applies FAST_SKIP_DIRS when mode != CBM_MODE_FULL",
+    "note": "ALWAYS_SKIP_DIRS applies in every mode including full."
+  },
+  "hypotheses": {
+    "H4": "edge-type insensitivity: degree counts TESTS and vendored edges at full weight; weighted PageRank can damp them.",
+    "H5": "utility inversion: raw in-degree ranks max-fan-in utilities first by construction.",
+    "H6": "edge ranking: LinkRank orders edges; no node-degree statistic can.",
+    "H7": "adaptation: runtime weights recover quality where compile-time constants cannot."
+  },
+  "corpora": [
+    {
+      "id": "cosign",
+      "repo": "sigstore/cosign",
+      "url": "https://github.com/sigstore/cosign",
+      "revision": "83d9ec8f4bdb25d680c2331528503cd85888868f",
+      "tree": "018c2e89e2c1b964d30fd98701eff57a513d9591",
+      "committed": "2026-07-31T15:14:31Z",
+      "language": "Go",
+      "stars": 6175,
+      "files_in_tree": 479,
+      "cohort": "adversarial",
+      "discriminates": [
+        "H4",
+        "H5",
+        "H7"
+      ],
+      "why": "The string 'attest' contains the substring 'test'. 30 paths under the pinned tree match 'attest', including production command code, so the bare strstr(file,\"test\") penalty at src/mcp/mcp.c:15367 (SCORE_TEST=-5) and the bare strstr(fp,\"test\") classifier at src/store/store.c:14905-14910 both fire on core production code. 163 paths contain 'test' overall, of which 104 are genuine _test.go files, giving a real signal/noise contrast rather than a synthetic one.",
+      "predicted_loss": {
+        "always_skipped_top_dirs": [],
+        "files_lost_every_mode": 0,
+        "fast_skipped_top_dirs": [
+          "doc",
+          "hack",
+          "scripts"
+        ],
+        "files_lost_outside_full_mode": 49
+      },
+      "issues": [
+        "#1406"
+      ],
+      "notes": "Uses plural scripts/, which IS in FAST_SKIP_DIRS. Pairs with runc, which uses singular script/, which is NOT."
+    },
+    {
+      "id": "jest",
+      "repo": "jestjs/jest",
+      "url": "https://github.com/jestjs/jest",
+      "revision": "f49721c78e195558b40913977c9230f5b7f559d8",
+      "tree": "9ab69bfdd7af987de9304dda0adb76513b3ea32f",
+      "committed": "2026-06-24T09:42:12Z",
+      "language": "TypeScript",
+      "stars": 45457,
+      "files_in_tree": 3317,
+      "cohort": "adversarial",
+      "discriminates": [
+        "H4",
+        "H7"
+      ],
+      "why": "The polarity-inversion corpus: the product IS test infrastructure, so 1630 of 3317 paths contain 'test' and a global test penalty demotes precisely the code a user is searching for. #879's TEST_MUL=0.1 and our edge_weight_tests=0.05 both misfire here in the same direction. Lower scaffolding@K is a DEFECT on this corpus, not a win; the metric is reported with an explicit sign.",
+      "predicted_loss": {
+        "always_skipped_top_dirs": [
+          ".claude",
+          ".vscode",
+          ".yarn"
+        ],
+        "files_lost_every_mode": 8,
+        "fast_skipped_top_dirs": [
+          "docs",
+          "e2e",
+          "examples",
+          "scripts"
+        ],
+        "files_lost_outside_full_mode": 1711
+      },
+      "issues": [
+        "#1406",
+        "#1294"
+      ],
+      "notes": "1711 of 3317 files (51.6%) disappear outside full mode. This is the strongest single demonstration of the #1406 class."
+    },
+    {
+      "id": "runc",
+      "repo": "opencontainers/runc",
+      "url": "https://github.com/opencontainers/runc",
+      "revision": "0c87c02ff02123f1bc2cd1b3f850f94e5b8de983",
+      "tree": "431b845435e4eb19593fd27ec12080c3a6fec29a",
+      "committed": "2026-07-29T18:18:53Z",
+      "language": "Go",
+      "stars": 13384,
+      "files_in_tree": 1305,
+      "cohort": "adversarial",
+      "discriminates": [
+        "H4",
+        "H5",
+        "H6"
+      ],
+      "why": "Natural experiment on skip-list asymmetry: runc keeps its shell helpers in script/ (singular), which is absent from FAST_SKIP_DIRS, while cosign uses scripts/ (plural), which is present. Same intent, opposite treatment, exactly parallel to the deploy/deployment asymmetry in ALWAYS_SKIP_DIRS reported as #1184. Also carries a committed vendor/ tree, so it measures ranking when 75% of the repository is absent from the graph in every mode.",
+      "predicted_loss": {
+        "always_skipped_top_dirs": [
+          "vendor"
+        ],
+        "files_lost_every_mode": 978,
+        "fast_skipped_top_dirs": [
+          "docs"
+        ],
+        "files_lost_outside_full_mode": 8
+      },
+      "issues": [
+        "#1184",
+        "#1406"
+      ],
+      "notes": "978 of 1305 files (74.9%) are dropped in EVERY mode including full, via the single ALWAYS_SKIP_DIRS entry 'vendor'. SCORE_VENDORED=-50 (mcp.c:15362) also targets vendored paths, so two mechanisms serve one intent."
+    },
+    {
+      "id": "flask",
+      "repo": "pallets/flask",
+      "url": "https://github.com/pallets/flask",
+      "revision": "6a2f545bfd8ed31e19066a299296917e034aca58",
+      "tree": "70a41ed9ca5461fc58ae35e39978af9b2ae93542",
+      "committed": "2026-07-30T17:29:33Z",
+      "language": "Python",
+      "stars": 72069,
+      "files_in_tree": 236,
+      "cohort": "adversarial",
+      "discriminates": [
+        "H4"
+      ],
+      "why": "Pure pytest project, so every test function carries is_test=false: def.is_test is assigned only for Rust #[test] and C++ GoogleTest at internal/cbm/extract_defs.c:3718,3723. Measures how much test signal survives on the TESTS-edge and path-heuristic channel alone when the node property is uniformly wrong. Small and well known, so relevance targets (Flask, Blueprint, url_for) are unambiguous.",
+      "predicted_loss": {
+        "always_skipped_top_dirs": [],
+        "files_lost_every_mode": 0,
+        "fast_skipped_top_dirs": [
+          "docs",
+          "examples"
+        ],
+        "files_lost_outside_full_mode": 129
+      },
+      "issues": [
+        "#1294",
+        "#1406"
+      ],
+      "notes": "129 of 236 files (54.7%) lost outside full mode."
+    },
+    {
+      "id": "redis",
+      "repo": "redis/redis",
+      "url": "https://github.com/redis/redis",
+      "revision": "0708bdbc0086bea03c5a40d9b606b5fe73d7159d",
+      "tree": "5d2b153566a03b37d14538863cbcb31bacf50649",
+      "committed": "2026-08-03T02:24:18Z",
+      "language": "C",
+      "stars": 75845,
+      "files_in_tree": 1858,
+      "cohort": "adversarial",
+      "discriminates": [
+        "H5",
+        "H6"
+      ],
+      "why": "Hub-utility corpus for H5: C allocators and logging helpers (zmalloc, serverLog, sds*) have the highest raw fan-in in the repository, which is precisely the shape the maintainer predicted PageRank would surface (#151: 'PageRank would rank log.Error() and fmt.Sprintf() as the most important functions'). Testing that claim needs a corpus where such hubs genuinely dominate. Deep call chains also make it the primary corpus for H6 edge ordering.",
+      "predicted_loss": {
+        "always_skipped_top_dirs": [],
+        "files_lost_every_mode": 0,
+        "fast_skipped_top_dirs": [
+          "scripts",
+          "tools"
+        ],
+        "files_lost_outside_full_mode": 13
+      },
+      "issues": [],
+      "notes": "594 paths contain 'test' (Tcl suite); 1 contains 'latest', a direct false-positive probe for strstr(fp,\"test\")."
+    },
+    {
+      "id": "ripgrep",
+      "repo": "BurntSushi/ripgrep",
+      "url": "https://github.com/BurntSushi/ripgrep",
+      "revision": "435f59fc4b43af3ab32f34d53fa34978f393fe52",
+      "tree": "45a1e81a7682d20dd41096482516a506d0adbdd1",
+      "committed": "2026-07-29T15:00:03Z",
+      "language": "Rust",
+      "stars": 66894,
+      "files_in_tree": 237,
+      "cohort": "control",
+      "discriminates": [],
+      "why": "Positive control: Rust is the one ecosystem where def.is_test is actually populated (#[test] handling at internal/cbm/extract_defs.c:3718), and the repository has almost nothing in the skip lists. If a metric moves here, the cause is the score rather than missing coverage.",
+      "predicted_loss": {
+        "always_skipped_top_dirs": [
+          ".cargo"
+        ],
+        "files_lost_every_mode": 1,
+        "fast_skipped_top_dirs": [
+          "scripts"
+        ],
+        "files_lost_outside_full_mode": 1
+      },
+      "issues": [],
+      "notes": "Near-zero predicted loss is the point: it isolates score effects from coverage effects."
+    },
+    {
+      "id": "codebase-memory-mcp",
+      "repo": "ahundt/codebase-memory-mcp",
+      "cohort": "workload",
+      "language": "C",
+      "revision": "resolve-at-run-time",
+      "discriminates": [],
+      "why": "Mined-workload corpus: 3422 real graph-tool calls were recovered against this repository, so its query battery is empirical rather than authored. Self-measurement also exposes our own scores to the same audit we apply to #879.",
+      "issues": [],
+      "notes": "Excluded from the >=1k-star popularity rule by design; it is a workload-validity corpus, not a popularity-cohort corpus.",
+      "url": "https://github.com/ahundt/codebase-memory-mcp"
+    },
+    {
+      "id": "ai-session-search",
+      "repo": "ahundt/ai-session-search",
+      "cohort": "workload",
+      "language": "Rust",
+      "revision": "resolve-at-run-time",
+      "discriminates": [],
+      "why": "Largest mined-workload source: 8558 real graph-tool calls, 66% of the recovered corpus. Supplies the highest-confidence realistic query distribution.",
+      "issues": [],
+      "notes": "Rust-heavy, so it over-represents one language; weighted accordingly in reporting.",
+      "url": "https://github.com/ahundt/ai-session-search"
+    },
+    {
+      "id": "autorun",
+      "repo": "ahundt/autorun",
+      "cohort": "workload",
+      "language": "Python",
+      "revision": "resolve-at-run-time",
+      "discriminates": [],
+      "why": "Mined-workload corpus with 648 real calls and a 33.3% query_graph zero-result rate, the highest observed. Supplies realistic structural-query failure cases.",
+      "issues": [],
+      "notes": "Also pytest-based, so it corroborates the flask is_test finding on a second Python codebase.",
+      "url": "https://github.com/ahundt/autorun"
+    },
+    {
+      "id": "codex",
+      "repo": "openai/codex",
+      "cohort": "workload",
+      "language": "Rust",
+      "revision": "resolve-at-run-time",
+      "discriminates": [],
+      "why": "Fourth permitted mined-workload repository (54 calls). Smallest contribution; included for coverage of a fourth independent codebase.",
+      "issues": [],
+      "notes": "Low call volume, so it contributes queries but carries little weight in the workload distribution.",
+      "url": "https://github.com/openai/codex"
+    },
+    {
+      "id": "scikit-learn",
+      "repo": "scikit-learn/scikit-learn",
+      "url": "https://github.com/scikit-learn/scikit-learn",
+      "revision": "5799d3eac08bda44fbce3309e641cbf98c5d312a",
+      "tree": "becf3d78e1e67254c8a1de53a3178d420e5ee7b8",
+      "committed": "2026-07-31T15:16:02Z",
+      "language": "Python",
+      "stars": 66855,
+      "cohort": "adversarial",
+      "discriminates": [
+        "H4",
+        "H7"
+      ],
+      "why": "The only corpus here where 'test' is production vocabulary at the SYMBOL level rather than a path convention: train_test_split is public API exported from sklearn/model_selection/__init__.py, and test_size, TimeSeriesSplit and hypothesis-testing helpers are core interface. A search_graph query for 'test' must therefore return production API here and scaffolding on flask, from the same language and the same labeller. Every other corpus comes from a domain where the substring means scaffolding, so without this one the corpus set under-samples the failure the campaign exists to find.",
+      "issues": [],
+      "notes": "Measured against the pinned tree, not assumed: 1812 files, 1016 Python, 330 paths containing 'test' of which 319 are genuine test modules. So the PATH-level misclassification surface is small (11 files, mostly conftest.py and sklearn/utils/_test_common/), and this corpus is NOT strong evidence for the path-based predicates at src/mcp/mcp.c:15367 or src/store/store.c:14905-14910. Its value is the symbol-name axis and the flask pairing: same language, same labeller, opposite polarity for the token 'test'.",
+      "files_in_tree": 1812,
+      "predicted_loss": {
+        "always_skipped_top_dirs": [],
+        "files_lost_every_mode": 0,
+        "fast_skipped_top_dirs": [
+          "doc",
+          "examples"
+        ],
+        "files_lost_outside_full_mode": 705
+      }
+    }
+  ],
+  "holdout": {
+    "id": "TBD-typescript-monorepo",
+    "cohort": "holdout",
+    "status": "unselected",
+    "requirement": "A TypeScript monorepo with substantial generated-code directories. Pinned and opened exactly once, after finalists are selected, per the cross-validation protocol.",
+    "rule": "Must not be inspected, indexed, or queried before selection is frozen."
+  },
+  "measurements_deferred_to_run_time": [
+    "TESTS-edge fraction per corpus (needs an index; required to rank corpora by H4 discriminating power).",
+    "Hub-utility identity and fan-in per corpus (needs an index; required for H5).",
+    "Actual vs predicted file loss per index mode (the silent-drop matrix, P4.6)."
+  ],
+  "workload_corpus_resolution": "Workload corpora record revision \"resolve-at-run-time\": their value is the query distribution mined against whatever the operator actually had indexed, so pinning one commit would misdescribe them. They resolve through the same ladder as every other benchmark repository (--corpus-repo <id>=PATH, CBM_BENCH_CORPUS_<ID>, the shared cache) and, with --clone-missing-real-repos, clone the current tip of the url below. The commit actually measured is read from the checkout and recorded in the run manifest, so a result always names a real commit even though the registry does not pin one."
+}

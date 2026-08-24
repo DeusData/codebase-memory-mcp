@@ -118,8 +118,20 @@ int cbm_default_worker_count(bool initial);
 
 /* Thread-safe getenv: copies the value into a caller-provided buffer.
  * Returns buf on success, or fallback if the variable is unset.
- * Returns NULL when the variable is unset and fallback is NULL. */
+ * Returns NULL when the variable is unset and fallback is NULL, the selected
+ * value does not fit completely, or the environment cannot be read. */
 const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const char *fallback);
+
+/* Copy a non-empty environment value only if it fits completely.
+ * Sets *present when the variable is set and non-empty, even if it does not
+ * fit. Uses the same UTF-8 environment reader as cbm_safe_getenv. */
+bool cbm_getenv_fits(const char *name, char *buf, size_t buf_sz, bool *present);
+
+/* Environment feature flag parser.
+ * Unset, empty, "0", "false", "off", and "no" are disabled; any other
+ * present value is enabled. Matching for textual false values is ASCII
+ * case-insensitive. */
+bool cbm_env_flag_enabled(const char *name);
 
 /* ── Home directory ─────────────────────────────────────────────── */
 

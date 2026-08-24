@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sqlite3.h>
 
 /* ── Test fixture: temp project with Python + Go files ─────────── */
 
@@ -370,7 +371,7 @@ TEST(integ_mcp_trace_path) {
     char args[256];
     snprintf(args, sizeof(args),
              "{\"function_name\":\"Compute\",\"project\":\"%s\","
-             "\"direction\":\"outbound\",\"max_depth\":3}",
+             "\"direction\":\"outbound\",\"depth\":3}",
              g_project);
 
     char *resp = call_tool("trace_path", args);
@@ -568,6 +569,9 @@ TEST(integ_store_bfs_traversal) {
         /* BFS outbound from Multiply */
         cbm_traverse_result_t trav = {0};
         int rc = cbm_store_bfs(store, results[0].id, "outbound", NULL, 0, 3, 20, &trav);
+        if (rc != CBM_STORE_OK) {
+            fprintf(stderr, "integ_store_bfs_traversal: %s\n", cbm_store_error(store));
+        }
         ASSERT_EQ(rc, CBM_STORE_OK);
         /* Should visit at least Add */
         ASSERT_TRUE(trav.visited_count >= 0); /* might be 0 if no edges */
@@ -622,7 +626,11 @@ TEST(store_bfs_edges_survive_large_visited_set) {
     }
 
     cbm_traverse_result_t tr = {0};
-    ASSERT_EQ(cbm_store_bfs(s, hub_id, "inbound", NULL, 0, 1, SPOKES + 10, &tr), CBM_STORE_OK);
+    int bfs_rc = cbm_store_bfs(s, hub_id, "inbound", NULL, 0, 1, SPOKES + 10, &tr);
+    if (bfs_rc != CBM_STORE_OK) {
+        fprintf(stderr, "store_bfs_edges_survive_large_visited_set: %s\n", cbm_store_error(s));
+    }
+    ASSERT_EQ(bfs_rc, CBM_STORE_OK);
     ASSERT_EQ(tr.visited_count, SPOKES);
     /* Every caller->hub edge must be collected — none silently dropped. */
     ASSERT_EQ(tr.edge_count, SPOKES);
@@ -704,6 +712,68 @@ TEST(store_bfs_multi_excludes_seeds_and_takes_min_hop) {
     ASSERT_TRUE(seen_mid && seen_leaf);
     ASSERT_EQ(leaf_hop, 1); /* MIN(hop): 1 from B, not 2 from A */
     cbm_store_traverse_free(&tr);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* "both" is a real undirected impact view, not an alias for outbound. The
+ * temporary seed rows are cleared before return so a later traversal on the
+ * same store cannot inherit another request's anchors. */
+TEST(store_bfs_multi_both_traverses_callers_and_callees_and_clears_seeds) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "impact_both", "/tmp/impact_both"), CBM_STORE_OK);
+
+    const char *names[] = {"caller", "seed", "callee"};
+    int64_t ids[3];
+    for (int i = 0; i < 3; i++) {
+        char qn[64];
+        snprintf(qn, sizeof(qn), "impact_both.%s", names[i]);
+        cbm_node_t node = {.project = "impact_both",
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = qn,
+                           .file_path = "both.c",
+                           .start_line = 1,
+                           .end_line = 2};
+        ids[i] = cbm_store_upsert_node(s, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    cbm_edge_t inbound = {.project = "impact_both",
+                          .source_id = ids[0],
+                          .target_id = ids[1],
+                          .type = "CALLS"};
+    cbm_edge_t outbound = {.project = "impact_both",
+                           .source_id = ids[1],
+                           .target_id = ids[2],
+                           .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &inbound), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &outbound), 0);
+
+    cbm_traverse_result_t tr = {0};
+    bool truncated = true;
+    ASSERT_EQ(cbm_store_bfs_multi(s, &ids[1], 1, "both", NULL, 0, 1, 10, &tr, &truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(truncated);
+    ASSERT_EQ(tr.visited_count, 2);
+    bool saw_caller = false;
+    bool saw_callee = false;
+    for (int i = 0; i < tr.visited_count; i++) {
+        saw_caller = saw_caller || tr.visited[i].node.id == ids[0];
+        saw_callee = saw_callee || tr.visited[i].node.id == ids[2];
+        ASSERT_EQ(tr.visited[i].hop, 1);
+    }
+    ASSERT_TRUE(saw_caller);
+    ASSERT_TRUE(saw_callee);
+    cbm_store_traverse_free(&tr);
+
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT COUNT(*) FROM temp.bfs_seeds", -1,
+                                 &stmt, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 0);
+    sqlite3_finalize(stmt);
     cbm_store_close(s);
     PASS();
 }
@@ -840,6 +910,7 @@ SUITE(integration) {
     RUN_TEST(integ_store_bfs_traversal);
     RUN_TEST(store_bfs_edges_survive_large_visited_set);
     RUN_TEST(store_bfs_multi_excludes_seeds_and_takes_min_hop);
+    RUN_TEST(store_bfs_multi_both_traverses_callers_and_callees_and_clears_seeds);
     RUN_TEST(store_bfs_multi_reports_truncation_at_ceiling);
 
     /* Pipeline API tests (no db needed) */

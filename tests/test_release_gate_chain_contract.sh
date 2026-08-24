@@ -262,10 +262,19 @@ if "scan_candidates: ${{ !inputs.skip_virustotal }}" not in dry_build:
         "dry-run build: scan_candidates must be exactly !inputs.skip_virustotal.")
 if "secrets: inherit" not in dry_build:
     failures.append("dry-run build: must inherit the VirusTotal API secret")
-if "virustotal" in dry_jobs:
-    failures.append(
-        "dry-run: obsolete post-smoke virustotal job must be removed; candidate\n"
-        "      scanning/selection belongs before smoke inside the build job.")
+dry_virustotal = dry_jobs.get("virustotal", "")
+for token in (
+    "needs: [build, smoke, soak]",
+    "needs.build.result == 'success'",
+    "scripts/ci/extract-release-archives.sh",
+    "--expect-archives=14",
+    "scripts/ci/exclude-rescanned-selected-objects.sh",
+    "files: binaries/objects/*",
+    "scripts/ci/check-virustotal.sh",
+):
+    if token not in dry_virustotal:
+        failures.append(
+            f"dry-run: full-surface post-package VirusTotal pass is missing: {token}")
 for caller_name, caller_jobs in (("release", blocks), ("dry-run", dry_jobs)):
     for downstream in ("smoke", "soak"):
         body = caller_jobs.get(downstream, "")

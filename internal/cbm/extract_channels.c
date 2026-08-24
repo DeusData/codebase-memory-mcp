@@ -26,24 +26,27 @@
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
 #include "tree_sitter/api.h"
+#include <limits.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 
 enum {
-    CHAN_CONST_CAP = 256,  /* max tracked identifiers per file */
-    CHAN_IDENT_MAX = 128,  /* max identifier length tracked */
-    CHAN_STACK_CAP = 4096, /* traversal stack depth per walk    */
-    CHAN_DIR_UNKNOWN = -1, /* unrecognized method → no channel */
+    CHAN_CONST_INITIAL_CAPACITY = CBM_SZ_32,
+    CHAN_STACK_CAP = CBM_SZ_4K, /* initial traversal stack capacity */
+    CHAN_DIR_UNKNOWN = -1,      /* unrecognized method → no channel */
 };
 
 typedef struct {
     const char *name;  /* borrowed — points into arena */
     const char *value; /* borrowed — points into arena */
+    int source_order;
 } chan_const_t;
 
 typedef struct {
-    chan_const_t items[CHAN_CONST_CAP];
+    chan_const_t *items;
     int count;
+    int capacity;
 } chan_const_table_t;
 
 /* ── String literal helpers ──────────────────────────────────────── */
@@ -94,17 +97,77 @@ static const char *literal_from_first_child(CBMExtractCtx *ctx, TSNode node) {
 
 /* ── Constant resolution table ──────────────────────────────────── */
 
+static bool chan_const_table_append(chan_const_table_t *tbl, const char *name, const char *value) {
+    if (!tbl || !name || !value) {
+        return true;
+    }
+    if (tbl->count >= tbl->capacity) {
+        int next_capacity = CHAN_CONST_INITIAL_CAPACITY;
+        if (tbl->capacity > 0) {
+            if (tbl->capacity > INT_MAX / CBM_SZ_2) {
+                return false;
+            }
+            next_capacity = tbl->capacity * CBM_SZ_2;
+        }
+        if ((size_t)next_capacity > SIZE_MAX / sizeof(*tbl->items)) {
+            return false;
+        }
+        chan_const_t *grown = realloc(tbl->items, (size_t)next_capacity * sizeof(*tbl->items));
+        if (!grown) {
+            return false;
+        }
+        tbl->items = grown;
+        tbl->capacity = next_capacity;
+    }
+    tbl->items[tbl->count] =
+        (chan_const_t){.name = name, .value = value, .source_order = tbl->count};
+    tbl->count++;
+    return true;
+}
+
+static int chan_const_compare(const void *lhs, const void *rhs) {
+    const chan_const_t *a = lhs;
+    const chan_const_t *b = rhs;
+    int name_cmp = strcmp(a->name, b->name);
+    if (name_cmp != 0) {
+        return name_cmp;
+    }
+    return (a->source_order > b->source_order) - (a->source_order < b->source_order);
+}
+
+static void chan_const_table_sort(chan_const_table_t *tbl) {
+    if (tbl && tbl->count > 1) {
+        qsort(tbl->items, (size_t)tbl->count, sizeof(*tbl->items), chan_const_compare);
+    }
+}
+
+static void chan_const_table_destroy(chan_const_table_t *tbl) {
+    if (!tbl) {
+        return;
+    }
+    free(tbl->items);
+    *tbl = (chan_const_table_t){0};
+}
+
+static void chan_const_table_report_allocation_failure(CBMExtractCtx *ctx) {
+    ctx->result->has_error = true;
+    ctx->result->error_msg =
+        cbm_arena_strdup(ctx->arena, "channel constant table allocation failed");
+}
+
 /* Walk the whole tree once and collect `const IDENT = "value"` bindings so
  * later passes can resolve bare-identifier channel arguments.  Only scalar
  * string literals are tracked — template literals and expressions are left
  * unresolved.  This is a flat lookup; scope boundaries are ignored (a single
- * const table per file is sufficient for the common Socket.IO pattern). */
-static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
+ * const table per file is sufficient for the common Socket.IO pattern).
+ * Returns false on allocation failure rather than publishing a silently
+ * truncated identifier table. */
+static bool scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
     ts_nstack_push(&stack, ctx->arena, ctx->root);
 
-    while (stack.count > 0 && tbl->count < CHAN_CONST_CAP) {
+    while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
@@ -119,10 +182,8 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
                     char *name_text = cbm_node_text(ctx->arena, name_node, ctx->source);
                     char *value_text = cbm_node_text(ctx->arena, value_node, ctx->source);
                     const char *unq = unquote_string(ctx->arena, value_text);
-                    if (name_text && unq) {
-                        tbl->items[tbl->count].name = name_text;
-                        tbl->items[tbl->count].value = unq;
-                        tbl->count++;
+                    if (name_text && unq && !chan_const_table_append(tbl, name_text, unq)) {
+                        return false;
                     }
                 }
             }
@@ -130,15 +191,17 @@ static void scan_string_consts_js(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
 
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
+    chan_const_table_sort(tbl);
+    return true;
 }
 
 /* Python constant resolution: NAME = "value" (assignment node). */
-static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
+static bool scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tbl) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
     ts_nstack_push(&stack, ctx->arena, ctx->root);
 
-    while (stack.count > 0 && tbl->count < CHAN_CONST_CAP) {
+    while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *kind = ts_node_type(node);
 
@@ -153,10 +216,8 @@ static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tb
                 if (!val) {
                     val = literal_from_first_child(ctx, right);
                 }
-                if (name && val) {
-                    tbl->items[tbl->count].name = name;
-                    tbl->items[tbl->count].value = val;
-                    tbl->count++;
+                if (name && val && !chan_const_table_append(tbl, name, val)) {
+                    return false;
                 }
             }
         }
@@ -166,19 +227,27 @@ static void scan_string_consts_python(CBMExtractCtx *ctx, chan_const_table_t *tb
             ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
+    chan_const_table_sort(tbl);
+    return true;
 }
 
-/* Resolve an identifier against the constant table.  Returns NULL on miss. */
+/* Resolve an identifier against the sorted constant table.  Duplicate names
+ * preserve the first source-order binding used by the historical linear scan. */
 static const char *resolve_identifier(const chan_const_table_t *tbl, const char *name) {
-    if (!name) {
+    if (!tbl || !name) {
         return NULL;
     }
-    for (int i = 0; i < tbl->count; i++) {
-        if (tbl->items[i].name && strcmp(tbl->items[i].name, name) == 0) {
-            return tbl->items[i].value;
+    int lo = 0;
+    int hi = tbl->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / CBM_SZ_2;
+        if (strcmp(tbl->items[mid].name, name) < 0) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
         }
     }
-    return NULL;
+    return lo < tbl->count && strcmp(tbl->items[lo].name, name) == 0 ? tbl->items[lo].value : NULL;
 }
 
 /* ── Enclosing function detection ───────────────────────────────── */
@@ -369,7 +438,11 @@ static void js_process_call(CBMExtractCtx *ctx, TSNode call, const chan_const_ta
 
 static void extract_channels_js(CBMExtractCtx *ctx) {
     chan_const_table_t consts = {0};
-    scan_string_consts_js(ctx, &consts);
+    if (!scan_string_consts_js(ctx, &consts)) {
+        chan_const_table_destroy(&consts);
+        chan_const_table_report_allocation_failure(ctx);
+        return;
+    }
 
     /* Second pass: walk the tree looking for call_expression nodes. */
     TSNodeStack stack;
@@ -383,6 +456,7 @@ static void extract_channels_js(CBMExtractCtx *ctx) {
         }
         ts_nstack_push_children(&stack, ctx->arena, node);
     }
+    chan_const_table_destroy(&consts);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -546,7 +620,11 @@ static void py_process_decorator(CBMExtractCtx *ctx, TSNode decorator,
 
 static void extract_channels_python(CBMExtractCtx *ctx) {
     chan_const_table_t consts = {0};
-    scan_string_consts_python(ctx, &consts);
+    if (!scan_string_consts_python(ctx, &consts)) {
+        chan_const_table_destroy(&consts);
+        chan_const_table_report_allocation_failure(ctx);
+        return;
+    }
 
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx->arena, CHAN_STACK_CAP);
@@ -565,6 +643,7 @@ static void extract_channels_python(CBMExtractCtx *ctx) {
             ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
         }
     }
+    chan_const_table_destroy(&consts);
 }
 
 /* ══════════════════════════════════════════════════════════════════

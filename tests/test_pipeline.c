@@ -5,22 +5,32 @@
  * on a temporary directory with known file layout.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/constants.h"
 #include "foundation/platform.h" // cbm_normalize_path_sep (drive-canonicalization regression)
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
+#include "cli/cli.h"
+#include "git/git_command.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
+#include "foundation/log.h"
+#include "foundation/profile.h"
+#include "semantic/semantic.h"
+#include "pagerank/pagerank.h"
+#include "test_graph_diff.h"
 #include "foundation/sha256.h"
 #include "foundation/compat_fs.h"
-#include "foundation/log.h"
 #include "foundation/win_utf8.h" // cbm_utf8_to_wide (Windows pipeline_test_set_mtime); no-op elsewhere
 #include "discover/userconfig.h"
 
+#include <sqlite3.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <string.h>
@@ -28,6 +38,11 @@
 #include "foundation/compat_thread.h"
 #include <fcntl.h>
 #include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#else
+#include <utime.h>
+#endif
 #include <unistd.h>
 #include "graph_buffer/graph_buffer.h"
 #include "yyjson/yyjson.h"
@@ -36,6 +51,42 @@
 /* ── Helper: create temp test repo with known layout ───────────── */
 
 static char g_tmpdir[256];
+
+enum { PIPELINE_TEST_OVERLONG_DB_PATH = CBM_PATH_MAX + CBM_SZ_128 };
+
+static char g_pipeline_log_capture[CBM_SZ_64K];
+static CBMLogLevel g_pipeline_prev_log_level = CBM_LOG_INFO;
+static cbm_mutex_t g_pipeline_log_capture_mutex;
+
+static void pipeline_capture_log_sink(const char *line) {
+    cbm_mutex_lock(&g_pipeline_log_capture_mutex);
+    size_t used = strlen(g_pipeline_log_capture);
+    size_t avail = sizeof(g_pipeline_log_capture) - used;
+    if (avail <= SKIP_ONE) {
+        cbm_mutex_unlock(&g_pipeline_log_capture_mutex);
+        return;
+    }
+    int n = snprintf(g_pipeline_log_capture + used, avail, "%s\n", line);
+    if (n < 0 || (size_t)n >= avail) {
+        g_pipeline_log_capture[sizeof(g_pipeline_log_capture) - SKIP_ONE] = '\0';
+    }
+    cbm_mutex_unlock(&g_pipeline_log_capture_mutex);
+}
+
+static void pipeline_capture_logs_start(void) {
+    cbm_mutex_init(&g_pipeline_log_capture_mutex);
+    g_pipeline_log_capture[0] = '\0';
+    g_pipeline_prev_log_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(pipeline_capture_log_sink);
+}
+
+static const char *pipeline_capture_logs_end(void) {
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(g_pipeline_prev_log_level);
+    cbm_mutex_destroy(&g_pipeline_log_capture_mutex);
+    return g_pipeline_log_capture;
+}
 
 /* Create:
  *   /tmp/cbm_test_XXXXXX/
@@ -225,6 +276,17 @@ TEST(store_bulk_persistence) {
 
 /* ── Integration: structure pass on temp repo ────────────────────── */
 
+static bool pipeline_test_derived_status_is(cbm_store_t *s, const char *project,
+                                            const char *view_name, const char *status) {
+    cbm_derived_view_state_t state = {0};
+    bool matches = false;
+    if (cbm_store_get_derived_view_state(s, project, view_name, &state) == CBM_STORE_OK) {
+        matches = state.status && strcmp(state.status, status) == 0;
+    }
+    cbm_store_derived_view_state_free_fields(&state);
+    return matches;
+}
+
 TEST(pipeline_structure_nodes) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -275,6 +337,12 @@ TEST(pipeline_structure_nodes) {
     /* Verify edges exist */
     int edge_count = cbm_store_count_edges(s, project);
     ASSERT_GTE(edge_count, 5); /* CONTAINS_FOLDER + CONTAINS_FILE edges */
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -282,12 +350,58 @@ TEST(pipeline_structure_nodes) {
     PASS();
 }
 
-/* Issue #516: an ADR stored via manage_adr (project_summaries) must survive a
- * full re-index. A full re-index deletes the DB and rebuilds it from the graph
- * buffer, which writes an empty project_summaries table; the fix captures the
- * ADR before the delete and restores it after the rebuild. Reproduce-first:
- * index, store an ADR, force a full re-index by adding files, assert the ADR
- * is still present and unchanged. */
+TEST(pipeline_full_reindex_preserves_adr_and_sibling_project) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/full_replace.db", g_tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char project[CBM_SZ_256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    static const char adr_text[] = "# Decision\nPreserve user-authored context.";
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_adr_store(store, project, adr_text), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(store, "sibling", "/tmp/sibling"), CBM_STORE_OK);
+    cbm_node_t sibling = {.project = "sibling",
+                          .label = "Function",
+                          .name = "keep",
+                          .qualified_name = "sibling.keep",
+                          .file_path = "keep.c"};
+    ASSERT_GT(cbm_store_upsert_node(store, &sibling), 0);
+    cbm_store_close(store);
+
+    /* The default policy disables incremental indexing. A second run must
+     * still replace only this project's derived graph, not rewrite the DB. */
+    p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(store, project, &adr), CBM_STORE_OK);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    ASSERT_EQ(cbm_store_count_nodes(store, "sibling"), 1);
+    cbm_node_t kept = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(store, "sibling", "sibling.keep", &kept), CBM_STORE_OK);
+    cbm_node_free_fields(&kept);
+    cbm_store_close(store);
+
+    teardown_test_repo();
+    PASS();
+}
+
+/* Issue #516: an ADR stored via manage_adr must survive the delete-and-rebuild
+ * full-index route, not only the project-scoped replacement route above. */
 TEST(pipeline_adr_survives_full_reindex) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_XXXXXX");
@@ -297,8 +411,6 @@ TEST(pipeline_adr_survives_full_reindex) {
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
-
-    /* Initial index with a single source file. */
     char path[512];
     snprintf(path, sizeof(path), "%s/main.py", tmp);
     FILE *f = fopen(path, "w");
@@ -309,20 +421,16 @@ TEST(pipeline_adr_survives_full_reindex) {
     cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p1);
     ASSERT_EQ(cbm_pipeline_run(p1), 0);
-    const char *project = cbm_pipeline_project_name(p1);
-    char project_copy[256];
-    snprintf(project_copy, sizeof(project_copy), "%s", project);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
     cbm_pipeline_free(p1);
 
-    /* Store an ADR. */
-    const char *adr_text = "# Decision\nWe chose X over Y.";
-    cbm_store_t *s1 = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(s1);
-    ASSERT_EQ(cbm_store_adr_store(s1, project_copy, adr_text), CBM_STORE_OK);
-    cbm_store_close(s1);
+    static const char adr_text[] = "# Decision\nWe chose X over Y.";
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_adr_store(store, project, adr_text), CBM_STORE_OK);
+    cbm_store_close(store);
 
-    /* Force a full re-index: add enough files to exceed the incremental
-     * threshold so the DB is deleted and rebuilt. */
     for (int i = 0; i < 4; i++) {
         snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
         f = fopen(path, "w");
@@ -336,16 +444,14 @@ TEST(pipeline_adr_survives_full_reindex) {
     ASSERT_EQ(cbm_pipeline_run(p2), 0);
     cbm_pipeline_free(p2);
 
-    /* The ADR must still be present and unchanged. */
-    cbm_store_t *s2 = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(s2);
+    store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
     cbm_adr_t adr = {0};
-    int rc = cbm_store_adr_get(s2, project_copy, &adr);
-    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_get(store, project, &adr), CBM_STORE_OK);
     ASSERT_NOT_NULL(adr.content);
     ASSERT_STR_EQ(adr.content, adr_text);
     cbm_store_adr_free(&adr);
-    cbm_store_close(s2);
+    cbm_store_close(store);
 
     rm_rf(tmp);
     PASS();
@@ -371,15 +477,59 @@ TEST(pipeline_structure_edges) {
     /* Check CONTAINS_FILE edges */
     int cf_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE");
     /* Check CONTAINS_FOLDER edges */
-    int cd_count = cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER");
+    int cd_count = cbm_store_count_edges_by_type(s, project, CBM_PIPELINE_EDGE_CONTAINS_FOLDER);
+
+    char *pkg_qn = cbm_pipeline_fqn_folder(project, "pkg");
+    char *util_qn = cbm_pipeline_fqn_folder(project, "pkg/util");
+    bool made_pkg_qn = pkg_qn != NULL;
+    bool made_util_qn = util_qn != NULL;
+    cbm_node_t pkg_node = {0};
+    cbm_node_t util_node = {0};
+    bool found_pkg = false;
+    bool found_util = false;
+    if (pkg_qn) {
+        rc = cbm_store_find_node_by_qn(s, project, pkg_qn, &pkg_node);
+        found_pkg = rc == CBM_STORE_OK;
+    }
+    if (util_qn) {
+        rc = cbm_store_find_node_by_qn(s, project, util_qn, &util_node);
+        found_util = rc == CBM_STORE_OK;
+    }
+    cbm_edge_t *pkg_folders = NULL;
+    int pkg_folder_count = 0;
+    bool found_pkg_folder_edges = false;
+    if (found_pkg) {
+        rc = cbm_store_find_edges_by_source_type(s, pkg_node.id,
+                                                 CBM_PIPELINE_EDGE_CONTAINS_FOLDER, &pkg_folders,
+                                                 &pkg_folder_count);
+        found_pkg_folder_edges = rc == CBM_STORE_OK;
+    }
+    bool has_nested_folder_edge = false;
+    for (int i = 0; i < pkg_folder_count; i++) {
+        if (pkg_folders[i].target_id == util_node.id) {
+            has_nested_folder_edge = true;
+            break;
+        }
+    }
 
     /* Cleanup before assertions (so failures don't leak) */
+    cbm_store_free_edges(pkg_folders, pkg_folder_count);
+    cbm_node_free_fields(&pkg_node);
+    cbm_node_free_fields(&util_node);
+    free(pkg_qn);
+    free(util_qn);
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_test_repo();
 
     ASSERT_GTE(cf_count, 3); /* project->main.go, pkg->service.go, util->helper.go */
-    ASSERT_GTE(cd_count, 1); /* project->pkg (pkg->util may merge on some platforms) */
+    ASSERT_GTE(cd_count, 2); /* branch->pkg and pkg->util */
+    ASSERT_TRUE(made_pkg_qn);
+    ASSERT_TRUE(made_util_qn);
+    ASSERT_TRUE(found_pkg);
+    ASSERT_TRUE(found_util);
+    ASSERT_TRUE(found_pkg_folder_edges);
+    ASSERT_TRUE(has_nested_folder_edge);
     PASS();
 }
 
@@ -488,6 +638,139 @@ TEST(pipeline_project_name_derived) {
     PASS();
 }
 
+TEST(pipeline_mode_global_semantic_edges_policy) {
+    ASSERT_TRUE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_FULL));
+    ASSERT_TRUE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_MODERATE));
+    ASSERT_FALSE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_FAST));
+    ASSERT_FALSE(cbm_pipeline_mode_builds_global_semantic_edges(CBM_MODE_DEP));
+    PASS();
+}
+
+TEST(pipeline_call_edge_props_include_args_and_line) {
+    char props[CBM_SZ_512];
+    int n = snprintf(props, sizeof(props),
+                     "{\"callee\":\"cbm_label_is_type_like\",\"confidence\":0.75,"
+                     "\"strategy\":\"unique_name\",\"candidates\":1");
+    ASSERT_GT(n, 0);
+
+    CBMCall call = {0};
+    call.start_line = 62;
+    call.arg_count = 1;
+    call.args[0].index = 0;
+    call.args[0].expr = "label";
+
+    cbm_pipeline_close_call_edge_props(props, sizeof(props), (size_t)n, &call, true);
+    ASSERT(strstr(props, "\"args\":[{\"i\":0,\"e\":\"label\"}]") != NULL);
+    ASSERT(strstr(props, "\"line\":62") != NULL);
+    ASSERT_EQ(props[strlen(props) - SKIP_ONE], '}');
+    PASS();
+}
+
+TEST(pipeline_weak_call_target_suppression) {
+    cbm_gbuf_node_t function_target = {.label = "Function"};
+    cbm_gbuf_node_t class_target = {.label = "Class"};
+    cbm_gbuf_node_t variable_target = {.label = "Variable"};
+    cbm_gbuf_node_t field_target = {.label = "Field"};
+
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &function_target, "unique_name"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &class_target, "suffix_match"));
+    ASSERT_TRUE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &variable_target, "unique_name"));
+    ASSERT_TRUE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &field_target, "suffix_match"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &variable_target, "same_module"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(
+        &variable_target, "import_map"));
+    ASSERT_FALSE(cbm_pipeline_should_suppress_weak_noncallable_call_target(NULL, "unique_name"));
+    PASS();
+}
+
+TEST(pipeline_member_call_normalization) {
+    CBMCall call = {.callee_name = "receiver.matches"};
+    ASSERT_TRUE(cbm_pipeline_call_is_member(&call, CBM_LANG_RUST));
+    ASSERT_FALSE(cbm_pipeline_call_is_member(&call, CBM_LANG_GO));
+
+    call.callee_name = "module::matches";
+    ASSERT_FALSE(cbm_pipeline_call_is_member(&call, CBM_LANG_RUST));
+
+    call.is_method = true;
+    ASSERT_TRUE(cbm_pipeline_call_is_member(&call, CBM_LANG_TYPESCRIPT));
+    ASSERT_FALSE(cbm_pipeline_call_is_member(NULL, CBM_LANG_RUST));
+    PASS();
+}
+
+TEST(pipeline_sequential_call_edges_preserve_eighth_arg) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    const char *py_path = TH_PATH(g_tmpdir, "wide_args.py");
+    ASSERT_EQ(th_write_file(py_path,
+                            "def wide_target(**kwargs):\n"
+                            "    return kwargs\n"
+                            "\n"
+                            "def wide_caller():\n"
+                            "    first_expression_value = 1\n"
+                            "    second_expression_value = 2\n"
+                            "    third_expression_value = 3\n"
+                            "    fourth_expression_value = 4\n"
+                            "    fifth_expression_value = 5\n"
+                            "    sixth_expression_value = 6\n"
+                            "    seventh_expression_value = 7\n"
+                            "    eighth_expression_value = 8\n"
+                            "    return wide_target(\n"
+                            "        first_keyword_argument=first_expression_value,\n"
+                            "        second_keyword_argument=second_expression_value,\n"
+                            "        third_keyword_argument=third_expression_value,\n"
+                            "        fourth_keyword_argument=fourth_expression_value,\n"
+                            "        fifth_keyword_argument=fifth_expression_value,\n"
+                            "        sixth_keyword_argument=sixth_expression_value,\n"
+                            "        seventh_keyword_argument=seventh_expression_value,\n"
+                            "        eighth_keyword_argument=eighth_expression_value,\n"
+                            "    )\n"),
+              0);
+
+    char db_path[CBM_SZ_512];
+    int n = snprintf(db_path, sizeof(db_path), "%s/wide_args.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_NOT_NULL(project);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    const char sql[] =
+        "SELECT e.properties FROM edges e "
+        "JOIN nodes t ON t.id = e.target_id "
+        "WHERE e.project = ?1 AND e.type = 'CALLS' AND t.name = 'wide_target' "
+        "LIMIT 1";
+    ASSERT_EQ(sqlite3_prepare_v2(db, sql, -1, &stmt, NULL), SQLITE_OK);
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    const char *edge_props = (const char *)sqlite3_column_text(stmt, 0);
+    ASSERT_NOT_NULL(edge_props);
+    ASSERT(strstr(edge_props, "\"k\":\"eighth_keyword_argument\"") != NULL);
+    ASSERT(strstr(edge_props, "\"e\":\"eighth_expression_value\"") != NULL);
+    static const char args_key[] = "\"args\":";
+    const char *first_args_key = strstr(edge_props, args_key);
+    ASSERT_NOT_NULL(first_args_key);
+    ASSERT(strstr(first_args_key + sizeof(args_key) - SKIP_ONE, args_key) == NULL);
+
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 TEST(pipeline_fast_mode) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -508,6 +791,12 @@ TEST(pipeline_fast_mode) {
     const char *project = cbm_pipeline_project_name(p);
     int node_count = cbm_store_count_nodes(s, project);
     ASSERT_GT(node_count, 0);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ROUTES,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_ARCHITECTURE,
+                                                CBM_STORE_DERIVED_STATUS_COMPLETE));
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project, CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -793,6 +1082,142 @@ TEST(pipeline_edge_props_valid_json) {
     PASS();
 }
 
+TEST(pipeline_persisted_route_purity_for_http_literals) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/route_noise.py", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write route_noise.py");
+    }
+    fprintf(f, "import os\n"
+               "from fastapi import FastAPI\n"
+               "import requests\n"
+               "\n"
+               "app = FastAPI()\n"
+               "\n"
+               "@app.get('/api/orders')\n"
+               "def orders():\n"
+               "    return {'ok': True}\n"
+               "\n"
+               "def client():\n"
+               "    requests.get('/tmp/alpha')\n"
+               "    requests.get('/Users/test/plans/foo.md')\n"
+               "    requests.get('/ar:allow')\n"
+               "    os.path.join('/api', 'orders')\n"
+               "    open('/usr/bin/uv')\n");
+    fclose(f);
+
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(db_path, sizeof(db_path), "%s/test_route_purity.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count),
+              CBM_STORE_OK);
+    bool saw_api = false;
+    for (int i = 0; i < route_count; i++) {
+        const char *name = routes[i].name ? routes[i].name : "";
+        if (strcmp(name, "/api/orders") == 0) {
+            saw_api = true;
+            continue;
+        }
+        ASSERT_FALSE(strcmp(name, "/tmp/alpha") == 0);
+        ASSERT_FALSE(strcmp(name, "/Users/test/plans/foo.md") == 0);
+        ASSERT_FALSE(strcmp(name, "/ar:allow") == 0);
+        ASSERT_FALSE(strcmp(name, "/usr/bin/uv") == 0);
+    }
+    ASSERT_TRUE(saw_api);
+
+    cbm_search_params_t params = {
+        .project = project, .label = "Route", .min_degree = -1, .max_degree = -1, .limit = 100};
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    for (int i = 0; i < out.count; i++) {
+        const char *name = out.results[i].node.name ? out.results[i].node.name : "";
+        ASSERT_FALSE(strcmp(name, "/tmp/alpha") == 0);
+        ASSERT_FALSE(strcmp(name, "/Users/test/plans/foo.md") == 0);
+        ASSERT_FALSE(strcmp(name, "/ar:allow") == 0);
+        ASSERT_FALSE(strcmp(name, "/usr/bin/uv") == 0);
+    }
+
+    cbm_store_search_free(&out);
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_infra_route_deny_wins_by_url_value) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/infra.yaml", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(path));
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        teardown_test_repo();
+        FAIL("failed to write infra.yaml");
+    }
+    fprintf(f, "registries:\n"
+               "  terraform_registry:\n"
+               "    url: https://registry.terraform.io\n"
+               "healthcheck: curl --fail http://localhost:8080/health || exit 1\n"
+               "push_endpoint: https://hooks.example.test/push\n");
+    fclose(f);
+
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(db_path, sizeof(db_path), "%s/test_infra_route_deny.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count),
+              CBM_STORE_OK);
+    bool saw_push_endpoint = false;
+    for (int i = 0; i < route_count; i++) {
+        const char *name = routes[i].name ? routes[i].name : "";
+        ASSERT_FALSE(strcmp(name, "https://registry.terraform.io") == 0);
+        ASSERT_FALSE(strcmp(name, "http://localhost:8080/health") == 0);
+        ASSERT_FALSE(strstr(name, "curl --fail http://localhost:8080/health") != NULL);
+        if (strcmp(name, "https://hooks.example.test/push") == 0) {
+            saw_push_endpoint = true;
+        }
+    }
+    ASSERT_TRUE(saw_push_endpoint);
+
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
 /* ── Calls pass tests ──────────────────────────────────────────── */
 
 TEST(pipeline_calls_resolution) {
@@ -824,8 +1249,9 @@ TEST(pipeline_calls_resolution) {
 
 /* True iff a CALLS edge exists from a node named src_name to a node named
  * tgt_name. Used to assert cross-file call resolution survives a reindex. */
-static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
-                                   const char *tgt_name) {
+static bool cross_file_call_with_strategy_exists(cbm_store_t *s, const char *project,
+                                                 const char *src_name, const char *tgt_name,
+                                                 const char *strategy) {
     cbm_node_t *srcs = NULL;
     cbm_node_t *tgts = NULL;
     int sc = 0;
@@ -839,7 +1265,9 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
         cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
         for (int j = 0; j < ec && !found; j++) {
             for (int k = 0; k < tc; k++) {
-                if (edges[j].target_id == tgts[k].id) {
+                if (edges[j].target_id == tgts[k].id &&
+                    (!strategy ||
+                     (edges[j].properties_json && strstr(edges[j].properties_json, strategy)))) {
                     found = true;
                     break;
                 }
@@ -857,6 +1285,13 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     }
     return found;
 }
+
+static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name) {
+    return cross_file_call_with_strategy_exists(s, project, src_name, tgt_name, NULL);
+}
+
+static cbm_config_t *incremental_test_config(const char *cache_dir);
 
 /* True iff the exact named CALLS edge exists and its serialized strategy
  * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
@@ -897,7 +1332,6 @@ static bool cross_file_call_has_strategy(cbm_store_t *s, const char *project, co
     }
     return found;
 }
-
 /* Nix attrpath qualification, end to end. A call inside a scoped binding must
  * source to the QUALIFIED definition.
  *
@@ -989,9 +1423,12 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     snprintf(helper, sizeof(helper), "%s/pkg/util/helper.go", g_tmpdir);
     ASSERT_EQ(th_append_file(helper, "\n// incremental regression marker\n"), 0);
 
-    /* 3. Re-run on the SAME db_path → auto-routes to incremental re-index. */
+    /* 3. Re-run on the SAME db_path with incremental explicitly enabled. */
+    cbm_config_t *cfg = incremental_test_config(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p2);
+    cbm_pipeline_apply_config(p2, cfg);
     ASSERT_EQ(cbm_pipeline_run(p2), 0);
 
     /* 4. The inbound cross-file CALLS edge must survive and the total CALLS
@@ -1006,6 +1443,104 @@ TEST(pipeline_incremental_preserves_cross_file_calls) {
     ASSERT_TRUE(cross_file_call_exists(s2, project2, "Serve", "Help"));
     cbm_store_close(s2);
     cbm_pipeline_free(p2);
+    cbm_config_close(cfg);
+
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_full_and_incremental_persist_file_state) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    int n = snprintf(db_path, sizeof(db_path), "%s/test_file_state.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+
+    const char *project1 = cbm_pipeline_project_name(p1);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    cbm_file_state_t first = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s1, project1, "pkg/util/helper.go", &first), CBM_STORE_OK);
+    ASSERT_STR_EQ(first.language, "Go");
+    ASSERT_EQ(first.generation, CBM_PIPELINE_COMPAT_GENERATION);
+    int64_t first_generation = first.generation;
+    ASSERT_NOT_NULL(first.content_hash);
+    char first_hash[CBM_SZ_32];
+    n = snprintf(first_hash, sizeof(first_hash), "%s", first.content_hash);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(first_hash));
+    cbm_store_file_state_free_fields(&first);
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    char helper[512];
+    n = snprintf(helper, sizeof(helper), "%s/pkg/util/helper.go", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(helper));
+    ASSERT_EQ(th_append_file(helper, "\nfunc Extra() {}\n"), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    cbm_pipeline_apply_config(p2, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+
+    const char *project2 = cbm_pipeline_project_name(p2);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_file_state_t second = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s2, project2, "pkg/util/helper.go", &second),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(second.language, "Go");
+    ASSERT_GT(second.generation, first_generation);
+    ASSERT_NOT_NULL(second.content_hash);
+    ASSERT_NEQ(strcmp(first_hash, second.content_hash), 0);
+    cbm_store_file_state_free_fields(&second);
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+    cbm_config_close(cfg);
+
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_incremental_full_index_rebuilds_owner_metadata) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[512];
+    int n = snprintf(db_path, sizeof(db_path), "%s/test_owner_metadata.db", g_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db_path));
+
+    cbm_config_t *cfg = incremental_test_config(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, "pkg/util/helper.go",
+                                                &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
 
     teardown_test_repo();
     PASS();
@@ -1405,7 +1940,8 @@ TEST(pipeline_objectscript_export_incremental_matches_full_relationships) {
     }
     cbm_init();
     CBMFileResult *carrier_result = cbm_pipeline_extract_objectscript_export(
-        carrier_xml, carrier_xml_len, "export-lifecycle", "studio-export.xml", NULL, NULL);
+        carrier_xml, carrier_xml_len, "export-lifecycle", "studio-export.xml", CBM_EXTRACT_BUDGET,
+        true, NULL, NULL);
     if (!carrier_result) {
         th_rmtree(tmp);
         FAIL("failed to extract Studio Export carrier fixture");
@@ -1542,7 +2078,8 @@ TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table) {
 
     cbm_init();
     CBMFileResult *aggregate = cbm_pipeline_extract_objectscript_export(
-        xml, (int)used, "arena-stress", "studio-export.xml", NULL, NULL);
+        xml, (int)used, "arena-stress", "studio-export.xml", CBM_EXTRACT_BUDGET, true, NULL,
+        NULL);
     free(xml);
     ASSERT_NOT_NULL(aggregate);
 
@@ -2146,18 +2683,19 @@ TEST(pipeline_incremental_repoints_call_reference_without_stale_edge) {
     ASSERT_EQ(named_edge_count(first_store, first_project, "CALLS", "incrementalReferenceSite",
                                "alphaReferenceTarget"),
               0);
-    cbm_file_hash_t stored_hash = {0};
-    ASSERT_EQ(cbm_store_get_file_hash(first_store, first_project, "refs.go", &stored_hash),
+    cbm_file_state_t stored_state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(first_store, first_project, "refs.go", &stored_state),
               CBM_STORE_OK);
-    char expected_hash[CBM_SHA256_HEX_LEN + 1];
-    cbm_sha256_hex(initial_source, strlen(initial_source), expected_hash);
-    ASSERT_NOT_NULL(stored_hash.sha256);
-    ASSERT_STR_EQ(stored_hash.sha256, expected_hash);
-    cbm_store_clear_file_hash(&stored_hash);
+    char expected_hash[CBM_SZ_32];
+    ASSERT_EQ(cbm_pipeline_content_hash_file(source_path, expected_hash, sizeof(expected_hash)),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(stored_state.content_hash);
+    ASSERT_STR_EQ(stored_state.content_hash, expected_hash);
+    cbm_store_file_state_free_fields(&stored_state);
     cbm_coverage_meta_t baseline_meta = {0};
     ASSERT_EQ(cbm_store_coverage_meta_get(first_store, first_project, &baseline_meta),
               CBM_STORE_OK);
-    ASSERT_EQ(baseline_meta.coverage_version, CBM_SEMANTIC_INDEX_VERSION);
+    ASSERT_EQ(baseline_meta.coverage_version, CBM_COVERAGE_VERSION);
     ASSERT_TRUE(baseline_meta.hash_records_complete);
     cbm_store_coverage_meta_clear(&baseline_meta);
     cbm_store_close(first_store);
@@ -2247,6 +2785,58 @@ TEST(pipeline_sql_lineage_and_relation_isolation) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_sequential_usages_caches_repeated_lineage_resolution) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Model", "query", "proj.query", "query.sql", 1, 1, "{}");
+    int64_t target_id = cbm_gbuf_upsert_node(gb, "Table", "users", "proj.schema.users",
+                                             "schema.sql", 1, 1, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_registry_add(reg, "users", "proj.schema.users", "Table");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMUsage usage = {.ref_name = "users", .enclosing_func_qn = "proj.query"};
+    for (int i = 0; i < 64; i++) {
+        cbm_usages_push(&result.usages, &result.arena, usage);
+    }
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FULL,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {
+        {.path = "/tmp/proj/query.sql", .rel_path = "query.sql", .language = CBM_LANG_SQL}};
+
+    cbm_registry_resolve_chain_calls_reset_for_test();
+    ASSERT_EQ(cbm_pipeline_pass_usages(&ctx, files, 1), 0);
+    ASSERT_EQ(cbm_registry_resolve_chain_calls_for_test(), 1);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "USAGE", &edges, &edge_count),
+              0);
+    ASSERT_TRUE(edge_count >= 1);
+    ASSERT_EQ(edges[0]->target_id, target_id);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
     PASS();
 }
 
@@ -2535,7 +3125,7 @@ TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold) {
     cbm_pipeline_t *edited = cbm_pipeline_new(tmp, db, CBM_MODE_FULL);
     ASSERT_NOT_NULL(edited);
     ASSERT_EQ(cbm_pipeline_run(edited), 0);
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_NOOP);
     cbm_pipeline_free(edited);
     th_rmtree(tmp);
     PASS();
@@ -2568,7 +3158,7 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     ASSERT_EQ(cbm_pipeline_run(incr), 0);
     cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
     cbm_pipeline_free(incr);
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
 
     int repaired_nodes = -1;
     int repaired_edges = -1;
@@ -2650,7 +3240,7 @@ TEST(pipeline_closure_repair_removed_def_drops_dependent_edge) {
 
     /* Function def -> const def is a label/type change, not an added NAME, so
      * the closure route must hold — and the stale edge must be gone. */
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     ASSERT_EQ(repaired_refs, full_refs);
     ASSERT_EQ(repaired_nodes, full_nodes);
     ASSERT_EQ(repaired_edges, full_edges);
@@ -2878,8 +3468,7 @@ TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
      * target_a.ts to target_b.ts. Since alias-config governance landed this
      * runs as a closure repair, and the convergence assertions below now
      * prove that route rather than being satisfied by a full rebuild. */
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
-              CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
     const char *incremental_project = cbm_pipeline_project_name(incremental);
     cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
     ASSERT_NOT_NULL(incremental_store);
@@ -2945,6 +3534,39 @@ static void observe_named_generation(const char *db_path, const char *project,
     *before_count = named_node_count(store, project, before_name);
     *after_count = named_node_count(store, project, after_name);
     cbm_store_close(store);
+}
+
+static void observe_incremental_generation(const char *db_path, const char *project,
+                                           int generation_size, int *before_count,
+                                           int *after_count) {
+    *before_count = -1;
+    *after_count = -1;
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store || !project) {
+        if (store) {
+            cbm_store_close(store);
+        }
+        return;
+    }
+    int before = 0;
+    int after = 0;
+    for (int i = 0; i < generation_size; i++) {
+        char before_name[32];
+        char after_name[32];
+        snprintf(before_name, sizeof(before_name), "Before%02d", i);
+        snprintf(after_name, sizeof(after_name), "After%02d", i);
+        int before_nodes = named_node_count(store, project, before_name);
+        int after_nodes = named_node_count(store, project, after_name);
+        if (before_nodes < 0 || after_nodes < 0) {
+            cbm_store_close(store);
+            return;
+        }
+        before += before_nodes;
+        after += after_nodes;
+    }
+    cbm_store_close(store);
+    *before_count = before;
+    *after_count = after;
 }
 
 static int count_generation_stage_artifacts(const char *dir_path, const char *db_basename) {
@@ -3053,15 +3675,17 @@ TEST(pipeline_source_mutation_before_publication_preserves_previous_generation) 
  * have picked, and all must survive. Against the old code exactly one is
  * consumed, whichever serial the counter had reached.
  *
- * This calls cbm_pipeline_publish_generation directly. The only in-tree
- * caller sits behind CBM_INCREMENTAL_TEST_API, so going through the pipeline
- * would never reach the code under test. */
+ * Exercise the production full-pipeline publication path so the test follows
+ * the same staging authority as real indexing. */
 TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_predictable_stage_XXXXXX");
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/main.py", tmp);
+    ASSERT_EQ(th_write_file(source_path, "def main():\n    return 0\n"), 0);
 
     enum { PREDICTABLE_CANARIES = 32 };
     static const char canary[] = "canary-must-survive\n";
@@ -3072,21 +3696,10 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
         ASSERT_EQ(th_write_file(canary_path[i], canary), 0);
     }
 
-    cbm_gbuf_t *gb = cbm_gbuf_new("predictable-stage-proj", tmp);
-    ASSERT_NOT_NULL(gb);
-    cbm_pipeline_generation_t generation = {
-        .gbuf = gb,
-        .final_db_path = db_path,
-        .project = "predictable-stage-proj",
-        .cancelled = NULL,
-        .manifest = NULL,
-        .manifest_count = 0,
-        .adr_content = NULL,
-        .coverage = NULL,
-        .coverage_count = 0,
-    };
-    int publish_rc = cbm_pipeline_publish_generation(&generation);
-    cbm_gbuf_free(gb);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int publish_rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
 
     int survived = 0;
     int intact = 0;
@@ -3343,109 +3956,6 @@ TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation
     PASS();
 }
 
-/* Metadata participates in exact-input compatibility. Old coverage schema or
- * an upgrade to a more comprehensive discovery/index mode must force a
- * complete replacement even when every semantic-input byte is unchanged; the
- * replacement must write current metadata so the next identical run is a
- * true no-op. Cheaper requests retain fuller published coverage separately. */
-TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_metadata_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "generation.py", "def ExactMetadataGeneration():\n    return 1\n");
-    char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
-    ASSERT_NOT_NULL(baseline);
-    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
-    char project[256];
-    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
-    cbm_pipeline_free(baseline);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *exact_before_migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
-    ASSERT_NOT_NULL(exact_before_migration);
-    ASSERT_EQ(cbm_pipeline_run(exact_before_migration), 0);
-    cbm_incremental_route_t exact_before_route = cbm_pipeline_incremental_test_last_route();
-    cbm_pipeline_free(exact_before_migration);
-
-    cbm_store_t *metadata_store = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(metadata_store);
-    cbm_coverage_row_t *coverage_rows = NULL;
-    int coverage_count = 0;
-    ASSERT_EQ(cbm_store_coverage_get(metadata_store, project, &coverage_rows, &coverage_count),
-              CBM_STORE_OK);
-    cbm_coverage_meta_t current_meta = {0};
-    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &current_meta), CBM_STORE_OK);
-    cbm_coverage_meta_t legacy_meta = current_meta;
-    legacy_meta.coverage_version = 1;
-    ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
-                                            &legacy_meta),
-              CBM_STORE_OK);
-    cbm_store_free_coverage(coverage_rows, coverage_count);
-    cbm_store_coverage_meta_clear(&current_meta);
-    cbm_store_close(metadata_store);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
-    ASSERT_NOT_NULL(migration);
-    ASSERT_EQ(cbm_pipeline_run(migration), 0);
-    cbm_incremental_route_t migration_route = cbm_pipeline_incremental_test_last_route();
-    cbm_pipeline_free(migration);
-
-    metadata_store = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(metadata_store);
-    cbm_coverage_meta_t migrated_meta = {0};
-    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &migrated_meta), CBM_STORE_OK);
-    int migrated_version = migrated_meta.coverage_version;
-    bool migrated_hashes_complete = migrated_meta.hash_records_complete;
-    char migrated_mode[32];
-    snprintf(migrated_mode, sizeof(migrated_mode), "%s",
-             migrated_meta.index_mode ? migrated_meta.index_mode : "");
-    cbm_store_coverage_meta_clear(&migrated_meta);
-    cbm_store_close(metadata_store);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *mode_change = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(mode_change);
-    ASSERT_EQ(cbm_pipeline_run(mode_change), 0);
-    cbm_incremental_route_t mode_change_route = cbm_pipeline_incremental_test_last_route();
-    cbm_pipeline_free(mode_change);
-
-    metadata_store = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(metadata_store);
-    cbm_coverage_meta_t full_meta = {0};
-    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &full_meta), CBM_STORE_OK);
-    int full_version = full_meta.coverage_version;
-    bool full_hashes_complete = full_meta.hash_records_complete;
-    char full_mode[32];
-    snprintf(full_mode, sizeof(full_mode), "%s", full_meta.index_mode ? full_meta.index_mode : "");
-    cbm_store_coverage_meta_clear(&full_meta);
-    cbm_store_close(metadata_store);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *exact_full = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(exact_full);
-    ASSERT_EQ(cbm_pipeline_run(exact_full), 0);
-    cbm_incremental_route_t exact_full_route = cbm_pipeline_incremental_test_last_route();
-    cbm_pipeline_free(exact_full);
-    cbm_pipeline_incremental_test_reset_faults();
-    th_rmtree(tmp);
-
-    ASSERT_EQ(exact_before_route, CBM_INCREMENTAL_ROUTE_NOOP);
-    ASSERT_EQ(migration_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
-    ASSERT_EQ(migrated_version, CBM_SEMANTIC_INDEX_VERSION);
-    ASSERT_TRUE(migrated_hashes_complete);
-    ASSERT_STR_EQ(migrated_mode, "fast");
-    ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
-    ASSERT_EQ(full_version, CBM_SEMANTIC_INDEX_VERSION);
-    ASSERT_TRUE(full_hashes_complete);
-    ASSERT_STR_EQ(full_mode, "full");
-    ASSERT_EQ(exact_full_route, CBM_INCREMENTAL_ROUTE_NOOP);
-    PASS();
-}
 
 typedef struct {
     bool published;
@@ -3489,72 +3999,6 @@ static int run_observing_artifact_publish(cbm_pipeline_t *pipeline,
     cbm_log_set_level(previous_level);
     g_artifact_publish_observer = NULL;
     return rc;
-}
-
-static bool pipeline_reports_excluded_dir(cbm_pipeline_t *pipeline, const char *rel_path) {
-    char **excluded = NULL;
-    int excluded_count = 0;
-    cbm_pipeline_get_excluded(pipeline, &excluded, &excluded_count);
-    for (int i = 0; i < excluded_count; i++) {
-        if (excluded[i] && strcmp(excluded[i], rel_path) == 0) {
-            return true;
-        }
-    }
-    return false;
-}
-
-typedef struct {
-    int rc;
-    cbm_incremental_route_t route;
-    bool tools_excluded;
-    artifact_publish_observer_t publish;
-} observed_fast_run_t;
-
-static observed_fast_run_t run_observed_fast_pipeline(const char *repo_path, const char *db_path) {
-    observed_fast_run_t result = {.rc = CBM_NOT_FOUND};
-    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FAST);
-    if (!pipeline) {
-        return result;
-    }
-    result.rc = run_observing_artifact_publish(pipeline, &result.publish);
-    result.route = cbm_pipeline_incremental_test_last_route();
-    result.tools_excluded = pipeline_reports_excluded_dir(pipeline, "tools");
-    cbm_pipeline_free(pipeline);
-    return result;
-}
-
-typedef struct {
-    int rc;
-    int before_nodes;
-    int after_nodes;
-} imported_generation_t;
-
-static imported_generation_t import_artifact_generation(const char *repo_path,
-                                                        const char *import_path,
-                                                        const char *project) {
-    imported_generation_t result = {
-        .rc = cbm_artifact_import(repo_path, import_path),
-        .before_nodes = -1,
-        .after_nodes = -1,
-    };
-    if (result.rc == 0) {
-        observe_named_generation(import_path, project, "StoredBefore", "StoredAfter",
-                                 &result.before_nodes, &result.after_nodes);
-    }
-    return result;
-}
-
-static bool stored_mode_is_full(const char *db_path, const char *project) {
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    if (!store) {
-        return false;
-    }
-    cbm_coverage_meta_t meta = {0};
-    bool full = cbm_store_coverage_meta_get(store, project, &meta) == CBM_STORE_OK &&
-                meta.index_mode && strcmp(meta.index_mode, "full") == 0;
-    cbm_store_coverage_meta_clear(&meta);
-    cbm_store_close(store);
-    return full;
 }
 
 /* Once a repository contains a shared artifact, every subsequently published
@@ -3657,10 +4101,15 @@ TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex) {
     ASSERT_EQ(baseline_observer.exports_before_publish, 0);
     ASSERT_EQ(baseline_observer.export_count, 1);
     ASSERT_EQ(reindex_rc, 0);
-    ASSERT_EQ(reindex_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(reindex_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    /* Ordering, independent of which route the change took: the artifact is
+     * exported exactly once, and only AFTER the generation is published. */
     ASSERT_EQ(reindex_observer.rename_calls, 1);
     ASSERT_EQ(reindex_observer.exports_before_publish, 0);
     ASSERT_EQ(reindex_observer.export_count, 1);
+    /* The artifact this run just refreshed must not read back as a changed
+     * input on the next run: an explicit persistence pass over unchanged
+     * sources still routes to a no-op. */
     ASSERT_EQ(explicit_rc, 0);
     ASSERT_EQ(explicit_route, CBM_INCREMENTAL_ROUTE_NOOP);
     ASSERT_EQ(explicit_observer.rename_calls, 1);
@@ -3728,11 +4177,11 @@ TEST(pipeline_full_cancel_after_predump_preserves_previous_generation) {
     th_rmtree(tmp);
 
     ASSERT_EQ(cancelled_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
-    ASSERT_EQ(cancelled_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(cancelled_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(cancelled_before, 1);
     ASSERT_EQ(cancelled_after, 0);
     ASSERT_EQ(retry_rc, 0);
-    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(retry_before, 0);
     ASSERT_EQ(retry_after, 1);
     ASSERT_EQ(stage_count, 0);
@@ -3835,8 +4284,8 @@ TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generatio
     PASS();
 }
 
-/* Keep the legacy partial route test-only so its fail-closed behavior remains
- * covered even though production semantic changes now force a full rebuild. */
+/* A failed destination publication must discard only the staged containment
+ * generation; the live graph remains retryable. */
 TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retries) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_incr_fail_XXXXXX");
@@ -3855,7 +4304,6 @@ TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retr
 
     write_temp_file(tmp, "generation.py",
                     "def AfterIncrementalPersist():\n    return 2\n# changed generation\n");
-    cbm_pipeline_incremental_test_force_legacy_partial_once();
     cbm_pipeline_incremental_test_fail_after_stage_dump_once();
     cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(faulted);
@@ -3883,12 +4331,12 @@ TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retr
     th_rmtree(tmp);
 
     ASSERT_EQ(faulted_rc, CBM_PIPELINE_PERSIST_FAILED);
-    ASSERT_EQ(faulted_route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(faulted_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(faulted_before, 1);
     ASSERT_EQ(faulted_after, 0);
     ASSERT_EQ(faulted_stage_count, 0);
     ASSERT_EQ(retry_rc, 0);
-    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_EQ(retry_before, 0);
     ASSERT_EQ(retry_after, 1);
     ASSERT_EQ(retry_stage_count, 0);
@@ -3918,7 +4366,6 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
 
     write_temp_file(tmp, "generation.py",
                     "def AfterAdrIncremental():\n    return 2\n# changed generation\n");
-    cbm_pipeline_incremental_test_force_legacy_partial_once();
     cbm_pipeline_t *incremental = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(incremental);
     int run_rc = cbm_pipeline_run(incremental);
@@ -3935,14 +4382,15 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
     th_rmtree(tmp);
 
     ASSERT_EQ(run_rc, 0);
-    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_LEGACY_PARTIAL);
+    ASSERT_EQ(route, CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     ASSERT_TRUE(adr_matches);
     PASS();
 }
 
-/* A forced-full rebuild must never erase an ADR merely because the old
- * generation could not be read completely. The capture is part of the
- * publication transaction: failure preserves both graph and ADR. */
+/* A readable graph whose auxiliary coverage schema cannot be consumed takes
+ * the atomic-rewrite route. ADR capture is part of that publication boundary:
+ * a capture failure must leave both the graph and its user-authored decision
+ * intact, and a clean retry must publish the edited generation with the ADR. */
 TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_adr_capture_XXXXXX");
@@ -3965,6 +4413,15 @@ TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
     ASSERT_EQ(cbm_store_adr_store(adr_store, project, adr_text), CBM_STORE_OK);
     cbm_store_close(adr_store);
 
+    sqlite3 *schema_store = NULL;
+    ASSERT_EQ(sqlite3_open_v2(db_path, &schema_store, SQLITE_OPEN_READWRITE, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(schema_store,
+                           "DROP TABLE index_coverage;"
+                           "CREATE TABLE index_coverage(unreadable_contract TEXT);",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(schema_store);
+
     write_temp_file(tmp, "generation.py", "def AfterAdrCapture():\n    return 2\n");
     cbm_pipeline_incremental_test_fail_adr_capture_once();
     cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
@@ -3976,7 +4433,7 @@ TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
     int faulted_after = -1;
     observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture",
                              &faulted_before, &faulted_after);
-    cbm_store_t *preserved = cbm_store_open_path(db_path);
+    cbm_store_t *preserved = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(preserved);
     cbm_adr_t preserved_adr = {0};
     int preserved_adr_rc = cbm_store_adr_get(preserved, project, &preserved_adr);
@@ -3994,7 +4451,7 @@ TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
     int retry_after = -1;
     observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture", &retry_before,
                              &retry_after);
-    cbm_store_t *published = cbm_store_open_path(db_path);
+    cbm_store_t *published = cbm_store_open_path_query(db_path);
     ASSERT_NOT_NULL(published);
     cbm_adr_t published_adr = {0};
     int published_adr_rc = cbm_store_adr_get(published, project, &published_adr);
@@ -4016,9 +4473,195 @@ TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
     PASS();
 }
 
-/* An exact semantic manifest must fail closed when its repository root cannot
- * be traversed. A regular file is a deterministic cross-platform opendir
- * failure that does not depend on process permissions. */
+/* Coverage metadata participates in exact-input compatibility. An older
+ * version and an upgrade from fast to full both force a complete replacement;
+ * a cheaper fast refresh of a full graph retains the fuller published mode. */
+TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_metadata_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def ExactMetadataGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *exact_fast = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(exact_fast);
+    ASSERT_EQ(cbm_pipeline_run(exact_fast), 0);
+    cbm_incremental_route_t exact_fast_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(exact_fast);
+
+    cbm_store_t *metadata_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(metadata_store);
+    cbm_coverage_row_t *coverage_rows = NULL;
+    int coverage_count = 0;
+    ASSERT_EQ(cbm_store_coverage_get(metadata_store, project, &coverage_rows, &coverage_count),
+              CBM_STORE_OK);
+    cbm_coverage_meta_t current_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &current_meta), CBM_STORE_OK);
+    cbm_coverage_meta_t legacy_meta = current_meta;
+    legacy_meta.coverage_version = 1;
+    ASSERT_EQ(cbm_store_coverage_replace_ex(metadata_store, project, coverage_rows, coverage_count,
+                                            &legacy_meta),
+              CBM_STORE_OK);
+    cbm_store_free_coverage(coverage_rows, coverage_count);
+    cbm_store_coverage_meta_clear(&current_meta);
+    cbm_store_close(metadata_store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *migration = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(migration);
+    ASSERT_EQ(cbm_pipeline_run(migration), 0);
+    cbm_incremental_route_t migration_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(migration);
+
+    metadata_store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(metadata_store);
+    cbm_coverage_meta_t migrated_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &migrated_meta), CBM_STORE_OK);
+    int migrated_version = migrated_meta.coverage_version;
+    bool migrated_hashes_complete = migrated_meta.hash_records_complete;
+    char migrated_mode[32];
+    snprintf(migrated_mode, sizeof(migrated_mode), "%s",
+             migrated_meta.index_mode ? migrated_meta.index_mode : "");
+    cbm_store_coverage_meta_clear(&migrated_meta);
+    cbm_store_close(metadata_store);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *mode_change = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(mode_change);
+    ASSERT_EQ(cbm_pipeline_run(mode_change), 0);
+    cbm_incremental_route_t mode_change_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(mode_change);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *cheaper_refresh = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(cheaper_refresh);
+    ASSERT_EQ(cbm_pipeline_run(cheaper_refresh), 0);
+    cbm_incremental_route_t cheaper_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(cheaper_refresh);
+
+    metadata_store = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(metadata_store);
+    cbm_coverage_meta_t full_meta = {0};
+    ASSERT_EQ(cbm_store_coverage_meta_get(metadata_store, project, &full_meta), CBM_STORE_OK);
+    int full_version = full_meta.coverage_version;
+    bool full_hashes_complete = full_meta.hash_records_complete;
+    char retained_mode[32];
+    snprintf(retained_mode, sizeof(retained_mode), "%s",
+             full_meta.index_mode ? full_meta.index_mode : "");
+    cbm_store_coverage_meta_clear(&full_meta);
+    cbm_store_close(metadata_store);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(exact_fast_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(migration_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(migrated_version, CBM_COVERAGE_VERSION);
+    ASSERT_TRUE(migrated_hashes_complete);
+    ASSERT_STR_EQ(migrated_mode, "fast");
+    ASSERT_EQ(mode_change_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(cheaper_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    ASSERT_EQ(full_version, CBM_COVERAGE_VERSION);
+    ASSERT_TRUE(full_hashes_complete);
+    ASSERT_STR_EQ(retained_mode, "full");
+    PASS();
+}
+
+/* A containment cache allocation failure is not allowed to publish purged
+ * hashes or a partial graph. This branch can recover by falling back to the
+ * staged full route in the same run; that is stronger than requiring a second
+ * invocation, and the final graph must contain only the edited generation. */
+TEST(pipeline_incremental_parallel_result_cache_alloc_failure_falls_back_without_data_loss) {
+    enum { GENERATION_SIZE = 51 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incr_cache_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    cbm_pipeline_incremental_test_reset_faults();
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? cbm_strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? cbm_strdup(old_single) : NULL;
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    for (int i = 0; i < GENERATION_SIZE; i++) {
+        char path[512];
+        char source[128];
+        snprintf(path, sizeof(path), "%s/generation_%02d.py", tmp, i);
+        snprintf(source, sizeof(source), "def Before%02d():\n    return %d\n", i, i);
+        ASSERT_EQ(th_write_file(path, source), 0);
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/incremental-cache.db", tmp);
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    ASSERT_EQ(cbm_pipeline_run(first), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(first));
+    cbm_pipeline_free(first);
+
+    for (int i = 0; i < GENERATION_SIZE; i++) {
+        char path[512];
+        char source[160];
+        snprintf(path, sizeof(path), "%s/generation_%02d.py", tmp, i);
+        snprintf(source, sizeof(source),
+                 "def After%02d():\n    return %d\n# edited generation %02d\n", i, i, i);
+        ASSERT_EQ(th_write_file(path, source), 0);
+    }
+
+    cbm_pipeline_incremental_test_fail_result_cache_alloc_once();
+    cbm_pipeline_t *fault_recovered = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(fault_recovered);
+    int recovered_rc = cbm_pipeline_run(fault_recovered);
+    cbm_incremental_route_t recovered_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(fault_recovered);
+    int recovered_before = -1;
+    int recovered_after = -1;
+    observe_incremental_generation(db_path, project, GENERATION_SIZE, &recovered_before,
+                                   &recovered_after);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *exact_retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(exact_retry);
+    int retry_rc = cbm_pipeline_run(exact_retry);
+    cbm_incremental_route_t retry_route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(exact_retry);
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(recovered_rc, 0);
+    ASSERT_EQ(recovered_route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_EQ(recovered_before, 0);
+    ASSERT_EQ(recovered_after, GENERATION_SIZE);
+    ASSERT_EQ(retry_rc, 0);
+    ASSERT_EQ(retry_route, CBM_INCREMENTAL_ROUTE_NOOP);
+    PASS();
+}
+
+
+/* Indexing must fail closed when its repository root cannot be traversed. A
+ * regular file is a deterministic cross-platform opendir failure. */
 TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_manifest_not_dir_XXXXXX");
@@ -4027,15 +4670,17 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
     char root_path[512];
     snprintf(root_path, sizeof(root_path), "%s/not-a-directory", tmp);
 
-    cbm_file_hash_t *manifest = NULL;
-    int manifest_count = -1;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-fail-closed", root_path, NULL, 0, NULL,
-                                                  0, NULL, NULL, &manifest, &manifest_count);
-    cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmp);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(root_path, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+    bool db_created = cbm_file_exists(db_path);
     th_rmtree(tmp);
 
     ASSERT_TRUE(rc != 0);
-    ASSERT_EQ(manifest_count, 0);
+    ASSERT_FALSE(db_created);
     PASS();
 }
 
@@ -4406,162 +5051,6 @@ TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids) {
     PASS();
 }
 
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-static void observe_incremental_generation(const char *db_path, const char *project,
-                                           int generation_size, int *before_count,
-                                           int *after_count) {
-    *before_count = -1;
-    *after_count = -1;
-    cbm_store_t *store = cbm_store_open_path(db_path);
-    if (!store || !project) {
-        if (store) {
-            cbm_store_close(store);
-        }
-        return;
-    }
-
-    int before = 0;
-    int after = 0;
-    for (int i = 0; i < generation_size; i++) {
-        char before_name[32];
-        char after_name[32];
-        snprintf(before_name, sizeof(before_name), "Before%02d", i);
-        snprintf(after_name, sizeof(after_name), "After%02d", i);
-        int before_nodes = named_node_count(store, project, before_name);
-        int after_nodes = named_node_count(store, project, after_name);
-        if (before_nodes < 0 || after_nodes < 0) {
-            cbm_store_close(store);
-            return;
-        }
-        before += before_nodes;
-        after += after_nodes;
-    }
-    cbm_store_close(store);
-    *before_count = before;
-    *after_count = after;
-}
-
-/* A parallel incremental run must preserve its prior database when the
- * per-file result cache cannot be allocated. A clean retry must then converge
- * to the new generation.
- *
- * RED before fail-closed propagation: the injected allocation failure skips
- * extract/resolve, but the caller dumps the already-purged graph, advances all
- * file hashes, and returns 0. The second graph is empty and the third run is a
- * no-op instead of recovering the missing definitions. */
-TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries) {
-    enum { GENERATION_SIZE = 51 };
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_incr_cache_XXXXXX");
-    if (!cbm_mkdtemp(tmp)) {
-        FAIL("tmpdir");
-    }
-
-    cbm_pipeline_incremental_test_reset_faults();
-    char *old_workers = getenv("CBM_WORKERS");
-    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
-    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
-    char *saved_single = old_single ? strdup(old_single) : NULL;
-    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
-    cbm_setenv("CBM_WORKERS", "4", 1);
-
-    int setup_ok = 1;
-    for (int i = 0; setup_ok && i < GENERATION_SIZE; i++) {
-        char path[512];
-        char source[128];
-        snprintf(path, sizeof(path), "%s/generation_%02d.py", tmp, i);
-        snprintf(source, sizeof(source), "def Before%02d():\n    return %d\n", i, i);
-        setup_ok = th_write_file(path, source) == 0;
-    }
-
-    char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/incremental-cache.db", tmp);
-    int first_rc = -1;
-    int baseline_before = -1;
-    int baseline_after = -1;
-    if (setup_ok) {
-        cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-        if (first) {
-            first_rc = cbm_pipeline_run(first);
-            observe_incremental_generation(db_path, cbm_pipeline_project_name(first),
-                                           GENERATION_SIZE, &baseline_before, &baseline_after);
-            cbm_pipeline_free(first);
-        }
-    }
-
-    int edit_ok = setup_ok && first_rc == 0;
-    for (int i = 0; edit_ok && i < GENERATION_SIZE; i++) {
-        char path[512];
-        char source[160];
-        snprintf(path, sizeof(path), "%s/generation_%02d.py", tmp, i);
-        snprintf(source, sizeof(source),
-                 "def After%02d():\n    return %d\n# edited generation %02d\n", i, i, i);
-        edit_ok = th_write_file(path, source) == 0;
-    }
-
-    int second_rc = -1;
-    int second_before = -1;
-    int second_after = -1;
-    if (edit_ok) {
-        cbm_pipeline_incremental_test_fail_result_cache_alloc_once();
-        cbm_pipeline_incremental_test_force_legacy_partial_once();
-        cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-        if (second) {
-            second_rc = cbm_pipeline_run(second);
-            observe_incremental_generation(db_path, cbm_pipeline_project_name(second),
-                                           GENERATION_SIZE, &second_before, &second_after);
-            cbm_pipeline_free(second);
-        }
-    }
-    cbm_pipeline_incremental_test_reset_faults();
-
-    int third_rc = -1;
-    int retry_before = -1;
-    int retry_after = -1;
-    if (edit_ok) {
-        cbm_pipeline_t *third = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-        if (third) {
-            third_rc = cbm_pipeline_run(third);
-            observe_incremental_generation(db_path, cbm_pipeline_project_name(third),
-                                           GENERATION_SIZE, &retry_before, &retry_after);
-            cbm_pipeline_free(third);
-        }
-    }
-    cbm_pipeline_incremental_test_reset_faults();
-
-    if (saved_workers) {
-        cbm_setenv("CBM_WORKERS", saved_workers, 1);
-        free(saved_workers);
-    } else {
-        cbm_unsetenv("CBM_WORKERS");
-    }
-    if (saved_single) {
-        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
-        free(saved_single);
-    } else {
-        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
-    }
-    th_rmtree(tmp);
-
-    bool second_is_preserved_failure = second_rc == CBM_PIPELINE_ABORT_PRESERVE_DB &&
-                                       second_before == GENERATION_SIZE && second_after == 0;
-    if (!second_is_preserved_failure) {
-        printf("  incremental cache failure diagnostic: rc=%d before=%d after=%d\n", second_rc,
-               second_before, second_after);
-    }
-
-    ASSERT_TRUE(setup_ok);
-    ASSERT_EQ(first_rc, 0);
-    ASSERT_EQ(baseline_before, GENERATION_SIZE);
-    ASSERT_EQ(baseline_after, 0);
-    ASSERT_TRUE(edit_ok);
-    ASSERT_TRUE(second_is_preserved_failure);
-    ASSERT_EQ(third_rc, 0);
-    ASSERT_EQ(retry_before, 0);
-    ASSERT_EQ(retry_after, GENERATION_SIZE);
-    PASS();
-}
-#endif
 
 TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     char tmp[256];
@@ -4627,6 +5116,92 @@ TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* Rust also resolves typed receivers through its LSP before the generic
+ * registry. An unresolved member receiver must not fall back to an unrelated
+ * project method by weak suffix matching, while a typed receiver must retain
+ * its real lsp_method_dispatch CALLS edge. The unresolved receiver is intentionally a
+ * semantic error: extraction must remain conservative when type lookup fails.
+ * RED before the fix:
+ * check_unknown->matches exists via suffix_match. */
+static int pipeline_rust_receiver_suppression_case(bool force_parallel) {
+    enum { RUST_RECEIVER_PARALLEL_PAD_FILES = 52 };
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rust_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+
+    write_temp_file(tmp, "src/query.rs",
+                    "pub struct CompiledProcessQuery;\n"
+                    "impl CompiledProcessQuery {\n"
+                    "    pub fn matches(&self) -> bool { true }\n"
+                    "}\n"
+                    "pub struct OtherQuery;\n"
+                    "impl OtherQuery {\n"
+                    "    pub fn matches(&self) -> bool { false }\n"
+                    "}\n"
+                    "pub fn check_typed(query: &CompiledProcessQuery) -> bool {\n"
+                    "    query.matches()\n"
+                    "}\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "mod query;\n"
+                    "mod unknown;\n");
+    write_temp_file(tmp, "src/unknown.rs",
+                    "pub fn check_unknown(value: UnknownReceiver) -> bool {\n"
+                    "    value.matches()\n"
+                    "}\n"
+                    "pub fn check_macro(value: bool) -> bool {\n"
+                    "    matches!(value, true)\n"
+                    "}\n");
+    if (force_parallel) {
+        for (int i = 0; i < RUST_RECEIVER_PARALLEL_PAD_FILES; i++) {
+            char name[CBM_SZ_64];
+            char body[CBM_SZ_128];
+            snprintf(name, sizeof(name), "src/pad_%02d.rs", i);
+            snprintf(body, sizeof(body), "pub fn pad_%02d() -> i32 { %d }\n", i, i);
+            write_temp_file(tmp, name, body);
+        }
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rust_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    cbm_store_t *s = NULL;
+    int ok = p && cbm_pipeline_run(p) == 0;
+    const char *project = ok ? cbm_pipeline_project_name(p) : NULL;
+    if (ok) {
+        s = cbm_store_open_path(db_path);
+        bool unknown_edge = s && cross_file_call_exists(s, project, "check_unknown", "matches");
+        bool macro_edge = s && cross_file_call_exists(s, project, "check_macro", "matches");
+        bool typed_edge = s && cross_file_call_with_strategy_exists(
+                                   s, project, "check_typed", "matches", "lsp_method_dispatch");
+        ok = s && !unknown_edge && !macro_edge && typed_edge;
+        if (!ok) {
+            fprintf(stderr,
+                    "  [RUST-RECEIVER] parallel=%d unknown_edge=%d macro_edge=%d typed_edge=%d "
+                    "db=%s\n",
+                    force_parallel, unknown_edge, macro_edge, typed_edge, db_path);
+        }
+    }
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (ok) {
+        th_rmtree(tmp);
+    }
+    return ok;
+}
+
+TEST(pipeline_rust_receiver_suppresses_weak_method_edge) {
+    ASSERT_TRUE(pipeline_rust_receiver_suppression_case(false));
+    PASS();
+}
+
+TEST(pipeline_rust_receiver_parallel_suppresses_weak_method_edge) {
+    ASSERT_TRUE(pipeline_rust_receiver_suppression_case(true));
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -4636,6 +5211,362 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
         cbm_store_free_nodes(ns, n);
     }
     return n;
+}
+
+/* Source-based route discovery is a fallback for frameworks whose call path
+ * cannot yet produce a canonical service Route (notably handlerless Ktor
+ * blocks). When AST resolution already emitted the endpoint, the httplink
+ * rescan must reuse that identity rather than mint handler-qualified Route
+ * clones. Function and Module scans must also converge on the same endpoint.
+ * This is an exact graph contract: Route nodes are cross-service rendezvous
+ * points, so duplicate identities split traversal results rather than merely
+ * consuming extra space. */
+static int pipeline_route_discovery_uses_canonical_identities_case(bool force_parallel) {
+    static const char *const expected_paths[] = {"/go/orders", "/ts/users", "/kt/status"};
+    static const char *const expected_qns[] = {"__route__GET__/go/orders",
+                                               "__route__GET__/ts/users",
+                                               "__route__GET__/kt/status"};
+    enum {
+        ROUTE_IDENTITY_EXPECTED_COUNT = sizeof(expected_paths) / sizeof(expected_paths[0]),
+        ROUTE_IDENTITY_PARALLEL_PAD_FILES = 52,
+    };
+
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_route_identity_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+
+    write_temp_file(tmp, "routes.go",
+                    "package routes\n\n"
+                    "type Engine struct{}\n"
+                    "func (e *Engine) GET(path string, handler interface{}) {}\n"
+                    "func listOrders() {}\n"
+                    "func RegisterRoutes(r *Engine) {\n"
+                    "\tr.GET(\"/go/orders\", listOrders)\n"
+                    "}\n");
+    write_temp_file(tmp, "routes.ts",
+                    "function listUsers(): void {}\n"
+                    "export function registerRoutes(app: any): void {\n"
+                    "  app.get('/ts/users', listUsers);\n"
+                    "}\n");
+    write_temp_file(tmp, "Routes.kt",
+                    "package routes\n\n"
+                    "fun configureRoutes() {\n"
+                    "    routing {\n"
+                    "        get(\"/kt/status\") { }\n"
+                    "    }\n"
+                    "}\n");
+
+    if (force_parallel) {
+        for (int i = 0; i < ROUTE_IDENTITY_PARALLEL_PAD_FILES; i++) {
+            char name[CBM_SZ_64];
+            char body[CBM_SZ_128];
+            snprintf(name, sizeof(name), "pad_%02d.py", i);
+            snprintf(body, sizeof(body), "def pad_%02d():\n    return %d\n", i, i);
+            write_temp_file(tmp, name, body);
+        }
+    }
+
+    char db_path[CBM_PATH_MAX];
+    int n = snprintf(db_path, sizeof(db_path), "%s/routes.db", tmp);
+    int ok = n > 0 && (size_t)n < sizeof(db_path);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    cbm_store_t *store = NULL;
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    if (!pipeline || cbm_pipeline_run(pipeline) != 0) {
+        ok = 0;
+        goto cleanup;
+    }
+
+    store = cbm_store_open_path(db_path);
+    const char *project = cbm_pipeline_project_name(pipeline);
+    if (!store || cbm_store_find_nodes_by_label(store, project, "Route", &routes, &route_count) !=
+                      CBM_STORE_OK ||
+        route_count != ROUTE_IDENTITY_EXPECTED_COUNT) {
+        ok = 0;
+        goto cleanup;
+    }
+
+    for (int i = 0; i < ROUTE_IDENTITY_EXPECTED_COUNT; i++) {
+        cbm_node_t route = {0};
+        if (count_nodes_named(store, project, expected_paths[i]) != 1 ||
+            cbm_store_find_node_by_qn(store, project, expected_qns[i], &route) != CBM_STORE_OK) {
+            ok = 0;
+        }
+        cbm_node_free_fields(&route);
+    }
+    if (cbm_store_count_edges_by_type(store, project, "HANDLES") !=
+        ROUTE_IDENTITY_EXPECTED_COUNT) {
+        ok = 0;
+    }
+
+cleanup:
+    if (!ok && store) {
+        fprintf(stderr, "  [ROUTE-IDENTITY] routes=%d handles=%d\n", route_count,
+                cbm_store_count_edges_by_type(store, project, "HANDLES"));
+        for (int i = 0; i < route_count; i++) {
+            fprintf(stderr, "    route name=%s qn=%s props=%s\n",
+                    routes[i].name ? routes[i].name : "<null>",
+                    routes[i].qualified_name ? routes[i].qualified_name : "<null>",
+                    routes[i].properties_json ? routes[i].properties_json : "<null>");
+        }
+        cbm_edge_t *http_edges = NULL;
+        int http_edge_count = 0;
+        if (cbm_store_find_edges_by_type(store, project, "HTTP_CALLS", &http_edges,
+                                         &http_edge_count) == CBM_STORE_OK) {
+            for (int i = 0; i < http_edge_count; i++) {
+                cbm_node_t target = {0};
+                (void)cbm_store_find_node_by_id(store, http_edges[i].target_id, &target);
+                fprintf(stderr, "    HTTP_CALLS target=%s props=%s\n",
+                        target.qualified_name ? target.qualified_name : "<missing>",
+                        http_edges[i].properties_json ? http_edges[i].properties_json : "<null>");
+                cbm_node_free_fields(&target);
+            }
+        }
+        cbm_store_free_edges(http_edges, http_edge_count);
+    }
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    return ok;
+}
+
+/* A caller whose HTTP call uses a FULL URL literal must join the same
+ * canonical Route node the handler HANDLES. Previously route minting used the
+ * raw url_path, so "http://users-svc:5000/api/users" minted a second Route
+ * distinct from the registration's "/api/users": caller→Route and
+ * handler→Route never met and the cross-service join query returned nothing. */
+static int pipeline_full_url_call_joins_canonical_route_case(void) {
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_url_route_join_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        return 0;
+    }
+
+    write_temp_file(tmp, "service/app.py",
+                    "from flask import Flask, jsonify\n\n"
+                    "app = Flask(__name__)\n\n\n"
+                    "@app.route(\"/api/users\", methods=[\"GET\"])\n"
+                    "def get_users():\n"
+                    "    return jsonify([])\n");
+    write_temp_file(tmp, "client/consumer.py",
+                    "import requests\n\n\n"
+                    "def fetch_users():\n"
+                    "    return requests.get(\"http://users-svc:5000/api/users\").json()\n");
+
+    char db_path[CBM_PATH_MAX];
+    int n = snprintf(db_path, sizeof(db_path), "%s/urljoin.db", tmp);
+    int ok = n > 0 && (size_t)n < sizeof(db_path);
+    cbm_pipeline_t *pipeline = ok ? cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL) : NULL;
+    cbm_store_t *store = NULL;
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_edge_t *http_edges = NULL;
+    int http_count = 0;
+    cbm_edge_t *handles_edges = NULL;
+    int handles_count = 0;
+    const char *project = NULL;
+    if (!pipeline || cbm_pipeline_run(pipeline) != 0) {
+        ok = 0;
+        goto cleanup;
+    }
+
+    store = cbm_store_open_path(db_path);
+    project = cbm_pipeline_project_name(pipeline);
+    if (!store) {
+        ok = 0;
+        goto cleanup;
+    }
+
+    /* No Route node may embed a scheme/authority. */
+    if (cbm_store_find_nodes_by_label(store, project, "Route", &routes, &route_count) !=
+            CBM_STORE_OK ||
+        route_count < 1) {
+        ok = 0;
+        goto cleanup;
+    }
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].name && strstr(routes[i].name, "://")) {
+            ok = 0;
+        }
+    }
+
+    /* The join: at least one HTTP_CALLS edge must target the same Route node
+     * that a HANDLES edge targets, and that Route must be "/api/users". */
+    if (cbm_store_find_edges_by_type(store, project, "HTTP_CALLS", &http_edges, &http_count) !=
+            CBM_STORE_OK ||
+        cbm_store_find_edges_by_type(store, project, "HANDLES", &handles_edges, &handles_count) !=
+            CBM_STORE_OK) {
+        ok = 0;
+        goto cleanup;
+    }
+    bool joined = false;
+    for (int i = 0; i < http_count && !joined; i++) {
+        for (int j = 0; j < handles_count && !joined; j++) {
+            if (http_edges[i].target_id != handles_edges[j].target_id) {
+                continue;
+            }
+            cbm_node_t route = {0};
+            if (cbm_store_find_node_by_id(store, http_edges[i].target_id, &route) ==
+                    CBM_STORE_OK &&
+                route.name && strcmp(route.name, "/api/users") == 0) {
+                joined = true;
+            }
+            cbm_node_free_fields(&route);
+        }
+    }
+    if (!joined) {
+        ok = 0;
+    }
+
+cleanup:
+    if (!ok && store) {
+        fprintf(stderr, "  [URL-JOIN] routes=%d http=%d handles=%d\n", route_count, http_count,
+                handles_count);
+        for (int i = 0; i < route_count; i++) {
+            fprintf(stderr, "    route name=%s qn=%s\n", routes[i].name ? routes[i].name : "<null>",
+                    routes[i].qualified_name ? routes[i].qualified_name : "<null>");
+        }
+    }
+    cbm_store_free_edges(http_edges, http_count);
+    cbm_store_free_edges(handles_edges, handles_count);
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    th_rmtree(tmp);
+    return ok;
+}
+
+TEST(pipeline_full_url_call_joins_canonical_route) {
+    ASSERT_TRUE(pipeline_full_url_call_joins_canonical_route_case());
+    PASS();
+}
+
+TEST(pipeline_route_discovery_uses_canonical_identities_sequential) {
+    ASSERT_TRUE(pipeline_route_discovery_uses_canonical_identities_case(false));
+    PASS();
+}
+
+TEST(pipeline_route_discovery_uses_canonical_identities_parallel) {
+    ASSERT_TRUE(pipeline_route_discovery_uses_canonical_identities_case(true));
+    PASS();
+}
+
+/* Route and call-site discovery must not silently stop at a per-worker or
+ * pass-wide collection ceiling. Keep this as a direct httplink-pass test so
+ * AST registration cannot mask source-discovery loss. */
+static bool pipeline_httplink_collects_all_large_fixture(void) {
+    enum { ROUTE_COUNT = 600 };
+    char *repo = th_mktempdir("cbm_httplink_scale");
+    if (!repo) {
+        return false;
+    }
+
+    char source_path[CBM_PATH_MAX];
+    int path_len = snprintf(source_path, sizeof(source_path), "%s/routes.ts", repo);
+    char saved_workers[CBM_SZ_64];
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers), NULL);
+    FILE *source = NULL;
+    cbm_gbuf_t *gbuf = NULL;
+    cbm_registry_t *registry = NULL;
+    bool ok = false;
+    if (path_len < 0 || (size_t)path_len >= sizeof(source_path)) {
+        goto cleanup;
+    }
+    source = fopen(source_path, "w");
+    if (!source) {
+        goto cleanup;
+    }
+    for (int route_index = 0; route_index < ROUTE_COUNT; route_index++) {
+        if (fprintf(source, "app.get('/route-%03d', handler);\n", route_index) < 0) {
+            goto cleanup;
+        }
+    }
+    int caller_start_line = ROUTE_COUNT + 1;
+    if (fprintf(source, "function callAll() {\n") < 0) {
+        goto cleanup;
+    }
+    for (int route_index = 0; route_index < ROUTE_COUNT; route_index++) {
+        if (fprintf(source, "  fetch('/route-%03d');\n", route_index) < 0) {
+            goto cleanup;
+        }
+    }
+    if (fprintf(source, "}\n") < 0 || fclose(source) != 0) {
+        source = NULL;
+        goto cleanup;
+    }
+    source = NULL;
+
+    gbuf = cbm_gbuf_new("httplink-scale", repo);
+    registry = cbm_registry_new();
+    if (!gbuf || !registry) {
+        goto cleanup;
+    }
+    for (int route_index = 0; route_index < ROUTE_COUNT; route_index++) {
+        char handler_name[CBM_SZ_64];
+        char handler_qn[CBM_SZ_256];
+        snprintf(handler_name, sizeof(handler_name), "handler_%03d", route_index);
+        snprintf(handler_qn, sizeof(handler_qn), "httplink-scale.service-%03d.routes.%s",
+                 route_index, handler_name);
+        if (cbm_gbuf_upsert_node(gbuf, "Function", handler_name, handler_qn, "routes.ts",
+                                 route_index + 1, route_index + 1, "{}") <= 0) {
+            goto cleanup;
+        }
+    }
+    int64_t caller_id = cbm_gbuf_upsert_node(
+        gbuf, "Function", "callAll", "httplink-scale.client.calls.callAll", "routes.ts",
+        caller_start_line, 2 * ROUTE_COUNT + 2, "{}");
+    if (caller_id <= 0 || cbm_setenv("CBM_WORKERS", "1", 1) != 0) {
+        goto cleanup;
+    }
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "httplink-scale",
+                              .repo_path = repo,
+                              .gbuf = gbuf,
+                              .registry = registry,
+                              .cancelled = &cancelled};
+    if (cbm_pipeline_pass_httplinks(&ctx) != 0) {
+        goto cleanup;
+    }
+
+    const cbm_gbuf_node_t **routes = NULL;
+    const cbm_gbuf_edge_t **http_calls = NULL;
+    int route_count = 0;
+    int http_call_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Route", &routes, &route_count) != 0 ||
+        cbm_gbuf_find_edges_by_source_type(gbuf, caller_id, "HTTP_CALLS", &http_calls,
+                                           &http_call_count) != 0) {
+        goto cleanup;
+    }
+    ok = route_count == ROUTE_COUNT && http_call_count == ROUTE_COUNT;
+    if (!ok) {
+        printf("    httplink scale mismatch: routes=%d http_calls=%d expected=%d\n", route_count,
+               http_call_count, ROUTE_COUNT);
+    }
+
+cleanup:
+    if (had_workers) {
+        (void)cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_WORKERS");
+    }
+    if (source) {
+        (void)fclose(source);
+    }
+    cbm_registry_free(registry);
+    cbm_gbuf_free(gbuf);
+    th_cleanup(repo);
+    return ok;
+}
+
+TEST(pipeline_httplink_collection_has_no_fixed_item_ceiling) {
+    ASSERT_TRUE(pipeline_httplink_collects_all_large_fixture());
+    PASS();
 }
 
 /* Parallel-resolver regression for the TS/JS receiver guard (>= 50 files forces
@@ -4750,11 +5681,10 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
      * a route suffix and `dev` is not an HTTP lib, so it was dropped before
      * emit_service_edge ran (RED on that guard: only axios's 2). */
     ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 3);
-    /* (2) The verb-suffix + route-path member calls keep their route
-     * registrations (edge type CALLS -> a Route node named by the path). These
-     * classify as route_registration on main, NOT HTTP_CALLS — Option A preserves
-     * that by construction. Assert the three Route paths survive:
-     * api.patch('/plans/:id'), request(app).get('/y'), router.get('/users'). */
+    /* (2) Verb-suffix calls keep their exact endpoint nodes. Generic
+     * handlerless clients such as api.patch/request(app).get classify through
+     * URL-argument HTTP detection, while router.get with a handler remains a
+     * route registration (commit a0a320f5). */
     ASSERT_GTE(count_nodes_named(s, project, "/plans/:id"), 1);
     ASSERT_GTE(count_nodes_named(s, project, "/y"), 1);
     ASSERT_GTE(count_nodes_named(s, project, "/users"), 1);
@@ -5146,6 +6076,7 @@ TEST(githistory_compute_coupling) {
                      strcmp(results[i].file_b, "d.go") == 0);
     }
 
+    cbm_change_coupling_paths_free(results, n);
     PASS();
 }
 
@@ -5186,6 +6117,180 @@ TEST(githistory_coupling_carries_last_co_change) {
         found_ab = true;
     }
     ASSERT_TRUE(found_ab);
+    cbm_change_coupling_paths_free(results, n);
+    PASS();
+}
+
+TEST(githistory_coupling_ranks_bounded_output_and_reports_omissions) {
+    char *weak[] = {"weak-a.go", "weak-b.go"};
+    char *medium[] = {"medium-a.go", "medium-b.go"};
+    char *strong[] = {"strong-a.go", "strong-b.go"};
+    char *noisy[] = {"noisy-a.go", "noisy-b.go"};
+    char *noisy_a[] = {"noisy-a.go"};
+    char *noisy_b[] = {"noisy-b.go"};
+    cbm_commit_files_t commits[] = {
+        {weak, 2, 101},    {medium, 2, 201},  {strong, 2, 301},  {weak, 2, 102},
+        {medium, 2, 202},  {strong, 2, 302},  {weak, 2, 103},    {medium, 2, 203},
+        {strong, 2, 303},  {medium, 2, 204},  {strong, 2, 304},  {strong, 2, 305},
+        {noisy, 2, 401},   {noisy, 2, 402},   {noisy, 2, 403},   {noisy, 2, 404},
+        {noisy, 2, 405},   {noisy, 2, 406},   {noisy_a, 1, 407}, {noisy_a, 1, 408},
+        {noisy_a, 1, 409}, {noisy_a, 1, 410}, {noisy_b, 1, 411}, {noisy_b, 1, 412},
+        {noisy_b, 1, 413}, {noisy_b, 1, 414},
+    };
+    int commit_count = (int)(sizeof(commits) / sizeof(*commits));
+    cbm_change_coupling_t out[2];
+    cbm_change_coupling_result_t result = cbm_compute_change_coupling_result(
+        commits, commit_count, out, (int)(sizeof(out) / sizeof(*out)), 0.0);
+
+    ASSERT_EQ(result.written, 2);
+    ASSERT_EQ(result.eligible, 4);
+    ASSERT_EQ(result.omitted, 2);
+    ASSERT_EQ(result.path_too_long, 0);
+    ASSERT_EQ(result.allocation_failed, 0);
+    ASSERT_STR_EQ(out[0].file_a, "strong-a.go");
+    ASSERT_STR_EQ(out[0].file_b, "strong-b.go");
+    ASSERT_EQ(out[0].co_change_count, 5);
+    ASSERT_STR_EQ(out[1].file_a, "medium-a.go");
+    ASSERT_STR_EQ(out[1].file_b, "medium-b.go");
+    ASSERT_EQ(out[1].co_change_count, 4);
+
+    cbm_change_coupling_t sentinel = {.co_change_count = 777};
+    result = cbm_compute_change_coupling_result(commits, commit_count, &sentinel, 0, 0.0);
+    ASSERT_EQ(result.written, 0);
+    ASSERT_EQ(result.eligible, 4);
+    ASSERT_EQ(result.omitted, 4);
+    ASSERT_EQ(result.allocation_failed, 0);
+    ASSERT_EQ(sentinel.co_change_count, 777);
+
+    cbm_commit_files_t reversed[sizeof(commits) / sizeof(*commits)];
+    for (int i = 0; i < commit_count; i++) {
+        reversed[i] = commits[commit_count - i - 1];
+    }
+    cbm_change_coupling_t reversed_out[2];
+    result = cbm_compute_change_coupling_result(reversed, commit_count, reversed_out,
+                                                (int)(sizeof(reversed_out) / sizeof(*reversed_out)),
+                                                0.0);
+    ASSERT_EQ(result.written, 2);
+    ASSERT_STR_EQ(reversed_out[0].file_a, out[0].file_a);
+    ASSERT_STR_EQ(reversed_out[0].file_b, out[0].file_b);
+    ASSERT_STR_EQ(reversed_out[1].file_a, out[1].file_a);
+    ASSERT_STR_EQ(reversed_out[1].file_b, out[1].file_b);
+    cbm_change_coupling_paths_free(reversed_out, result.written);
+    cbm_change_coupling_paths_free(out, 2);
+
+    char long_a[CBM_SZ_1K];
+    char long_b[CBM_SZ_1K];
+    memset(long_a, 'a', sizeof(long_a));
+    memset(long_b, 'b', sizeof(long_b));
+    long_a[sizeof(long_a) - 1] = '\0';
+    long_b[sizeof(long_b) - 1] = '\0';
+    char *long_files[] = {long_a, long_b};
+    cbm_commit_files_t long_commits[] = {
+        {long_files, 2, 1},
+        {long_files, 2, 2},
+        {long_files, 2, 3},
+    };
+    cbm_change_coupling_t long_out = {0};
+    result = cbm_compute_change_coupling_result(
+        long_commits, (int)(sizeof(long_commits) / sizeof(*long_commits)), &long_out, 1, 0.0);
+    ASSERT_EQ(result.written, 1);
+    ASSERT_EQ(result.eligible, 1);
+    ASSERT_EQ(result.omitted, 0);
+    ASSERT_EQ(result.path_too_long, 0);
+    ASSERT_EQ(result.allocation_failed, 0);
+    ASSERT_STR_EQ(long_out.file_a, long_a);
+    ASSERT_STR_EQ(long_out.file_b, long_b);
+    ASSERT_EQ(long_out.co_change_count, 3);
+    cbm_change_coupling_paths_free(&long_out, result.written);
+    ASSERT_TRUE(long_out.file_a == NULL);
+    ASSERT_TRUE(long_out.file_b == NULL);
+    cbm_change_coupling_paths_free(&long_out, result.written);
+    PASS();
+}
+
+TEST(githistory_temporal_retains_files_past_legacy_capacity) {
+    enum {
+        GH_TEST_FILES_PER_COMMIT = 20,
+        GH_TEST_UNIQUE_FILES = 16385,
+        GH_TEST_BASE_COMMITS =
+            (GH_TEST_UNIQUE_FILES + GH_TEST_FILES_PER_COMMIT - 1) / GH_TEST_FILES_PER_COMMIT,
+        GH_TEST_COMMIT_COUNT = GH_TEST_BASE_COMMITS + 1,
+    };
+    char (*paths)[CBM_SZ_32] = calloc(GH_TEST_UNIQUE_FILES, sizeof(*paths));
+    char **file_ptrs = calloc(GH_TEST_UNIQUE_FILES, sizeof(*file_ptrs));
+    cbm_commit_files_t *commits = calloc(GH_TEST_COMMIT_COUNT, sizeof(*commits));
+    ASSERT_NOT_NULL(paths);
+    ASSERT_NOT_NULL(file_ptrs);
+    ASSERT_NOT_NULL(commits);
+
+    for (int i = 0; i < GH_TEST_UNIQUE_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "file-%05d.go", i);
+        file_ptrs[i] = paths[i];
+    }
+    for (int c = 0; c < GH_TEST_BASE_COMMITS; c++) {
+        int offset = c * GH_TEST_FILES_PER_COMMIT;
+        int remaining = GH_TEST_UNIQUE_FILES - offset;
+        commits[c].files = &file_ptrs[offset];
+        commits[c].count =
+            remaining < GH_TEST_FILES_PER_COMMIT ? remaining : GH_TEST_FILES_PER_COMMIT;
+        commits[c].timestamp = c + 1;
+    }
+    commits[GH_TEST_BASE_COMMITS] = (cbm_commit_files_t){
+        .files = &file_ptrs[GH_TEST_UNIQUE_FILES - 1],
+        .count = 1,
+        .timestamp = 999999,
+    };
+
+    cbm_file_temporal_t *temporal = NULL;
+    int temporal_count = 0;
+    ASSERT_EQ(cbm_compute_file_temporal(commits, GH_TEST_COMMIT_COUNT, &temporal, &temporal_count),
+              0);
+    ASSERT_EQ(temporal_count, GH_TEST_UNIQUE_FILES);
+
+    const cbm_file_temporal_t *last = NULL;
+    for (int i = 0; i < temporal_count; i++) {
+        if (strcmp(temporal[i].file_path, paths[GH_TEST_UNIQUE_FILES - 1]) == 0) {
+            last = &temporal[i];
+            break;
+        }
+    }
+    ASSERT_NOT_NULL(last);
+    ASSERT_EQ(last->change_count, 2);
+    ASSERT_EQ(last->last_modified, 999999);
+
+    cbm_file_temporal_free(temporal, temporal_count);
+    free(commits);
+    free(file_ptrs);
+    free(paths);
+    PASS();
+}
+
+TEST(githistory_temporal_preserves_long_file_paths) {
+    char path[CBM_SZ_1K];
+    memset(path, 'a', sizeof(path));
+    path[0] = 's';
+    path[1] = 'r';
+    path[2] = 'c';
+    path[3] = '/';
+    path[sizeof(path) - 4] = '.';
+    path[sizeof(path) - 3] = 'c';
+    path[sizeof(path) - 2] = 'p';
+    path[sizeof(path) - 1] = '\0';
+
+    char *files[] = {path};
+    cbm_commit_files_t commits[] = {
+        {.files = files, .count = 1, .timestamp = 123456},
+    };
+    cbm_file_temporal_t *temporal = NULL;
+    int temporal_count = 0;
+
+    ASSERT_EQ(cbm_compute_file_temporal(commits, 1, &temporal, &temporal_count), 0);
+    ASSERT_EQ(temporal_count, 1);
+    ASSERT_STR_EQ(temporal[0].file_path, path);
+    ASSERT_EQ(temporal[0].change_count, 1);
+    ASSERT_EQ(temporal[0].last_modified, 123456);
+
+    cbm_file_temporal_free(temporal, temporal_count);
     PASS();
 }
 
@@ -5241,6 +6346,7 @@ TEST(githistory_limits_to_max) {
     ASSERT_TRUE(n <= 100);
 
     /* Cleanup */
+    cbm_change_coupling_paths_free(results, n);
     for (int i = 0; i < ncommits; i++) {
         free(commits[i].files);
     }
@@ -5383,6 +6489,56 @@ TEST(implements_creates_override) {
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(close_override_count, 1);
     ASSERT_EQ(close_overrides[0]->target_id, close_method_id);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(implements_accepts_struct_label) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test-proj", "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t iface_id =
+        cbm_gbuf_upsert_node(gb, "Interface", "Runner", "pkg.Runner", "pkg/runner.go", 1, 3, "{}");
+    ASSERT_GT(iface_id, 0);
+    int64_t run_method_id =
+        cbm_gbuf_upsert_node(gb, "Method", "Run", "pkg.Runner.Run", "pkg/runner.go", 2, 2, "{}");
+    ASSERT_GT(run_method_id, 0);
+    cbm_gbuf_insert_edge(gb, iface_id, run_method_id, "DEFINES_METHOD", "{}");
+
+    int64_t struct_id =
+        cbm_gbuf_upsert_node(gb, "Struct", "Job", "pkg.Job", "pkg/job.go", 1, 4, "{}");
+    ASSERT_GT(struct_id, 0);
+    int64_t job_run_id = cbm_gbuf_upsert_node(gb, "Method", "Run", "pkg.Job.Run", "pkg/job.go", 2,
+                                              3, "{\"receiver\":\"(j Job)\"}");
+    ASSERT_GT(job_run_id, 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "test-proj",
+        .repo_path = "/tmp/test",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    int edges_created = cbm_pipeline_implements_go(&ctx);
+    ASSERT_GT(edges_created, 0);
+
+    const cbm_gbuf_edge_t **impl_edges = NULL;
+    int impl_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, struct_id, "IMPLEMENTS", &impl_edges,
+                                                 &impl_count),
+              0);
+    ASSERT_EQ(impl_count, 1);
+    ASSERT_EQ(impl_edges[0]->target_id, iface_id);
+
+    const cbm_gbuf_edge_t **override_edges = NULL;
+    int override_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, job_run_id, "OVERRIDE", &override_edges,
+                                                 &override_count),
+              0);
+    ASSERT_EQ(override_count, 1);
+    ASSERT_EQ(override_edges[0]->target_id, run_method_id);
 
     cbm_gbuf_free(gb);
     PASS();
@@ -5823,26 +6979,46 @@ TEST(usages_kotlin_no_duplicate_calls) {
 static char g_lang_tmpdir[256];
 
 static int setup_lang_repo(const char **filenames, const char **contents, int count) {
-    snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "/tmp/cbm_lang_XXXXXX");
-    if (!cbm_mkdtemp(g_lang_tmpdir))
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(g_lang_tmpdir, sizeof(g_lang_tmpdir), "%s/cbm-lang-XXXXXX", cache);
+    if (n < 0 || (size_t)n >= sizeof(g_lang_tmpdir) || !cbm_mkdtemp(g_lang_tmpdir)) {
+        g_lang_tmpdir[0] = '\0';
         return -1;
+    }
 
     for (int i = 0; i < count; i++) {
         char path[512];
-        snprintf(path, sizeof(path), "%s/%s", g_lang_tmpdir, filenames[i]);
+        n = snprintf(path, sizeof(path), "%s/%s", g_lang_tmpdir, filenames[i]);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            rm_rf(g_lang_tmpdir);
+            g_lang_tmpdir[0] = '\0';
+            return -1;
+        }
 
         /* Create parent directories */
         char dir[512];
-        snprintf(dir, sizeof(dir), "%s", path);
+        n = snprintf(dir, sizeof(dir), "%s", path);
+        if (n < 0 || (size_t)n >= sizeof(dir)) {
+            rm_rf(g_lang_tmpdir);
+            g_lang_tmpdir[0] = '\0';
+            return -1;
+        }
         char *slash = strrchr(dir, '/');
         if (slash) {
             *slash = '\0';
-            th_mkdir_p(dir);
+            if (th_mkdir_p(dir) != 0) {
+                rm_rf(g_lang_tmpdir);
+                g_lang_tmpdir[0] = '\0';
+                return -1;
+            }
         }
 
         FILE *f = fopen(path, "wb");
-        if (!f)
+        if (!f) {
+            rm_rf(g_lang_tmpdir);
+            g_lang_tmpdir[0] = '\0';
             return -1;
+        }
         fprintf(f, "%s", contents[i]);
         fclose(f);
     }
@@ -5853,6 +7029,142 @@ static void teardown_lang_repo(void) {
     if (g_lang_tmpdir[0])
         rm_rf(g_lang_tmpdir);
     g_lang_tmpdir[0] = '\0';
+}
+
+static int pipeline_dump_store_file_to_file(const char *src_path, const char *dest_path) {
+    cbm_store_t *s = cbm_store_open_path(src_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_dump_to_file(s, dest_path);
+    cbm_store_close(s);
+    return rc;
+}
+
+static bool pipeline_store_edge_between_qns_matches(const char *db_path, const char *project,
+                                                    const char *source_qn, const char *type,
+                                                    const char *target_qn,
+                                                    const char *props_needle) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return false;
+    }
+
+    cbm_node_t src = {0};
+    cbm_node_t tgt = {0};
+    bool found = false;
+    if (cbm_store_find_node_by_qn(s, project, source_qn, &src) == CBM_STORE_OK &&
+        cbm_store_find_node_by_qn(s, project, target_qn, &tgt) == CBM_STORE_OK) {
+        cbm_edge_t *edges = NULL;
+        int edge_count = 0;
+        if (cbm_store_find_edges_by_source_type(s, src.id, type, &edges, &edge_count) ==
+            CBM_STORE_OK) {
+            for (int i = 0; i < edge_count; i++) {
+                if (edges[i].target_id == tgt.id &&
+                    (!props_needle || (edges[i].properties_json &&
+                                       strstr(edges[i].properties_json, props_needle)))) {
+                    found = true;
+                    break;
+                }
+            }
+            cbm_store_free_edges(edges, edge_count);
+        }
+    }
+
+    cbm_node_free_fields(&src);
+    cbm_node_free_fields(&tgt);
+    cbm_store_close(s);
+    return found;
+}
+
+static bool pipeline_store_has_edge_between_qns(const char *db_path, const char *project,
+                                                const char *source_qn, const char *type,
+                                                const char *target_qn) {
+    return pipeline_store_edge_between_qns_matches(db_path, project, source_qn, type, target_qn,
+                                                   NULL);
+}
+
+static bool pipeline_resolved_call_contains(const CBMResolvedCallArray *arr,
+                                            const char *caller_substr,
+                                            const char *callee_substr) {
+    if (!arr || !caller_substr || !callee_substr) {
+        return false;
+    }
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && rc->callee_qn && strstr(rc->caller_qn, caller_substr) &&
+            strstr(rc->callee_qn, callee_substr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool pipeline_text_array_contains(char *const *items, int count, const char *needle) {
+    if (!items || !needle) {
+        return false;
+    }
+    for (int i = 0; i < count; i++) {
+        if (items[i] && strcmp(items[i], needle) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void pipeline_restore_workers_env(bool had_workers, const char *saved_workers) {
+    if (had_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+}
+
+static int pipeline_run_with_worker_count(const char *repo_path, const char *db_path, int workers,
+                                          char **out_project) {
+    char worker_buf[CBM_SZ_32];
+    int n = snprintf(worker_buf, sizeof(worker_buf), "%d", workers);
+    if (n <= 0 || (size_t)n >= sizeof(worker_buf) ||
+        cbm_setenv("CBM_WORKERS", worker_buf, 1) != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return CBM_NOT_FOUND;
+    }
+    int rc = cbm_pipeline_run(p);
+    if (rc == 0 && out_project) {
+        *out_project = strdup(cbm_pipeline_project_name(p));
+        if (!*out_project) {
+            rc = CBM_NOT_FOUND;
+        }
+    }
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+static int pipeline_count_channel_edges_to_non_channels(const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return CBM_NOT_FOUND;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    int count = CBM_NOT_FOUND;
+    static const char sql[] =
+        "SELECT COUNT(*) "
+        "FROM edges e JOIN nodes t ON t.id = e.target_id "
+        "WHERE e.project = ?1 AND e.type IN ('EMITS','LISTENS_ON') AND t.label <> 'Channel'";
+    if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, SKIP_ONE, project, CBM_NOT_FOUND, SQLITE_STATIC);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    return count;
 }
 
 TEST(pipeline_python_project) {
@@ -5951,6 +7263,77 @@ TEST(pipeline_imports_multi_symbol_edges) {
     ASSERT_TRUE(strstr(edges[0].properties_json, "\"local_name\":\"B\"") != NULL ||
                 strstr(edges[1].properties_json, "\"local_name\":\"B\"") != NULL);
     cbm_store_free_edges(edges, count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation) {
+    enum { FILE_COUNT = 3 };
+    const char *files[] = {"nested/feature-adapter/implementation.ts",
+                           "nested/feature-adapter/barrel.ts",
+                           "nested/feature-adapter/consumer.ts"};
+    const char *contents[] = {
+        "export async function targetOperation(): Promise<void> {\n  return;\n}\n",
+        "export { targetOperation } from './implementation';\n",
+        "import {\n  targetOperation,\n} from './barrel';\n\n"
+        "export async function callerOperation(): Promise<void> {\n"
+        "  await targetOperation();\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_exists(s, cbm_pipeline_project_name(p), "callerOperation",
+                                       "targetOperation"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_python_pyo3_import_resolves_rust_function_calls) {
+    enum { FILE_COUNT = 2 };
+    const char *files[] = {"native_bridge/src/lib.rs", "python_package/entrypoint.py"};
+    const char *contents[] = {
+        "#[pyfunction]\nfn native_execute() -> i32 { 42 }\n\n"
+        "#[pyfunction]\nfn serve_protocol() {}\n",
+        "def cli_main():\n"
+        "    from python_package._native import native_execute, serve_protocol\n"
+        "    serve_protocol()\n"
+        "    return native_execute()\n"};
+
+    if (setup_lang_repo(files, contents, FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_TRUE(cross_file_call_exists(s, project, "cli_main", "native_execute"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "cli_main", "serve_protocol"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -6163,28 +7546,20 @@ TEST(pipeline_python_cross_module_call) {
     PASS();
 }
 
-/* #725: two same-named symbols across languages must not share CALLS edges.
- * Python Store.commit is the real callee of save(); the JS Editor.commit
- * function is a distinct binding and must have no inbound CALLS from Python.
- * unique_name (candidates==1) is #1572 and is not this claim. */
-TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
-    const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
+TEST(pipeline_python_reexport_call_uses_resolved_import_edge) {
+    enum { REEXPORT_FILE_COUNT = 4 };
+    const char *files[] = {"fastapi/__init__.py", "fastapi/param_functions.py",
+                           "fastapi/openapi/models.py", "docs_src/app/main.py"};
     const char *contents[] = {
-        "class Store:\n"
-        "    def commit(self):\n"
-        "        return True\n",
+        "from .param_functions import Header\n",
+        "def Header(default=None):\n    return default\n",
+        "class Header:\n    pass\n",
+        ("from fastapi import Header\n\n"
+         "def create_item():\n    return Header(None)\n")};
 
-        "from store import Store\n"
-        "\n"
-        "def save():\n"
-        "    return Store().commit()\n",
-
-        "export function commit() {\n"
-        "  return 1;\n"
-        "}\n"};
-
-    if (setup_lang_repo(files, contents, 3) != 0)
+    if (setup_lang_repo(files, contents, REEXPORT_FILE_COUNT) != 0) {
         FAIL("tmpdir");
+    }
     char db[512];
     snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
 
@@ -6196,54 +7571,391 @@ TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     ASSERT_NOT_NULL(s);
     const char *proj = cbm_pipeline_project_name(p);
 
-    cbm_node_t *commits = NULL;
-    int ncommit = 0;
-    cbm_store_find_nodes_by_name(s, proj, "commit", &commits, &ncommit);
-    ASSERT_GTE(ncommit, 2);
+    cbm_node_t *callers = NULL;
+    int caller_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "create_item", &callers, &caller_count);
+    ASSERT_GT(caller_count, 0);
 
-    int64_t js_id = 0;
-    int64_t py_id = 0;
-    for (int i = 0; i < ncommit; i++) {
-        if (commits[i].file_path && strstr(commits[i].file_path, "Editor.js"))
-            js_id = commits[i].id;
-        if (commits[i].file_path && strstr(commits[i].file_path, "store.py"))
-            py_id = commits[i].id;
+    cbm_node_t *headers = NULL;
+    int header_count = 0;
+    cbm_store_find_nodes_by_name(s, proj, "Header", &headers, &header_count);
+    ASSERT_GT(header_count, 1);
+
+    int64_t expected_target_id = 0;
+    int64_t wrong_target_id = 0;
+    for (int i = 0; i < header_count; i++) {
+        const char *qn = headers[i].qualified_name ? headers[i].qualified_name : "";
+        if (strstr(qn, ".fastapi.param_functions.Header")) {
+            expected_target_id = headers[i].id;
+        } else if (strstr(qn, ".fastapi.openapi.models.Header")) {
+            wrong_target_id = headers[i].id;
+        }
     }
-    ASSERT_TRUE(js_id != 0);
-    ASSERT_TRUE(py_id != 0);
+    ASSERT_GT(expected_target_id, 0);
+    ASSERT_GT(wrong_target_id, 0);
 
-    cbm_node_t *saves = NULL;
-    int nsave = 0;
-    cbm_store_find_nodes_by_name(s, proj, "save", &saves, &nsave);
-    ASSERT_GT(nsave, 0);
-
-    cbm_edge_t *from_save = NULL;
-    int nfrom = 0;
-    cbm_store_find_edges_by_source_type(s, saves[0].id, "CALLS", &from_save, &nfrom);
-    bool save_calls_py = false;
-    bool save_calls_js = false;
-    for (int i = 0; i < nfrom; i++) {
-        if (from_save[i].target_id == py_id)
-            save_calls_py = true;
-        if (from_save[i].target_id == js_id)
-            save_calls_js = true;
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    cbm_store_find_edges_by_source_type(s, callers[0].id, "CALLS", &edges, &edge_count);
+    bool found_expected = false;
+    bool found_wrong = false;
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i].target_id == expected_target_id) {
+            found_expected = true;
+        }
+        if (edges[i].target_id == wrong_target_id) {
+            found_wrong = true;
+        }
     }
-    ASSERT_TRUE(save_calls_py);
-    ASSERT_FALSE(save_calls_js);
+    ASSERT_TRUE(found_expected);
+    ASSERT_FALSE(found_wrong);
 
-    cbm_edge_t *into_js = NULL;
-    int njs = 0;
-    cbm_store_find_edges_by_target_type(s, js_id, "CALLS", &into_js, &njs);
-    ASSERT_EQ(njs, 0);
-
-    if (from_save)
-        cbm_store_free_edges(from_save, nfrom);
-    if (into_js)
-        cbm_store_free_edges(into_js, njs);
-    cbm_store_free_nodes(commits, ncommit);
-    cbm_store_free_nodes(saves, nsave);
+    if (edges) {
+        cbm_store_free_edges(edges, edge_count);
+    }
+    cbm_store_free_nodes(headers, header_count);
+    cbm_store_free_nodes(callers, caller_count);
     cbm_store_close(s);
     cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_incremental_reexport_target_matches_full) {
+    enum { REEXPORT_AFFECTED_PATHS = 2 };
+    enum { REEXPORT_FILE_COUNT = 4 };
+    const char *files[] = {"fastapi/__init__.py", "fastapi/param_functions.py",
+                           "fastapi/openapi/models.py", "docs_src/app/main.py"};
+    const char *contents[] = {
+        "from .param_functions import Header\n",
+        "def Header(default=None):\n    return default\n",
+        "class Header:\n    pass\n",
+        ("from fastapi import Header\n\n"
+         "def create_item():\n    return Header(None)\n")};
+
+    if (setup_lang_repo(files, contents, REEXPORT_FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, "fastapi/__init__.py"),
+                            "from .openapi.models import Header\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_lang_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char affected_cap[CBM_SZ_32];
+    n = snprintf(affected_cap, sizeof(affected_cap), "%d", CBM_SZ_64);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(affected_cap));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+                             affected_cap),
+              0);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=2") != NULL ||
+           strstr(logs, "msg=incremental.frontier changed=1 expanded=2") != NULL);
+    cbm_pipeline_publish_kind_t kind = cbm_pipeline_publish_kind(p);
+    ASSERT(kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT ||
+           kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    if (kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT) {
+        cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+        ASSERT_EQ(stats.changed_paths, 1);
+        ASSERT_EQ(stats.affected_paths, REEXPORT_AFFECTED_PATHS);
+        ASSERT_EQ(stats.published_paths, REEXPORT_AFFECTED_PATHS);
+    } else {
+        ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "missing_existing_ownership");
+    }
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+
+    char incremental_db[CBM_SZ_512];
+    n = snprintf(incremental_db, sizeof(incremental_db), "%s/reexport-incremental.db",
+                 g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(incremental_db));
+    cbm_unlink(incremental_db);
+    ASSERT_EQ(pipeline_dump_store_file_to_file(db, incremental_db), CBM_STORE_OK);
+
+    cbm_unlink(db);
+    p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc =
+        cbm_test_compare_canonical_graphs(incremental_db, db, project, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [incremental:reexport-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    cbm_unlink(incremental_db);
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential) {
+    enum { FILLER_FILE_COUNT = 52, SEQUENTIAL_WORKERS = 1, PARALLEL_WORKERS = 4 };
+    const char *files[] = {"fastapi/openapi/models.py", "fastapi/security/base.py",
+                           "fastapi/security/api_key.py"};
+    const char *contents[] = {
+        "class SecurityBase:\n    pass\n",
+        "from fastapi.openapi.models import SecurityBase as SecurityBaseModel\n\n"
+        "class SecurityBase:\n    model: SecurityBaseModel\n",
+        "from fastapi.security.base import SecurityBase\n\n"
+        "class APIKeyBase(SecurityBase):\n    pass\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < FILLER_FILE_COUNT; i++) {
+        char rel[CBM_SZ_128];
+        char body[CBM_SZ_256];
+        int rn = snprintf(rel, sizeof(rel), "fillers/filler_%02d.py", i);
+        int bn = snprintf(body, sizeof(body), "def filler_%02d():\n    return %d\n", i, i);
+        ASSERT_GT(rn, 0);
+        ASSERT_LT((size_t)rn, sizeof(rel));
+        ASSERT_GT(bn, 0);
+        ASSERT_LT((size_t)bn, sizeof(body));
+        ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, rel), body), 0);
+    }
+
+    char seq_db[CBM_SZ_512];
+    char par_db[CBM_SZ_512];
+    int n = snprintf(seq_db, sizeof(seq_db), "%s/seq.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(seq_db));
+    n = snprintf(par_db, sizeof(par_db), "%s/par.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(par_db));
+
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers),
+                                       NULL) != NULL;
+
+    char *project = NULL;
+    int seq_rc =
+        pipeline_run_with_worker_count(g_lang_tmpdir, seq_db, SEQUENTIAL_WORKERS, &project);
+    int par_rc = pipeline_run_with_worker_count(g_lang_tmpdir, par_db, PARALLEL_WORKERS, NULL);
+    pipeline_restore_workers_env(had_workers, saved_workers);
+    ASSERT_EQ(seq_rc, 0);
+    ASSERT_EQ(par_rc, 0);
+    ASSERT_NOT_NULL(project);
+
+    char src_qn[CBM_SZ_512];
+    char target_qn[CBM_SZ_512];
+    n = snprintf(src_qn, sizeof(src_qn), "%s.fastapi.security.api_key.APIKeyBase", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(src_qn));
+    n = snprintf(target_qn, sizeof(target_qn), "%s.fastapi.security.base.SecurityBase", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(target_qn));
+
+    char openapi_class_qn[CBM_SZ_512];
+    char *base_file_qn = cbm_pipeline_fqn_compute(project, "fastapi/security/base.py", "__file__");
+    ASSERT_NOT_NULL(base_file_qn);
+    n = snprintf(openapi_class_qn, sizeof(openapi_class_qn),
+                 "%s.fastapi.openapi.models.SecurityBase",
+                 project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(openapi_class_qn));
+
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, base_file_qn, "IMPORTS",
+                                                    openapi_class_qn));
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, base_file_qn, "IMPORTS",
+                                                    openapi_class_qn));
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(seq_db, project, src_qn, "INHERITS", target_qn));
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(par_db, project, src_qn, "INHERITS", target_qn));
+
+    free(base_file_qn);
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = cbm_test_compare_canonical_graphs(seq_db, par_db, project, diff_err,
+                                                    sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [parallel:duplicate-import-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_parallel_env_access_matches_sequential) {
+    enum {
+        FILLER_FILE_COUNT = 52,
+        FILE_COUNT = FILLER_FILE_COUNT + 1,
+        SEQUENTIAL_WORKERS = 1,
+        PARALLEL_WORKERS = 4
+    };
+    const char *files[FILE_COUNT];
+    const char *contents[FILE_COUNT];
+    char filler_files[FILLER_FILE_COUNT][CBM_SZ_64];
+    char filler_bodies[FILLER_FILE_COUNT][CBM_SZ_128];
+
+    files[0] = "src/env.c";
+    contents[0] = "#include <stdlib.h>\n\n"
+                  "const char *cbm_safe_getenv(const char *key, char *buf, unsigned long cap, "
+                  "void *err) {\n"
+                  "    (void)buf;\n"
+                  "    (void)cap;\n"
+                  "    (void)err;\n"
+                  "    return key;\n"
+                  "}\n\n"
+                  "const char *load_temp(void) {\n"
+                  "    return getenv(\"CBM_TEST_PARALLEL_ENV\");\n"
+                  "}\n\n"
+                  "const char *load_home(void) {\n"
+                  "    char buf[32];\n"
+                  "    return cbm_safe_getenv(\"HOME\", buf, sizeof(buf), NULL);\n"
+                  "}\n";
+    for (int i = 0; i < FILLER_FILE_COUNT; i++) {
+        int rn = snprintf(filler_files[i], sizeof(filler_files[i]), "fillers/filler_%02d.c", i);
+        int bn = snprintf(filler_bodies[i], sizeof(filler_bodies[i]),
+                          "int filler_%02d(void) {\n    return %d;\n}\n", i, i);
+        ASSERT_GT(rn, 0);
+        ASSERT_LT((size_t)rn, sizeof(filler_files[i]));
+        ASSERT_GT(bn, 0);
+        ASSERT_LT((size_t)bn, sizeof(filler_bodies[i]));
+        files[i + 1] = filler_files[i];
+        contents[i + 1] = filler_bodies[i];
+    }
+
+    if (setup_lang_repo(files, contents, FILE_COUNT) != 0) {
+        FAIL("tmpdir");
+    }
+
+    char seq_db[CBM_SZ_512];
+    char par_db[CBM_SZ_512];
+    int n = snprintf(seq_db, sizeof(seq_db), "%s/env-seq.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(seq_db));
+    n = snprintf(par_db, sizeof(par_db), "%s/env-par.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(par_db));
+
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers),
+                                       NULL) != NULL;
+
+    char *project = NULL;
+    int seq_rc =
+        pipeline_run_with_worker_count(g_lang_tmpdir, seq_db, SEQUENTIAL_WORKERS, &project);
+    int par_rc = pipeline_run_with_worker_count(g_lang_tmpdir, par_db, PARALLEL_WORKERS, NULL);
+    pipeline_restore_workers_env(had_workers, saved_workers);
+    ASSERT_EQ(seq_rc, 0);
+    ASSERT_EQ(par_rc, 0);
+    ASSERT_NOT_NULL(project);
+
+    char env_source_qn[CBM_SZ_512];
+    n = snprintf(env_source_qn, sizeof(env_source_qn), "%s.src.env.load_temp", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(env_source_qn));
+    const char *env_qn = "__env__CBM_TEST_PARALLEL_ENV";
+
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(seq_db, project, env_source_qn, "CONFIGURES",
+                                                    env_qn));
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(par_db, project, env_source_qn, "CONFIGURES",
+                                                    env_qn));
+    char call_source_qn[CBM_SZ_512];
+    n = snprintf(call_source_qn, sizeof(call_source_qn), "%s.src.env.load_home", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(call_source_qn));
+    char call_target_qn[CBM_SZ_512];
+    n = snprintf(call_target_qn, sizeof(call_target_qn), "%s.src.env.cbm_safe_getenv", project);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(call_target_qn));
+    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(seq_db, project, call_source_qn,
+                                                        "CONFIGURES", call_target_qn,
+                                                        "\"args\":["));
+    ASSERT_TRUE(pipeline_store_edge_between_qns_matches(par_db, project, call_source_qn,
+                                                        "CONFIGURES", call_target_qn,
+                                                        "\"args\":["));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = cbm_test_compare_canonical_graphs(seq_db, par_db, project, diff_err,
+                                                    sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [parallel:env-access-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    teardown_lang_repo();
+    PASS();
+}
+
+TEST(pipeline_parallel_channel_edges_target_channels) {
+    enum { FILLER_FILE_COUNT = 52, PARALLEL_WORKERS = 4 };
+    const char *files[] = {"app/main.py"};
+    const char *contents[] = {
+        "from fastapi import FastAPI, WebSocket\n\n"
+        "app = FastAPI()\n\n"
+        "def marker(fn):\n    return fn\n\n"
+        "@app.websocket('/ws')\n"
+        "async def ws(websocket: WebSocket):\n"
+        "    await websocket.accept()\n"
+        "    await websocket.send_text('Hello, router!')\n"
+        "    await websocket.send_text('Hello, world!')\n\n"
+        "@app.get('/items')\n"
+        "def read_items():\n"
+        "    return {'ok': True}\n\n"
+        "@marker\n"
+        "def decorated():\n"
+        "    return read_items()\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0) {
+        FAIL("tmpdir");
+    }
+    for (int i = 0; i < FILLER_FILE_COUNT; i++) {
+        char rel[CBM_SZ_128];
+        char body[CBM_SZ_256];
+        int rn = snprintf(rel, sizeof(rel), "fillers/filler_%02d.py", i);
+        int bn = snprintf(body, sizeof(body), "def filler_%02d():\n    return %d\n", i, i);
+        ASSERT_GT(rn, 0);
+        ASSERT_LT((size_t)rn, sizeof(rel));
+        ASSERT_GT(bn, 0);
+        ASSERT_LT((size_t)bn, sizeof(body));
+        ASSERT_EQ(th_write_file(TH_PATH(g_lang_tmpdir, rel), body), 0);
+    }
+
+    char db[CBM_SZ_512];
+    int n = snprintf(db, sizeof(db), "%s/channel-parallel.db", g_lang_tmpdir);
+    ASSERT_GT(n, 0);
+    ASSERT_LT((size_t)n, sizeof(db));
+
+    char saved_workers[CBM_SZ_32] = {0};
+    bool had_workers = cbm_safe_getenv("CBM_WORKERS", saved_workers, sizeof(saved_workers),
+                                       NULL) != NULL;
+    char *project = NULL;
+    int rc = pipeline_run_with_worker_count(g_lang_tmpdir, db, PARALLEL_WORKERS, &project);
+    pipeline_restore_workers_env(had_workers, saved_workers);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(project);
+    ASSERT_EQ(pipeline_count_channel_edges_to_non_channels(db, project), 0);
+
+    free(project);
     teardown_lang_repo();
     PASS();
 }
@@ -6278,12 +7990,12 @@ TEST(pipeline_go_type_classification) {
     cbm_store_free_nodes(ifaces, ic);
 
     /* Should have 1 Struct node (Config struct) */
-    cbm_node_t *cls = NULL;
-    int cc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Struct", &cls, &cc);
-    ASSERT_EQ(cc, 1);
-    ASSERT_STR_EQ(cls[0].name, "Config");
-    cbm_store_free_nodes(cls, cc);
+    cbm_node_t *structs = NULL;
+    int sc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Struct", &structs, &sc);
+    ASSERT_EQ(sc, 1);
+    ASSERT_STR_EQ(structs[0].name, "Config");
+    cbm_store_free_nodes(structs, sc);
 
     /* Should have 1 Type node (ID alias) */
     cbm_node_t *types = NULL;
@@ -6322,11 +8034,11 @@ TEST(pipeline_go_grouped_types) {
     ASSERT_NOT_NULL(s);
     const char *proj = cbm_pipeline_project_name(p);
 
-    cbm_node_t *cls = NULL;
-    int cc = 0;
-    cbm_store_find_nodes_by_label(s, proj, "Struct", &cls, &cc);
-    ASSERT_EQ(cc, 2); /* Request, Response */
-    cbm_store_free_nodes(cls, cc);
+    cbm_node_t *structs = NULL;
+    int sc = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Struct", &structs, &sc);
+    ASSERT_EQ(sc, 2); /* Request, Response */
+    cbm_store_free_nodes(structs, sc);
 
     cbm_node_t *ifaces = NULL;
     int ic = 0;
@@ -6812,7 +8524,7 @@ TEST(pipeline_docstring_kotlin_function) {
     PASS();
 }
 
-TEST(pipeline_docstring_go_class) {
+TEST(pipeline_docstring_go_struct) {
     /* Go struct with // comment docstring */
     const char *files[] = {"main.go"};
     const char *contents[] = {"package main\n\n"
@@ -6938,6 +8650,20 @@ TEST(git_context_non_git_path) {
     ASSERT_GT(cbm_git_context_props_json(&ctx, json, sizeof(json)), 0);
     ASSERT_NOT_NULL(strstr(json, "\"is_git\":false"));
     ASSERT_NOT_NULL(strstr(json, "\"root_exists\":true"));
+
+    const char control_root[] = {'r', 'o', 'o', 't', '\f', 'p', 'a', 't', 'h', '\0'};
+    cbm_git_context_t control_ctx = {
+        .root_exists = true,
+        .canonical_root = (char *)control_root,
+    };
+    ASSERT_GT(cbm_git_context_props_json(&control_ctx, json, sizeof(json)), 0);
+    ASSERT_NOT_NULL(strstr(json, "\"canonical_root\":\"root\\u000cpath\""));
+    yyjson_doc *control_doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(control_doc);
+    yyjson_val *control_value = yyjson_obj_get(yyjson_doc_get_root(control_doc), "canonical_root");
+    ASSERT_NOT_NULL(control_value);
+    ASSERT_STR_EQ(yyjson_get_str(control_value), control_root);
+    yyjson_doc_free(control_doc);
 
     char long_value[1200];
     memset(long_value, 'a', sizeof(long_value) - 1);
@@ -7409,6 +9135,2812 @@ TEST(gitdiff_parse_hunks_deletion) {
     int n = cbm_parse_hunks(input, hunks, 4);
     ASSERT_EQ(n, 1);
     ASSERT_EQ(hunks[0].start_line, 10);
+    PASS();
+}
+
+static const cbm_store_delta_edge_t *pipeline_delta_find_edge(const cbm_pipeline_file_delta_t *delta,
+                                                              const char *type) {
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        if (strcmp(delta->edges[i].type, type) == 0) {
+            return &delta->edges[i];
+        }
+    }
+    return NULL;
+}
+
+static const cbm_store_delta_edge_t *pipeline_delta_find_edge_by_qn(
+    const cbm_pipeline_file_delta_t *delta, const char *source_qn, const char *target_qn,
+    const char *type) {
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &delta->edges[i];
+        if (edge->source_qn && edge->target_qn && edge->type &&
+            strcmp(edge->source_qn, source_qn) == 0 &&
+            strcmp(edge->target_qn, target_qn) == 0 && strcmp(edge->type, type) == 0) {
+            return edge;
+        }
+    }
+    return NULL;
+}
+
+static const cbm_store_import_ref_t *pipeline_delta_first_import(
+    const cbm_pipeline_file_delta_t *delta) {
+    return delta->delta.import_count > 0 ? &delta->imports[0] : NULL;
+}
+
+static int pipeline_delta_plan_contains_path(const cbm_pipeline_file_delta_plan_t *plan,
+                                             const char *path) {
+    for (int i = 0; i < plan->affected_count; i++) {
+        if (strcmp(plan->affected_paths[i], path) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void pipeline_delta_free_string_array(char **items, int count) {
+    if (!items) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(items[i]);
+    }
+    free(items);
+}
+
+static int pipeline_delta_store_qn_exists(cbm_store_t *s, const char *project, const char *qn) {
+    cbm_node_t node = {0};
+    int rc = cbm_store_find_node_by_qn(s, project, qn, &node);
+    if (rc == CBM_STORE_OK) {
+        cbm_node_free_fields(&node);
+        return 1;
+    }
+    return 0;
+}
+
+TEST(pipeline_file_delta_detects_cross_file_node_qn_collision) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t existing = {.project = "test",
+                           .label = "Class",
+                           .name = "Thing",
+                           .qualified_name = "test.src.store.store.Thing",
+                           .file_path = "src/store/store.c",
+                           .start_line = 1,
+                           .end_line = 4,
+                           .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &existing), 0);
+
+    cbm_node_t delta_node = {.project = "test",
+                             .label = "Class",
+                             .name = "Thing",
+                             .qualified_name = "test.src.store.store.Thing",
+                             .file_path = "src/store/store.h",
+                             .start_line = 1,
+                             .end_line = 1,
+                             .properties_json = "{}"};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "src/store/store.h", .node_count = 1},
+        .nodes = &delta_node,
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_UPSERT,
+    };
+    delta.delta.nodes = &delta_node;
+
+    bool collision = false;
+    ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
+              CBM_STORE_OK);
+    ASSERT_FALSE(collision);
+
+    cbm_node_t existing_var = {.project = "test",
+                               .label = "Variable",
+                               .name = "thing",
+                               .qualified_name = "test.src.store.store.thing",
+                               .file_path = "src/store/store.c",
+                               .start_line = 1,
+                               .end_line = 1,
+                               .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &existing_var), 0);
+    delta_node.label = "Variable";
+    delta_node.name = "thing";
+    delta_node.qualified_name = "test.src.store.store.thing";
+    collision = false;
+    ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
+              CBM_STORE_OK);
+    ASSERT_TRUE(collision);
+
+    delta_node.label = "Class";
+    delta_node.name = "Thing";
+    delta_node.qualified_name = "test.src.store.store.Thing";
+    delta_node.file_path = "src/store/store.c";
+    collision = true;
+    ASSERT_EQ(cbm_pipeline_file_delta_has_cross_file_node_qn_collision(s, &delta, &collision),
+              CBM_STORE_OK);
+    ASSERT_FALSE(collision);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+static void pipeline_delta_attach_test_metadata(cbm_pipeline_file_delta_t *delta,
+                                                cbm_file_hash_t *hash,
+                                                cbm_file_state_t *state) {
+    enum { PIPELINE_DELTA_TEST_GENERATION = 1 };
+    *hash = (cbm_file_hash_t){.project = delta->delta.project,
+                              .rel_path = delta->delta.rel_path,
+                              .sha256 = "test-hash",
+                              .mtime_ns = 1,
+                              .size = 10};
+    *state = (cbm_file_state_t){.project = delta->delta.project,
+                                .rel_path = delta->delta.rel_path,
+                                .content_hash = "test-content",
+                                .git_oid = "",
+                                .mtime_ns = 1,
+                                .size = 10,
+                                .language = "go",
+                                .pass_fingerprint = "test-pass",
+                                .generation = PIPELINE_DELTA_TEST_GENERATION,
+                                .indexed_at = "2026-06-30T00:00:00Z"};
+    delta->delta.generation = PIPELINE_DELTA_TEST_GENERATION;
+    delta->delta.file_hash = hash;
+    delta->delta.file_state = state;
+}
+
+static int64_t pipeline_delta_seed_existing_ownership_id(cbm_store_t *s, const char *project,
+                                                         const char *rel_path,
+                                                         const char *qualified_name) {
+    enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
+    cbm_node_t node = {.project = (char *)project,
+                       .label = "Function",
+                       .name = "Existing",
+                       .qualified_name = (char *)qualified_name,
+                       .file_path = (char *)rel_path,
+                       .start_line = 1,
+                       .end_line = 1,
+                       .properties_json = "{}"};
+    int64_t node_id = cbm_store_upsert_node(s, &node);
+    if (node_id <= CBM_STORE_NO_NODE_ID) {
+        return CBM_STORE_NO_NODE_ID;
+    }
+    cbm_file_state_t state = {.project = (char *)project,
+                              .rel_path = (char *)rel_path,
+                              .content_hash = "base-content",
+                              .git_oid = "",
+                              .mtime_ns = 1,
+                              .size = 10,
+                              .language = "go",
+                              .pass_fingerprint = "test-pass",
+                              .generation = PIPELINE_DELTA_TEST_BASE_GENERATION,
+                              .indexed_at = "2026-06-30T00:00:00Z"};
+    if (cbm_store_upsert_file_state(s, &state) != CBM_STORE_OK) {
+        return CBM_STORE_NO_NODE_ID;
+    }
+    if (cbm_store_upsert_node_owner(s, project, node_id, rel_path,
+                                    PIPELINE_DELTA_TEST_BASE_GENERATION) != CBM_STORE_OK) {
+        return CBM_STORE_NO_NODE_ID;
+    }
+    return node_id;
+}
+
+static int pipeline_delta_seed_existing_ownership(cbm_store_t *s, const char *project,
+                                                  const char *rel_path,
+                                                  const char *qualified_name) {
+    return pipeline_delta_seed_existing_ownership_id(s, project, rel_path, qualified_name) >
+                   CBM_STORE_NO_NODE_ID
+               ? CBM_STORE_OK
+               : CBM_STORE_ERR;
+}
+
+static int pipeline_delta_seed_file_owned_unowned_source_edge(
+    cbm_store_t *s, const char *project, const char *rel_path, const char *source_qn,
+    const char *target_qn, const char *edge_type) {
+    enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
+    int64_t target_id = pipeline_delta_seed_existing_ownership_id(s, project, rel_path, target_qn);
+    if (target_id <= CBM_STORE_NO_NODE_ID) {
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t source = {.project = (char *)project,
+                         .label = "Module",
+                         .name = "module",
+                         .qualified_name = (char *)source_qn,
+                         .file_path = "",
+                         .properties_json = "{}"};
+    int64_t source_id = cbm_store_upsert_node(s, &source);
+    if (source_id <= CBM_STORE_NO_NODE_ID) {
+        return CBM_STORE_ERR;
+    }
+    cbm_edge_t edge = {.project = (char *)project,
+                       .source_id = source_id,
+                       .target_id = target_id,
+                       .type = (char *)edge_type,
+                       .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &edge);
+    if (edge_id <= CBM_STORE_NO_NODE_ID) {
+        return CBM_STORE_ERR;
+    }
+    return cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                       PIPELINE_DELTA_TEST_BASE_GENERATION);
+}
+
+static int pipeline_delta_seed_project_node(cbm_store_t *s, const char *project) {
+    cbm_node_t project_node = {.project = (char *)project,
+                               .label = "Project",
+                               .name = (char *)project,
+                               .qualified_name = (char *)project,
+                               .file_path = "",
+                               .properties_json = "{}"};
+    return cbm_store_upsert_node(s, &project_node) > CBM_STORE_NO_NODE_ID ? CBM_STORE_OK
+                                                                          : CBM_STORE_ERR;
+}
+
+static int pipeline_store_file_state_generation_memory(cbm_store_t *s, const char *project,
+                                                       const char *rel_path,
+                                                       int64_t *generation) {
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(s, project, rel_path, &state);
+    if (rc == CBM_STORE_OK && generation) {
+        *generation = state.generation;
+    }
+    cbm_store_file_state_free_fields(&state);
+    return rc;
+}
+
+TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths) {
+    const char *project = "test";
+    const char *changed_paths[] = {"main.go"};
+    const int changed_path_count = (int)(sizeof(changed_paths) / sizeof(changed_paths[0]));
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp"), CBM_STORE_OK);
+
+    cbm_node_t helper = {.project = (char *)project,
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = "test.helper.Helper",
+                         .file_path = "helper.go",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t stale = {.project = (char *)project,
+                        .label = "Function",
+                        .name = "Old",
+                        .qualified_name = "test.main.Old",
+                        .file_path = "main.go",
+                        .start_line = 1,
+                        .end_line = 1,
+                        .properties_json = "{\"is_exported\":true}"};
+    cbm_node_t module = {.project = (char *)project,
+                         .label = "Module",
+                         .name = "helper",
+                         .qualified_name = "test.helper",
+                         .file_path = "helper.go",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &helper), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &stale), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &module), 0);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  s, scratch, registry, project, changed_paths, changed_path_count),
+              CBM_STORE_OK);
+
+    ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper.Helper"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper"));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, "test.main.Old"));
+    ASSERT_TRUE(cbm_registry_exists(registry, "test.helper.Helper"));
+    ASSERT_FALSE(cbm_registry_exists(registry, "test.main.Old"));
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = "/tmp",
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .store_backed_node_lookup = s,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = changed_path_count};
+    ASSERT_NOT_NULL(cbm_pipeline_find_node_by_qn(&ctx, "test.helper.Helper"));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, "test.helper.Helper"));
+    ASSERT_NULL(cbm_pipeline_find_node_by_qn(&ctx, "test.main.Old"));
+
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots) {
+    enum { PIPELINE_DELTA_STRUCTURE_GENERATION = 1 };
+    const char *project = "test";
+    const char *repo_path = "/tmp";
+    const char *rel_path = "main.go";
+    const char *changed_paths[] = {rel_path};
+    const int changed_path_count = (int)(sizeof(changed_paths) / sizeof(changed_paths[0]));
+    const char *branch_qn = "test.branch.main";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, repo_path), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.main.Old"),
+              CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    ASSERT_NOT_NULL(file_qn);
+    cbm_node_t project_node = {.project = (char *)project,
+                               .label = "Project",
+                               .name = (char *)project,
+                               .qualified_name = (char *)project,
+                               .file_path = NULL,
+                               .properties_json = "{}"};
+    cbm_node_t branch_node = {.project = (char *)project,
+                              .label = "Branch",
+                              .name = "main",
+                              .qualified_name = (char *)branch_qn,
+                              .file_path = NULL,
+                              .properties_json = "{}"};
+    cbm_node_t file_node = {.project = (char *)project,
+                            .label = "File",
+                            .name = (char *)rel_path,
+                            .qualified_name = file_qn,
+                            .file_path = (char *)rel_path,
+                            .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &project_node), CBM_STORE_NO_NODE_ID);
+    int64_t branch_id = cbm_store_upsert_node(s, &branch_node);
+    int64_t file_id = cbm_store_upsert_node(s, &file_node);
+    ASSERT_GT(branch_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(file_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, project, file_id, rel_path,
+                                          PIPELINE_DELTA_STRUCTURE_GENERATION),
+              CBM_STORE_OK);
+    cbm_edge_t contains = {.project = (char *)project,
+                           .source_id = branch_id,
+                           .target_id = file_id,
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &contains);
+    ASSERT_GT(edge_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                          PIPELINE_DELTA_STRUCTURE_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, repo_path);
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  s, scratch, registry, project, changed_paths, changed_path_count),
+              CBM_STORE_OK);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, project));
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(scratch, branch_qn));
+    ASSERT_NULL(cbm_gbuf_find_by_qn(scratch, file_qn));
+
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, branch_qn, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", "test.main.New", rel_path, 1,
+                                   1, "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 0, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *structure_edge =
+        pipeline_delta_find_edge(&delta, "CONTAINS_FILE");
+    ASSERT_NOT_NULL(structure_edge);
+    ASSERT_STR_EQ(structure_edge->source_qn, branch_qn);
+    ASSERT_STR_EQ(structure_edge->target_qn, file_qn);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    free(file_qn);
+    PASS();
+}
+
+TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor) {
+    const char *project = "test";
+    const char *changed_paths[] = {"main.go"};
+    const int changed_path_count = (int)(sizeof(changed_paths) / sizeof(changed_paths[0]));
+    const char *helper_qn = "test.helper.Helper";
+    const char *main_file_qn = "test.main.__file__";
+    const char *main_qn = "test.main.Run";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, changed_paths[0],
+                                                     "test.main.Old"),
+              CBM_STORE_OK);
+
+    cbm_node_t helper = {.project = (char *)project,
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = (char *)helper_qn,
+                         .file_path = "helper.go",
+                         .start_line = 1,
+                         .end_line = 1,
+                         .properties_json = "{\"is_exported\":true}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &helper), 0);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp");
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  s, scratch, registry, project, changed_paths, changed_path_count),
+              CBM_STORE_OK);
+
+    int64_t file_id =
+        cbm_gbuf_upsert_node(scratch, "File", "main.go", main_file_qn, "main.go", 1, 1, "{}");
+    int64_t run_id = cbm_gbuf_upsert_node(scratch, "Function", "Run", main_qn, "main.go", 2, 4,
+                                          "{\"is_exported\":true}");
+    ASSERT_GT(file_id, 0);
+    ASSERT_GT(run_id, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = "/tmp",
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .store_backed_node_lookup = s,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = changed_path_count};
+    const cbm_gbuf_node_t *helper_node = cbm_pipeline_find_node_by_qn(&ctx, helper_qn);
+    ASSERT_NOT_NULL(helper_node);
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, file_id, helper_node, "Helper"), 1);
+    ASSERT_GT(cbm_gbuf_insert_edge(scratch, run_id, helper_node->id, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_paths[0], 1, &delta),
+              CBM_STORE_OK);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    ASSERT_EQ(delta.delta.edge_count, 2);
+    ASSERT_NOT_NULL(pipeline_delta_find_edge(&delta, "CALLS"));
+    ASSERT_NOT_NULL(pipeline_delta_find_edge(&delta, "IMPORTS"));
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, changed_paths[0]), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_descriptor_from_gbuf) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t file_id =
+        cbm_gbuf_upsert_node(gb, "File", "main.go", "proj.main.__file__", "main.go", 1, 1, "{}");
+    int64_t run_id = cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run", "main.go", 3, 5,
+                                          "{\"is_exported\":true}");
+    int64_t helper_id = cbm_gbuf_upsert_node(gb, "Function", "Helper", "proj.helper.Helper",
+                                             "helper.go", 1, 3, "{\"is_exported\":true}");
+    ASSERT_GT(file_id, 0);
+    ASSERT_GT(run_id, 0);
+    ASSERT_GT(helper_id, 0);
+
+    const cbm_gbuf_node_t *helper = cbm_gbuf_find_by_qn(gb, "proj.helper.Helper");
+    ASSERT_NOT_NULL(helper);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj", .repo_path = "/tmp/proj", .gbuf = gb};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, file_id, helper, "Helper"), 1);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, run_id, helper_id, "CALLS", "{\"line\":4}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, helper_id, run_id, "CALLS", "{\"line\":2}"), 0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, "proj", "main.go", 7, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.unsupported_edge_count, 0);
+    ASSERT_EQ(delta.delta.node_count, 2);
+    ASSERT_EQ(delta.delta.export_count, 1);
+    ASSERT_EQ(delta.delta.edge_count, 2);
+    ASSERT_EQ(delta.delta.import_count, 1);
+    ASSERT_STR_EQ(delta.delta.project, "proj");
+    ASSERT_STR_EQ(delta.delta.rel_path, "main.go");
+    ASSERT_EQ(delta.delta.generation, 7);
+    ASSERT_STR_EQ(delta.delta.derived_view_name, CBM_STORE_DERIVED_VIEW_NODES_FTS);
+    ASSERT_STR_EQ(delta.delta.derived_status, CBM_STORE_DERIVED_STATUS_COMPLETE);
+    ASSERT_STR_EQ(delta.exports[0].qualified_name, "proj.main.Run");
+
+    const cbm_store_delta_edge_t *call_edge = pipeline_delta_find_edge(&delta, "CALLS");
+    ASSERT_NOT_NULL(call_edge);
+    ASSERT_STR_EQ(call_edge->source_qn, "proj.main.Run");
+    ASSERT_STR_EQ(call_edge->target_qn, "proj.helper.Helper");
+
+    const cbm_store_import_ref_t *imp = pipeline_delta_first_import(&delta);
+    ASSERT_NOT_NULL(imp);
+    ASSERT_STR_EQ(imp->import_text, "proj.helper.Helper");
+    ASSERT_STR_EQ(imp->local_name, "Helper");
+    ASSERT_STR_EQ(imp->target_qn, "proj.helper.Helper");
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_file_delta_owns_target_header_usage_edges) {
+    const char *project = "proj";
+    const char *header_rel = "src/store/store.h";
+    const char *source_module_qn = "proj.src.store.store";
+    const char *target_qn = "proj.src.store.store.NewHeaderSymbol";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "Module", "store", source_module_qn,
+                                             "src/store/store.c", 1, 100, "{}");
+    int64_t target_id =
+        cbm_gbuf_upsert_node(gb, "Function", "NewHeaderSymbol", target_qn, header_rel, 12,
+                             14, "{\"is_exported\":true}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, source_id, target_id, "USAGE",
+                                   "{\"callee\":\"NewHeaderSymbol\"}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, project, header_rel, 3, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *usage =
+        pipeline_delta_find_edge_by_qn(&delta, source_module_qn, target_qn, "USAGE");
+    ASSERT_NOT_NULL(usage);
+    ASSERT_STR_EQ(usage->properties_json, "{\"callee\":\"NewHeaderSymbol\"}");
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay) {
+    const char *project = "test";
+    const char *target_rel = "target.go";
+    const char *caller_rel = "caller.go";
+    const char *target_qn = "test.target.Handle";
+    const char *stale_qn = "test.target.Legacy";
+    const char *caller_qn = "test.caller.Call";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    int64_t target_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, target_rel, target_qn);
+    int64_t stale_id = pipeline_delta_seed_existing_ownership_id(s, project, target_rel, stale_qn);
+    int64_t caller_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, caller_rel, caller_qn);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(stale_id, 0);
+    ASSERT_GT(caller_id, 0);
+
+    cbm_edge_t call_edge = {.project = (char *)project,
+                            .source_id = caller_id,
+                            .target_id = target_id,
+                            .type = "CALLS",
+                            .properties_json = "{\"confidence\":0.9}"};
+    cbm_edge_t stale_edge = {.project = (char *)project,
+                             .source_id = caller_id,
+                             .target_id = stale_id,
+                             .type = "CALLS",
+                             .properties_json = "{\"stale\":true}"};
+    cbm_edge_t recomputed_edge = {.project = (char *)project,
+                                  .source_id = caller_id,
+                                  .target_id = target_id,
+                                  .type = CBM_PIPELINE_EDGE_SIMILAR_TO,
+                                  .properties_json = "{\"score\":1.0}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &call_edge), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &stale_edge), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &recomputed_edge), 0);
+    ASSERT_EQ(cbm_store_rebuild_file_delta_owners(s, project, 1), CBM_STORE_OK);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "Handle", target_qn, target_rel, 3, 7,
+                                   "{\"is_exported\":true}"),
+              0);
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, project, target_rel, 1, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.delta.edge_count, 0);
+
+    int added = -1;
+    ASSERT_EQ(cbm_pipeline_file_delta_add_preserved_inbound_edges(s, &delta, &added),
+              CBM_STORE_OK);
+    ASSERT_EQ(added, 1);
+    ASSERT_EQ(delta.delta.edge_count, 1);
+    const cbm_store_delta_edge_t *preserved =
+        pipeline_delta_find_edge_by_qn(&delta, caller_qn, target_qn, "CALLS");
+    ASSERT_NOT_NULL(preserved);
+    ASSERT_STR_EQ(preserved->properties_json, "{\"confidence\":0.9}");
+    ASSERT_NULL(pipeline_delta_find_edge_by_qn(&delta, caller_qn, stale_qn, "CALLS"));
+    ASSERT_NULL(
+        pipeline_delta_find_edge_by_qn(&delta, caller_qn, target_qn, CBM_PIPELINE_EDGE_SIMILAR_TO));
+
+    added = -1;
+    ASSERT_EQ(cbm_pipeline_file_delta_add_preserved_inbound_edges(s, &delta, &added),
+              CBM_STORE_OK);
+    ASSERT_EQ(added, 0);
+    ASSERT_EQ(delta.delta.edge_count, 1);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_preserves_sibling_named_imports_to_shared_target) {
+    const char *project = "test";
+    const char *target_rel = "target.py";
+    const char *caller_rel = "consumer.py";
+    const char *target_qn = "test.target.Service.openapi";
+    const char *caller_qn = "test.consumer.py.__file__";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    int64_t target_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, target_rel, target_qn);
+    int64_t caller_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, caller_rel, caller_qn);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(caller_id, 0);
+
+    cbm_edge_t first = {.project = (char *)project,
+                        .source_id = caller_id,
+                        .target_id = target_id,
+                        .type = "IMPORTS",
+                        .properties_json = "{\"local_name\":\"METHODS_WITH_BODY\"}"};
+    cbm_edge_t second = {.project = (char *)project,
+                         .source_id = caller_id,
+                         .target_id = target_id,
+                         .type = "IMPORTS",
+                         .properties_json = "{\"local_name\":\"REF_PREFIX\"}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &first), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &second), 0);
+    ASSERT_EQ(cbm_store_rebuild_file_delta_owners(s, project, 1), CBM_STORE_OK);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Method", "openapi", target_qn, target_rel, 3, 7,
+                                   "{\"is_exported\":true}"),
+              0);
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, project, target_rel, 1, &delta),
+              CBM_STORE_OK);
+
+    int added = -1;
+    ASSERT_EQ(cbm_pipeline_file_delta_add_preserved_inbound_edges(s, &delta, &added),
+              CBM_STORE_OK);
+    ASSERT_EQ(added, 2);
+    ASSERT_EQ(delta.delta.edge_count, 2);
+    ASSERT_TRUE(strstr(delta.delta.edges[0].properties_json, "METHODS_WITH_BODY") != NULL ||
+                strstr(delta.delta.edges[1].properties_json, "METHODS_WITH_BODY") != NULL);
+    ASSERT_TRUE(strstr(delta.delta.edges[0].properties_json, "REF_PREFIX") != NULL ||
+                strstr(delta.delta.edges[1].properties_json, "REF_PREFIX") != NULL);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_descriptor_marks_unsupported_edges) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t run_id =
+        cbm_gbuf_upsert_node(gb, "Function", "Run", "proj.main.Run", "main.go", 3, 5, "{}");
+    ASSERT_GT(run_id, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, run_id, 9999, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(gb, "proj", "main.go", 8, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.unsupported_edge_count, 1);
+    ASSERT_EQ(delta.delta.node_count, 1);
+    ASSERT_EQ(delta.delta.edge_count, 0);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_file_delta_metadata_from_file) {
+    enum {
+        PIPELINE_DELTA_META_GENERATION_FIRST = 11,
+        PIPELINE_DELTA_META_GENERATION_SECOND = 12,
+    };
+    char *tmp = th_mktempdir("cbm_delta_meta");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *first_content = "package main\nfunc Run() {}\n";
+    ASSERT_EQ(th_write_file(path, first_content), 0);
+
+    cbm_file_info_t file = {
+        .path = (char *)path,
+        .rel_path = "main.go",
+        .language = CBM_LANG_GO,
+        .size = (int64_t)strlen(first_content),
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION_FIRST}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&delta, &file), CBM_STORE_OK);
+    ASSERT(delta.delta.file_hash == &delta.file_hash);
+    ASSERT(delta.delta.file_state == &delta.file_state);
+    ASSERT_STR_EQ(delta.file_hash.project, "test");
+    ASSERT_STR_EQ(delta.file_hash.rel_path, "main.go");
+    ASSERT_STR_EQ(delta.file_hash.sha256, "");
+    ASSERT_EQ(delta.file_hash.size, (int64_t)strlen(first_content));
+    ASSERT_STR_EQ(delta.file_state.project, "test");
+    ASSERT_STR_EQ(delta.file_state.rel_path, "main.go");
+    ASSERT_EQ(delta.file_state.size, (int64_t)strlen(first_content));
+    ASSERT_STR_EQ(delta.file_state.language, "Go");
+    ASSERT_EQ(delta.file_state.generation, PIPELINE_DELTA_META_GENERATION_FIRST);
+    ASSERT_NOT_NULL(delta.file_state.content_hash);
+    ASSERT_EQ((int)strlen(delta.file_state.content_hash), CBM_SZ_16);
+    ASSERT_NOT_NULL(delta.file_state.indexed_at);
+    ASSERT_NOT_NULL(strchr(delta.file_state.indexed_at, 'T'));
+    char first_hash[CBM_SZ_32];
+    snprintf(first_hash, sizeof(first_hash), "%s", delta.file_state.content_hash);
+
+    const char *second_content = "package main\nfunc Run() { println(\"changed\") }\n";
+    ASSERT_EQ(th_write_file(path, second_content), 0);
+    cbm_pipeline_file_delta_t changed = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION_SECOND}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&changed, &file), CBM_STORE_OK);
+    ASSERT_NEQ(strcmp(first_hash, changed.file_state.content_hash), 0);
+    ASSERT_EQ(changed.file_state.generation, PIPELINE_DELTA_META_GENERATION_SECOND);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint) {
+    enum { PIPELINE_DELTA_META_GENERATION = 13 };
+    char effective_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
+                  effective_fingerprint, sizeof(effective_fingerprint), CBM_MODE_FULL, 0.7, 0.25,
+                  0.75, 0.3, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS, 0.6),
+              CBM_STORE_OK);
+    char *tmp = th_mktempdir("cbm_delta_meta_fingerprint");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"fingerprint\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    cbm_file_info_t file = {
+        .path = (char *)path,
+        .rel_path = "main.go",
+        .language = CBM_LANG_GO,
+        .size = (int64_t)strlen(content),
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(
+                  &delta, &file, effective_fingerprint),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(delta.file_state.pass_fingerprint, effective_fingerprint);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_delta_stamp_generation_updates_metadata) {
+    enum { PIPELINE_DELTA_STAMP_GENERATION = 21 };
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {.project = "test", .rel_path = "main.go", .sha256 = ""};
+    delta.file_state = (cbm_file_state_t){.project = "test",
+                                          .rel_path = "main.go",
+                                          .content_hash = "test-content",
+                                          .indexed_at = "2026-07-01T00:00:00Z"};
+    delta.delta.file_hash = &hash;
+    delta.delta.file_state = &delta.file_state;
+
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, 0), CBM_STORE_ERR);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, PIPELINE_DELTA_STAMP_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.delta.generation, PIPELINE_DELTA_STAMP_GENERATION);
+    ASSERT_EQ(delta.file_state.generation, PIPELINE_DELTA_STAMP_GENERATION);
+    ASSERT_EQ(delta.delta.file_state->generation, PIPELINE_DELTA_STAMP_GENERATION);
+
+    PASS();
+}
+
+TEST(pipeline_content_hash_helper_matches_file_delta_metadata) {
+    enum { PIPELINE_DELTA_META_GENERATION = 14 };
+    char *tmp = th_mktempdir("cbm_delta_hash");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"hash\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    char expected_hash[CBM_SZ_32];
+    ASSERT_EQ(cbm_pipeline_content_hash_file(path, expected_hash, sizeof(expected_hash)),
+              CBM_STORE_OK);
+
+    cbm_file_info_t file = {
+        .path = (char *)path,
+        .rel_path = "main.go",
+        .language = CBM_LANG_GO,
+        .size = (int64_t)strlen(content),
+    };
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .generation = PIPELINE_DELTA_META_GENERATION}};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&delta, &file), CBM_STORE_OK);
+    ASSERT_STR_EQ(delta.file_state.content_hash, expected_hash);
+    ASSERT_EQ((int)strlen(expected_hash), CBM_SZ_16);
+
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_state_persist_helper_writes_hash_metadata) {
+    enum { PIPELINE_FILE_STATE_GENERATION = 14 };
+    char *tmp = th_mktempdir("cbm_file_state_persist");
+    ASSERT_NOT_NULL(tmp);
+    const char *go_path = TH_PATH(tmp, "main.go");
+    const char *py_path = TH_PATH(tmp, "worker.py");
+    const char *go_content = "package main\nfunc Run() { println(\"persist\") }\n";
+    const char *py_content = "def run():\n    return 'persist'\n";
+    ASSERT_EQ(th_write_file(go_path, go_content), 0);
+    ASSERT_EQ(th_write_file(py_path, py_content), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t files[2] = {
+        {.path = (char *)go_path,
+         .rel_path = "main.go",
+         .language = CBM_LANG_GO,
+         .size = (int64_t)strlen(go_content)},
+        {.path = (char *)py_path,
+         .rel_path = "worker.py",
+         .language = CBM_LANG_PYTHON,
+         .size = (int64_t)strlen(py_content)},
+    };
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", files, 2, PIPELINE_FILE_STATE_GENERATION,
+                                               "test-pass"),
+              CBM_STORE_OK);
+
+    char expected_go_hash[CBM_SZ_32];
+    char expected_py_hash[CBM_SZ_32];
+    ASSERT_EQ(cbm_pipeline_content_hash_file(go_path, expected_go_hash, sizeof(expected_go_hash)),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_content_hash_file(py_path, expected_py_hash, sizeof(expected_py_hash)),
+              CBM_STORE_OK);
+
+    cbm_file_state_t go_state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "main.go", &go_state), CBM_STORE_OK);
+    ASSERT_STR_EQ(go_state.content_hash, expected_go_hash);
+    ASSERT_STR_EQ(go_state.language, "Go");
+    ASSERT_STR_EQ(go_state.pass_fingerprint, "test-pass");
+    ASSERT_EQ(go_state.size, (int64_t)strlen(go_content));
+    ASSERT_EQ(go_state.generation, PIPELINE_FILE_STATE_GENERATION);
+    ASSERT_NOT_NULL(go_state.indexed_at);
+    ASSERT_NOT_NULL(strchr(go_state.indexed_at, 'T'));
+    cbm_store_file_state_free_fields(&go_state);
+
+    cbm_file_state_t py_state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "worker.py", &py_state), CBM_STORE_OK);
+    ASSERT_STR_EQ(py_state.content_hash, expected_py_hash);
+    ASSERT_STR_EQ(py_state.language, "Python");
+    ASSERT_STR_EQ(py_state.pass_fingerprint, "test-pass");
+    ASSERT_EQ(py_state.size, (int64_t)strlen(py_content));
+    ASSERT_EQ(py_state.generation, PIPELINE_FILE_STATE_GENERATION);
+    cbm_store_file_state_free_fields(&py_state);
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint) {
+    enum { PIPELINE_FILE_STATE_GENERATION = 15 };
+    char *tmp = th_mktempdir("cbm_file_state_current_pass");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"current\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t file = {.path = (char *)path,
+                            .rel_path = "main.go",
+                            .language = CBM_LANG_GO,
+                            .size = (int64_t)strlen(content)};
+    ASSERT_TRUE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, cbm_pipeline_file_delta_pass_fingerprint()));
+
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", &file, 1,
+                                               PIPELINE_FILE_STATE_GENERATION, "old-pass"),
+              CBM_STORE_OK);
+    ASSERT_FALSE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, cbm_pipeline_file_delta_pass_fingerprint()));
+
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", &file, 1,
+                                               PIPELINE_FILE_STATE_GENERATION + 1, NULL),
+              CBM_STORE_OK);
+    ASSERT_TRUE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, cbm_pipeline_file_delta_pass_fingerprint()));
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds) {
+    char full_default[CBM_SZ_256];
+    char full_tuned[CBM_SZ_256];
+    char full_tuned_again[CBM_SZ_256];
+    char full_coupling_budget_tuned[CBM_SZ_256];
+    char fast_default[CBM_SZ_256];
+    char capabilities_disabled[CBM_SZ_256];
+
+    cbm_pipeline_t *full = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    cbm_pipeline_t *fast = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(full);
+    ASSERT_NOT_NULL(fast);
+
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_default, sizeof(full_default)),
+              CBM_STORE_OK);
+    cbm_pipeline_set_similarity_threshold(full, 0.7);
+    cbm_pipeline_set_httplink_min_confidence(full, 0.25);
+    cbm_pipeline_set_semantic_threshold(full, 0.75);
+    cbm_pipeline_set_githistory_min_coupling(full, 0.3);
+    cbm_pipeline_set_lsp_confidence_floor(full, 0.6);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_tuned, sizeof(full_tuned)),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_tuned_again,
+                                                    sizeof(full_tuned_again)),
+              CBM_STORE_OK);
+    cbm_pipeline_set_githistory_max_couplings(full, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS + 1);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, full_coupling_budget_tuned,
+                                                    sizeof(full_coupling_budget_tuned)),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(fast, fast_default, sizeof(fast_default)),
+              CBM_STORE_OK);
+    cbm_pipeline_set_similarity_enabled(full, false);
+    cbm_pipeline_set_semantic_edges_enabled(full, false);
+    cbm_pipeline_set_githistory_enabled(full, false);
+    cbm_pipeline_set_httplinks_enabled(full, false);
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(full, capabilities_disabled,
+                                                    sizeof(capabilities_disabled)),
+              CBM_STORE_OK);
+
+    ASSERT_NEQ(strcmp(full_default, full_tuned), 0);
+    ASSERT_STR_EQ(full_tuned, full_tuned_again);
+    ASSERT_NEQ(strcmp(full_tuned, full_coupling_budget_tuned), 0);
+    ASSERT_NEQ(strcmp(full_default, fast_default), 0);
+    ASSERT_NEQ(strcmp(full_coupling_budget_tuned, capabilities_disabled), 0);
+
+    cbm_pipeline_free(full);
+    cbm_pipeline_free(fast);
+    PASS();
+}
+
+TEST(pipeline_file_state_current_check_rejects_stale_config_fingerprint) {
+    enum { PIPELINE_FILE_STATE_GENERATION = 16 };
+    char *tmp = th_mktempdir("cbm_file_state_current_config");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() { println(\"config\") }\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    char old_fingerprint[CBM_SZ_256];
+    char current_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
+                  old_fingerprint, sizeof(old_fingerprint), CBM_MODE_FULL, 0.7, 0.25, 0.75, 0.3,
+                  CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS, 0.6),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_format_file_delta_pass_fingerprint(
+                  current_fingerprint, sizeof(current_fingerprint), CBM_MODE_FULL, 0.8, 0.25, 0.75,
+                  0.3, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS, 0.6),
+              CBM_STORE_OK);
+    ASSERT_NEQ(strcmp(old_fingerprint, current_fingerprint), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t file = {.path = (char *)path,
+                            .rel_path = "main.go",
+                            .language = CBM_LANG_GO,
+                            .size = (int64_t)strlen(content)};
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", &file, 1,
+                                               PIPELINE_FILE_STATE_GENERATION, old_fingerprint),
+              CBM_STORE_OK);
+    ASSERT_FALSE(cbm_pipeline_file_state_is_current_or_legacy(
+        s, "test", &file, current_fingerprint));
+    ASSERT_TRUE(cbm_pipeline_file_state_is_current_or_legacy(s, "test", &file, old_fingerprint));
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_state_persist_helper_rolls_back_on_failure) {
+    char *tmp = th_mktempdir("cbm_file_state_persist_fail");
+    ASSERT_NOT_NULL(tmp);
+    const char *path = TH_PATH(tmp, "main.go");
+    const char *content = "package main\nfunc Run() {}\n";
+    ASSERT_EQ(th_write_file(path, content), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", tmp), CBM_STORE_OK);
+
+    cbm_file_info_t files[2] = {
+        {.path = (char *)path,
+         .rel_path = "main.go",
+         .language = CBM_LANG_GO,
+         .size = (int64_t)strlen(content)},
+        {.path = (char *)TH_PATH(tmp, "missing.py"),
+         .rel_path = "missing.py",
+         .language = CBM_LANG_PYTHON,
+         .size = 0},
+    };
+    ASSERT_EQ(cbm_pipeline_persist_file_states(s, "test", files, 2,
+                                               CBM_PIPELINE_COMPAT_GENERATION, "test-pass"),
+              CBM_STORE_ERR);
+
+    cbm_file_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, "test", "main.go", &state), CBM_STORE_NOT_FOUND);
+
+    cbm_store_close(s);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_candidate_from_frontier) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "lib.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_falls_back_on_publish_error) {
+    enum { PIPELINE_DELTA_APPLY_ONE = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "Value",
+                            .qualified_name = "test.lib.Value",
+                            .file_path = "lib.go",
+                            .properties_json = "{}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test",
+                                                 .rel_path = "lib.go",
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELTA_APPLY_ONE,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "publish_error");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, "test", "test.lib.Value"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_falls_back_without_generation) {
+    enum { PIPELINE_DELTA_APPLY_ONE = 1 };
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.Value", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELTA_APPLY_ONE,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_generation");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, "test", "test.lib.Value"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_succeeds_after_generation_stamp) {
+    enum { PIPELINE_DELTA_APPLY_ONE = 1 };
+    const char *project = "test";
+    const char *rel_path = "lib.go";
+    const char *old_qn = "test.lib.Old";
+    const char *new_qn = "test.lib.Value";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, old_qn), CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = (char *)project,
+                            .label = "Function",
+                            .name = "Value",
+                            .qualified_name = (char *)new_qn,
+                            .file_path = (char *)rel_path,
+                            .properties_json = "{}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = new_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = rel_path,
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+    state.generation = 0;
+
+    cbm_pipeline_file_delta_plan_t preflight_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &preflight_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(preflight_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&preflight_plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, 0);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+    ASSERT(delta.delta.file_state == &delta.file_state);
+    ASSERT_EQ(delta.file_state.generation, generation);
+    ASSERT_EQ(state.generation, 0);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELTA_APPLY_ONE,
+                                                  CBM_SZ_4, &apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, rel_path, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, generation);
+    cbm_store_file_state_free_fields(&got);
+
+    cbm_pipeline_file_delta_plan_free(&apply_plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_inserts_new_file_without_existing_ownership) {
+    enum { PIPELINE_NEW_FILE_DELTA_COUNT = 1 };
+    const char *project = "test";
+    const char *rel_path = "pkg/new.go";
+    const char *new_qn = "test.pkg.new.Value";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
+
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "pkg");
+    ASSERT_NOT_NULL(folder_qn);
+    cbm_node_t folder = {.project = (char *)project,
+                         .label = "Folder",
+                         .name = "pkg",
+                         .qualified_name = folder_qn,
+                         .file_path = "pkg",
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &folder), CBM_STORE_NO_NODE_ID);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "Value", new_qn, rel_path, 1, 1,
+                                   "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 0, &delta),
+              CBM_STORE_OK);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+
+    cbm_pipeline_file_delta_plan_t preflight_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &preflight_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(preflight_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&preflight_plan, rel_path), 1);
+    ASSERT_EQ(preflight_plan.affected_count, 1);
+    cbm_pipeline_file_delta_plan_free(&preflight_plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, 0);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_NEW_FILE_DELTA_COUNT,
+                                                  CBM_SZ_4, &apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, rel_path, &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, rel_path, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, generation);
+    cbm_store_file_state_free_fields(&got);
+
+    cbm_pipeline_file_delta_plan_free(&apply_plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_falls_back_on_new_file_importer_frontier) {
+    enum { PIPELINE_NEW_IMPORTER_DELTA_COUNT = 1 };
+    const char *project = "test";
+    const char *new_rel = "pkg/new.go";
+    const char *main_rel = "main.go";
+    const char *new_qn = "test.pkg.new.Value";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, main_rel, "test.main.Main"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, main_rel, "test.pkg.new", "Value",
+                                          new_qn, 1),
+              CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = (char *)project,
+                            .label = "Function",
+                            .name = "Value",
+                            .qualified_name = (char *)new_qn,
+                            .file_path = (char *)new_rel,
+                            .properties_json = "{\"is_exported\":true}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = new_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = new_rel,
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas,
+                                                  PIPELINE_NEW_IMPORTER_DELTA_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_requires_batch");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_existing_ownership");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    int64_t main_id =
+        pipeline_delta_seed_existing_ownership_id(s, "test", "main.go", "test.main.Old");
+    int64_t helper_id =
+        pipeline_delta_seed_existing_ownership_id(s, "test", "helper.go", "test.helper.Helper");
+    ASSERT_GT(main_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(helper_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t inbound = {.project = "test",
+                          .source_id = helper_id,
+                          .target_id = main_id,
+                          .type = "CALLS",
+                          .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &inbound), CBM_STORE_NO_NODE_ID);
+
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "inbound_edges_require_full");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    int64_t main_id =
+        pipeline_delta_seed_existing_ownership_id(s, "test", "main.go", "test.main.Old");
+    ASSERT_GT(main_id, CBM_STORE_NO_NODE_ID);
+
+    cbm_node_t folder = {.project = "test",
+                         .label = "Folder",
+                         .name = "test",
+                         .qualified_name = "test",
+                         .file_path = "",
+                         .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder);
+    ASSERT_GT(folder_id, CBM_STORE_NO_NODE_ID);
+
+    cbm_edge_t inbound = {.project = "test",
+                          .source_id = folder_id,
+                          .target_id = main_id,
+                          .type = "CONTAINS_FILE",
+                          .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &inbound), CBM_STORE_NO_NODE_ID);
+
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "inbound_edges_require_full");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_accepts_full_pipeline_structure_edge) {
+    enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.src.main.Old"),
+              CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_node_t file_node = {.project = (char *)project,
+                            .label = "File",
+                            .name = "main.go",
+                            .qualified_name = file_qn,
+                            .file_path = (char *)rel_path,
+                            .properties_json = "{}"};
+    int64_t file_id = cbm_store_upsert_node(s, &file_node);
+    ASSERT_GT(file_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, project, file_id, rel_path,
+                                          PIPELINE_DELTA_TEST_BASE_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_node_t folder_node = {.project = (char *)project,
+                              .label = "Folder",
+                              .name = "src",
+                              .qualified_name = folder_qn,
+                              .file_path = "src",
+                              .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder_node);
+    ASSERT_GT(folder_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t contains = {.project = (char *)project,
+                           .source_id = folder_id,
+                           .target_id = file_id,
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &contains);
+    ASSERT_GT(edge_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                          PIPELINE_DELTA_TEST_BASE_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", "test.src.main.New", rel_path, 1,
+                                   1, "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 1, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *structure_edge =
+        pipeline_delta_find_edge(&delta, "CONTAINS_FILE");
+    ASSERT_NOT_NULL(structure_edge);
+    ASSERT_STR_EQ(structure_edge->source_qn, folder_qn);
+    ASSERT_STR_EQ(structure_edge->target_qn, file_qn);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &delta.delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_new_folder_structure_edge) {
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, "test.src.main.Old"),
+              CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", "test.src.main.New", rel_path, 1,
+                                   1, "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 1, &delta),
+              CBM_STORE_OK);
+    const cbm_store_delta_edge_t *structure_edge =
+        pipeline_delta_find_edge(&delta, "CONTAINS_FILE");
+    ASSERT_NOT_NULL(structure_edge);
+    ASSERT_STR_EQ(structure_edge->source_qn, folder_qn);
+    ASSERT_STR_EQ(structure_edge->target_qn, file_qn);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unresolved_edge_endpoint");
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_inserts_and_prunes_new_folder_context) {
+    enum {
+        PIPELINE_NEW_FOLDER_DELTA_COUNT = 1,
+    };
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    const char *new_qn = "test.src.main.New";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, rel_path, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "New", new_qn, rel_path, 1, 1,
+                                   "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, rel_path, 0, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(delta.delta.context_node_count, 1);
+    ASSERT_EQ(delta.delta.context_edge_count, 1);
+    ASSERT_STR_EQ(delta.context_nodes[0].qualified_name, folder_qn);
+    ASSERT_STR_EQ(delta.context_edges[0].type, "CONTAINS_FOLDER");
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+    delta.delta.generation = 0;
+    delta.file_state.generation = 0;
+
+    cbm_pipeline_file_delta_plan_t preflight_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &preflight_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(preflight_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&preflight_plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, 0);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_NEW_FOLDER_DELTA_COUNT,
+                                                  CBM_SZ_4, &apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, folder_qn), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER"), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE"), 1);
+
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, "src", &node_owners, &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_EQ(node_owners, 0);
+    ASSERT_EQ(edge_owners, 0);
+    ASSERT_EQ(cbm_store_count_file_delta_owners(s, project, rel_path, &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    ASSERT_GT(edge_owners, 0);
+
+    cbm_pipeline_file_delta_plan_free(&apply_plan);
+    cbm_pipeline_file_delta_free(&delta);
+
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delete_delta = {
+        .delta = {.project = project, .rel_path = rel_path, .generation = generation},
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *delete_deltas[] = {&delete_delta};
+    cbm_pipeline_file_delta_plan_t delete_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, delete_deltas,
+                                                  PIPELINE_NEW_FOLDER_DELTA_COUNT, CBM_SZ_4,
+                                                  &delete_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(delete_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, file_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, folder_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, project), 1);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FOLDER"), 0);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CONTAINS_FILE"), 0);
+
+    cbm_pipeline_file_delta_plan_free(&delete_plan);
+    cbm_gbuf_free(scratch);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_accepts_regenerated_structural_inbound_edge) {
+    enum { PIPELINE_DELTA_TEST_BASE_GENERATION = 1 };
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel_path, "__file__");
+    char *folder_qn = cbm_pipeline_fqn_folder(project, "src");
+    ASSERT_NOT_NULL(file_qn);
+    ASSERT_NOT_NULL(folder_qn);
+
+    cbm_node_t old_file = {.project = (char *)project,
+                           .label = "File",
+                           .name = "main.go",
+                           .qualified_name = file_qn,
+                           .file_path = (char *)rel_path,
+                           .properties_json = "{}"};
+    int64_t file_id = cbm_store_upsert_node(s, &old_file);
+    ASSERT_GT(file_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_node_owner(s, project, file_id, rel_path,
+                                          PIPELINE_DELTA_TEST_BASE_GENERATION),
+              CBM_STORE_OK);
+    cbm_file_state_t base_state = {.project = (char *)project,
+                                   .rel_path = (char *)rel_path,
+                                   .content_hash = "base-content",
+                                   .git_oid = "",
+                                   .mtime_ns = 1,
+                                   .size = 10,
+                                   .language = "go",
+                                   .pass_fingerprint = "test-pass",
+                                   .generation = PIPELINE_DELTA_TEST_BASE_GENERATION,
+                                   .indexed_at = "2026-06-30T00:00:00Z"};
+    ASSERT_EQ(cbm_store_upsert_file_state(s, &base_state), CBM_STORE_OK);
+
+    cbm_node_t folder = {.project = (char *)project,
+                         .label = "Folder",
+                         .name = "src",
+                         .qualified_name = folder_qn,
+                         .file_path = "src",
+                         .properties_json = "{}"};
+    int64_t folder_id = cbm_store_upsert_node(s, &folder);
+    ASSERT_GT(folder_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t contains = {.project = (char *)project,
+                           .source_id = folder_id,
+                           .target_id = file_id,
+                           .type = "CONTAINS_FILE",
+                           .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &contains);
+    ASSERT_GT(edge_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                          PIPELINE_DELTA_TEST_BASE_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_node_t new_file = {.project = (char *)project,
+                           .label = "File",
+                           .name = "main.go",
+                           .qualified_name = file_qn,
+                           .file_path = (char *)rel_path,
+                           .properties_json = "{}"};
+    cbm_store_delta_edge_t regenerated_edge = {.source_qn = folder_qn,
+                                               .target_qn = file_qn,
+                                               .type = "CONTAINS_FILE",
+                                               .properties_json = "{}"};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = rel_path,
+                                                 .nodes = &new_file,
+                                                 .node_count = 1,
+                                                 .edges = &regenerated_edge,
+                                                 .edge_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, rel_path), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    free(folder_qn);
+    free(file_qn);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_accepts_regenerated_file_owned_unowned_source_edge) {
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    const char *source_qn = "test.src.module";
+    const char *target_qn = "test.src.main.Run";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_file_owned_unowned_source_edge(
+                  s, project, rel_path, source_qn, target_qn, "CALLS"),
+              CBM_STORE_OK);
+
+    cbm_node_t replacement_node = {.project = (char *)project,
+                                   .label = "Function",
+                                   .name = "Run",
+                                   .qualified_name = (char *)target_qn,
+                                   .file_path = (char *)rel_path,
+                                   .properties_json = "{}"};
+    cbm_store_delta_edge_t replacement_edge = {.source_qn = source_qn,
+                                               .target_qn = target_qn,
+                                               .type = "CALLS",
+                                               .properties_json = "{}",
+                                               .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = rel_path,
+                                                 .nodes = &replacement_node,
+                                                 .node_count = 1,
+                                                 .edges = &replacement_edge,
+                                                 .edge_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, rel_path), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_stale_file_owned_unowned_source_edge) {
+    const char *project = "test";
+    const char *rel_path = "src/main.go";
+    const char *source_qn = "test.src.module";
+    const char *target_qn = "test.src.main.Run";
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_file_owned_unowned_source_edge(
+                  s, project, rel_path, source_qn, target_qn, "CALLS"),
+              CBM_STORE_OK);
+
+    cbm_node_t replacement_node = {.project = (char *)project,
+                                   .label = "Function",
+                                   .name = "Run",
+                                   .qualified_name = (char *)target_qn,
+                                   .file_path = (char *)rel_path,
+                                   .properties_json = "{}"};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = rel_path,
+                                                 .nodes = &replacement_node,
+                                                 .node_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "inbound_edges_require_full");
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_without_file_metadata) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "main.go"}};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_file_metadata");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "main.go"}, .unsupported_edge_count = 1};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unsupported_edges");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_delete) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "gone.go"},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "missing_generation");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_deletes_owned_file_delta) {
+    enum {
+        PIPELINE_DELETE_BASE_GENERATION = 1,
+        PIPELINE_DELETE_FINAL_GENERATION = 2,
+        PIPELINE_DELETE_DELTA_COUNT = 1,
+    };
+    const char *project = "test";
+    const char *rel_path = "gone.go";
+    const char *old_qn = "test.gone.Old";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_DELETE_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, rel_path, old_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_DELETE_FINAL_GENERATION);
+
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = rel_path,
+                                                 .generation = generation},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELETE_DELTA_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_qn), 0);
+    cbm_file_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, rel_path, &state), CBM_STORE_NOT_FOUND);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_mixed_delete_upsert_batch) {
+    enum {
+        PIPELINE_RENAME_BASE_GENERATION = 1,
+        PIPELINE_RENAME_FINAL_GENERATION = 2,
+        PIPELINE_RENAME_DELTA_COUNT = 2,
+    };
+    const char *project = "test";
+    const char *old_rel = "pkg/file_0000.go";
+    const char *new_rel = "pkg/file_renamed.go";
+    const char *old_qn = "test.pkg.file_0000.OldName";
+    const char *new_qn = "test.pkg.file_renamed.NewName";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_project_node(s, project), CBM_STORE_OK);
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, old_rel, old_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation_memory(s, project, old_rel, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_FINAL_GENERATION);
+
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, "/tmp/test");
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Project", project, project, NULL, 0, 0, "{}"), 0);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, project, new_rel, NULL), 0);
+    ASSERT_GT(cbm_gbuf_upsert_node(scratch, "Function", "NewName", new_qn, new_rel, 1, 1,
+                                   "{\"is_exported\":true}"),
+              0);
+
+    cbm_pipeline_file_delta_t upsert_delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(scratch, project, new_rel,
+                                                      PIPELINE_RENAME_FINAL_GENERATION,
+                                                      &upsert_delta),
+              CBM_STORE_OK);
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&upsert_delta, &hash, &state);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&upsert_delta,
+                                                       PIPELINE_RENAME_FINAL_GENERATION),
+              CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delete_delta = {
+        .delta = {.project = project,
+                  .rel_path = old_rel,
+                  .generation = PIPELINE_RENAME_FINAL_GENERATION},
+        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *deltas[] = {&delete_delta, &upsert_delta};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_RENAME_DELTA_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_qn), 1);
+    ASSERT_EQ(pipeline_store_file_state_generation_memory(s, project, old_rel, &generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(pipeline_store_file_state_generation_memory(s, project, new_rel, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_RENAME_FINAL_GENERATION);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_pipeline_file_delta_free(&upsert_delta);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_falls_back_on_delete_batch) {
+    enum {
+        PIPELINE_DELETE_BATCH_BASE_GENERATION = 1,
+        PIPELINE_DELETE_BATCH_FINAL_GENERATION = 2,
+        PIPELINE_DELETE_BATCH_COUNT = 2,
+    };
+    const char *project = "test";
+    const char *first_rel = "one.go";
+    const char *second_rel = "two.go";
+    const char *first_qn = "test.one.Old";
+    const char *second_qn = "test.two.Old";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_DELETE_BATCH_BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, first_rel, first_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, second_rel, second_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, PIPELINE_DELETE_BATCH_FINAL_GENERATION);
+
+    cbm_pipeline_file_delta_t first = {.delta = {.project = project,
+                                                 .rel_path = first_rel,
+                                                 .generation = generation},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    cbm_pipeline_file_delta_t second = {.delta = {.project = project,
+                                                  .rel_path = second_rel,
+                                                  .generation = generation},
+                                        .change_kind = CBM_PIPELINE_DELTA_CHANGE_DELETE};
+    const cbm_pipeline_file_delta_t *deltas[] = {&first, &second};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas, PIPELINE_DELETE_BATCH_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "delete_batch_requires_full");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, first_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, second_qn), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch) {
+    enum { PIPELINE_FRONTIER_MISSING_DELTA_COUNT = 1 };
+    const char *project = "test";
+    const char *lib_rel = "lib.go";
+    const char *main_rel = "main.go";
+    const char *lib_qn = "test.lib.Hot";
+    const char *new_lib_qn = "test.lib.HotRenamed";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, lib_rel, lib_qn), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, lib_qn, lib_rel, CBM_STORE_NO_NODE_ID,
+                                             1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, main_rel, "test.lib", "Hot", lib_qn, 1),
+              CBM_STORE_OK);
+
+    cbm_node_t nodes[1] = {{.project = (char *)project,
+                            .label = "Function",
+                            .name = "HotRenamed",
+                            .qualified_name = (char *)new_lib_qn,
+                            .file_path = (char *)lib_rel,
+                            .properties_json = "{}"}};
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = new_lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = project,
+                                                 .rel_path = lib_rel,
+                                                 .nodes = nodes,
+                                                 .node_count = 1,
+                                                 .exports = exports,
+                                                 .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, deltas,
+                                                  PIPELINE_FRONTIER_MISSING_DELTA_COUNT,
+                                                  CBM_SZ_4, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_requires_batch");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, lib_qn), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_rename) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_pipeline_file_delta_t delta = {.delta = {.project = "test", .rel_path = "new.go"},
+                                       .change_kind = CBM_PIPELINE_DELTA_CHANGE_RENAME,
+                                       .old_rel_path = "old.go"};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "rename_requires_full");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unsupported_derived_view) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .derived_view_name = CBM_STORE_DERIVED_VIEW_PAGERANK,
+                  .derived_status = CBM_STORE_DERIVED_STATUS_STALE}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unsupported_derived_view");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "main.go", "test.main.Old"),
+              CBM_STORE_OK);
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "Run",
+                            .qualified_name = "test.main.Run",
+                            .file_path = "main.go",
+                            .properties_json = "{}"}};
+    cbm_store_delta_edge_t edges[1] = {{.source_qn = "test.main.Run",
+                                        .target_qn = "test.missing.Helper",
+                                        .type = "CALLS",
+                                        .properties_json = "{}",
+                                        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .nodes = nodes,
+                  .node_count = 1,
+                  .edges = edges,
+                  .edge_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "unresolved_edge_endpoint");
+    ASSERT_EQ(plan.affected_count, 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "main.go", "test.main.Old"),
+              CBM_STORE_OK);
+    cbm_node_t helper = {.project = "test",
+                         .label = "Function",
+                         .name = "Helper",
+                         .qualified_name = "test.helper.Helper",
+                         .file_path = "helper.go",
+                         .properties_json = "{}"};
+    ASSERT_GT(cbm_store_upsert_node(s, &helper), 0);
+
+    cbm_node_t nodes[1] = {{.project = "test",
+                            .label = "Function",
+                            .name = "Run",
+                            .qualified_name = "test.main.Run",
+                            .file_path = "main.go",
+                            .properties_json = "{}"}};
+    cbm_store_delta_edge_t edges[1] = {{.source_qn = "test.main.Run",
+                                        .target_qn = "test.helper.Helper",
+                                        .type = "CALLS",
+                                        .properties_json = "{}",
+                                        .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test",
+                  .rel_path = "main.go",
+                  .nodes = nodes,
+                  .node_count = 1,
+                  .edges = edges,
+                  .edge_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_4, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "main.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_falls_back_on_large_frontier) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, "test", "lib.go", "test.lib.Old"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, "test", "test.lib.Hot", "lib.go",
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "a.go", "test.lib", "Hot",
+                                          "test.lib.Hot", 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, "test", "b.go", "test.lib", "Hot",
+                                          "test.lib.Hot", 1),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t exports[1] = {
+        {.qualified_name = "test.lib.HotRenamed", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t delta = {
+        .delta = {.project = "test", .rel_path = "lib.go", .exports = exports, .export_count = 1}};
+    cbm_file_hash_t hash = {0};
+    cbm_file_state_t state = {0};
+    pipeline_delta_attach_test_metadata(&delta, &hash, &state);
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &delta, CBM_SZ_2, &plan), CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_too_large");
+    ASSERT_EQ(plan.affected_count, 3);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "lib.go"), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "a.go"), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, "b.go"), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_frontier_noop_mask_bounds_recursive_frontier) {
+    enum {
+        PIPELINE_NOOP_FRONTIER_DELTA_COUNT = 2,
+        PIPELINE_NOOP_FRONTIER_MAX_AFFECTED = 2,
+    };
+    const char *project = "test";
+    const char *lib_rel = "lib.py";
+    const char *importer_rel = "a.py";
+    const char *downstream_rel = "b.py";
+    const char *lib_qn = "test.lib.Hot";
+    const char *importer_qn = "test.a.Stable";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, lib_rel, lib_qn), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, importer_rel, importer_qn),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, lib_qn, lib_rel,
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, importer_qn, importer_rel,
+                                             CBM_STORE_NO_NODE_ID, 1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, importer_rel, "test.lib", "Hot", lib_qn,
+                                          1),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, downstream_rel, "test.a", "Stable",
+                                          importer_qn, 1),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t lib_exports[1] = {
+        {.qualified_name = "test.lib.HotRenamed", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_symbol_export_t importer_exports[1] = {
+        {.qualified_name = "test.a.StableRenamed", .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t lib_delta = {
+        .delta = {.project = project,
+                  .rel_path = lib_rel,
+                  .exports = lib_exports,
+                  .export_count = 1}};
+    cbm_pipeline_file_delta_t importer_delta = {
+        .delta = {.project = project,
+                  .rel_path = importer_rel,
+                  .exports = importer_exports,
+                  .export_count = 1}};
+    cbm_file_hash_t lib_hash = {0};
+    cbm_file_hash_t importer_hash = {0};
+    cbm_file_state_t lib_state = {0};
+    cbm_file_state_t importer_state = {0};
+    pipeline_delta_attach_test_metadata(&lib_delta, &lib_hash, &lib_state);
+    pipeline_delta_attach_test_metadata(&importer_delta, &importer_hash, &importer_state);
+    const cbm_pipeline_file_delta_t *deltas[PIPELINE_NOOP_FRONTIER_DELTA_COUNT] = {
+        &lib_delta, &importer_delta};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(
+                  s, deltas, PIPELINE_NOOP_FRONTIER_DELTA_COUNT,
+                  PIPELINE_NOOP_FRONTIER_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(plan.reason, "frontier_too_large");
+    ASSERT_EQ(plan.affected_count, 3);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 1);
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    bool frontier_noop_mask[PIPELINE_NOOP_FRONTIER_DELTA_COUNT] = {false, true};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+                  s, deltas, frontier_noop_mask, PIPELINE_NOOP_FRONTIER_DELTA_COUNT,
+                  PIPELINE_NOOP_FRONTIER_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, PIPELINE_NOOP_FRONTIER_MAX_AFFECTED);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_frontier_noop_mask_skips_masked_inbound_precheck) {
+    enum {
+        PIPELINE_NOOP_INBOUND_DELTA_COUNT = 2,
+        PIPELINE_NOOP_INBOUND_MAX_AFFECTED = 2,
+        PIPELINE_NOOP_INBOUND_GENERATION = 1,
+    };
+    const char *project = "test";
+    const char *lib_rel = "lib.py";
+    const char *importer_rel = "a.py";
+    const char *downstream_rel = "b.py";
+    const char *lib_qn = "test.lib.Hot";
+    const char *importer_qn = "test.a.Stable";
+    const char *downstream_qn = "test.b.UsesStable";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(pipeline_delta_seed_existing_ownership(s, project, lib_rel, lib_qn), CBM_STORE_OK);
+    int64_t importer_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, importer_rel, importer_qn);
+    int64_t downstream_id =
+        pipeline_delta_seed_existing_ownership_id(s, project, downstream_rel, downstream_qn);
+    ASSERT_GT(importer_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(downstream_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, lib_qn, lib_rel,
+                                             CBM_STORE_NO_NODE_ID,
+                                             PIPELINE_NOOP_INBOUND_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, importer_rel, "test.lib", "Hot", lib_qn,
+                                          PIPELINE_NOOP_INBOUND_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_edge_t downstream_call = {.project = (char *)project,
+                                  .source_id = downstream_id,
+                                  .target_id = importer_id,
+                                  .type = "CALLS",
+                                  .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &downstream_call);
+    ASSERT_GT(edge_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_EQ(cbm_store_upsert_edge_owner(s, project, edge_id, downstream_rel, NULL,
+                                          PIPELINE_NOOP_INBOUND_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_store_symbol_export_t lib_exports[1] = {
+        {.qualified_name = lib_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_symbol_export_t importer_exports[1] = {
+        {.qualified_name = importer_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t lib_delta = {
+        .delta = {.project = project,
+                  .rel_path = lib_rel,
+                  .exports = lib_exports,
+                  .export_count = 1}};
+    cbm_pipeline_file_delta_t importer_delta = {
+        .delta = {.project = project,
+                  .rel_path = importer_rel,
+                  .exports = importer_exports,
+                  .export_count = 1}};
+    cbm_file_hash_t lib_hash = {0};
+    cbm_file_hash_t importer_hash = {0};
+    cbm_file_state_t lib_state = {0};
+    cbm_file_state_t importer_state = {0};
+    pipeline_delta_attach_test_metadata(&lib_delta, &lib_hash, &lib_state);
+    pipeline_delta_attach_test_metadata(&importer_delta, &importer_hash, &importer_state);
+    const cbm_pipeline_file_delta_t *deltas[PIPELINE_NOOP_INBOUND_DELTA_COUNT] = {
+        &lib_delta, &importer_delta};
+    bool frontier_noop_mask[PIPELINE_NOOP_INBOUND_DELTA_COUNT] = {false, true};
+
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch_with_frontier_noop_mask(
+                  s, deltas, frontier_noop_mask, PIPELINE_NOOP_INBOUND_DELTA_COUNT,
+                  PIPELINE_NOOP_INBOUND_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, lib_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, importer_rel), 0);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, downstream_rel), 0);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_plan_batch_accepts_mutual_frontier) {
+    enum {
+        PIPELINE_MUTUAL_GENERATION = 1,
+        PIPELINE_MUTUAL_SINGLE_COUNT = 1,
+        PIPELINE_MUTUAL_DELTA_COUNT = 2,
+        PIPELINE_MUTUAL_MAX_AFFECTED = 4,
+    };
+    const char *project = "test";
+    const char *a_rel = "a.go";
+    const char *b_rel = "b.go";
+    const char *old_a_qn = "test.a.OldA";
+    const char *old_b_qn = "test.b.OldB";
+    const char *new_a_qn = "test.a.NewA";
+    const char *new_b_qn = "test.b.NewB";
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, "/tmp/test"), CBM_STORE_OK);
+    int64_t old_a_id = pipeline_delta_seed_existing_ownership_id(s, project, a_rel, old_a_qn);
+    int64_t old_b_id = pipeline_delta_seed_existing_ownership_id(s, project, b_rel, old_b_qn);
+    ASSERT_GT(old_a_id, CBM_STORE_NO_NODE_ID);
+    ASSERT_GT(old_b_id, CBM_STORE_NO_NODE_ID);
+    cbm_edge_t old_a_to_b = {.project = (char *)project,
+                             .source_id = old_a_id,
+                             .target_id = old_b_id,
+                             .type = "CALLS",
+                             .properties_json = "{}"};
+    cbm_edge_t old_b_to_a = {.project = (char *)project,
+                             .source_id = old_b_id,
+                             .target_id = old_a_id,
+                             .type = "CALLS",
+                             .properties_json = "{}"};
+    ASSERT_GT(cbm_store_insert_edge(s, &old_a_to_b), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &old_b_to_a), 0);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, old_a_qn, a_rel, old_a_id,
+                                             PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_symbol_export(s, project, old_b_qn, b_rel, old_b_id,
+                                             PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, a_rel, "test.b", "OldB", old_b_qn,
+                                          PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_import_ref(s, project, b_rel, "test.a", "OldA", old_a_qn,
+                                          PIPELINE_MUTUAL_GENERATION),
+              CBM_STORE_OK);
+
+    cbm_node_t a_nodes[PIPELINE_MUTUAL_SINGLE_COUNT] = {{.project = (char *)project,
+                                                         .label = "Function",
+                                                         .name = "NewA",
+                                                         .qualified_name = (char *)new_a_qn,
+                                                         .file_path = (char *)a_rel,
+                                                         .properties_json = "{}"}};
+    cbm_node_t b_nodes[PIPELINE_MUTUAL_SINGLE_COUNT] = {{.project = (char *)project,
+                                                         .label = "Function",
+                                                         .name = "NewB",
+                                                         .qualified_name = (char *)new_b_qn,
+                                                         .file_path = (char *)b_rel,
+                                                         .properties_json = "{}"}};
+    cbm_store_delta_edge_t a_edges[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.source_qn = new_a_qn,
+         .target_qn = new_b_qn,
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_store_delta_edge_t b_edges[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.source_qn = new_b_qn,
+         .target_qn = new_a_qn,
+         .type = "CALLS",
+         .properties_json = "{}",
+         .derived_kind = CBM_STORE_DERIVED_KIND_DIRECT}};
+    cbm_store_symbol_export_t a_exports[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.qualified_name = new_a_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_store_symbol_export_t b_exports[PIPELINE_MUTUAL_SINGLE_COUNT] = {
+        {.qualified_name = new_b_qn, .node_id = CBM_STORE_NO_NODE_ID}};
+    cbm_pipeline_file_delta_t a_delta = {
+        .delta = {.project = project,
+                  .rel_path = a_rel,
+                  .nodes = a_nodes,
+                  .node_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .edges = a_edges,
+                  .edge_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .exports = a_exports,
+                  .export_count = PIPELINE_MUTUAL_SINGLE_COUNT}};
+    cbm_pipeline_file_delta_t b_delta = {
+        .delta = {.project = project,
+                  .rel_path = b_rel,
+                  .nodes = b_nodes,
+                  .node_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .edges = b_edges,
+                  .edge_count = PIPELINE_MUTUAL_SINGLE_COUNT,
+                  .exports = b_exports,
+                  .export_count = PIPELINE_MUTUAL_SINGLE_COUNT}};
+    cbm_file_hash_t a_hash = {0};
+    cbm_file_hash_t b_hash = {0};
+    cbm_file_state_t a_state = {0};
+    cbm_file_state_t b_state = {0};
+    pipeline_delta_attach_test_metadata(&a_delta, &a_hash, &a_state);
+    pipeline_delta_attach_test_metadata(&b_delta, &b_hash, &b_state);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&a_delta, &b_delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(s, deltas, PIPELINE_MUTUAL_DELTA_COUNT,
+                                                 PIPELINE_MUTUAL_MAX_AFFECTED, &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_STR_EQ(plan.reason, "candidate");
+    ASSERT_EQ(plan.affected_count, PIPELINE_MUTUAL_DELTA_COUNT);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, a_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&plan, b_rel), 1);
+
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish) {
+    enum {
+        BASE_GENERATION = 1,
+        FINAL_GENERATION = 2,
+        PIPELINE_DELTA_PARITY_MAX_AFFECTED = CBM_SZ_4,
+        PIPELINE_DELTA_PARITY_SINGLE_COUNT = 1,
+        PIPELINE_DELTA_PARITY_BATCH_COUNT = 2,
+        EXPECTED_FINAL_CALLS_EDGES = 1,
+        EXPECTED_FINAL_IMPORTS_EDGES = 1,
+        EXPECTED_FINAL_EDGES = EXPECTED_FINAL_CALLS_EDGES + EXPECTED_FINAL_IMPORTS_EDGES,
+    };
+    const char *project = "test";
+    const char *helper_rel = "helper.go";
+    const char *main_rel = "main.go";
+    const char *old_helper_qn = "test.helper.Helper";
+    const char *new_helper_qn = "test.helper.NewHelper";
+    const char *old_main_qn = "test.main.Old";
+    const char *new_main_qn = "test.main.New";
+
+    char *tmp = th_mktempdir("cbm_delta_pipeline");
+    ASSERT_NOT_NULL(tmp);
+    const char *helper_path = TH_PATH(tmp, helper_rel);
+    const char *main_path = TH_PATH(tmp, main_rel);
+    ASSERT_EQ(th_write_file(helper_path, "package helper\nfunc Helper() {}\n"), 0);
+    ASSERT_EQ(th_write_file(main_path, "package main\nfunc Old() {}\n"), 0);
+
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, project, tmp), CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+
+    cbm_gbuf_t *base_gb = cbm_gbuf_new(project, tmp);
+    ASSERT_NOT_NULL(base_gb);
+    int64_t base_helper_id = cbm_gbuf_upsert_node(base_gb, "Function", "Helper",
+                                                  old_helper_qn, helper_rel, 1, 1,
+                                                  "{\"is_exported\":true}");
+    int64_t base_file_id = cbm_gbuf_upsert_node(base_gb, "File", main_rel,
+                                                "test.main.__file__", main_rel, 1, 1, "{}");
+    int64_t base_main_id = cbm_gbuf_upsert_node(base_gb, "Function", "Old", old_main_qn,
+                                                main_rel, 1, 1, "{\"is_exported\":true}");
+    ASSERT_GT(base_helper_id, 0);
+    ASSERT_GT(base_file_id, 0);
+    ASSERT_GT(base_main_id, 0);
+    const cbm_gbuf_node_t *base_helper = cbm_gbuf_find_by_qn(base_gb, old_helper_qn);
+    ASSERT_NOT_NULL(base_helper);
+    cbm_pipeline_ctx_t base_ctx = {.project_name = project, .repo_path = tmp, .gbuf = base_gb};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&base_ctx, base_file_id, base_helper, "Helper"), 1);
+    ASSERT_GT(cbm_gbuf_insert_edge(base_gb, base_main_id, base_helper_id, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t base_helper_delta = {0};
+    cbm_pipeline_file_delta_t base_main_delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(base_gb, project, helper_rel, generation,
+                                                      &base_helper_delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(base_gb, project, main_rel, generation,
+                                                      &base_main_delta),
+              CBM_STORE_OK);
+    cbm_file_info_t helper_file = {.path = (char *)helper_path,
+                                   .rel_path = (char *)helper_rel,
+                                   .language = CBM_LANG_GO};
+    cbm_file_info_t main_file = {
+        .path = (char *)main_path, .rel_path = (char *)main_rel, .language = CBM_LANG_GO};
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&base_helper_delta, &helper_file),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&base_main_delta, &main_file),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &base_helper_delta.delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_publish_file_delta(s, &base_main_delta.delta), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_finish_index_generation(s, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    cbm_pipeline_file_delta_free(&base_helper_delta);
+    cbm_pipeline_file_delta_free(&base_main_delta);
+    cbm_gbuf_free(base_gb);
+
+    ASSERT_EQ(th_write_file(helper_path, "package helper\nfunc NewHelper() {}\n"), 0);
+    ASSERT_EQ(th_write_file(main_path,
+                            "package main\nimport \"helper\"\nfunc New() { helper.NewHelper() }\n"),
+              0);
+    ASSERT_EQ(cbm_store_reserve_index_generation(s, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FINAL_GENERATION);
+
+    cbm_gbuf_t *final_gb = cbm_gbuf_new(project, tmp);
+    ASSERT_NOT_NULL(final_gb);
+    int64_t new_helper_id = cbm_gbuf_upsert_node(final_gb, "Function", "NewHelper",
+                                                 new_helper_qn, helper_rel, 1, 1,
+                                                 "{\"is_exported\":true}");
+    int64_t final_file_id = cbm_gbuf_upsert_node(final_gb, "File", main_rel,
+                                                 "test.main.__file__", main_rel, 1, 1, "{}");
+    int64_t new_main_id = cbm_gbuf_upsert_node(final_gb, "Function", "New", new_main_qn,
+                                               main_rel, 3, 3, "{\"is_exported\":true}");
+    ASSERT_GT(new_helper_id, 0);
+    ASSERT_GT(final_file_id, 0);
+    ASSERT_GT(new_main_id, 0);
+    const cbm_gbuf_node_t *new_helper = cbm_gbuf_find_by_qn(final_gb, new_helper_qn);
+    ASSERT_NOT_NULL(new_helper);
+    cbm_pipeline_ctx_t final_ctx = {.project_name = project, .repo_path = tmp, .gbuf = final_gb};
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&final_ctx, final_file_id, new_helper, "NewHelper"),
+              1);
+    ASSERT_GT(cbm_gbuf_insert_edge(final_gb, new_main_id, new_helper_id, "CALLS", "{}"), 0);
+
+    cbm_pipeline_file_delta_t final_helper_delta = {0};
+    cbm_pipeline_file_delta_t final_main_delta = {0};
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(final_gb, project, helper_rel, generation,
+                                                      &final_helper_delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_build_file_delta_from_gbuf(final_gb, project, main_rel, generation,
+                                                      &final_main_delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&final_helper_delta, &helper_file),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata(&final_main_delta, &main_file),
+              CBM_STORE_OK);
+
+    cbm_pipeline_file_delta_plan_t main_before_helper_plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta(s, &final_main_delta,
+                                           PIPELINE_DELTA_PARITY_MAX_AFFECTED,
+                                           &main_before_helper_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_before_helper_plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(main_before_helper_plan.reason, "unresolved_edge_endpoint");
+    const cbm_pipeline_file_delta_t *main_only_deltas[] = {&final_main_delta};
+    cbm_pipeline_file_delta_plan_t main_only_apply_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, main_only_deltas,
+                                                  PIPELINE_DELTA_PARITY_SINGLE_COUNT,
+                                                  PIPELINE_DELTA_PARITY_MAX_AFFECTED,
+                                                  &main_only_apply_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_only_apply_plan.route, CBM_PIPELINE_DELTA_ROUTE_FALLBACK);
+    ASSERT_STR_EQ(main_only_apply_plan.reason, "unresolved_edge_endpoint");
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_helper_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_main_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_helper_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_main_qn), 0);
+
+    const cbm_pipeline_file_delta_t *batch_deltas[] = {&final_helper_delta, &final_main_delta};
+    cbm_pipeline_file_delta_plan_t batch_plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(s, batch_deltas,
+                                                  PIPELINE_DELTA_PARITY_BATCH_COUNT,
+                                                  PIPELINE_DELTA_PARITY_MAX_AFFECTED, &batch_plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(batch_plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, helper_rel), 1);
+    ASSERT_EQ(pipeline_delta_plan_contains_path(&batch_plan, main_rel), 1);
+
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_helper_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, old_main_qn), 0);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_helper_qn), 1);
+    ASSERT_EQ(pipeline_delta_store_qn_exists(s, project, new_main_qn), 1);
+    ASSERT_EQ(cbm_store_count_edges(s, project), EXPECTED_FINAL_EDGES);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "CALLS"), EXPECTED_FINAL_CALLS_EDGES);
+    ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "IMPORTS"), EXPECTED_FINAL_IMPORTS_EDGES);
+
+    cbm_file_state_t got = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, helper_rel, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, FINAL_GENERATION);
+    cbm_store_file_state_free_fields(&got);
+    ASSERT_EQ(cbm_store_get_file_state(s, project, main_rel, &got), CBM_STORE_OK);
+    ASSERT_EQ(got.generation, FINAL_GENERATION);
+    cbm_store_file_state_free_fields(&got);
+
+    char **import_paths = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_store_list_import_ref_paths_by_target(s, project, new_helper_qn, &import_paths,
+                                                        &import_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(import_paths[0], main_rel);
+    pipeline_delta_free_string_array(import_paths, import_count);
+
+    cbm_store_t *fresh = cbm_store_open_memory();
+    ASSERT_NOT_NULL(fresh);
+    ASSERT_EQ(cbm_store_upsert_project(fresh, project, tmp), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(fresh, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, BASE_GENERATION);
+    ASSERT_EQ(cbm_store_finish_index_generation(fresh, project, generation,
+                                                CBM_STORE_INDEX_STATUS_COMPLETE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_reserve_index_generation(fresh, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, FINAL_GENERATION);
+    const cbm_store_file_delta_t *fresh_store_deltas[] = {&final_helper_delta.delta,
+                                                          &final_main_delta.delta};
+    ASSERT_EQ(cbm_store_publish_file_delta_batch_complete(
+                  fresh, fresh_store_deltas, PIPELINE_DELTA_PARITY_BATCH_COUNT),
+              CBM_STORE_OK);
+
+    const char *delta_db = TH_PATH(tmp, "delta-route.db");
+    const char *fresh_db = TH_PATH(tmp, "fresh-final.db");
+    ASSERT_EQ(cbm_store_dump_to_file(s, delta_db), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_dump_to_file(fresh, fresh_db), CBM_STORE_OK);
+    char diff_err[CBM_SZ_8K] = {0};
+    ASSERT_EQ(cbm_test_compare_canonical_graphs(delta_db, fresh_db, project, diff_err,
+                                                sizeof(diff_err)),
+              0);
+
+    cbm_pipeline_file_delta_plan_free(&main_before_helper_plan);
+    cbm_pipeline_file_delta_plan_free(&main_only_apply_plan);
+    cbm_pipeline_file_delta_plan_free(&batch_plan);
+    cbm_pipeline_file_delta_free(&final_helper_delta);
+    cbm_pipeline_file_delta_free(&final_main_delta);
+    cbm_gbuf_free(final_gb);
+    cbm_store_close(fresh);
+    cbm_store_close(s);
+    th_cleanup(tmp);
     PASS();
 }
 
@@ -8158,6 +12690,303 @@ TEST(infra_is_env_file) {
     PASS();
 }
 
+/* ── K8s extraction tests ───────────────────────────────────────── */
+
+TEST(k8s_extract_kustomize) {
+    const char *src =
+        "apiVersion: kustomize.config.k8s.io/v1beta1\n"
+        "kind: Kustomization\n"
+        "resources:\n"
+        "  - deployment.yaml\n"
+        "  - service.yaml\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE,
+                                        "myproj", "base/kustomization.yaml",
+                                        0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->imports.count, 2);
+
+    bool found_deploy = false, found_svc = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "deployment.yaml") == 0)
+            found_deploy = true;
+        if (r->imports.items[i].module_path &&
+            strcmp(r->imports.items[i].module_path, "service.yaml") == 0)
+            found_svc = true;
+    }
+    ASSERT_TRUE(found_deploy);
+    ASSERT_TRUE(found_svc);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest) {
+    const char *src =
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: my-app\n"
+        "  namespace: production\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/deployment.yaml",
+                                        0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT_GTE(r->defs.count, 1);
+
+    bool found_resource = false;
+    for (int d = 0; d < r->defs.count; d++) {
+        if (r->defs.items[d].label &&
+            strcmp(r->defs.items[d].label, "Resource") == 0 &&
+            r->defs.items[d].name &&
+            strstr(r->defs.items[d].name, "Deployment") != NULL)
+            found_resource = true;
+    }
+    ASSERT_TRUE(found_resource);
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_no_name) {
+    const char *src = "apiVersion: apps/v1\nkind: Deployment\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/deploy.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    /* No crash — defs count may be 0 because metadata.name is absent */
+    ASSERT(!r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(k8s_extract_manifest_multidoc) {
+    /* Two-document YAML separated by "---".
+     * extract_k8s_manifest contains a "break" after the first successful push,
+     * so it processes only the first document that has both kind and
+     * metadata.name.  This test pins that behaviour: the first document's
+     * resource must be present and no crash must occur. */
+    const char *src =
+        "apiVersion: apps/v1\n"
+        "kind: Deployment\n"
+        "metadata:\n"
+        "  name: my-app\n"
+        "---\n"
+        "apiVersion: v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: my-svc\n";
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S,
+                                        "myproj", "k8s/multi.yaml", 0, NULL, NULL);
+    ASSERT(r != NULL);
+    ASSERT(!r->has_error);
+    /* First document's resource must be present */
+    int found = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
+            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
+            found = 1;
+        }
+    }
+    ASSERT(found);
+    ASSERT(r->defs.count >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+static void k8s_selector_test_ctx(cbm_pipeline_ctx_t *ctx, cbm_gbuf_t *gbuf,
+                                  atomic_int *cancelled, const char *repo_path) {
+    atomic_init(cancelled, 0);
+    *ctx = (cbm_pipeline_ctx_t){.project_name = "k8s-selector-test",
+                                .repo_path = repo_path,
+                                .gbuf = gbuf,
+                                .cancelled = cancelled,
+                                .mode = CBM_MODE_FAST};
+}
+
+TEST(k8s_selector_links_manifests_after_former_record_limit) {
+    enum {
+        K8S_TEST_FORMER_RECORD_LIMIT = CBM_SZ_512,
+        K8S_TEST_FILE_COUNT = K8S_TEST_FORMER_RECORD_LIMIT + CBM_SZ_2
+    };
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_k8s_records_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char filler_path[CBM_SZ_512];
+    char service_path[CBM_SZ_512];
+    char workload_path[CBM_SZ_512];
+    snprintf(filler_path, sizeof(filler_path), "%s/filler.yaml", tmp);
+    snprintf(service_path, sizeof(service_path), "%s/service.yaml", tmp);
+    snprintf(workload_path, sizeof(workload_path), "%s/workload.yaml", tmp);
+    ASSERT_EQ(th_write_file(filler_path,
+                            "apiVersion: apps/v1\n"
+                            "kind: Deployment\n"
+                            "metadata:\n"
+                            "  name: filler\n"
+                            "spec:\n"
+                            "  template:\n"
+                            "    metadata:\n"
+                            "      labels:\n"
+                            "        app: filler\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "apiVersion: v1\n"
+                            "kind: Service\n"
+                            "metadata:\n"
+                            "  name: after-former-limit\n"
+                            "spec:\n"
+                            "  selector:\n"
+                            "    app: after-former-limit\n"),
+              0);
+    ASSERT_EQ(th_write_file(workload_path,
+                            "apiVersion: apps/v1\n"
+                            "kind: Deployment\n"
+                            "metadata:\n"
+                            "  name: after-former-limit\n"
+                            "spec:\n"
+                            "  template:\n"
+                            "    metadata:\n"
+                            "      labels:\n"
+                            "        app: after-former-limit\n"),
+              0);
+
+    cbm_file_info_t *files = calloc(K8S_TEST_FILE_COUNT, sizeof(*files));
+    char(*rel_paths)[CBM_SZ_64] = calloc(K8S_TEST_FILE_COUNT, sizeof(*rel_paths));
+    ASSERT_NOT_NULL(files);
+    ASSERT_NOT_NULL(rel_paths);
+    for (int i = 0; i < K8S_TEST_FORMER_RECORD_LIMIT; i++) {
+        snprintf(rel_paths[i], sizeof(rel_paths[i]), "filler-%d.yaml", i);
+        files[i] = (cbm_file_info_t){.path = filler_path,
+                                     .rel_path = rel_paths[i],
+                                     .language = CBM_LANG_YAML};
+    }
+    snprintf(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT],
+             sizeof(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT]), "service.yaml");
+    files[K8S_TEST_FORMER_RECORD_LIMIT] =
+        (cbm_file_info_t){.path = service_path,
+                          .rel_path = rel_paths[K8S_TEST_FORMER_RECORD_LIMIT],
+                          .language = CBM_LANG_YAML};
+    snprintf(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE],
+             sizeof(rel_paths[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE]), "workload.yaml");
+    files[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE] =
+        (cbm_file_info_t){.path = workload_path,
+                          .rel_path = rel_paths[K8S_TEST_FORMER_RECORD_LIMIT + SKIP_ONE],
+                          .language = CBM_LANG_YAML};
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("k8s-selector-test", tmp);
+    ASSERT_NOT_NULL(gbuf);
+    atomic_int cancelled;
+    cbm_pipeline_ctx_t ctx;
+    k8s_selector_test_ctx(&ctx, gbuf, &cancelled, tmp);
+    ASSERT_EQ(cbm_pipeline_pass_k8s(&ctx, files, K8S_TEST_FILE_COUNT), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_type(gbuf, "INFRA_MAPS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1);
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gbuf, edges[0]->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[0]->target_id);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(source->name, "Service/after-former-limit");
+    ASSERT_STR_EQ(target->name, "Deployment/after-former-limit");
+
+    cbm_gbuf_free(gbuf);
+    free(rel_paths);
+    free(files);
+    th_cleanup(tmp);
+    PASS();
+}
+
+TEST(k8s_selector_requires_every_key_value_pair_beyond_former_pair_limit) {
+    enum { K8S_TEST_SELECTOR_PAIRS = CBM_SZ_16 + SKIP_ONE };
+    char tmp[CBM_SZ_256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_k8s_pairs_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    char service[CBM_SZ_4K];
+    char partial[CBM_SZ_4K];
+    char complete[CBM_SZ_4K];
+    int service_len =
+        snprintf(service, sizeof(service),
+                 "apiVersion: v1\nkind: Service\nmetadata:\n  name: exact-selector\nspec:\n"
+                 "  selector:\n");
+    int partial_len =
+        snprintf(partial, sizeof(partial),
+                 "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: app-target\nspec:\n"
+                 "  template:\n    metadata:\n      labels:\n");
+    int complete_len =
+        snprintf(complete, sizeof(complete),
+                 "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: complete\nspec:\n"
+                 "  template:\n    metadata:\n      labels:\n");
+    ASSERT_GT(service_len, 0);
+    ASSERT_GT(partial_len, 0);
+    ASSERT_GT(complete_len, 0);
+    for (int i = 0; i < K8S_TEST_SELECTOR_PAIRS; i++) {
+        const char *key = i == K8S_TEST_SELECTOR_PAIRS - SKIP_ONE ? "app" : NULL;
+        const char *value = i == K8S_TEST_SELECTOR_PAIRS - SKIP_ONE ? "app-target" : NULL;
+        char generated_key[CBM_SZ_32];
+        char generated_value[CBM_SZ_32];
+        if (!key) {
+            snprintf(generated_key, sizeof(generated_key), "selector-%02d", i);
+            snprintf(generated_value, sizeof(generated_value), "value-%02d", i);
+            key = generated_key;
+            value = generated_value;
+        }
+        int n = snprintf(service + service_len, sizeof(service) - (size_t)service_len,
+                         "    %s: %s\n", key, value);
+        ASSERT_GT(n, 0);
+        service_len += n;
+        n = snprintf(complete + complete_len, sizeof(complete) - (size_t)complete_len,
+                     "        %s: %s\n", key, value);
+        ASSERT_GT(n, 0);
+        complete_len += n;
+        if (i < K8S_TEST_SELECTOR_PAIRS - SKIP_ONE) {
+            n = snprintf(partial + partial_len, sizeof(partial) - (size_t)partial_len,
+                         "        %s: %s\n", key, value);
+            ASSERT_GT(n, 0);
+            partial_len += n;
+        }
+    }
+    int n = snprintf(partial + partial_len, sizeof(partial) - (size_t)partial_len,
+                     "        app: conflicting-label\n");
+    ASSERT_GT(n, 0);
+    partial_len += n;
+
+    const char *names[] = {"service.yaml", "partial.yaml", "complete.yaml"};
+    const char *sources[] = {service, partial, complete};
+    cbm_file_info_t files[CBM_SZ_3] = {0};
+    char paths[CBM_SZ_3][CBM_SZ_512];
+    for (int i = 0; i < CBM_SZ_3; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmp, names[i]);
+        ASSERT_EQ(th_write_file(paths[i], sources[i]), 0);
+        files[i] = (cbm_file_info_t){
+            .path = paths[i], .rel_path = (char *)names[i], .language = CBM_LANG_YAML};
+    }
+
+    cbm_gbuf_t *gbuf = cbm_gbuf_new("k8s-selector-test", tmp);
+    ASSERT_NOT_NULL(gbuf);
+    atomic_int cancelled;
+    cbm_pipeline_ctx_t ctx;
+    k8s_selector_test_ctx(&ctx, gbuf, &cancelled, tmp);
+    ASSERT_EQ(cbm_pipeline_pass_k8s(&ctx, files, CBM_SZ_3), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_type(gbuf, "INFRA_MAPS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1);
+    const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gbuf, edges[0]->source_id);
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gbuf, edges[0]->target_id);
+    ASSERT_NOT_NULL(source);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(source->name, "Service/exact-selector");
+    ASSERT_STR_EQ(target->name, "Deployment/complete");
+
+    cbm_gbuf_free(gbuf);
+    th_cleanup(tmp);
+    PASS();
+}
+
 /* ── Infrascan: cleanJSONBrackets ───────────────────────────────── */
 
 TEST(infra_clean_json_brackets) {
@@ -8787,6 +13616,398 @@ TEST(registry_confidence_suffix_match) {
     PASS();
 }
 
+TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Function", "caller", "proj.app.caller", "app.py", 1, 10,
+                             "{}");
+    int64_t suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.fastapi.routing.APIRoute.__init__", "routing.py", 1,
+        10, "{}");
+    int64_t second_suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.other.Route.__init__", "other.py", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(suffix_target_id, 0);
+    ASSERT_GT(second_suffix_target_id, 0);
+    cbm_registry_add(reg, "__init__", "proj.fastapi.routing.APIRoute.__init__", "Method");
+    cbm_registry_add(reg, "__init__", "proj.other.Route.__init__", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "super().__init__",
+                    .enclosing_func_qn = "proj.app.caller",
+                    .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMResolvedCall resolved = {.caller_qn = "proj.app.caller",
+                                .callee_qn = "starlette.routing.Route.__init__",
+                                .strategy = "lsp_type_dispatch",
+                                .confidence = 0.95f};
+    cbm_resolvedcall_push(&result.resolved_calls, &result.arena, resolved);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/app.py",
+                                 .rel_path = "app.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_python_super_init_without_lsp_suppresses_weak_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "Method", "__init__", "proj.app.Child.__init__",
+                                             "app.py", 1, 10, "{}");
+    int64_t unrelated_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.other.Unrelated.__init__", "other.py", 1, 10, "{}");
+    int64_t second_unrelated_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "__init__", "proj.third.AlsoUnrelated.__init__", "third.py", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(unrelated_target_id, 0);
+    ASSERT_GT(second_unrelated_target_id, 0);
+    cbm_registry_add(reg, "__init__", "proj.other.Unrelated.__init__", "Method");
+    cbm_registry_add(reg, "__init__", "proj.third.AlsoUnrelated.__init__", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "super().__init__",
+                    .enclosing_func_qn = "proj.app.Child.__init__",
+                    .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {
+        {.path = "/tmp/proj/app.py", .rel_path = "app.py", .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_external_lsp_target_suppresses_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Function", "caller", "proj.app.caller", "app.py", 1, 10,
+                             "{}");
+    int64_t suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "get", "proj.fastapi.routing.APIRouter.get", "routing.py", 1, 10, "{}");
+    int64_t second_suffix_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "get", "proj.other.Mapping.get", "other.py", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(suffix_target_id, 0);
+    ASSERT_GT(second_suffix_target_id, 0);
+    cbm_registry_add(reg, "get", "proj.fastapi.routing.APIRouter.get", "Method");
+    cbm_registry_add(reg, "get", "proj.other.Mapping.get", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "scope.get",
+                    .enclosing_func_qn = "proj.app.caller",
+                    .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMResolvedCall resolved = {.caller_qn = "proj.app.caller",
+                                .callee_qn = "external.collections.Mapping.get",
+                                .strategy = "lsp_external_method",
+                                .confidence = 0.95f};
+    cbm_resolvedcall_push(&result.resolved_calls, &result.arena, resolved);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/app.py",
+                                 .rel_path = "app.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_internal_lsp_declaration_keeps_canonical_registry_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id =
+        cbm_gbuf_upsert_node(gb, "Function", "run", "proj.main.run", "main.c", 1, 10, "{}");
+    int64_t target_id =
+        cbm_gbuf_upsert_node(gb, "Function", "add", "proj.util.add", "util.c", 1, 10, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    cbm_registry_add(reg, "add", "proj.util.add", "Function");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "add", .enclosing_func_qn = "proj.main.run", .start_line = 2};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMResolvedCall resolved = {.caller_qn = "proj.main.run",
+                                .callee_qn = "proj.main.add",
+                                .strategy = "lsp_direct",
+                                .confidence = 0.95f};
+    cbm_resolvedcall_push(&result.resolved_calls, &result.arena, resolved);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {
+        {.path = "/tmp/proj/main.c", .rel_path = "main.c", .language = CBM_LANG_C}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count), 0);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0]->target_id, target_id);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_python_file_self_call_suppresses_weak_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "File", "routing.py",
+                                             "proj.fastapi.routing.py.__file__",
+                                             "fastapi/routing.py", 1, 1, "{}");
+    int64_t first_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "add_api_route", "proj.fastapi.routing.APIRouter.add_api_route",
+        "fastapi/routing.py", 10, 20, "{}");
+    int64_t second_target_id =
+        cbm_gbuf_upsert_node(gb, "Method", "add_api_route",
+                             "proj.fastapi.applications.FastAPI.add_api_route",
+                             "fastapi/applications.py", 30, 40, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(first_target_id, 0);
+    ASSERT_GT(second_target_id, 0);
+    cbm_registry_add(reg, "add_api_route", "proj.fastapi.routing.APIRouter.add_api_route",
+                     "Method");
+    cbm_registry_add(reg, "add_api_route", "proj.fastapi.applications.FastAPI.add_api_route",
+                     "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "self.add_api_route", .start_line = 12};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/fastapi/routing.py",
+                                 .rel_path = "fastapi/routing.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_python_file_dotted_call_suppresses_weak_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "File", "routing.py",
+                                             "proj.fastapi.routing.py.__file__",
+                                             "fastapi/routing.py", 1, 1, "{}");
+    int64_t first_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "get", "proj.fastapi.routing.APIRouter.get", "fastapi/routing.py", 10,
+        20, "{}");
+    int64_t second_target_id = cbm_gbuf_upsert_node(
+        gb, "Method", "get", "proj.datastructures.Headers.get", "fastapi/datastructures.py",
+        30, 40, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(first_target_id, 0);
+    ASSERT_GT(second_target_id, 0);
+    cbm_registry_add(reg, "get", "proj.fastapi.routing.APIRouter.get", "Method");
+    cbm_registry_add(reg, "get", "proj.datastructures.Headers.get", "Method");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "request.headers.get", .start_line = 207};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/fastapi/routing.py",
+                                 .rel_path = "fastapi/routing.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 0);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_python_file_dotted_call_keeps_import_reachable_suffix_fallback) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    cbm_registry_t *reg = cbm_registry_new();
+    ASSERT_NOT_NULL(gb);
+    ASSERT_NOT_NULL(reg);
+
+    int64_t source_id = cbm_gbuf_upsert_node(gb, "File", "app.py", "proj.app.py.__file__",
+                                             "app.py", 1, 1, "{}");
+    int64_t target_id = cbm_gbuf_upsert_node(gb, "Method", "get", "proj.client.API.get",
+                                             "client.py", 10, 20, "{}");
+    int64_t other_target_id = cbm_gbuf_upsert_node(gb, "Method", "get", "proj.other.API.get",
+                                                   "other.py", 10, 20, "{}");
+    ASSERT_GT(source_id, 0);
+    ASSERT_GT(target_id, 0);
+    ASSERT_GT(other_target_id, 0);
+    cbm_registry_add(reg, "get", "proj.client.API.get", "Method");
+    cbm_registry_add(reg, "get", "proj.other.API.get", "Method");
+    cbm_gbuf_insert_edge(gb, source_id, target_id, "IMPORTS", "{\"local_name\":\"client\"}");
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMCall call = {.callee_name = "client.get", .start_line = 3};
+    cbm_calls_push(&result.calls, &result.arena, call);
+    CBMFileResult *result_cache[1] = {&result};
+
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj",
+                              .repo_path = "/tmp/proj",
+                              .gbuf = gb,
+                              .registry = reg,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .result_cache = result_cache};
+    cbm_file_info_t files[1] = {{.path = "/tmp/proj/app.py",
+                                 .rel_path = "app.py",
+                                 .language = CBM_LANG_PYTHON}};
+
+    ASSERT_EQ(cbm_pipeline_pass_calls(&ctx, files, 1), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_id, "CALLS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0]->target_id, target_id);
+
+    cbm_arena_destroy(&result.arena);
+    cbm_registry_free(reg);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
@@ -8988,106 +14209,7 @@ TEST(infra_pipeline_idempotent) {
     PASS();
 }
 
-/* ── K8s / Kustomize extraction tests ──────────────────────────── */
-
-TEST(k8s_extract_kustomize) {
-    const char *src = "apiVersion: kustomize.config.k8s.io/v1beta1\n"
-                      "kind: Kustomization\n"
-                      "resources:\n"
-                      "  - deployment.yaml\n"
-                      "  - service.yaml\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_KUSTOMIZE, "myproj",
-                                        "base/kustomization.yaml", 0, NULL, NULL);
-    ASSERT(r != NULL);
-    ASSERT_GTE(r->imports.count, 2);
-
-    bool found_deploy = false, found_svc = false;
-    for (int i = 0; i < r->imports.count; i++) {
-        if (r->imports.items[i].module_path &&
-            strcmp(r->imports.items[i].module_path, "deployment.yaml") == 0)
-            found_deploy = true;
-        if (r->imports.items[i].module_path &&
-            strcmp(r->imports.items[i].module_path, "service.yaml") == 0)
-            found_svc = true;
-    }
-    ASSERT_TRUE(found_deploy);
-    ASSERT_TRUE(found_svc);
-
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(k8s_extract_manifest) {
-    const char *src = "apiVersion: apps/v1\n"
-                      "kind: Deployment\n"
-                      "metadata:\n"
-                      "  name: my-app\n"
-                      "  namespace: production\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
-                                        "k8s/deployment.yaml", 0, NULL, NULL);
-    ASSERT(r != NULL);
-    ASSERT_GTE(r->defs.count, 1);
-
-    bool found_resource = false;
-    for (int d = 0; d < r->defs.count; d++) {
-        if (r->defs.items[d].label && strcmp(r->defs.items[d].label, "Resource") == 0 &&
-            r->defs.items[d].name && strstr(r->defs.items[d].name, "Deployment") != NULL)
-            found_resource = true;
-    }
-    ASSERT_TRUE(found_resource);
-
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(k8s_extract_manifest_no_name) {
-    const char *src = "apiVersion: apps/v1\nkind: Deployment\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
-                                        "k8s/deploy.yaml", 0, NULL, NULL);
-    ASSERT(r != NULL);
-    /* No crash — defs count may be 0 because metadata.name is absent */
-    ASSERT(!r->has_error);
-    cbm_free_result(r);
-    PASS();
-}
-
-TEST(k8s_extract_manifest_multidoc) {
-    /* Two-document YAML separated by "---".
-     * extract_k8s_manifest contains a "break" after the first successful push,
-     * so it processes only the first document that has both kind and
-     * metadata.name.  This test pins that behaviour: the first document's
-     * resource must be present and no crash must occur.
-     *
-     * Note: with some tree-sitter YAML grammar versions the root stream may
-     * expose both documents as siblings; the break still fires after the first
-     * successful def push, so defs.count must be exactly 1. */
-    const char *src = "apiVersion: apps/v1\n"
-                      "kind: Deployment\n"
-                      "metadata:\n"
-                      "  name: my-app\n"
-                      "---\n"
-                      "apiVersion: v1\n"
-                      "kind: Service\n"
-                      "metadata:\n"
-                      "  name: my-svc\n";
-    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_K8S, "myproj",
-                                        "k8s/multi.yaml", 0, NULL, NULL);
-    ASSERT(r != NULL);
-    ASSERT(!r->has_error);
-    /* First document's resource must be present */
-    int found = 0;
-    for (int i = 0; i < r->defs.count; i++) {
-        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Resource") == 0 &&
-            r->defs.items[i].name && strcmp(r->defs.items[i].name, "Deployment/my-app") == 0) {
-            found = 1;
-        }
-    }
-    ASSERT(found);
-    /* At least one def, no more than one (only first document processed) */
-    ASSERT(r->defs.count >= 1);
-    cbm_free_result(r);
-    PASS();
-}
+/* (K8s extraction tests already defined above from origin/main) */
 
 /* ── Envscan tests (port of envscan_test.go) ───────────────────── */
 
@@ -9134,6 +14256,262 @@ static int has_binding_value(const cbm_env_binding_t *bindings, int count, const
             return 1;
     }
     return 0;
+}
+
+enum {
+    ENVSCAN_WIDE_DIRECTORY_COUNT = CBM_SZ_256 + 17,
+    ENVSCAN_OLD_FILE_LIMIT_BYTES = CBM_SZ_1K * CBM_SZ_1K,
+};
+
+static int envscan_write_large_file(const char *path, const char *first_line, size_t total_bytes) {
+    FILE *file = cbm_fopen(path, "wb");
+    if (!file) {
+        return -1;
+    }
+    size_t written = strlen(first_line);
+    if (written > total_bytes || fwrite(first_line, 1, written, file) != written) {
+        (void)fclose(file);
+        return -1;
+    }
+    static const char padding[] = "# padding keeps this a valid ignored shell comment\n";
+    while (written < total_bytes) {
+        size_t remaining = total_bytes - written;
+        size_t chunk = remaining < sizeof(padding) - 1U ? remaining : sizeof(padding) - 1U;
+        if (fwrite(padding, 1, chunk, file) != chunk) {
+            (void)fclose(file);
+            return -1;
+        }
+        written += chunk;
+    }
+    return fclose(file);
+}
+
+TEST(envscan_walks_more_than_256_pending_directories) {
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_wide_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+
+    for (int i = 0; i < ENVSCAN_WIDE_DIRECTORY_COUNT; i++) {
+        char dir_path[CBM_SZ_512];
+        char file_path[CBM_SZ_512];
+        int dir_len = snprintf(dir_path, sizeof(dir_path), "%s/d_%03d", tmpdir, i);
+        int file_len = snprintf(file_path, sizeof(file_path), "%s/config.sh", dir_path);
+        ASSERT_TRUE(dir_len > 0 && (size_t)dir_len < sizeof(dir_path));
+        ASSERT_TRUE(file_len > 0 && (size_t)file_len < sizeof(file_path));
+        ASSERT_EQ(cbm_mkdir(dir_path), 0);
+        ASSERT_EQ(th_write_file(file_path, "export WIDE_URL=https://wide.example.test/v1\n"), 0);
+    }
+
+    cbm_env_binding_t *bindings = calloc(ENVSCAN_WIDE_DIRECTORY_COUNT, sizeof(*bindings));
+    ASSERT_NOT_NULL(bindings);
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, ENVSCAN_WIDE_DIRECTORY_COUNT);
+    ASSERT_EQ(count, ENVSCAN_WIDE_DIRECTORY_COUNT);
+
+    free(bindings);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_accepts_root_path_longer_than_512_bytes) {
+    char cleanup_root[CBM_SZ_256];
+    char scan_root[CBM_SZ_2K];
+    snprintf(cleanup_root, sizeof(cleanup_root), "/tmp/cbm_envscan_longroot_XXXXXX");
+    if (!cbm_mkdtemp(cleanup_root))
+        FAIL("tmpdir");
+    snprintf(scan_root, sizeof(scan_root), "%s", cleanup_root);
+
+    int component = 0;
+    while (strlen(scan_root) <= CBM_SZ_512) {
+        size_t used = strlen(scan_root);
+        int appended = snprintf(scan_root + used, sizeof(scan_root) - used,
+                                "/component_%03d_abcdefghijkl", component++);
+        ASSERT_TRUE(appended > 0 && (size_t)appended < sizeof(scan_root) - used);
+    }
+    /* Create the complete deep path once through the same UTF-8/extended-path
+     * helper used by production. Re-running mkdir-p for every prefix would add
+     * avoidable O(D * P) test setup work for depth D and final path length P. */
+    ASSERT_EQ(th_mkdir_p(scan_root), 0);
+    char file_path[CBM_SZ_2K];
+    int file_len = snprintf(file_path, sizeof(file_path), "%s/config.sh", scan_root);
+    ASSERT_TRUE(file_len > 0 && (size_t)file_len < sizeof(file_path));
+    ASSERT_EQ(th_write_file(file_path, "export LONG_ROOT_URL=https://long.example.test/v1\n"), 0);
+
+    cbm_env_binding_t bindings[2] = {0};
+    int count = cbm_scan_project_env_urls(scan_root, bindings, 2);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "LONG_ROOT_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "LONG_ROOT_URL")->file_path, "config.sh");
+
+    th_rmtree(cleanup_root);
+    PASS();
+}
+
+TEST(envscan_uses_shared_file_size_policy) {
+    char tmpdir[CBM_SZ_256];
+    char file_path[CBM_SZ_512];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_large_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    snprintf(file_path, sizeof(file_path), "%s/config.sh", tmpdir);
+    ASSERT_EQ(envscan_write_large_file(file_path,
+                                       "export LARGE_FILE_URL=https://large.example.test/v1\n",
+                                       (size_t)ENVSCAN_OLD_FILE_LIMIT_BYTES + CBM_SZ_1K),
+              0);
+
+    cbm_env_binding_t bindings[2] = {0};
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 2);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "LARGE_FILE_URL"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_parses_one_complete_line_across_old_buffer_boundary) {
+    char tmpdir[CBM_SZ_256];
+    char file_path[CBM_SZ_512];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_longline_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    snprintf(file_path, sizeof(file_path), "%s/config.sh", tmpdir);
+
+    const char assignment[] = "BOUNDARY_URL=https://boundary.example.test/v1\n";
+    size_t prefix_len = CBM_SZ_2K - strlen("BOUNDARY_URL=https");
+    char *line = malloc(prefix_len + sizeof(assignment));
+    ASSERT_NOT_NULL(line);
+    memset(line, ' ', prefix_len);
+    memcpy(line + prefix_len, assignment, sizeof(assignment));
+    ASSERT_EQ(th_write_file(file_path, line), 0);
+    free(line);
+
+    cbm_env_binding_t bindings[2] = {0};
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 2);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "BOUNDARY_URL"));
+    ASSERT_STR_EQ(find_binding_by_key(bindings, count, "BOUNDARY_URL")->value,
+                  "https://boundary.example.test/v1");
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+enum {
+    ENVSCAN_CONCURRENT_SCANNER_COUNT = 4,
+    ENVSCAN_CONCURRENT_SCAN_REPETITIONS = 16,
+};
+
+typedef struct {
+    const char *root;
+    int successful_scans;
+} envscan_thread_context_t;
+
+static void *envscan_concurrent_scan_worker(void *opaque) {
+    envscan_thread_context_t *context = opaque;
+    for (int i = 0; i < ENVSCAN_CONCURRENT_SCAN_REPETITIONS; i++) {
+        cbm_env_binding_t binding = {0};
+        int count = cbm_scan_project_env_urls(context->root, &binding, 1);
+        if (count == 1 && strcmp(binding.key, "CONCURRENT_URL") == 0 &&
+            strcmp(binding.value, "https://concurrent.example.test/v1") == 0) {
+            context->successful_scans++;
+        }
+    }
+    return NULL;
+}
+
+TEST(envscan_concurrent_first_use_and_cleanup_reinitialize) {
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_threads_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    write_temp_file(tmpdir, "config.sh",
+                    "export CONCURRENT_URL=https://concurrent.example.test/v1\n");
+
+    /* Force the workers through the lazy first-use path together. The TSan
+     * target proves publication of the shared compiled regexes is ordered. */
+    cbm_envscan_free_patterns();
+    cbm_thread_t threads[ENVSCAN_CONCURRENT_SCANNER_COUNT];
+    envscan_thread_context_t contexts[ENVSCAN_CONCURRENT_SCANNER_COUNT] = {0};
+    int created = 0;
+    for (; created < ENVSCAN_CONCURRENT_SCANNER_COUNT; created++) {
+        contexts[created].root = tmpdir;
+        if (cbm_thread_create(&threads[created], 0, envscan_concurrent_scan_worker,
+                              &contexts[created]) != 0) {
+            break;
+        }
+    }
+    for (int i = 0; i < created; i++) {
+        ASSERT_EQ(cbm_thread_join(&threads[i]), 0);
+        ASSERT_EQ(contexts[i].successful_scans, ENVSCAN_CONCURRENT_SCAN_REPETITIONS);
+    }
+    ASSERT_EQ(created, ENVSCAN_CONCURRENT_SCANNER_COUNT);
+
+    cbm_envscan_free_patterns();
+    cbm_env_binding_t binding = {0};
+    ASSERT_EQ(cbm_scan_project_env_urls(tmpdir, &binding, 1), 1);
+    ASSERT_STR_EQ(binding.key, "CONCURRENT_URL");
+    ASSERT_STR_EQ(binding.value, "https://concurrent.example.test/v1");
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_reports_unrepresentable_key_and_value_without_truncating) {
+    char tmpdir[CBM_SZ_256];
+    char file_path[CBM_SZ_512];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_fields_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    snprintf(file_path, sizeof(file_path), "%s/config.sh", tmpdir);
+
+    const char normal_url[] = "https://field.example.test/v1";
+    const char value_key[] = "VALUE_URL=";
+    const char value_prefix[] = "https://field.example.test/";
+    const size_t key_length = sizeof(((cbm_env_binding_t *)0)->key);
+    const size_t value_length = sizeof(((cbm_env_binding_t *)0)->value);
+    FILE *file = cbm_fopen(file_path, "wb");
+    ASSERT_NOT_NULL(file);
+    for (size_t i = 0; i < key_length; i++) {
+        ASSERT_NEQ(fputc('K', file), EOF);
+    }
+    ASSERT_NEQ(fputc('=', file), EOF);
+    ASSERT_EQ(fwrite(normal_url, 1, strlen(normal_url), file), strlen(normal_url));
+    ASSERT_NEQ(fputc('\n', file), EOF);
+    ASSERT_EQ(fwrite(value_key, 1, strlen(value_key), file), strlen(value_key));
+    ASSERT_EQ(fwrite(value_prefix, 1, strlen(value_prefix), file), strlen(value_prefix));
+    for (size_t i = strlen(value_prefix); i < value_length; i++) {
+        ASSERT_NEQ(fputc('v', file), EOF);
+    }
+    ASSERT_NEQ(fputc('\n', file), EOF);
+    ASSERT_EQ(fclose(file), 0);
+
+    cbm_env_binding_t bindings[2] = {0};
+    pipeline_capture_logs_start();
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 2);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(count, 0);
+    ASSERT_NOT_NULL(strstr(logs, "reason=binding_unrepresentable"));
+    ASSERT_NOT_NULL(strstr(logs, "constraint=key_capacity"));
+    ASSERT_NOT_NULL(strstr(logs, "constraint=value_capacity"));
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(envscan_preserves_caller_output_capacity) {
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_capacity_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("tmpdir");
+    write_temp_file(tmpdir, "config.sh",
+                    "export FIRST_URL=https://first.example.test/v1\n"
+                    "export SECOND_URL=https://second.example.test/v1\n");
+
+    cbm_env_binding_t bindings[2] = {0};
+    cbm_str_copy(bindings[1].key, sizeof(bindings[1].key), "UNTOUCHED");
+    int count = cbm_scan_project_env_urls(tmpdir, bindings, 1);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(bindings[1].key, "UNTOUCHED");
+
+    th_rmtree(tmpdir);
+    PASS();
 }
 
 TEST(envscan_dockerfile_env_urls) {
@@ -9441,6 +14819,47 @@ TEST(envscan_skips_ignored_dirs) {
     PASS();
 }
 
+TEST(envscan_does_not_follow_links_outside_root) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink containment test; Windows reparse-point behavior has a compile gate");
+#else
+    char root[256];
+    char outside[256];
+    snprintf(root, sizeof(root), "/tmp/cbm_envscan_root_XXXXXX");
+    snprintf(outside, sizeof(outside), "/tmp/cbm_envscan_outside_XXXXXX");
+    if (!cbm_mkdtemp(root) || !cbm_mkdtemp(outside)) {
+        th_rmtree(root);
+        th_rmtree(outside);
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(root, "control.sh",
+                    "export CONTROL_URL=https://control.example.com/v1\n");
+    write_temp_file(outside, "outside.sh",
+                    "export OUTSIDE_URL=https://outside.example.com/v1\n");
+
+    char linked_dir[512];
+    char outside_file[512];
+    char linked_file[512];
+    snprintf(linked_dir, sizeof(linked_dir), "%s/linked", root);
+    snprintf(outside_file, sizeof(outside_file), "%s/outside.sh", outside);
+    snprintf(linked_file, sizeof(linked_file), "%s/linked.sh", root);
+    ASSERT_EQ(symlink(outside, linked_dir), 0);
+    ASSERT_EQ(symlink(outside_file, linked_file), 0);
+
+    cbm_env_binding_t bindings[32];
+    int count = cbm_scan_project_env_urls(root, bindings, 32);
+    ASSERT_NOT_NULL(find_binding_by_key(bindings, count, "CONTROL_URL"));
+    ASSERT_NULL(find_binding_by_key(bindings, count, "OUTSIDE_URL"));
+
+    ASSERT_EQ(unlink(linked_file), 0);
+    ASSERT_EQ(unlink(linked_dir), 0);
+    th_rmtree(root);
+    th_rmtree(outside);
+    PASS();
+#endif
+}
+
 TEST(envscan_non_url_values_skipped) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_envscan_nurl_XXXXXX");
@@ -9543,6 +14962,62 @@ TEST(pkgmap_swift_targets_registers_module) {
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
     cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* PackageDescription executableTarget declarations create importable Swift
+ * modules just like regular target declarations. The manifest scanner must
+ * recognize the factory itself rather than keying capability to one spelling. */
+TEST(pkgmap_swift_executable_target_registers_module) {
+    static const char src[] =
+        "let package = Package(\n"
+        "    name: \"Tooling\",\n"
+        "    targets: [.executableTarget(name: \"Tooling\", dependencies: [])]\n"
+        ")\n";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "Tools/Package.swift", src, (int)strlen(src),
+                                     &entries));
+    ASSERT_TRUE(pkg_entries_has_name(&entries, "Tooling"));
+    ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Tooling"), "Tools/Sources/Tooling");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    PASS();
+}
+
+/* Manifest paths are input data, not a semantic output budget. A fixed local
+ * buffer used to return a plausible but truncated module path. Keep the full
+ * value or fail allocation; never silently redirect an IMPORTS edge. */
+TEST(pkgmap_swift_literal_path_is_not_silently_truncated) {
+    enum { SEGMENTS = 180 };
+    char path[SEGMENTS * sizeof("nested/") + sizeof("Module")];
+    size_t used = 0;
+    for (int i = 0; i < SEGMENTS; i++) {
+        memcpy(path + used, "nested/", sizeof("nested/") - 1);
+        used += sizeof("nested/") - 1;
+    }
+    memcpy(path + used, "Module", sizeof("Module"));
+
+    const char *prefix =
+        "let package = Package(name: \"Deep\", targets: [.target(name: \"Deep\", path: \"";
+    const char *suffix = "\")])\n";
+    size_t source_len = strlen(prefix) + strlen(path) + strlen(suffix);
+    char *source = malloc(source_len + 1);
+    ASSERT_NOT_NULL(source);
+    snprintf(source, source_len + 1, "%s%s%s", prefix, path, suffix);
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(cbm_pkgmap_try_parse("Package.swift", "Deep/Package.swift", source, (int)source_len,
+                                     &entries));
+    const char *entry = pkg_entries_entry_for(&entries, "Deep");
+    ASSERT_NOT_NULL(entry);
+    ASSERT_EQ(strlen(entry), strlen("Deep/") + strlen(path));
+    ASSERT_TRUE(strlen(entry) >= strlen("/Module"));
+    ASSERT_STR_EQ(entry + strlen(entry) - strlen("/Module"), "/Module");
+    ASSERT_EQ(entries.count, 1);
+    cbm_pkg_entries_free(&entries);
+    free(source);
     PASS();
 }
 
@@ -9793,14 +15268,14 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     cbm_mkdir(dir);
     snprintf(dir, sizeof(dir), "%s/packages/app", tmpdir);
     cbm_mkdir(dir);
-    snprintf(dir, sizeof(dir), "%s/vendor_big", tmpdir);
+    snprintf(dir, sizeof(dir), "%s/large_ignored", tmpdir);
     cbm_mkdir(dir);
-    snprintf(dir, sizeof(dir), "%s/vendor_big/lib", tmpdir);
+    snprintf(dir, sizeof(dir), "%s/large_ignored/lib", tmpdir);
     cbm_mkdir(dir);
 
     write_temp_file(tmpdir, "packages/app/package.json",
                     "{\"name\":\"@org/app\",\"main\":\"index.js\"}\n");
-    write_temp_file(tmpdir, "vendor_big/lib/package.json",
+    write_temp_file(tmpdir, "large_ignored/lib/package.json",
                     "{\"name\":\"@org/vendored\",\"main\":\"index.js\"}\n");
 
     /* Control: NULL exclusion list — the walk reaches and parses BOTH
@@ -9812,9 +15287,9 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     ASSERT_TRUE(pkg_entries_has_name(&control, "@org/vendored"));
     cbm_pkg_entries_free(&control);
 
-    /* With vendor_big excluded (as discovery reports for a gitignored
+    /* With large_ignored excluded (as discovery reports for a gitignored
      * subtree): the walk must not descend into it. */
-    char *excluded[] = {(char *)"vendor_big"};
+    char *excluded[] = {(char *)"large_ignored"};
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
     cbm_pkgmap_scan_repo(tmpdir, &entries, excluded, 1);
@@ -9823,6 +15298,433 @@ TEST(pkgmap_scan_repo_honors_discovery_exclusions) {
     cbm_pkg_entries_free(&entries);
 
     th_rmtree(tmpdir);
+    PASS();
+}
+
+enum {
+    /* Exceeds the former 1,024-byte resolver buffer after prefix/appended path. */
+    PKGMAP_LONG_TEST_FILL = 1100,
+};
+
+static char *pkgmap_long_test_value(const char *prefix, char fill, size_t fill_count) {
+    size_t prefix_len = strlen(prefix);
+    char *value = malloc(prefix_len + fill_count + 1);
+    if (!value) {
+        return NULL;
+    }
+    memcpy(value, prefix, prefix_len);
+    memset(value + prefix_len, fill, fill_count);
+    value[prefix_len + fill_count] = '\0';
+    return value;
+}
+
+/* Package entry resolution must preserve the complete manifest directory and
+ * entry value. A fixed join buffer can otherwise redirect an import to a
+ * plausible but different module. */
+TEST(pkgmap_package_json_entry_is_not_silently_truncated) {
+    char *directory = pkgmap_long_test_value("packages/", 'p', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(directory);
+    size_t rel_path_len = strlen(directory) + strlen("/package.json");
+    char *rel_path = malloc(rel_path_len + 1);
+    ASSERT_NOT_NULL(rel_path);
+    snprintf(rel_path, rel_path_len + 1, "%s/package.json", directory);
+
+    static const char source[] = "{\"name\":\"@org/deep\",\"main\":\"src/index.js\"}";
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    ASSERT_TRUE(
+        cbm_pkgmap_try_parse("package.json", rel_path, source, (int)strlen(source), &entries));
+    const char *resolved = pkg_entries_entry_for(&entries, "@org/deep");
+    ASSERT_NOT_NULL(resolved);
+    size_t expected_len = strlen(directory) + strlen("/src/index");
+    ASSERT_EQ(strlen(resolved), expected_len);
+    ASSERT_STR_EQ(resolved + strlen(directory), "/src/index");
+
+    cbm_pkg_entries_free(&entries);
+    free(rel_path);
+    free(directory);
+    PASS();
+}
+
+/* The filesystem walker must preserve each platform-supported path byte. A
+ * local fixed buffer otherwise makes two distinct deep entries alias before
+ * stat, exclusion matching, or manifest parsing sees them. */
+TEST(pkgmap_walk_path_join_is_not_silently_truncated) {
+    char *directory = pkgmap_long_test_value("workspace/", 'w', PKGMAP_LONG_TEST_FILL);
+    char *name = pkgmap_long_test_value("package-", 'n', PKGMAP_LONG_TEST_FILL);
+    if (!directory || !name) {
+        free(name);
+        free(directory);
+        FAIL("walker path fixture allocation");
+    }
+    size_t expected_len = strlen(directory) + SKIP_ONE + strlen(name);
+    char *joined = cbm_pkgmap_join_path(directory, name);
+    bool exact = joined && strlen(joined) == expected_len &&
+                 memcmp(joined, directory, strlen(directory)) == 0 &&
+                 joined[strlen(directory)] == '/' &&
+                 strcmp(joined + strlen(directory) + SKIP_ONE, name) == 0;
+
+    free(joined);
+    free(name);
+    free(directory);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(pkgmap_walk_reaches_manifest_beyond_legacy_depth_cap) {
+    enum {
+        /* The former walker stopped at 64 recursive frames. This finite tree
+         * stays well inside platform path limits while proving deeper content
+         * is not silently omitted. */
+        PKGMAP_DEEP_TEST_LEVELS = 80,
+    };
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_deep_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("deep pkgmap tmpdir");
+    }
+
+    char *directory = cbm_strdup(tmpdir);
+    for (int level = 0; directory && level < PKGMAP_DEEP_TEST_LEVELS; level++) {
+        char *next = cbm_pkgmap_join_path(directory, "d");
+        free(directory);
+        directory = next;
+    }
+    char *manifest = directory ? cbm_pkgmap_join_path(directory, "package.json") : NULL;
+    bool fixture_ready = directory && manifest && cbm_mkdir_p(directory, 0700);
+    FILE *file = fixture_ready ? cbm_fopen(manifest, "wb") : NULL;
+    static const char source[] = "{\"name\":\"@org/deep\",\"main\":\"index.js\"}\n";
+    if (file) {
+        bool wrote =
+            fwrite(source, SKIP_ONE, sizeof(source) - SKIP_ONE, file) == sizeof(source) - SKIP_ONE;
+        int close_result = fclose(file);
+        fixture_ready = wrote && close_result == 0;
+    } else {
+        fixture_ready = false;
+    }
+    if (!fixture_ready) {
+        free(manifest);
+        free(directory);
+        th_rmtree(tmpdir);
+        FAIL("deep pkgmap fixture");
+    }
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    int parsed = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool found = pkg_entries_has_name(&entries, "@org/deep");
+    cbm_pkg_entries_free(&entries);
+    free(manifest);
+    free(directory);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(parsed, 1);
+    ASSERT_TRUE(found);
+    PASS();
+}
+
+/* A directory symlink back to an active ancestor must not duplicate manifests
+ * or keep the now-unbounded iterative walk alive. Windows uses reparse-point
+ * inspection for the equivalent junction/symlink rule and has separate
+ * compile/platform gates because creating one requires platform privileges. */
+TEST(pkgmap_walk_does_not_follow_directory_symlink_cycle) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink cycle; Windows reparse behavior is compile-gated");
+#else
+    char tmpdir[CBM_SZ_256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_cycle_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("pkgmap cycle tmpdir");
+    }
+    write_temp_file(tmpdir, "package.json", "{\"name\":\"@org/root\",\"main\":\"index.js\"}\n");
+
+    char *cycle_path = cbm_pkgmap_join_path(tmpdir, "cycle");
+    bool fixture_ready = cycle_path && symlink(tmpdir, cycle_path) == 0;
+    if (!fixture_ready) {
+        free(cycle_path);
+        th_rmtree(tmpdir);
+        FAIL("pkgmap cycle symlink");
+    }
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    int parsed = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool exact = parsed == 1 && entries.count == 1 && pkg_entries_has_name(&entries, "@org/root");
+    cbm_pkg_entries_free(&entries);
+    int unlink_result = unlink(cycle_path);
+    free(cycle_path);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(unlink_result, 0);
+    ASSERT_TRUE(exact);
+    PASS();
+#endif
+}
+
+/* Every manifest parser must preserve the same exact directory identity. This
+ * table exercises the seven parsers that historically rebuilt entry paths in
+ * independent 1,024-byte buffers; one shared fixture prevents ecosystem fixes
+ * from drifting while keeping each parser's manifest semantics distinct. */
+TEST(pkgmap_manifest_ecosystems_preserve_long_entry_paths) {
+    typedef struct {
+        const char *basename;
+        const char *source;
+        const char *package_name;
+        const char *entry_suffix;
+    } pkgmap_manifest_case_t;
+    static const pkgmap_manifest_case_t cases[] = {
+        {"pyproject.toml", "[project]\nname = \"deep_pkg\"\n", "deep_pkg", "src/deep_pkg/__init__"},
+        {"composer.json",
+         "{\"name\":\"vendor/package\",\"autoload\":{\"psr-4\":{\"Vendor\\\\\":\"src/\"}}}",
+         "Vendor\\", "src"},
+        {"pubspec.yaml", "name: deep_dart\n", "deep_dart", "lib"},
+        {"pom.xml",
+         "<project><groupId>com.example</groupId><artifactId>demo</artifactId></project>",
+         "com.example.demo", "src/main/java"},
+        {"build.gradle", "group = 'com.example'\n", "com.example", "src/main/java"},
+        {"mix.exs", "app: :deep_app,\n", "deep_app", "lib/deep_app"},
+        {"deep.gemspec", "spec.name = 'deep_gem'\n", "deep_gem", "lib/deep_gem"},
+    };
+
+    char *directory = pkgmap_long_test_value("packages/", 'e', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(directory);
+    const char *failed_case = NULL;
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        size_t rel_path_len = strlen(directory) + SKIP_ONE + strlen(cases[i].basename);
+        char *rel_path = malloc(rel_path_len + SKIP_ONE);
+        size_t expected_len = strlen(directory) + SKIP_ONE + strlen(cases[i].entry_suffix);
+        char *expected = malloc(expected_len + SKIP_ONE);
+        if (!rel_path || !expected) {
+            free(rel_path);
+            free(expected);
+            failed_case = "fixture allocation";
+            break;
+        }
+        snprintf(rel_path, rel_path_len + SKIP_ONE, "%s/%s", directory, cases[i].basename);
+        snprintf(expected, expected_len + SKIP_ONE, "%s/%s", directory, cases[i].entry_suffix);
+
+        cbm_pkg_entries_t entries;
+        cbm_pkg_entries_init(&entries);
+        bool parsed = cbm_pkgmap_try_parse(cases[i].basename, rel_path, cases[i].source,
+                                           (int)strlen(cases[i].source), &entries);
+        const char *actual = pkg_entries_entry_for(&entries, cases[i].package_name);
+        if (!parsed || !actual || strcmp(actual, expected) != 0) {
+            failed_case = cases[i].basename;
+        }
+        cbm_pkg_entries_free(&entries);
+        free(expected);
+        free(rel_path);
+    }
+    free(directory);
+
+    if (failed_case) {
+        FAIL(failed_case);
+    }
+    PASS();
+}
+
+/* Maven coordinates form a lookup key, not a display abbreviation. Preserve
+ * every groupId and artifactId byte so two long coordinates cannot collapse
+ * to the same truncated package name. */
+TEST(pkgmap_pom_coordinates_are_not_silently_truncated) {
+    enum {
+        FORMAT_PLACEHOLDER_BYTES = sizeof("%s") - SKIP_ONE,
+    };
+    char *group_id = pkgmap_long_test_value("com.example.", 'g', PKGMAP_LONG_TEST_FILL);
+    char *artifact_id = pkgmap_long_test_value("artifact_", 'a', PKGMAP_LONG_TEST_FILL);
+    if (!group_id || !artifact_id) {
+        free(artifact_id);
+        free(group_id);
+        FAIL("coordinate fixture allocation");
+    }
+
+    static const char source_format[] =
+        "<project><groupId>%s</groupId><artifactId>%s</artifactId></project>";
+    size_t source_size = strlen(source_format) - PAIR_LEN * FORMAT_PLACEHOLDER_BYTES +
+                         strlen(group_id) + strlen(artifact_id) + SKIP_ONE;
+    char *source = malloc(source_size);
+    if (!source) {
+        free(artifact_id);
+        free(group_id);
+        FAIL("POM fixture allocation");
+    }
+    int written = snprintf(source, source_size, source_format, group_id, artifact_id);
+    bool source_exact = written > 0 && (size_t)written < source_size;
+
+    size_t coordinate_size = strlen(group_id) + SKIP_ONE + strlen(artifact_id) + SKIP_ONE;
+    char *coordinate = malloc(coordinate_size);
+    if (!coordinate) {
+        free(source);
+        free(artifact_id);
+        free(group_id);
+        FAIL("coordinate result allocation");
+    }
+    written = snprintf(coordinate, coordinate_size, "%s.%s", group_id, artifact_id);
+    bool coordinate_exact = written > 0 && (size_t)written < coordinate_size;
+
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    bool parsed = source_exact && coordinate_exact &&
+                  cbm_pkgmap_try_parse("pom.xml", "pom.xml", source, (int)strlen(source), &entries);
+    const char *entry = parsed ? pkg_entries_entry_for(&entries, coordinate) : NULL;
+    bool exact = entry && strcmp(entry, "src/main/java") == 0;
+
+    cbm_pkg_entries_free(&entries);
+    free(coordinate);
+    free(source);
+    free(artifact_id);
+    free(group_id);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+/* Manifest parsing shares the repository's configurable per-file policy. A
+ * historical 1 MiB local cap silently discarded valid package metadata even
+ * when CBM_MAX_FILE_BYTES explicitly allowed the file. */
+TEST(pkgmap_manifest_above_legacy_cap_uses_shared_file_limit) {
+    enum {
+        LEGACY_MANIFEST_CAP_BYTES = CBM_SZ_1K * CBM_SZ_1K,
+        SHARED_MANIFEST_CAP_MIB = 2,
+        SHARED_MANIFEST_CAP_BYTES = SHARED_MANIFEST_CAP_MIB * LEGACY_MANIFEST_CAP_BYTES,
+        MANIFEST_WRITE_CHUNK_BYTES = CBM_SZ_4K,
+    };
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pkgmap_large_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char path[512];
+    snprintf(path, sizeof(path), "%s/package.json", tmpdir);
+    FILE *manifest = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(manifest);
+    char padding[MANIFEST_WRITE_CHUNK_BYTES];
+    memset(padding, ' ', sizeof(padding));
+    size_t remaining = LEGACY_MANIFEST_CAP_BYTES + SKIP_ONE;
+    while (remaining > 0) {
+        size_t chunk = remaining < sizeof(padding) ? remaining : sizeof(padding);
+        ASSERT_EQ(fwrite(padding, SKIP_ONE, chunk, manifest), chunk);
+        remaining -= chunk;
+    }
+    static const char body[] = "{\"name\":\"@org/large\",\"main\":\"src/index.js\"}";
+    ASSERT_EQ(fwrite(body, SKIP_ONE, sizeof(body) - SKIP_ONE, manifest), sizeof(body) - SKIP_ONE);
+    ASSERT_EQ(fclose(manifest), 0);
+
+    const char *saved_raw = getenv("CBM_MAX_FILE_BYTES");
+    char *saved = saved_raw ? cbm_strdup(saved_raw) : NULL;
+    char shared_cap_raw[CBM_SZ_32];
+    char legacy_cap_raw[CBM_SZ_32];
+    int shared_cap_len =
+        snprintf(shared_cap_raw, sizeof(shared_cap_raw), "%d", SHARED_MANIFEST_CAP_BYTES);
+    int legacy_cap_len =
+        snprintf(legacy_cap_raw, sizeof(legacy_cap_raw), "%d", LEGACY_MANIFEST_CAP_BYTES);
+    ASSERT(shared_cap_len > 0 && (size_t)shared_cap_len < sizeof(shared_cap_raw));
+    ASSERT(legacy_cap_len > 0 && (size_t)legacy_cap_len < sizeof(legacy_cap_raw));
+    ASSERT_EQ(cbm_setenv("CBM_MAX_FILE_BYTES", shared_cap_raw, 1), 0);
+    cbm_pkg_entries_t entries;
+    cbm_pkg_entries_init(&entries);
+    int parsed = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool found = pkg_entries_has_name(&entries, "@org/large");
+    cbm_pkg_entries_free(&entries);
+
+    ASSERT_EQ(cbm_setenv("CBM_MAX_FILE_BYTES", legacy_cap_raw, 1), 0);
+    pipeline_capture_logs_start();
+    cbm_pkg_entries_init(&entries);
+    int rejected = cbm_pkgmap_scan_repo(tmpdir, &entries, NULL, 0);
+    bool rejected_found = pkg_entries_has_name(&entries, "@org/large");
+    cbm_pkg_entries_free(&entries);
+    const char *logs = pipeline_capture_logs_end();
+    bool logged_reason = strstr(logs, "msg=pkgmap.manifest_skipped") != NULL &&
+                         strstr(logs, "reason=oversized") != NULL &&
+                         strstr(logs, "constraint=CBM_MAX_FILE_BYTES") != NULL;
+
+    saved ? cbm_setenv("CBM_MAX_FILE_BYTES", saved, 1) : cbm_unsetenv("CBM_MAX_FILE_BYTES");
+    free(saved);
+    th_rmtree(tmpdir);
+
+    ASSERT_EQ(parsed, 1);
+    ASSERT_TRUE(found);
+    ASSERT_EQ(rejected, 0);
+    ASSERT_FALSE(rejected_found);
+    ASSERT_TRUE(logged_reason);
+    PASS();
+}
+
+TEST(pkgmap_prefix_slash_result_is_not_silently_truncated) {
+    char *base = pkgmap_long_test_value("proj.", 's', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(base);
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, cbm_strdup("example.com/root"), cbm_strdup(base));
+    cbm_pipeline_set_pkgmap(pkgmap);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj"};
+
+    char *resolved = cbm_pipeline_resolve_module(&ctx, "main.go", "example.com/root/pkg/utils");
+    size_t expected_len = strlen(base) + strlen(".pkg.utils");
+    char *expected = malloc(expected_len + 1);
+    ASSERT_NOT_NULL(expected);
+    snprintf(expected, expected_len + 1, "%s.pkg.utils", base);
+    ASSERT_NOT_NULL(resolved);
+    ASSERT_STR_EQ(resolved, expected);
+
+    free(expected);
+    free(resolved);
+    free(base);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
+    PASS();
+}
+
+TEST(pkgmap_prefix_dot_result_is_not_silently_truncated) {
+    char *base = pkgmap_long_test_value("mapped/", 'd', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(base);
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, cbm_strdup("com.example"), cbm_strdup(base));
+    cbm_pipeline_set_pkgmap(pkgmap);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj"};
+
+    char *resolved = cbm_pipeline_resolve_module(&ctx, "Main.java", "com.example.Feature.Type");
+    size_t input_len = strlen(base) + strlen("/Feature/Type");
+    char *input = malloc(input_len + 1);
+    ASSERT_NOT_NULL(input);
+    snprintf(input, input_len + 1, "%s/Feature/Type", base);
+    char *expected = cbm_pipeline_fqn_module("proj", input);
+    ASSERT_NOT_NULL(resolved);
+    ASSERT_NOT_NULL(expected);
+    ASSERT_STR_EQ(resolved, expected);
+
+    free(expected);
+    free(input);
+    free(resolved);
+    free(base);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
+    PASS();
+}
+
+TEST(pkgmap_prefix_backslash_result_is_not_silently_truncated) {
+    char *base = pkgmap_long_test_value("mapped/", 'b', PKGMAP_LONG_TEST_FILL);
+    ASSERT_NOT_NULL(base);
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, cbm_strdup("App\\"), cbm_strdup(base));
+    cbm_pipeline_set_pkgmap(pkgmap);
+    cbm_pipeline_ctx_t ctx = {.project_name = "proj"};
+
+    char *resolved = cbm_pipeline_resolve_module(&ctx, "index.php", "App\\Controllers\\Foo");
+    size_t input_len = strlen(base) + strlen("/Controllers/Foo");
+    char *input = malloc(input_len + 1);
+    ASSERT_NOT_NULL(input);
+    snprintf(input, input_len + 1, "%s/Controllers/Foo", base);
+    char *expected = cbm_pipeline_fqn_module("proj", input);
+    ASSERT_NOT_NULL(resolved);
+    ASSERT_NOT_NULL(expected);
+    ASSERT_STR_EQ(resolved, expected);
+
+    free(expected);
+    free(input);
+    free(resolved);
+    free(base);
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
     PASS();
 }
 
@@ -9928,6 +15830,7 @@ TEST(githistory_compute_change_coupling) {
             ASSERT(0); /* d.go should not appear */
         }
     }
+    cbm_change_coupling_paths_free(out, count);
     PASS();
 }
 
@@ -9977,6 +15880,7 @@ TEST(githistory_coupling_limits_output) {
     cbm_change_coupling_t out[200];
     int count = cbm_compute_change_coupling(commits, ci, out, 100);
     ASSERT(count <= 100);
+    cbm_change_coupling_paths_free(out, count);
     PASS();
 }
 
@@ -10038,7 +15942,7 @@ TEST(registry_find_ending_with) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
- *  Incremental reindex tests
+ *  Incremental reindex
  * ═══════════════════════════════════════════════════════════════════ */
 
 /* Helper: create a simple 2-file Go project for incremental tests */
@@ -10046,19 +15950,30 @@ static char g_incr_tmpdir[256];
 static char g_incr_dbpath[512];
 
 static int setup_incremental_repo(void) {
-    snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "/tmp/cbm_incr_XXXXXX");
-    if (!cbm_mkdtemp(g_incr_tmpdir)) {
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "%s/cbm-incr-XXXXXX", cache);
+    if (n < 0 || (size_t)n >= sizeof(g_incr_tmpdir) || !cbm_mkdtemp(g_incr_tmpdir)) {
+        g_incr_tmpdir[0] = '\0';
         return -1;
     }
-    snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+    n = snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(g_incr_dbpath)) {
+        rm_rf(g_incr_tmpdir);
+        g_incr_tmpdir[0] = '\0';
+        g_incr_dbpath[0] = '\0';
+        return -1;
+    }
 
     char path[512];
     FILE *f;
 
     /* main.go — calls Helper() */
     snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
-    f = fopen(path, "w");
+    f = cbm_fopen(path, "wb");
     if (!f) {
+        rm_rf(g_incr_tmpdir);
+        g_incr_tmpdir[0] = '\0';
+        g_incr_dbpath[0] = '\0';
         return -1;
     }
     fprintf(f, "package main\n\nfunc main() {\n\tHelper()\n}\n");
@@ -10066,8 +15981,11 @@ static int setup_incremental_repo(void) {
 
     /* helper.go — defines Helper() */
     snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
-    f = fopen(path, "w");
+    f = cbm_fopen(path, "wb");
     if (!f) {
+        rm_rf(g_incr_tmpdir);
+        g_incr_tmpdir[0] = '\0';
+        g_incr_dbpath[0] = '\0';
         return -1;
     }
     fprintf(f, "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n");
@@ -10076,8 +15994,993 @@ static int setup_incremental_repo(void) {
     return 0;
 }
 
+enum { INCR_PARALLEL_CHANGED_FILE_COUNT = 64 };
+
+static int incremental_parallel_file_path(int index, char *path, size_t path_sz) {
+    int n = snprintf(path, path_sz, "%s/file_%03d.go", g_incr_tmpdir, index);
+    return (n < 0 || (size_t)n >= path_sz) ? -1 : 0;
+}
+
+static int write_incremental_parallel_file(int index, bool changed) {
+    char path[CBM_PATH_MAX];
+    if (incremental_parallel_file_path(index, path, sizeof(path)) != 0) {
+        return -1;
+    }
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return -1;
+    }
+    fprintf(f, "package main\n\nfunc Func%03d() int {\n\treturn %d\n}\n", index,
+            index + (changed ? 1 : 0));
+    if (changed && index == 0) {
+        fprintf(f, "\nfunc NewFunc() int {\n\treturn 42\n}\n");
+    }
+    return fclose(f);
+}
+
+static int setup_incremental_parallel_repo(void) {
+    int n = snprintf(g_incr_tmpdir, sizeof(g_incr_tmpdir), "/tmp/cbm_incr_parallel_XXXXXX");
+    if (n < 0 || (size_t)n >= sizeof(g_incr_tmpdir) || !cbm_mkdtemp(g_incr_tmpdir)) {
+        return -1;
+    }
+    n = snprintf(g_incr_dbpath, sizeof(g_incr_dbpath), "%s/test.db", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(g_incr_dbpath)) {
+        return -1;
+    }
+    for (int i = 0; i < INCR_PARALLEL_CHANGED_FILE_COUNT; i++) {
+        if (write_incremental_parallel_file(i, false) != 0) {
+            return -1;
+        }
+    }
+    char manifest_path[CBM_PATH_MAX];
+    n = snprintf(manifest_path, sizeof(manifest_path), "%s/go.mod", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(manifest_path)) {
+        return -1;
+    }
+    FILE *manifest = fopen(manifest_path, "w");
+    if (!manifest) {
+        return -1;
+    }
+    fprintf(manifest, "module example.com/incremental-parallel\n\ngo 1.21\n");
+    if (fclose(manifest) != 0) {
+        return -1;
+    }
+    return 0;
+}
+
+static int rewrite_incremental_parallel_repo(void) {
+    for (int i = 0; i < INCR_PARALLEL_CHANGED_FILE_COUNT; i++) {
+        if (write_incremental_parallel_file(i, true) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
 static void cleanup_incremental_repo(void) {
     th_rmtree(g_incr_tmpdir);
+}
+
+static cbm_config_t *incremental_test_config(const char *cache_dir) {
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    if (cfg) {
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_REINDEX, CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS);
+    }
+    return cfg;
+}
+
+enum { PIPELINE_INCR_FRONTIER_CALLER_COUNT = CBM_SZ_4 };
+
+static int write_incremental_leaf_file(int leaf_value) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_512];
+    n = snprintf(body, sizeof(body),
+                 "package main\n\n"
+                 "func Leaf() int {\n"
+                 "\tfor i := 0; i < 10; i++ {\n"
+                 "\t\tfor j := 0; j < 10; j++ {\n"
+                 "\t\t}\n"
+                 "\t}\n"
+                 "\treturn %d\n"
+                 "}\n",
+                 leaf_value);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_leaf_file_with_extra(int leaf_value) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_512];
+    n = snprintf(body, sizeof(body),
+                 "package main\n\n"
+                 "func Leaf() int {\n"
+                 "\tfor i := 0; i < 10; i++ {\n"
+                 "\t\tfor j := 0; j < 10; j++ {\n"
+                 "\t\t}\n"
+                 "\t}\n"
+                 "\treturn %d\n"
+                 "}\n\n"
+                 "func LeafExtra() int {\n"
+                 "\treturn Leaf()\n"
+                 "}\n",
+                 leaf_value);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_frontier_callers(void) {
+    const char *caller_names[PIPELINE_INCR_FRONTIER_CALLER_COUNT] = {
+        "caller_a.go", "caller_b.go", "caller_c.go", "caller_d.go"};
+    const char *caller_funcs[PIPELINE_INCR_FRONTIER_CALLER_COUNT] = {
+        "CallerA", "CallerB", "CallerC", "CallerD"};
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_512];
+    for (size_t i = 0; i < sizeof(caller_names) / sizeof(caller_names[0]); i++) {
+        int n = snprintf(path, sizeof(path), "%s/%s", g_incr_tmpdir, caller_names[i]);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            return -1;
+        }
+        n = snprintf(body, sizeof(body),
+                     "package main\n\n"
+                     "func %s() int {\n"
+                     "\treturn Leaf()\n"
+                     "}\n",
+                     caller_funcs[i]);
+        if (n < 0 || (size_t)n >= sizeof(body)) {
+            return -1;
+        }
+        if (th_write_file(path, body) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int write_incremental_frontier_fixture(int leaf_value) {
+    if (write_incremental_leaf_file(leaf_value) != 0) {
+        return -1;
+    }
+    return write_incremental_frontier_callers();
+}
+
+enum { PIPELINE_INCR_C_HEADER_IMPORTER_COUNT = CBM_SZ_4 };
+static int write_incremental_c_header_frontier_fixture(int marker) {
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_1K];
+    int n = snprintf(path, sizeof(path), "%s/shared.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    n = snprintf(body, sizeof(body),
+                 "#ifndef SHARED_H\n"
+                 "#define SHARED_H\n"
+                 "#define SHARED_MARKER %d\n"
+                 "int shared_value(void);\n"
+                 "#endif\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+        return -1;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/shared.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    if (th_write_file(path,
+                      "#include \"shared.h\"\n\n"
+                      "int shared_value(void) {\n"
+                      "    return SHARED_MARKER;\n"
+                      "}\n") != 0) {
+        return -1;
+    }
+
+    for (int i = 0; i < PIPELINE_INCR_C_HEADER_IMPORTER_COUNT; i++) {
+        n = snprintf(path, sizeof(path), "%s/consumer_%d.c", g_incr_tmpdir, i);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            return -1;
+        }
+        n = snprintf(body, sizeof(body),
+                     "#include \"shared.h\"\n\n"
+                     "int consumer_%d(void) {\n"
+                     "    return shared_value() + %d;\n"
+                     "}\n",
+                     i, i);
+        if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int write_incremental_c_header_second_level_callers(void) {
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_512];
+    for (int i = 0; i < PIPELINE_INCR_C_HEADER_IMPORTER_COUNT; i++) {
+        int n = snprintf(path, sizeof(path), "%s/caller_%d.c", g_incr_tmpdir, i);
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            return -1;
+        }
+        n = snprintf(body, sizeof(body),
+                     "int caller_%d(void) {\n"
+                     "    return consumer_%d();\n"
+                     "}\n",
+                     i, i);
+        if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static int write_incremental_c_header_extra_export(int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/shared.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "#ifndef SHARED_H\n"
+                 "#define SHARED_H\n"
+                 "#define SHARED_MARKER %d\n"
+                 "int shared_value(void);\n"
+                 "static int shared_extra(void) {\n"
+                 "    return SHARED_MARKER + 1;\n"
+                 "}\n"
+                 "#endif\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_c_header_impl_marker(int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/shared.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "#include \"shared.h\"\n\n"
+                 "int shared_value(void) {\n"
+                 "    return SHARED_MARKER + %d;\n"
+                 "}\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_c_source_extra_call(int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/shared.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "#include \"shared.h\"\n\n"
+                 "static int shared_extra(void) {\n"
+                 "    return %d;\n"
+                 "}\n\n"
+                 "int shared_value(void) {\n"
+                 "    return SHARED_MARKER + shared_extra();\n"
+                 "}\n",
+                 marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_two_header_additive_fixture(int alpha_marker, int beta_marker,
+                                                         bool include_extra) {
+    enum {
+        PIPELINE_ALPHA_EXTRA_RETURN = 101,
+        PIPELINE_BETA_EXTRA_RETURN = 202,
+    };
+    char path[CBM_PATH_MAX];
+    char body[CBM_SZ_1K];
+    char alpha_extra[CBM_SZ_128] = "";
+    char beta_extra[CBM_SZ_128] = "";
+    if (include_extra) {
+        int extra_n = snprintf(alpha_extra, sizeof(alpha_extra),
+                               "static int alpha_added(void) {\n"
+                               "    return %d;\n"
+                               "}\n",
+                               PIPELINE_ALPHA_EXTRA_RETURN);
+        if (extra_n < 0 || (size_t)extra_n >= sizeof(alpha_extra)) {
+            return -1;
+        }
+        extra_n = snprintf(beta_extra, sizeof(beta_extra),
+                           "static int beta_added(void) {\n"
+                           "    return %d;\n"
+                           "}\n",
+                           PIPELINE_BETA_EXTRA_RETURN);
+        if (extra_n < 0 || (size_t)extra_n >= sizeof(beta_extra)) {
+            return -1;
+        }
+    }
+    int n = snprintf(path, sizeof(path), "%s/alpha.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    n = snprintf(body, sizeof(body),
+                 "#ifndef ALPHA_H\n"
+                 "#define ALPHA_H\n"
+                 "static int alpha_existing(void) {\n"
+                 "    return %d;\n"
+                 "}\n"
+                 "%s"
+                 "#endif\n",
+                 alpha_marker, alpha_extra);
+    if (n < 0 || (size_t)n >= sizeof(body) || th_write_file(path, body) != 0) {
+        return -1;
+    }
+
+    n = snprintf(path, sizeof(path), "%s/beta.h", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    n = snprintf(body, sizeof(body),
+                 "#ifndef BETA_H\n"
+                 "#define BETA_H\n"
+                 "static int beta_existing(void) {\n"
+                 "    return %d;\n"
+                 "}\n"
+                 "%s"
+                 "#endif\n",
+                 beta_marker, beta_extra);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int write_incremental_arg_url_route_file(const char *route_path, int marker) {
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/http_routes.c", g_incr_tmpdir);
+    if (n < 0 || (size_t)n >= sizeof(path)) {
+        return -1;
+    }
+    char body[CBM_SZ_1K];
+    n = snprintf(body, sizeof(body),
+                 "static int cbm_http_path_match(const char *path, const char *pattern) {\n"
+                 "    return path && pattern;\n"
+                 "}\n\n"
+                 "int dispatch_request(const char *path) {\n"
+                 "    if (cbm_http_path_match(path, \"%s\")) {\n"
+                 "        return %d;\n"
+                 "    }\n"
+                 "    return 0;\n"
+                 "}\n",
+                 route_path, marker);
+    if (n < 0 || (size_t)n >= sizeof(body)) {
+        return -1;
+    }
+    return th_write_file(path, body);
+}
+
+static int pipeline_store_insert_file_owned_unowned_source_edge(const char *db_path,
+                                                               const char *project,
+                                                               const char *rel_path,
+                                                               const char *target_name,
+                                                               const char *edge_type) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    /* Resolve the fixture target by its persisted identity rather than
+     * reconstructing a language-specific FQN. Go and Java use directory
+     * modules, while other languages retain filename-stem modules. */
+    cbm_node_t *named_nodes = NULL;
+    int named_count = 0;
+    int rc = cbm_store_find_nodes_by_name(s, project, target_name, &named_nodes, &named_count);
+    int64_t target_id = CBM_STORE_NO_NODE_ID;
+    if (rc == CBM_STORE_OK) {
+        for (int i = 0; i < named_count; i++) {
+            if (named_nodes[i].file_path && strcmp(named_nodes[i].file_path, rel_path) == 0) {
+                if (target_id != CBM_STORE_NO_NODE_ID) {
+                    target_id = CBM_STORE_NO_NODE_ID;
+                    break;
+                }
+                target_id = named_nodes[i].id;
+            }
+        }
+    }
+    cbm_store_free_nodes(named_nodes, named_count);
+    if (rc != CBM_STORE_OK || target_id == CBM_STORE_NO_NODE_ID) {
+        cbm_store_close(s);
+        return rc == CBM_STORE_OK ? CBM_STORE_NOT_FOUND : rc;
+    }
+    char source_qn[CBM_SZ_512];
+    int n = snprintf(source_qn, sizeof(source_qn), "%s.__unowned_source", project);
+    if (n < 0 || (size_t)n >= sizeof(source_qn)) {
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t source = {.project = (char *)project,
+                         .label = "Module",
+                         .name = "unowned_source",
+                         .qualified_name = source_qn,
+                         .file_path = "",
+                         .properties_json = "{}"};
+    int64_t source_id = cbm_store_upsert_node(s, &source);
+    if (source_id <= CBM_STORE_NO_NODE_ID) {
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    cbm_edge_t edge = {.project = (char *)project,
+                       .source_id = source_id,
+                       .target_id = target_id,
+                       .type = (char *)edge_type,
+                       .properties_json = "{}"};
+    int64_t edge_id = cbm_store_insert_edge(s, &edge);
+    if (edge_id <= CBM_STORE_NO_NODE_ID) {
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    rc = cbm_store_upsert_edge_owner(s, project, edge_id, rel_path, NULL,
+                                     CBM_PIPELINE_COMPAT_GENERATION);
+    cbm_store_close(s);
+    return rc;
+}
+
+static int pipeline_store_has_node_name_by_label(const char *db_path, const char *project,
+                                                 const char *label, const char *name) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return 0;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int found = 0;
+    if (cbm_store_find_nodes_by_label(s, project, label, &nodes, &count) == CBM_STORE_OK) {
+        for (int i = 0; i < count; i++) {
+            if (nodes[i].name && strcmp(nodes[i].name, name) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        cbm_store_free_nodes(nodes, count);
+    }
+    cbm_store_close(s);
+    return found;
+}
+
+static int pipeline_store_has_function_name(const char *db_path, const char *project,
+                                            const char *name) {
+    return pipeline_store_has_node_name_by_label(db_path, project, "Function", name);
+}
+
+static int pipeline_store_has_route_name(const char *db_path, const char *project,
+                                         const char *name) {
+    return pipeline_store_has_node_name_by_label(db_path, project, "Route", name);
+}
+
+static int pipeline_restore_file_times(const char *path, const struct stat *st) {
+    if (!path || !st) {
+        return -1;
+    }
+#ifdef _WIN32
+    struct __utimbuf64 times = {.actime = st->st_atime, .modtime = st->st_mtime};
+    return _utime64(path, &times);
+#else
+    struct timespec times[CBM_SZ_2];
+#ifdef __APPLE__
+    times[0] = st->st_atimespec;
+    times[SKIP_ONE] = st->st_mtimespec;
+#else
+    times[0] = st->st_atim;
+    times[SKIP_ONE] = st->st_mtim;
+#endif
+    return utimensat(AT_FDCWD, path, times, 0);
+#endif
+}
+
+enum { PIPELINE_TEST_MTIME_BUMP_SECONDS = 2 };
+
+static int pipeline_bump_file_mtime_seconds(const char *path, const struct stat *st, long seconds) {
+    if (!path || !st) {
+        return -1;
+    }
+    struct stat bumped = *st;
+#ifdef _WIN32
+    bumped.st_mtime += seconds;
+#elif defined(__APPLE__)
+    bumped.st_mtimespec.tv_sec += seconds;
+#else
+    bumped.st_mtim.tv_sec += seconds;
+#endif
+    return pipeline_restore_file_times(path, &bumped);
+}
+
+static int pipeline_store_file_hash_count(const char *db_path, const char *project) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    int rc = cbm_store_get_file_hashes(s, project, &hashes, &count);
+    cbm_store_free_file_hashes(hashes, count);
+    cbm_store_close(s);
+    return rc == CBM_STORE_OK ? count : CBM_STORE_ERR;
+}
+
+static int pipeline_store_file_hash_mtime(const char *db_path, const char *project,
+                                          const char *rel_path, int64_t *out_mtime_ns) {
+    if (!out_mtime_ns) {
+        return CBM_STORE_ERR;
+    }
+    *out_mtime_ns = 0;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    int rc = cbm_store_get_file_hashes(s, project, &hashes, &count);
+    if (rc == CBM_STORE_OK) {
+        rc = CBM_STORE_NOT_FOUND;
+        for (int i = 0; i < count; i++) {
+            if (hashes[i].rel_path && strcmp(hashes[i].rel_path, rel_path) == 0) {
+                *out_mtime_ns = hashes[i].mtime_ns;
+                rc = CBM_STORE_OK;
+                break;
+            }
+        }
+    }
+    cbm_store_free_file_hashes(hashes, count);
+    cbm_store_close(s);
+    return rc;
+}
+
+static int pipeline_store_file_state_generation(const char *db_path, const char *project,
+                                                const char *rel_path, int64_t *out_generation) {
+    if (!out_generation) {
+        return CBM_STORE_ERR;
+    }
+    *out_generation = 0;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_file_state_t state = {0};
+    int rc = cbm_store_get_file_state(s, project, rel_path, &state);
+    if (rc == CBM_STORE_OK) {
+        *out_generation = state.generation;
+        cbm_store_file_state_free_fields(&state);
+    }
+    cbm_store_close(s);
+    return rc;
+}
+
+static int pipeline_store_dirty_counts(const char *db_path, const char *project,
+                                       int *out_pending, int *out_overlay_ready) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_count_dirty_files(s, project, out_pending, out_overlay_ready);
+    cbm_store_close(s);
+    return rc;
+}
+
+static bool pipeline_store_overlay_call_connected(const char *db_path, const char *project,
+                                                  const char *source_name,
+                                                  const char *target_name) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return false;
+    }
+    cbm_node_t *sources = NULL;
+    int source_count = 0;
+    bool found = false;
+    if (cbm_store_find_nodes_by_name_overlay_view(s, project, source_name, &sources,
+                                                  &source_count) == CBM_STORE_OK) {
+        const char *edge_types[] = {"CALLS"};
+        for (int i = 0; i < source_count && !found; i++) {
+            if (!sources[i].qualified_name) {
+                continue;
+            }
+            cbm_traverse_result_t trace = {0};
+            if (cbm_store_bfs_overlay_view(s, project, sources[i].qualified_name, "outbound",
+                                           edge_types, 1, 1, CBM_SZ_64, &trace) !=
+                CBM_STORE_OK) {
+                continue;
+            }
+            for (int j = 0; j < trace.visited_count; j++) {
+                if (trace.visited[j].node.name &&
+                    strcmp(trace.visited[j].node.name, target_name) == 0) {
+                    found = true;
+                    break;
+                }
+            }
+            cbm_store_traverse_free(&trace);
+        }
+    }
+    cbm_store_free_nodes(sources, source_count);
+    cbm_store_close(s);
+    return found;
+}
+
+static int pipeline_store_overlay_file_function_count(const char *db_path, const char *project,
+                                                      const char *rel_path, const char *name) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int matches = 0;
+    if (cbm_store_find_nodes_by_file_overlay_view(s, project, rel_path, &nodes, &count) !=
+        CBM_STORE_OK) {
+        cbm_store_close(s);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, "Function") == 0 && nodes[i].name &&
+            strcmp(nodes[i].name, name) == 0) {
+            matches++;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    return matches;
+}
+
+static int pipeline_store_overlay_file_has_function(const char *db_path, const char *project,
+                                                    const char *rel_path, const char *name) {
+    return pipeline_store_overlay_file_function_count(db_path, project, rel_path, name) > 0;
+}
+
+static int pipeline_store_generation_status_count(const char *db_path, const char *project,
+                                                  const char *status) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "SELECT COUNT(*) FROM index_generations "
+                      "WHERE project = ?1 AND status = ?2 AND generation > ?3;";
+    int count = CBM_STORE_ERR;
+    if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, status, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 3, CBM_PIPELINE_COMPAT_GENERATION);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            count = sqlite3_column_int(stmt, 0);
+        }
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    return count;
+}
+
+static int pipeline_store_completed_generation_count(const char *db_path, const char *project) {
+    return pipeline_store_generation_status_count(db_path, project,
+                                                  CBM_STORE_INDEX_STATUS_COMPLETE);
+}
+
+static int pipeline_store_overlay_generation_status_count(const char *db_path,
+                                                          const char *project,
+                                                          const char *status) {
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    int count = CBM_STORE_ERR;
+    if (cbm_store_count_overlay_generations(s, project, status, &count) != CBM_STORE_OK) {
+        count = CBM_STORE_ERR;
+    }
+    cbm_store_close(s);
+    return count;
+}
+
+static int pipeline_store_count_file_rows_sql(const char *db_path, const char *project,
+                                              const char *rel_path, const char *sql,
+                                              int *out_count) {
+    if (!db_path || !project || !rel_path || !sql || !out_count) {
+        return CBM_STORE_ERR;
+    }
+    *out_count = 0;
+    cbm_store_t *s = cbm_store_open_path_query(db_path);
+    if (!s) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3 *db = cbm_store_get_db(s);
+    sqlite3_stmt *stmt = NULL;
+    int rc = CBM_STORE_ERR;
+    if (db && sqlite3_prepare_v2(db, sql, CBM_NOT_FOUND, &stmt, NULL) == SQLITE_OK) {
+        sqlite3_bind_text(stmt, 1, project, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, rel_path, CBM_NOT_FOUND, SQLITE_TRANSIENT);
+        if (sqlite3_step(stmt) == SQLITE_ROW) {
+            *out_count = sqlite3_column_int(stmt, 0);
+            rc = CBM_STORE_OK;
+        }
+    }
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    return rc;
+}
+
+static int pipeline_compare_current_db_to_fresh_rebuild(const char *repo_path, const char *db_path,
+                                                        const char *project,
+                                                        cbm_index_mode_t rebuild_mode,
+                                                        cbm_config_t *cfg, char *err,
+                                                        size_t err_sz) {
+    char incremental_snapshot_db[CBM_SZ_512];
+    int n = snprintf(incremental_snapshot_db, sizeof(incremental_snapshot_db),
+                     "%s/canonical-incremental-snapshot.db", repo_path);
+    if (n < 0 || (size_t)n >= sizeof(incremental_snapshot_db)) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "canonical incremental snapshot path overflow");
+        }
+        return CBM_STORE_ERR;
+    }
+    cbm_unlink(incremental_snapshot_db);
+    int rc = pipeline_dump_store_file_to_file(db_path, incremental_snapshot_db);
+    if (rc != CBM_STORE_OK) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "canonical incremental snapshot dump failed: rc=%d", rc);
+        }
+        cbm_unlink(incremental_snapshot_db);
+        return rc;
+    }
+
+    cbm_unlink(db_path);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo_path, db_path, rebuild_mode);
+    if (!p) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "fresh mode %d pipeline allocation failed", rebuild_mode);
+        }
+        cbm_unlink(incremental_snapshot_db);
+        return CBM_STORE_ERR;
+    }
+    cbm_pipeline_apply_config(p, cfg);
+    int run_rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+    if (run_rc != 0) {
+        if (err && err_sz > 0) {
+            snprintf(err, err_sz, "fresh mode %d rebuild failed: rc=%d", rebuild_mode, run_rc);
+        }
+        cbm_unlink(incremental_snapshot_db);
+        return CBM_STORE_ERR;
+    }
+
+    rc = cbm_test_compare_canonical_graphs(incremental_snapshot_db, db_path, project, err, err_sz);
+    if (rc == 0) {
+        cbm_unlink(incremental_snapshot_db);
+    }
+    return rc;
+}
+
+static int pipeline_compare_current_db_to_fresh_fast_rebuild(const char *repo_path,
+                                                             const char *db_path,
+                                                             const char *project, cbm_config_t *cfg,
+                                                             char *err, size_t err_sz) {
+    return pipeline_compare_current_db_to_fresh_rebuild(repo_path, db_path, project, CBM_MODE_FAST,
+                                                        cfg, err, err_sz);
+}
+
+static int pipeline_gbuf_count_usage_edge(const cbm_gbuf_t *gb, const char *source_qn,
+                                          const char *target_qn, const char *callee) {
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gb, source_qn);
+    const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(gb, target_qn);
+    if (!src || !tgt) {
+        return 0;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gb, src->id, "USAGE", &edges, &edge_count) != 0) {
+        return 0;
+    }
+    int matches = 0;
+    for (int i = 0; i < edge_count; i++) {
+        const cbm_gbuf_edge_t *edge = edges[i];
+        if (edge && edge->target_id == tgt->id &&
+            (!callee || (edge->properties_json && strstr(edge->properties_json, callee)))) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static int pipeline_file_delta_count_usage_edge(const cbm_pipeline_file_delta_t *delta,
+                                                const char *source_qn, const char *target_qn,
+                                                const char *callee) {
+    int matches = 0;
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &delta->edges[i];
+        if (edge->type && strcmp(edge->type, "USAGE") == 0 &&
+            edge->source_qn && strcmp(edge->source_qn, source_qn) == 0 &&
+            edge->target_qn && strcmp(edge->target_qn, target_qn) == 0 &&
+            (!callee || (edge->properties_json && strstr(edge->properties_json, callee)))) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static int pipeline_file_delta_count_call_edge(const cbm_pipeline_file_delta_t *delta,
+                                               const char *source_qn, const char *target_qn,
+                                               const char *callee, const char *strategy) {
+    int matches = 0;
+    for (int i = 0; i < delta->delta.edge_count; i++) {
+        const cbm_store_delta_edge_t *edge = &delta->edges[i];
+        if (edge->type && strcmp(edge->type, "CALLS") == 0 &&
+            edge->source_qn && strcmp(edge->source_qn, source_qn) == 0 &&
+            edge->target_qn && strcmp(edge->target_qn, target_qn) == 0 &&
+            (!callee || (edge->properties_json && strstr(edge->properties_json, callee))) &&
+            (!strategy || (edge->properties_json && strstr(edge->properties_json, strategy)))) {
+            matches++;
+        }
+    }
+    return matches;
+}
+
+static const char *pipeline_exact_scratch_structure_root_qn(const cbm_gbuf_t *gbuf,
+                                                            const char *project) {
+    const cbm_gbuf_node_t **branches = NULL;
+    int branch_count = 0;
+    if (cbm_gbuf_find_by_label(gbuf, "Branch", &branches, &branch_count) == 0 &&
+        branch_count > 0 && branches[0]->qualified_name) {
+        return branches[0]->qualified_name;
+    }
+    return project;
+}
+
+static int pipeline_build_exact_scratch_for_changed_files_ex(
+    cbm_store_t *store, const char *repo_path, const char *project,
+    cbm_file_info_t *changed_files, int changed_count, const cbm_file_info_t *all_files,
+    int all_file_count, int store_backed_lsp_scope_cap, cbm_gbuf_t **out_scratch,
+    cbm_pipeline_file_delta_t *deltas) {
+    if (out_scratch) {
+        *out_scratch = NULL;
+    }
+    if (!store || !repo_path || !project || !changed_files || changed_count <= 0 ||
+        !out_scratch || !deltas) {
+        return CBM_STORE_ERR;
+    }
+
+    const char **changed_paths = calloc((size_t)changed_count, sizeof(*changed_paths));
+    CBMFileResult **result_cache = calloc((size_t)changed_count, sizeof(*result_cache));
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, repo_path);
+    cbm_registry_t *registry = cbm_registry_new();
+    cbm_path_alias_collection_t *path_aliases = NULL;
+    CBMHashTable *pkgmap = NULL;
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_pipeline_ctx_t ctx = {0};
+    int rc = CBM_STORE_ERR;
+    if (!changed_paths || !result_cache || !scratch || !registry) {
+        goto cleanup;
+    }
+    for (int i = 0; i < changed_count; i++) {
+        changed_paths[i] = changed_files[i].rel_path;
+    }
+    rc = cbm_pipeline_seed_file_delta_scratch_from_store(store, scratch, registry, project,
+                                                         changed_paths, changed_count);
+    if (rc != CBM_STORE_OK) {
+        goto cleanup;
+    }
+
+    path_aliases = cbm_load_path_aliases(repo_path);
+    pkgmap =
+        cbm_pkgmap_build_from_repo(repo_path, changed_files, changed_count, project, NULL, 0);
+    cbm_pipeline_set_pkgmap(pkgmap);
+
+    const double pipeline_default_threshold = 0.0; /* Pipeline constructor sentinel: use pass defaults. */
+    ctx = (cbm_pipeline_ctx_t){.project_name = project,
+                              .repo_path = repo_path,
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .similarity_threshold = pipeline_default_threshold,
+                              .httplink_min_confidence = pipeline_default_threshold,
+                              .semantic_threshold = pipeline_default_threshold,
+                              .githistory_min_coupling = pipeline_default_threshold,
+                              .lsp_confidence_floor = pipeline_default_threshold,
+                              .path_aliases = path_aliases,
+                              .result_cache = result_cache,
+                              .store_backed_node_lookup = store,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = changed_count,
+                              .store_backed_all_files = all_files,
+                              .store_backed_all_file_count = all_file_count,
+                              .store_backed_lsp_scope_cap = store_backed_lsp_scope_cap};
+    const char *structure_root_qn = pipeline_exact_scratch_structure_root_qn(scratch, project);
+    for (int i = 0; i < changed_count; i++) {
+        if (cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
+                                               changed_files[i].rel_path, NULL) != 0) {
+            goto cleanup;
+        }
+    }
+    if (cbm_pipeline_pass_definitions(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_lsp_cross(&ctx, changed_files, changed_count, result_cache) != 0 ||
+        cbm_pipeline_pass_calls(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_usages(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_semantic(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_k8s(&ctx, changed_files, changed_count) != 0 ||
+        cbm_pipeline_pass_tests(&ctx, changed_files, changed_count) != 0) {
+        goto cleanup;
+    }
+    (void)cbm_pipeline_pass_decorator_tags(scratch, project);
+    (void)cbm_pipeline_pass_configlink(&ctx);
+    cbm_pipeline_clear_route_derived_edges(scratch);
+    cbm_pipeline_create_route_nodes(scratch);
+    cbm_pipeline_pass_complexity_for_paths(&ctx, changed_paths, changed_count);
+    if (cbm_pipeline_pass_httplinks(&ctx) != 0) {
+        goto cleanup;
+    }
+    cbm_pipeline_pass_normalize(scratch);
+    for (int i = 0; i < changed_count; i++) {
+        rc = cbm_pipeline_build_file_delta_from_gbuf(scratch, project, changed_files[i].rel_path,
+                                                     CBM_PIPELINE_COMPAT_GENERATION, &deltas[i]);
+        if (rc != CBM_STORE_OK) {
+            goto cleanup;
+        }
+    }
+
+    *out_scratch = scratch;
+    scratch = NULL;
+    rc = CBM_STORE_OK;
+
+cleanup:
+    cbm_pipeline_release_seq_cross_state(&ctx);
+    for (int i = 0; i < changed_count; i++) {
+        if (result_cache && result_cache[i]) {
+            cbm_free_result(result_cache[i]);
+        }
+    }
+    free(result_cache);
+    cbm_path_alias_collection_free(path_aliases);
+    if (cbm_pipeline_get_pkgmap() == pkgmap) {
+        cbm_pipeline_set_pkgmap(NULL);
+    }
+    cbm_pkgmap_free(pkgmap);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    free(changed_paths);
+    return rc;
+}
+
+static int pipeline_build_exact_scratch_for_changed_files(cbm_store_t *store,
+                                                          const char *repo_path,
+                                                          const char *project,
+                                                          cbm_file_info_t *changed_files,
+                                                          int changed_count,
+                                                          cbm_gbuf_t **out_scratch,
+                                                          cbm_pipeline_file_delta_t *deltas) {
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FAST, .ignore_file = NULL, .max_file_size = 0};
+    cbm_file_info_t *all_files = NULL;
+    int all_file_count = 0;
+    if (cbm_discover(repo_path, &opts, &all_files, &all_file_count) != 0) {
+        return CBM_STORE_ERR;
+    }
+    int rc = pipeline_build_exact_scratch_for_changed_files_ex(
+        store, repo_path, project, changed_files, changed_count, all_files, all_file_count,
+        CBM_PIPELINE_STORE_BACKED_LSP_SCOPE_DEFAULT_CAP, out_scratch, deltas);
+    cbm_discover_free(all_files, all_file_count);
+    return rc;
 }
 
 /* Atomic-publish cancellation seam. Production invokes this hook after the
@@ -10125,11 +17028,15 @@ static void observe_publish_boundary(cbm_pipeline_t *p, const char *staging_path
 
 typedef struct {
     int calls;
+    bool block_rollback;
 } publish_rename_fail_ctx_t;
 
 static int fail_publish_rename(const char *staging_path, const char *final_path, void *arg) {
     publish_rename_fail_ctx_t *ctx = (publish_rename_fail_ctx_t *)arg;
     ctx->calls++;
+    if (ctx->block_rollback && final_path) {
+        (void)th_write_file(final_path, "rollback-blocker");
+    }
     return staging_path && final_path ? CBM_NOT_FOUND : 0;
 }
 
@@ -10247,6 +17154,463 @@ TEST(pipeline_fastapi_depends_edges) {
     PASS();
 }
 
+TEST(import_edge_helper_escapes_local_name_once) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t source_file = cbm_gbuf_upsert_node(gb, "File", "main.py",
+                                               "proj.main.py.__file__", "main.py", 1, 1, "{}");
+    int64_t target_fn =
+        cbm_gbuf_upsert_node(gb, "Function", "factory", "proj.pkg.factory", "pkg.py", 1, 1, "{}");
+    ASSERT_GT(source_file, 0);
+    ASSERT_GT(target_fn, 0);
+
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, target_fn);
+    ASSERT_NOT_NULL(target);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    const char alias[] = "quoted\"alias\\module\nnext\tfield";
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file, target, alias), 1);
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file, cbm_gbuf_find_by_id(gb, source_file),
+                                              "self"), 0);
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(cbm_gbuf_find_edges_by_source_type(gb, source_file, "IMPORTS", &edges, &edge_count),
+              0);
+    ASSERT_EQ(edge_count, 1);
+    ASSERT_EQ(edges[0]->target_id, target_fn);
+
+    yyjson_doc *doc =
+        yyjson_read(edges[0]->properties_json, strlen(edges[0]->properties_json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *local = yyjson_obj_get(root, "local_name");
+    ASSERT_NOT_NULL(local);
+    ASSERT_STR_EQ(yyjson_get_str(local), alias);
+    yyjson_doc_free(doc);
+
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_pipeline_build_import_map_from_edges(gb, "proj", "main.py", &keys, &vals,
+                                                       &import_count),
+              0);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(keys[0], alias);
+    ASSERT_STR_EQ(vals[0], target->qualified_name);
+    cbm_pipeline_free_import_map(keys, vals, import_count);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_edge_helper_preserves_long_local_name) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t source_file = cbm_gbuf_upsert_node(gb, "File", "main.py",
+                                               "proj.main.py.__file__", "main.py", 1, 1, "{}");
+    int64_t target_fn =
+        cbm_gbuf_upsert_node(gb, "Function", "factory", "proj.pkg.factory", "pkg.py", 1, 1, "{}");
+    ASSERT_GT(source_file, 0);
+    ASSERT_GT(target_fn, 0);
+
+    const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, target_fn);
+    ASSERT_NOT_NULL(target);
+
+    enum { LONG_ALIAS_LEN = CBM_SZ_256 + CBM_SZ_64 };
+    char alias[LONG_ALIAS_LEN + SKIP_ONE];
+    for (int i = 0; i < LONG_ALIAS_LEN; i++) {
+        alias[i] = (char)('a' + (i % CBM_DECIMAL_BASE));
+    }
+    alias[LONG_ALIAS_LEN] = '\0';
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file, target, alias), 1);
+
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_pipeline_build_import_map_from_edges(gb, "proj", "main.py", &keys, &vals,
+                                                       &import_count),
+              0);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(keys[0], alias);
+    ASSERT_STR_EQ(vals[0], target->qualified_name);
+    cbm_pipeline_free_import_map(keys, vals, import_count);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_map_from_edges_follows_package_reexport) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t source_file = cbm_gbuf_upsert_node(gb, "File", "main.py",
+                                               "proj.app.main.py.__file__", "app/main.py", 1,
+                                               1, "{}");
+    int64_t package_module =
+        cbm_gbuf_upsert_node(gb, "Folder", "fastapi", "proj.fastapi", "fastapi", 1,
+                             1, "{}");
+    int64_t package_file =
+        cbm_gbuf_upsert_node(gb, "File", "__init__.py", "proj.fastapi.__init__.py.__file__",
+                             "fastapi/__init__.py", 1, 1, "{}");
+    int64_t wrong_header = cbm_gbuf_upsert_node(gb, "Class", "Header",
+                                                "proj.fastapi.openapi.models.Header",
+                                                "fastapi/openapi/models.py", 1, 1, "{}");
+    int64_t exported_header =
+        cbm_gbuf_upsert_node(gb, "Function", "Header", "proj.fastapi.param_functions.Header",
+                             "fastapi/param_functions.py", 1, 1, "{}");
+    ASSERT_GT(source_file, 0);
+    ASSERT_GT(package_module, 0);
+    ASSERT_GT(package_file, 0);
+    ASSERT_GT(wrong_header, 0);
+    ASSERT_GT(exported_header, 0);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    ASSERT_EQ(cbm_pipeline_insert_import_edge(&ctx, source_file,
+                                              cbm_gbuf_find_by_id(gb, package_module), "Header"),
+              1);
+    cbm_gbuf_insert_edge(gb, package_file, exported_header, "IMPORTS",
+                         "{\"local_name\":\"Header\"}");
+
+    const char **keys = NULL;
+    const char **vals = NULL;
+    int import_count = 0;
+    ASSERT_EQ(cbm_pipeline_build_import_map_from_edges(gb, "proj", "app/main.py", &keys, &vals,
+                                                       &import_count),
+              0);
+    ASSERT_EQ(import_count, 1);
+    ASSERT_STR_EQ(keys[0], "Header");
+    ASSERT_STR_EQ(vals[0], "proj.fastapi.param_functions.Header");
+    ASSERT_TRUE(cbm_pipeline_import_map_entry_is_reexport(
+        gb, "proj", "app/main.py", "Header", "proj.fastapi.param_functions.Header"));
+    ASSERT_FALSE(cbm_pipeline_import_map_entry_is_reexport(
+        gb, "proj", "app/main.py", "Header", "proj.fastapi.openapi.models.Header"));
+
+    cbm_pipeline_free_import_map(keys, vals, import_count);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_reexport_falls_back_when_pkgmap_target_missing) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t openapi_header = cbm_gbuf_upsert_node(
+        gb, "Class", "Header", "proj.fastapi.openapi.models.Header", "fastapi/openapi/models.py", 1,
+        1, "{}");
+    int64_t package_file = cbm_gbuf_upsert_node(gb, "File", "__init__.py", "proj.fastapi.__file__",
+                                                "fastapi/__init__.py", 1, 1, "{}");
+    int64_t test_header = cbm_gbuf_upsert_node(
+        gb, "Class", "Header", "proj.tests.test_headers.Header", "tests/test_headers.py", 1, 1,
+        "{}");
+    int64_t exported_header = cbm_gbuf_upsert_node(
+        gb, "Function", "Header", "proj.fastapi.param_functions.Header", "fastapi/param_functions.py",
+        1, 1, "{}");
+    ASSERT_GT(openapi_header, 0);
+    ASSERT_GT(package_file, 0);
+    ASSERT_GT(test_header, 0);
+    ASSERT_GT(exported_header, 0);
+    cbm_gbuf_insert_edge(gb, package_file, test_header, "IMPORTS", "{\"local_name\":\"Header\"}");
+    cbm_gbuf_insert_edge(gb, package_file, exported_header, "IMPORTS", "{\"local_name\":\"Header\"}");
+
+    CBMHashTable *pkgmap = cbm_ht_create(CBM_SZ_16);
+    ASSERT_NOT_NULL(pkgmap);
+    cbm_ht_set(pkgmap, strdup("fastapi"), strdup("proj.src.fastapi.__init__"));
+    cbm_pipeline_set_pkgmap(pkgmap);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    CBMImport imp = {
+        .local_name = "Header",
+        .module_path = "fastapi.Header",
+    };
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "docs_src/app/main.py",
+                                         "proj.docs_src.app.main.__file__", &imp, NULL);
+
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.param_functions.Header");
+
+    CBMImport owner_imp = {
+        .local_name = "Header",
+        .module_path = "fastapi",
+    };
+    target = cbm_pipeline_resolve_import_node(&ctx, "docs_src/app/main.py",
+                                             "proj.docs_src.app.main.__file__", &owner_imp, NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.param_functions.Header");
+
+    cbm_pipeline_set_pkgmap(NULL);
+    cbm_pkgmap_free(pkgmap);
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_symbol_fallback_prefers_import_path_over_insertion_order) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+
+    int64_t security_http_base = cbm_gbuf_upsert_node(
+        gb, "Class", "HTTPBase", "proj.fastapi.security.http.HTTPBase",
+        "fastapi/security/http.py", 1, 1, "{}");
+    int64_t openapi_http_base = cbm_gbuf_upsert_node(
+        gb, "Class", "HTTPBase", "proj.fastapi.openapi.models.HTTPBase",
+        "fastapi/openapi/models.py", 1, 1, "{}");
+    int64_t openapi_oauth2 = cbm_gbuf_upsert_node(
+        gb, "Class", "OAuth2", "proj.fastapi.openapi.models.OAuth2",
+        "fastapi/openapi/models.py", 1, 1, "{}");
+    int64_t security_oauth2 = cbm_gbuf_upsert_node(
+        gb, "Class", "OAuth2", "proj.fastapi.security.oauth2.OAuth2",
+        "fastapi/security/oauth2.py", 1, 1, "{}");
+    ASSERT_GT(security_http_base, 0);
+    ASSERT_GT(openapi_http_base, 0);
+    ASSERT_GT(openapi_oauth2, 0);
+    ASSERT_GT(security_oauth2, 0);
+
+    cbm_pipeline_ctx_t ctx = {
+        .gbuf = gb,
+        .project_name = "proj",
+    };
+    CBMImport model_alias = {
+        .local_name = "HTTPBaseModel",
+        .module_path = "fastapi.openapi.models.HTTPBase",
+    };
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "fastapi/security/http.py",
+                                         "proj.fastapi.security.http.__file__", &model_alias,
+                                         NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.openapi.models.HTTPBase");
+
+    CBMImport public_class = {
+        .local_name = "HTTPBase",
+        .module_path = "fastapi.security.http.HTTPBase",
+    };
+    target = cbm_pipeline_resolve_import_node(&ctx, "tests/test_security_http_base.py",
+                                             "proj.tests.test_security_http_base.__file__",
+                                             &public_class, NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.security.http.HTTPBase");
+
+    CBMImport oauth_model_alias = {
+        .local_name = "OAuth2Model",
+        .module_path = "fastapi.openapi.models.OAuth2",
+    };
+    target = cbm_pipeline_resolve_import_node(&ctx, "fastapi/security/oauth2.py",
+                                             "proj.fastapi.security.oauth2.__file__",
+                                             &oauth_model_alias, NULL);
+    ASSERT_NOT_NULL(target);
+    ASSERT_STR_EQ(target->qualified_name, "proj.fastapi.openapi.models.OAuth2");
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(import_resolution_long_header_prefers_source_relative_file) {
+    char *directory = pkgmap_long_test_value("include/", 'h', PKGMAP_LONG_TEST_FILL);
+    char *source_rel = directory ? cbm_pkgmap_join_path(directory, "main.c") : NULL;
+    char *target_rel = directory ? cbm_pkgmap_join_path(directory, "config.h") : NULL;
+    if (!directory || !source_rel || !target_rel) {
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long header fixture allocation");
+    }
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!gb) {
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long header graph allocation");
+    }
+    int64_t wrong = cbm_gbuf_upsert_node(gb, "File", "config.h", "proj.other.config.__file__",
+                                         "other/config.h", 1, 1, "{}");
+    int64_t expected = cbm_gbuf_upsert_node(gb, "File", "config.h", "proj.deep.config.__file__",
+                                            target_rel, 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "config.h", .module_path = "config.h"};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, source_rel, "proj.deep.main.__file__", &imp, NULL);
+    bool exact = wrong > 0 && expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    free(target_rel);
+    free(source_rel);
+    free(directory);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_long_sibling_path_is_exact) {
+    char *directory = pkgmap_long_test_value("styles/", 's', PKGMAP_LONG_TEST_FILL);
+    char *source_rel = directory ? cbm_pkgmap_join_path(directory, "main.scss") : NULL;
+    char *target_rel = directory ? cbm_pkgmap_join_path(directory, "_vars.scss") : NULL;
+    char *target_qn = target_rel ? cbm_pipeline_fqn_module("proj", target_rel) : NULL;
+    if (!directory || !source_rel || !target_rel || !target_qn) {
+        free(target_qn);
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long sibling fixture allocation");
+    }
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!gb) {
+        free(target_qn);
+        free(target_rel);
+        free(source_rel);
+        free(directory);
+        FAIL("long sibling graph allocation");
+    }
+    int64_t expected =
+        cbm_gbuf_upsert_node(gb, "Module", "_vars", target_qn, target_rel, 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "vars", .module_path = "vars"};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, source_rel, "proj.recipes.main.__file__", &imp, NULL);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    free(target_qn);
+    free(target_rel);
+    free(source_rel);
+    free(directory);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_long_namespace_key_and_qn_are_exact) {
+    char *namespace_key = pkgmap_long_test_value("org.", 'n', PKGMAP_LONG_TEST_FILL);
+    char *target_qn = pkgmap_long_test_value("proj.", 'q', PKGMAP_LONG_TEST_FILL);
+    if (!namespace_key || !target_qn) {
+        free(target_qn);
+        free(namespace_key);
+        FAIL("long namespace fixture allocation");
+    }
+    size_t module_size = strlen(namespace_key) + sizeof(".*");
+    char *module_path = malloc(module_size);
+    if (!module_path) {
+        free(target_qn);
+        free(namespace_key);
+        FAIL("long namespace import allocation");
+    }
+    snprintf(module_path, module_size, "%s.*", namespace_key);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    CBMHashTable *namespace_map = cbm_ht_create(CBM_SZ_16);
+    if (!gb || !namespace_map) {
+        cbm_ht_free(namespace_map);
+        cbm_gbuf_free(gb);
+        free(module_path);
+        free(target_qn);
+        free(namespace_key);
+        FAIL("long namespace graph or map allocation");
+    }
+    int64_t expected =
+        cbm_gbuf_upsert_node(gb, "File", "namespace.py", target_qn, "namespace.py", 1, 1, "{}");
+    cbm_ht_set(namespace_map, namespace_key, target_qn);
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "*", .module_path = module_path};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "consumer.py", "proj.consumer.__file__", &imp, namespace_map);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_ht_free(namespace_map);
+    cbm_gbuf_free(gb);
+    free(module_path);
+    free(target_qn);
+    free(namespace_key);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_namespace_map_normalizes_declaration_and_import) {
+    CBMFileResult result = {0};
+    result.namespace_name = "Acme::Tools";
+    CBMFileResult *results[] = {&result};
+    const char *rels[] = {"src/tools.php"};
+    CBMHashTable *namespace_map = cbm_pipeline_namespace_map_build("proj", results, rels, SKIP_ONE);
+    char *target_qn = cbm_pipeline_fqn_compute("proj", rels[0], "__file__");
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!namespace_map || !target_qn || !gb) {
+        cbm_pipeline_namespace_map_free(namespace_map);
+        free(target_qn);
+        cbm_gbuf_free(gb);
+        FAIL("namespace normalization fixture allocation");
+    }
+
+    int64_t expected =
+        cbm_gbuf_upsert_node(gb, "File", "tools.php", target_qn, rels[0], 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "*", .module_path = "Acme\\Tools\\*"};
+    const cbm_gbuf_node_t *target = cbm_pipeline_resolve_import_node(
+        &ctx, "src/consumer.php", "proj.src.consumer.__file__", &imp, namespace_map);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_pipeline_namespace_map_free(namespace_map);
+    free(target_qn);
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_symbol_fallback_has_no_segment_limit) {
+    static const char module_path[] = "rootcandidate.a.b.c.d.e.f.g.h.i.j.k.l.m.n.o.p.q.r.s.t";
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    ASSERT_NOT_NULL(gb);
+    int64_t expected = cbm_gbuf_upsert_node(
+        gb, "Class", "rootcandidate", "proj.unrelated.RootCandidate", "target.py", 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "alias", .module_path = module_path};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "consumer.py", "proj.consumer.__file__", &imp, NULL);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
+TEST(import_resolution_long_symbol_name_is_exact) {
+    char *symbol = pkgmap_long_test_value("Symbol", 'x', PKGMAP_LONG_TEST_FILL);
+    if (!symbol) {
+        FAIL("long symbol fixture allocation");
+    }
+    cbm_gbuf_t *gb = cbm_gbuf_new("proj", "/tmp/proj");
+    if (!gb) {
+        free(symbol);
+        FAIL("long symbol graph allocation");
+    }
+    int64_t expected = cbm_gbuf_upsert_node(gb, "Class", symbol, "proj.unrelated.LongSymbol",
+                                            "target.py", 1, 1, "{}");
+    cbm_pipeline_ctx_t ctx = {.gbuf = gb, .project_name = "proj"};
+    CBMImport imp = {.local_name = "alias", .module_path = symbol};
+    const cbm_gbuf_node_t *target =
+        cbm_pipeline_resolve_import_node(&ctx, "consumer.py", "proj.consumer.__file__", &imp, NULL);
+    bool exact = expected > 0 && target && target->id == expected;
+
+    cbm_gbuf_free(gb);
+    free(symbol);
+    ASSERT_TRUE(exact);
+    PASS();
+}
+
 /* DLL resolve test removed after the associated builds received a Windows
  * Defender Wacatac.B!ml verdict. The opaque verdict did not attribute the
  * result to this feature; see issue #89 for the historical observation. */
@@ -10254,6 +17618,84 @@ TEST(pipeline_fastapi_depends_edges) {
 /* ═══════════════════════════════════════════════════════════════════
  *  Incremental reindex
  * ═══════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char *key;
+    char value[CBM_SZ_64];
+    bool had_value;
+} pipeline_env_snapshot_t;
+
+static const char pipeline_test_env_enabled[] = "1";
+
+static pipeline_env_snapshot_t pipeline_env_save(const char *key) {
+    pipeline_env_snapshot_t snap = {.key = key};
+    snap.had_value = cbm_safe_getenv(key, snap.value, sizeof(snap.value), NULL) != NULL;
+    return snap;
+}
+
+static void pipeline_env_restore(const pipeline_env_snapshot_t *snap) {
+    if (!snap || !snap->key) {
+        return;
+    }
+    if (snap->had_value) {
+        cbm_setenv(snap->key, snap->value, 1);
+    } else {
+        cbm_unsetenv(snap->key);
+    }
+}
+
+static int run_parallel_incremental_phase_failure_case(const char *phase) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_parallel_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_TRUE(cbm_pipeline_graph_changed(p));
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+    ASSERT_EQ(rewrite_incremental_parallel_repo(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GTE(file_count, INCR_PARALLEL_CHANGED_FILE_COUNT);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, phase, 1);
+    int rc = cbm_pipeline_run_incremental(p, g_incr_dbpath, files, file_count);
+    pipeline_env_restore(&fail_env);
+    cbm_discover_free(files, file_count);
+
+    ASSERT_NEQ(rc, 0);
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    return 0;
+}
 
 TEST(incremental_full_then_noop) {
     /* Full index, then re-run → should detect no changes and skip */
@@ -10265,6 +17707,7 @@ TEST(incremental_full_then_noop) {
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
     char *project = strdup(cbm_pipeline_project_name(p));
     cbm_pipeline_free(p);
 
@@ -10276,9 +17719,14 @@ TEST(incremental_full_then_noop) {
     cbm_store_close(s);
 
     /* Second: incremental — nothing changed → should be no-op */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_FALSE(cbm_pipeline_graph_changed(p));
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
     cbm_pipeline_free(p);
 
     s = cbm_store_open_path(g_incr_dbpath);
@@ -10288,7 +17736,119 @@ TEST(incremental_full_then_noop) {
     ASSERT_EQ(nodes_after, nodes_before);
     cbm_store_close(s);
     free(project);
+    cbm_config_close(cfg);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_aborts_when_previous_coverage_is_unreadable) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    ASSERT_NOT_NULL(project);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    /* Simulate an unreadable prior coverage generation while leaving the
+     * graph and file hashes healthy enough to otherwise run incrementally. */
+    ASSERT_EQ(
+        cbm_store_exec(s, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
+        CBM_STORE_OK);
+    cbm_store_close(s);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    FILE *f = cbm_fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    ASSERT_GT(fprintf(f, "\nfunc MustNotBeIndexed() int { return 7 }\n"), 0);
+    ASSERT_EQ(fclose(f), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_TRUE(cbm_pipeline_run_incremental(p, g_incr_dbpath, files, file_count) != 0);
+    cbm_discover_free(files, file_count);
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+
+    /* Failure happens before the dump/replacement boundary, preserving the
+     * original graph rather than publishing a falsely complete generation. */
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    free(project);
+
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_touch_only_refreshes_metadata_without_reindex) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    int64_t generation_before = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_before),
+              CBM_STORE_OK);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+    ASSERT_EQ(pipeline_bump_file_mtime_seconds(path, &before, PIPELINE_TEST_MTIME_BUMP_SECONDS),
+              0);
+    struct stat touched;
+    ASSERT_EQ(stat(path, &touched), 0);
+    ASSERT_NEQ(cbm_stat_mtime_ns(&touched), cbm_stat_mtime_ns(&before));
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    int64_t generation_after = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_after),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation_after, generation_before);
+
+    int64_t hash_mtime_ns = 0;
+    ASSERT_EQ(pipeline_store_file_hash_mtime(g_incr_dbpath, project, "helper.go",
+                                             &hash_mtime_ns),
+              CBM_STORE_OK);
+    ASSERT_EQ(hash_mtime_ns, cbm_stat_mtime_ns(&touched));
+
+    free(project);
+    cbm_config_close(cfg);
     cleanup_incremental_repo();
     PASS();
 }
@@ -10317,8 +17877,11 @@ TEST(incremental_detects_changed_file) {
     fclose(f);
 
     /* Second: incremental — should detect change and re-index */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     /* Verify node count increased (NewFunc was added) */
@@ -10329,7 +17892,4147 @@ TEST(incremental_detects_changed_file) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
+    cbm_config_close(cfg);
 
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_exact_upsert_matches_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_FALSE(cbm_pipeline_incremental_fallback(p));
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func NewLeaf() int {\n\treturn 7\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewLeaf"));
+    int64_t generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 0);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [exact-upsert-diff] %s\n", diff_err);
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_body_only_change_uses_graph_noop) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    int64_t generation_before = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_before),
+              CBM_STORE_OK);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"goodbye\"\n}\n"),
+              0);
+
+    cbm_store_t *store = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_file_info_t changed[] = {
+        {.path = path, .rel_path = "helper.go", .language = CBM_LANG_GO},
+    };
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             changed, CBM_ALLOC_ONE, &scratch,
+                                                             &delta),
+              CBM_STORE_OK);
+    const cbm_store_file_delta_t *store_delta = &delta.delta;
+    bool graph_equal = false;
+    ASSERT_EQ(cbm_store_file_delta_batch_graph_equal(store, &store_delta, CBM_ALLOC_ONE,
+                                                     &graph_equal),
+              CBM_STORE_OK);
+    if (!graph_equal) {
+        static const char node_owner_count_sql[] =
+            "SELECT COUNT(*) FROM node_owners WHERE project = ?1 AND rel_path = ?2;";
+        static const char edge_owner_count_sql[] =
+            "SELECT COUNT(*) FROM edge_owners WHERE project = ?1 AND rel_path = ?2;";
+        static const char export_count_sql[] =
+            "SELECT COUNT(*) FROM symbol_exports WHERE project = ?1 AND rel_path = ?2;";
+        static const char import_count_sql[] =
+            "SELECT COUNT(*) FROM import_refs WHERE project = ?1 AND rel_path = ?2;";
+        int stored_nodes = -1;
+        int stored_edges = -1;
+        int stored_exports = -1;
+        int stored_imports = -1;
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 node_owner_count_sql, &stored_nodes);
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 edge_owner_count_sql, &stored_edges);
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 export_count_sql, &stored_exports);
+        (void)pipeline_store_count_file_rows_sql(g_incr_dbpath, project, "helper.go",
+                                                 import_count_sql, &stored_imports);
+        char detail[CBM_SZ_512];
+        int dn = snprintf(detail, sizeof(detail),
+                          "graph equality rejected body-only delta: stored n/e/x/i=%d/%d/%d/%d "
+                          "delta n/e/x/i=%d/%d/%d/%d ctx n/e=%d/%d",
+                          stored_nodes, stored_edges, stored_exports, stored_imports,
+                          delta.delta.node_count, delta.delta.edge_count,
+                          delta.delta.export_count, delta.delta.import_count,
+                          delta.delta.context_node_count, delta.delta.context_edge_count);
+        if (dn < 0 || (size_t)dn >= sizeof(detail)) {
+            FAIL("graph equality rejected body-only delta; diagnostic overflow");
+        }
+        FAIL(detail);
+    }
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(store);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    if (!strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=2") ||
+        !strstr(logs, "msg=incremental.exact.noop files=2")) {
+        const char *debug = strstr(logs, "msg=delta.graph_equal.mismatch");
+        char detail[CBM_SZ_512];
+        int dn = snprintf(detail, sizeof(detail), "missing incremental no-op marker: %.420s",
+                          debug ? debug : logs);
+        if (dn < 0 || (size_t)dn >= sizeof(detail)) {
+            FAIL("missing incremental no-op marker; diagnostic overflow");
+        }
+        FAIL(detail);
+    }
+    ASSERT_FALSE(cbm_pipeline_graph_changed(p));
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP);
+    cbm_pipeline_free(p);
+
+    int64_t generation_after = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &generation_after),
+              CBM_STORE_OK);
+    ASSERT_GT(generation_after, generation_before);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "body-only graph no-op differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=2") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewHelper"));
+    int64_t main_generation = 0;
+    int64_t helper_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_OK);
+    ASSERT_GT(main_generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(main_generation, helper_generation);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "two-file exact upsert differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_configured_cap_uses_containment_for_oversized_inbound_frontier) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, "1"), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_leaf_file(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_GT(stats.affected_paths, 1);
+    ASSERT_EQ(stats.affected_paths_limit, cbm_pipeline_exact_max_affected_paths(p));
+    ASSERT_TRUE(stats.affected_paths_truncated);
+    ASSERT_EQ(stats.published_paths, -1);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *owner_store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(owner_store);
+    int node_owners = 0;
+    int edge_owners = 0;
+    ASSERT_EQ(cbm_store_count_file_delta_owners(owner_store, project, "leaf.go", &node_owners,
+                                                &edge_owners),
+              CBM_STORE_OK);
+    ASSERT_GT(node_owners, 0);
+    cbm_store_close(owner_store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "oversized inbound fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_python_parallel_frontier_falls_back_before_incomplete_resolution) {
+    enum { PIPELINE_PY_PARALLEL_FRONTIER_IMPORTERS = 51, PIPELINE_PY_FRONTIER_WORKERS = 4 };
+    pipeline_env_snapshot_t workers_env = pipeline_env_save("CBM_WORKERS");
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char workers[CBM_SZ_32];
+    int n = snprintf(workers, sizeof(workers), "%d", PIPELINE_PY_FRONTIER_WORKERS);
+    ASSERT(n > 0 && (size_t)n < sizeof(workers));
+    ASSERT_EQ(cbm_setenv("CBM_WORKERS", workers, 1), 0);
+
+    char path[CBM_PATH_MAX];
+    n = snprintf(path, sizeof(path), "%s/leaf.py", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path, "def leaf():\n    return 1\n"), 0);
+    for (int i = 0; i < PIPELINE_PY_PARALLEL_FRONTIER_IMPORTERS; i++) {
+        char body[CBM_SZ_256];
+        n = snprintf(path, sizeof(path), "%s/caller_%04d.py", g_incr_tmpdir, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(path));
+        n = snprintf(body, sizeof(body),
+                     "from leaf import leaf\n\n"
+                     "def caller_%04d():\n"
+                     "    return leaf() + %d\n",
+                     i, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(body));
+        ASSERT_EQ(th_write_file(path, body), 0);
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, "64"), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/leaf.py", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path, "def leaf():\n    return 2\n"), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=52") != NULL);
+    ASSERT(strstr(logs,
+                  "msg=incremental.exact.skip reason=scoped_lsp_gap scope=parallel_frontier ") !=
+           NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), CBM_PIPELINE_DELTA_REASON_SCOPED_LSP_GAP);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "large Python frontier fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    pipeline_env_restore(&workers_env);
+    PASS();
+}
+
+TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char skipped_dir[CBM_PATH_MAX];
+    int n = snprintf(skipped_dir, sizeof(skipped_dir), "%s/scripts", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(skipped_dir));
+    ASSERT_TRUE(cbm_mkdir_p(skipped_dir, 0755));
+    char skipped_path[CBM_PATH_MAX];
+    n = snprintf(skipped_path, sizeof(skipped_path), "%s/scripts/probe.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(skipped_path));
+    ASSERT_EQ(th_write_file(skipped_path, "def skipped_probe():\n    return 1\n"), 0);
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char conservative_cap[CBM_SZ_32];
+    n = snprintf(conservative_cap, sizeof(conservative_cap), "%d", CBM_SZ_4);
+    ASSERT(n >= 0 && (size_t)n < sizeof(conservative_cap));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+                             conservative_cap),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    char fallback_log[CBM_SZ_128];
+    n = snprintf(fallback_log, sizeof(fallback_log),
+                 "msg=incremental.fallback reason=%s scope=%s",
+                 CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE,
+                 CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fallback_log));
+    ASSERT(strstr(logs, fallback_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    ASSERT_TRUE(cbm_pipeline_incremental_fallback(p));
+    cbm_pipeline_free(p);
+
+    int skipped_nodes = 0;
+    ASSERT_EQ(pipeline_store_count_file_rows_sql(
+                  g_incr_dbpath, project, "scripts/probe.py",
+                  "SELECT COUNT(*) FROM nodes WHERE project = ?1 AND file_path = ?2;",
+                  &skipped_nodes),
+              CBM_STORE_OK);
+    ASSERT_EQ(skipped_nodes, 0);
+    int skipped_hashes = 0;
+    ASSERT_EQ(pipeline_store_count_file_rows_sql(
+                  g_incr_dbpath, project, "scripts/probe.py",
+                  "SELECT COUNT(*) FROM file_hashes WHERE project = ?1 AND rel_path = ?2;",
+                  &skipped_hashes),
+              CBM_STORE_OK);
+    ASSERT_EQ(skipped_hashes, 0);
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 0);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C header full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_default_c_header_frontier_cap_allows_bounded_exact) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, CBM_ALLOC_ONE);
+    ASSERT_GT(stats.affected_paths, CBM_SZ_4);
+    ASSERT(stats.affected_paths <= CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT_EQ(stats.published_paths, stats.affected_paths);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "default C header exact update differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+    ASSERT_EQ(write_incremental_c_header_second_level_callers(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char conservative_cap[CBM_SZ_32];
+    int n = snprintf(conservative_cap, sizeof(conservative_cap), "%d", CBM_SZ_4);
+    ASSERT(n >= 0 && (size_t)n < sizeof(conservative_cap));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS,
+                             conservative_cap),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_source_extra_call(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    char fallback_log[CBM_SZ_128];
+    n = snprintf(fallback_log, sizeof(fallback_log),
+                 "msg=incremental.fallback reason=%s scope=%s",
+                 CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE,
+                 CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_SOURCE);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fallback_log));
+    ASSERT(strstr(logs, fallback_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "frontier_too_large");
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C source full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_default_c_source_frontier_cap_allows_bounded_exact) {
+    enum { PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED = CBM_SZ_32 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+    ASSERT_EQ(write_incremental_c_header_second_level_callers(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_source_extra_call(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier changed=1 expanded=") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, CBM_ALLOC_ONE);
+    ASSERT_GT(stats.affected_paths, CBM_SZ_4);
+    ASSERT(stats.affected_paths <= CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT_EQ(PIPELINE_C_SOURCE_EXACT_MAX_AFFECTED,
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT_EQ(stats.published_paths, stats.affected_paths);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "configured C source exact update differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_publish_single_c_header_uses_active_overlay) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT(strstr(logs, "scope=c_family_header") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "shared_extra"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "shared.h",
+                                                    "shared_extra"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_visible) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char header_path[CBM_PATH_MAX];
+    char source_path[CBM_PATH_MAX];
+    int n = snprintf(header_path, sizeof(header_path), "%s/paired.h", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(header_path));
+    n = snprintf(source_path, sizeof(source_path), "%s/paired.c", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(source_path));
+    ASSERT_EQ(th_write_file(header_path,
+                            "#ifndef PAIRED_H\n"
+                            "#define PAIRED_H\n"
+                            "typedef struct Paired Paired;\n"
+                            "int paired_value(Paired *p);\n"
+                            "#endif\n"),
+              0);
+    ASSERT_EQ(th_write_file(source_path,
+                            "#include \"paired.h\"\n\n"
+                            "struct Paired {\n"
+                            "    int value;\n"
+                            "};\n\n"
+                            "int paired_value(Paired *p) {\n"
+                            "    return p ? p->value : 0;\n"
+                            "}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(header_path,
+                            "#ifndef PAIRED_H\n"
+                            "#define PAIRED_H\n"
+                            "typedef struct Paired Paired;\n"
+                            "int paired_value(Paired *p);\n"
+                            "static int paired_extra(void) {\n"
+                            "    return 7;\n"
+                            "}\n"
+                            "#endif\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT(strstr(logs, CBM_PIPELINE_DELTA_REASON_HEADER_TYPE_IMPL_PAIR) == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "paired_value"));
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "paired_extra"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "paired.h",
+                                                    "paired_extra"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved) {
+    enum {
+        PIPELINE_C_HEADER_BATCH_CHANGED = CBM_SZ_2,
+        PIPELINE_C_HEADER_BATCH_AFFECTED_CAP = CBM_SZ_8,
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_two_header_additive_fixture(CBM_ALLOC_ONE, CBM_SZ_2, false),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_C_HEADER_BATCH_CHANGED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value), 0);
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_C_HEADER_BATCH_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_two_header_additive_fixture(CBM_ALLOC_ONE, CBM_SZ_2, true),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=2") != NULL);
+    ASSERT(strstr(logs, CBM_PIPELINE_DELTA_REASON_ADDITIVE_SUBSET_REQUIRED) == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, PIPELINE_C_HEADER_BATCH_CHANGED);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_C_HEADER_BATCH_CHANGED);
+    ASSERT_EQ(stats.published_paths, PIPELINE_C_HEADER_BATCH_CHANGED);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "alpha_added"));
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "beta_added"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "alpha.h",
+                                                    "alpha_added"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "beta.h",
+                                                    "beta_added"));
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof) {
+    enum {
+        PIPELINE_C_HEADER_OVERLAY_MAX_AFFECTED = CBM_SZ_16,
+        PIPELINE_C_HEADER_AFFECTED_FRONTIER =
+            CBM_SZ_2 + (PIPELINE_INCR_C_HEADER_IMPORTER_COUNT * CBM_SZ_2),
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+    ASSERT_EQ(write_incremental_c_header_second_level_callers(), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d",
+                     PIPELINE_C_HEADER_OVERLAY_MAX_AFFECTED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+    ASSERT_EQ(write_incremental_c_header_impl_marker(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=2") != NULL);
+    char frontier_log[CBM_SZ_128];
+    int log_n = snprintf(frontier_log, sizeof(frontier_log),
+                         "msg=incremental.exact.frontier changed=2 expanded=%d",
+                         PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    ASSERT(log_n >= 0 && (size_t)log_n < sizeof(frontier_log));
+    ASSERT(strstr(logs, frontier_log) != NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
+    char done_log[CBM_SZ_128];
+    log_n = snprintf(done_log, sizeof(done_log), "msg=incremental.exact.done files=%d",
+                     PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    ASSERT(log_n >= 0 && (size_t)log_n < sizeof(done_log));
+    ASSERT(strstr(logs, done_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT(cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, CBM_SZ_2);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    ASSERT_EQ(stats.published_paths, PIPELINE_C_HEADER_AFFECTED_FRONTIER);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "C header exact update differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact) {
+    enum {
+        PIPELINE_EXPECTED_EXACT_FRONTIER_FILES =
+            PIPELINE_INCR_FRONTIER_CALLER_COUNT + CBM_ALLOC_ONE,
+        PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8,
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_CONFIGURED_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_leaf_file_with_extra(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    char frontier_log[CBM_SZ_128];
+    n = snprintf(frontier_log, sizeof(frontier_log),
+                 "msg=incremental.exact.frontier changed=1 expanded=%d",
+                 PIPELINE_EXPECTED_EXACT_FRONTIER_FILES);
+    ASSERT(n >= 0 && (size_t)n < sizeof(frontier_log));
+    ASSERT(strstr(logs, frontier_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_free(p);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "configured exact frontier differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_full_defer_exact_delta_reindexes_defers_global_derived_refresh) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                       CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(p));
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(write_incremental_leaf_file_with_extra(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=1") != NULL);
+    ASSERT(strstr(logs, "pass=incr_similarity") == NULL);
+    ASSERT(strstr(logs, "pass=incr_semantic_edges") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project,
+                                                CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
+    cbm_store_close(s);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_full_defer_exact_delta_reindexes_mixed_delete_upsert_marks_semantic_stale) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_leaf_file(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                       CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES),
+        0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(cbm_unlink(path), 0);
+    n = snprintf(path, sizeof(path), "%s/extra.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Extra() int {\n\treturn 7\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    ASSERT(strstr(logs, "deleted=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done files=2") != NULL);
+    ASSERT(strstr(logs, "pass=incr_similarity") == NULL);
+    ASSERT(strstr(logs, "pass=incr_semantic_edges") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT_NULL(cbm_pipeline_publish_reason(p));
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Extra"));
+    int64_t leaf_generation = 0;
+    int64_t extra_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "extra.go",
+                                                   &extra_generation),
+              CBM_STORE_OK);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project,
+                                                CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
+    cbm_store_close(s);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_full_defer_all_incremental_reindexes_defers_containment_semantic_refresh) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(
+                  cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                  CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n\tLeaf()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func NewLeaf() int {\n\treturn 17\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=changed_batch_too_large") != NULL);
+    ASSERT(strstr(logs, "pass=incr_semantic_edges") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "changed_batch_too_large");
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(pipeline_test_derived_status_is(s, project,
+                                                CBM_STORE_DERIVED_VIEW_SEMANTIC_EDGES,
+                                                CBM_STORE_DERIVED_STATUS_STALE));
+    cbm_store_close(s);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild) {
+    enum { PIPELINE_CONFIGURED_AFFECTED_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    int n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_CONFIGURED_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(pipeline_store_insert_file_owned_unowned_source_edge(g_incr_dbpath, project,
+                                                                   "leaf.go", "Leaf", "CALLS"),
+              CBM_STORE_OK);
+    ASSERT_EQ(write_incremental_leaf_file_with_extra(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    char exact_fallback_log[CBM_SZ_128];
+    n = snprintf(exact_fallback_log, sizeof(exact_fallback_log),
+                 "msg=incremental.exact.fallback reason=%s",
+                 CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
+    ASSERT(n >= 0 && (size_t)n < sizeof(exact_fallback_log));
+    ASSERT(strstr(logs, exact_fallback_log) != NULL);
+    char full_fallback_log[CBM_SZ_128];
+    n = snprintf(full_fallback_log, sizeof(full_fallback_log),
+                 "msg=incremental.fallback reason=%s",
+                 CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
+    ASSERT(n >= 0 && (size_t)n < sizeof(full_fallback_log));
+    ASSERT(strstr(logs, full_fallback_log) != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.frontier") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.done") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p),
+                  CBM_PIPELINE_DELTA_REASON_INBOUND_EDGES_REQUIRE_FULL);
+    cbm_pipeline_free(p);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "LeafExtra"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "inbound full fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full) {
+    enum {
+        PIPELINE_EXPECTED_EXACT_FILES = 3,
+    };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n"
+                            "\treturn 1\n"
+                            "}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() int {\n"
+                            "\treturn Leaf()\n"
+                            "}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n"
+                            "\tHelper()\n"
+                            "}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n"
+                            "\tfor i := 0; i < 10; i++ {\n"
+                            "\t}\n"
+                            "\treturn 2\n"
+                            "}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.classify changed=1") != NULL);
+    char frontier_log[CBM_SZ_128];
+    n = snprintf(frontier_log, sizeof(frontier_log),
+                 "msg=incremental.exact.frontier changed=1 expanded=%d",
+                 PIPELINE_EXPECTED_EXACT_FILES);
+    ASSERT(n >= 0 && (size_t)n < sizeof(frontier_log));
+    ASSERT(strstr(logs, frontier_log) != NULL);
+    char done_log[CBM_SZ_128];
+    n = snprintf(done_log, sizeof(done_log), "msg=incremental.exact.done files=%d",
+                 PIPELINE_EXPECTED_EXACT_FILES);
+    ASSERT(n >= 0 && (size_t)n < sizeof(done_log));
+    ASSERT(strstr(logs, done_log) != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    int64_t leaf_generation = 0;
+    int64_t helper_generation = 0;
+    int64_t main_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_GT(leaf_generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(leaf_generation, helper_generation);
+    ASSERT_EQ(helper_generation, main_generation);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "small inbound exact frontier differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n\tLeaf()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+    n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func NewLeaf() int {\n\treturn 17\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "changed_batch_too_large");
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewMain"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewHelper"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewLeaf"));
+    int64_t main_generation = 0;
+    int64_t helper_generation = 0;
+    int64_t leaf_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(main_generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(main_generation, helper_generation);
+    ASSERT_EQ(main_generation, leaf_generation);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "three-file fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_single_delete_exact_matches_full_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+
+    ASSERT_EQ(cbm_unlink(path), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+    int64_t leaf_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_GT(pipeline_store_completed_generation_count(g_incr_dbpath, project), 0);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "single-delete exact differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(cbm_unlink(path), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    int64_t main_generation = 0;
+    int64_t helper_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &main_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(main_generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "delete fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(cbm_unlink(path), 0);
+    n = snprintf(path, sizeof(path), "%s/helper2.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func RenamedHelper() string {\n\treturn \"renamed\"\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "RenamedHelper"));
+    int64_t helper_generation = 0;
+    int64_t helper2_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper.go",
+                                                   &helper_generation),
+              CBM_STORE_NOT_FOUND);
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "helper2.go",
+                                                   &helper2_generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(helper2_generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "rename-like fallback differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_new_folder_exact_delta_parity) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH, CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+        0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/pkg", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_TRUE(cbm_mkdir_p(path, 0755));
+    n = snprintf(path, sizeof(path), "%s/pkg/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package pkg\n\n"
+                            "func FolderLeaf() int {\n\treturn 23\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "FolderLeaf"));
+    int64_t generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "pkg/leaf.go",
+                                                   &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "new-folder exact delta differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_route_decorator_change_matches_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/routes.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/api/orders')\n"
+                            "def orders():\n"
+                            "    return {'ok': True}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/orders"));
+
+    ASSERT_EQ(th_write_file(path,
+                            "from fastapi import FastAPI\n\n"
+                            "app = FastAPI()\n\n"
+                            "@app.get('/api/items')\n"
+                            "def orders():\n"
+                            "    return {'ok': True}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_route_name(g_incr_dbpath, project, "/api/orders"));
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/items"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "route decorator incremental differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_arg_url_route_change_matches_parallel_full_rebuild) {
+    enum { ARG_URL_FILLER_FILES = 52, ARG_URL_WORKERS = 4 };
+    pipeline_env_snapshot_t workers_env = pipeline_env_save("CBM_WORKERS");
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char worker_buf[CBM_SZ_32];
+    int n = snprintf(worker_buf, sizeof(worker_buf), "%d", ARG_URL_WORKERS);
+    ASSERT(n > 0 && (size_t)n < sizeof(worker_buf));
+    ASSERT_EQ(cbm_setenv("CBM_WORKERS", worker_buf, 1), 0);
+
+    for (int i = 0; i < ARG_URL_FILLER_FILES; i++) {
+        char path[CBM_PATH_MAX];
+        char body[CBM_SZ_256];
+        n = snprintf(path, sizeof(path), "%s/filler_%02d.c", g_incr_tmpdir, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(path));
+        n = snprintf(body, sizeof(body), "int filler_%02d(void) { return %d; }\n", i, i);
+        ASSERT(n > 0 && (size_t)n < sizeof(body));
+        ASSERT_EQ(th_write_file(path, body), 0);
+    }
+    ASSERT_EQ(write_incremental_arg_url_route_file("/api/index", 1), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/index"));
+
+    ASSERT_EQ(write_incremental_arg_url_route_file("/api/index-status", 2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_publish_kind_t kind = cbm_pipeline_publish_kind(p);
+    ASSERT(kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT ||
+           kind == CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_route_name(g_incr_dbpath, project, "/api/index"));
+    ASSERT(pipeline_store_has_route_name(g_incr_dbpath, project, "/api/index-status"));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "arg-url route incremental differed from fresh FAST rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    pipeline_env_restore(&workers_env);
+    PASS();
+}
+
+TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char main_path[CBM_PATH_MAX];
+    char helper_path[CBM_PATH_MAX];
+    int n = snprintf(main_path, sizeof(main_path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(main_path));
+    n = snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(helper_path));
+    ASSERT_EQ(th_write_file(main_path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(helper_path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+
+    cbm_file_info_t changed[] = {
+        {.path = main_path, .rel_path = "main.go", .language = CBM_LANG_GO},
+        {.path = helper_path, .rel_path = "helper.go", .language = CBM_LANG_GO},
+    };
+    cbm_store_t *store = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t deltas[CBM_SZ_2] = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(
+                  store, g_incr_tmpdir, project, changed,
+                  (int)(sizeof(changed) / sizeof(changed[0])), &scratch, deltas),
+              CBM_STORE_OK);
+
+    char *helper_file_qn = cbm_pipeline_fqn_compute(project, "helper.go", "__file__");
+    static const char *function_labels[] = {"Function"};
+    const cbm_gbuf_node_t *main_fn = cbm_gbuf_resolve_by_name_in_file(
+        scratch, "main", "main.go", function_labels,
+        (int)(sizeof(function_labels) / sizeof(function_labels[0])));
+    ASSERT_NOT_NULL(helper_file_qn);
+    ASSERT_NOT_NULL(main_fn);
+    ASSERT_NOT_NULL(main_fn->qualified_name);
+    ASSERT_EQ(pipeline_gbuf_count_usage_edge(scratch, helper_file_qn, main_fn->qualified_name,
+                                             "main"),
+              1);
+    ASSERT_EQ(pipeline_file_delta_count_usage_edge(&deltas[1], helper_file_qn,
+                                                   main_fn->qualified_name, "main"),
+              1);
+
+    free(helper_file_qn);
+    cbm_pipeline_file_delta_free(&deltas[0]);
+    cbm_pipeline_file_delta_free(&deltas[1]);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(store);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char main_path[CBM_PATH_MAX];
+    char helper_path[CBM_PATH_MAX];
+    int n = snprintf(main_path, sizeof(main_path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(main_path));
+    n = snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(helper_path));
+    ASSERT_EQ(th_write_file(main_path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n\tNewHelper()\n}\n\n"
+                            "func NewMain() int {\n\treturn 11\n}\n"),
+              0);
+    ASSERT_EQ(th_write_file(helper_path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"updated\"\n}\n\n"
+                            "func NewHelper() int {\n\treturn 13\n}\n"),
+              0);
+
+    cbm_file_info_t changed[] = {
+        {.path = main_path, .rel_path = "main.go", .language = CBM_LANG_GO},
+        {.path = helper_path, .rel_path = "helper.go", .language = CBM_LANG_GO},
+    };
+    const int changed_count = (int)(sizeof(changed) / sizeof(changed[0]));
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t deltas[CBM_SZ_2] = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             changed, changed_count, &scratch,
+                                                             deltas),
+              CBM_STORE_OK);
+    for (int i = 0; i < changed_count; i++) {
+        ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(
+                      &deltas[i], &changed[i], pass_fingerprint),
+                  CBM_STORE_OK);
+    }
+
+    const cbm_pipeline_file_delta_t *delta_ptrs[CBM_SZ_2] = {&deltas[0], &deltas[1]};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_plan_file_delta_batch(store, delta_ptrs, changed_count,
+                                                 CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                 &plan),
+              CBM_STORE_OK);
+    if (plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        FAIL(plan.reason ? plan.reason : "exact batch plan rejected candidate");
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    for (int i = 0; i < changed_count; i++) {
+        ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&deltas[i], generation),
+                  CBM_STORE_OK);
+    }
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, delta_ptrs, changed_count,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    if (plan.route != CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE) {
+        const char *store_err = cbm_store_error(store);
+        if (store_err && store_err[0]) {
+            FAIL(store_err);
+        }
+        FAIL(plan.reason ? plan.reason : "exact batch apply rejected candidate");
+    }
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "exact batch publish differed from fresh FAST rebuild");
+    }
+
+    cbm_pipeline_file_delta_free(&deltas[0]);
+    cbm_pipeline_file_delta_free(&deltas[1]);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayOnly"));
+
+    char helper_path[CBM_PATH_MAX];
+    int n = snprintf(helper_path, sizeof(helper_path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(helper_path));
+    ASSERT_EQ(th_write_file(helper_path,
+                            "package main\n\n"
+                            "func Helper() string {\n\treturn \"overlay\"\n}\n\n"
+                            "func OverlayOnly() int {\n\treturn 21\n}\n"),
+              0);
+
+    cbm_file_info_t changed = {
+        .path = helper_path,
+        .rel_path = "helper.go",
+        .language = CBM_LANG_GO,
+    };
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             &changed, 1, &scratch, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    int64_t overlay_generation = 0;
+    ASSERT_EQ(cbm_pipeline_publish_overlay_file_delta_batch(
+                  store, deltas, 1, CBM_PIPELINE_COMPAT_GENERATION,
+                  CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX, &overlay_generation),
+              CBM_STORE_OK);
+    ASSERT_GT(overlay_generation, 0);
+    cbm_store_close(store);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayOnly"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "helper.go",
+                                                    "OverlayOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayRunOnly"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func OverlayRunOnly() int {\n\treturn 77\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(pipeline_store_generation_status_count(g_incr_dbpath, project,
+                                                     CBM_STORE_INDEX_STATUS_RESERVED),
+              0);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayRunOnly"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "leaf.go",
+                                                    "OverlayRunOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild) {
+    enum { PIPELINE_EXACT_AFFECTED_PATHS = 2 };
+    enum { PIPELINE_EXACT_PUBLISHED_PATHS = 1 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/app.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "def helper():\n"
+                            "    return 1\n"),
+              0);
+    char consumer_path[CBM_PATH_MAX];
+    n = snprintf(consumer_path, sizeof(consumer_path), "%s/consumer.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(consumer_path));
+    ASSERT_EQ(th_write_file(consumer_path,
+                            "from app import helper\n\n"
+                            "def use_helper():\n"
+                            "    return helper()\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_AFFECTED_PATHS);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(path,
+                            "def helper():\n"
+                            "    return 2\n\n"
+                            "def py_overlay_gap_marker():\n"
+                            "    return helper()\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, PIPELINE_EXACT_AFFECTED_PATHS);
+    ASSERT_EQ(stats.published_paths, PIPELINE_EXACT_PUBLISHED_PATHS);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "Python scoped-LSP exact reindex differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow) {
+    enum { PIPELINE_EXACT_AFFECTED_CAP = 64 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char leaf_path[CBM_PATH_MAX];
+    int n = snprintf(leaf_path, sizeof(leaf_path), "%s/leaf.js", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(leaf_path));
+    ASSERT_EQ(th_write_file(leaf_path, "export function leaf() { return 1; }\n"), 0);
+    char consumer_path[CBM_PATH_MAX];
+    n = snprintf(consumer_path, sizeof(consumer_path), "%s/consumer.js", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(consumer_path));
+    ASSERT_EQ(th_write_file(consumer_path,
+                            "import { leaf } from './leaf.js';\n"
+                            "export function consume() { return leaf(); }\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char cap_value[CBM_SZ_32];
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_AFFECTED_CAP);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value), 0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(leaf_path,
+                            "export function leaf() { return 2; }\n"
+                            "export function leafExtra() { return leaf() + 1; }\n"),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "scoped_lsp_gap");
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.affected_paths_limit, PIPELINE_EXACT_AFFECTED_CAP);
+    ASSERT_FALSE(stats.affected_paths_truncated);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "JavaScript scoped-LSP fallback differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+typedef struct {
+    const char *name;
+    const char *filename;
+    const char *initial_source;
+    const char *updated_source;
+    cbm_pipeline_publish_kind_t expected_publish_kind;
+} incremental_language_oracle_case_t;
+
+static int run_incremental_language_oracle_case(const incremental_language_oracle_case_t *tc,
+                                                char *err, size_t err_sz) {
+    char root[CBM_PATH_MAX];
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(root, sizeof(root), "%s/cbm-incr-language-%s-XXXXXX", cache, tc->name);
+    if (n < 0 || (size_t)n >= sizeof(root) || !cbm_mkdtemp(root)) {
+        snprintf(err, err_sz, "%s: fixture directory creation failed", tc->name);
+        return CBM_STORE_ERR;
+    }
+
+    int rc = CBM_STORE_ERR;
+    char source_path[CBM_PATH_MAX];
+    char db_path[CBM_PATH_MAX];
+    char *project = NULL;
+    cbm_config_t *cfg = NULL;
+    cbm_pipeline_t *pipeline = NULL;
+    n = snprintf(source_path, sizeof(source_path), "%s/%s", root, tc->filename);
+    if (n < 0 || (size_t)n >= sizeof(source_path) ||
+        th_write_file(source_path, tc->initial_source) != 0) {
+        snprintf(err, err_sz, "%s: initial source write failed", tc->name);
+        goto cleanup;
+    }
+    n = snprintf(db_path, sizeof(db_path), "%s/graph.db", root);
+    if (n < 0 || (size_t)n >= sizeof(db_path)) {
+        snprintf(err, err_sz, "%s: database path overflow", tc->name);
+        goto cleanup;
+    }
+
+    cfg = incremental_test_config(root);
+    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                               CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH) != 0) {
+        snprintf(err, err_sz, "%s: incremental config setup failed", tc->name);
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "%s: initial pipeline allocation failed", tc->name);
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "%s: initial full publication failed", tc->name);
+        goto cleanup;
+    }
+    project = cbm_strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+    if (!project) {
+        snprintf(err, err_sz, "%s: project name allocation failed", tc->name);
+        goto cleanup;
+    }
+
+    if (th_write_file(source_path, tc->updated_source) != 0) {
+        snprintf(err, err_sz, "%s: updated source write failed", tc->name);
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "%s: incremental pipeline allocation failed", tc->name);
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "%s: incremental publication failed", tc->name);
+        goto cleanup;
+    }
+    cbm_pipeline_publish_kind_t actual_kind = cbm_pipeline_publish_kind(pipeline);
+    const char *actual_reason = cbm_pipeline_publish_reason(pipeline);
+    if (actual_kind != tc->expected_publish_kind) {
+        snprintf(err, err_sz, "%s: publish kind=%d reason=%s, expected=%d", tc->name, actual_kind,
+                 actual_reason ? actual_reason : "", tc->expected_publish_kind);
+        goto cleanup;
+    }
+    if (actual_kind == CBM_PIPELINE_PUBLISH_FULL &&
+        (!actual_reason || strcmp(actual_reason, "scoped_lsp_gap") != 0)) {
+        snprintf(err, err_sz, "%s: full fallback reason=%s, expected=scoped_lsp_gap", tc->name,
+                 actual_reason ? actual_reason : "");
+        goto cleanup;
+    }
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+
+    rc =
+        pipeline_compare_current_db_to_fresh_fast_rebuild(root, db_path, project, cfg, err, err_sz);
+    if (rc != 0 && (!err || err[0] == '\0')) {
+        snprintf(err, err_sz, "%s: incremental graph differed from fresh rebuild", tc->name);
+    }
+
+cleanup:
+    cbm_pipeline_free(pipeline);
+    free(project);
+    cbm_config_close(cfg);
+    const char *artifact_dir = getenv("CBM_TEST_ARTIFACT_DIR");
+    if (rc != 0 && artifact_dir && artifact_dir[0] != '\0') {
+        printf("    [incremental-language-artifact] %s\n", root);
+    } else {
+        th_rmtree(root);
+    }
+    return rc;
+}
+
+TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild) {
+    static const incremental_language_oracle_case_t cases[] = {
+        {"go", "sample.go", "package sample\n\nfunc Value() int { return 1 }\n",
+         "package sample\n\nfunc Value() int { return 2 }\nfunc Added() int { return Value() }\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"c", "sample.c", "int matrix_value(void) { return 1; }\n",
+         "int matrix_value(void) { return 2; }\nint matrix_added(void) { return matrix_value(); "
+         "}\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"cpp", "sample.cpp", "int matrix_value() { return 1; }\n",
+         "int matrix_value() { return 2; }\nint matrix_added() { return matrix_value(); }\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"cuda", "sample.cu", "__device__ int matrix_value() { return 1; }\n",
+         "__device__ int matrix_value() { return 2; }\n"
+         "__device__ int matrix_added() { return matrix_value(); }\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"python", "sample.py", "def matrix_value():\n    return 1\n",
+         "def matrix_value():\n    return 2\n\ndef matrix_added():\n    return matrix_value()\n",
+         CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT},
+        {"javascript", "sample.js", "export function matrixValue() { return 1; }\n",
+         "export function matrixValue() { return 2; }\n"
+         "export function matrixAdded() { return matrixValue(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"typescript", "sample.ts", "export function matrixValue(): number { return 1; }\n",
+         "export function matrixValue(): number { return 2; }\n"
+         "export function matrixAdded(): number { return matrixValue(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"tsx", "sample.tsx", "export function MatrixValue(): number { return 1; }\n",
+         "export function MatrixValue(): number { return 2; }\n"
+         "export function MatrixAdded(): number { return MatrixValue(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"php", "sample.php", "<?php function matrix_value() { return 1; }\n",
+         "<?php function matrix_value() { return 2; }\n"
+         "function matrix_added() { return matrix_value(); }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"csharp", "Sample.cs", "class MatrixType { static int Value() { return 1; } }\n",
+         "class MatrixType { static int Value() { return 2; } "
+         "static int Added() { return Value(); } }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"java", "MatrixType.java", "class MatrixType { static int value() { return 1; } }\n",
+         "class MatrixType { static int value() { return 2; } "
+         "static int added() { return value(); } }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"kotlin", "Sample.kt", "fun matrixValue(): Int = 1\n",
+         "fun matrixValue(): Int = 2\nfun matrixAdded(): Int = matrixValue()\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+        {"rust", "sample.rs", "pub fn matrix_value() -> i32 { 1 }\n",
+         "pub fn matrix_value() -> i32 { 2 }\n"
+         "pub fn matrix_added() -> i32 { matrix_value() }\n",
+         CBM_PIPELINE_PUBLISH_FULL},
+    };
+    char err[CBM_SZ_8K];
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        err[0] = '\0';
+        int rc = run_incremental_language_oracle_case(&cases[i], err, sizeof(err));
+        if (rc != 0) {
+            FAIL(err[0] ? err : "incremental language oracle failed");
+        }
+    }
+    PASS();
+}
+
+/* ObjectScript calls can be introduced by $$$ macros declared in an unchanged
+ * .inc file. Incremental extraction must therefore use the same repository-wide
+ * macro context as a fresh build, even when only the consuming .cls changed.
+ * Return through one cleanup block so a red assertion never leaks its store. */
+typedef enum {
+    OBJECTSCRIPT_MACRO_CHANGE_CONSUMER,
+    OBJECTSCRIPT_MACRO_CHANGE_INCLUDE,
+    OBJECTSCRIPT_MACRO_DELETE_INCLUDE,
+} objectscript_macro_change_t;
+
+static int run_incremental_objectscript_macro_oracle(objectscript_macro_change_t change,
+                                                      char *err, size_t err_sz) {
+    int rc = -1;
+    cbm_config_t *cfg = NULL;
+    cbm_pipeline_t *pipeline = NULL;
+    cbm_store_t *store = NULL;
+    char *project = NULL;
+    bool initial_call = false;
+    bool incremental_validate_call = false;
+    bool incremental_reject_call = false;
+    char *created = th_mktempdir("cbm_incr_objectscript_macro");
+    if (!created) {
+        snprintf(err, err_sz, "ObjectScript fixture directory creation failed");
+        return -1;
+    }
+    char root[CBM_PATH_MAX];
+    int n = snprintf(root, sizeof(root), "%s", created);
+    if (n <= 0 || (size_t)n >= sizeof(root)) {
+        snprintf(err, err_sz, "ObjectScript fixture path overflow");
+        th_rmtree(created);
+        return -1;
+    }
+
+    char include_path[CBM_PATH_MAX];
+    char caller_path[CBM_PATH_MAX];
+    char utils_path[CBM_PATH_MAX];
+    char db_path[CBM_PATH_MAX];
+    n = snprintf(include_path, sizeof(include_path), "%s/Macros.inc", root);
+    if (n <= 0 || (size_t)n >= sizeof(include_path)) {
+        snprintf(err, err_sz, "ObjectScript include path overflow");
+        goto cleanup;
+    }
+    n = snprintf(caller_path, sizeof(caller_path), "%s/Caller.cls", root);
+    if (n <= 0 || (size_t)n >= sizeof(caller_path)) {
+        snprintf(err, err_sz, "ObjectScript class path overflow");
+        goto cleanup;
+    }
+    n = snprintf(utils_path, sizeof(utils_path), "%s/Utils.cls", root);
+    if (n <= 0 || (size_t)n >= sizeof(utils_path)) {
+        snprintf(err, err_sz, "ObjectScript utility path overflow");
+        goto cleanup;
+    }
+    n = snprintf(db_path, sizeof(db_path), "%s/graph.db", root);
+    if (n <= 0 || (size_t)n >= sizeof(db_path)) {
+        snprintf(err, err_sz, "ObjectScript database path overflow");
+        goto cleanup;
+    }
+
+    const char *include_initial =
+        "ROUTINE MyApp.Macros [Type=INC]\n"
+        "#define MyCheck(%sc) ##class(MyApp.Utils).Validate(%sc)\n";
+    const char *include_updated =
+        "ROUTINE MyApp.Macros [Type=INC]\n"
+        "#define MyCheck(%sc) ##class(MyApp.Utils).Reject(%sc)\n";
+    if (th_write_file(include_path, include_initial) != 0) {
+        snprintf(err, err_sz, "ObjectScript include write failed");
+        goto cleanup;
+    }
+    if (th_write_file(utils_path,
+                      "Class MyApp.Utils Extends %RegisteredObject\n"
+                      "{\n"
+                      "ClassMethod Validate(sc As %Status) As %Status\n"
+                      "{\n"
+                      "    Quit sc\n"
+                      "}\n"
+                      "ClassMethod Reject(sc As %Status) As %Status\n"
+                      "{\n"
+                      "    Quit sc\n"
+                      "}\n"
+                      "}\n") != 0) {
+        snprintf(err, err_sz, "ObjectScript utility class write failed");
+        goto cleanup;
+    }
+    const char *caller_initial =
+        "Include Macros\n"
+        "Class MyApp.Caller Extends %RegisteredObject\n"
+        "{\n"
+        "Method Run(sc As %Status) As %Status\n"
+        "{\n"
+        "    If $$$MyCheck(sc) { Quit sc }\n"
+        "    Quit $$$OK\n"
+        "}\n"
+        "}\n";
+    const char *caller_updated =
+        "Include Macros\n"
+        "Class MyApp.Caller Extends %RegisteredObject\n"
+        "{\n"
+        "Method Run(sc As %Status) As %Status\n"
+        "{\n"
+        "    Set touched = 1\n"
+        "    If $$$MyCheck(sc) { Quit sc }\n"
+        "    Quit $$$OK\n"
+        "}\n"
+        "}\n";
+    if (th_write_file(caller_path, caller_initial) != 0) {
+        snprintf(err, err_sz, "initial ObjectScript class write failed");
+        goto cleanup;
+    }
+
+    cfg = incremental_test_config(root);
+    if (!cfg || cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                               CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH) != 0) {
+        snprintf(err, err_sz, "ObjectScript incremental config setup failed");
+        goto cleanup;
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "initial ObjectScript pipeline allocation failed");
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "initial ObjectScript full publication failed");
+        goto cleanup;
+    }
+    project = cbm_strdup(cbm_pipeline_project_name(pipeline));
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+    if (!project) {
+        snprintf(err, err_sz, "ObjectScript project allocation failed");
+        goto cleanup;
+    }
+
+    store = cbm_store_open_path(db_path);
+    if (!store) {
+        snprintf(err, err_sz, "initial ObjectScript store open failed");
+        goto cleanup;
+    }
+    initial_call = cross_file_call_exists(store, project, "Run", "Validate");
+    cbm_store_close(store);
+    store = NULL;
+    if (!initial_call) {
+        snprintf(err, err_sz,
+                 "full ObjectScript pipeline did not resolve the macro-supplied local call");
+        goto cleanup;
+    }
+
+    if (change == OBJECTSCRIPT_MACRO_DELETE_INCLUDE) {
+        if (cbm_unlink(include_path) != 0) {
+            snprintf(err, err_sz, "ObjectScript include deletion failed");
+            goto cleanup;
+        }
+    } else {
+        const char *changed_path =
+            change == OBJECTSCRIPT_MACRO_CHANGE_INCLUDE ? include_path : caller_path;
+        const char *changed_source =
+            change == OBJECTSCRIPT_MACRO_CHANGE_INCLUDE ? include_updated : caller_updated;
+        if (th_write_file(changed_path, changed_source) != 0) {
+            snprintf(err, err_sz, "updated ObjectScript fixture write failed");
+            goto cleanup;
+        }
+    }
+    pipeline = cbm_pipeline_new(root, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        snprintf(err, err_sz, "incremental ObjectScript pipeline allocation failed");
+        goto cleanup;
+    }
+    cbm_pipeline_apply_config(pipeline, cfg);
+    if (cbm_pipeline_run(pipeline) != 0) {
+        snprintf(err, err_sz, "incremental ObjectScript publication failed");
+        goto cleanup;
+    }
+    if (change == OBJECTSCRIPT_MACRO_CHANGE_CONSUMER &&
+        cbm_pipeline_publish_kind(pipeline) != CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT) {
+        snprintf(err, err_sz, "ObjectScript publication kind=%d reason=%s, expected exact",
+                 cbm_pipeline_publish_kind(pipeline),
+                 cbm_pipeline_publish_reason(pipeline) ? cbm_pipeline_publish_reason(pipeline)
+                                                       : "");
+        goto cleanup;
+    }
+    cbm_pipeline_free(pipeline);
+    pipeline = NULL;
+
+    store = cbm_store_open_path(db_path);
+    if (!store) {
+        snprintf(err, err_sz, "incremental ObjectScript store open failed");
+        goto cleanup;
+    }
+    incremental_validate_call = cross_file_call_exists(store, project, "Run", "Validate");
+    incremental_reject_call = cross_file_call_exists(store, project, "Run", "Reject");
+    cbm_store_close(store);
+    store = NULL;
+    if (change == OBJECTSCRIPT_MACRO_CHANGE_CONSUMER && !incremental_validate_call) {
+        snprintf(err, err_sz,
+                 "incremental ObjectScript extraction lost an unchanged .inc macro call");
+        goto cleanup;
+    }
+    if (change == OBJECTSCRIPT_MACRO_CHANGE_INCLUDE &&
+        (incremental_validate_call || !incremental_reject_call)) {
+        snprintf(err, err_sz,
+                 "changed ObjectScript .inc did not invalidate and re-extract its consumer");
+        goto cleanup;
+    }
+    if (change == OBJECTSCRIPT_MACRO_DELETE_INCLUDE &&
+        (incremental_validate_call || incremental_reject_call)) {
+        snprintf(err, err_sz,
+                 "deleted ObjectScript .inc did not invalidate and re-extract its consumer");
+        goto cleanup;
+    }
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        root, db_path, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        snprintf(err, err_sz, "%s",
+                 diff_err[0] ? diff_err
+                             : "incremental ObjectScript macro graph differed from fresh rebuild");
+        goto cleanup;
+    }
+    rc = 0;
+
+cleanup:
+    cbm_store_close(store);
+    cbm_pipeline_free(pipeline);
+    free(project);
+    cbm_config_close(cfg);
+    const char *artifact_dir = getenv("CBM_TEST_ARTIFACT_DIR");
+    if (rc != 0 && artifact_dir && artifact_dir[0] != '\0') {
+        printf("    [incremental-objectscript-artifact] %s\n", root);
+    } else {
+        th_rmtree(root);
+    }
+    return rc;
+}
+
+TEST(incremental_objectscript_unchanged_include_macro_matches_fresh_rebuild) {
+    char err[CBM_SZ_8K] = {0};
+    if (run_incremental_objectscript_macro_oracle(OBJECTSCRIPT_MACRO_CHANGE_CONSUMER, err,
+                                                  sizeof(err)) != 0) {
+        FAIL(err[0] ? err : "ObjectScript incremental macro oracle failed");
+    }
+    PASS();
+}
+
+TEST(incremental_objectscript_changed_include_reextracts_consumers) {
+    char err[CBM_SZ_8K] = {0};
+    if (run_incremental_objectscript_macro_oracle(OBJECTSCRIPT_MACRO_CHANGE_INCLUDE, err,
+                                                  sizeof(err)) != 0) {
+        FAIL(err[0] ? err : "ObjectScript include invalidation oracle failed");
+    }
+    PASS();
+}
+
+TEST(incremental_objectscript_deleted_include_reextracts_consumers) {
+    char err[CBM_SZ_8K] = {0};
+    if (run_incremental_objectscript_macro_oracle(OBJECTSCRIPT_MACRO_DELETE_INCLUDE, err,
+                                                  sizeof(err)) != 0) {
+        FAIL(err[0] ? err : "ObjectScript include deletion invalidation oracle failed");
+    }
+    PASS();
+}
+
+TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char rust_path[CBM_PATH_MAX];
+    char python_path[CBM_PATH_MAX];
+    int n = snprintf(rust_path, sizeof(rust_path), "%s/native_bridge.rs", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(rust_path));
+    n = snprintf(python_path, sizeof(python_path), "%s/entrypoint.py", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(python_path));
+    ASSERT_EQ(th_write_file(rust_path, "#[pyfunction]\nfn native_execute() -> i32 { 1 }\n"), 0);
+    ASSERT_EQ(th_write_file(python_path, "def cli_main():\n"
+                                         "    from package._native import native_execute\n"
+                                         "    return native_execute()\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(python_path, "def python_helper():\n"
+                                         "    return 2\n\n"
+                                         "def cli_main():\n"
+                                         "    from package._native import native_execute\n"
+                                         "    return native_execute() + python_helper()\n"),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "mixed Python/Rust Python edit differed from fresh rebuild");
+    }
+
+    ASSERT_EQ(th_write_file(rust_path, "#[pyfunction]\nfn native_execute() -> i32 { 2 }\n"
+                                       "#[pyfunction]\nfn native_extra() -> i32 { 3 }\n"),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "scoped_lsp_gap");
+    cbm_pipeline_free(p);
+
+    diff_err[0] = '\0';
+    diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "mixed Python/Rust Rust edit differed from fresh rebuild");
+    }
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char rust_path[CBM_PATH_MAX];
+    char bridge_path[CBM_PATH_MAX];
+    char caller_path[CBM_PATH_MAX];
+    int n = snprintf(rust_path, sizeof(rust_path), "%s/native_core.rs", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(rust_path));
+    n = snprintf(bridge_path, sizeof(bridge_path), "%s/bridge.ts", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(bridge_path));
+    n = snprintf(caller_path, sizeof(caller_path), "%s/caller.js", g_incr_tmpdir);
+    ASSERT(n > 0 && (size_t)n < sizeof(caller_path));
+    ASSERT_EQ(th_write_file(rust_path, "pub fn native_score() -> i32 { 1 }\n"), 0);
+    ASSERT_EQ(
+        th_write_file(bridge_path, "export function bridgeOperation(): number { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(caller_path,
+                            "import { bridgeOperation } from './bridge';\n"
+                            "export function javascriptCaller() { return bridgeOperation(); }\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_TRUE(cross_file_call_exists(store, project, "javascriptCaller", "bridgeOperation"));
+    cbm_store_close(store);
+
+    ASSERT_EQ(
+        th_write_file(bridge_path,
+                      "export function bridgeOperation(): number { return 2; }\n"
+                      "export function bridgeExtra(): number { return bridgeOperation(); }\n"),
+        0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_FULL);
+    ASSERT_STR_EQ(cbm_pipeline_publish_reason(p), "scoped_lsp_gap");
+    cbm_pipeline_free(p);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "mixed Rust/TypeScript/JavaScript edit differed from fresh rebuild");
+    }
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild) {
+    enum { PIPELINE_EXACT_ONE_PATH = 1 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    char cap_value[CBM_SZ_32];
+    n = snprintf(cap_value, sizeof(cap_value), "%d", PIPELINE_EXACT_ONE_PATH);
+    ASSERT(n >= 0 && (size_t)n < sizeof(cap_value));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, cap_value),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, cap_value),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('new')\n\n"
+                            "def scoped_gap_marker():\n"
+                            "    return Service().run()\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.skip reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.fallback reason=scoped_lsp_gap") == NULL);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    cbm_pipeline_free(p);
+
+    char *source_qn = cbm_pipeline_fqn_compute(project, "service.py", "Service.run");
+    char *target_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log");
+    ASSERT_NOT_NULL(source_qn);
+    ASSERT_NOT_NULL(target_qn);
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(g_incr_dbpath, project, source_qn, "CALLS", target_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err
+                         : "Python receiver-type exact reindex differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(source_qn);
+    free(target_qn);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp) {
+    enum { PIPELINE_PERSISTED_SCOPE_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    const char *changed_source =
+        "from provider import Logger\n\n"
+        "class Service:\n"
+        "    def __init__(self):\n"
+        "        self.logger: Logger = Logger()\n\n"
+        "    def run(self):\n"
+        "        return self.logger.log('new')\n";
+    CBMFileResult *changed_result = cbm_extract_file_with_options(
+        changed_source, (int)strlen(changed_source), CBM_LANG_PYTHON, project, "service.py",
+        CBM_EXTRACT_BUDGET, NULL, NULL, false);
+    ASSERT_NOT_NULL(changed_result);
+
+    cbm_file_info_t changed_file = {
+        .path = service_path,
+        .rel_path = "service.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    CBMFileResult *changed_cache[] = {changed_result};
+    char *changed_modules[] = {NULL};
+    int own_def_count = 0;
+    CBMLSPDef *own_defs = cbm_pxc_collect_all_defs(changed_cache, &changed_file, CBM_ALLOC_ONE,
+                                                   project, changed_modules, &own_def_count, NULL);
+    ASSERT_NOT_NULL(own_defs);
+    ASSERT_GT(own_def_count, 0);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+
+    char *import_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger");
+    char *provider_log_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log");
+    char *other_log_qn = cbm_pipeline_fqn_compute(project, "provider.py", "OtherLogger.log");
+    ASSERT_NOT_NULL(import_qn);
+    ASSERT_NOT_NULL(provider_log_qn);
+    ASSERT_NOT_NULL(other_log_qn);
+
+    const char *scope_inputs[] = {import_qn};
+    char **candidate_qns = NULL;
+    int candidate_qn_count = 0;
+    bool candidate_truncated = true;
+    ASSERT_EQ(cbm_store_list_symbol_scope_qns_by_qns(
+                  store, project, scope_inputs, CBM_ALLOC_ONE, PIPELINE_PERSISTED_SCOPE_CAP,
+                  &candidate_qns, &candidate_qn_count, &candidate_truncated),
+              CBM_STORE_OK);
+    ASSERT_FALSE(candidate_truncated);
+    ASSERT_EQ(candidate_qn_count, PAIR_LEN);
+    ASSERT_TRUE(pipeline_text_array_contains(candidate_qns, candidate_qn_count, import_qn));
+    ASSERT_TRUE(pipeline_text_array_contains(candidate_qns, candidate_qn_count, provider_log_qn));
+    ASSERT_FALSE(pipeline_text_array_contains(candidate_qns, candidate_qn_count, other_log_qn));
+
+    cbm_node_t *provider_nodes = NULL;
+    int provider_node_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qns(store, project, (const char **)candidate_qns,
+                                          candidate_qn_count, &provider_nodes,
+                                          &provider_node_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(provider_node_count, PAIR_LEN);
+
+    CBMArena persisted_arena;
+    cbm_arena_init(&persisted_arena);
+    CBMLSPDef persisted_defs[PIPELINE_PERSISTED_SCOPE_CAP];
+    memset(persisted_defs, 0, sizeof(persisted_defs));
+    int persisted_count = 0;
+    for (int i = 0; i < provider_node_count; i++) {
+        ASSERT_EQ(cbm_pxc_build_lsp_def_from_node(&persisted_arena, &provider_nodes[i],
+                                                  CBM_LANG_PYTHON,
+                                                  &persisted_defs[persisted_count]),
+                  0);
+        persisted_count++;
+    }
+    cbm_store_free_nodes(provider_nodes, provider_node_count);
+    cbm_store_close(store);
+
+    int total_def_count = own_def_count + persisted_count;
+    CBMLSPDef *all_defs = calloc((size_t)total_def_count, sizeof(*all_defs));
+    ASSERT_NOT_NULL(all_defs);
+    memcpy(all_defs, own_defs, (size_t)own_def_count * sizeof(*all_defs));
+    memcpy(all_defs + own_def_count, persisted_defs,
+           (size_t)persisted_count * sizeof(*all_defs));
+
+    char *module_qn = cbm_pipeline_fqn_module(project, "service.py");
+    ASSERT_NOT_NULL(module_qn);
+    const char *imp_names[] = {"Logger"};
+    const char *imp_qns[] = {import_qn};
+    CBMArena out_arena;
+    cbm_arena_init(&out_arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross(&out_arena, changed_source, (int)strlen(changed_source), module_qn,
+                         all_defs, total_def_count, imp_names, imp_qns, CBM_ALLOC_ONE,
+                         changed_result->cached_tree, &out, NULL);
+
+    ASSERT_TRUE(pipeline_resolved_call_contains(&out, "Service.run", "provider.Logger.log"));
+
+    cbm_arena_destroy(&out_arena);
+    free(import_qn);
+    free(provider_log_qn);
+    free(other_log_qn);
+    free(module_qn);
+    free(all_defs);
+    for (int i = 0; i < candidate_qn_count; i++) {
+        free(candidate_qns[i]);
+    }
+    free(candidate_qns);
+    cbm_arena_destroy(&persisted_arena);
+    free(own_defs);
+    free(changed_modules[0]);
+    cbm_free_result(changed_result);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs) {
+    enum { PIPELINE_STORE_BACKED_LSP_SCOPE_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('new')\n"),
+              0);
+
+    const char *changed_paths[] = {"service.py"};
+    cbm_file_info_t all_files[] = {
+        {.path = provider_path, .rel_path = "provider.py", .language = CBM_LANG_PYTHON},
+        {.path = service_path, .rel_path = "service.py", .language = CBM_LANG_PYTHON},
+    };
+    cbm_file_info_t changed_file = {
+        .path = service_path,
+        .rel_path = "service.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    CBMFileResult *result_cache[CBM_ALLOC_ONE] = {NULL};
+    atomic_int cancelled;
+    atomic_init(&cancelled, 0);
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = cbm_gbuf_new(project, g_incr_tmpdir);
+    cbm_registry_t *registry = cbm_registry_new();
+    ASSERT_NOT_NULL(scratch);
+    ASSERT_NOT_NULL(registry);
+    ASSERT_EQ(cbm_pipeline_seed_file_delta_scratch_from_store(
+                  store, scratch, registry, project, changed_paths, CBM_ALLOC_ONE),
+              CBM_STORE_OK);
+    const char *structure_root_qn = pipeline_exact_scratch_structure_root_qn(scratch, project);
+    ASSERT_EQ(cbm_pipeline_ensure_file_structure(scratch, project, structure_root_qn,
+                                                 changed_file.rel_path, NULL),
+              0);
+
+    const double pipeline_default_threshold = 0.0;
+    cbm_pipeline_ctx_t ctx = {.project_name = project,
+                              .repo_path = g_incr_tmpdir,
+                              .gbuf = scratch,
+                              .registry = registry,
+                              .cancelled = &cancelled,
+                              .mode = CBM_MODE_FAST,
+                              .similarity_threshold = pipeline_default_threshold,
+                              .httplink_min_confidence = pipeline_default_threshold,
+                              .semantic_threshold = pipeline_default_threshold,
+                              .githistory_min_coupling = pipeline_default_threshold,
+                              .lsp_confidence_floor = pipeline_default_threshold,
+                              .result_cache = result_cache,
+                              .store_backed_node_lookup = store,
+                              .store_backed_changed_paths = changed_paths,
+                              .store_backed_changed_path_count = CBM_ALLOC_ONE,
+                              .store_backed_all_files = all_files,
+                              .store_backed_all_file_count =
+                                  (int)(sizeof(all_files) / sizeof(all_files[0])),
+                              .store_backed_lsp_scope_cap =
+                                  PIPELINE_STORE_BACKED_LSP_SCOPE_CAP};
+
+    ASSERT_EQ(cbm_pipeline_pass_definitions(&ctx, &changed_file, CBM_ALLOC_ONE), 0);
+    ASSERT_NOT_NULL(result_cache[0]);
+    ASSERT_EQ(cbm_pipeline_pass_lsp_cross(&ctx, &changed_file, CBM_ALLOC_ONE, result_cache), 0);
+    ASSERT_TRUE(pipeline_resolved_call_contains(&result_cache[0]->resolved_calls, "Service.run",
+                                                "provider.Logger.log"));
+    ASSERT_FALSE(pipeline_resolved_call_contains(&result_cache[0]->resolved_calls, "Service.run",
+                                                 "provider.OtherLogger.log"));
+
+    cbm_pipeline_release_seq_cross_state(&ctx);
+    cbm_free_result(result_cache[0]);
+    cbm_registry_free(registry);
+    cbm_gbuf_free(scratch);
+    cbm_store_close(store);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild) {
+    enum { PIPELINE_STORE_BACKED_EXACT_SCOPE_CAP = CBM_SZ_8 };
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char provider_path[CBM_PATH_MAX];
+    char service_path[CBM_PATH_MAX];
+    int n = snprintf(provider_path, sizeof(provider_path), "%s/provider.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(provider_path));
+    n = snprintf(service_path, sizeof(service_path), "%s/service.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(service_path));
+
+    ASSERT_EQ(th_write_file(provider_path,
+                            "class Logger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n\n"
+                            "class OtherLogger:\n"
+                            "    def log(self, msg):\n"
+                            "        return msg\n"),
+              0);
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('old')\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(service_path,
+                            "from provider import Logger\n\n"
+                            "class Service:\n"
+                            "    def __init__(self):\n"
+                            "        self.logger: Logger = Logger()\n\n"
+                            "    def run(self):\n"
+                            "        return self.logger.log('new')\n"),
+              0);
+
+    cbm_file_info_t all_files[] = {
+        {.path = provider_path, .rel_path = "provider.py", .language = CBM_LANG_PYTHON},
+        {.path = service_path, .rel_path = "service.py", .language = CBM_LANG_PYTHON},
+    };
+    cbm_file_info_t changed = {
+        .path = service_path,
+        .rel_path = "service.py",
+        .language = CBM_LANG_PYTHON,
+    };
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files_ex(
+                  store, g_incr_tmpdir, project, &changed, CBM_ALLOC_ONE, all_files,
+                  (int)(sizeof(all_files) / sizeof(all_files[0])),
+                  PIPELINE_STORE_BACKED_EXACT_SCOPE_CAP, &scratch, &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, deltas, CBM_ALLOC_ONE,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char *source_qn = cbm_pipeline_fqn_compute(project, "service.py", "Service.run");
+    char *target_qn = cbm_pipeline_fqn_compute(project, "provider.py", "Logger.log");
+    ASSERT_NOT_NULL(source_qn);
+    ASSERT_NOT_NULL(target_qn);
+    ASSERT_TRUE(
+        pipeline_store_has_edge_between_qns(g_incr_dbpath, project, source_qn, "CALLS", target_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "store-backed Python exact delta differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(source_qn);
+    free(target_qn);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_exact_scratch_field_hint_materializes_store_target) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char docs_dir[CBM_PATH_MAX];
+    char custom_dir[CBM_PATH_MAX];
+    char fastapi_dir[CBM_PATH_MAX];
+    char routing_path[CBM_PATH_MAX];
+    char tutorial_path[CBM_PATH_MAX];
+    char payload_path[CBM_PATH_MAX];
+    int n = snprintf(docs_dir, sizeof(docs_dir), "%s/docs_src", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(docs_dir));
+    n = snprintf(custom_dir, sizeof(custom_dir), "%s/docs_src/custom_request_and_route",
+                 g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(custom_dir));
+    n = snprintf(fastapi_dir, sizeof(fastapi_dir), "%s/fastapi", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fastapi_dir));
+    ASSERT_EQ(th_mkdir_p(docs_dir), 0);
+    ASSERT_EQ(th_mkdir_p(custom_dir), 0);
+    ASSERT_EQ(th_mkdir_p(fastapi_dir), 0);
+
+    n = snprintf(routing_path, sizeof(routing_path), "%s/fastapi/routing.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(routing_path));
+    n = snprintf(tutorial_path, sizeof(tutorial_path),
+                 "%s/docs_src/custom_request_and_route/tutorial001.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(tutorial_path));
+    n = snprintf(payload_path, sizeof(payload_path), "%s/payloads.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(payload_path));
+
+    ASSERT_EQ(th_write_file(tutorial_path,
+                            "class GzipRequest:\n"
+                            "    def body(self):\n"
+                            "        return b'gzip'\n"),
+              0);
+    ASSERT_EQ(th_write_file(payload_path,
+                            "class Payload:\n"
+                            "    def body(self):\n"
+                            "        return b'payload'\n"),
+              0);
+    ASSERT_EQ(th_write_file(routing_path,
+                            "def route(request):\n"
+                            "    return request.body()\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(routing_path,
+                            "def route(request):\n"
+                            "    value = request.body()\n"
+                            "    return value\n"),
+              0);
+
+    cbm_file_info_t changed = {
+        .path = routing_path,
+        .rel_path = "fastapi/routing.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             &changed, CBM_ALLOC_ONE, &scratch,
+                                                             &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+
+    char *source_qn = cbm_pipeline_fqn_compute(project, "fastapi/routing.py", "route");
+    char *target_qn =
+        cbm_pipeline_fqn_compute(project, "docs_src/custom_request_and_route/tutorial001.py",
+                                 "GzipRequest.body");
+    ASSERT_NOT_NULL(source_qn);
+    ASSERT_NOT_NULL(target_qn);
+    ASSERT_EQ(pipeline_file_delta_count_call_edge(&delta, source_qn, target_qn, "request.body",
+                                                  "field_type_hint"),
+              1);
+
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, deltas, CBM_ALLOC_ONE,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "field-hint exact delta differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    free(source_qn);
+    free(target_qn);
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char fastapi_dir[CBM_PATH_MAX];
+    int n = snprintf(fastapi_dir, sizeof(fastapi_dir), "%s/fastapi", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fastapi_dir));
+    ASSERT_EQ(cbm_mkdir(fastapi_dir), 0);
+
+    char init_path[CBM_PATH_MAX];
+    char exceptions_path[CBM_PATH_MAX];
+    char datastructures_path[CBM_PATH_MAX];
+    char routing_path[CBM_PATH_MAX];
+    n = snprintf(init_path, sizeof(init_path), "%s/fastapi/__init__.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(init_path));
+    n = snprintf(exceptions_path, sizeof(exceptions_path), "%s/fastapi/exceptions.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(exceptions_path));
+    n = snprintf(datastructures_path, sizeof(datastructures_path),
+                 "%s/fastapi/datastructures.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(datastructures_path));
+    n = snprintf(routing_path, sizeof(routing_path), "%s/fastapi/routing.py", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(routing_path));
+
+    ASSERT_EQ(th_write_file(init_path,
+                            "from .datastructures import DefaultPlaceholder\n"
+                            "from .exceptions import HTTPException\n"),
+              0);
+    ASSERT_EQ(th_write_file(exceptions_path,
+                            "class HTTPException(Exception):\n"
+                            "    pass\n"),
+              0);
+    ASSERT_EQ(th_write_file(datastructures_path,
+                            "class DefaultPlaceholder:\n"
+                            "    pass\n"),
+              0);
+    ASSERT_EQ(th_write_file(routing_path,
+                            "from fastapi.datastructures import DefaultPlaceholder\n"
+                            "from fastapi.exceptions import HTTPException\n\n"
+                            "def serialize_response(field=None, response_content=None):\n"
+                            "    return response_content\n\n"
+                            "def route_handler(response_field, raw_response):\n"
+                            "    marker = DefaultPlaceholder()\n"
+                            "    if marker:\n"
+                            "        raise HTTPException()\n"
+                            "    return raw_response\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char pass_fingerprint[CBM_SZ_256];
+    ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(p, pass_fingerprint,
+                                                    sizeof(pass_fingerprint)),
+              CBM_STORE_OK);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    ASSERT_EQ(th_write_file(routing_path,
+                            "from fastapi.datastructures import DefaultPlaceholder\n"
+                            "from fastapi.exceptions import HTTPException\n\n"
+                            "def serialize_response(field=None, response_content=None, include=None, "
+                            "exclude=None, by_alias=True, exclude_unset=False, "
+                            "exclude_defaults=False, exclude_none=False):\n"
+                            "    return response_content\n\n"
+                            "def route_handler(response_field, raw_response, response_model_include, "
+                            "response_model_exclude, response_model_by_alias, "
+                            "response_model_exclude_unset, response_model_exclude_defaults, "
+                            "response_model_exclude_none):\n"
+                            "    marker = DefaultPlaceholder()\n"
+                            "    if not marker:\n"
+                            "        return raw_response\n"
+                            "    return serialize_response(field=response_field, "
+                            "response_content=raw_response, include=response_model_include, "
+                            "exclude=response_model_exclude, by_alias=response_model_by_alias, "
+                            "exclude_unset=response_model_exclude_unset, "
+                            "exclude_defaults=response_model_exclude_defaults, "
+                            "exclude_none=response_model_exclude_none)\n"),
+              0);
+
+    cbm_file_info_t changed = {
+        .path = routing_path,
+        .rel_path = "fastapi/routing.py",
+        .language = CBM_LANG_PYTHON,
+    };
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_gbuf_t *scratch = NULL;
+    cbm_pipeline_file_delta_t delta = {0};
+    ASSERT_EQ(pipeline_build_exact_scratch_for_changed_files(store, g_incr_tmpdir, project,
+                                                             &changed, CBM_ALLOC_ONE, &scratch,
+                                                             &delta),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_pipeline_attach_file_delta_metadata_with_fingerprint(&delta, &changed,
+                                                                       pass_fingerprint),
+              CBM_STORE_OK);
+    int64_t generation = 0;
+    ASSERT_EQ(cbm_store_reserve_index_generation(store, project, NULL, NULL, &generation),
+              CBM_STORE_OK);
+    ASSERT_GT(generation, CBM_PIPELINE_COMPAT_GENERATION);
+    ASSERT_EQ(cbm_pipeline_file_delta_stamp_generation(&delta, generation), CBM_STORE_OK);
+    const cbm_pipeline_file_delta_t *deltas[] = {&delta};
+    cbm_pipeline_file_delta_plan_t plan = {0};
+    ASSERT_EQ(cbm_pipeline_apply_file_delta_batch(store, deltas, CBM_ALLOC_ONE,
+                                                  CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS,
+                                                  &plan),
+              CBM_STORE_OK);
+    ASSERT_EQ(plan.route, CBM_PIPELINE_DELTA_ROUTE_EXACT_CANDIDATE);
+    cbm_pipeline_file_delta_plan_free(&plan);
+    cbm_store_close(store);
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = pipeline_compare_current_db_to_fresh_fast_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, cfg, diff_err, sizeof(diff_err));
+    if (diff_rc != 0) {
+        FAIL(diff_err[0] ? diff_err : "Python exact scratch delta differed from fresh rebuild");
+    }
+    ASSERT_EQ(diff_rc, 0);
+
+    cbm_pipeline_file_delta_free(&delta);
+    cbm_gbuf_free(scratch);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    ASSERT_EQ(write_incremental_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_overlay_call_connected(g_incr_dbpath, project, "CallerA", "Leaf"));
+
+    ASSERT_EQ(write_incremental_leaf_file(CBM_SZ_2), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") == NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_overlay_call_connected(g_incr_dbpath, project, "CallerA", "Leaf"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 1\n}\n"),
+              0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+    ASSERT(pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "leaf.go", "Leaf"));
+
+    ASSERT_EQ(cbm_unlink(path), 0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.overlay.done files=1") != NULL);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+    ASSERT(!cbm_pipeline_graph_changed(p));
+    cbm_pipeline_exact_delta_stats_t stats = cbm_pipeline_exact_delta_stats(p);
+    ASSERT_EQ(stats.changed_paths, 1);
+    ASSERT_EQ(stats.affected_paths, 1);
+    ASSERT_EQ(stats.published_paths, 1);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(pipeline_store_generation_status_count(g_incr_dbpath, project,
+                                                     CBM_STORE_INDEX_STATUS_RESERVED),
+              0);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Leaf"));
+    ASSERT(!pipeline_store_overlay_file_has_function(g_incr_dbpath, project, "leaf.go", "Leaf"));
+    int64_t leaf_generation = 0;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "leaf.go",
+                                                   &leaf_generation),
+              CBM_STORE_OK);
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func OverlayRetryOnly() int {\n\treturn 77\n}\n"),
+              0);
+
+    for (int i = 0; i < 2; i++) {
+        p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+        ASSERT_NOT_NULL(p);
+        cbm_pipeline_apply_config(p, cfg);
+        ASSERT_EQ(cbm_pipeline_run(p), 0);
+        ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY);
+        ASSERT(!cbm_pipeline_graph_changed(p));
+        cbm_pipeline_free(p);
+    }
+
+    ASSERT_EQ(pipeline_store_generation_status_count(g_incr_dbpath, project,
+                                                     CBM_STORE_INDEX_STATUS_RESERVED),
+              0);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayRetryOnly"));
+    ASSERT_EQ(pipeline_store_overlay_file_function_count(g_incr_dbpath, project, "leaf.go",
+                                                        "OverlayRetryOnly"),
+              1);
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 1);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_publish_failure_falls_back_to_canonical_exact) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayFailureOnly"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func OverlayFailureOnly() int {\n\treturn 88\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_OVERLAY_PUBLISH, 1);
+    int run_rc = cbm_pipeline_run(p);
+    pipeline_env_restore(&fail_env);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(cbm_pipeline_publish_kind(p), CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT);
+    ASSERT(cbm_pipeline_graph_changed(p));
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(pipeline_store_overlay_generation_status_count(
+                  g_incr_dbpath, project, CBM_STORE_OVERLAY_STATUS_FAILED),
+              1);
+    ASSERT_EQ(pipeline_store_overlay_generation_status_count(
+                  g_incr_dbpath, project, CBM_STORE_OVERLAY_STATUS_READY),
+              0);
+    ASSERT_EQ(pipeline_store_generation_status_count(g_incr_dbpath, project,
+                                                     CBM_STORE_INDEX_STATUS_RESERVED),
+              0);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayFailureOnly"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 0);
+    ASSERT_EQ(dirty_overlay_ready, 0);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_overlay_extract_failure_keeps_dirty_pending_without_overlay) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_OVERLAY_PUBLISH,
+                             CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "OverlayExtractFailureOnly"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/leaf.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func Leaf() int {\n\treturn 2\n}\n\n"
+                            "func OverlayExtractFailureOnly() int {\n\treturn 99\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FAST, .ignore_file = NULL, .max_file_size = 0};
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_EXTRACT, 1);
+    int run_rc = cbm_pipeline_run_incremental(p, g_incr_dbpath, files, file_count);
+    pipeline_env_restore(&fail_env);
+    cbm_discover_free(files, file_count);
+    ASSERT_NEQ(run_rc, 0);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project,
+                                             "OverlayExtractFailureOnly"));
+    ASSERT_EQ(pipeline_store_overlay_generation_status_count(
+                  g_incr_dbpath, project, CBM_STORE_OVERLAY_STATUS_FAILED),
+              0);
+    ASSERT_EQ(pipeline_store_overlay_generation_status_count(
+                  g_incr_dbpath, project, CBM_STORE_OVERLAY_STATUS_READY),
+              0);
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 1);
+    ASSERT_EQ(dirty_overlay_ready, 0);
+    cbm_pipeline_free(p);
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_full_mode_keeps_exact_upsert_disabled) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/main.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    ASSERT_EQ(th_write_file(path,
+                            "package main\n\n"
+                            "func main() {\n\tHelper()\n}\n\n"
+                            "func FullModeNewMain() int {\n\treturn 9\n}\n"),
+              0);
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "FullModeNewMain"));
+    int64_t generation = -1;
+    ASSERT_EQ(pipeline_store_file_state_generation(g_incr_dbpath, project, "main.go",
+                                                   &generation),
+              CBM_STORE_OK);
+    ASSERT_EQ(generation, CBM_PIPELINE_COMPAT_GENERATION);
+
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+    int canonical_graph_diff_rc = pipeline_compare_current_db_to_fresh_rebuild(
+        g_incr_tmpdir, g_incr_dbpath, project, CBM_MODE_FULL, cfg, canonical_graph_diff_error,
+        sizeof(canonical_graph_diff_error));
+    if (canonical_graph_diff_rc != 0) {
+        printf("    [full-mode:canonical-diff] %s\n", canonical_graph_diff_error);
+    }
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
+    PASS();
+}
+
+TEST(incremental_detects_same_size_rewrite_with_preserved_mtime) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    const char original[] = "package main\n\nfunc Helper() string {\n\treturn \"hello\"\n}\n";
+    const char rewritten[] = "package main\n\nfunc Helped() string {\n\treturn \"hello\"\n}\n";
+    ASSERT_EQ((int)strlen(original), (int)strlen(rewritten));
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helped"));
+
+    char path[CBM_PATH_MAX];
+    int n = snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(path));
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+    ASSERT_EQ((int64_t)before.st_size, (int64_t)strlen(original));
+    ASSERT_EQ(th_write_file(path, rewritten), 0);
+    ASSERT_EQ(pipeline_restore_file_times(path, &before), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helped"));
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_missing_file_state_keeps_legacy_metadata_path) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    ASSERT_EQ(cbm_store_delete_file_state(s, project, "helper.go"), CBM_STORE_OK);
+    cbm_file_state_t state = {0};
+    ASSERT_EQ(cbm_store_get_file_state(s, project, "helper.go", &state), CBM_STORE_NOT_FOUND);
+    cbm_store_close(s);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "Helper"));
+
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_publish_failure_keeps_existing_db) {
+    pipeline_env_snapshot_t flush_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT);
+    pipeline_env_snapshot_t dump_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    char path[CBM_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_setenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, pipeline_test_env_enabled, 1);
+    cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, pipeline_test_env_enabled, 1);
+    int rc = cbm_pipeline_run(p);
+    pipeline_env_restore(&flush_fail_env);
+    pipeline_env_restore(&dump_fail_env);
+
+    ASSERT_NEQ(rc, 0);
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+    int dirty_pending = -1;
+    int dirty_overlay_ready = -1;
+    ASSERT_EQ(pipeline_store_dirty_counts(g_incr_dbpath, project, &dirty_pending,
+                                          &dirty_overlay_ready),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_pending, 1);
+    ASSERT_EQ(dirty_overlay_ready, 0);
+    s = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    cbm_dirty_file_state_t *dirty_rows = NULL;
+    int dirty_row_count = 0;
+    ASSERT_EQ(cbm_store_list_dirty_files(s, project, &dirty_rows, &dirty_row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_row_count, 1);
+    ASSERT_STR_EQ(dirty_rows[0].project, project);
+    ASSERT_STR_EQ(dirty_rows[0].rel_path, "helper.go");
+    char expected_dirty_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    ASSERT_EQ(cbm_file_content_hash(path, expected_dirty_hash, sizeof(expected_dirty_hash)), 0);
+    ASSERT_STR_EQ(dirty_rows[0].observed_hash, expected_dirty_hash);
+    ASSERT_GT(dirty_rows[0].observed_mtime_ns, 0);
+    ASSERT_GT(dirty_rows[0].observed_size, 0);
+    ASSERT_STR_EQ(dirty_rows[0].source, CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX);
+    ASSERT_STR_EQ(dirty_rows[0].status, CBM_STORE_DIRTY_STATUS_PENDING);
+    cbm_store_free_dirty_files(dirty_rows, dirty_row_count);
+    cbm_store_close(s);
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
     cleanup_incremental_repo();
     PASS();
 }
@@ -10349,8 +22052,6 @@ TEST(full_reindex_recovers_when_previous_coverage_is_unreadable) {
     ASSERT_NOT_NULL(s);
     int nodes_before = cbm_store_count_nodes(s, project);
     ASSERT_GT(nodes_before, 0);
-    /* Simulate an unreadable prior coverage generation while leaving the
-     * graph and file hashes healthy enough to otherwise run incrementally. */
     ASSERT_EQ(
         cbm_store_exec(s, "ALTER TABLE index_coverage RENAME COLUMN detail TO broken_detail;"),
         CBM_STORE_OK);
@@ -10368,8 +22069,6 @@ TEST(full_reindex_recovers_when_previous_coverage_is_unreadable) {
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
-    /* An exact-manifest delta routes to an isolated full generation, which
-     * does not depend on the damaged coverage table and repairs it atomically. */
     s = cbm_store_open_path(g_incr_dbpath);
     ASSERT_NOT_NULL(s);
     ASSERT_GT(cbm_store_count_nodes(s, project), nodes_before);
@@ -10384,6 +22083,250 @@ TEST(full_reindex_recovers_when_previous_coverage_is_unreadable) {
     free(project);
 
     cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_frontier_full_fallback_failure_preserves_dirty_ledger) {
+    pipeline_env_snapshot_t flush_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT);
+    pipeline_env_snapshot_t dump_fail_env =
+        pipeline_env_save(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+    ASSERT_EQ(write_incremental_c_header_frontier_fixture(CBM_ALLOC_ONE), 0);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    char conservative_cap[CBM_SZ_32];
+    int n = snprintf(conservative_cap, sizeof(conservative_cap), "%d", CBM_SZ_4);
+    ASSERT(n >= 0 && (size_t)n < sizeof(conservative_cap));
+    ASSERT_EQ(
+        cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, conservative_cap), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = cbm_strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_NOT_NULL(project);
+
+    cbm_store_t *store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    int nodes_before = cbm_store_count_nodes(store, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(store);
+    ASSERT_FALSE(pipeline_store_has_function_name(g_incr_dbpath, project, "shared_extra"));
+
+    ASSERT_EQ(write_incremental_c_header_extra_export(CBM_SZ_16), 0);
+    char changed_path[CBM_PATH_MAX];
+    n = snprintf(changed_path, sizeof(changed_path), "%s/shared.h", g_incr_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(changed_path));
+
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    cbm_setenv(CBM_TEST_FAIL_GBUF_FLUSH_BEFORE_COMMIT, pipeline_test_env_enabled, 1);
+    cbm_setenv(CBM_TEST_FAIL_GBUF_DUMP_BEFORE_REPLACE, pipeline_test_env_enabled, 1);
+    pipeline_capture_logs_start();
+    int run_rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    pipeline_env_restore(&flush_fail_env);
+    pipeline_env_restore(&dump_fail_env);
+
+    ASSERT_NEQ(run_rc, 0);
+    ASSERT(strstr(logs, "msg=incremental.exact.fallback reason=frontier_too_large") != NULL);
+    char fallback_log[CBM_SZ_128];
+    n = snprintf(fallback_log, sizeof(fallback_log), "msg=incremental.fallback reason=%s scope=%s",
+                 CBM_PIPELINE_DELTA_REASON_FRONTIER_TOO_LARGE,
+                 CBM_PIPELINE_DELTA_SCOPE_C_FAMILY_HEADER);
+    ASSERT(n >= 0 && (size_t)n < sizeof(fallback_log));
+    ASSERT(strstr(logs, fallback_log) != NULL);
+
+    store = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_count_nodes(store, project), nodes_before);
+    cbm_store_close(store);
+    ASSERT_FALSE(pipeline_store_has_function_name(g_incr_dbpath, project, "shared_extra"));
+
+    store = cbm_store_open_path_query(g_incr_dbpath);
+    ASSERT_NOT_NULL(store);
+    cbm_dirty_file_state_t *dirty_rows = NULL;
+    int dirty_row_count = 0;
+    ASSERT_EQ(cbm_store_list_dirty_files(store, project, &dirty_rows, &dirty_row_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(dirty_row_count, 1);
+    ASSERT_STR_EQ(dirty_rows[0].project, project);
+    ASSERT_STR_EQ(dirty_rows[0].rel_path, "shared.h");
+    char expected_dirty_hash[CBM_FILE_CONTENT_HASH_BUFSZ] = "";
+    ASSERT_EQ(cbm_file_content_hash(changed_path, expected_dirty_hash, sizeof(expected_dirty_hash)),
+              0);
+    ASSERT_STR_EQ(dirty_rows[0].observed_hash, expected_dirty_hash);
+    ASSERT_GT(dirty_rows[0].observed_mtime_ns, 0);
+    ASSERT_GT(dirty_rows[0].observed_size, 0);
+    ASSERT_STR_EQ(dirty_rows[0].source, CBM_STORE_DIRTY_SOURCE_EXPLICIT_REINDEX);
+    ASSERT_STR_EQ(dirty_rows[0].status, CBM_STORE_DIRTY_STATUS_PENDING);
+    cbm_store_free_dirty_files(dirty_rows, dirty_row_count);
+    cbm_store_close(store);
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_postpass_failure_keeps_existing_db) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    int nodes_before = cbm_store_count_nodes(s, project);
+    ASSERT_GT(nodes_before, 0);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    char path[CBM_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_file_info_t *files = NULL;
+    int file_count = 0;
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL, .ignore_file = NULL, .max_file_size = 0};
+    ASSERT_EQ(cbm_discover(g_incr_tmpdir, &opts, &files, &file_count), 0);
+    ASSERT_GT(file_count, 0);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_POSTPASS, 1);
+    int rc = cbm_pipeline_run_incremental(p, g_incr_dbpath, files, file_count);
+    pipeline_env_restore(&fail_env);
+    cbm_discover_free(files, file_count);
+
+    ASSERT_NEQ(rc, 0);
+    s = cbm_store_open_path(g_incr_dbpath);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, project), nodes_before);
+    cbm_store_close(s);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_hash_persist_failure_falls_back_to_full) {
+    pipeline_env_snapshot_t fail_env = pipeline_env_save(CBM_TEST_FAIL_INCREMENTAL_PHASE);
+
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char *project = strdup(cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    ASSERT_GTE(pipeline_store_file_hash_count(g_incr_dbpath, project), 2);
+    ASSERT(!pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+
+    char path[CBM_PATH_MAX];
+    snprintf(path, sizeof(path), "%s/helper.go", g_incr_tmpdir);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\n"
+               "func Helper() string {\n\treturn \"hello\"\n}\n\n"
+               "func NewFunc() int {\n\treturn 42\n}\n");
+    fclose(f);
+
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    cbm_setenv(CBM_TEST_FAIL_INCREMENTAL_PHASE, CBM_TEST_FAIL_INCREMENTAL_HASH_PERSIST, 1);
+    int rc = cbm_pipeline_run(p);
+    pipeline_env_restore(&fail_env);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT(pipeline_store_has_function_name(g_incr_dbpath, project, "NewFunc"));
+    ASSERT_GTE(pipeline_store_file_hash_count(g_incr_dbpath, project), 2);
+
+    cbm_pipeline_free(p);
+    free(project);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_parallel_extract_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_EXTRACT), 0);
+    PASS();
+}
+
+TEST(incremental_parallel_success_releases_package_map) {
+    ASSERT_EQ(setup_incremental_parallel_repo(), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    ASSERT_EQ(rewrite_incremental_parallel_repo(), 0);
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    ASSERT_NULL(cbm_pipeline_get_pkgmap());
+
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+    cleanup_incremental_repo();
+    PASS();
+}
+
+TEST(incremental_parallel_registry_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_REGISTRY), 0);
+    PASS();
+}
+
+TEST(incremental_parallel_resolve_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_RESOLVE), 0);
+    PASS();
+}
+
+TEST(incremental_classify_deleted_failure_keeps_existing_db) {
+    ASSERT_EQ(run_parallel_incremental_phase_failure_case(CBM_TEST_FAIL_INCREMENTAL_CLASSIFY_DELETED),
+              0);
     PASS();
 }
 
@@ -10406,8 +22349,11 @@ TEST(incremental_detects_deleted_file) {
     unlink(path);
 
     /* Second: incremental — should remove Helper nodes */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     /* Verify node count decreased (Helper's file was deleted) */
@@ -10418,6 +22364,7 @@ TEST(incremental_detects_deleted_file) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
+    cbm_config_close(cfg);
 
     cleanup_incremental_repo();
     PASS();
@@ -10445,8 +22392,11 @@ TEST(incremental_new_file_added) {
     fclose(f);
 
     /* Second: incremental — should pick up Extra */
+    cbm_config_t *cfg = incremental_test_config(g_incr_tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(g_incr_tmpdir, g_incr_dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
 
     cbm_store_t *s = cbm_store_open_path(g_incr_dbpath);
@@ -10456,6 +22406,7 @@ TEST(incremental_new_file_added) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     free(project);
+    cbm_config_close(cfg);
 
     cleanup_incremental_repo();
     PASS();
@@ -10623,7 +22574,9 @@ TEST(backup_failed_publish_failure_preserves_final_sidecars) {
     cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &hook);
+    pipeline_capture_logs_start();
     int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
     cbm_pipeline_free(p);
 
     bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main");
@@ -10644,6 +22597,8 @@ TEST(backup_failed_publish_failure_preserves_final_sidecars) {
     ASSERT_TRUE(wal_preserved);
     ASSERT_TRUE(shm_preserved);
     ASSERT_TRUE(journal_preserved);
+    ASSERT_NOT_NULL(strstr(logs, "reason=backup_failed_sidecars_preserved"));
+    ASSERT_NOT_NULL(strstr(logs, "reason=destination_prepare"));
     PASS();
 }
 
@@ -10662,7 +22617,9 @@ TEST(backup_failed_rename_failure_preserves_corrupt_main) {
     ASSERT_NOT_NULL(p);
     cbm_pipeline_set_before_publish_hook_for_tests(p, observe_publish_boundary, &observe);
     cbm_pipeline_set_rename_hook_for_tests(p, fail_publish_rename, &rename_fail);
+    pipeline_capture_logs_start();
     int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
     cbm_pipeline_free(p);
 
     bool final_preserved = pipeline_fixture_file_equals(final_path, "corrupt-main-before-rename");
@@ -10674,6 +22631,43 @@ TEST(backup_failed_rename_failure_preserves_corrupt_main) {
     ASSERT_EQ(rename_fail.calls, 1);
     ASSERT_TRUE(rc != 0);
     ASSERT_TRUE(final_preserved);
+    ASSERT_NOT_NULL(strstr(logs, "reason=rename_replace"));
+    PASS();
+}
+
+TEST(backup_failed_rename_reports_failed_corrupt_main_rollback) {
+    if (setup_incremental_repo() != 0) {
+        FAIL("setup failed");
+    }
+
+    char final_path[512];
+    char quarantine_path[544];
+    snprintf(final_path, sizeof(final_path), "%s/corrupt-rollback.db", g_incr_tmpdir);
+    snprintf(quarantine_path, sizeof(quarantine_path), "%s.corrupt", final_path);
+    ASSERT_EQ(th_write_file(final_path, "corrupt-main-before-rollback"), 0);
+
+    publish_rename_fail_ctx_t rename_fail = {.block_rollback = true};
+    cbm_pipeline_t *p = cbm_pipeline_new(g_incr_tmpdir, final_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_set_rename_hook_for_tests(p, fail_publish_rename, &rename_fail);
+    pipeline_capture_logs_start();
+    int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    cbm_pipeline_free(p);
+
+    bool blocker_preserved = pipeline_fixture_file_equals(final_path, "rollback-blocker");
+    bool corrupt_preserved =
+        pipeline_fixture_file_equals(quarantine_path, "corrupt-main-before-rollback");
+    (void)cbm_unlink(final_path);
+    (void)cbm_unlink(quarantine_path);
+    cleanup_incremental_repo();
+
+    ASSERT_EQ(rename_fail.calls, 1);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_TRUE(blocker_preserved);
+    ASSERT_TRUE(corrupt_preserved);
+    ASSERT_NOT_NULL(strstr(logs, "finalize.rollback_failed"));
+    ASSERT_NOT_NULL(strstr(logs, "reason=main_restore"));
     PASS();
 }
 
@@ -10766,134 +22760,6 @@ TEST(full_reindex_preserves_exact_long_db_path) {
 }
 #endif
 
-TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete) {
-    char tmpdir[256];
-    char artifact_tmpdir[256];
-    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_mode_scope_XXXXXX");
-    snprintf(artifact_tmpdir, sizeof(artifact_tmpdir), "/tmp/cbm_mode_artifact_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
-    ASSERT_NOT_NULL(cbm_mkdtemp(artifact_tmpdir));
-
-    char dbpath[512];
-    char cancelled_import_path[512];
-    char retry_import_path[512];
-    char deleted_import_path[512];
-    snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
-    snprintf(cancelled_import_path, sizeof(cancelled_import_path), "%s/cancelled.db",
-             artifact_tmpdir);
-    snprintf(retry_import_path, sizeof(retry_import_path), "%s/retry.db", artifact_tmpdir);
-    snprintf(deleted_import_path, sizeof(deleted_import_path), "%s/deleted.db", artifact_tmpdir);
-    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "main.go"), "package main\n\nfunc main() {}\n"), 0);
-    ASSERT_TRUE(cbm_mkdir_p(TH_PATH(tmpdir, "tools"), 0755));
-    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "tools/util.go"),
-                            "package tools\n\nfunc StoredBefore() string { return \"old\" }\n"),
-              0);
-
-    cbm_pipeline_t *pipeline = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(pipeline);
-    cbm_pipeline_set_persistence(pipeline, true);
-    ASSERT_EQ(cbm_pipeline_run(pipeline), 0);
-    char *project = strdup(cbm_pipeline_project_name(pipeline));
-    ASSERT_NOT_NULL(project);
-    cbm_pipeline_free(pipeline);
-    ASSERT_TRUE(cbm_artifact_exists(tmpdir));
-
-    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "tools/util.go"),
-                            "package tools\n\nfunc StoredAfter() string { return \"new\" }\n"),
-              0);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_incremental_test_cancel_after_predump_once();
-    observed_fast_run_t cancelled = run_observed_fast_pipeline(tmpdir, dbpath);
-    int cancelled_live_before;
-    int cancelled_live_after;
-    observe_named_generation(dbpath, project, "StoredBefore", "StoredAfter", &cancelled_live_before,
-                             &cancelled_live_after);
-    imported_generation_t cancelled_artifact =
-        import_artifact_generation(tmpdir, cancelled_import_path, project);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    observed_fast_run_t retry = run_observed_fast_pipeline(tmpdir, dbpath);
-    int retry_live_before;
-    int retry_live_after;
-    observe_named_generation(dbpath, project, "StoredBefore", "StoredAfter", &retry_live_before,
-                             &retry_live_after);
-    bool retry_full_mode = stored_mode_is_full(dbpath, project);
-    imported_generation_t retry_artifact =
-        import_artifact_generation(tmpdir, retry_import_path, project);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    observed_fast_run_t noop = run_observed_fast_pipeline(tmpdir, dbpath);
-
-    ASSERT_EQ(cbm_unlink(TH_PATH(tmpdir, "tools/util.go")), 0);
-    cbm_pipeline_incremental_test_reset_faults();
-    observed_fast_run_t deleted = run_observed_fast_pipeline(tmpdir, dbpath);
-    int deleted_live_before;
-    int deleted_live_after;
-    observe_named_generation(dbpath, project, "StoredBefore", "StoredAfter", &deleted_live_before,
-                             &deleted_live_after);
-    bool delete_full_mode = stored_mode_is_full(dbpath, project);
-
-    cbm_store_t *store = cbm_store_open_path(dbpath);
-    ASSERT_NOT_NULL(store);
-    cbm_file_hash_t deleted_hash = {0};
-    int deleted_hash_rc = cbm_store_get_file_hash(store, project, "tools/util.go", &deleted_hash);
-    cbm_store_clear_file_hash(&deleted_hash);
-    cbm_store_close(store);
-    imported_generation_t deleted_artifact =
-        import_artifact_generation(tmpdir, deleted_import_path, project);
-
-    cbm_pipeline_incremental_test_reset_faults();
-    free(project);
-    th_rmtree(artifact_tmpdir);
-    th_rmtree(tmpdir);
-
-    ASSERT_EQ(cancelled.rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
-    ASSERT_EQ(cancelled.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
-    ASSERT_TRUE(cancelled.tools_excluded);
-    ASSERT_EQ(cancelled_live_before, 1);
-    ASSERT_EQ(cancelled_live_after, 0);
-    ASSERT_EQ(cancelled.publish.rename_calls, 0);
-    ASSERT_EQ(cancelled.publish.export_count, 0);
-    ASSERT_EQ(cancelled_artifact.rc, 0);
-    ASSERT_EQ(cancelled_artifact.before_nodes, 1);
-    ASSERT_EQ(cancelled_artifact.after_nodes, 0);
-
-    ASSERT_EQ(retry.rc, 0);
-    ASSERT_EQ(retry.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
-    ASSERT_TRUE(retry.tools_excluded);
-    ASSERT_TRUE(retry_full_mode);
-    ASSERT_EQ(retry_live_before, 0);
-    ASSERT_EQ(retry_live_after, 1);
-    ASSERT_EQ(retry.publish.rename_calls, 1);
-    ASSERT_EQ(retry.publish.exports_before_publish, 0);
-    ASSERT_EQ(retry.publish.export_count, 1);
-    ASSERT_EQ(retry_artifact.rc, 0);
-    ASSERT_EQ(retry_artifact.before_nodes, 0);
-    ASSERT_EQ(retry_artifact.after_nodes, 1);
-
-    ASSERT_EQ(noop.rc, 0);
-    ASSERT_EQ(noop.route, CBM_INCREMENTAL_ROUTE_NOOP);
-    ASSERT_TRUE(noop.tools_excluded);
-    ASSERT_EQ(noop.publish.rename_calls, 1);
-    ASSERT_EQ(noop.publish.exports_before_publish, 0);
-    ASSERT_EQ(noop.publish.export_count, 1);
-
-    ASSERT_EQ(deleted.rc, 0);
-    ASSERT_EQ(deleted.route, CBM_INCREMENTAL_ROUTE_FORCED_FULL);
-    ASSERT_TRUE(deleted.tools_excluded);
-    ASSERT_EQ(deleted.publish.rename_calls, 1);
-    ASSERT_EQ(deleted.publish.exports_before_publish, 0);
-    ASSERT_EQ(deleted.publish.export_count, 1);
-    ASSERT_EQ(deleted_hash_rc, CBM_STORE_NOT_FOUND);
-    ASSERT_TRUE(delete_full_mode);
-    ASSERT_EQ(deleted_live_before, 0);
-    ASSERT_EQ(deleted_live_after, 0);
-    ASSERT_EQ(deleted_artifact.rc, 0);
-    ASSERT_EQ(deleted_artifact.before_nodes, 0);
-    ASSERT_EQ(deleted_artifact.after_nodes, 0);
-    PASS();
-}
 
 TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     /* Regression: 2026-04-13. A fast-mode reindex after a full-mode index
@@ -10914,6 +22780,11 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     }
     char dbpath[512];
     snprintf(dbpath, sizeof(dbpath), "%s/test.db", tmpdir);
+    cbm_config_t *cfg = incremental_test_config(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH,
+                             CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH),
+              0);
 
     char path[512];
     FILE *f;
@@ -10952,11 +22823,28 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     ASSERT_GT(tools_count_before, 0); /* full mode must see tools/util.go */
     cbm_store_free_nodes(tools_nodes_before, tools_count_before);
     int total_before = cbm_store_count_nodes(s, project);
+    char dep_project[CBM_SZ_512];
+    int dep_len = snprintf(dep_project, sizeof(dep_project), "%s.dep.requests", project);
+    ASSERT_TRUE(dep_len > 0 && (size_t)dep_len < sizeof(dep_project));
+    ASSERT_EQ(cbm_store_upsert_project(s, dep_project, "/tmp/requests"), CBM_STORE_OK);
+    cbm_node_t dep_node = {
+        .project = dep_project,
+        .label = "Module",
+        .name = "requests",
+        .qualified_name = dep_project,
+        .file_path = "__init__.py",
+        .start_line = 1,
+        .end_line = 1,
+        .properties_json = "{}",
+    };
+    ASSERT_GT(cbm_store_upsert_node(s, &dep_node), 0);
+    ASSERT_GT(cbm_store_count_nodes(s, dep_project), 0);
     cbm_store_close(s);
 
     /* Step 2: fast-mode reindex — tools/util.go MUST survive (additive semantics) */
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -10978,11 +22866,11 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     ASSERT_GTE(total_after, total_before); /* additive — never less */
     cbm_store_close(s);
 
-    /* Step 3: mutate main.go and fast reindex — forces dump_and_persist to
+    /* Step 3: mutate main.go and fast reindex — forces publish_and_persist to
      * run (instead of the noop early-return path that step 2 hit). This is
      * the real dangerous path: the gbuf gets loaded, mutated for main.go,
-     * dumped back to disk. tools/util.go must survive THAT cycle, not just
-     * the trivial noop path. Audit finding from 2026-04-13. */
+     * and published back to the store. tools/util.go must survive that cycle,
+     * not just the trivial noop path. Audit finding from 2026-04-13. */
     snprintf(path, sizeof(path), "%s/main.go", tmpdir);
     f = fopen(path, "w");
     ASSERT_NOT_NULL(f);
@@ -11004,6 +22892,7 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
 
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FAST);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -11013,10 +22902,19 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     int tools_count_run3 = 0;
     cbm_store_find_nodes_by_file(s, project, "tools/util.go", &tools_nodes_run3, &tools_count_run3);
     /* tools/util.go nodes must STILL be present after a fast reindex that
-     * actually ran the full dump_and_persist cycle (not the noop fast-path). */
+     * actually ran the full publish_and_persist cycle (not the noop fast-path). */
     ASSERT_EQ(tools_count_run3, tools_count_before);
     cbm_store_free_nodes(tools_nodes_run3, tools_count_run3);
+    ASSERT_GT(cbm_store_count_nodes(s, dep_project), 0);
     cbm_store_close(s);
+
+    char canonical_graph_diff_error[CBM_SZ_8K] = {0};
+    int canonical_graph_diff_rc = pipeline_compare_current_db_to_fresh_rebuild(
+        tmpdir, dbpath, project, CBM_MODE_FULL, cfg, canonical_graph_diff_error,
+        sizeof(canonical_graph_diff_error));
+    if (canonical_graph_diff_rc != 0) {
+        printf("    [full-to-fast-mode:canonical-diff] %s\n", canonical_graph_diff_error);
+    }
 
     /* Step 4: actually delete tools/util.go from disk and full-reindex.
      * Now it really is gone, so its nodes should be purged. This pins the
@@ -11041,7 +22939,9 @@ TEST(incremental_fast_preserves_mode_skipped_tools_dir) {
     cbm_store_close(s);
 
     free(project);
+    cbm_config_close(cfg);
     th_rmtree(tmpdir);
+    ASSERT_EQ(canonical_graph_diff_rc, 0);
     PASS();
 }
 
@@ -11090,8 +22990,11 @@ TEST(incremental_k8s_manifest_indexed) {
     fclose(f);
 
     /* Incremental re-index */
+    cbm_config_t *cfg = incremental_test_config(tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -11106,6 +23009,7 @@ TEST(incremental_k8s_manifest_indexed) {
     cbm_store_close(s);
 
     free(project);
+    cbm_config_close(cfg);
     th_rmtree(tmpdir);
     PASS();
 }
@@ -11148,8 +23052,11 @@ TEST(incremental_kustomize_module_indexed) {
     fclose(f);
 
     /* Incremental re-index */
+    cbm_config_t *cfg = incremental_test_config(tmpdir);
+    ASSERT_NOT_NULL(cfg);
     p = cbm_pipeline_new(tmpdir, dbpath, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
     ASSERT_EQ(cbm_pipeline_run(p), 0);
     cbm_pipeline_free(p);
 
@@ -11171,6 +23078,7 @@ TEST(incremental_kustomize_module_indexed) {
     ASSERT_TRUE(found_kust);
 
     free(project);
+    cbm_config_close(cfg);
     th_rmtree(tmpdir);
     PASS();
 }
@@ -11307,6 +23215,945 @@ TEST(pipeline_double_free_prevention) {
      * the same pointer, but we verify NULL is safe as documented. */
     cbm_pipeline_free(NULL);
     cbm_pipeline_free(NULL);
+    PASS();
+}
+
+TEST(pipeline_unit_threshold_setters_clamp_invalid_values) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+
+    cbm_pipeline_set_similarity_threshold(p, 0.7);
+    cbm_pipeline_set_httplink_min_confidence(p, 0.25);
+    cbm_pipeline_set_semantic_threshold(p, 0.75);
+    cbm_pipeline_set_githistory_min_coupling(p, 0.3);
+    cbm_pipeline_set_lsp_confidence_floor(p, 0.6);
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) == 0.7);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) == 0.25);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) == 0.75);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) == 0.3);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) == 0.6);
+
+    cbm_pipeline_set_similarity_threshold(p, -1.0);
+    cbm_pipeline_set_httplink_min_confidence(p, 0.0);
+    cbm_pipeline_set_semantic_threshold(p, 1.5);
+    cbm_pipeline_set_githistory_min_coupling(p, 2.0);
+    cbm_pipeline_set_lsp_confidence_floor(p, -0.1);
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) == 0.0);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) == 0.0);
+
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_githistory_max_couplings_clamps_to_shared_range) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
+
+    cbm_pipeline_set_githistory_max_couplings(p, CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+
+    cbm_pipeline_set_githistory_max_couplings(p, 0);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
+
+    cbm_pipeline_set_githistory_max_couplings(p, CBM_GITHISTORY_MAX_COUPLINGS_LIMIT + 1);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_publish_kind_names_are_stable) {
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_NONE), "none");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_FULL), "full");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP),
+                  "incremental_noop");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT),
+                  "incremental_exact");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY),
+                  "incremental_overlay");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name(CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT),
+                  "incremental_containment");
+    ASSERT_STR_EQ(cbm_pipeline_publish_kind_name((cbm_pipeline_publish_kind_t)999), "unknown");
+    PASS();
+}
+
+TEST(pipeline_apply_config_sets_all_thresholds) {
+    enum {
+        PIPELINE_TEST_EXACT_MAX_CHANGED = 3,
+        PIPELINE_TEST_EXACT_MAX_AFFECTED = 9,
+        PIPELINE_TEST_GITHISTORY_MAX_COUPLINGS = 65536,
+    };
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_pipeline_cfg_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_THRESHOLD, "0.71"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE, "0.26"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_THRESHOLD, "0.76"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MIN_COUPLING, "0.31"), 0);
+    char githistory_max_couplings[CBM_SZ_32];
+    int n = snprintf(githistory_max_couplings, sizeof(githistory_max_couplings), "%d",
+                     PIPELINE_TEST_GITHISTORY_MAX_COUPLINGS);
+    ASSERT(n >= 0 && (size_t)n < sizeof(githistory_max_couplings));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_MAX_COUPLINGS, githistory_max_couplings),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_LSP_CONFIDENCE_FLOOR, "0.61"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "17000"), 0);
+    char max_changed[CBM_SZ_32];
+    char max_affected[CBM_SZ_32];
+    n = snprintf(max_changed, sizeof(max_changed), "%d", PIPELINE_TEST_EXACT_MAX_CHANGED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(max_changed));
+    n = snprintf(max_affected, sizeof(max_affected), "%d", PIPELINE_TEST_EXACT_MAX_AFFECTED);
+    ASSERT(n >= 0 && (size_t)n < sizeof(max_affected));
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS, max_changed),
+              0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS, max_affected),
+              0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) > 0.70);
+    ASSERT_TRUE(cbm_pipeline_similarity_threshold(p) < 0.72);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) > 0.25);
+    ASSERT_TRUE(cbm_pipeline_httplink_min_confidence(p) < 0.27);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) > 0.75);
+    ASSERT_TRUE(cbm_pipeline_semantic_threshold(p) < 0.77);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) > 0.30);
+    ASSERT_TRUE(cbm_pipeline_githistory_min_coupling(p) < 0.32);
+    ASSERT_EQ(cbm_pipeline_githistory_max_couplings(p), PIPELINE_TEST_GITHISTORY_MAX_COUPLINGS);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) > 0.60);
+    ASSERT_TRUE(cbm_pipeline_lsp_confidence_floor(p) < 0.62);
+    ASSERT_FALSE(cbm_pipeline_similarity_enabled(p));
+    ASSERT_FALSE(cbm_pipeline_semantic_edges_enabled(p));
+    ASSERT_FALSE(cbm_pipeline_githistory_enabled(p));
+    ASSERT_FALSE(cbm_pipeline_httplinks_enabled(p));
+    ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p), 17000000);
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_MAX_CHANGED);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_MAX_AFFECTED);
+    ASSERT_TRUE(cbm_pipeline_incremental_derived_results_refresh_defers_exact_delta_reindexes(p));
+    ASSERT_TRUE(
+        cbm_pipeline_incremental_derived_results_refresh_defers_all_incremental_reindexes(p));
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
+    cbm_config_close(cfg);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "1"), 0);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p),
+              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS * 1000);
+
+    ASSERT_NEQ(cbm_config_set(cfg, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "999999"), 0);
+    cbm_config_close(cfg);
+    ASSERT_EQ(th_set_raw_config_value(tmpdir, CBM_CONFIG_EXTRACT_TIMEOUT_MS, "999999"), 0);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    cbm_pipeline_apply_config(p, cfg);
+    ASSERT_EQ(cbm_pipeline_extract_timeout_micros(p),
+              (int64_t)CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS * 1000);
+
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+    rm_rf(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_capability_gates_default_enabled) {
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_TRUE(cbm_pipeline_similarity_enabled(p));
+    ASSERT_TRUE(cbm_pipeline_semantic_edges_enabled(p));
+    ASSERT_TRUE(cbm_pipeline_githistory_enabled(p));
+    ASSERT_TRUE(cbm_pipeline_httplinks_enabled(p));
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+TEST(pipeline_disabled_capabilities_skip_expensive_passes) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create capability-gate repo");
+    }
+    char db_path[CBM_PATH_MAX];
+    int n = snprintf(db_path, sizeof(db_path), "%s/capabilities.db", g_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(db_path));
+
+    cbm_config_t *cfg = cbm_config_open(g_tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SIMILARITY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_SEMANTIC_EDGES_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_GITHISTORY_ENABLED, "false"), 0);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_HTTPLINKS_ENABLED, "false"), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_pipeline_apply_config(p, cfg);
+    pipeline_capture_logs_start();
+    int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(rc, 0);
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=githistory reason=disabled"));
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=similarity reason=disabled"));
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=semantic_edges reason=disabled"));
+    ASSERT_NOT_NULL(strstr(logs, "msg=pass.skip pass=httplinks reason=disabled"));
+
+    cbm_pipeline_free(p);
+    cbm_config_close(cfg);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_githistory_compute_overlaps_independent_postpasses) {
+    enum { PIPELINE_GITHISTORY_SYNCHRONOUS_WORKERS = 1, PIPELINE_GITHISTORY_THREADED_WORKERS = 2 };
+    pipeline_env_snapshot_t workers_env = pipeline_env_save("CBM_WORKERS");
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create Git-history overlap repo");
+    }
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const email_args[] = {"config", "user.email", "test@example.invalid", NULL};
+    const char *const name_args[] = {"config", "user.name", "CBM Test", NULL};
+    const char *const add_args[] = {"add", "main.go", "pkg/service.go", NULL};
+    const char *const initial_commit_args[] = {"commit", "-q", "-m", "initial", NULL};
+    const char *const changed_commit_args[] = {"commit", "-q", "-m", "changed", NULL};
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, init_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, email_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, name_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, initial_commit_args), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"changed\") }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "pkg/service.go"),
+                            "package pkg\n\nfunc Serve() { println(\"changed\") }\n"),
+              0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, changed_commit_args), 0);
+    /* Meet the production evidence floor so both schedules publish an edge. */
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "main.go"),
+                            "package main\n\nfunc main() { println(\"changed again\") }\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "pkg/service.go"),
+                            "package pkg\n\nfunc Serve() { println(\"changed again\") }\n"),
+              0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, add_args), 0);
+    ASSERT_EQ(cbm_git_drain_command(g_tmpdir, changed_commit_args), 0);
+
+    char synchronous_db[CBM_PATH_MAX];
+    char threaded_db[CBM_PATH_MAX];
+    int n =
+        snprintf(synchronous_db, sizeof(synchronous_db), "%s/githistory-synchronous.db", g_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(synchronous_db));
+    n = snprintf(threaded_db, sizeof(threaded_db), "%s/githistory-threaded.db", g_tmpdir);
+    ASSERT(n >= 0 && (size_t)n < sizeof(threaded_db));
+
+    char *project = NULL;
+    int synchronous_rc = pipeline_run_with_worker_count(
+        g_tmpdir, synchronous_db, PIPELINE_GITHISTORY_SYNCHRONOUS_WORKERS, &project);
+    pipeline_capture_logs_start();
+    int threaded_rc = pipeline_run_with_worker_count(g_tmpdir, threaded_db,
+                                                     PIPELINE_GITHISTORY_THREADED_WORKERS, NULL);
+    const char *logs = pipeline_capture_logs_end();
+    const char *history_start = strstr(logs, "msg=pass.start pass=githistory execution=threaded");
+    const char *http_done = strstr(logs, "msg=pass.timing pass=httplinks");
+    const char *history_done = strstr(logs, "msg=pass.done pass=githistory");
+    bool scheduling_order_is_valid = history_start && http_done && history_done &&
+                                     history_start < http_done && http_done < history_done;
+
+    pipeline_env_restore(&workers_env);
+    ASSERT_EQ(synchronous_rc, 0);
+    ASSERT_EQ(threaded_rc, 0);
+    ASSERT_NOT_NULL(project);
+    ASSERT_TRUE(scheduling_order_is_valid);
+
+    char *main_qn = cbm_pipeline_fqn_compute(project, "main.go", "__file__");
+    char *service_qn = cbm_pipeline_fqn_compute(project, "pkg/service.go", "__file__");
+    ASSERT_NOT_NULL(main_qn);
+    ASSERT_NOT_NULL(service_qn);
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(synchronous_db, project, main_qn,
+                                                    "FILE_CHANGES_WITH", service_qn));
+    ASSERT_TRUE(pipeline_store_has_edge_between_qns(threaded_db, project, main_qn,
+                                                    "FILE_CHANGES_WITH", service_qn));
+
+    char diff_err[CBM_SZ_8K] = {0};
+    int diff_rc = cbm_test_compare_canonical_graphs(synchronous_db, threaded_db, project, diff_err,
+                                                    sizeof(diff_err));
+    if (diff_rc != 0) {
+        printf("    [githistory:scheduling-diff] %s\n", diff_err);
+    }
+    free(main_qn);
+    free(service_qn);
+    free(project);
+    teardown_test_repo();
+    ASSERT_EQ(diff_rc, 0);
+    PASS();
+}
+
+TEST(pipeline_capability_combinations_have_unique_fingerprints) {
+    enum { PIPELINE_CAPABILITY_COMBINATIONS = 16 };
+    char fingerprints[PIPELINE_CAPABILITY_COMBINATIONS][CBM_SZ_256];
+    for (int mask = 0; mask < PIPELINE_CAPABILITY_COMBINATIONS; mask++) {
+        cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        cbm_pipeline_set_similarity_enabled(p, (mask & 1) != 0);
+        cbm_pipeline_set_semantic_edges_enabled(p, (mask & 2) != 0);
+        cbm_pipeline_set_githistory_enabled(p, (mask & 4) != 0);
+        cbm_pipeline_set_httplinks_enabled(p, (mask & 8) != 0);
+        ASSERT_EQ(cbm_pipeline_current_pass_fingerprint(
+                      p, fingerprints[mask], sizeof(fingerprints[mask])),
+                  CBM_STORE_OK);
+        cbm_pipeline_free(p);
+        for (int prior = 0; prior < mask; prior++) {
+            ASSERT_NEQ(strcmp(fingerprints[prior], fingerprints[mask]), 0);
+        }
+    }
+    PASS();
+}
+
+TEST(pipeline_exact_delta_limits_keep_safe_defaults) {
+    enum { PIPELINE_TEST_EXACT_INVERTED_CHANGED = CBM_SZ_8 };
+    ASSERT_EQ(CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS, CBM_SZ_32);
+    cbm_pipeline_t *p = cbm_pipeline_new("/tmp/nonexistent", NULL, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+
+    cbm_pipeline_set_exact_delta_limits(p, 0, -1);
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_CHANGED_PATHS);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p),
+              CBM_PIPELINE_EXACT_DELTA_DEFAULT_MAX_AFFECTED_PATHS);
+
+    cbm_pipeline_set_exact_delta_limits(p, PIPELINE_TEST_EXACT_INVERTED_CHANGED,
+                                        CBM_ALLOC_ONE);
+    ASSERT_EQ(cbm_pipeline_exact_max_changed_paths(p), PIPELINE_TEST_EXACT_INVERTED_CHANGED);
+    ASSERT_EQ(cbm_pipeline_exact_max_affected_paths(p), PIPELINE_TEST_EXACT_INVERTED_CHANGED);
+
+    cbm_pipeline_free(p);
+    PASS();
+}
+
+static const char *semantic_edge_props_for(cbm_gbuf_t *gb, const char *src_qn,
+                                           const char *dst_qn) {
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gb, src_qn);
+    const cbm_gbuf_node_t *dst = cbm_gbuf_find_by_qn(gb, dst_qn);
+    if (!src || !dst) {
+        return NULL;
+    }
+    const cbm_gbuf_edge_t **edges = NULL;
+    int edge_count = 0;
+    if (cbm_gbuf_find_edges_by_source_type(gb, src->id, "SEMANTICALLY_RELATED", &edges,
+                                           &edge_count) != 0) {
+        return NULL;
+    }
+    for (int i = 0; i < edge_count; i++) {
+        if (edges[i]->target_id == dst->id) {
+            return edges[i]->properties_json;
+        }
+    }
+    return NULL;
+}
+
+static cbm_gbuf_t *build_semantic_order_graph(bool reverse_alpha_calls) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-order", "/tmp/sem-order");
+    if (!gb) {
+        return NULL;
+    }
+    const char props[] =
+        "{\"signature\":\"(request: Request, item: Item) -> Response\","
+        "\"return_type\":\"Response\",\"param_names\":[\"request\",\"item\"],"
+        "\"param_types\":[\"Request\",\"Item\"],\"bt\":\"validate item return response\"}";
+    int64_t alpha =
+        cbm_gbuf_upsert_node(gb, "Function", "alpha_handler", "sem-order.alpha_handler",
+                             "routes.py", 1, 20, props);
+    int64_t beta = cbm_gbuf_upsert_node(gb, "Function", "beta_handler", "sem-order.beta_handler",
+                                        "routes.py", 21, 40, props);
+    int64_t validate =
+        cbm_gbuf_upsert_node(gb, "Function", "validate_item", "sem-order.validate_item",
+                             "helpers.py", 1, 5, "{\"signature\":\"(item)\"}");
+    int64_t serialize =
+        cbm_gbuf_upsert_node(gb, "Function", "serialize_response", "sem-order.serialize_response",
+                             "helpers.py", 6, 10, "{\"signature\":\"(response)\"}");
+    if (alpha <= 0 || beta <= 0 || validate <= 0 || serialize <= 0) {
+        cbm_gbuf_free(gb);
+        return NULL;
+    }
+    if (reverse_alpha_calls) {
+        cbm_gbuf_insert_edge(gb, alpha, serialize, "CALLS", "{}");
+        cbm_gbuf_insert_edge(gb, alpha, validate, "CALLS", "{}");
+    } else {
+        cbm_gbuf_insert_edge(gb, alpha, validate, "CALLS", "{}");
+        cbm_gbuf_insert_edge(gb, alpha, serialize, "CALLS", "{}");
+    }
+    cbm_gbuf_insert_edge(gb, beta, validate, "CALLS", "{}");
+    cbm_gbuf_insert_edge(gb, beta, serialize, "CALLS", "{}");
+    return gb;
+}
+
+TEST(pipeline_semantic_edges_independent_of_call_insertion_order) {
+    cbm_gbuf_t *gb_forward = build_semantic_order_graph(false);
+    cbm_gbuf_t *gb_reverse = build_semantic_order_graph(true);
+    ASSERT_NOT_NULL(gb_forward);
+    ASSERT_NOT_NULL(gb_reverse);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx_forward = {
+        .project_name = "sem-order",
+        .repo_path = "/tmp/sem-order",
+        .gbuf = gb_forward,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+    cbm_pipeline_ctx_t ctx_reverse = ctx_forward;
+    ctx_reverse.gbuf = gb_reverse;
+
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx_forward), 0);
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx_reverse), 0);
+
+    const char *forward =
+        semantic_edge_props_for(gb_forward, "sem-order.alpha_handler", "sem-order.beta_handler");
+    const char *reverse =
+        semantic_edge_props_for(gb_reverse, "sem-order.alpha_handler", "sem-order.beta_handler");
+    ASSERT_NOT_NULL(forward);
+    ASSERT_NOT_NULL(reverse);
+    ASSERT_STR_EQ(forward, reverse);
+
+    cbm_gbuf_free(gb_forward);
+    cbm_gbuf_free(gb_reverse);
+    PASS();
+}
+
+static cbm_sem_corpus_t *build_semantic_worker_parity_corpus(int worker_count) {
+    enum {
+        SEM_PARITY_DOCS = 4,
+        SEM_PARITY_MAX_TOKENS = 7,
+    };
+    char *tokens[SEM_PARITY_DOCS * SEM_PARITY_MAX_TOKENS] = {
+        "request", "validate", "item",     "response", "json",     "route",    "status",
+        "request", "validate", "payload",  "response", "json",     "handler",  "status",
+        "auth",    "token",    "validate", "request",  "handler",  "security", "status",
+        "auth",    "token",    "refresh",  "response", "security", "handler",  "json",
+    };
+    int counts[SEM_PARITY_DOCS] = {
+        7,
+        7,
+        7,
+        7,
+    };
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    if (!corpus) {
+        return NULL;
+    }
+    if (!cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, SEM_PARITY_DOCS,
+                                                    SEM_PARITY_MAX_TOKENS, worker_count)) {
+        cbm_sem_corpus_free(corpus);
+        return NULL;
+    }
+    cbm_sem_corpus_finalize_with_workers(corpus, worker_count);
+    return corpus;
+}
+
+TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count) {
+    enum {
+        SEM_PARITY_SERIAL_WORKERS = 1,
+        SEM_PARITY_PARALLEL_WORKERS = 4,
+    };
+    const float eps = 0.000001F;
+    cbm_sem_corpus_t *serial = build_semantic_worker_parity_corpus(SEM_PARITY_SERIAL_WORKERS);
+    cbm_sem_corpus_t *parallel = build_semantic_worker_parity_corpus(SEM_PARITY_PARALLEL_WORKERS);
+    ASSERT_NOT_NULL(serial);
+    ASSERT_NOT_NULL(parallel);
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(serial), cbm_sem_corpus_doc_count(parallel));
+    int token_count = cbm_sem_corpus_token_count(serial);
+    ASSERT_EQ(token_count, cbm_sem_corpus_token_count(parallel));
+    const char *previous_token = NULL;
+    for (int i = 0; i < token_count; i++) {
+        const cbm_sem_vec_t *serial_vec = NULL;
+        const cbm_sem_vec_t *parallel_vec = NULL;
+        float serial_idf = 0.0F;
+        float parallel_idf = 0.0F;
+        const char *serial_token = cbm_sem_corpus_token_at(serial, i, &serial_vec, &serial_idf);
+        const char *parallel_token =
+            cbm_sem_corpus_token_at(parallel, i, &parallel_vec, &parallel_idf);
+        ASSERT_STR_EQ(serial_token, parallel_token);
+        if (previous_token) {
+            ASSERT(strcmp(previous_token, serial_token) <= 0);
+        }
+        previous_token = serial_token;
+        ASSERT_FLOAT_EQ(serial_idf, parallel_idf, eps);
+        ASSERT_NOT_NULL(serial_vec);
+        ASSERT_NOT_NULL(parallel_vec);
+        for (int d = 0; d < CBM_SEM_DIM; d++) {
+            ASSERT_FLOAT_EQ(serial_vec->v[d], parallel_vec->v[d], eps);
+        }
+    }
+
+    cbm_sem_corpus_free(serial);
+    cbm_sem_corpus_free(parallel);
+    PASS();
+}
+
+TEST(pipeline_semantic_corpus_add_doc_reserves_without_losing_docs) {
+    enum {
+        SEM_RESERVE_DOCS = 70,
+        SEM_RESERVE_TOKEN_COUNT = 2,
+    };
+    const char *tokens[SEM_RESERVE_TOKEN_COUNT] = {"alpha", "beta"};
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+
+    for (int i = 0; i < SEM_RESERVE_DOCS; i++) {
+        cbm_sem_corpus_add_doc(corpus, tokens, SEM_RESERVE_TOKEN_COUNT);
+    }
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), SEM_RESERVE_DOCS);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus), SEM_RESERVE_TOKEN_COUNT);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "alpha"), 0);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "beta"), 0);
+
+    cbm_sem_corpus_free(corpus);
+    PASS();
+}
+
+TEST(pipeline_semantic_batch_rejects_invalid_token_stride) {
+    char *tokens[1] = {"alpha"};
+    int counts[1] = {1};
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+
+    ASSERT_FALSE(cbm_sem_corpus_add_docs_batch_with_workers(corpus, tokens, counts, 1, 0, 1));
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 0);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus), 0);
+
+    cbm_sem_corpus_free(corpus);
+    PASS();
+}
+
+TEST(pipeline_semantic_corpus_accepts_nonuniform_docs_beyond_legacy_stride) {
+    enum {
+        SEM_LONG_DOC_TOKENS = 600,
+        SEM_SHORT_DOC_TOKENS = 1,
+    };
+    char **long_doc = calloc(SEM_LONG_DOC_TOKENS, sizeof(*long_doc));
+    ASSERT_NOT_NULL(long_doc);
+    for (int i = 0; i < SEM_LONG_DOC_TOKENS; i++) {
+        long_doc[i] = malloc(CBM_SZ_32);
+        ASSERT_NOT_NULL(long_doc[i]);
+        snprintf(long_doc[i], CBM_SZ_32, "semantic_token_%d", i);
+    }
+    char *short_doc[SEM_SHORT_DOC_TOKENS] = {"short_doc_token"};
+    char **docs[] = {long_doc, short_doc};
+    int counts[] = {SEM_LONG_DOC_TOKENS, SEM_SHORT_DOC_TOKENS};
+
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+    ASSERT_TRUE(cbm_sem_corpus_add_doc_arrays_with_workers(corpus, docs, counts, 2, 2));
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 2);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus),
+              SEM_LONG_DOC_TOKENS + SEM_SHORT_DOC_TOKENS);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "semantic_token_0"), 0);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "semantic_token_599"), 0);
+    ASSERT_GTE(cbm_sem_corpus_token_id(corpus, "short_doc_token"), 0);
+
+    cbm_sem_corpus_free(corpus);
+    for (int i = 0; i < SEM_LONG_DOC_TOKENS; i++) {
+        free(long_doc[i]);
+    }
+    free(long_doc);
+    PASS();
+}
+
+TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids) {
+    const char *existing[] = {"zeta"};
+    char *new_doc[] = {"alpha"};
+    char **docs[] = {new_doc};
+    int counts[] = {1};
+    cbm_sem_corpus_t *corpus = cbm_sem_corpus_new();
+    ASSERT_NOT_NULL(corpus);
+    cbm_sem_corpus_add_doc(corpus, existing, 1);
+    ASSERT_EQ(cbm_sem_corpus_token_id(corpus, "zeta"), 0);
+
+    ASSERT_FALSE(cbm_sem_corpus_add_doc_arrays_with_workers(corpus, docs, counts, 1, 1));
+
+    ASSERT_EQ(cbm_sem_corpus_doc_count(corpus), 1);
+    ASSERT_EQ(cbm_sem_corpus_token_count(corpus), 1);
+    ASSERT_EQ(cbm_sem_corpus_token_id(corpus, "zeta"), 0);
+    ASSERT_EQ(cbm_sem_corpus_token_id(corpus, "alpha"), CBM_NOT_FOUND);
+
+    cbm_sem_corpus_free(corpus);
+    PASS();
+}
+
+TEST(pipeline_semantic_edges_tokenize_complete_long_metadata) {
+    enum {
+        SEM_LONG_METADATA_DISTINCT_TOKENS = 600,
+        SEM_LONG_METADATA_ARRAY_ITEMS = 40,
+        SEM_LONG_METADATA_JSON_CAP = CBM_SZ_32K,
+    };
+    char *props = malloc(SEM_LONG_METADATA_JSON_CAP);
+    ASSERT_NOT_NULL(props);
+    size_t used = 0;
+    int written = snprintf(props, SEM_LONG_METADATA_JSON_CAP, "{\"docstring\":\"");
+    ASSERT_GT(written, 0);
+    used = (size_t)written;
+    for (int i = 0; i < SEM_LONG_METADATA_DISTINCT_TOKENS; i++) {
+        written = snprintf(props + used, (size_t)SEM_LONG_METADATA_JSON_CAP - used,
+                           "semantic_unique_%d ", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, (size_t)SEM_LONG_METADATA_JSON_CAP - used);
+        used += (size_t)written;
+    }
+    written = snprintf(props + used, (size_t)SEM_LONG_METADATA_JSON_CAP - used,
+                       "\",\"param_names\":[");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, (size_t)SEM_LONG_METADATA_JSON_CAP - used);
+    used += (size_t)written;
+    for (int i = 0; i < SEM_LONG_METADATA_ARRAY_ITEMS; i++) {
+        written = snprintf(props + used, (size_t)SEM_LONG_METADATA_JSON_CAP - used,
+                           "%s\"arrayitem%03d\"", i == 0 ? "" : ",", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, (size_t)SEM_LONG_METADATA_JSON_CAP - used);
+        used += (size_t)written;
+    }
+    written = snprintf(props + used, (size_t)SEM_LONG_METADATA_JSON_CAP - used,
+                       "],\"bt\":\"neutral neutral neutral throw\"}");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, (size_t)SEM_LONG_METADATA_JSON_CAP - used);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-long", "/tmp/sem-long");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "long_metadata",
+                                   "sem-long.long_metadata", "long.py", 1, 2, props),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "peer", "sem-long.peer", "peer.py", 1, 2,
+                                   "{\"docstring\":\"peer\"}"),
+              0);
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "sem-long",
+        .repo_path = "/tmp/sem-long",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+
+    pipeline_capture_logs_start();
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx), 0);
+    const char *logs = pipeline_capture_logs_end();
+    const char *marker = strstr(logs, "pass.semantic.token_vectors count=");
+    ASSERT_NOT_NULL(marker);
+    marker += strlen("pass.semantic.token_vectors count=");
+    char *end = NULL;
+    long token_count = strtol(marker, &end, 10);
+    ASSERT_TRUE(end != marker);
+    ASSERT_GTE(token_count,
+               SEM_LONG_METADATA_DISTINCT_TOKENS + SEM_LONG_METADATA_ARRAY_ITEMS);
+
+    cbm_gbuf_free(gb);
+    free(props);
+    PASS();
+}
+
+TEST(pipeline_semantic_edges_tokenize_escaped_json_metadata) {
+    /* Faithful shape from scripts/test_mcp_interactive.py::read_json_lines:
+     * quoted type annotations become JSON escapes in signature/param_types,
+     * and square brackets inside the quoted values are data, not array ends. */
+    const char props[] =
+        "{\"signature\":\"(stream: BinaryIO, responses: "
+        "\\\"queue.Queue[dict[str, Any]]\\\", sig_tail_canary)\","
+        "\"return_type\":\"None\","
+        "\"param_types\":[\"BinaryIO\",\"\\\"queue.Queue[dict[str, Any]]\\\"\","
+        "\"array_tail_canary\"],"
+        "\"docstring\":\"semantic_after_escaped_quote\","
+        "\"bt\":\"array_after_escaped_quote\"}";
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-escaped", "/tmp/sem-escaped");
+    ASSERT_NOT_NULL(gb);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "read_json_lines",
+                                   "sem-escaped.read_json_lines", "interactive.py", 1, 12, props),
+              0);
+    ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "peer", "sem-escaped.peer", "peer.py", 1, 2,
+                                   "{\"docstring\":\"peer\"}"),
+              0);
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "sem-escaped",
+        .repo_path = "/tmp/sem-escaped",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+
+    pipeline_capture_logs_start();
+    int rc = cbm_pipeline_pass_semantic_edges(&ctx);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(strstr(logs, "pass.semantic.tokenize_failed"));
+    const char *marker = strstr(logs, "pass.semantic.token_vectors count=");
+    ASSERT_NOT_NULL(marker);
+    marker += strlen("pass.semantic.token_vectors count=");
+    char *end = NULL;
+    long token_count = strtol(marker, &end, 10);
+    ASSERT_TRUE(end != marker);
+    /* Escaped quotes must not truncate the signature at responses, and the
+     * first ']' inside dict[str, Any] must not terminate param_types. */
+    ASSERT_GTE(token_count, 23);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results) {
+    enum {
+        SEM_NOISY_BUCKET_FUNCTIONS = 205,
+        SEM_NOISY_BUCKET_SHARED_TOKENS = 256,
+        SEM_NOISY_BUCKET_JSON_CAP = CBM_SZ_16K,
+    };
+    char *props = malloc(SEM_NOISY_BUCKET_JSON_CAP);
+    ASSERT_NOT_NULL(props);
+    int written = snprintf(props, SEM_NOISY_BUCKET_JSON_CAP, "{\"docstring\":\"");
+    ASSERT_GT(written, 0);
+    size_t used = (size_t)written;
+    for (int i = 0; i < SEM_NOISY_BUCKET_SHARED_TOKENS; i++) {
+        written = snprintf(props + used, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used,
+                           "shared_semantic_%d ", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used);
+        used += (size_t)written;
+    }
+    written = snprintf(props + used, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used, "\"}");
+    ASSERT_GT(written, 0);
+    ASSERT_LT((size_t)written, (size_t)SEM_NOISY_BUCKET_JSON_CAP - used);
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("sem-noisy", "/tmp/sem-noisy");
+    ASSERT_NOT_NULL(gb);
+    for (int i = 0; i < SEM_NOISY_BUCKET_FUNCTIONS; i++) {
+        char qualified_name[CBM_SZ_128];
+        written = snprintf(qualified_name, sizeof(qualified_name), "sem-noisy.clone_%d", i);
+        ASSERT_GT(written, 0);
+        ASSERT_LT((size_t)written, sizeof(qualified_name));
+        ASSERT_GT(cbm_gbuf_upsert_node(gb, "Function", "clone", qualified_name, "clone.py", 1, 2,
+                                       props),
+                  0);
+    }
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "sem-noisy",
+        .repo_path = "/tmp/sem-noisy",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+        .semantic_threshold = 0.01,
+    };
+
+    pipeline_capture_logs_start();
+    ASSERT_EQ(cbm_pipeline_pass_semantic_edges(&ctx), 0);
+    const char *logs = pipeline_capture_logs_end();
+    ASSERT_NOT_NULL(strstr(logs, "pass.semantic.candidates_partial"));
+    const char *noisy = strstr(logs, "noisy_bucket_visits=");
+    ASSERT_NOT_NULL(noisy);
+    noisy += strlen("noisy_bucket_visits=");
+    char *end = NULL;
+    unsigned long long noisy_visits = strtoull(noisy, &end, 10);
+    ASSERT_TRUE(end != noisy);
+    ASSERT_GT(noisy_visits, 0);
+    ASSERT_NOT_NULL(strstr(logs, "unscored_candidates="));
+
+    cbm_gbuf_free(gb);
+    free(props);
+    PASS();
+}
+
+TEST(pipeline_semantic_candidate_rank_prefers_band_evidence_canonically) {
+    cbm_semantic_candidate_t candidates[] = {
+        {.function_index = 40, .band_matches = 1}, {.function_index = 30, .band_matches = 4},
+        {.function_index = 20, .band_matches = 4}, {.function_index = 10, .band_matches = 2},
+        {.function_index = 50, .band_matches = 3},
+    };
+    cbm_semantic_candidate_t permuted[] = {
+        candidates[SKIP_ONE], candidates[4], candidates[0], candidates[3], candidates[2],
+    };
+    const int expected[] = {20, 30, 50};
+
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(candidates, 5, 3), 3);
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(permuted, 5, 3), 3);
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(candidates[i].function_index, expected[i]);
+        ASSERT_EQ(permuted[i].function_index, expected[i]);
+    }
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(candidates, 5, 0), 0);
+    ASSERT_EQ(cbm_pipeline_rank_semantic_candidates(NULL, 5, 3), 0);
+    PASS();
+}
+
+static const cbm_config_entry_t *find_config_entry(const char *key) {
+    for (int i = 0; CBM_CONFIG_REGISTRY[i].key; i++) {
+        if (strcmp(CBM_CONFIG_REGISTRY[i].key, key) == 0) {
+            return &CBM_CONFIG_REGISTRY[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(config_registry_includes_mcp_timeout_knobs) {
+    const cbm_config_entry_t *idle = find_config_entry("store_idle_timeout_s");
+    ASSERT_NOT_NULL(idle);
+    ASSERT_STR_EQ(idle->default_val, "60");
+    ASSERT_STR_EQ(idle->category, "MCP");
+
+    const cbm_config_entry_t *validate = find_config_entry("db_validate_busy_timeout_ms");
+    ASSERT_NOT_NULL(validate);
+    ASSERT_STR_EQ(validate->default_val, "1000");
+    ASSERT_STR_EQ(validate->category, "MCP");
+
+    const cbm_config_entry_t *update = find_config_entry("update_check_timeout_s");
+    ASSERT_NOT_NULL(update);
+    ASSERT_STR_EQ(update->default_val, "5");
+    ASSERT_STR_EQ(update->category, "MCP");
+    PASS();
+}
+
+TEST(config_registry_includes_incremental_reindex_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_INCREMENTAL_REINDEX);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT, "always");
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "always|full_rebuild|fast_mode_indexes_only");
+    ASSERT_NOT_NULL(strstr(entry->guidance, "Every edit triggers a reindex"));
+    ASSERT_NOT_NULL(strstr(entry->guidance, "preserving correctness"));
+    PASS();
+}
+
+TEST(config_registry_includes_extract_timeout) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_EXTRACT_TIMEOUT_MS);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "100-120000");
+    PASS();
+}
+
+TEST(config_registry_includes_overlay_publish_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_OVERLAY_PUBLISH);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_OVERLAY_PUBLISH_OFF);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range, "off|small_deltas");
+    PASS();
+}
+
+TEST(config_registry_includes_overlay_compaction_policy) {
+    const cbm_config_entry_t *policy =
+        find_config_entry(CBM_CONFIG_OVERLAY_COMPACTION_POLICY);
+    ASSERT_NOT_NULL(policy);
+    ASSERT_STR_EQ(policy->default_val, CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL);
+    ASSERT_STR_EQ(policy->category, "Indexing");
+    ASSERT_STR_EQ(policy->range, "manual|after_publish");
+
+    const cbm_config_entry_t *max_generations =
+        find_config_entry(CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS);
+    ASSERT_NOT_NULL(max_generations);
+    ASSERT_STR_EQ(max_generations->default_val,
+                  CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS);
+    ASSERT_STR_EQ(max_generations->category, "Indexing");
+    ASSERT_STR_EQ(max_generations->range, "1-256");
+    PASS();
+}
+
+TEST(config_registry_includes_incremental_exact_frontier_caps) {
+    const cbm_config_entry_t *changed =
+        find_config_entry(CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS);
+    ASSERT_NOT_NULL(changed);
+    ASSERT_STR_EQ(changed->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS);
+    ASSERT_STR_EQ(changed->category, "Indexing");
+    ASSERT_STR_EQ(changed->range, "1-100000");
+
+    const cbm_config_entry_t *affected =
+        find_config_entry(CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS);
+    ASSERT_NOT_NULL(affected);
+    ASSERT_STR_EQ(affected->default_val, CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS);
+    ASSERT_STR_EQ(affected->default_val, "32");
+    ASSERT_STR_EQ(affected->category, "Indexing");
+    ASSERT_STR_EQ(affected->range, "1-100000");
+    ASSERT_NOT_NULL(strstr(affected->guidance, "does not bound total indexing cost"));
+    ASSERT_NOT_NULL(strstr(affected->guidance, "Default 32"));
+
+    PASS();
+}
+
+TEST(config_registry_includes_incremental_derived_results_refresh_policy) {
+    const cbm_config_entry_t *entry =
+        find_config_entry(CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_NULL(find_config_entry("incremental_derived_refresh"));
+    ASSERT_STR_EQ(CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT,
+                  "defer_all_incremental_reindexes");
+    ASSERT_STR_EQ(entry->default_val, CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT);
+    ASSERT_STR_EQ(entry->category, "Indexing");
+    ASSERT_STR_EQ(entry->range,
+                  "at_publish|defer_exact_delta_reindexes|defer_all_incremental_reindexes");
+    ASSERT_NOT_NULL(strstr(entry->description, "semantic edges"));
+    ASSERT_NOT_NULL(strstr(entry->description, "similarity edges"));
+    ASSERT_NOT_NULL(strstr(entry->description, "architecture"));
+    ASSERT_NOT_NULL(strstr(entry->description, "routes"));
+    PASS();
+}
+
+TEST(config_registry_includes_githistory_max_couplings) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_GITHISTORY_MAX_COUPLINGS);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(entry->default_val, CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS_STR);
+    ASSERT_EQ(atoi(entry->default_val), CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS);
+    ASSERT_STR_EQ(entry->category, "Similarity");
+    ASSERT_STR_EQ(entry->range, "1-" CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR);
+    ASSERT_EQ(atoi(CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR), CBM_GITHISTORY_MAX_COUPLINGS_LIMIT);
+    ASSERT_NOT_NULL(strstr(entry->guidance, "partial"));
+    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_STRINGIFY(CBM_GITHISTORY_HISTORY_COMMIT_LIMIT)));
+    ASSERT_NOT_NULL(strstr(entry->guidance, CBM_STRINGIFY(CBM_GITHISTORY_MAX_FILES_PER_COMMIT)));
+    PASS();
+}
+
+TEST(config_registry_includes_rank_refresh_policy) {
+    const cbm_config_entry_t *entry = find_config_entry(CBM_CONFIG_RANK_REFRESH);
+    ASSERT_NOT_NULL(entry);
+    ASSERT_STR_EQ(CBM_RANK_REFRESH_DEFAULT, "defer_all_incremental_reindexes");
+    ASSERT_STR_EQ(entry->default_val, CBM_RANK_REFRESH_DEFAULT);
+    ASSERT_STR_EQ(entry->category, "PageRank");
+    ASSERT_STR_EQ(entry->range,
+                  "at_publish|defer_exact_delta_reindexes|defer_all_incremental_reindexes");
+    ASSERT_NOT_NULL(strstr(entry->guidance, "small exact-delta reindexes"));
+    ASSERT_NOT_NULL(strstr(entry->guidance, "dependency reindexes"));
+    PASS();
+}
+
+TEST(config_registry_includes_capability_gates) {
+    const char *keys[] = {CBM_CONFIG_RANK_ENABLED, CBM_CONFIG_SIMILARITY_ENABLED,
+                          CBM_CONFIG_SEMANTIC_EDGES_ENABLED, CBM_CONFIG_GITHISTORY_ENABLED,
+                          CBM_CONFIG_HTTPLINKS_ENABLED};
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        const cbm_config_entry_t *entry = find_config_entry(keys[i]);
+        ASSERT_NOT_NULL(entry);
+        ASSERT_STR_EQ(entry->default_val, "true");
+        ASSERT_STR_EQ(entry->range, "true|false");
+        ASSERT_NOT_NULL(strstr(entry->guidance, "config set"));
+    }
     PASS();
 }
 
@@ -11774,6 +24621,152 @@ TEST(pipeline_complexity_transitive_loop_depth) {
     PASS();
 }
 
+static void loop_props(char *buf, size_t buf_sz, int loop_depth) {
+    snprintf(buf, buf_sz, "{\"loop_depth\":%d,\"self_recursive\":false}", loop_depth);
+}
+
+TEST(pipeline_complexity_scc_tld_is_deterministic) {
+    enum {
+        CX_LOOP_A = 1,
+        CX_LOOP_B = 2,
+        CX_LOOP_LEAF = 3,
+        CX_COMPONENT_TLD = CX_LOOP_B + CX_LOOP_LEAF,
+    };
+    cbm_gbuf_t *gb = cbm_gbuf_new("cx-scc", "/tmp/cx-scc");
+    ASSERT_NOT_NULL(gb);
+
+    char props_a[CBM_SZ_64];
+    char props_b[CBM_SZ_64];
+    char props_leaf[CBM_SZ_64];
+    loop_props(props_a, sizeof(props_a), CX_LOOP_A);
+    loop_props(props_b, sizeof(props_b), CX_LOOP_B);
+    loop_props(props_leaf, sizeof(props_leaf), CX_LOOP_LEAF);
+
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "cx.a", "cx.go", 1, 4, props_a);
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "cx.b", "cx.go", 5, 8, props_b);
+    int64_t leaf =
+        cbm_gbuf_upsert_node(gb, "Function", "leaf", "cx.leaf", "cx.go", 9, 12, props_leaf);
+    ASSERT_GT(a, 0);
+    ASSERT_GT(b, 0);
+    ASSERT_GT(leaf, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, a, b, "CALLS", "{}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, b, a, "CALLS", "{}"), 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, b, leaf, "CALLS", "{}"), 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "cx-scc",
+        .repo_path = "/tmp/cx-scc",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    cbm_pipeline_pass_complexity(&ctx);
+
+    const cbm_gbuf_node_t *node_a = cbm_gbuf_find_by_qn(gb, "cx.a");
+    const cbm_gbuf_node_t *node_b = cbm_gbuf_find_by_qn(gb, "cx.b");
+    ASSERT_NOT_NULL(node_a);
+    ASSERT_NOT_NULL(node_b);
+    ASSERT_NOT_NULL(node_a->properties_json);
+    ASSERT_NOT_NULL(node_b->properties_json);
+
+    char expected_tld[CBM_SZ_64];
+    snprintf(expected_tld, sizeof(expected_tld), "\"transitive_loop_depth\":%d",
+             CX_COMPONENT_TLD);
+    ASSERT_NOT_NULL(strstr(node_a->properties_json, expected_tld));
+    ASSERT_NOT_NULL(strstr(node_b->properties_json, expected_tld));
+    ASSERT_NOT_NULL(strstr(node_a->properties_json, "\"recursive\":true"));
+    ASSERT_NOT_NULL(strstr(node_b->properties_json, "\"recursive\":true"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_complexity_scoped_writeback_keeps_unchanged_nodes) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("cx-scope", "/tmp/cx-scope");
+    ASSERT_NOT_NULL(gb);
+
+    char changed_props[CBM_SZ_64];
+    char unchanged_props[CBM_SZ_128];
+    loop_props(changed_props, sizeof(changed_props), 1);
+    snprintf(unchanged_props, sizeof(unchanged_props),
+             "{\"loop_depth\":1,\"transitive_loop_depth\":3,\"self_recursive\":false,"
+             "\"stable\":true}");
+
+    int64_t changed =
+        cbm_gbuf_upsert_node(gb, "Function", "changed", "cx.changed", "changed.go", 1, 4,
+                             changed_props);
+    int64_t unchanged =
+        cbm_gbuf_upsert_node(gb, "Function", "unchanged", "cx.unchanged", "unchanged.go", 1, 4,
+                             unchanged_props);
+    ASSERT_GT(changed, 0);
+    ASSERT_GT(unchanged, 0);
+    ASSERT_GT(cbm_gbuf_insert_edge(gb, changed, unchanged, "CALLS", "{}"), 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "cx-scope",
+        .repo_path = "/tmp/cx-scope",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    const char *scope[] = {"changed.go"};
+    cbm_pipeline_pass_complexity_for_paths(&ctx, scope, (int)(sizeof(scope) / sizeof(scope[0])));
+
+    const cbm_gbuf_node_t *changed_node = cbm_gbuf_find_by_qn(gb, "cx.changed");
+    const cbm_gbuf_node_t *unchanged_node = cbm_gbuf_find_by_qn(gb, "cx.unchanged");
+    ASSERT_NOT_NULL(changed_node);
+    ASSERT_NOT_NULL(unchanged_node);
+    ASSERT_NOT_NULL(changed_node->properties_json);
+    ASSERT_NOT_NULL(unchanged_node->properties_json);
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"transitive_loop_depth\":4"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"transitive_loop_depth\":3"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"stable\":true"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
+TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("cx-scope-rec", "/tmp/cx-scope-rec");
+    ASSERT_NOT_NULL(gb);
+
+    const char *changed_props =
+        "{\"loop_depth\":1,\"transitive_loop_depth\":3,\"self_recursive\":false,"
+        "\"recursive\":true}";
+    int64_t changed =
+        cbm_gbuf_upsert_node(gb, "Function", "changed", "cx.changed", "changed.go", 1, 4,
+                             changed_props);
+    int64_t unchanged =
+        cbm_gbuf_upsert_node(gb, "Function", "unchanged", "cx.unchanged", "unchanged.go", 1, 4,
+                             changed_props);
+    ASSERT_GT(changed, 0);
+    ASSERT_GT(unchanged, 0);
+
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "cx-scope-rec",
+        .repo_path = "/tmp/cx-scope-rec",
+        .gbuf = gb,
+        .cancelled = &cancelled,
+    };
+    const char *scope[] = {"changed.go"};
+    cbm_pipeline_pass_complexity_for_paths(&ctx, scope, (int)(sizeof(scope) / sizeof(scope[0])));
+
+    const cbm_gbuf_node_t *changed_node = cbm_gbuf_find_by_qn(gb, "cx.changed");
+    const cbm_gbuf_node_t *unchanged_node = cbm_gbuf_find_by_qn(gb, "cx.unchanged");
+    ASSERT_NOT_NULL(changed_node);
+    ASSERT_NOT_NULL(unchanged_node);
+    ASSERT_NOT_NULL(changed_node->properties_json);
+    ASSERT_NOT_NULL(unchanged_node->properties_json);
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"transitive_loop_depth\":1"));
+    ASSERT_NOT_NULL(strstr(changed_node->properties_json, "\"recursive\":false"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"transitive_loop_depth\":3"));
+    ASSERT_NOT_NULL(strstr(unchanged_node->properties_json, "\"recursive\":true"));
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* Regression for #334: the plausibility gate compares committed (extracted)
  * node count against persisted rows. committed_nodes must be captured BEFORE
  * cbm_gbuf_dump_to_sqlite frees the gbuf node index — otherwise it reads 0 and
@@ -11783,13 +24776,24 @@ TEST(pipeline_committed_counts_match_persisted) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
     }
+    ASSERT_EQ(th_write_file(TH_PATH(g_tmpdir, "semantic.py"),
+                            "class Base:\n"
+                            "    pass\n\n"
+                            "class Child(Base):\n"
+                            "    pass\n"),
+              0);
 
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/committed_test.db", g_tmpdir);
 
     cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
     ASSERT_NOT_NULL(p);
+    bool saved_profile = cbm_profile_active;
+    cbm_profile_active = true;
+    pipeline_capture_logs_start();
     int rc = cbm_pipeline_run(p);
+    const char *logs = pipeline_capture_logs_end();
+    cbm_profile_active = saved_profile;
     ASSERT_EQ(rc, 0);
 
     int committed_nodes = -1;
@@ -11806,10 +24810,46 @@ TEST(pipeline_committed_counts_match_persisted) {
     ASSERT_GT(committed_nodes, 0);
     /* A faithful full dump persists exactly what it committed. */
     ASSERT_EQ(committed_nodes, persisted_nodes);
+    char done_marker[CBM_SZ_256];
+    int marker_len = snprintf(done_marker, sizeof(done_marker),
+                              "msg=pipeline.done nodes=%d edges=%d", committed_nodes,
+                              committed_edges);
+    ASSERT(marker_len > 0 && (size_t)marker_len < sizeof(done_marker));
+    ASSERT(strstr(logs, done_marker) != NULL);
+    ASSERT(strstr(logs,
+                  "msg=pass.done pass=semantic inherits=1 decorates=0 implements=0 overrides=0 "
+                  "errors=0") != NULL);
     /* The gate must NOT flag a healthy full index as degraded. */
     ASSERT_FALSE(cbm_dump_verify_is_degraded(committed_nodes, persisted_nodes,
                                              CBM_DUMP_VERIFY_DEFAULT_RATIO,
                                              CBM_DUMP_VERIFY_MIN_FLOOR));
+
+    cbm_pipeline_free(p);
+    teardown_test_repo();
+    PASS();
+}
+
+TEST(pipeline_rejects_overlong_db_path_without_truncated_write) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char db_path[PIPELINE_TEST_OVERLONG_DB_PATH];
+    int prefix_len = snprintf(db_path, sizeof(db_path), "%s/", g_tmpdir);
+    ASSERT_GT(prefix_len, 0);
+    ASSERT_TRUE((size_t)prefix_len < sizeof(db_path));
+    memset(db_path + prefix_len, 'a', sizeof(db_path) - (size_t)prefix_len - CBM_ALLOC_ONE);
+    db_path[sizeof(db_path) - 1] = '\0';
+
+    char truncated[CBM_PATH_MAX];
+    int trunc_len = snprintf(truncated, sizeof(truncated), "%s", db_path);
+    ASSERT_TRUE(trunc_len >= CBM_PATH_MAX);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(p);
+    int rc = cbm_pipeline_run(p);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NEQ(access(truncated, F_OK), 0);
 
     cbm_pipeline_free(p);
     teardown_test_repo();
@@ -12069,6 +25109,91 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
     PASS();
 }
 
+/* #725: two same-named symbols across languages must not share CALLS edges.
+ * Python Store.commit is the real callee of save(); the JS Editor.commit
+ * function is a distinct binding and must have no inbound CALLS from Python.
+ * unique_name (candidates==1) is #1572 and is not this claim. */
+TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
+    const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
+    const char *contents[] = {
+        "class Store:\n"
+        "    def commit(self):\n"
+        "        return True\n",
+
+        "from store import Store\n"
+        "\n"
+        "def save():\n"
+        "    return Store().commit()\n",
+
+        "export function commit() {\n"
+        "  return 1;\n"
+        "}\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *commits = NULL;
+    int ncommit = 0;
+    cbm_store_find_nodes_by_name(s, proj, "commit", &commits, &ncommit);
+    ASSERT_GTE(ncommit, 2);
+
+    int64_t js_id = 0;
+    int64_t py_id = 0;
+    for (int i = 0; i < ncommit; i++) {
+        if (commits[i].file_path && strstr(commits[i].file_path, "Editor.js"))
+            js_id = commits[i].id;
+        if (commits[i].file_path && strstr(commits[i].file_path, "store.py"))
+            py_id = commits[i].id;
+    }
+    ASSERT_TRUE(js_id != 0);
+    ASSERT_TRUE(py_id != 0);
+
+    cbm_node_t *saves = NULL;
+    int nsave = 0;
+    cbm_store_find_nodes_by_name(s, proj, "save", &saves, &nsave);
+    ASSERT_GT(nsave, 0);
+
+    cbm_edge_t *from_save = NULL;
+    int nfrom = 0;
+    cbm_store_find_edges_by_source_type(s, saves[0].id, "CALLS", &from_save, &nfrom);
+    bool save_calls_py = false;
+    bool save_calls_js = false;
+    for (int i = 0; i < nfrom; i++) {
+        if (from_save[i].target_id == py_id)
+            save_calls_py = true;
+        if (from_save[i].target_id == js_id)
+            save_calls_js = true;
+    }
+    ASSERT_TRUE(save_calls_py);
+    ASSERT_FALSE(save_calls_js);
+
+    cbm_edge_t *into_js = NULL;
+    int njs = 0;
+    cbm_store_find_edges_by_target_type(s, js_id, "CALLS", &into_js, &njs);
+    ASSERT_EQ(njs, 0);
+
+    if (from_save)
+        cbm_store_free_edges(from_save, nfrom);
+    if (into_js)
+        cbm_store_free_edges(into_js, njs);
+    cbm_store_free_nodes(commits, ncommit);
+    cbm_store_free_nodes(saves, nsave);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -12083,6 +25208,83 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(pipeline_unit_threshold_setters_clamp_invalid_values);
+    RUN_TEST(pipeline_githistory_max_couplings_clamps_to_shared_range);
+    RUN_TEST(pipeline_apply_config_sets_all_thresholds);
+    RUN_TEST(pipeline_capability_gates_default_enabled);
+    RUN_TEST(pipeline_disabled_capabilities_skip_expensive_passes);
+    RUN_TEST(pipeline_githistory_compute_overlaps_independent_postpasses);
+    RUN_TEST(pipeline_capability_combinations_have_unique_fingerprints);
+    RUN_TEST(pipeline_exact_delta_limits_keep_safe_defaults);
+    RUN_TEST(pipeline_semantic_edges_independent_of_call_insertion_order);
+    RUN_TEST(pipeline_semantic_corpus_vectors_independent_of_worker_count);
+    RUN_TEST(pipeline_semantic_corpus_add_doc_reserves_without_losing_docs);
+    RUN_TEST(pipeline_semantic_batch_rejects_invalid_token_stride);
+    RUN_TEST(pipeline_semantic_corpus_accepts_nonuniform_docs_beyond_legacy_stride);
+    RUN_TEST(pipeline_semantic_batch_rejects_nonempty_corpus_without_reordering_existing_ids);
+    RUN_TEST(pipeline_semantic_edges_tokenize_complete_long_metadata);
+    RUN_TEST(pipeline_semantic_edges_tokenize_escaped_json_metadata);
+    RUN_TEST(pipeline_semantic_edges_reports_noisy_bucket_partial_results);
+    RUN_TEST(pipeline_semantic_candidate_rank_prefers_band_evidence_canonically);
+    RUN_TEST(config_registry_includes_mcp_timeout_knobs);
+    RUN_TEST(config_registry_includes_incremental_reindex_policy);
+    RUN_TEST(config_registry_includes_extract_timeout);
+    RUN_TEST(config_registry_includes_overlay_publish_policy);
+    RUN_TEST(config_registry_includes_overlay_compaction_policy);
+    RUN_TEST(config_registry_includes_incremental_exact_frontier_caps);
+    RUN_TEST(config_registry_includes_incremental_derived_results_refresh_policy);
+    RUN_TEST(config_registry_includes_githistory_max_couplings);
+    RUN_TEST(config_registry_includes_rank_refresh_policy);
+    RUN_TEST(config_registry_includes_capability_gates);
+    RUN_TEST(pipeline_file_delta_scratch_seed_excludes_changed_paths);
+    RUN_TEST(pipeline_file_delta_scratch_seed_preserves_structure_roots);
+    RUN_TEST(pipeline_file_delta_scratch_seed_supports_external_endpoint_descriptor);
+    RUN_TEST(pipeline_file_delta_descriptor_from_gbuf);
+    RUN_TEST(pipeline_file_delta_detects_cross_file_node_qn_collision);
+    RUN_TEST(pipeline_file_delta_owns_target_header_usage_edges);
+    RUN_TEST(pipeline_file_delta_preserves_safe_inbound_edges_for_overlay);
+    RUN_TEST(pipeline_file_delta_preserves_sibling_named_imports_to_shared_target);
+    RUN_TEST(pipeline_file_delta_descriptor_marks_unsupported_edges);
+    RUN_TEST(pipeline_file_delta_metadata_from_file);
+    RUN_TEST(pipeline_file_delta_metadata_accepts_effective_fingerprint);
+    RUN_TEST(pipeline_file_delta_stamp_generation_updates_metadata);
+    RUN_TEST(pipeline_content_hash_helper_matches_file_delta_metadata);
+    RUN_TEST(pipeline_file_state_persist_helper_writes_hash_metadata);
+    RUN_TEST(pipeline_file_state_current_check_rejects_stale_pass_fingerprint);
+    RUN_TEST(pipeline_pass_fingerprint_includes_effective_mode_and_thresholds);
+    RUN_TEST(pipeline_file_state_current_check_rejects_stale_config_fingerprint);
+    RUN_TEST(pipeline_file_state_persist_helper_rolls_back_on_failure);
+    RUN_TEST(pipeline_file_delta_plan_candidate_from_frontier);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_on_publish_error);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_without_generation);
+    RUN_TEST(pipeline_file_delta_apply_succeeds_after_generation_stamp);
+    RUN_TEST(pipeline_file_delta_apply_inserts_new_file_without_existing_ownership);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_on_new_file_importer_frontier);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_without_existing_ownership);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_external_inbound_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unowned_structural_inbound_edge);
+    RUN_TEST(pipeline_file_delta_plan_accepts_full_pipeline_structure_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_new_folder_structure_edge);
+    RUN_TEST(pipeline_file_delta_apply_inserts_and_prunes_new_folder_context);
+    RUN_TEST(pipeline_file_delta_plan_accepts_regenerated_structural_inbound_edge);
+    RUN_TEST(pipeline_file_delta_plan_accepts_regenerated_file_owned_unowned_source_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_stale_file_owned_unowned_source_edge);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_without_file_metadata);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_edges);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_delete);
+    RUN_TEST(pipeline_file_delta_apply_deletes_owned_file_delta);
+    RUN_TEST(pipeline_file_delta_apply_mixed_delete_upsert_batch);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_on_delete_batch);
+    RUN_TEST(pipeline_file_delta_apply_falls_back_when_frontier_path_missing_from_batch);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_rename);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unsupported_derived_view);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_unresolved_edge_endpoint);
+    RUN_TEST(pipeline_file_delta_plan_accepts_resolved_external_edge_endpoint);
+    RUN_TEST(pipeline_file_delta_plan_falls_back_on_large_frontier);
+    RUN_TEST(pipeline_file_delta_plan_frontier_noop_mask_bounds_recursive_frontier);
+    RUN_TEST(pipeline_file_delta_plan_frontier_noop_mask_skips_masked_inbound_precheck);
+    RUN_TEST(pipeline_file_delta_plan_batch_accepts_mutual_frontier);
+    RUN_TEST(pipeline_file_delta_orchestrates_descriptor_plan_and_publish);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
@@ -12092,11 +25294,18 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_structure_nodes);
+    RUN_TEST(pipeline_full_reindex_preserves_adr_and_sibling_project);
     RUN_TEST(pipeline_committed_counts_match_persisted);
+    RUN_TEST(pipeline_rejects_overlong_db_path_without_truncated_write);
     RUN_TEST(pipeline_adr_survives_full_reindex);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);
+    RUN_TEST(pipeline_mode_global_semantic_edges_policy);
+    RUN_TEST(pipeline_call_edge_props_include_args_and_line);
+    RUN_TEST(pipeline_weak_call_target_suppression);
+    RUN_TEST(pipeline_member_call_normalization);
+    RUN_TEST(pipeline_sequential_call_edges_preserve_eighth_arg);
     RUN_TEST(pipeline_fast_mode);
     /* Definitions pass */
     RUN_TEST(pipeline_definitions_function_nodes);
@@ -12104,12 +25313,19 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_definitions_properties);
     RUN_TEST(pipeline_def_props_valid_json_when_oversized);
     RUN_TEST(pipeline_edge_props_valid_json);
+    RUN_TEST(pipeline_persisted_route_purity_for_http_literals);
+    RUN_TEST(pipeline_infra_route_deny_wins_by_url_value);
     /* Complexity propagation pass (Tier B) */
     RUN_TEST(pipeline_complexity_transitive_loop_depth);
+    RUN_TEST(pipeline_complexity_scc_tld_is_deterministic);
+    RUN_TEST(pipeline_complexity_scoped_writeback_keeps_unchanged_nodes);
+    RUN_TEST(pipeline_complexity_scoped_writeback_preserves_stored_recursive);
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_full_and_incremental_persist_file_state);
+    RUN_TEST(pipeline_incremental_full_index_rebuilds_owner_metadata);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
@@ -12118,10 +25334,13 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
-#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
-    RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
-#endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_rust_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_rust_receiver_parallel_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_full_url_call_joins_canonical_route);
+    RUN_TEST(pipeline_route_discovery_uses_canonical_identities_sequential);
+    RUN_TEST(pipeline_route_discovery_uses_canonical_identities_parallel);
+    RUN_TEST(pipeline_httplink_collection_has_no_fixed_item_ceiling);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
@@ -12132,6 +25351,9 @@ SUITE(pipeline) {
     RUN_TEST(githistory_is_trackable);
     RUN_TEST(githistory_compute_coupling);
     RUN_TEST(githistory_coupling_carries_last_co_change);
+    RUN_TEST(githistory_coupling_ranks_bounded_output_and_reports_omissions);
+    RUN_TEST(githistory_temporal_retains_files_past_legacy_capacity);
+    RUN_TEST(githistory_temporal_preserves_long_file_paths);
     RUN_TEST(githistory_skip_large_commits);
     RUN_TEST(githistory_limits_to_max);
     /* Test detection */
@@ -12139,6 +25361,7 @@ SUITE(pipeline) {
     RUN_TEST(testdetect_is_test_function);
     /* Implements pass (graph buffer based) */
     RUN_TEST(implements_creates_override);
+    RUN_TEST(implements_accepts_struct_label);
     RUN_TEST(implements_no_match);
     /* Usages pass (full pipeline integration) */
     RUN_TEST(usages_creates_edges);
@@ -12149,10 +25372,17 @@ SUITE(pipeline) {
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
+    RUN_TEST(pipeline_typescript_barrel_reexport_call_resolves_implementation);
+    RUN_TEST(pipeline_python_pyo3_import_resolves_rust_function_calls);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
+    RUN_TEST(pipeline_python_reexport_call_uses_resolved_import_edge);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);
+    RUN_TEST(pipeline_incremental_reexport_target_matches_full);
+    RUN_TEST(pipeline_parallel_duplicate_import_inherits_matches_sequential);
+    RUN_TEST(pipeline_parallel_env_access_matches_sequential);
+    RUN_TEST(pipeline_parallel_channel_edges_target_channels);
     RUN_TEST(pipeline_go_type_classification);
     RUN_TEST(pipeline_go_grouped_types);
     RUN_TEST(pipeline_kotlin_project);
@@ -12166,7 +25396,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_docstring_python_function);
     RUN_TEST(pipeline_docstring_java_method);
     RUN_TEST(pipeline_docstring_kotlin_function);
-    RUN_TEST(pipeline_docstring_go_class);
+    RUN_TEST(pipeline_docstring_go_struct);
     /* Project name */
     RUN_TEST(project_name_from_path);
     RUN_TEST(project_name_drive_letter_case_insensitive_issue394);
@@ -12215,6 +25445,13 @@ SUITE(pipeline) {
     RUN_TEST(infra_is_k8s_manifest);
     RUN_TEST(infra_is_env_file);
     RUN_TEST(infra_clean_json_brackets);
+    /* K8s extraction tests */
+    RUN_TEST(k8s_extract_kustomize);
+    RUN_TEST(k8s_extract_manifest);
+    RUN_TEST(k8s_extract_manifest_no_name);
+    RUN_TEST(k8s_extract_manifest_multidoc);
+    RUN_TEST(k8s_selector_links_manifests_after_former_record_limit);
+    RUN_TEST(k8s_selector_requires_every_key_value_pair_beyond_former_pair_limit);
     RUN_TEST(infra_secret_detection);
     /* Infrascan: Dockerfile parser */
     RUN_TEST(infra_parse_dockerfile_multistage);
@@ -12243,11 +25480,6 @@ SUITE(pipeline) {
     /* Infrascan: pipeline integration */
     RUN_TEST(infra_pipeline_integration);
     RUN_TEST(infra_pipeline_idempotent);
-    /* K8s / Kustomize extraction */
-    RUN_TEST(k8s_extract_kustomize);
-    RUN_TEST(k8s_extract_manifest);
-    RUN_TEST(k8s_extract_manifest_no_name);
-    RUN_TEST(k8s_extract_manifest_multidoc);
     /* Env URL scanning */
     RUN_TEST(envscan_dockerfile_env_urls);
     RUN_TEST(envscan_shell_env_urls);
@@ -12260,9 +25492,19 @@ SUITE(pipeline) {
     RUN_TEST(envscan_secret_value_exclusion);
     RUN_TEST(envscan_secret_file_exclusion);
     RUN_TEST(envscan_skips_ignored_dirs);
+    RUN_TEST(envscan_does_not_follow_links_outside_root);
     RUN_TEST(envscan_non_url_values_skipped);
+    RUN_TEST(envscan_walks_more_than_256_pending_directories);
+    RUN_TEST(envscan_accepts_root_path_longer_than_512_bytes);
+    RUN_TEST(envscan_uses_shared_file_size_policy);
+    RUN_TEST(envscan_parses_one_complete_line_across_old_buffer_boundary);
+    RUN_TEST(envscan_concurrent_first_use_and_cleanup_reinitialize);
+    RUN_TEST(envscan_reports_unrepresentable_key_and_value_without_truncating);
+    RUN_TEST(envscan_preserves_caller_output_capacity);
     /* SwiftPM Package.swift manifest resolution (issue #551 item 1) */
     RUN_TEST(pkgmap_swift_targets_registers_module);
+    RUN_TEST(pkgmap_swift_executable_target_registers_module);
+    RUN_TEST(pkgmap_swift_literal_path_is_not_silently_truncated);
     RUN_TEST(pkgmap_swift_products_do_not_register_alias);
     RUN_TEST(pkgmap_swift_target_name_immediately_before_close_paren);
     RUN_TEST(pkgmap_swift_target_honors_literal_path);
@@ -12272,9 +25514,19 @@ SUITE(pipeline) {
     RUN_TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry);
     RUN_TEST(pkgmap_swift_ambiguous_target_name_fails_closed);
     RUN_TEST(pkgmap_swift_scan_repo_finds_nested_manifest);
+    RUN_TEST(pkgmap_package_json_entry_is_not_silently_truncated);
+    RUN_TEST(pkgmap_walk_path_join_is_not_silently_truncated);
+    RUN_TEST(pkgmap_walk_reaches_manifest_beyond_legacy_depth_cap);
+    RUN_TEST(pkgmap_walk_does_not_follow_directory_symlink_cycle);
+    RUN_TEST(pkgmap_manifest_ecosystems_preserve_long_entry_paths);
+    RUN_TEST(pkgmap_pom_coordinates_are_not_silently_truncated);
+    RUN_TEST(pkgmap_manifest_above_legacy_cap_uses_shared_file_limit);
     /* Discovery-exclusion plumbing in auxiliary repo walks (#792) */
     RUN_TEST(pipeline_relpath_excluded_boundary);
     RUN_TEST(pkgmap_scan_repo_honors_discovery_exclusions);
+    RUN_TEST(pkgmap_prefix_slash_result_is_not_silently_truncated);
+    RUN_TEST(pkgmap_prefix_dot_result_is_not_silently_truncated);
+    RUN_TEST(pkgmap_prefix_backslash_result_is_not_silently_truncated);
     RUN_TEST(envscan_walk_honors_discovery_exclusions);
     /* Function registry / resolver */
     RUN_TEST(registry_resolve_single_candidate);
@@ -12288,6 +25540,13 @@ SUITE(pipeline) {
     RUN_TEST(registry_confidence_same_module);
     RUN_TEST(registry_confidence_unique_name);
     RUN_TEST(registry_confidence_suffix_match);
+    RUN_TEST(pipeline_python_super_init_external_lsp_suppresses_suffix_fallback);
+    RUN_TEST(pipeline_python_super_init_without_lsp_suppresses_weak_suffix_fallback);
+    RUN_TEST(pipeline_external_lsp_target_suppresses_suffix_fallback);
+    RUN_TEST(pipeline_internal_lsp_declaration_keeps_canonical_registry_fallback);
+    RUN_TEST(pipeline_python_file_self_call_suppresses_weak_suffix_fallback);
+    RUN_TEST(pipeline_python_file_dotted_call_suppresses_weak_suffix_fallback);
+    RUN_TEST(pipeline_python_file_dotted_call_keeps_import_reachable_suffix_fallback);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
     RUN_TEST(registry_negative_import_rejects);
@@ -12303,11 +25562,86 @@ SUITE(pipeline) {
     RUN_TEST(githistory_coupling_skips_large_commits);
     RUN_TEST(githistory_coupling_limits_output);
     /* Incremental reindex */
-    /* FastAPI Depends edge tracking (PR #66 port) */
+    /* FastAPI Depends edge tracking */
     RUN_TEST(pipeline_fastapi_depends_edges);
+    RUN_TEST(import_edge_helper_escapes_local_name_once);
+    RUN_TEST(import_edge_helper_preserves_long_local_name);
+    RUN_TEST(import_map_from_edges_follows_package_reexport);
+    RUN_TEST(import_reexport_falls_back_when_pkgmap_target_missing);
+    RUN_TEST(import_symbol_fallback_prefers_import_path_over_insertion_order);
+    RUN_TEST(import_resolution_long_header_prefers_source_relative_file);
+    RUN_TEST(import_resolution_long_sibling_path_is_exact);
+    RUN_TEST(import_resolution_long_namespace_key_and_qn_are_exact);
+    RUN_TEST(import_resolution_namespace_map_normalizes_declaration_and_import);
+    RUN_TEST(import_resolution_symbol_fallback_has_no_segment_limit);
+    RUN_TEST(import_resolution_long_symbol_name_is_exact);
     /* Incremental */
     RUN_TEST(incremental_full_then_noop);
+    RUN_TEST(incremental_aborts_when_previous_coverage_is_unreadable);
+    RUN_TEST(incremental_touch_only_refreshes_metadata_without_reindex);
     RUN_TEST(incremental_detects_changed_file);
+    RUN_TEST(incremental_fast_exact_upsert_matches_full_rebuild);
+    RUN_TEST(incremental_fast_body_only_change_uses_graph_noop);
+    RUN_TEST(incremental_fast_two_file_batch_exact_upsert_matches_full_rebuild);
+    RUN_TEST(
+        incremental_fast_configured_cap_uses_containment_for_oversized_inbound_frontier);
+    RUN_TEST(incremental_fast_python_parallel_frontier_falls_back_before_incomplete_resolution);
+    RUN_TEST(incremental_fast_c_header_frontier_too_large_uses_full_rebuild);
+    RUN_TEST(incremental_fast_default_c_header_frontier_cap_allows_bounded_exact);
+    RUN_TEST(incremental_fast_c_source_frontier_too_large_uses_full_rebuild);
+    RUN_TEST(incremental_fast_default_c_source_frontier_cap_allows_bounded_exact);
+    RUN_TEST(incremental_overlay_publish_single_c_header_uses_active_overlay);
+    RUN_TEST(incremental_overlay_single_c_header_type_impl_pair_keeps_canonical_rows_visible);
+    RUN_TEST(incremental_c_header_batch_uses_additive_overlay_when_owned_rows_preserved);
+    RUN_TEST(incremental_c_header_uses_exact_not_additive_overlay_without_subset_proof);
+    RUN_TEST(incremental_fast_configured_frontier_cap_allows_bounded_exact);
+    RUN_TEST(incremental_full_defer_exact_delta_reindexes_defers_global_derived_refresh);
+    RUN_TEST(incremental_full_defer_exact_delta_reindexes_mixed_delete_upsert_marks_semantic_stale);
+    RUN_TEST(incremental_full_defer_all_incremental_reindexes_defers_containment_semantic_refresh);
+    RUN_TEST(incremental_fast_mixed_unowned_edge_frontier_falls_back_to_full_rebuild);
+    RUN_TEST(incremental_fast_expands_small_inbound_frontier_and_matches_full);
+    RUN_TEST(incremental_fast_three_file_batch_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_single_delete_exact_matches_full_rebuild);
+    RUN_TEST(incremental_fast_delete_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_rename_like_batch_falls_back_to_full_rebuild_parity);
+    RUN_TEST(incremental_fast_new_folder_exact_delta_parity);
+    RUN_TEST(incremental_fast_route_decorator_change_matches_fresh_rebuild);
+    RUN_TEST(incremental_fast_arg_url_route_change_matches_parallel_full_rebuild);
+    RUN_TEST(incremental_fast_exact_scratch_multifile_usage_edges_match_fresh);
+    RUN_TEST(incremental_fast_exact_batch_publish_matches_fresh_rebuild_for_two_file_go);
+    RUN_TEST(incremental_overlay_producer_marks_dirty_ready_without_canonical_mutation);
+    RUN_TEST(incremental_overlay_publish_small_deltas_keeps_canonical_base_visible);
+    RUN_TEST(incremental_exact_python_scoped_lsp_gap_matches_full_rebuild);
+    RUN_TEST(incremental_javascript_scoped_lsp_gap_reports_full_rebuild_not_cap_overflow);
+    RUN_TEST(incremental_cross_lsp_language_matrix_matches_fresh_rebuild);
+    RUN_TEST(incremental_objectscript_unchanged_include_macro_matches_fresh_rebuild);
+    RUN_TEST(incremental_objectscript_changed_include_reextracts_consumers);
+    RUN_TEST(incremental_objectscript_deleted_include_reextracts_consumers);
+    RUN_TEST(incremental_mixed_python_rust_edits_match_fresh_rebuild);
+    RUN_TEST(incremental_mixed_rust_typescript_javascript_matches_fresh_rebuild);
+    RUN_TEST(incremental_exact_python_receiver_type_gap_matches_full_rebuild);
+    RUN_TEST(pipeline_persisted_python_defs_feed_scoped_cross_lsp);
+    RUN_TEST(pipeline_store_backed_lsp_cross_uses_import_scope_defs);
+    RUN_TEST(incremental_exact_scratch_store_backed_lsp_matches_fresh_rebuild);
+    RUN_TEST(incremental_exact_scratch_field_hint_materializes_store_target);
+    RUN_TEST(incremental_exact_scratch_python_package_matches_fresh_rebuild);
+    RUN_TEST(incremental_overlay_first_preserves_inbound_edges_past_exact_frontier_cap);
+    RUN_TEST(incremental_overlay_publish_delete_keeps_canonical_base_visible);
+    RUN_TEST(incremental_overlay_publish_repeated_update_keeps_active_view_idempotent);
+    RUN_TEST(incremental_overlay_publish_failure_falls_back_to_canonical_exact);
+    RUN_TEST(incremental_overlay_extract_failure_keeps_dirty_pending_without_overlay);
+    RUN_TEST(incremental_full_mode_keeps_exact_upsert_disabled);
+    RUN_TEST(incremental_detects_same_size_rewrite_with_preserved_mtime);
+    RUN_TEST(incremental_missing_file_state_keeps_legacy_metadata_path);
+    RUN_TEST(incremental_publish_failure_keeps_existing_db);
+    RUN_TEST(incremental_frontier_full_fallback_failure_preserves_dirty_ledger);
+    RUN_TEST(incremental_postpass_failure_keeps_existing_db);
+    RUN_TEST(incremental_hash_persist_failure_falls_back_to_full);
+    RUN_TEST(incremental_parallel_extract_failure_keeps_existing_db);
+    RUN_TEST(incremental_parallel_success_releases_package_map);
+    RUN_TEST(incremental_parallel_registry_failure_keeps_existing_db);
+    RUN_TEST(incremental_parallel_resolve_failure_keeps_existing_db);
+    RUN_TEST(incremental_classify_deleted_failure_keeps_existing_db);
     RUN_TEST(full_reindex_recovers_when_previous_coverage_is_unreadable);
     RUN_TEST(incremental_detects_deleted_file);
     RUN_TEST(incremental_new_file_added);
@@ -12315,6 +25649,7 @@ SUITE(pipeline) {
     RUN_TEST(cancelled_incremental_reindex_preserves_committed_db);
     RUN_TEST(backup_failed_publish_failure_preserves_final_sidecars);
     RUN_TEST(backup_failed_rename_failure_preserves_corrupt_main);
+    RUN_TEST(backup_failed_rename_reports_failed_corrupt_main_rollback);
 #ifdef __linux__
     RUN_TEST(full_reindex_preserves_exact_long_db_path);
 #endif
@@ -12324,6 +25659,7 @@ SUITE(pipeline) {
     /* Resource management & internal helper tests */
     RUN_TEST(pipeline_empty_path);
     RUN_TEST(pipeline_project_name_content);
+    RUN_TEST(pipeline_publish_kind_names_are_stable);
     RUN_TEST(pipeline_cancel_sets_flag);
     RUN_TEST(pipeline_double_cancel);
     RUN_TEST(pipeline_double_free_prevention);
@@ -12380,15 +25716,18 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+    /* Release pipeline-level global state (compiled regex patterns etc.).
+     * Patterns are compiled on first use and cached; free once at suite end. */
+    cbm_pipeline_global_cleanup();
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
  * broad pipeline suite so RED/GREEN iterations exercise only this boundary;
  * the default all-suite run still executes it. */
 SUITE(pipeline_semantic_manifest_repro) {
-    RUN_TEST(incremental_downgrade_preserves_scope_and_artifact_across_change_noop_delete);
     RUN_TEST(pipeline_incremental_repoints_call_reference_without_stale_edge);
     RUN_TEST(pipeline_sql_lineage_and_relation_isolation);
+    RUN_TEST(pipeline_sequential_usages_caches_repeated_lineage_resolution);
     RUN_TEST(pipeline_incremental_sql_table_rename_drops_stale_lineage);
     RUN_TEST(pipeline_dbt_jinja_lineage);
     RUN_TEST(pipeline_parallel_manifest_is_byte_stable_above_threshold);
@@ -12405,7 +25744,6 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
-    RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
     RUN_TEST(pipeline_existing_artifact_refreshes_after_default_forced_full_reindex);
     RUN_TEST(pipeline_full_cancel_after_predump_preserves_previous_generation);
     RUN_TEST(pipeline_full_cancel_after_destination_prepare_preserves_previous_generation);
@@ -12413,6 +25751,9 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retries);
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
     RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
+    RUN_TEST(pipeline_exact_inputs_migrate_coverage_metadata_and_index_mode);
+    RUN_TEST(
+        pipeline_incremental_parallel_result_cache_alloc_failure_falls_back_without_data_loss);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);

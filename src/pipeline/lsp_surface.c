@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "cbm.h" /* cbm_label_is_relation — reg-only surface membership */
+#include "foundation/compat.h"
 #include "foundation/log.h"
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
@@ -32,10 +33,10 @@ enum { SURFACE_CODEC_VERSION = 1 };
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
  * participate in the surface hash, or renaming one would slip past the
  * early cutoff while stale references to it survive in dependent files —
- * for Table/View that means a renamed table keeping stale FROM/JOIN lineage
+ * for data relations that means a rename keeping stale FROM/JOIN/ref lineage
  * edges from dependent SQL files. KEEP IN SYNC with pxc_map_label
- * (pass_lsp_cross.c) and incr_label_is_registry_symbol
- * (pipeline_incremental.c); the codec unit test cross-checks the three. */
+ * (pass_lsp_cross.c) and the canonical cbm_label_is_registry_symbol predicate;
+ * end-to-end incremental tests cover both code symbols and SQL relations. */
 static bool surface_reg_only_label(const char *label) {
     return label && (strcmp(label, "Field") == 0 || cbm_label_is_relation(label));
 }
@@ -159,13 +160,13 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
         char sha[CBM_SHA256_HEX_LEN + 1];
         cbm_sha256_hex(json, strlen(json), sha);
         cbm_lsp_surface_row_t *r = &rows[n];
-        r->project = strdup(project);
-        r->rel_path = strdup(files[i].rel_path);
-        r->surface_sha = strdup(sha);
+        r->project = cbm_strdup(project);
+        r->rel_path = cbm_strdup(files[i].rel_path);
+        r->surface_sha = cbm_strdup(sha);
         r->defs_json = json;
         r->ref_bloom = NULL;
         r->ref_bloom_len = 0;
-        r->config_ctx = strdup("");
+        r->config_ctx = cbm_strdup("");
         if (!r->project || !r->rel_path || !r->surface_sha || !r->config_ctx) {
             n++;
             cbm_store_free_lsp_surfaces(rows, n);

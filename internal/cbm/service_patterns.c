@@ -95,6 +95,7 @@ static const lib_pattern_t http_libraries[] = {
     {"Net::HTTP", CBM_SVC_HTTP, NULL},
 
     /* PHP */
+    {"GuzzleHttp", CBM_SVC_HTTP, NULL},
     {"Guzzle", CBM_SVC_HTTP, NULL},
     {"guzzle", CBM_SVC_HTTP, NULL},
     {"curl", CBM_SVC_HTTP, NULL},
@@ -462,59 +463,66 @@ static const lib_pattern_t trpc_libraries[] = {
     {NULL, CBM_SVC_NONE, NULL},
 };
 
-/* Method suffix type (used by both route registration and HTTP client tables) */
 typedef struct {
     const char *suffix;
     const char *method;
 } method_suffix_t;
 
+typedef struct {
+    const char *suffix;
+    const char *method;
+    bool allows_no_handler;
+} route_reg_suffix_t;
+
 /* Route registration method suffixes — matched on callee name.
  * These are methods on router objects that register handlers. */
-static const method_suffix_t route_reg_suffixes[] = {
+static const route_reg_suffix_t route_reg_suffixes[] = {
     /* HTTP method registrations */
-    {".GET", "GET"},
-    {".Get", "GET"},
-    {".get", "GET"},
-    {".POST", "POST"},
-    {".Post", "POST"},
-    {".post", "POST"},
-    {".PUT", "PUT"},
-    {".Put", "PUT"},
-    {".put", "PUT"},
-    {".DELETE", "DELETE"},
-    {".Delete", "DELETE"},
-    {".delete", "DELETE"},
-    {".PATCH", "PATCH"},
-    {".Patch", "PATCH"},
-    {".patch", "PATCH"},
+    {".GET", "GET", false},
+    {".Get", "GET", false},
+    {".get", "GET", false},
+    {".POST", "POST", false},
+    {".Post", "POST", false},
+    {".post", "POST", false},
+    {".PUT", "PUT", false},
+    {".Put", "PUT", false},
+    {".put", "PUT", false},
+    {".DELETE", "DELETE", false},
+    {".Delete", "DELETE", false},
+    {".delete", "DELETE", false},
+    {".PATCH", "PATCH", false},
+    {".Patch", "PATCH", false},
+    {".patch", "PATCH", false},
     /* Handle/HandleFunc (Go stdlib, gorilla) */
-    {".Handle", "ANY"},
-    {".HandleFunc", "ANY"},
-    {".handle", "ANY"},
+    {".Handle", "ANY", false},
+    {".HandleFunc", "ANY", false},
+    {".handle", "ANY", false},
     /* Framework-specific route registration */
-    {".Route", "ANY"},
-    {".route", "ANY"},
-    {"::get", "GET"},
-    {"::post", "POST"},
-    {"::put", "PUT"},
-    {"::delete", "DELETE"},
-    {"::patch", "PATCH"},
+    {".Route", "ANY", false},
+    {".route", "ANY", false},
+    {".websocket_route", "ANY", true},
+    {".websocket", "ANY", true},
+    {"::get", "GET", false},
+    {"::post", "POST", false},
+    {"::put", "PUT", false},
+    {"::delete", "DELETE", false},
+    {"::patch", "PATCH", false},
     /* Minimal API (C# ASP.NET) */
-    {".MapGet", "GET"},
-    {".MapPost", "POST"},
-    {".MapPut", "PUT"},
-    {".MapDelete", "DELETE"},
+    {".MapGet", "GET", false},
+    {".MapPost", "POST", false},
+    {".MapPut", "PUT", false},
+    {".MapDelete", "DELETE", false},
     /* Router mounting / prefix registration (any method) */
-    {".include_router", "ANY"},
-    {".mount", "ANY"},
-    {".add_url_rule", "ANY"},
-    {".register_blueprint", "ANY"},
-    {".use", "ANY"},
-    {".register", "ANY"},
-    {".add_route", "ANY"},
-    {".add_api_route", "ANY"},
-    {".add_api_websocket_route", "ANY"},
-    {NULL, NULL},
+    {".include_router", "ANY", true},
+    {".mount", "ANY", false},
+    {".add_url_rule", "ANY", true},
+    {".register_blueprint", "ANY", true},
+    {".use", "ANY", false},
+    {".register", "ANY", false},
+    {".add_route", "ANY", true},
+    {".add_api_route", "ANY", true},
+    {".add_api_websocket_route", "ANY", true},
+    {NULL, NULL, false},
 };
 
 /* ── HTTP method inference from function/method name suffix ───── */
@@ -534,17 +542,39 @@ static const method_suffix_t method_suffixes[] = {
 
 /* ── Matching implementation ───────────────────────────────────── */
 
-/* Check if any library identifier appears as a substring in the QN.
- * Case-sensitive: "requests" matches "project.venv.requests.api.get"
- * but not "Requests". Library names are specific enough to avoid
- * false positives even with substring matching. */
+static bool qn_token_char(char ch) {
+    return (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9');
+}
+
+static bool qn_pattern_occurrence_matches(const char *qn, const char *hit, const char *pattern) {
+    size_t plen = strlen(pattern);
+    if (plen == 0) {
+        return false;
+    }
+    if (qn_token_char(pattern[0]) && hit > qn && qn_token_char(hit[-1])) {
+        return false;
+    }
+    if (qn_token_char(pattern[plen - 1]) && qn_token_char(hit[plen])) {
+        return false;
+    }
+    return true;
+}
+
+/* Check if a library identifier appears as a token-aligned substring in the QN.
+ * Case-sensitive: "requests" matches "project.venv.requests.api.get" but not
+ * "myrequests".  The boundary check also prevents short framework ids like
+ * "gin." from firing inside unrelated names such as "plugin.". */
 static const lib_pattern_t *match_qn(const char *qn, const lib_pattern_t *patterns) {
     if (!qn || !qn[0]) {
         return NULL;
     }
     for (int i = 0; patterns[i].library_id != NULL; i++) {
-        if (strstr(qn, patterns[i].library_id) != NULL) {
-            return &patterns[i];
+        const char *p = qn;
+        while ((p = strstr(p, patterns[i].library_id)) != NULL) {
+            if (qn_pattern_occurrence_matches(qn, p, patterns[i].library_id)) {
+                return &patterns[i];
+            }
+            p++;
         }
     }
     return NULL;
@@ -648,9 +678,9 @@ static bool has_filesystem_extension(const char *path) {
     ext[ext_len] = '\0';
 
     static const char *const hard_file_exts[] = {
-        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
-        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",  ".env",        ".ini", ".key",
+        ".log",  ".md",     ".pdf",         ".pem",  ".pid", ".properties", ".rst", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", ".txt", NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
@@ -716,6 +746,11 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
     if (!path || !path[0]) {
         return false;
     }
+    /* Routes never contain whitespace; reject command/description strings
+     * (e.g. "/autorun test task description") that start with '/'. */
+    if (strpbrk(path, " \t\r\n")) {
+        return false;
+    }
     if (strncmp(path, "http://", 7) == 0 || strncmp(path, "https://", 8) == 0) {
         return true;
     }
@@ -724,6 +759,16 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
     }
     if (path[0] != '/') {
         return false;
+    }
+    /* Reject CLI slash-command syntax ("/ar:allow", "/gh:pr") without blocking
+     * ordinary route parameters in later segments ("/teams/:team/users/:id"). */
+    const char *first_slash = strchr(path + 1, '/');
+    size_t first_segment_len = first_slash ? (size_t)(first_slash - (path + 1)) : strlen(path + 1);
+    if (first_segment_len > 0) {
+        const char *colon = memchr(path + 1, ':', first_segment_len);
+        if (colon && path[1] != ':') {
+            return false;
+        }
     }
     if (callee_is_delimiter_or_filesystem_builder(callee_name)) {
         return false;
@@ -852,6 +897,40 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
         }
     }
     return NULL;
+}
+
+bool cbm_service_pattern_route_suffix_allows_no_handler(const char *callee_name) {
+    if (!callee_name) {
+        return false;
+    }
+    size_t clen = strlen(callee_name);
+    for (int i = 0; route_reg_suffixes[i].suffix != NULL; i++) {
+        size_t slen = strlen(route_reg_suffixes[i].suffix);
+        if (clen >= slen && strcmp(callee_name + clen - slen, route_reg_suffixes[i].suffix) == 0) {
+            return route_reg_suffixes[i].allows_no_handler;
+        }
+    }
+    return false;
+}
+
+bool cbm_service_pattern_is_php_route_facade(const char *callee_name) {
+    static const char php_route_facade_prefix[] = "Route::";
+    return callee_name != NULL &&
+           strncmp(callee_name, php_route_facade_prefix, sizeof(php_route_facade_prefix) - 1) ==
+               0 &&
+           cbm_service_pattern_route_method(callee_name) != NULL;
+}
+
+bool cbm_service_pattern_is_handlerless_http_client(const char *callee_name) {
+    /* The overlap between the route and HTTP-method tables is intentional:
+     * dotted verbs such as api.get('/x') are clients without a handler, while
+     * framework-only registration suffixes (MapGet/Handle) and the PHP Route
+     * facade (#952 inverse guard: not Cache::get) are not. Explicitly
+     * handlerless route APIs remain routes. */
+    return cbm_service_pattern_route_method(callee_name) != NULL &&
+           cbm_service_pattern_http_method(callee_name) != NULL &&
+           !cbm_service_pattern_is_php_route_facade(callee_name) &&
+           !cbm_service_pattern_route_suffix_allows_no_handler(callee_name);
 }
 
 const char *cbm_service_pattern_broker(const char *resolved_qn) {

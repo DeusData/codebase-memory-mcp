@@ -1,6 +1,6 @@
 {
   "version": "0.8.1",
-  "description": "Fast code intelligence engine — native executable with verified runtime assets",
+  "description": "Fast code intelligence engine — self-contained verified native executable",
   "homepage": "https://github.com/DeusData/codebase-memory-mcp",
   "license": "MIT",
   "architecture": {

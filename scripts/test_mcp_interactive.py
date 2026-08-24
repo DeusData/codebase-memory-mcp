@@ -113,7 +113,9 @@ def wait_response(
                 raise queue.Empty
             message = responses.get(timeout=remaining)
         except queue.Empty as error:
-            raise SmokeFailure(f"timed out waiting for MCP response id={request_id}") from error
+            raise SmokeFailure(
+                f"timed out waiting for MCP response id={request_id}"
+            ) from error
         if message.get("id") != request_id:
             continue
         if "result" not in message and "error" not in message:
@@ -158,12 +160,30 @@ def request(
     return wait_response(process, responses, request_id, timeout, accept_tool_error)
 
 
-def grouped_search_qualified_name(
-    structured: Any, expected_name: str
-) -> Optional[str]:
-    """Extract a qualified name from search_graph's grouped JSON tree."""
+def grouped_search_qualified_name(structured: Any, expected_name: str) -> Optional[str]:
+    """Extract a qualified name from current or legacy search_graph JSON."""
     if not isinstance(structured, dict):
         return None
+
+    # Current format=json returns result objects. Compact responses may omit
+    # `name` when it equals the qualified name's final segment, so the
+    # qualified name itself is the stable cross-version authority.
+    results = structured.get("results")
+    if isinstance(results, list):
+        for result in results:
+            if not isinstance(result, dict):
+                continue
+            qualified_name = result.get("qualified_name")
+            if not isinstance(qualified_name, str):
+                continue
+            name = result.get("name")
+            if (
+                name == expected_name
+                or qualified_name.rsplit(".", 1)[-1] == expected_name
+            ):
+                return qualified_name
+
+    # Legacy compact JSON grouped rows under a shared qualified-name prefix.
     columns = structured.get("cols")
     groups = structured.get("groups")
     if not isinstance(columns, list) or not isinstance(groups, list):
@@ -196,6 +216,7 @@ def run_scenario(
     responses: "queue.Queue[dict[str, Any]]",
     scenario: str,
     repo_path: str,
+    symbol: str,
     timeout: float,
 ) -> None:
     request(process, responses, 1, "initialize", INITIALIZE_PARAMS, timeout)
@@ -223,7 +244,9 @@ def run_scenario(
             not isinstance(invalid_index_result, dict)
             or invalid_index_result.get("isError") is not True
         ):
-            raise SmokeFailure("index_repository unexpectedly accepted a nonexistent path")
+            raise SmokeFailure(
+                "index_repository unexpectedly accepted a nonexistent path"
+            )
         request(process, responses, 3, "ping", {}, timeout)
         return
     index_response = request(
@@ -238,10 +261,16 @@ def run_scenario(
         timeout,
     )
     index_result = index_response.get("result")
-    structured = index_result.get("structuredContent") if isinstance(index_result, dict) else None
+    structured = (
+        index_result.get("structuredContent")
+        if isinstance(index_result, dict)
+        else None
+    )
     project = structured.get("project") if isinstance(structured, dict) else None
     if not isinstance(project, str) or not project:
-        raise SmokeFailure("index_repository response did not identify the indexed project")
+        raise SmokeFailure(
+            "index_repository response did not identify the indexed project"
+        )
     if scenario == "roundtrip":
         request(
             process,
@@ -250,7 +279,7 @@ def run_scenario(
             "tools/call",
             {
                 "name": "search_graph",
-                "arguments": {"project": project, "name_pattern": "compute"},
+                "arguments": {"project": project, "name_pattern": symbol},
             },
             timeout,
         )
@@ -264,7 +293,7 @@ def run_scenario(
             "name": "search_code",
             "arguments": {
                 "project": project,
-                "pattern": "compute",
+                "pattern": symbol,
                 "mode": "compact",
                 "limit": 3,
             },
@@ -280,7 +309,7 @@ def run_scenario(
             "name": "search_graph",
             "arguments": {
                 "project": project,
-                "name_pattern": "compute",
+                "name_pattern": symbol,
                 "format": "json",
                 "limit": 1,
             },
@@ -293,9 +322,9 @@ def run_scenario(
         if isinstance(discovery_result, dict)
         else None
     )
-    qualified_name = grouped_search_qualified_name(discovery_structured, "compute")
+    qualified_name = grouped_search_qualified_name(discovery_structured, symbol)
     if not qualified_name:
-        raise SmokeFailure("search_graph did not discover compute's qualified name")
+        raise SmokeFailure(f"search_graph did not discover {symbol!r}'s qualified name")
     request(
         process,
         responses,
@@ -329,6 +358,11 @@ def main() -> int:
         required=True,
     )
     parser.add_argument("--repo-path", required=True)
+    parser.add_argument(
+        "--symbol",
+        default="compute",
+        help="symbol/pattern exercised by roundtrip and advanced scenarios",
+    )
     parser.add_argument("--response-timeout", type=float, default=45.0)
     parser.add_argument("--exit-timeout", type=float, default=15.0)
     args = parser.parse_args()
@@ -367,6 +401,7 @@ def main() -> int:
             responses,
             args.scenario,
             args.repo_path,
+            args.symbol,
             args.response_timeout,
         )
         assert process.stdin is not None
@@ -374,9 +409,13 @@ def main() -> int:
         try:
             return_code = process.wait(timeout=args.exit_timeout)
         except subprocess.TimeoutExpired as error:
-            raise SmokeFailure("MCP server did not exit after interactive stdin EOF") from error
+            raise SmokeFailure(
+                "MCP server did not exit after interactive stdin EOF"
+            ) from error
         if return_code != 0:
-            raise SmokeFailure(f"MCP server exited nonzero after completed session: {return_code}")
+            raise SmokeFailure(
+                f"MCP server exited nonzero after completed session: {return_code}"
+            )
         stdout_thread.join(timeout=2)
         stderr_thread.join(timeout=2)
         for message in transcript:

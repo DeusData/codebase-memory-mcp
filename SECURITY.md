@@ -4,7 +4,7 @@
 
 codebase-memory-mcp interacts deeply with your filesystem. It reads source files across your entire codebase, writes to agent configuration files, and spawns background processes. This is inherent to what it does — not a bug.
 
-**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each archive contains a native executable and its authenticated release-owned runtime assets.
+**If you are uncomfortable with these access patterns**, please audit the source code before running. The full source is available in this repository. Release archives produced by the current release pipeline are verifiably built from this source and can be independently verified via SLSA Build Level 3 provenance, Sigstore signatures, and SHA-256 checksums (see [Verification](#verification) below). Each platform runtime is one self-contained native executable; the graph UI and integration templates are embedded.
 
 We are humans and can make mistakes. We take security seriously — it is Priority #1 for this project — but we cannot guarantee perfection. By using this software you accept responsibility for evaluating whether it meets your own security requirements.
 
@@ -29,9 +29,11 @@ check is ignored. The request is also bounded with `curl --max-time 5`; a
 process shutting down immediately while the check is still running may wait for
 that bounded background thread to finish.
 
-Explicit install, package-manager, and `codebase-memory-mcp update` flows are
-separate user-initiated network operations that download release assets and
-checksums from GitHub.
+Explicit install and package-manager flows are separate user-initiated network
+operations that download release archives and checksums from GitHub.
+`codebase-memory-mcp update` performs no network or replacement work itself; it
+prints the platform installer command, and downloading begins only if the user
+runs that command.
 
 ## Help Us Stay Secure
 
@@ -154,7 +156,7 @@ tolerance and selection table are specified in [Our release policy](#our-release
 
 ### Verification
 
-Users can independently verify any release archive and the runtime set it contains:
+Users can independently verify any release archive and the executable it contains:
 
 ```bash
 # SLSA Build Level 3 provenance for release archives

@@ -4,7 +4,8 @@
  * A file's SURFACE is everything another file's resolution can consume from
  * it: the CBMLSPDefs pass_lsp_cross registers into the cross registries,
  * plus the registry-only symbols (labels the name registry serves that
- * pxc_map_label drops — Field, today). Serialized to canonical JSON, hashed,
+ * pxc_map_label drops — Field and data relations today). Serialized to
+ * canonical JSON, hashed,
  * and persisted per file (store: lsp_surface rows) at publication, so an
  * incremental run can (a) detect that an edit left a file's surface
  * unchanged — a body edit — and skip recomputing its dependents, and

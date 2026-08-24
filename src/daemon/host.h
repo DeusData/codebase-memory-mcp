@@ -13,6 +13,8 @@ typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_build_identity_t identity;
     const char *executable_path;
+    const char *build_fingerprint_cache_path;
+    bool build_fingerprint_cache_enabled;
     atomic_int *stop_requested;
     /* Born via `daemon start`: the generation survives its last client
      * disconnect and the no-client initial window; it stops only through the

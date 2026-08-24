@@ -53,6 +53,15 @@ typedef struct {
     cbm_version_cohort_lease_t *lease;
 } version_cohort_mutation_wait_t;
 
+typedef struct {
+    cbm_version_cohort_manager_t *manager;
+    cbm_daemon_build_identity_t identity;
+    atomic_bool entered;
+    cbm_version_cohort_status_t status;
+    cbm_version_cohort_lease_t *lease;
+    cbm_daemon_conflict_t conflict;
+} version_cohort_bootstrap_wait_t;
+
 static cbm_daemon_build_identity_t version_cohort_identity(const char *version, const char *build) {
     cbm_daemon_build_identity_t identity = {
         .semantic_version = version,
@@ -123,6 +132,14 @@ static void *version_cohort_mutation_wait_thread(void *context) {
         wait->manager, wait->deadline_ms, version_cohort_test_request_quiesce, wait,
         &wait->quiesce_result, &wait->lease);
     atomic_store_explicit(&wait->finished, true, memory_order_release);
+    return NULL;
+}
+
+static void *version_cohort_bootstrap_wait_thread(void *context) {
+    version_cohort_bootstrap_wait_t *wait = context;
+    atomic_store_explicit(&wait->entered, true, memory_order_release);
+    wait->status = cbm_version_cohort_bootstrap_acquire(
+        wait->manager, &wait->identity, cbm_now_ms() + 2000U, &wait->lease, &wait->conflict);
     return NULL;
 }
 
@@ -538,6 +555,154 @@ TEST(version_cohort_does_not_repurpose_daemon_startup_lock_for_lifetime) {
     PASS();
 }
 
+TEST(version_cohort_bootstrap_activity_defers_and_excludes_daemon_drain) {
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "bootstrap-drain"));
+    cbm_version_cohort_manager_t *daemon = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *bootstrap = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(daemon);
+    ASSERT_NOT_NULL(bootstrap);
+    cbm_daemon_build_identity_t identity = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A);
+    cbm_daemon_conflict_t conflict;
+    cbm_version_cohort_lease_t *daemon_lease = NULL;
+    cbm_version_cohort_lease_t *bootstrap_lease = NULL;
+    cbm_version_cohort_lease_t *drain = NULL;
+
+    cbm_version_cohort_status_t daemon_status = cbm_version_cohort_acquire(
+        daemon, &identity, cbm_now_ms() + 2000U, &daemon_lease, &conflict);
+    cbm_version_cohort_status_t bootstrap_status = cbm_version_cohort_bootstrap_acquire(
+        bootstrap, &identity, cbm_now_ms() + 2000U, &bootstrap_lease, &conflict);
+    cbm_version_cohort_status_t drain_while_pending =
+        cbm_version_cohort_bootstrap_drain_try_acquire(daemon, &drain);
+    version_cohort_release(&bootstrap_lease);
+    cbm_version_cohort_status_t drain_after_release =
+        cbm_version_cohort_bootstrap_drain_try_acquire(daemon, &drain);
+    bool drain_retained = drain != NULL;
+    cbm_version_cohort_status_t bootstrap_during_drain = cbm_version_cohort_bootstrap_acquire(
+        bootstrap, &identity, cbm_now_ms(), &bootstrap_lease, &conflict);
+    version_cohort_release(&drain);
+    cbm_version_cohort_status_t bootstrap_after_drain = cbm_version_cohort_bootstrap_acquire(
+        bootstrap, &identity, cbm_now_ms() + 2000U, &bootstrap_lease, &conflict);
+
+    version_cohort_release(&bootstrap_lease);
+    version_cohort_release(&daemon_lease);
+    version_cohort_manager_close(&bootstrap);
+    version_cohort_manager_close(&daemon);
+    version_cohort_fixture_finish(&fixture);
+
+    ASSERT_EQ(daemon_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(bootstrap_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(drain_while_pending, CBM_VERSION_COHORT_BUSY);
+    ASSERT_EQ(drain_after_release, CBM_VERSION_COHORT_OK);
+    ASSERT_TRUE(drain_retained);
+    ASSERT_EQ(bootstrap_during_drain, CBM_VERSION_COHORT_BUSY);
+    ASSERT_EQ(bootstrap_after_drain, CBM_VERSION_COHORT_OK);
+    PASS();
+}
+
+TEST(version_cohort_bootstrap_activity_can_precede_identity_admission) {
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "bootstrap-early"));
+    cbm_version_cohort_manager_t *daemon = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *client = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(daemon);
+    ASSERT_NOT_NULL(client);
+    cbm_daemon_build_identity_t identity = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A);
+    cbm_daemon_conflict_t conflict;
+    cbm_version_cohort_lease_t *daemon_lease = NULL;
+    cbm_version_cohort_lease_t *bootstrap_lease = NULL;
+    cbm_version_cohort_lease_t *admission_lease = NULL;
+    cbm_version_cohort_lease_t *drain = NULL;
+
+    cbm_version_cohort_status_t daemon_status = cbm_version_cohort_acquire(
+        daemon, &identity, cbm_now_ms() + 2000U, &daemon_lease, &conflict);
+    cbm_version_cohort_status_t bootstrap_status = cbm_version_cohort_bootstrap_activity_acquire(
+        client, cbm_now_ms() + 2000U, &bootstrap_lease);
+    cbm_version_cohort_status_t drain_before_admission =
+        cbm_version_cohort_bootstrap_drain_try_acquire(daemon, &drain);
+    cbm_version_cohort_status_t admission_status = cbm_version_cohort_acquire(
+        client, &identity, cbm_now_ms() + 2000U, &admission_lease, &conflict);
+    version_cohort_release(&admission_lease);
+    cbm_version_cohort_status_t drain_after_admission =
+        cbm_version_cohort_bootstrap_drain_try_acquire(daemon, &drain);
+    version_cohort_release(&bootstrap_lease);
+    cbm_version_cohort_status_t drain_after_bootstrap =
+        cbm_version_cohort_bootstrap_drain_try_acquire(daemon, &drain);
+
+    version_cohort_release(&drain);
+    version_cohort_release(&daemon_lease);
+    version_cohort_manager_close(&client);
+    version_cohort_manager_close(&daemon);
+    version_cohort_fixture_finish(&fixture);
+
+    ASSERT_EQ(daemon_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(bootstrap_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(drain_before_admission, CBM_VERSION_COHORT_BUSY);
+    ASSERT_EQ(admission_status, CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(drain_after_admission, CBM_VERSION_COHORT_BUSY);
+    ASSERT_EQ(drain_after_bootstrap, CBM_VERSION_COHORT_OK);
+    PASS();
+}
+
+TEST(version_cohort_bootstrap_marks_activity_before_serialized_admission) {
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "bootstrap-wait"));
+    cbm_private_lock_directory_t *directory = NULL;
+    ASSERT_EQ(cbm_daemon_ipc_private_lock_directory_new(fixture.endpoint, &directory),
+              CBM_PRIVATE_FILE_LOCK_OK);
+    cbm_private_file_lock_t *admission = NULL;
+    ASSERT_EQ(cbm_private_file_lock_try_acquire(directory, "cbm-version-cohort-admission-v1.lock",
+                                                CBM_PRIVATE_FILE_LOCK_EX, &admission),
+              CBM_PRIVATE_FILE_LOCK_OK);
+    cbm_version_cohort_manager_t *bootstrap = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *daemon = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(bootstrap);
+    ASSERT_NOT_NULL(daemon);
+    version_cohort_bootstrap_wait_t wait = {
+        .manager = bootstrap,
+        .identity = version_cohort_identity("2.4.0", VERSION_COHORT_BUILD_A),
+        .status = CBM_VERSION_COHORT_IO,
+    };
+    atomic_init(&wait.entered, false);
+    cbm_thread_t thread;
+    int created =
+        cbm_thread_create(&thread, 128U * 1024U, version_cohort_bootstrap_wait_thread, &wait);
+    bool entered =
+        created == 0 && version_cohort_wait_for_atomic(&wait.entered, cbm_now_ms() + 1000U);
+    bool activity_seen = false;
+    uint64_t observation_deadline = cbm_now_ms() + 250U;
+    while (entered && cbm_now_ms() < observation_deadline) {
+        cbm_version_cohort_lease_t *drain = NULL;
+        cbm_version_cohort_status_t status =
+            cbm_version_cohort_bootstrap_drain_try_acquire(daemon, &drain);
+        if (status == CBM_VERSION_COHORT_BUSY) {
+            activity_seen = true;
+            break;
+        }
+        version_cohort_release(&drain);
+        cbm_usleep(1000);
+    }
+    cbm_private_file_lock_status_t admission_release = cbm_private_file_lock_release(&admission);
+    int joined = created == 0 ? cbm_thread_join(&thread) : -1;
+
+    version_cohort_release(&wait.lease);
+    while (admission) {
+        admission_release = cbm_private_file_lock_release(&admission);
+    }
+    version_cohort_manager_close(&daemon);
+    version_cohort_manager_close(&bootstrap);
+    cbm_private_lock_directory_close(directory);
+    version_cohort_fixture_finish(&fixture);
+
+    ASSERT_EQ(created, 0);
+    ASSERT_TRUE(entered);
+    ASSERT_TRUE(activity_seen);
+    ASSERT_EQ(admission_release, CBM_PRIVATE_FILE_LOCK_OK);
+    ASSERT_EQ(joined, 0);
+    ASSERT_EQ(wait.status, CBM_VERSION_COHORT_OK);
+    PASS();
+}
+
 TEST(version_cohort_distinguishes_coordinated_daemon_without_connecting) {
     version_cohort_fixture_t fixture;
     ASSERT_TRUE(version_cohort_fixture_start(&fixture, "daemon-marker"));
@@ -901,6 +1066,9 @@ SUITE(version_cohort) {
     RUN_TEST(version_cohort_mutation_waits_for_every_lifetime_participant);
     RUN_TEST(version_cohort_mutation_timeout_releases_all_guards);
     RUN_TEST(version_cohort_does_not_repurpose_daemon_startup_lock_for_lifetime);
+    RUN_TEST(version_cohort_bootstrap_activity_defers_and_excludes_daemon_drain);
+    RUN_TEST(version_cohort_bootstrap_activity_can_precede_identity_admission);
+    RUN_TEST(version_cohort_bootstrap_marks_activity_before_serialized_admission);
     RUN_TEST(version_cohort_distinguishes_coordinated_daemon_without_connecting);
     RUN_TEST(version_cohort_transition_presence_is_authoritative_and_marker_checked);
     RUN_TEST(version_cohort_transition_shutdown_order_has_no_false_conflict);

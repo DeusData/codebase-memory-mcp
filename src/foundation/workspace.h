@@ -51,11 +51,12 @@ bool cbm_workspace_verdict_is_overridable(cbm_ws_verdict_t verdict);
  * 0 (the share root itself). Exposed for tests. */
 int cbm_workspace_path_depth(const char *canonical_path);
 
+/* Component-boundary containment for two already-canonical absolute paths. */
+bool cbm_canonical_path_has_root(const char *root_path, const char *candidate_path);
+
 /* Canonical containment check: is abs_path at or below root_path, after symlink
- * and junction resolution? The definition currently lives in src/mcp/mcp.c; it is
- * declared here so the MCP handler, the HTTP UI route and the CLI all reach the
- * same implementation. Two entry points evaluating the same policy separately is
- * what produced the UI/MCP divergence in the first place. */
+ * and junction resolution? Two entry points evaluating the same policy
+ * separately is what produced the UI/MCP divergence in the first place. */
 bool cbm_path_within_root(const char *root_path, const char *abs_path);
 
 /*

@@ -22,6 +22,7 @@ performed and the two negative cases can use a short deterministic deadline:
 Exit code: 0 == green, 1 == behavior regression, 2 == fixture/setup error.
 """
 
+import ctypes
 import os
 import re
 import shutil
@@ -57,6 +58,25 @@ def force_kill(pid):
         subprocess.run(["kill", "-9", str(pid)], capture_output=True, timeout=30)
 
 
+def wait_for_process_exit(pid, timeout_s):
+    if os.name != "nt" or not pid:
+        return True
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = (ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32)
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+    kernel32.WaitForSingleObject.restype = ctypes.c_uint32
+    kernel32.CloseHandle.argtypes = (ctypes.c_void_p,)
+    kernel32.CloseHandle.restype = ctypes.c_int
+    handle = kernel32.OpenProcess(0x00100000, False, pid)  # SYNCHRONIZE
+    if not handle:
+        return ctypes.get_last_error() == 87  # ERROR_INVALID_PARAMETER: process is gone
+    try:
+        return kernel32.WaitForSingleObject(handle, int(timeout_s * 1000)) == 0
+    finally:
+        kernel32.CloseHandle(handle)
+
+
 def stop_daemon(binary, env, pid):
     stopped = False
     try:
@@ -74,8 +94,11 @@ def stop_daemon(binary, env, pid):
         except (OSError, subprocess.TimeoutExpired):
             pass
         time.sleep(0.1)
-    if not stopped:
-        force_kill(pid)
+    if stopped and wait_for_process_exit(pid, 5):
+        return
+    force_kill(pid)
+    if not wait_for_process_exit(pid, 5):
+        raise RuntimeError("daemon pid %d did not exit after cleanup kill" % pid)
 
 
 def occupied_loopback_port():
@@ -327,11 +350,19 @@ def assert_active_daemon_open(binary, work):
         stop_daemon(binary, env, daemon_pid)
 
 
+def resolve_binary_path(argument, platform_name=os.name):
+    binary = os.path.abspath(argument)
+    executable = binary + ".exe"
+    if platform_name == "nt" and not os.path.isfile(binary) and os.path.isfile(executable):
+        return executable
+    return binary
+
+
 def main():
     if len(sys.argv) != 2:
         print("usage: python3 test_daemon_open_readiness.py <ui-binary>")
         return 2
-    binary = os.path.abspath(sys.argv[1])
+    binary = resolve_binary_path(sys.argv[1])
     if not os.path.isfile(binary):
         print("SETUP FAIL: binary not found: %s" % binary)
         return 2

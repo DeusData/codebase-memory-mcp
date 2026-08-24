@@ -301,7 +301,25 @@ TEST(diagnostics_soak_discovers_daemon_emitted_paths) {
     char *script = diagnostics_read_file("scripts/soak-test.sh");
     ASSERT_NOT_NULL(script);
     bool parses_start_event = strstr(script, "\"event\":\"diagnostics.start\"") != NULL;
-    bool isolates_daemon = strstr(script, "CBM_CACHE_DIR=\"$SOAK_CACHE_DIR_VALUE\"") != NULL;
+    /* The soak run must point the daemon at its OWN cache directory so it can
+     * neither read nor evict the developer's real cache, and so the diagnostics
+     * and daemon log it later reads belong to this run.
+     *
+     * Asserted as a PROPERTY rather than as one spelling. Upstream pinned the
+     * literal CBM_CACHE_DIR="$SOAK_CACHE_DIR_VALUE", prefixed onto each command;
+     * the merged script assigns CBM_CACHE_DIR from a per-run "$SOAK_CACHE"
+     * (itself under the mktemp soak root) and EXPORTS it once, which is at least
+     * as strong — an exported value cannot be forgotten on a newly added
+     * command, whereas a per-command prefix can. Pinning either spelling would
+     * fail a script that isolates correctly by the other mechanism, which is
+     * what happened here. Accept either, and still fail if isolation is
+     * removed. */
+    bool isolates_via_export =
+        strstr(script, "CBM_CACHE_DIR=\"$SOAK_CACHE\"") != NULL &&
+        strstr(script, "export CBM_CACHE_DIR") != NULL;
+    bool isolates_via_command_prefix =
+        strstr(script, "CBM_CACHE_DIR=\"$SOAK_CACHE_DIR_VALUE\"") != NULL;
+    bool isolates_daemon = isolates_via_export || isolates_via_command_prefix;
     bool legacy_predictable_path = strstr(script, "/tmp/cbm-diagnostics-${SERVER_PID}") != NULL;
     free(script);
 

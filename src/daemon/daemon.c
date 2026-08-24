@@ -326,6 +326,9 @@ void cbm_daemon_coordinator_set_permanent(cbm_daemon_coordinator_t *coordinator,
     }
     cbm_mutex_lock(&coordinator->mutex);
     coordinator->permanent = permanent;
+    if (!permanent && coordinator->client_count == 0) {
+        coordinator->state = CBM_DAEMON_COORDINATOR_STOPPING;
+    }
     cbm_mutex_unlock(&coordinator->mutex);
 }
 

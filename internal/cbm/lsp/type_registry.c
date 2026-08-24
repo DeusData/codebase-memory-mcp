@@ -89,7 +89,7 @@ static void build_method_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
         bucket_count = 16;
     int *buckets = (int *)cbm_arena_alloc(idx_arena, (size_t)bucket_count * sizeof(int));
     CBMRegistryHashEntry *entries = (CBMRegistryHashEntry *)cbm_arena_alloc(
-        reg->arena, (size_t)reg->func_count * sizeof(CBMRegistryHashEntry));
+        idx_arena, (size_t)reg->func_count * sizeof(CBMRegistryHashEntry));
     if (!buckets || !entries)
         return;
     for (int i = 0; i < bucket_count; i++)

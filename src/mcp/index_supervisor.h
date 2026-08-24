@@ -74,6 +74,8 @@ void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
  * before any worker can be launched. Repeated calls return the original capture
  * and never re-hash a pathname that an installer may since have replaced. */
 bool cbm_index_supervisor_capture_build_fingerprint(void);
+bool cbm_index_supervisor_capture_build_fingerprint_cached(const char *cache_path,
+                                                           bool allow_cache);
 const char *cbm_index_supervisor_build_fingerprint(void);
 
 typedef struct {
@@ -128,6 +130,13 @@ int cbm_index_supervisor_spawn_count(void);
 /* Test hook: single-threaded spawn count — must stay ZERO (production
  * recovery is parallel-only; no sequential runs). */
 int cbm_index_supervisor_spawn_st_count(void);
+
+/* Quiet-timeout (ms) for a supervised index worker: no-progress window (each
+ * completed log line resets it), NOT a total-time cap. Default 15 min; the
+ * CBM_INDEX_WORKER_TIMEOUT_S env override (seconds) tightens it for tests.
+ * Shared by every spawn site that runs `cli --index-worker` (the MCP
+ * supervisor gate and the UI /api/index job) so one knob governs both. */
+int cbm_index_worker_quiet_timeout_ms(void);
 
 typedef struct {
     cbm_proc_outcome_t outcome; /* how the worker ended */

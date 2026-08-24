@@ -6,6 +6,7 @@
 #include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include "test_helpers.h"
+#include <pagerank/pagerank.h>
 #include <store/store.h>
 #include <stdint.h>
 #include <string.h>
@@ -64,6 +65,42 @@ TEST(store_search_by_label) {
     ASSERT_EQ(out.total, 2);
     cbm_store_search_free(&out);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_summary_returns_exact_facets_without_node_rows) {
+    int64_t ids[3];
+    cbm_store_t *s = setup_search_store(ids);
+
+    cbm_search_params_t params = {
+        .project = "test",
+        .min_degree = -1,
+        .max_degree = -1,
+        .summary_only = true,
+        /* Summary aggregation is independent of node-page controls. */
+        .limit = 1,
+        .offset = 2,
+    };
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.total, 3);
+    ASSERT_EQ(out.count, 0);
+    ASSERT_NULL(out.results);
+
+    ASSERT_EQ(out.label_facet_count, 2);
+    ASSERT_STR_EQ(out.label_facets[0].value, "Function");
+    ASSERT_EQ(out.label_facets[0].count, 2);
+    ASSERT_STR_EQ(out.label_facets[1].value, "Class");
+    ASSERT_EQ(out.label_facets[1].count, 1);
+
+    ASSERT_EQ(out.file_facet_count, 2);
+    ASSERT_STR_EQ(out.file_facets[0].value, "service.go");
+    ASSERT_EQ(out.file_facets[0].count, 2);
+    ASSERT_STR_EQ(out.file_facets[1].value, "main.go");
+    ASSERT_EQ(out.file_facets[1].count, 1);
+
+    cbm_store_search_free(&out);
     cbm_store_close(s);
     PASS();
 }
@@ -992,6 +1029,315 @@ TEST(store_bfs_with_risk_labels) {
     PASS();
 }
 
+TEST(store_bfs_carries_joined_pagerank_score) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t na = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t nb = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    int64_t idA = cbm_store_upsert_node(s, &na);
+    int64_t idB = cbm_store_upsert_node(s, &nb);
+    cbm_edge_t e = {.project = "test", .source_id = idA, .target_id = idB, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e);
+
+    char rank_sql[256];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('test',%lld,0.75,'2026-06-30T00:00:00Z')",
+             (long long)idB);
+    ASSERT_EQ(cbm_store_exec(s, rank_sql), CBM_STORE_OK);
+
+    const char *types[] = {"CALLS"};
+    cbm_traverse_result_t result = {0};
+    ASSERT_EQ(cbm_store_bfs(s, idA, "outbound", types, 1, 1, 10, &result), CBM_STORE_OK);
+    ASSERT_EQ(result.visited_count, 1);
+    ASSERT_EQ(result.visited[0].node.id, idB);
+    ASSERT_FLOAT_EQ(result.visited[0].pagerank_score, 0.75, CBM_PAGERANK_EPSILON);
+
+    cbm_store_traverse_free(&result);
+
+    cbm_store_trail_graph_t *trail_graph = NULL;
+    ASSERT_EQ(cbm_store_trail_graph_load(s, "test", "outbound", types, 1, &trail_graph),
+              CBM_STORE_OK);
+    int trail_work = 0;
+    bool trail_limit_hit = false;
+    bool trail_cancelled = false;
+    cbm_traverse_result_t trail_result = {0};
+    ASSERT_EQ(cbm_store_trail_graph_traverse(trail_graph, idA, NULL, 1, 1, 10, NULL, NULL,
+                                             &trail_result, &trail_work, &trail_limit_hit,
+                                             &trail_cancelled),
+              CBM_STORE_OK);
+    ASSERT_EQ(trail_result.visited_count, 1);
+    ASSERT_FLOAT_EQ(trail_result.visited[0].pagerank_score, 0.75, CBM_PAGERANK_EPSILON);
+    cbm_store_traverse_free(&trail_result);
+    cbm_store_trail_graph_free(trail_graph);
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+    cbm_traverse_result_t stale_result = {0};
+    ASSERT_EQ(cbm_store_bfs(s, idA, "outbound", types, 1, 1, 10, &stale_result), CBM_STORE_OK);
+    ASSERT_TRUE(stale_result.pagerank_stale);
+    ASSERT_EQ(stale_result.visited_count, 1);
+    ASSERT_FLOAT_EQ(stale_result.visited[0].pagerank_score, 0.0, CBM_PAGERANK_EPSILON);
+
+    cbm_store_traverse_free(&stale_result);
+
+    trail_graph = NULL;
+    ASSERT_EQ(cbm_store_trail_graph_load(s, "test", "outbound", types, 1, &trail_graph),
+              CBM_STORE_OK);
+    trail_work = 0;
+    trail_limit_hit = false;
+    trail_cancelled = false;
+    memset(&trail_result, 0, sizeof(trail_result));
+    ASSERT_EQ(cbm_store_trail_graph_traverse(trail_graph, idA, NULL, 1, 1, 10, NULL, NULL,
+                                             &trail_result, &trail_work, &trail_limit_hit,
+                                             &trail_cancelled),
+              CBM_STORE_OK);
+    ASSERT_TRUE(trail_result.pagerank_stale);
+    ASSERT_EQ(trail_result.visited_count, 1);
+    ASSERT_FLOAT_EQ(trail_result.visited[0].pagerank_score, 0.0, CBM_PAGERANK_EPSILON);
+    cbm_store_traverse_free(&trail_result);
+    cbm_store_trail_graph_free(trail_graph);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_trail_graph_snapshot_is_project_scoped) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "selected", "/tmp/selected"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, "foreign", "/tmp/foreign"), CBM_STORE_OK);
+
+    cbm_node_t selected = {.project = "selected",
+                           .label = "Function",
+                           .name = "selected",
+                           .qualified_name = "selected.fn"};
+    cbm_node_t foreign = {.project = "foreign",
+                          .label = "Function",
+                          .name = "foreign",
+                          .qualified_name = "foreign.fn"};
+    int64_t selected_id = cbm_store_upsert_node(s, &selected);
+    int64_t foreign_id = cbm_store_upsert_node(s, &foreign);
+    ASSERT_GT(selected_id, 0);
+    ASSERT_GT(foreign_id, 0);
+
+    /* Deliberately malformed ownership: a foreign-project edge connects the
+     * selected-project node. Project-scoped Cypher must not traverse it. */
+    cbm_edge_t foreign_edge = {
+        .project = "foreign", .source_id = selected_id, .target_id = foreign_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &foreign_edge), 0);
+
+    const char *types[] = {"CALLS"};
+    cbm_store_trail_graph_t *graph = NULL;
+    ASSERT_EQ(cbm_store_trail_graph_load(s, "selected", "outbound", types, 1, &graph),
+              CBM_STORE_OK);
+    cbm_traverse_result_t result = {0};
+    int work_rows = 0;
+    bool work_limit_hit = false;
+    bool cancelled = false;
+    ASSERT_EQ(cbm_store_trail_graph_traverse(graph, selected_id, NULL, 1, 1, 10, NULL, NULL,
+                                             &result, &work_rows, &work_limit_hit, &cancelled),
+              CBM_STORE_OK);
+    ASSERT_EQ(result.visited_count, 0);
+    ASSERT_EQ(work_rows, 0);
+    ASSERT_FALSE(work_limit_hit);
+    ASSERT_FALSE(cancelled);
+
+    cbm_store_traverse_free(&result);
+    cbm_store_trail_graph_free(graph);
+    cbm_store_close(s);
+    PASS();
+}
+
+typedef struct {
+    bool *used;
+    int edge_count;
+    int visits;
+    bool fail;
+} store_trail_visit_test_ctx_t;
+
+static int store_trail_visit_test_cb(const cbm_node_t *node, const cbm_edge_t *last_edge,
+                                     void *userdata) {
+    store_trail_visit_test_ctx_t *ctx = userdata;
+    if (!node || !last_edge) {
+        return CBM_STORE_ERR;
+    }
+    int used_count = 0;
+    for (int i = 0; i < ctx->edge_count; i++) {
+        used_count += ctx->used[i] ? 1 : 0;
+    }
+    if (used_count <= 0) {
+        return CBM_STORE_ERR;
+    }
+    ctx->visits++;
+    return ctx->fail ? CBM_STORE_ERR : CBM_STORE_OK;
+}
+
+static bool store_trail_cancel_immediately(void *userdata) {
+    (void)userdata;
+    return true;
+}
+
+TEST(store_trail_graph_visit_unwinds_used_edges_on_every_exit) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    cbm_node_t a = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t b = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    cbm_node_t c = {
+        .project = "test", .label = "Function", .name = "C", .qualified_name = "test.C"};
+    int64_t a_id = cbm_store_upsert_node(s, &a);
+    int64_t b_id = cbm_store_upsert_node(s, &b);
+    int64_t c_id = cbm_store_upsert_node(s, &c);
+    cbm_edge_t ab = {.project = "test", .source_id = a_id, .target_id = b_id, .type = "CALLS"};
+    cbm_edge_t bc = {.project = "test", .source_id = b_id, .target_id = c_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(s, &ab), 0);
+    ASSERT_GT(cbm_store_insert_edge(s, &bc), 0);
+
+    cbm_store_trail_graph_t *graph = NULL;
+    ASSERT_EQ(cbm_store_trail_graph_load(s, "test", "any", NULL, 0, &graph), CBM_STORE_OK);
+    int edge_count = cbm_store_trail_graph_edge_count(graph);
+    ASSERT_EQ(edge_count, 2);
+    ASSERT_EQ(cbm_store_trail_graph_arc_count(graph), 4);
+    bool used[2] = {false, false};
+    const char *types[] = {"CALLS"};
+    int work_rows = 0;
+    bool work_limit_hit = false;
+    bool cancelled = false;
+    store_trail_visit_test_ctx_t ctx = {
+        .used = used, .edge_count = edge_count, .visits = 0, .fail = false};
+
+    ASSERT_EQ(cbm_store_trail_graph_visit(graph, a_id, NULL, "outbound", types, 1, 1, 2, used, 10,
+                                          &work_rows, NULL, NULL, store_trail_visit_test_cb, &ctx,
+                                          &work_limit_hit, &cancelled),
+              CBM_STORE_OK);
+    ASSERT_EQ(ctx.visits, 2);
+    ASSERT_FALSE(used[0]);
+    ASSERT_FALSE(used[1]);
+
+    memset(used, 0, sizeof(used));
+    work_rows = 0;
+    work_limit_hit = false;
+    cancelled = false;
+    ctx.visits = 0;
+    ctx.fail = true;
+    ASSERT_EQ(cbm_store_trail_graph_visit(graph, a_id, NULL, "outbound", types, 1, 1, 2, used, 10,
+                                          &work_rows, NULL, NULL, store_trail_visit_test_cb, &ctx,
+                                          &work_limit_hit, &cancelled),
+              CBM_STORE_ERR);
+    ASSERT_FALSE(used[0]);
+    ASSERT_FALSE(used[1]);
+
+    memset(used, 0, sizeof(used));
+    work_rows = 0;
+    work_limit_hit = false;
+    cancelled = false;
+    ctx.visits = 0;
+    ctx.fail = false;
+    ASSERT_EQ(cbm_store_trail_graph_visit(graph, a_id, NULL, "outbound", types, 1, 1, 2, used, 1,
+                                          &work_rows, NULL, NULL, store_trail_visit_test_cb, &ctx,
+                                          &work_limit_hit, &cancelled),
+              CBM_STORE_OK);
+    ASSERT_TRUE(work_limit_hit);
+    ASSERT_FALSE(used[0]);
+    ASSERT_FALSE(used[1]);
+
+    /* A nested segment shares the query-wide work counter. If an earlier
+     * segment already exhausted or crossed the budget, exact equality is too
+     * fragile: the visitor must fail closed without examining another arc and
+     * must leave every caller-owned edge mark unchanged. */
+    memset(used, 0, sizeof(used));
+    work_rows = 2;
+    work_limit_hit = false;
+    cancelled = false;
+    ctx.visits = 0;
+    ASSERT_EQ(cbm_store_trail_graph_visit(graph, a_id, NULL, "outbound", types, 1, 1, 2, used, 1,
+                                          &work_rows, NULL, NULL, store_trail_visit_test_cb, &ctx,
+                                          &work_limit_hit, &cancelled),
+              CBM_STORE_OK);
+    ASSERT_TRUE(work_limit_hit);
+    ASSERT_EQ(work_rows, 2);
+    ASSERT_EQ(ctx.visits, 0);
+    ASSERT_FALSE(used[0]);
+    ASSERT_FALSE(used[1]);
+
+    memset(used, 0, sizeof(used));
+    work_rows = 0;
+    work_limit_hit = false;
+    cancelled = false;
+    ASSERT_EQ(cbm_store_trail_graph_visit(graph, a_id, NULL, "outbound", types, 1, 1, 2, used, 10,
+                                          &work_rows, store_trail_cancel_immediately, NULL,
+                                          store_trail_visit_test_cb, &ctx, &work_limit_hit,
+                                          &cancelled),
+              CBM_STORE_OK);
+    ASSERT_TRUE(cancelled);
+    ASSERT_FALSE(used[0]);
+    ASSERT_FALSE(used[1]);
+
+    cbm_store_trail_graph_free(graph);
+    graph = NULL;
+    ASSERT_EQ(cbm_store_trail_graph_load(s, "test", "outbound", NULL, 0, &graph), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_trail_graph_edge_count(graph), 2);
+    ASSERT_EQ(cbm_store_trail_graph_arc_count(graph), 2);
+    cbm_store_trail_graph_free(graph);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_uses_legacy_but_not_stale_pagerank) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t na = {
+        .project = "test", .label = "Function", .name = "A", .qualified_name = "test.A"};
+    cbm_node_t nb = {
+        .project = "test", .label = "Function", .name = "B", .qualified_name = "test.B"};
+    int64_t idA = cbm_store_upsert_node(s, &na);
+    int64_t idB = cbm_store_upsert_node(s, &nb);
+
+    char rank_sql[512];
+    snprintf(rank_sql, sizeof(rank_sql),
+             "INSERT INTO pagerank(project,node_id,rank,computed_at) "
+             "VALUES('test',%lld,0.1,'2026-06-30T00:00:00Z'),"
+             "('test',%lld,0.9,'2026-06-30T00:00:00Z')",
+             (long long)idA, (long long)idB);
+    ASSERT_EQ(cbm_store_exec(s, rank_sql), CBM_STORE_OK);
+
+    cbm_search_params_t params = {0};
+    params.project = "test";
+    params.limit = 2;
+    params.min_degree = -1;
+    params.max_degree = -1;
+    cbm_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_FALSE(out.pagerank_stale);
+    ASSERT_EQ(out.count, 2);
+    ASSERT_STR_EQ(out.results[0].node.name, "B");
+    ASSERT_FLOAT_EQ(out.results[0].pagerank_score, 0.9, CBM_PAGERANK_EPSILON);
+    cbm_store_search_free(&out);
+
+    ASSERT_EQ(cbm_store_set_derived_view_state(s, "test", CBM_STORE_DERIVED_VIEW_PAGERANK,
+                                               CBM_STORE_DERIVED_GENERATION_UNKNOWN,
+                                               CBM_STORE_DERIVED_STATUS_STALE),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_search(s, &params, &out), CBM_STORE_OK);
+    ASSERT_TRUE(out.pagerank_stale);
+    ASSERT_EQ(out.count, 2);
+    ASSERT_STR_EQ(out.results[0].node.name, "A");
+    ASSERT_FLOAT_EQ(out.results[0].pagerank_score, 0.0, CBM_PAGERANK_EPSILON);
+
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── BFS cross-service summary ─────────────────────────────────── */
 
 TEST(store_bfs_cross_service_summary) {
@@ -1194,6 +1540,111 @@ TEST(store_batch_count_degrees) {
     /* C: in=2, out=0 (CALLS only) */
     ASSERT_EQ(in2[1], 2);
     ASSERT_EQ(out2[1], 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── SQL injection resistance for exclude_labels ─────────────────── */
+/* TDD test for C3: origin/main commit 6a6127c switched exclude_labels
+ * and edge_types filter clauses to sqlite3_bind_text() parameterized
+ * binding.  This test verifies that a SQL injection payload in an
+ * exclude_labels value cannot corrupt or destroy the database.
+ *
+ * With the old snprintf approach [api-consolidation store.c:2008-2019]
+ * a value like "') DROP TABLE nodes; --" would be interpolated directly
+ * into the SQL string and could be executed.  With bind params the value
+ * is treated as a literal string and cannot break out of the IN clause.
+ */
+TEST(store_search_exclude_labels_sqli) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "safe_fn",
+                     .qualified_name = "test.safe_fn",
+                     .file_path = "a.go"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Class",
+                     .name = "SafeClass",
+                     .qualified_name = "test.SafeClass",
+                     .file_path = "b.go"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+
+    /* SQL injection payload in the exclude_labels array. With snprintf
+     * interpolation [api-consolidation store.c:2015] this would produce:
+     *   n.label NOT IN ('') DROP TABLE nodes; --')
+     * which breaks out of the literal and executes a DROP TABLE.
+     * With bind params the payload is a literal string comparison and
+     * cannot execute arbitrary SQL. */
+    const char *excl[] = {"') DROP TABLE nodes; --", NULL};
+    cbm_search_params_t params = {.project = "test",
+                                  .limit = 100,
+                                  .min_degree = -1,
+                                  .max_degree = -1,
+                                  .exclude_labels = excl};
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search(s, &params, &out);
+
+    /* The search must not fail — parameterized binding ensures the
+     * injection payload is treated as a literal string, not SQL. */
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* Both nodes (Function, Class) should still be present — nodes
+     * table must NOT have been dropped by the injection attempt. */
+    ASSERT_EQ(out.total, 2);
+    cbm_store_search_free(&out);
+
+    /* Double-check: search again with no exclusions to confirm table intact */
+    cbm_search_params_t params2 = {
+        .project = "test", .limit = 100, .min_degree = -1, .max_degree = -1};
+    cbm_search_output_t out2 = {0};
+    rc = cbm_store_search(s, &params2, &out2);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out2.total, 2);
+    cbm_store_search_free(&out2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* ── SQL injection resistance for BFS edge_types ─────────────────── */
+/* Same principle: verify that a SQL injection payload in an edge_types
+ * value passed to cbm_store_bfs() cannot corrupt the database.
+ *
+ * The types_clause in [api-consolidation store.c:2258-2268] builds
+ *   'CALLS','IMPORTS'
+ * with snprintf.  A payload like "','') DROP TABLE edges; --" would
+ * break out of the IN clause with the old approach.  With bind params
+ * it is treated as a literal and causes no harm. */
+TEST(store_bfs_edge_types_sqli) {
+    int64_t ids[3];
+    cbm_store_t *s = setup_search_store(ids);
+
+    /* SQL injection payload as an edge type.
+     * cbm_store_bfs signature [api-consolidation src/store/store.h:365]:
+     *   int cbm_store_bfs(cbm_store_t *s, int64_t start_id,
+     *                     const char *direction, const char **edge_types,
+     *                     int edge_type_count, int max_depth,
+     *                     int max_results, cbm_traverse_result_t *out); */
+    const char *edge_types_sqli[] = {"','') DROP TABLE edges; --"};
+    cbm_traverse_result_t result = {0};
+    int rc = cbm_store_bfs(s, ids[0], "outbound", edge_types_sqli, 1, 3, 50, &result);
+
+    /* Must not crash or corrupt the database.  The injection payload
+     * matches no real edge type, so we expect 0 visited but CBM_STORE_OK. */
+    ASSERT_TRUE(rc == CBM_STORE_OK || rc == CBM_STORE_NOT_FOUND);
+
+    /* Verify edges table still intact: BFS with a real edge type must work */
+    cbm_store_traverse_free(&result);
+    cbm_traverse_result_t result2 = {0};
+    const char *real_types[] = {"CALLS"};
+    rc = cbm_store_bfs(s, ids[0], "outbound", real_types, 1, 3, 50, &result2);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* Should find ids[1] (ProcessOrder) */
+    ASSERT_GTE(result2.visited_count, 1);
+    cbm_store_traverse_free(&result2);
 
     cbm_store_close(s);
     PASS();
@@ -1482,6 +1933,7 @@ TEST(store_find_nodes_rejects_null_store_without_ub) {
 
 SUITE(store_search) {
     RUN_TEST(store_search_by_label);
+    RUN_TEST(store_search_summary_returns_exact_facets_without_node_rows);
     RUN_TEST(store_search_by_name_pattern);
     RUN_TEST(store_search_empty_label_ignored);
     RUN_TEST(store_search_by_file_pattern);
@@ -1509,12 +1961,19 @@ SUITE(store_search) {
     RUN_TEST(store_cross_service_detection);
     RUN_TEST(store_deduplicate_hops);
     RUN_TEST(store_bfs_with_risk_labels);
+    RUN_TEST(store_bfs_carries_joined_pagerank_score);
+    RUN_TEST(store_trail_graph_snapshot_is_project_scoped);
+    RUN_TEST(store_trail_graph_visit_unwinds_used_edges_on_every_exit);
+    RUN_TEST(store_search_uses_legacy_but_not_stale_pagerank);
     RUN_TEST(store_bfs_cross_service_summary);
     RUN_TEST(store_glob_to_like);
     RUN_TEST(store_extract_like_hints);
     RUN_TEST(store_ensure_case_insensitive);
     RUN_TEST(store_strip_case_flag);
     RUN_TEST(store_batch_count_degrees);
+    /* SQL injection resistance tests (parameterized bind) */
+    RUN_TEST(store_search_exclude_labels_sqli);
+    RUN_TEST(store_bfs_edge_types_sqli);
     /* Edge case tests */
     RUN_TEST(store_glob_to_like_empty);
     RUN_TEST(store_glob_to_like_only_star);

@@ -80,6 +80,10 @@ package windows amd64 windows v0.0.0-contract >/dev/null
 package linux amd64-portable portable v0.0.0-contract >/dev/null
 package linux amd64 plainlinux v0.0.0-contract >/dev/null
 package darwin arm64 unversioned >/dev/null
+if package darwin arm64 hostile-version '0.0.0-"broken' >/dev/null 2>&1; then
+    echo "FAIL: package-release accepted a VERSION that breaks manifest JSON" >&2
+    exit 1
+fi
 
 if [ -e "$FORBIDDEN_TOOL_LOG" ]; then
     echo "package-release invoked a forbidden mutation tool:" >&2

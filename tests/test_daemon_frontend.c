@@ -12,6 +12,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
 #include "foundation/sanitized.h"
+#include "mcp/mcp.h"
 
 #include <stdint.h>
 #include <stdatomic.h>
@@ -90,6 +91,7 @@ typedef struct {
     atomic_int second_session_cancels;
     atomic_bool block_first_request;
     atomic_bool first_request_started;
+    atomic_bool tools_list_changed;
     /* Overflow mode: set by the writer AFTER stdin is fully pumped and closed,
      * releasing the deliberately-held first request. The hold is what forces
      * the input queue to actually fill (proving enqueue backpressures instead
@@ -177,6 +179,17 @@ static cbm_daemon_runtime_application_status_t frontend_eof_application_request(
             return CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
         }
         /* Released: fall through and answer normally like every later item. */
+    }
+    if (atomic_load_explicit(&context->tools_list_changed, memory_order_acquire)) {
+        static const char response[] = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+        uint8_t *copy = malloc(sizeof(response) - 1U);
+        if (!copy) {
+            return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        }
+        memcpy(copy, response, sizeof(response) - 1U);
+        *response_out = copy;
+        *response_length_out = (uint32_t)(sizeof(response) - 1U);
+        return CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED;
     }
     if (request_length == 0) {
         return CBM_DAEMON_RUNTIME_APPLICATION_OK;
@@ -304,6 +317,7 @@ static bool frontend_eof_fixture_start(frontend_eof_fixture_t *fixture, const ch
     atomic_init(&fixture->application.second_session_cancels, 0);
     atomic_init(&fixture->application.block_first_request, true);
     atomic_init(&fixture->application.first_request_started, false);
+    atomic_init(&fixture->application.tools_list_changed, false);
     atomic_init(&fixture->application.release_first_request, false);
     fixture->application.request_observed_fd = -1;
     fixture->application.session_cancel_fd = -1;
@@ -499,6 +513,86 @@ static bool frontend_eof_run_isolated(const char *tag, bool overflow) {
         (void)fprintf(stderr, "frontend EOF fixture %s: cleanup failed\n", tag);
     }
     return child_ok && cleaned;
+}
+
+static bool frontend_tools_list_changed_run(bool content_length_framed) {
+    char parent[FRONTEND_TEST_PATH_CAP];
+    int written =
+        snprintf(parent, sizeof(parent), "%s/cbm-frontend-list-changed-XXXXXX", cbm_tmpdir());
+    if (written <= 0 || written >= (int)sizeof(parent) || !cbm_mkdtemp(parent)) {
+        return false;
+    }
+    frontend_eof_fixture_t fixture;
+    bool started = frontend_eof_fixture_start(&fixture, parent);
+    if (started) {
+        atomic_store_explicit(&fixture.application.block_first_request, false,
+                              memory_order_release);
+        atomic_store_explicit(&fixture.application.tools_list_changed, true, memory_order_release);
+    }
+    FILE *input = started ? tmpfile() : NULL;
+    FILE *output = input ? tmpfile() : NULL;
+    static const char request[] = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                                  "\"params\":{\"name\":\"_hidden_tools\",\"arguments\":{}}}";
+    bool input_ready = false;
+    if (output) {
+        int request_written =
+            content_length_framed
+                ? fprintf(input, "Content-Length: %zu\r\n\r\n%s", sizeof(request) - 1U, request)
+                : fprintf(input, "%s\n", request);
+        input_ready = request_written > 0 && fflush(input) == 0 && fseek(input, 0, SEEK_SET) == 0;
+    }
+    cbm_daemon_runtime_client_t *frontend_client = input_ready ? fixture.client : NULL;
+    if (frontend_client) {
+        fixture.client = NULL; /* cbm_daemon_frontend_mcp_run consumes it. */
+    }
+    int result = frontend_client
+                     ? cbm_daemon_frontend_mcp_run(frontend_client, fixture.manager, input, output)
+                     : -1;
+    char *transcript = NULL;
+    long transcript_length = -1;
+    if (result == 0 && fseek(output, 0, SEEK_END) == 0 && (transcript_length = ftell(output)) > 0 &&
+        fseek(output, 0, SEEK_SET) == 0) {
+        transcript = malloc((size_t)transcript_length + 1U);
+        if (transcript) {
+            size_t read_length = fread(transcript, 1, (size_t)transcript_length, output);
+            transcript[read_length] = '\0';
+            if (read_length != (size_t)transcript_length) {
+                free(transcript);
+                transcript = NULL;
+            }
+        }
+    }
+    static const char response[] = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}";
+    const char *response_position = transcript ? strstr(transcript, response) : NULL;
+    const char *notification_position =
+        transcript ? strstr(transcript, CBM_MCP_TOOLS_LIST_CHANGED_JSON) : NULL;
+    bool ordered = response_position && notification_position &&
+                   response_position < notification_position &&
+                   strstr(notification_position + 1, CBM_MCP_TOOLS_LIST_CHANGED_JSON) == NULL;
+    if (content_length_framed && ordered) {
+        char response_header[64];
+        char notification_header[64];
+        int response_header_length = snprintf(response_header, sizeof(response_header),
+                                              "Content-Length: %zu\r\n\r\n", sizeof(response) - 1U);
+        int notification_header_length =
+            snprintf(notification_header, sizeof(notification_header),
+                     "Content-Length: %zu\r\n\r\n", sizeof(CBM_MCP_TOOLS_LIST_CHANGED_JSON) - 1U);
+        size_t notification_offset = (size_t)(notification_position - transcript);
+        ordered = response_header_length > 0 &&
+                  response_header_length < (int)sizeof(response_header) &&
+                  notification_header_length > 0 &&
+                  notification_header_length < (int)sizeof(notification_header) &&
+                  notification_offset >= (size_t)notification_header_length &&
+                  strstr(transcript, response_header) == transcript &&
+                  strstr(notification_position - notification_header_length, notification_header) ==
+                      notification_position - notification_header_length;
+    }
+    bool input_closed = input && fclose(input) == 0;
+    bool output_closed = output && fclose(output) == 0;
+    bool fixture_closed = frontend_eof_fixture_finish(&fixture);
+    bool cleaned = th_rmtree(parent) == 0;
+    free(transcript);
+    return result == 0 && ordered && input_closed && output_closed && fixture_closed && cleaned;
 }
 
 static void frontend_test_release_lease(cbm_version_cohort_lease_t **lease) {
@@ -1401,6 +1495,12 @@ TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success) {
     PASS();
 }
 
+TEST(daemon_frontend_writes_list_change_after_response_in_both_framings) {
+    ASSERT_TRUE(frontend_tools_list_changed_run(false));
+    ASSERT_TRUE(frontend_tools_list_changed_run(true));
+    PASS();
+}
+
 /* A daemon response can finish its IPC exchange and then block forever while
  * writing to an agent that stopped reading stdout. EOF must still bound the
  * thin frontend process. Keep the daemon in a separate child so the frontend's
@@ -1448,6 +1548,7 @@ SUITE(daemon_frontend) {
     RUN_TEST(daemon_local_participant_monitor_allows_supervisor_containment_window);
     RUN_TEST(daemon_frontend_over_capacity_input_backpressures_without_loss);
     RUN_TEST(daemon_frontend_eof_drain_timeout_cancels_and_returns_success);
+    RUN_TEST(daemon_frontend_writes_list_change_after_response_in_both_framings);
     RUN_TEST(daemon_frontend_stdout_backpressure_eof_fail_stops_and_cancels_session);
     RUN_TEST(daemon_frontend_stdout_backpressure_maintenance_stops_and_cancels_session);
 #endif

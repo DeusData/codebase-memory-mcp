@@ -3,7 +3,7 @@
  *
  * For each discovered file:
  *   1. Read source content from disk
- *   2. Call cbm_extract_file() to get defs, calls, imports
+ *   2. Call cbm_extract_file_with_options() to get defs, calls, imports
  *   3. Create Function/Class/Method/Variable/Module nodes in graph buffer
  *   4. Register callables in the function registry
  *   5. Store import maps and call sites for later passes
@@ -12,7 +12,7 @@
  */
 #include "foundation/constants.h"
 
-enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD_ESC_SPACE = 2 };
+enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_SPACE = 2 };
 /* Fixed bytes around a serialized JSON field: ,"key":"value" / ,"key":[...]
  * -> comma + 2 key quotes + colon + 2 value quotes (resp. brackets). */
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
@@ -31,6 +31,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -63,10 +64,10 @@ static char *read_file(const char *path, int *out_len, long *out_size,
         *out_size = size;
     }
 
-    if (size <= 0) {
+    if (size < 0) {
         (void)fclose(f);
         if (out_status) {
-            *out_status = CBM_READ_EMPTY;
+            *out_status = CBM_READ_OPEN_FAIL;
         }
         return NULL;
     }
@@ -113,62 +114,6 @@ static const char *itoa_log(int val) {
     return bufs[i];
 }
 
-/* Append a JSON-escaped string value to buf at position *pos.
- * Writes: ,"key":"escaped_value"
- * Handles: \, ", \n, \r, \t */
-static int def_json_escape_char(char *buf, size_t avail, char ch) {
-    char esc = 0;
-    switch (ch) {
-    case '"':
-        esc = '"';
-        break;
-    case '\\':
-        esc = '\\';
-        break;
-    case '\n':
-        esc = 'n';
-        break;
-    case '\r':
-        esc = 'r';
-        break;
-    case '\t':
-        esc = 't';
-        break;
-    default:
-        if (avail >= SKIP_ONE) {
-            /* Any other raw control byte (e.g. form feed) is invalid inside a
-             * JSON string — degrade to a space. */
-            buf[0] = ((unsigned char)ch < 0x20) ? ' ' : ch;
-        }
-        return SKIP_ONE;
-    }
-    if (avail >= PD_ESC_SPACE) {
-        buf[0] = '\\';
-        buf[SKIP_ONE] = esc;
-    }
-    return PD_ESC_SPACE;
-}
-
-/* Escaped length of a string under def_json_escape_char's rules: escaped
- * characters expand to 2 bytes, everything else stays 1. */
-static size_t def_json_escaped_len(const char *s) {
-    size_t n = 0;
-    for (; *s; s++) {
-        switch (*s) {
-        case '"':
-        case '\\':
-        case '\n':
-        case '\r':
-        case '\t':
-            n += PD_ESC_SPACE;
-            break;
-        default:
-            n += SKIP_ONE;
-        }
-    }
-    return n;
-}
-
 /* Appends are ATOMIC: a field is emitted only if the WHOLE serialized form
  * fits (with PD_ESC_SPACE bytes reserved for the closing '}' + NUL). Cutting a
  * field mid-value produced unterminated strings/arrays — malformed properties
@@ -181,7 +126,8 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     /* ,"key":"<escaped>" — comma + 2 key quotes + colon + 2 value quotes */
-    size_t required = strlen(key) + def_json_escaped_len(val) + PD_JSON_FIELD_OVERHEAD;
+    size_t escaped_len = cbm_json_escaped_len(val);
+    size_t required = strlen(key) + escaped_len + PD_JSON_FIELD_OVERHEAD;
     if (*pos + required + PD_ESC_SPACE > bufsize) {
         return; /* whole field would not fit — skip it atomically */
     }
@@ -191,9 +137,16 @@ static void append_json_string(char *buf, size_t bufsize, size_t *pos, const cha
         return;
     }
     p += (size_t)w;
-    for (const char *s = val; *s && p < bufsize - PD_ESC_MARGIN; s++) {
-        p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
+    if (bufsize - p > (size_t)INT_MAX) {
+        buf[*pos] = '\0';
+        return;
     }
+    int escaped = cbm_json_escape(buf + p, (int)(bufsize - p), val);
+    if ((size_t)escaped != escaped_len) {
+        buf[*pos] = '\0';
+        return;
+    }
+    p += (size_t)escaped;
     if (p < bufsize - SKIP_ONE) {
         buf[p++] = '"';
     }
@@ -211,7 +164,7 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
     /* ,"key":[ + per item "<escaped>" + separating commas + ] */
     size_t required = strlen(key) + PD_JSON_FIELD_OVERHEAD;
     for (int i = 0; arr[i]; i++) {
-        required += def_json_escaped_len(arr[i]) + PD_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
+        required += cbm_json_escaped_len(arr[i]) + PD_ESC_SPACE + (i > 0 ? SKIP_ONE : 0);
     }
     if (*pos + required + PD_ESC_SPACE > bufsize) {
         return; /* whole array would not fit — skip it atomically */
@@ -229,12 +182,17 @@ static void append_json_str_array(char *buf, size_t bufsize, size_t *pos, const 
         if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
-        /* Full escaping (not just quote/backslash): items like C param types
-         * sliced from multi-line declarations carry raw \n/\t bytes, which are
-         * invalid inside JSON strings. */
-        for (const char *s = arr[i]; *s && p < bufsize - PD_ESC_SPACE; s++) {
-            p += (size_t)def_json_escape_char(buf + p, bufsize - p - PD_ESC_SPACE, *s);
+        size_t escaped_len = cbm_json_escaped_len(arr[i]);
+        if (bufsize - p > (size_t)INT_MAX) {
+            buf[*pos] = '\0';
+            return;
         }
+        int escaped = cbm_json_escape(buf + p, (int)(bufsize - p), arr[i]);
+        if ((size_t)escaped != escaped_len) {
+            buf[*pos] = '\0';
+            return;
+        }
+        p += (size_t)escaped;
         if (p < bufsize - SKIP_ONE) {
             buf[p++] = '"';
         }
@@ -328,12 +286,16 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
-    /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
-     * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
-     * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
-     * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
-     * through the same predicate, so the three registries cannot diverge. */
-    if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
+    /* Register callable symbols + Interface.  Interface must be in the registry
+     * so C#/Java `class Foo : IBar` / `class Foo implements IBar` can resolve
+     * `IBar` to an INHERITS edge target during the enrichment phase.
+     * Variable/Field defs are also registered so pass_usages.c can resolve
+     * READS/WRITES accesses (rw->var_name) to a Variable/Field node QN. */
+    /* The shared predicate covers callables, every type-like container, and
+     * Variable/Field nodes used by READS/WRITES resolution. Keep this path in
+     * sync with parallel and incremental registry seeding through that single
+     * predicate rather than repeating a label list here. */
+    if (node_id > 0 && cbm_pipeline_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -342,10 +304,14 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
     free(file_qn);
+    /* DEFINES_METHOD edge: Class → Method
+     * MEMBER_OF reverse edge: Method → Class (enables PageRank to
+     * propagate member importance back to the parent class). */
     if (def->parent_class && def->label && strcmp(def->label, "Method") == 0) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
         if (parent && node_id > 0) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");
+            cbm_gbuf_insert_edge(ctx->gbuf, node_id, parent->id, "MEMBER_OF", "{}");
         }
     }
 }
@@ -439,37 +405,6 @@ int cbm_pipeline_create_env_configures_for_file(cbm_pipeline_ctx_t *ctx,
         if (src && src->id != env_id) {
             cbm_gbuf_insert_edge(ctx->gbuf, src->id, env_id, "CONFIGURES",
                                  "{\"strategy\":\"env_access\"}");
-            count++;
-        }
-    }
-    free(file_qn);
-    return count;
-}
-
-/* Create IMPORTS edges for one file's imports.  Mirrors the resolution
- * logic in pass_parallel.c register_and_link_def — keep the two in sync. */
-static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                        const char *rel, CBMHashTable *namespace_map) {
-    int count = 0;
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    if (!source_node) {
-        free(file_qn);
-        return 0;
-    }
-    for (int j = 0; j < result->imports.count; j++) {
-        const CBMImport *imp = &result->imports.items[j];
-        if (!imp->module_path) {
-            continue;
-        }
-        const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
-        if (target && target->id != source_node->id) {
-            char esc_ln[CBM_SZ_128];
-            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
-            char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
-            cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
             count++;
         }
     }
@@ -572,7 +507,8 @@ static bool objectscript_export_append_error_ranges(CBMFileResult *aggregate,
  * semantic passes. */
 CBMFileResult *cbm_pipeline_extract_objectscript_export(
     const char *source, int source_len, const char *project_name, const char *rel_path,
-    const CBMMacroTable *macro_table, const CBMReturnTypeTable *return_type_table) {
+    int64_t timeout_micros, bool extract_macros, const CBMMacroTable *macro_table,
+    const CBMReturnTypeTable *return_type_table) {
     CBMArena export_arena;
     cbm_arena_init(&export_arena);
     int class_count = 0;
@@ -603,9 +539,9 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     aggregate->cached_lang = CBM_LANG_OBJECTSCRIPT_UDL;
 
     for (int ci = 0; ci < class_count; ci++) {
-        CBMFileResult *part = cbm_extract_file_ex(
+        CBMFileResult *part = cbm_extract_file_with_options_ex(
             udl_strings[ci], (int)strlen(udl_strings[ci]), CBM_LANG_OBJECTSCRIPT_UDL, project_name,
-            rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
+            rel_path, timeout_micros, NULL, NULL, extract_macros, macro_table, return_type_table);
         if (!part) {
             continue;
         }
@@ -673,6 +609,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
     int total_calls = 0;
     int total_imports = 0;
     int errors = 0;
+    bool hard_fail = false; /* run-level failure (OOM) — unlike recorded skips */
 
     /* Sequential pass must extract all defs (which create Module/Function/...
      * nodes) BEFORE resolving imports — otherwise a workspace import in the
@@ -710,14 +647,11 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         const char *rel = files[i].rel_path;
         CBMLanguage lang = files[i].language;
 
-        /* Crash-quarantine skip (Stage 3c): the supervisor's single-threaded
-         * recovery re-run always lands on THIS sequential path (worker_count
-         * forced to 1). This first sequential pass REPORTS a crasher as a
-         * phase="crash" skip (surfacing it in skipped[]) and continues; later
-         * sequential passes (calls/usages/semantic) re-extract on a cache miss
-         * but hit the hard guard inside cbm_extract_file, so they no-op without
-         * re-crashing and without duplicating the skip. No-op unless
-         * CBM_INDEX_QUARANTINE_FILE is set. */
+        /* Crash-quarantine skip (Stage 3c): small recovery runs land on this
+         * sequential path while larger runs use pass_parallel.c. Report the
+         * crasher in skipped[] without making the successful partial index a
+         * fatal extraction error. Later cache-miss passes hit the hard guard in
+         * cbm_extract_file, so they no-op without duplicating the skip. */
         if (cbm_index_is_quarantined(rel)) {
             const char *phase = cbm_index_quarantine_phase(rel);
             if (!phase) {
@@ -726,7 +660,6 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             const char *reason =
                 (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
             cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
-            errors++;
             continue;
         }
 
@@ -751,8 +684,12 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                              itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
             } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
+                if (rst == CBM_READ_OOM) {
+                    /* Run-level resource failure — publishing after OOM would
+                     * be silently incomplete. Mirrors the parallel path. */
+                    hard_fail = true;
+                }
             }
-            /* CBM_READ_EMPTY: benign 0-byte file — nothing to index, not reported. */
             continue;
         }
 
@@ -760,14 +697,22 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
          * passes see the same calls/usages/semantic carriers as native UDL. */
         CBMFileResult *result =
             lang == CBM_LANG_OBJECTSCRIPT_EXPORT
-                ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
-                                                           rel, ctx->macro_table, NULL)
-                : cbm_extract_file_ex(
-                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
+                ? cbm_pipeline_extract_objectscript_export(
+                      source, source_len, ctx->project_name, rel,
+                      cbm_pipeline_ctx_extract_timeout(ctx),
+                      cbm_pipeline_mode_extracts_macro_nodes(ctx->mode), ctx->macro_table, NULL)
+                : cbm_extract_file_with_options_ex(
+                      source, source_len, lang, ctx->project_name, rel,
+                      cbm_pipeline_ctx_extract_timeout(ctx), NULL,
+                      NULL /* no extra defines or include paths */,
+                      cbm_pipeline_mode_extracts_macro_nodes(ctx->mode), ctx->macro_table, NULL);
         free(source);
 
-        if (!result) {
+        if (!result || result->has_error) {
+            if (result && result->error_msg) {
+                cbm_log_error("definitions.extract.error", "path", rel, "error", result->error_msg);
+            }
+            cbm_free_result(result);
             errors++;
             cbm_pipeline_add_file_error(ctx->pipeline, rel, "extract failed", "extract");
             continue;
@@ -806,7 +751,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
              * resolve to defs already in the graph, but the file's
              * own defs are now persisted before the lookup. No namespace
              * map is available without the cache (single-file scope). */
-            total_imports += create_import_edges_for_file(ctx, result, rel, NULL);
+            total_imports += cbm_pipeline_create_import_edges_for_file(ctx, result, rel, NULL);
             create_channel_edges_for_file(ctx, result, rel);
             cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
             cbm_free_result(result);
@@ -817,7 +762,7 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
      * nodes for every file are in the graph, walk the cache again to
      * create IMPORTS / channel edges. Imports resolve against the full
      * project graph. */
-    if (local_cache) {
+    if (local_cache && errors == 0) {
         /* Build a namespace/package → File-QN map so that namespace imports
          * (C# `using`, Java/Kotlin `import`, PHP `use`) resolve to the file
          * that declares the namespace. */
@@ -838,24 +783,29 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!result) {
                 continue;
             }
-            total_imports +=
-                create_import_edges_for_file(ctx, result, files[i].rel_path, namespace_map);
+            total_imports += cbm_pipeline_create_import_edges_for_file(
+                ctx, result, files[i].rel_path, namespace_map);
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
         cbm_pipeline_namespace_map_free(namespace_map);
-        if (owns_local_cache) {
-            for (int i = 0; i < file_count; i++) {
-                if (local_cache[i]) {
-                    cbm_free_result(local_cache[i]);
-                }
+    }
+    if (owns_local_cache) {
+        for (int i = 0; i < file_count; i++) {
+            if (local_cache[i]) {
+                cbm_free_result(local_cache[i]);
             }
-            free(local_cache);
         }
+        free(local_cache);
     }
 
     cbm_log_info("pass.done", "pass", "definitions", "defs", itoa_log(total_defs), "calls",
                  itoa_log(total_calls), "imports", itoa_log(total_imports), "errors",
                  itoa_log(errors));
-    return 0;
+    /* Counted errors were all RECORDED as reportable skips (oversized / read /
+     * extract → skipped[] + logfile), so the run still publishes and reports
+     * "indexed" — skip-and-report, never fail (Track B; guarded by
+     * tests/test_index_resilience.c). Only a run-level resource failure (OOM),
+     * which could publish a silently incomplete graph, fails the pass. */
+    return hard_fail ? CBM_NOT_FOUND : 0;
 }

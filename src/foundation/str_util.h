@@ -1,8 +1,7 @@
 /*
  * str_util.h — Safe string operations.
  *
- * All functions that return char* allocate via the provided arena
- * (no malloc, no free needed).
+ * Arena-taking functions return arena-owned strings (no free needed).
  */
 #ifndef CBM_STR_UTIL_H
 #define CBM_STR_UTIL_H
@@ -20,7 +19,7 @@ char *cbm_path_join_n(CBMArena *a, const char **parts, int n);
 /* Get the file extension (without dot). Returns "" if none. */
 const char *cbm_path_ext(const char *path);
 
-/* Get the base name (after last '/'). Returns path if no '/'. */
+/* Get the base name (after last '/' or '\\'). Returns path if no separator. */
 const char *cbm_path_base(const char *path);
 
 /* Get the directory part (before last '/'). Returns "." if no '/'. */
@@ -34,6 +33,18 @@ bool cbm_str_ends_with(const char *s, const char *suffix);
 
 /* Check if string contains substring. */
 bool cbm_str_contains(const char *s, const char *sub);
+
+/* Count equal dot-separated leading segments in two qualified names. */
+int cbm_str_common_dot_prefix_len(const char *a, const char *b);
+
+/* Copy src into fixed buffer dst, always NUL-terminating when dst_sz > 0.
+ * NULL src is copied as "". Returns true when the complete string fit. */
+bool cbm_str_copy(char *dst, size_t dst_sz, const char *src);
+
+/* Join qualified-name components with '.'. Uses inline_storage when it fits;
+ * otherwise returns an exact heap allocation and sets *owned for free(). */
+char *cbm_str_join_dotted_temp(const char *left, const char *right, char *inline_storage,
+                               size_t inline_capacity, bool *owned);
 
 /* Convert to lowercase (arena-allocated copy). */
 char *cbm_str_tolower(CBMArena *a, const char *s);
@@ -95,5 +106,9 @@ bool cbm_validate_project_name(const char *name);
  * Writes into buf (including NUL). Returns number of chars written (excl NUL).
  * If buf is too small, output is truncated but always NUL-terminated. */
 int cbm_json_escape(char *buf, int bufsize, const char *src);
+
+/* Exact output length of cbm_json_escape() with an unbounded destination.
+ * NULL is treated as an empty string. */
+size_t cbm_json_escaped_len(const char *src);
 
 #endif /* CBM_STR_UTIL_H */

@@ -7,6 +7,7 @@
 #include "daemon/service.h"
 #include "foundation/compat.h"
 #include "foundation/platform.h"
+#include "foundation/subprocess.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -18,7 +19,6 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include "foundation/subprocess.h"
 #include "foundation/win_utf8.h"
 #include <windows.h>
 #else
@@ -175,7 +175,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
             if (bootstrap_has_help_after(argc, argv, arg + 1)) {
                 return CBM_DAEMON_PROCESS_STATELESS;
             }
-            return CBM_DAEMON_PROCESS_LOCAL_CLI;
+            return CBM_DAEMON_PROCESS_DAEMON_CLI;
         }
         if (bootstrap_arg_is(argv[arg], "hook-augment")) {
             return CBM_DAEMON_PROCESS_HOOK_CLIENT;
@@ -185,7 +185,7 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
                                                                  : CBM_DAEMON_PROCESS_LOCAL_CLI;
         }
         /* Placed after the `cli` check on purpose: `cbm cli search "daemon
-         * start"` is opaque tool input and must stay LOCAL_CLI. */
+         * start"` is opaque tool input and must stay DAEMON_CLI. */
         if (bootstrap_arg_is(argv[arg], "daemon")) {
             return bootstrap_has_help_after(argc, argv, arg + 1) ? CBM_DAEMON_PROCESS_STATELESS
                                                                  : CBM_DAEMON_PROCESS_DAEMON_CTL;
@@ -230,6 +230,14 @@ static const char *bootstrap_runtime_parent_override(char *buffer, size_t capaci
 }
 
 cbm_daemon_ipc_endpoint_t *cbm_daemon_bootstrap_endpoint_new(const char *runtime_parent) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char test_runtime_parent[BOOTSTRAP_PATH_CAP];
+    const char *configured = cbm_safe_getenv("CBM_TEST_DAEMON_RUNTIME_PARENT", test_runtime_parent,
+                                             sizeof(test_runtime_parent), NULL);
+    if (!runtime_parent && configured && configured[0]) {
+        runtime_parent = configured;
+    }
+#endif
     char key[CBM_DAEMON_KEY_SIZE];
     if (!cbm_daemon_rendezvous_key(key)) {
         return NULL;
@@ -359,11 +367,19 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
 
 static cbm_daemon_bootstrap_probe_status_t bootstrap_probe(
     const cbm_daemon_bootstrap_config_t *config, const cbm_daemon_bootstrap_ops_t *ops,
-    cbm_daemon_runtime_client_t **client_out, cbm_daemon_runtime_connect_result_t *connect_result) {
+    uint64_t deadline_ms, cbm_daemon_runtime_client_t **client_out,
+    cbm_daemon_runtime_connect_result_t *connect_result) {
     memset(connect_result, 0, sizeof(*connect_result));
     *client_out = NULL;
-    return ops->probe(ops->context, config->endpoint, config->identity, config->connect_timeout_ms,
-                      client_out, connect_result);
+    uint64_t now_ms = cbm_now_ms();
+    if (now_ms >= deadline_ms) {
+        return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
+    }
+    uint64_t remaining_ms = deadline_ms - now_ms;
+    uint32_t timeout_ms = remaining_ms < config->connect_timeout_ms ? (uint32_t)remaining_ms
+                                                                    : config->connect_timeout_ms;
+    return ops->probe(ops->context, config->endpoint, config->identity, timeout_ms, client_out,
+                      connect_result);
 }
 
 static bool bootstrap_probe_is_finishable(cbm_daemon_bootstrap_probe_status_t probe) {
@@ -433,7 +449,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     cbm_daemon_runtime_client_t *client = NULL;
     cbm_daemon_runtime_connect_result_t connect_result;
     cbm_daemon_bootstrap_probe_status_t probe =
-        bootstrap_probe(config, ops, &client, &connect_result);
+        bootstrap_probe(config, ops, deadline, &client, &connect_result);
     if (bootstrap_probe_is_finishable(probe)) {
         cbm_daemon_bootstrap_status_t status =
             bootstrap_finish_probe(probe, client, &connect_result, ops, result_out);
@@ -461,7 +477,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
              * replacements from being launched. */
             generation_observed = true;
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
             continue;
         }
 
@@ -473,7 +489,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
         if (lock_status == 0) {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
             continue;
         }
         if (lock_status != 1 || !startup_lock) {
@@ -482,7 +498,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
 
         lock_acquired = true;
-        probe = bootstrap_probe(config, ops, &client, &connect_result);
+        probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
         if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
             probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
             generation_observed = true;
@@ -516,7 +532,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
          * bootstrap against a daemon that is trying to cleanly stand down. */
         do {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
             if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
                 probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
                 generation_observed = true;
@@ -596,6 +612,7 @@ typedef struct bootstrap_production_cohort {
 
 typedef struct {
     bootstrap_production_cohort_t *cohort;
+    bool bootstrap_activity_held;
 #ifdef _WIN32
     DWORD spawn_error;
 #elif defined(__APPLE__)
@@ -625,6 +642,19 @@ static cbm_daemon_bootstrap_probe_status_t bootstrap_production_probe(
             return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
         }
     } else if (claim != CBM_VERSION_COHORT_DAEMON_COORDINATED) {
+        return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
+    }
+
+    int transport = cbm_daemon_ipc_transport_probe(endpoint);
+    if (transport == 0) {
+        /* A claim/lifetime reservation without a published transport is a
+         * real generation transition, not a reason to enter the full client
+         * connect timeout. The outer bootstrap loop rechecks ownership after
+         * its shared retry interval, so handoff latency is O(transition time)
+         * rather than O(connect timeout), with O(1) memory. */
+        return CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
+    }
+    if (transport != 1) {
         return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
     }
 
@@ -660,15 +690,17 @@ static cbm_version_cohort_status_t bootstrap_production_cohort_acquire(
         free(cohort);
         return CBM_VERSION_COHORT_IO;
     }
-    cbm_version_cohort_status_t status = cbm_version_cohort_acquire(
-        cohort->manager, identity, deadline_ms, &cohort->lease, conflict_out);
+    bootstrap_production_context_t *production = context;
+    cbm_version_cohort_status_t status =
+        (production && production->bootstrap_activity_held ? cbm_version_cohort_acquire
+                                                           : cbm_version_cohort_bootstrap_acquire)(
+            cohort->manager, identity, deadline_ms, &cohort->lease, conflict_out);
     if (status == CBM_VERSION_COHORT_CONFLICT) {
         (void)cbm_version_cohort_log_conflict(conflict_out);
     }
     if (status == CBM_VERSION_COHORT_OK || cohort->lease) {
         *cohort_out = cohort;
-        if (context) {
-            bootstrap_production_context_t *production = context;
+        if (production) {
             production->cohort = cohort;
         }
         return status;
@@ -926,17 +958,8 @@ static bool bootstrap_production_spawn(void *context,
     return true;
 }
 #else
-static void bootstrap_child_close_fds(void) {
-    long open_max = sysconf(_SC_OPEN_MAX);
-    if (open_max < 0 || open_max > 1048576L) {
-        open_max = 65536L;
-    }
-    for (int fd = 3; fd < open_max; fd++) {
-        (void)close(fd);
-    }
-}
-
-static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec) {
+static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t *spec,
+                                        long max_fd) {
     (void)umask(077);
     sigset_t empty;
     (void)sigemptyset(&empty);
@@ -949,7 +972,7 @@ static void bootstrap_daemon_grandchild(const cbm_daemon_bootstrap_launch_spec_t
     if (null_fd > STDERR_FILENO) {
         (void)close(null_fd);
     }
-    bootstrap_child_close_fds();
+    cbm_subprocess_posix_close_nonstdio(max_fd);
     execv(spec->executable_path, (char *const *)spec->argv);
     _exit(127);
 }
@@ -960,6 +983,11 @@ static bool bootstrap_production_spawn(void *context,
     if (!spec || !spec->detached || spec->inherit_standard_handles || spec->use_shell) {
         return false;
     }
+    /* Resolve the portable fallback bound before fork. The grandchild then
+     * reuses subprocess.c's allocation-free close_range/F_CLOSEM/close loop,
+     * preserving descriptor hygiene without O(OPEN_MAX) failed syscalls on
+     * kernels that provide a range primitive. */
+    long max_fd = cbm_subprocess_posix_fd_close_limit();
     pid_t first = fork();
     if (first < 0) {
         return false;
@@ -975,7 +1003,7 @@ static bool bootstrap_production_spawn(void *context,
         if (daemon > 0) {
             _exit(0);
         }
-        bootstrap_daemon_grandchild(spec);
+        bootstrap_daemon_grandchild(spec, max_fd);
     }
 
     int status = 0;
@@ -1014,7 +1042,9 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
 
 cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute(
     const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result_out) {
-    bootstrap_production_context_t context = {0};
+    bootstrap_production_context_t context = {
+        .bootstrap_activity_held = config && config->bootstrap_activity_held,
+    };
     const cbm_daemon_bootstrap_ops_t ops = {
         .context = &context,
         .cohort_acquire = bootstrap_production_cohort_acquire,

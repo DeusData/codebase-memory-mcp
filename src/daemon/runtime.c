@@ -172,6 +172,8 @@ struct cbm_daemon_runtime_service {
     cbm_daemon_runtime_worker_t *workers;
     size_t worker_capacity;
     size_t worker_mutexes_initialized;
+    size_t worker_application_mutexes_initialized;
+    size_t worker_application_conditions_initialized;
     size_t active_connections;
     size_t committed_clients;
     /* Monotonic count of every admission since service start. The host's
@@ -200,11 +202,19 @@ struct cbm_daemon_runtime_service {
     cbm_daemon_build_identity_t identity;
     runtime_process_image_reference_t active_image;
     char *conflict_log_path;
+    char *build_fingerprint_cache_path;
+    bool build_fingerprint_cache_enabled;
+#if defined(CBM_CLI_ENABLE_TEST_API)
+    bool active_image_fingerprint_cache_hit;
+    atomic_uint_fast64_t peer_fingerprint_cache_hits;
+    atomic_uint_fast64_t application_worker_starts;
+#endif
     size_t conflict_log_cap_bytes;
     uint64_t lease_timeout_ms;
     uint32_t request_timeout_ms;
     uint32_t shutdown_timeout_ms;
     cbm_daemon_runtime_application_callbacks_t application;
+    cbm_daemon_runtime_ephemeral_stop_callbacks_t ephemeral_stop;
     /* Owned only by the convenience start() path. start_reserved() callers
      * retain their externally managed participant guard. */
     cbm_daemon_ipc_participant_guard_t *owned_participant_guard;
@@ -230,9 +240,13 @@ struct cbm_daemon_runtime_worker {
     bool application_cancelled;
     atomic_bool disconnecting;
 
+    cbm_mutex_t application_mutex;
+    cbm_thread_condition_t application_condition;
     cbm_thread_t application_thread;
     bool application_thread_started;
-    atomic_bool application_thread_done;
+    bool application_stop_requested;
+    bool application_request_pending;
+    bool application_request_active;
     cbm_daemon_runtime_application_token_t application_request_token;
     cbm_daemon_runtime_application_token_t last_application_request_token;
     uint8_t *application_request;
@@ -901,6 +915,45 @@ static bool runtime_process_image_reference_matches_process(
 #endif
 }
 
+/* Fingerprint the already-retained process image, then prove that the process
+ * still maps that exact native object. A cache hit remains exact because the
+ * native-file cache brackets identity/size/change metadata around lookup and
+ * this function revalidates the process mapping afterward. Unchanged startup
+ * is O(1) time and memory; a miss remains O(executable bytes) time with O(1)
+ * auxiliary memory. */
+static bool runtime_process_image_reference_fingerprint_cached(
+    const runtime_process_image_reference_t *reference, uint64_t process_id, const char *cache_path,
+    bool allow_cache, char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out) {
+    if (!reference || !reference->held || process_id == 0 || !out) {
+        return false;
+    }
+    out[0] = '\0';
+    if (cache_hit_out) {
+        *cache_hit_out = false;
+    }
+#ifdef _WIN32
+    uintptr_t native_file = (uintptr_t)reference->file;
+#elif defined(__APPLE__) || defined(__linux__)
+    uintptr_t native_file = (uintptr_t)reference->fd;
+#else
+    // cppcheck-suppress unreadVariable
+    uintptr_t native_file = 0;
+    (void)cache_path;
+    (void)allow_cache;
+    return false;
+#endif
+    bool ok = cbm_daemon_build_fingerprint_native_file_cached(native_file, cache_path, allow_cache,
+                                                              out, cache_hit_out) &&
+              runtime_process_image_reference_matches_process(reference, process_id);
+    if (!ok) {
+        out[0] = '\0';
+        if (cache_hit_out) {
+            *cache_hit_out = false;
+        }
+    }
+    return ok;
+}
+
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
                                                   char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]) {
     if (!out) {
@@ -915,6 +968,35 @@ bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
     }
     if (!ok) {
         out[0] = '\0';
+    }
+    return ok;
+}
+
+bool cbm_daemon_runtime_process_build_fingerprint_cached(
+    uint64_t process_id, const char *cache_path, bool allow_cache,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE], bool *cache_hit_out) {
+    if (!out) {
+        return false;
+    }
+    out[0] = '\0';
+    if (cache_hit_out) {
+        *cache_hit_out = false;
+    }
+    runtime_process_image_reference_t reference;
+    runtime_process_image_reference_init(&reference);
+    bool ok = runtime_process_image_reference_acquire(process_id, &reference, NULL);
+    if (ok) {
+        ok = runtime_process_image_reference_fingerprint_cached(&reference, process_id, cache_path,
+                                                                allow_cache, out, cache_hit_out);
+    }
+    if (!runtime_process_image_reference_release(&reference)) {
+        ok = false;
+    }
+    if (!ok) {
+        out[0] = '\0';
+        if (cache_hit_out) {
+            *cache_hit_out = false;
+        }
     }
     return ok;
 }
@@ -1040,7 +1122,7 @@ static bool runtime_worker_send_status(cbm_daemon_runtime_worker_t *worker,
 
 static bool runtime_application_status_is_callback_result(
     cbm_daemon_runtime_application_status_t status) {
-    return status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||
+    return cbm_daemon_runtime_application_status_is_success(status) ||
            status == CBM_DAEMON_RUNTIME_APPLICATION_REJECTED ||
            status == CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR ||
            status == CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED;
@@ -1052,7 +1134,7 @@ static bool runtime_worker_send_application_response(
     uint32_t response_length, bool suppress_when_disconnecting) {
     if (!worker || request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID ||
         status <= CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR ||
-        status > CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED ||
+        status > CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED ||
         response_length > CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX ||
         (response_length > 0 && !response)) {
         return false;
@@ -1099,6 +1181,7 @@ static void runtime_service_begin_stopping_locked(cbm_daemon_runtime_service_t *
     if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING) {
         service->state = CBM_DAEMON_RUNTIME_SERVICE_STOPPING;
         service->stop_deadline_ms = deadline;
+        cbm_daemon_coordinator_set_permanent(service->coordinator, false);
         /* The generation's fate is decided here by one of several owners
          * (last-client exit, coordinator stop, activation drain, external
          * stop). Sessions dropped by the losing side of a race are
@@ -1147,10 +1230,31 @@ static void runtime_service_interrupt_connections(cbm_daemon_runtime_service_t *
     runtime_service_interrupt_connections_except(service, NULL, false);
 }
 
+static void runtime_service_stop_ephemeral_if_idle_locked(cbm_daemon_runtime_service_t *service,
+                                                          size_t connections_finishing) {
+    if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING && !service->permanent &&
+        service->admitted_total > 0 && service->committed_clients == 0 &&
+        service->active_connections <= connections_finishing) {
+        cbm_daemon_runtime_ephemeral_stop_result_t prepared =
+            service->ephemeral_stop.prepare
+                ? service->ephemeral_stop.prepare(service->ephemeral_stop.context)
+                : CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY;
+        if (prepared == CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_DEFER) {
+            return;
+        }
+        const char *reason = "last_accepted_client_disconnected";
+        if (prepared != CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY) {
+            cbm_log_error("daemon.runtime_stop_guard_failed", "component", "bootstrap");
+            reason = "bootstrap_stop_guard_failed";
+        }
+        runtime_service_begin_stopping_locked(
+            service, runtime_deadline_after(service->shutdown_timeout_ms), false, reason);
+    }
+}
+
 static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
     cbm_daemon_runtime_service_t *service = worker->service;
     cbm_daemon_client_id_t client_id = CBM_DAEMON_CLIENT_ID_INVALID;
-    uint64_t shutdown_deadline = runtime_deadline_after(service->shutdown_timeout_ms);
     atomic_store_explicit(&worker->disconnecting, true, memory_order_release);
     cbm_mutex_lock(&service->mutex);
     if (worker->admitted) {
@@ -1162,16 +1266,13 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
         if (service->committed_clients > 0) {
             service->committed_clients--;
         }
-        if (service->committed_clients == 0 && !service->permanent) {
-            /* A HELLO whose application session is still opening is only a
-             * provisional coordinator client. It cannot keep the generation
-             * alive after the final fully committed frontend disconnects.
-             * A permanent generation (`daemon start`) deliberately survives
-             * this: only the stop/drain ops or a process kill end it. */
-            runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
-                                                  "last_committed_client_disconnected");
-        }
     }
+    /* An exact-build peer already accepted by the transport may still be
+     * opening its application session. Let that bounded attempt settle before
+     * retiring an ephemeral generation; otherwise parallel cold clients force
+     * serial daemon restarts. A lone final client still begins stopping here,
+     * before its close-response drain, exactly as before. */
+    runtime_service_stop_ephemeral_if_idle_locked(service, 1);
     cbm_mutex_unlock(&service->mutex);
     if (client_id == CBM_DAEMON_CLIENT_ID_INVALID) {
         return;
@@ -1270,61 +1371,90 @@ static bool runtime_worker_handle_unsubscribe(cbm_daemon_runtime_worker_t *worke
 static void *runtime_application_worker(void *opaque) {
     cbm_daemon_runtime_worker_t *worker = opaque;
     cbm_daemon_runtime_service_t *service = worker->service;
-    uint8_t *response = NULL;
-    uint32_t response_length = 0;
-    cbm_daemon_runtime_application_status_t status = service->application.request(
-        service->application.context, worker->application_session,
-        worker->application_request_token, worker->application_request,
-        worker->application_request_length, &response, &response_length);
+    bool wait_failed = false;
+    for (;;) {
+        cbm_mutex_lock(&worker->application_mutex);
+        while (!worker->application_request_pending && !worker->application_stop_requested) {
+            if (cbm_thread_condition_wait(&worker->application_condition,
+                                          &worker->application_mutex) ==
+                CBM_THREAD_CONDITION_WAIT_ERROR) {
+                wait_failed = true;
+                worker->application_stop_requested = true;
+            }
+        }
+        if (worker->application_stop_requested && !worker->application_request_pending) {
+            cbm_mutex_unlock(&worker->application_mutex);
+            break;
+        }
+        uint8_t *request = worker->application_request;
+        uint32_t request_length = worker->application_request_length;
+        cbm_daemon_runtime_application_token_t request_token = worker->application_request_token;
+        worker->application_request_pending = false;
+        worker->application_request_active = true;
+        cbm_mutex_unlock(&worker->application_mutex);
 
-    bool valid_status = runtime_application_status_is_callback_result(status);
-    bool valid_response =
-        response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
-        (response_length == 0 || response != NULL) &&
-        (status == CBM_DAEMON_RUNTIME_APPLICATION_OK || (response == NULL && response_length == 0));
-    if (!valid_status || !valid_response) {
+        uint8_t *response = NULL;
+        uint32_t response_length = 0;
+        cbm_daemon_runtime_application_status_t status = service->application.request(
+            service->application.context, worker->application_session, request_token, request,
+            request_length, &response, &response_length);
+
+        bool valid_status = runtime_application_status_is_callback_result(status);
+        bool valid_response = response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
+                              (response_length == 0 || response != NULL) &&
+                              ((status == CBM_DAEMON_RUNTIME_APPLICATION_OK) ||
+                               (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+                                response && response_length > 0) ||
+                               (!cbm_daemon_runtime_application_status_is_success(status) &&
+                                response == NULL && response_length == 0));
+        if (!valid_status || !valid_response) {
+            free(response);
+            response = NULL;
+            response_length = 0;
+            status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        }
+
+        /* Publish slot reuse before sending the response. A client may submit
+         * the next request as soon as it receives these bytes; the persistent
+         * worker queues that request without an OS-thread create/join cycle.
+         * For R requests on C application-using live connections, time remains
+         * O(R + handler work), thread lifecycle events fall from O(R) to O(C),
+         * and retained worker-stack space rises from active-request-bound
+         * O(A * S) to O(C * S), where A <= C and S is the fixed stack size. */
+        cbm_mutex_lock(&worker->application_mutex);
+        free(worker->application_request);
+        worker->application_request = NULL;
+        worker->application_request_length = 0;
+        worker->application_request_active = false;
+        worker->application_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+        cbm_mutex_unlock(&worker->application_mutex);
+
+        bool sent = runtime_worker_send_application_response(worker, request_token, status,
+                                                             response, response_length, true);
         free(response);
-        response = NULL;
-        response_length = 0;
-        status = CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+        if (!sent && !atomic_load_explicit(&worker->disconnecting, memory_order_acquire)) {
+            cbm_daemon_ipc_connection_interrupt(worker->connection);
+        }
     }
-
-    /* Completion must be one atomic transition from the client's point of
-     * view: publish the done flag BEFORE the response bytes leave, so by the
-     * time any client can react to the response, admission already observes
-     * this slot as reusable. With the store after the send, a client that
-     * pipelines its next request the moment it sees a response raced this
-     * thread's final instructions and was rejected BUSY — on loaded Windows
-     * hosts roughly half of all back-to-back requests on one connection,
-     * surfacing as the wandering Phase 5 session drops. The admission side
-     * joins this thread after observing the flag, which safely absorbs the
-     * tail of the send. */
-    atomic_store_explicit(&worker->application_thread_done, true, memory_order_release);
-    bool sent = runtime_worker_send_application_response(worker, worker->application_request_token,
-                                                         status, response, response_length, true);
-    free(response);
-    if (!sent && !atomic_load_explicit(&worker->disconnecting, memory_order_acquire)) {
+    if (wait_failed && !atomic_load_explicit(&worker->disconnecting, memory_order_acquire)) {
         cbm_daemon_ipc_connection_interrupt(worker->connection);
     }
     return NULL;
 }
 
-static bool runtime_worker_reap_application(cbm_daemon_runtime_worker_t *worker, bool wait) {
+static bool runtime_worker_stop_application(cbm_daemon_runtime_worker_t *worker) {
     if (!worker->application_thread_started) {
         return true;
     }
-    if (!wait && !atomic_load_explicit(&worker->application_thread_done, memory_order_acquire)) {
-        return false;
-    }
+    cbm_mutex_lock(&worker->application_mutex);
+    worker->application_stop_requested = true;
+    cbm_thread_condition_broadcast(&worker->application_condition);
+    cbm_mutex_unlock(&worker->application_mutex);
     if (cbm_thread_join(&worker->application_thread) != 0) {
         return false;
     }
     worker->application_thread_started = false;
-    free(worker->application_request);
-    worker->application_request = NULL;
-    worker->application_request_length = 0;
-    worker->application_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
-    atomic_store_explicit(&worker->application_thread_done, false, memory_order_release);
+    worker->application_stop_requested = false;
     return true;
 }
 
@@ -1350,8 +1480,9 @@ static bool runtime_worker_handle_application(cbm_daemon_runtime_worker_t *worke
         return runtime_worker_send_application_response(
             worker, request_token, CBM_DAEMON_RUNTIME_APPLICATION_UNAVAILABLE, NULL, 0, false);
     }
-    (void)runtime_worker_reap_application(worker, false);
-    if (worker->application_thread_started) {
+    cbm_mutex_lock(&worker->application_mutex);
+    if (worker->application_request_pending || worker->application_request_active) {
+        cbm_mutex_unlock(&worker->application_mutex);
         return runtime_worker_send_application_response(
             worker, request_token, CBM_DAEMON_RUNTIME_APPLICATION_BUSY, NULL, 0, false);
     }
@@ -1360,6 +1491,7 @@ static bool runtime_worker_handle_application(cbm_daemon_runtime_worker_t *worke
     if (request_length > 0) {
         request_copy = malloc(request_length);
         if (!request_copy) {
+            cbm_mutex_unlock(&worker->application_mutex);
             return runtime_worker_send_application_response(
                 worker, request_token, CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR, NULL, 0,
                 false);
@@ -1369,16 +1501,28 @@ static bool runtime_worker_handle_application(cbm_daemon_runtime_worker_t *worke
     worker->application_request_token = request_token;
     worker->application_request = request_copy;
     worker->application_request_length = request_length;
-    atomic_store_explicit(&worker->application_thread_done, false, memory_order_release);
-    if (cbm_thread_create(&worker->application_thread, RUNTIME_WORKER_STACK_SIZE,
+    worker->application_request_pending = true;
+    if (!worker->application_thread_started &&
+        cbm_thread_create(&worker->application_thread, RUNTIME_WORKER_STACK_SIZE,
                           runtime_application_worker, worker) != 0) {
         free(worker->application_request);
         worker->application_request = NULL;
         worker->application_request_length = 0;
+        worker->application_request_pending = false;
+        worker->application_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
+        cbm_mutex_unlock(&worker->application_mutex);
         return runtime_worker_send_application_response(
             worker, request_token, CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR, NULL, 0, false);
     }
-    worker->application_thread_started = true;
+    if (!worker->application_thread_started) {
+#if defined(CBM_CLI_ENABLE_TEST_API)
+        (void)atomic_fetch_add_explicit(&worker->service->application_worker_starts, 1,
+                                        memory_order_relaxed);
+#endif
+        worker->application_thread_started = true;
+    }
+    cbm_thread_condition_broadcast(&worker->application_condition);
+    cbm_mutex_unlock(&worker->application_mutex);
     return true;
 }
 
@@ -1391,8 +1535,12 @@ static bool runtime_worker_handle_application_cancel(cbm_daemon_runtime_worker_t
     if (request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID) {
         return false;
     }
-    if (worker->application_thread_started && worker->application_request_token == request_token &&
-        !atomic_load_explicit(&worker->application_thread_done, memory_order_acquire)) {
+    cbm_mutex_lock(&worker->application_mutex);
+    bool active = worker->application_thread_started &&
+                  (worker->application_request_pending || worker->application_request_active) &&
+                  worker->application_request_token == request_token;
+    cbm_mutex_unlock(&worker->application_mutex);
+    if (active) {
         worker->service->application.request_cancel(worker->service->application.context,
                                                     worker->application_session, request_token);
     }
@@ -1432,7 +1580,7 @@ static bool runtime_worker_handle_disconnect(cbm_daemon_runtime_worker_t *worker
 static void runtime_worker_finish(cbm_daemon_runtime_worker_t *worker) {
     cbm_daemon_runtime_service_t *service = worker->service;
     runtime_worker_disconnect(worker);
-    if (!runtime_worker_reap_application(worker, true)) {
+    if (!runtime_worker_stop_application(worker)) {
         /* Fail closed on an impossible/invalid join rather than closing the
          * session or freeing storage a callback could still reference. The
          * service intentionally remains non-terminal for diagnosis. */
@@ -1458,6 +1606,9 @@ static void runtime_worker_finish(cbm_daemon_runtime_worker_t *worker) {
     if (service->active_connections > 0) {
         service->active_connections--;
     }
+    /* Completes the deferred branch above when every already-accepted peer
+     * failed or closed without becoming the next committed client. */
+    runtime_service_stop_ephemeral_if_idle_locked(service, 0);
     atomic_store_explicit(&worker->done, true, memory_order_release);
     cbm_mutex_unlock(&service->mutex);
 }
@@ -1780,8 +1931,20 @@ static void *runtime_connection_worker(void *opaque) {
     bool peer_image_fingerprinted = false;
     if (!peer_image_verified) {
         char peer_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+        bool peer_cache_hit = false;
         peer_image_fingerprinted =
-            cbm_daemon_runtime_process_build_fingerprint(worker->peer_process_id, peer_fingerprint);
+            service->build_fingerprint_cache_enabled
+                ? cbm_daemon_runtime_process_build_fingerprint_cached(
+                      worker->peer_process_id, service->build_fingerprint_cache_path, true,
+                      peer_fingerprint, &peer_cache_hit)
+                : cbm_daemon_runtime_process_build_fingerprint(worker->peer_process_id,
+                                                               peer_fingerprint);
+        if (peer_cache_hit) {
+#if defined(CBM_CLI_ENABLE_TEST_API)
+            atomic_fetch_add_explicit(&service->peer_fingerprint_cache_hits, 1,
+                                      memory_order_relaxed);
+#endif
+        }
         peer_image_verified = peer_image_fingerprinted &&
                               strcmp(peer_fingerprint, requested_build) == 0 &&
                               strcmp(peer_fingerprint, service->identity.build_fingerprint) == 0;
@@ -1957,13 +2120,15 @@ static void runtime_worker_reset_after_join(cbm_daemon_runtime_worker_t *worker)
     worker->application_session_opened = false;
     worker->application_cancelled = false;
     worker->application_thread_started = false;
+    worker->application_stop_requested = false;
+    worker->application_request_pending = false;
+    worker->application_request_active = false;
     worker->application_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     worker->last_application_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     worker->application_request = NULL;
     worker->application_request_length = 0;
     atomic_store_explicit(&worker->done, false, memory_order_release);
     atomic_store_explicit(&worker->disconnecting, false, memory_order_release);
-    atomic_store_explicit(&worker->application_thread_done, false, memory_order_release);
 }
 
 static void runtime_reap_completed_workers(cbm_daemon_runtime_service_t *service) {
@@ -2034,6 +2199,9 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
         worker->application_session_opened = false;
         worker->application_cancelled = false;
         worker->application_thread_started = false;
+        worker->application_stop_requested = false;
+        worker->application_request_pending = false;
+        worker->application_request_active = false;
         free(worker->application_request);
         worker->application_request = NULL;
         worker->application_request_length = 0;
@@ -2041,7 +2209,6 @@ static void runtime_accept_connection(cbm_daemon_runtime_service_t *service,
         worker->in_use = true;
         atomic_store_explicit(&worker->done, false, memory_order_release);
         atomic_store_explicit(&worker->disconnecting, false, memory_order_release);
-        atomic_store_explicit(&worker->application_thread_done, false, memory_order_release);
         service->active_connections++;
         int created = cbm_thread_create(&worker->thread, RUNTIME_WORKER_STACK_SIZE,
                                         runtime_connection_worker, worker);
@@ -2092,6 +2259,7 @@ static void *runtime_accept_loop(void *opaque) {
     for (;;) {
         runtime_reap_completed_workers(service);
         cbm_mutex_lock(&service->mutex);
+        runtime_service_stop_ephemeral_if_idle_locked(service, 0);
         cbm_daemon_runtime_service_state_t state = service->state;
         cbm_mutex_unlock(&service->mutex);
         if (state == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
@@ -2143,6 +2311,11 @@ static bool runtime_application_callbacks_valid(
     bool all = application->session_open && application->request && application->request_cancel &&
                application->session_cancel && application->session_close;
     return !any || all;
+}
+
+static bool runtime_ephemeral_stop_callbacks_valid(
+    const cbm_daemon_runtime_ephemeral_stop_callbacks_t *ephemeral_stop) {
+    return ephemeral_stop && (ephemeral_stop->prepare || !ephemeral_stop->context);
 }
 
 static bool runtime_participant_guard_release_complete(
@@ -2199,8 +2372,15 @@ static void runtime_service_destroy_unstarted(cbm_daemon_runtime_service_t *serv
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
     free(service->conflict_log_path);
+    free(service->build_fingerprint_cache_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
+    }
+    for (size_t i = 0; i < service->worker_application_conditions_initialized; i++) {
+        cbm_thread_condition_destroy(&service->workers[i].application_condition);
+    }
+    for (size_t i = 0; i < service->worker_application_mutexes_initialized; i++) {
+        cbm_mutex_destroy(&service->workers[i].application_mutex);
     }
     free(service->workers);
     cbm_mutex_destroy(&service->mutex);
@@ -2211,17 +2391,21 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     const cbm_daemon_runtime_service_config_t *config,
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io) {
     uint8_t validation[CBM_DAEMON_RENDEZVOUS_REQUEST_SIZE];
-    char active_process_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char active_process_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool active_image_fingerprint_cache_hit = false;
     runtime_process_image_reference_t active_image;
     runtime_process_image_reference_init(&active_image);
     if (!reservation_io || !*reservation_io || !config || !config->endpoint ||
         !config->conflict_log_path || config->conflict_log_cap_bytes == 0 ||
+        (config->build_fingerprint_cache_enabled &&
+         (!config->build_fingerprint_cache_path || !config->build_fingerprint_cache_path[0])) ||
         config->max_clients == 0 || config->max_clients > RUNTIME_MAX_CLIENTS_HARD ||
         config->lease_timeout_ms == 0 || config->request_timeout_ms == 0 ||
         config->request_timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER ||
         config->shutdown_timeout_ms == 0 ||
         config->shutdown_timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER ||
         !runtime_application_callbacks_valid(&config->application) ||
+        !runtime_ephemeral_stop_callbacks_valid(&config->ephemeral_stop) ||
         !cbm_daemon_runtime_hello_request_encode(validation, &config->identity)) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "config_validation");
         return NULL;
@@ -2229,9 +2413,13 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     /* WHY: cppcheck evaluates the unsupported-platform fail-closed branch
      * because its invocation defines no host OS macro. Production compilers
      * select one of the Windows/macOS/Linux native-image implementations. */
+    uint64_t active_process_id = runtime_current_process_id();
     // cppcheck-suppress knownConditionTrueFalse
-    if (!runtime_process_image_reference_acquire(runtime_current_process_id(), &active_image,
-                                                 active_process_fingerprint) ||
+    if (!runtime_process_image_reference_acquire(active_process_id, &active_image, NULL) ||
+        !runtime_process_image_reference_fingerprint_cached(
+            &active_image, active_process_id, config->build_fingerprint_cache_path,
+            config->build_fingerprint_cache_enabled, active_process_fingerprint,
+            &active_image_fingerprint_cache_hit) ||
         strcmp(active_process_fingerprint, config->identity.build_fingerprint) != 0) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "active_image_identity");
         (void)runtime_process_image_reference_release(&active_image);
@@ -2248,14 +2436,29 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     runtime_process_image_reference_init(&active_image);
     cbm_mutex_init(&service->mutex);
     atomic_init(&service->accept_thread_done, false);
+#if defined(CBM_CLI_ENABLE_TEST_API)
+    service->active_image_fingerprint_cache_hit = active_image_fingerprint_cache_hit;
+    atomic_init(&service->peer_fingerprint_cache_hits, 0);
+    atomic_init(&service->application_worker_starts, 0);
+#else
+    (void)active_image_fingerprint_cache_hit;
+#endif
     service->worker_capacity = config->max_clients;
     service->workers = calloc(service->worker_capacity, sizeof(*service->workers));
     service->coordinator = cbm_daemon_coordinator_new(config->lease_timeout_ms);
-    if (service->coordinator && config->permanent) {
+    if (service->coordinator) {
+        /* The runtime sees accepted pre-HELLO connections that the coordinator
+         * cannot. Keep its narrower client census from ending the generation;
+         * runtime_service_begin_stopping_locked releases this hold. */
         cbm_daemon_coordinator_set_permanent(service->coordinator, true);
     }
     service->conflict_log_path =
         runtime_string_copy_bounded(config->conflict_log_path, RUNTIME_PATH_CAP);
+    if (config->build_fingerprint_cache_enabled) {
+        service->build_fingerprint_cache_path =
+            runtime_string_copy_bounded(config->build_fingerprint_cache_path, RUNTIME_PATH_CAP);
+    }
+    service->build_fingerprint_cache_enabled = config->build_fingerprint_cache_enabled;
     size_t version_length = 0;
     size_t build_length = 0;
     bool copied_identity =
@@ -2277,10 +2480,12 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->request_timeout_ms = config->request_timeout_ms;
     service->shutdown_timeout_ms = config->shutdown_timeout_ms;
     service->application = config->application;
+    service->ephemeral_stop = config->ephemeral_stop;
     service->permanent = config->permanent;
     service->state = CBM_DAEMON_RUNTIME_SERVICE_STARTING;
 
     if (!service->workers || !service->coordinator || !service->conflict_log_path ||
+        (service->build_fingerprint_cache_enabled && !service->build_fingerprint_cache_path) ||
         !copied_identity) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "service_initialization");
         runtime_service_destroy_unstarted(service);
@@ -2290,9 +2495,17 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
         service->workers[i].service = service;
         cbm_mutex_init(&service->workers[i].send_mutex);
         service->worker_mutexes_initialized++;
+        cbm_mutex_init(&service->workers[i].application_mutex);
+        service->worker_application_mutexes_initialized++;
+        if (cbm_thread_condition_init(&service->workers[i].application_condition) != 0) {
+            cbm_log_error("daemon.runtime.start_failed", "stage",
+                          "application_condition_initialization");
+            runtime_service_destroy_unstarted(service);
+            return NULL;
+        }
+        service->worker_application_conditions_initialized++;
         atomic_init(&service->workers[i].done, false);
         atomic_init(&service->workers[i].disconnecting, false);
-        atomic_init(&service->workers[i].application_thread_done, false);
     }
     service->listener = cbm_daemon_ipc_listen_reserved(config->endpoint, reservation_io);
     if (!service->listener) {
@@ -2474,6 +2687,26 @@ bool cbm_daemon_runtime_service_job_reaped(cbm_daemon_runtime_service_t *service
     return service && cbm_daemon_job_reaped(service->coordinator, project_key, cbm_now_ms());
 }
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+bool cbm_daemon_runtime_service_active_image_cache_hit_for_testing(
+    const cbm_daemon_runtime_service_t *service) {
+    return service && service->active_image_fingerprint_cache_hit;
+}
+
+uint64_t cbm_daemon_runtime_service_peer_cache_hits_for_testing(
+    const cbm_daemon_runtime_service_t *service) {
+    return service
+               ? atomic_load_explicit(&service->peer_fingerprint_cache_hits, memory_order_relaxed)
+               : 0;
+}
+
+uint64_t cbm_daemon_runtime_service_application_worker_starts_for_testing(
+    const cbm_daemon_runtime_service_t *service) {
+    return service ? atomic_load_explicit(&service->application_worker_starts, memory_order_relaxed)
+                   : 0;
+}
+#endif
+
 bool cbm_daemon_runtime_service_stop(cbm_daemon_runtime_service_t *service, uint32_t timeout_ms) {
     if (!service) {
         return false;
@@ -2518,8 +2751,15 @@ bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service) {
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
     free(service->conflict_log_path);
+    free(service->build_fingerprint_cache_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
+    }
+    for (size_t i = 0; i < service->worker_application_conditions_initialized; i++) {
+        cbm_thread_condition_destroy(&service->workers[i].application_condition);
+    }
+    for (size_t i = 0; i < service->worker_application_mutexes_initialized; i++) {
+        cbm_mutex_destroy(&service->workers[i].application_mutex);
     }
     free(service->workers);
     cbm_mutex_destroy(&service->mutex);
@@ -3019,12 +3259,15 @@ cbm_daemon_runtime_application_status_t cbm_daemon_runtime_client_application_re
         cbm_daemon_runtime_application_token_t response_token = runtime_get_u64(payload);
         status = (cbm_daemon_runtime_application_status_t)runtime_get_u32(payload + 8);
         response_length = runtime_get_u32(payload + 12);
-        protocol_valid = response_token == request_token &&
-                         status >= CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-                         status <= CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED &&
-                         response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
-                         frame.length == APPLICATION_RESPONSE_PREFIX_SIZE + response_length &&
-                         (status == CBM_DAEMON_RUNTIME_APPLICATION_OK || response_length == 0);
+        protocol_valid =
+            response_token == request_token && status >= CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+            status <= CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+            response_length <= CBM_DAEMON_RUNTIME_APPLICATION_PAYLOAD_MAX &&
+            frame.length == APPLICATION_RESPONSE_PREFIX_SIZE + response_length &&
+            (status == CBM_DAEMON_RUNTIME_APPLICATION_OK ||
+             (status == CBM_DAEMON_RUNTIME_APPLICATION_OK_TOOLS_LIST_CHANGED &&
+              response_length > 0) ||
+             (!cbm_daemon_runtime_application_status_is_success(status) && response_length == 0));
     }
 
     uint8_t *response_copy = NULL;

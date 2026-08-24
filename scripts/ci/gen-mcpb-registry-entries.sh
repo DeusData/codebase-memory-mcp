@@ -70,6 +70,22 @@ if not entries:
     print(f"FAIL: no .mcpb lines in {checksums}", file=sys.stderr)
     raise SystemExit(1)
 
+expected_names = {
+    "codebase-memory-mcp-darwin-amd64.mcpb",
+    "codebase-memory-mcp-darwin-arm64.mcpb",
+    "codebase-memory-mcp-linux-amd64-portable.mcpb",
+    "codebase-memory-mcp-linux-arm64-portable.mcpb",
+    "codebase-memory-mcp-windows-amd64.mcpb",
+    "codebase-memory-mcp-windows-arm64.mcpb",
+}
+actual_names = [name for name, _ in entries]
+if len(actual_names) != len(set(actual_names)) or set(actual_names) != expected_names:
+    missing = sorted(expected_names - set(actual_names))
+    unexpected = sorted(set(actual_names) - expected_names)
+    print(f"FAIL: MCPB checksum set is not canonical; missing={missing}, "
+          f"unexpected={unexpected}", file=sys.stderr)
+    raise SystemExit(1)
+
 packages = [package for package in manifest.get("packages", [])
             if package.get("registryType") != "mcpb"]
 for name, sha in sorted(entries):

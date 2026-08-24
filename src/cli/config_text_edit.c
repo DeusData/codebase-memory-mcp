@@ -582,7 +582,7 @@ static int text_replace_file(const char *temp_path, const char *path, int destin
         }
         return text_sync_parent_directory(path);
     }
-    if (rename(temp_path, path) != 0) {
+    if (cbm_replace_file(temp_path, path) != 0) {
         return TEXT_ERROR;
     }
     return text_sync_parent_directory(path);
@@ -783,7 +783,7 @@ static int text_delete_file(const char *path, const char *old_data, size_t old_l
     free(wide_path);
     return removed ? TEXT_OK : TEXT_ERROR;
 #else
-    if (unlink(path) != 0) {
+    if (cbm_unlink(path) != 0) {
         return TEXT_ERROR;
     }
     return text_sync_parent_directory(path);

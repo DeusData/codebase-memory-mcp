@@ -14,7 +14,6 @@
 typedef enum {
     CBM_READ_OK = 0,    /* file read successfully */
     CBM_READ_OPEN_FAIL, /* could not open (missing / permission) */
-    CBM_READ_EMPTY,     /* zero/negative size — benign, nothing to index */
     CBM_READ_OVERSIZED, /* size exceeds cbm_max_file_bytes() */
     CBM_READ_OOM,       /* buffer allocation failed */
 } cbm_read_status_t;
@@ -29,13 +28,6 @@ typedef enum {
  * change the cap via setenv without a process restart or a stale memoized copy
  * leaking across runs. */
 long cbm_max_file_bytes(void);
-
-/* Maximum variable-length path depth for the Cypher engine (the `*min..max`
- * hop ceiling). BOTH the explicit (`*1..N`) and unbounded (`*`, `*..m`) forms
- * are clamped to this, so `[:CALLS*1..1000000]` degrades to a WARN-and-cap
- * rather than an unbounded (cyclic-graph DoS) traversal. Override with
- * CBM_CYPHER_MAX_DEPTH (a positive integer). Default 10. */
-int cbm_cypher_max_depth(void);
 
 /* Maximum traversal depth for client-driven MCP graph tools (trace_call_path,
  * detect_changes): the client `depth` argument is WARN-clamped to this so an

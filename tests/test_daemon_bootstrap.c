@@ -37,6 +37,7 @@ typedef struct {
     atomic_int lock_held;
     atomic_int spawn_count;
     atomic_int probe_count;
+    atomic_uint probe_timeout_ms;
     atomic_int lock_attempt_count;
     atomic_int handoff_count;
     atomic_int diagnostic_count;
@@ -115,8 +116,8 @@ static cbm_daemon_bootstrap_probe_status_t bootstrap_fake_probe(
     cbm_daemon_runtime_client_t **client_out, cbm_daemon_runtime_connect_result_t *result_out) {
     (void)endpoint;
     (void)identity;
-    (void)timeout_ms;
     bootstrap_fake_ops_t *fake = opaque;
+    atomic_store(&fake->probe_timeout_ms, timeout_ms);
     atomic_fetch_add(&fake->probe_count, 1);
     memset(result_out, 0, sizeof(*result_out));
     *client_out = NULL;
@@ -312,12 +313,12 @@ TEST(daemon_bootstrap_classifies_config_as_coordinated_local_cli) {
     PASS();
 }
 
-TEST(daemon_bootstrap_cli_help_is_stateless_but_tool_calls_are_local) {
+TEST(daemon_bootstrap_cli_help_is_stateless_but_tool_calls_are_daemon_backed) {
     char *tool_help[] = {"codebase-memory-mcp", "cli", "search_graph", "--help", NULL};
     char *tool_call[] = {"codebase-memory-mcp", "cli", "search_graph", "{}", NULL};
     ASSERT_EQ(classify(4, tool_help), CBM_DAEMON_PROCESS_STATELESS);
-    ASSERT_EQ(classify(4, tool_call), CBM_DAEMON_PROCESS_LOCAL_CLI);
-    ASSERT_FALSE(cbm_daemon_process_role_requires_client(CBM_DAEMON_PROCESS_LOCAL_CLI));
+    ASSERT_EQ(classify(4, tool_call), CBM_DAEMON_PROCESS_DAEMON_CLI);
+    ASSERT_FALSE(cbm_daemon_process_role_requires_client(CBM_DAEMON_PROCESS_DAEMON_CLI));
     PASS();
 }
 
@@ -326,8 +327,8 @@ TEST(daemon_bootstrap_cli_arguments_cannot_reclassify_the_process) {
         "codebase-memory-mcp", "cli", "search_code", "--query", "install", NULL};
     char *version_value[] = {"codebase-memory-mcp", "cli", "search_code", "--query",
                              "--version",           NULL};
-    ASSERT_EQ(classify(5, install_value), CBM_DAEMON_PROCESS_LOCAL_CLI);
-    ASSERT_EQ(classify(5, version_value), CBM_DAEMON_PROCESS_LOCAL_CLI);
+    ASSERT_EQ(classify(5, install_value), CBM_DAEMON_PROCESS_DAEMON_CLI);
+    ASSERT_EQ(classify(5, version_value), CBM_DAEMON_PROCESS_DAEMON_CLI);
     PASS();
 }
 
@@ -491,7 +492,7 @@ TEST(daemon_bootstrap_daemon_ctl_token_routes_after_cli) {
     ASSERT_EQ(classify(3, stop), CBM_DAEMON_PROCESS_DAEMON_CTL);
     ASSERT_EQ(classify(3, status), CBM_DAEMON_PROCESS_DAEMON_CTL);
     ASSERT_EQ(classify(3, help), CBM_DAEMON_PROCESS_STATELESS);
-    ASSERT_EQ(classify(5, opaque), CBM_DAEMON_PROCESS_LOCAL_CLI);
+    ASSERT_EQ(classify(5, opaque), CBM_DAEMON_PROCESS_DAEMON_CLI);
     ASSERT_FALSE(cbm_daemon_process_role_requires_client(CBM_DAEMON_PROCESS_DAEMON_CTL));
     PASS();
 }
@@ -580,6 +581,32 @@ TEST(daemon_bootstrap_existing_exact_daemon_connects_without_spawn) {
     ASSERT_NOT_NULL(result.client);
     ASSERT_FALSE(result.daemon_spawned);
     ASSERT_EQ(atomic_load(&fake.spawn_count), 0);
+    bootstrap_endpoint_fixture_finish(&fixture);
+    PASS();
+}
+
+TEST(daemon_bootstrap_probe_timeout_is_bounded_by_remaining_startup_budget) {
+    bootstrap_endpoint_fixture_t fixture;
+    ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "probe-budget"));
+    bootstrap_fake_ops_t fake = {0};
+    fake.forced_probe = CBM_DAEMON_BOOTSTRAP_PROBE_CONFLICT;
+    cbm_daemon_bootstrap_ops_t ops = bootstrap_fake_callbacks(&fake);
+    cbm_daemon_build_identity_t identity = bootstrap_identity("2.4.0", BOOTSTRAP_BUILD_B);
+    cbm_daemon_bootstrap_config_t config = {
+        .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+        .endpoint = fixture.endpoint,
+        .identity = &identity,
+        .executable_path = "/tmp/cbm",
+        .connect_timeout_ms = 5000,
+        .startup_timeout_ms = BOOTSTRAP_TEST_SHORT_TIMEOUT_MS,
+    };
+    cbm_daemon_bootstrap_result_t result;
+
+    ASSERT_EQ(cbm_daemon_bootstrap_execute_with_ops(&config, &ops, &result),
+              CBM_DAEMON_BOOTSTRAP_CONFLICT);
+    unsigned int timeout_ms = atomic_load(&fake.probe_timeout_ms);
+    ASSERT(timeout_ms > 0U);
+    ASSERT(timeout_ms <= BOOTSTRAP_TEST_SHORT_TIMEOUT_MS);
     bootstrap_endpoint_fixture_finish(&fixture);
     PASS();
 }
@@ -852,7 +879,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_classifies_default_and_ui_as_mcp_clients);
     RUN_TEST(daemon_bootstrap_classifies_stateless_commands_without_client);
     RUN_TEST(daemon_bootstrap_classifies_config_as_coordinated_local_cli);
-    RUN_TEST(daemon_bootstrap_cli_help_is_stateless_but_tool_calls_are_local);
+    RUN_TEST(daemon_bootstrap_cli_help_is_stateless_but_tool_calls_are_daemon_backed);
     RUN_TEST(daemon_bootstrap_cli_arguments_cannot_reclassify_the_process);
     RUN_TEST(daemon_bootstrap_internal_roles_never_take_client_leases);
     RUN_TEST(daemon_bootstrap_rejects_ambiguous_internal_daemon_argv);
@@ -865,6 +892,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_stateless_roles_bypass_every_daemon_operation);
     RUN_TEST(daemon_bootstrap_cohort_conflict_is_visible_before_probe_or_spawn);
     RUN_TEST(daemon_bootstrap_existing_exact_daemon_connects_without_spawn);
+    RUN_TEST(daemon_bootstrap_probe_timeout_is_bounded_by_remaining_startup_budget);
     RUN_TEST(daemon_bootstrap_conflict_is_visible_and_never_spawns);
     RUN_TEST(daemon_bootstrap_terminal_generation_that_never_exits_is_not_replaced);
     RUN_TEST(daemon_bootstrap_terminal_then_absent_spawns_replacement);

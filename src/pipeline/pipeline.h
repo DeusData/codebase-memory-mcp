@@ -16,8 +16,8 @@
 #define CBM_PIPELINE_H
 
 #include <stdbool.h>
-#include <stdint.h>
 #include <stdatomic.h>
+#include <stdint.h>
 
 #include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
 #include "foundation/constants.h" /* CBM_SZ_512 */
@@ -25,6 +25,7 @@
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
 typedef struct cbm_gbuf cbm_gbuf_t;
+typedef struct cbm_config cbm_config_t;
 
 /* ── Opaque handle ──────────────────────────────────────────────── */
 
@@ -41,8 +42,31 @@ typedef enum {
     CBM_MODE_FULL = 0,     /* Full: everything including SIMILAR_TO + SEMANTICALLY_RELATED */
     CBM_MODE_MODERATE = 1, /* Moderate: fast discovery + SIMILAR_TO + SEMANTICALLY_RELATED */
     CBM_MODE_FAST = 2,     /* Fast: skip non-essential files, no similarity/semantic edges */
+    CBM_MODE_DEP = 3, /* Dep: like FAST but keeps vendor/, .d.ts, third_party/ (fork depindex) */
 } cbm_index_mode_t;
 #endif
+
+typedef enum {
+    CBM_PIPELINE_PUBLISH_NONE = 0,
+    CBM_PIPELINE_PUBLISH_FULL,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_NOOP,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_EXACT,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_OVERLAY,
+    CBM_PIPELINE_PUBLISH_INCREMENTAL_CONTAINMENT,
+} cbm_pipeline_publish_kind_t;
+
+typedef struct {
+    int changed_paths;   /* changed/deleted paths before frontier expansion */
+    int affected_paths;  /* exact frontier paths known before publish/fallback */
+    int published_paths; /* paths published by exact delta; 0 for exact no-op, -1 if not exact */
+    int affected_paths_limit; /* configured exact frontier cap when relevant; -1 if not reported */
+    bool affected_paths_truncated; /* true when affected_paths reached the cap before full counting
+                                    */
+} cbm_pipeline_exact_delta_stats_t;
+
+/* Generation used by compatibility full/containment publishes that replace the
+ * graph as one committed view. Exact deltas reserve higher generations. */
+#define CBM_PIPELINE_FILE_DELTA_GENERATION 0
 
 /* ── Pipeline lifecycle ─────────────────────────────────────────── */
 
@@ -55,6 +79,12 @@ void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
+
+/* Release all process-lifetime global state held by the pipeline subsystem
+ * (e.g., lazily-compiled regex patterns used by pass_envscan).
+ * Call once at server shutdown, after all pipelines have been freed and all
+ * background indexing threads have been joined.  Safe to call multiple times. */
+void cbm_pipeline_global_cleanup(void);
 
 /* Run the full indexing pipeline. Discovers files, extracts, resolves, and
  * dumps to SQLite. Returns 0 on success and non-zero on failure.
@@ -71,6 +101,96 @@ int cbm_pipeline_run(cbm_pipeline_t *p);
 /* Request cancellation of a running pipeline (thread-safe). */
 void cbm_pipeline_cancel(cbm_pipeline_t *p);
 
+/* Set a store to flush into instead of dumping to a new SQLite file.
+ * When set, pipeline uses cbm_gbuf_flush_to_store() which upserts by project name.
+ * Must be called before cbm_pipeline_run(). Pipeline does NOT own the store. */
+void cbm_pipeline_set_flush_store(cbm_pipeline_t *p, cbm_store_t *store);
+
+/* Config keys consumed by cbm_pipeline_apply_config(). Boolean capabilities
+ * default enabled; threshold values <=0 retain their compiled-in defaults. */
+#define CBM_CONFIG_SIMILARITY_THRESHOLD "similarity_threshold"
+#define CBM_CONFIG_SIMILARITY_ENABLED "similarity_enabled"
+#define CBM_CONFIG_HTTPLINK_MIN_CONFIDENCE "httplink_min_confidence"
+#define CBM_CONFIG_HTTPLINKS_ENABLED "httplinks_enabled"
+#define CBM_CONFIG_SEMANTIC_THRESHOLD "semantic_threshold"
+#define CBM_CONFIG_SEMANTIC_EDGES_ENABLED "semantic_edges_enabled"
+#define CBM_CONFIG_GITHISTORY_MIN_COUPLING "githistory_min_coupling"
+#define CBM_CONFIG_GITHISTORY_MAX_COUPLINGS "githistory_max_couplings"
+#define CBM_CONFIG_GITHISTORY_ENABLED "githistory_enabled"
+/* Preserve the established default graph-size budget, but permit exhaustive
+ * output for the current parser window. At most C(20,2)=190 pairs are observed
+ * per accepted commit, and parse_git_log reads at most 10,000 commits. */
+#define CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS 8192
+#define CBM_GITHISTORY_DEFAULT_MAX_COUPLINGS_STR "8192"
+#define CBM_GITHISTORY_HISTORY_COMMIT_LIMIT 10000
+#define CBM_GITHISTORY_MAX_FILES_PER_COMMIT 20
+#define CBM_GITHISTORY_MAX_PAIRS_PER_COMMIT \
+    ((CBM_GITHISTORY_MAX_FILES_PER_COMMIT * (CBM_GITHISTORY_MAX_FILES_PER_COMMIT - 1)) / 2)
+#define CBM_GITHISTORY_MAX_COUPLINGS_LIMIT \
+    (CBM_GITHISTORY_HISTORY_COMMIT_LIMIT * CBM_GITHISTORY_MAX_PAIRS_PER_COMMIT)
+#define CBM_GITHISTORY_MAX_COUPLINGS_LIMIT_STR "1900000"
+#define CBM_CONFIG_LSP_CONFIDENCE_FLOOR "lsp_confidence_floor"
+#define CBM_CONFIG_EXTRACT_TIMEOUT_MS "extract_timeout_ms"
+#define CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT_MS 5000
+#define CBM_CONFIG_EXTRACT_TIMEOUT_DEFAULT "5000"
+#define CBM_CONFIG_EXTRACT_TIMEOUT_MIN_MS 100
+#define CBM_CONFIG_EXTRACT_TIMEOUT_MAX_MS 120000
+#define CBM_CONFIG_INCREMENTAL_REINDEX "incremental_reindex"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_FULL_REBUILD "full_rebuild"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_FAST_MODE_INDEXES_ONLY "fast_mode_indexes_only"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS "always"
+#define CBM_CONFIG_INCREMENTAL_REINDEX_DEFAULT CBM_CONFIG_INCREMENTAL_REINDEX_ALWAYS
+#define CBM_CONFIG_OVERLAY_PUBLISH "overlay_publish"
+#define CBM_CONFIG_OVERLAY_PUBLISH_OFF "off"
+#define CBM_CONFIG_OVERLAY_PUBLISH_SMALL_DELTAS "small_deltas"
+#define CBM_CONFIG_OVERLAY_COMPACTION_POLICY "overlay_compaction_policy"
+#define CBM_CONFIG_OVERLAY_COMPACTION_POLICY_MANUAL "manual"
+#define CBM_CONFIG_OVERLAY_COMPACTION_POLICY_AFTER_PUBLISH "after_publish"
+#define CBM_CONFIG_OVERLAY_COMPACTION_MAX_GENERATIONS "overlay_compaction_max_generations"
+#define CBM_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS 1
+#define CBM_CONFIG_OVERLAY_COMPACTION_DEFAULT_MAX_GENERATIONS "1"
+#define CBM_CONFIG_INCREMENTAL_EXACT_MAX_CHANGED_PATHS "incremental_exact_max_changed_paths"
+#define CBM_CONFIG_INCREMENTAL_EXACT_MAX_AFFECTED_PATHS "incremental_exact_max_affected_paths"
+#define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_CHANGED_PATHS "2"
+#define CBM_CONFIG_INCREMENTAL_EXACT_DEFAULT_MAX_AFFECTED_PATHS "32"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH "incremental_derived_results_refresh"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_AT_PUBLISH "at_publish"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_EXACT_DELTA_REINDEXES \
+    "defer_exact_delta_reindexes"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES \
+    "defer_all_incremental_reindexes"
+#define CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFAULT \
+    CBM_CONFIG_INCREMENTAL_DERIVED_RESULTS_REFRESH_DEFER_ALL_INCREMENTAL_REINDEXES
+
+/* Set the Jaccard similarity threshold for SIMILAR-edge creation (pass_similarity).
+ * <=0 (or unset) uses the CBM_MINHASH_JACCARD_THRESHOLD default. Before run(). */
+void cbm_pipeline_set_similarity_threshold(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_similarity_enabled(cbm_pipeline_t *p, bool enabled);
+void cbm_pipeline_set_httplink_min_confidence(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_httplinks_enabled(cbm_pipeline_t *p, bool enabled);
+void cbm_pipeline_set_semantic_threshold(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_semantic_edges_enabled(cbm_pipeline_t *p, bool enabled);
+void cbm_pipeline_set_githistory_min_coupling(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_githistory_max_couplings(cbm_pipeline_t *p, int max_couplings);
+void cbm_pipeline_set_githistory_enabled(cbm_pipeline_t *p, bool enabled);
+void cbm_pipeline_set_lsp_confidence_floor(cbm_pipeline_t *p, double threshold);
+void cbm_pipeline_set_exact_delta_limits(cbm_pipeline_t *p, int max_changed_paths,
+                                         int max_affected_paths);
+/* Apply config-backed thresholds. NULL cfg is allowed and leaves defaults. */
+void cbm_pipeline_apply_config(cbm_pipeline_t *p, cbm_config_t *cfg);
+double cbm_pipeline_similarity_threshold(const cbm_pipeline_t *p);
+bool cbm_pipeline_similarity_enabled(const cbm_pipeline_t *p);
+double cbm_pipeline_httplink_min_confidence(const cbm_pipeline_t *p);
+bool cbm_pipeline_httplinks_enabled(const cbm_pipeline_t *p);
+double cbm_pipeline_semantic_threshold(const cbm_pipeline_t *p);
+bool cbm_pipeline_semantic_edges_enabled(const cbm_pipeline_t *p);
+double cbm_pipeline_githistory_min_coupling(const cbm_pipeline_t *p);
+int cbm_pipeline_githistory_max_couplings(const cbm_pipeline_t *p);
+bool cbm_pipeline_githistory_enabled(const cbm_pipeline_t *p);
+double cbm_pipeline_lsp_confidence_floor(const cbm_pipeline_t *p);
+int cbm_pipeline_exact_max_changed_paths(const cbm_pipeline_t *p);
+int cbm_pipeline_exact_max_affected_paths(const cbm_pipeline_t *p);
+
 /* Bind cancellation to a caller-owned atomic flag. The flag must outlive the
  * pipeline and should be initialized before binding. This lets a long-lived
  * daemon request cancellation without retaining/dereferencing a pipeline
@@ -81,10 +201,24 @@ void cbm_pipeline_bind_cancel_flag(cbm_pipeline_t *p, atomic_int *cancelled);
  * owned by the pipeline. Valid until cbm_pipeline_free(). */
 const char *cbm_pipeline_project_name(const cbm_pipeline_t *p);
 
-/* Override the derived project name with a sanitized user-provided label. */
+/* Get the repo path. Returned string is owned by the pipeline. */
+const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+
+/* Get a pointer to the pipeline's cancellation flag. Used by incremental
+ * pipeline to propagate cancellation into the sub-pipeline context. */
+atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
+
+/* Check whether this pipeline's project in an already-open store is current
+ * for the pipeline mode and configured thresholds. This is a metadata-only
+ * gate when mtime/size match and hash-confirms only ambiguous files. */
+int cbm_pipeline_store_project_current(cbm_pipeline_t *p, cbm_store_t *store, bool *out_current);
+
+/* Override the derived project name with a sanitized user-provided label.
+ * Must be called before cbm_pipeline_run(). Copies the string and reports
+ * validation/allocation failure to callers that need an actionable error. */
 bool cbm_pipeline_set_project_name(cbm_pipeline_t *p, const char *name);
 
-/* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST). */
+/* Get the index mode (CBM_MODE_FULL, CBM_MODE_MODERATE, CBM_MODE_FAST, CBM_MODE_DEP). */
 int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
 
 /* Get the list of directory subtrees skipped during discovery (#411).
@@ -96,6 +230,26 @@ void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count)
 /* Committed node/edge counts captured at dump time (-1 when dump did not run).
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
+
+/* True when the last successful run changed persisted graph contents.
+ * Incremental no-op runs return false so callers can skip derived-view
+ * recomputation when the existing derived views are already complete. */
+bool cbm_pipeline_graph_changed(const cbm_pipeline_t *p);
+
+/* Last publish route for the most recent run. This is observability for callers
+ * that need derived-view policy decisions; it does not change graph contents. */
+cbm_pipeline_publish_kind_t cbm_pipeline_publish_kind(const cbm_pipeline_t *p);
+const char *cbm_pipeline_publish_kind_name(cbm_pipeline_publish_kind_t kind);
+const char *cbm_pipeline_publish_reason(const cbm_pipeline_t *p);
+/* True when the most recent FULL publish was reached by attempting an
+ * incremental route first and safely falling back to a replacement rebuild. */
+bool cbm_pipeline_incremental_fallback(const cbm_pipeline_t *p);
+/* True once the staging database was atomically installed at the final path.
+ * This can remain true when a later persistence-artifact export fails, so
+ * callers can perform graph freshness/notification work while reporting the
+ * secondary failure explicitly. */
+bool cbm_pipeline_publication_committed(const cbm_pipeline_t *p);
+cbm_pipeline_exact_delta_stats_t cbm_pipeline_exact_delta_stats(const cbm_pipeline_t *p);
 
 /* ── Per-file indexing failures (Stage 2 / Track B) ─────────────── */
 
@@ -153,13 +307,26 @@ bool cbm_pipeline_try_lock(void);
  * Use this in MCP handler and autoindex — wait for busy watcher to finish. */
 void cbm_pipeline_lock(void);
 
+/* Acquire the global index lock unless the request is cancelled while waiting.
+ * Returns true with the lock held, or false with no lock held. A NULL flag
+ * preserves cbm_pipeline_lock()'s unconditional blocking behavior. */
+bool cbm_pipeline_lock_cancellable(const atomic_int *cancelled);
+
+#ifdef CBM_PIPELINE_ENABLE_TEST_API
+/* Number of blocking callers that have observed the global pipeline lock held.
+ * Test synchronization only; production builds pay no counter cost. */
+int cbm_pipeline_lock_waiter_count_for_testing(void);
+#endif
+
 /* Release the global index lock. */
 void cbm_pipeline_unlock(void);
 
 /* ── FQN helpers (used by passes and external callers) ──────────── */
 
 /* Compute a qualified name: project.dir.parts.name
- * Strips extension, converts / to ., drops __init__ and index.
+ * Strips extension, converts / to ., drops __init__ and index for symbols.
+ * File-node QNs (`name == "__file__"`) keep the filename extension so same-stem
+ * source/header/template files remain distinct graph nodes.
  * Caller must free() the returned string. */
 char *cbm_pipeline_fqn_compute(const char *project, const char *rel_path, const char *name);
 
@@ -174,6 +341,11 @@ char *cbm_pipeline_fqn_module_dir(const char *project, const char *rel_path, boo
 
 /* Folder QN: project.dir.parts. Caller must free(). */
 char *cbm_pipeline_fqn_folder(const char *project, const char *rel_dir);
+
+/* Return the borrowed repository-relative suffix after an exact `<project>.`
+ * prefix. Returns qn unchanged when either input is absent, qn is the project
+ * node itself, or the prefix is only a partial project-name match. */
+const char *cbm_pipeline_fqn_without_project(const char *project, const char *qn);
 
 /* Resolve an import specifier that uses a relative path (./foo, ../bar, .foo,
  * or an unqualified local name like "foo.h") against the importing file's
@@ -212,7 +384,7 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
  * Returns result with qualified_name="" if unresolved.
- * Never returns a data relation (Table/View): relations are lineage-only
+ * Never returns a data relation (Table/View/Model): relations are lineage-only
  * registry members and common table names (users, orders, config) collide with
  * code identifiers in every language, so the default resolve vetoes them
  * centrally instead of relying on per-consumer label checks. */
@@ -220,9 +392,9 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
 
-/* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
- * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
- * cache stores the default variant's relation-vetoed answers). */
+/* Relation-permitting resolve for SQL FROM/JOIN/ref lineage usages ONLY — the
+ * one consumer allowed to bind Table/View/Model targets. Uses a separate
+ * per-file cache so relation-permitting answers cannot poison default resolution. */
 cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const char *callee_name,
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count);
@@ -242,14 +414,20 @@ void cbm_registry_reach_cache_end(void);
 void cbm_registry_import_map_cache_begin(const char **keys, const char **vals, int count);
 void cbm_registry_import_map_cache_end(void);
 
-/* Per-file full-result cache for cbm_registry_resolve. The same
- * callee_name appears in many call sites within a file; module_qn
- * is constant per file so each name resolves identically. First
- * lookup does the full strategy chain; repeats are O(1) hash hits.
+/* Per-file full-result caches for ordinary and SQL-lineage resolution. The
+ * same callee_name appears in many references within a file; module_qn is
+ * constant per file so each name resolves identically. The variants remain
+ * separate because ordinary resolution vetoes relation nodes. First lookup
+ * does the full strategy chain; repeats are O(1) hash hits.
  * This eliminates ~75% of the resolve-chain work on K8s where the
  * same names ("Get", "Add", "New", etc) appear hundreds of times. */
 void cbm_registry_resolve_cache_begin(int estimated_capacity);
 void cbm_registry_resolve_cache_end(void);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_registry_resolve_chain_calls_reset_for_test(void);
+uint64_t cbm_registry_resolve_chain_calls_for_test(void);
+#endif
 
 /* Check if a qualified name exists in the registry. */
 bool cbm_registry_exists(const cbm_registry_t *r, const char *qn);
@@ -260,6 +438,11 @@ bool cbm_registry_exists(const cbm_registry_t *r, const char *qn);
  * the name. Perl-scoped: callers gate on the file language. */
 bool cbm_perl_is_builtin(const char *name);
 
+/* True for registry strategies that are only weak short-name guesses. Strong
+ * same-module and import-map matches return false. */
+bool cbm_registry_strategy_is_weak_short_name(const char *strategy);
+bool cbm_registry_strategy_is_import_map(const char *strategy);
+
 /* Decide whether a resolved Perl call edge is generic-resolver noise to drop
  * (#476): true only for Perl, only for a builtin/method call, and only when the
  * match used a weak short-name strategy — high-confidence same_module/import_map
@@ -267,13 +450,16 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
-/* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
- * drop (#592/#606): true only for TS/JS, only for a member call with a
- * non-this/super receiver (is_method), and only when the match used a weak
- * short-name strategy (suffix_match / unique_name / field_type_hint / fuzzy).
- * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
- * Pure; unit-tested in test_registry.c. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+/* Decide whether a resolved call edge is weak-strategy noise to drop.
+ * TS/JS/TSX reject every weak receiver fallback, matching the established
+ * guard. Rust rejects only ambiguous name-only matches: its cross-file resolver
+ * can still miss a valid sole candidate or receiver-assisted field hint in
+ * manifest-free source sets. Rust macro syntax also rejects every weak textual
+ * match because `matches!` is not a call to a project method named `matches`.
+ * The explicit language-specific drop-list keeps every lsp_* / import /
+ * same-module / qualified match. Pure and unit-tested in test_registry.c. */
+bool cbm_suppress_weak_call_match(CBMLanguage language, bool is_member, bool is_macro_invocation,
+                                  int candidate_count, const char *strategy);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572

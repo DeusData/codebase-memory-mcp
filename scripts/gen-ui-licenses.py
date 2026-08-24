@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Emit a markdown license appendix for the external graph-UI asset pack.
+"""Emit a markdown license appendix for the embedded graph UI.
 
 Usage: gen-ui-licenses.py <graph-ui-dir>
 
@@ -9,8 +9,8 @@ package, its declared license and the verbatim license file text found in
 node_modules. Build-time tooling (vite, tailwind, lightningcss, ...) is
 excluded: its code does not ship in the bundle.
 
-Called by gen-third-party-notices.sh when node_modules is present (the
-with-ui packaging path). Output is deterministic (sorted by name@version).
+Called by gen-third-party-notices.sh when node_modules is present. Output is
+deterministic (sorted by name@version).
 """
 import json
 import os
@@ -78,9 +78,9 @@ def main():
     excluded = set()
     collect(ui_dir, tree.get("dependencies"), pkgs, excluded)
 
-    print("## External Graph UI asset pack — bundled npm packages")
+    print("## Embedded Graph UI — bundled npm packages")
     print()
-    print("The `-ui` archives ship a compiled frontend asset pack beside the binary.")
+    print("Release executables embed the compiled frontend.")
     print("The packages below are its production dependency tree; license texts are")
     print("reproduced verbatim from the packages as installed at build time.")
     print()

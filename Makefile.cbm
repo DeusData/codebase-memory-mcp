@@ -2,10 +2,25 @@
 #
 # Usage:
 #   make -f Makefile.cbm test           # Build + run all tests (ASan + UBSan)
+#   CBM_ONLY_SUITE=pipeline make -f Makefile.cbm test
+#                                        # Run one suite after building
+#   CBM_ONLY_SUITE=pipeline CBM_ONLY_TEST=exact build/c/test-runner
+#                                        # Run matching tests inside one suite
 #   make -f Makefile.cbm test-foundation # Foundation tests only (fast)
 #   make -f Makefile.cbm test-tsan      # Thread sanitizer build
-#   make -f Makefile.cbm cbm            # Production binary
+#   make -f Makefile.cbm test-syntax TEST_SYNTAX_SRCS="tests/test_mcp.c"
+#                                        # syntax-check selected C units with real test flags
+#   make -f Makefile.cbm cbm            # Production binary (auto-signed on macOS)
+#   make -f Makefile.cbm native-extraction-benchmark
+#                                        # O2 production extraction benchmark runner
+#   make -f Makefile.cbm install        # Build + install to INSTALL_DIR (default ~/.local/bin)
 #   make -f Makefile.cbm clean-c        # Remove build artifacts
+#
+# macOS signing note:
+#   macOS 25+ enforces ad-hoc code signatures on binaries.  Copying a binary
+#   without re-signing causes immediate SIGKILL at runtime.  This Makefile
+#   runs `codesign --force --sign -` automatically after every build and
+#   install step on macOS.  On Linux and other platforms the step is a no-op.
 
 # Compiler selection — override via: make CC=gcc CXX=g++
 # macOS: cc (Apple Clang) — universal binary with ASan support
@@ -34,6 +49,44 @@ TS_INCLUDE = $(CBM_DIR)/vendored/ts_runtime/include
 # This ensures we use our vendored copies instead of requiring system libicu-dev.
 TS_SRC = $(CBM_DIR)/vendored/ts_runtime/src
 
+# ── Optional libgit2 (faster git history parsing) ────────────────
+# Auto-detected via pkg-config. Falls back to popen("git log ...") if absent.
+LIBGIT2_CFLAGS := $(shell pkg-config --cflags libgit2 2>/dev/null)
+LIBGIT2_LIBS := $(shell pkg-config --libs libgit2 2>/dev/null)
+ifneq ($(LIBGIT2_LIBS),)
+LIBGIT2_FLAGS = -DHAVE_LIBGIT2 $(LIBGIT2_CFLAGS)
+else
+LIBGIT2_FLAGS =
+LIBGIT2_LIBS =
+endif
+
+# ── Platform detection & code signing ───────────────────────────
+# macOS 25+ kills unsigned or invalidly-signed binaries with SIGKILL.
+# codesign --force --sign - applies an ad-hoc signature (no Apple Developer
+# account required).  On Linux/other platforms this entire block is a no-op.
+UNAME_S := $(shell uname -s)
+ifeq ($(UNAME_S),Darwin)
+CODESIGN_BIN := $(shell command -v codesign 2>/dev/null)
+ifneq ($(CODESIGN_BIN),)
+# codesign is available — sign and report
+define codesign_binary
+	@$(CODESIGN_BIN) --force --sign - $(1) 2>&1 && \
+		echo "  ✓ signed $(1) (ad-hoc, macOS 25+ compatible)" || \
+		{ echo "  ✗ WARNING: codesign failed for $(1) — binary may crash on macOS 25+"; true; }
+endef
+else
+# codesign not found — warn but don't fail the build
+define codesign_binary
+	@echo "  ✗ WARNING: codesign not found — $(1) may crash on macOS 25+ (install Xcode CLT)"
+endef
+endif
+else
+# Non-macOS: signing is a documented no-op
+define codesign_binary
+	@echo "  (signing skipped — not macOS)"
+endef
+endif
+
 # GCC-only warning suppressions (Clang rejects unknown -Wno-* with -Werror).
 # Detect GCC by checking for __GNUC__ without __clang__ — handles all versions.
 IS_GCC := $(shell echo | $(CC) -dM -E - 2>/dev/null | grep -q '__GNUC__' && ! echo | $(CC) -dM -E - 2>/dev/null | grep -q '__clang__' && echo yes || echo no)
@@ -50,6 +103,7 @@ endif
 CFLAGS_COMMON = -std=c11 -D_DEFAULT_SOURCE -D_GNU_SOURCE -Wall -Wextra -Werror \
                 -Wno-unused-parameter -Wno-sign-compare -Wdate-time \
                 $(GCC_ONLY_FLAGS) \
+                $(LIBGIT2_FLAGS) \
                 -Isrc -Ivendored -Ivendored/sqlite3 \
                 -Ivendored/mimalloc/include \
                 -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(BUILD_DIR)/generated
@@ -58,33 +112,32 @@ CXXFLAGS_COMMON = -std=c++14 -Wall -Wextra -Werror \
                   -Wno-unused-parameter \
                   -I$(CBM_DIR) -I$(TS_INCLUDE)
 
-# Test seams are OPT-IN, never opt-out. Some suites drive behaviour that only a
-# test should be able to ask for (fork an orphan the watchdog must reap, publish
-# a lease-ownership marker). That code has no production caller and reads exactly
-# like malware to a generic classifier, so it must not be in a shipped binary.
-# Opt-IN means the failure mode of forgetting the flag is a CLEAN binary rather
-# than a leaky one — the opposite choice would make every future release depend
-# on someone remembering. scripts/test.sh passes TEST_SEAMS=1 for the suites that
-# need it; the test-runner always has them.
+# Test seams are opt-in for production binaries. The test runner always enables
+# them through EDITOR_TEST_DEFINES, while selected production watchdog tests set
+# TEST_SEAMS=1 explicitly. A forgotten flag therefore produces a clean release
+# binary instead of silently shipping test-only process and lease controls.
 TEST_SEAM_DEFINE :=
 ifeq ($(TEST_SEAMS),1)
 TEST_SEAM_DEFINE := -DCBM_ENABLE_TEST_SEAMS=1
 endif
 
-# Production flags (CFLAGS_EXTRA allows CI to inject -DCBM_VERSION)
+# Production flags. CFLAGS_EXTRA carries the generated version define;
+# EXTRA_{C,CXX,LD}FLAGS are explicit developer/CI overrides appended last.
 # CBM_BIND_TS_ALLOCATOR=1: bind the tree-sitter runtime to mimalloc (#424). Only
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
 CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
-              $(GLOBAL_OVERRIDE_DEFINE) $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
+              $(GLOBAL_OVERRIDE_DEFINE) $(CFLAGS_EXTRA) $(EXTRA_CFLAGS)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(EXTRA_CXXFLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
 EDITOR_TEST_DEFINES = -DCBM_JSON_LIKE_ENABLE_TEST_API=1 \
 	-DCBM_TOML_EDIT_ENABLE_TEST_API=1 -DCBM_YAML_ENABLE_TEST_API=1 \
 	-DCBM_TEXT_EDIT_ENABLE_TEST_API=1 -DCBM_CLI_ENABLE_TEST_API=1 \
-	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
+	-DCBM_DIAGNOSTICS_ENABLE_TEST_API=1 -DCBM_PIPELINE_ENABLE_TEST_API=1 \
+	-DCBM_WATCHER_ENABLE_TEST_API=1 -DCBM_ENABLE_TEST_SEAMS=1
+TEST_INCLUDE_FLAGS = -Itests -Itests/repro
 # The build system is the single source of truth for "is this binary
 # instrumented": compiler-specific probes (__SANITIZE_ADDRESS__) miss
 # clang's feature-check spelling and every non-ASan sanitizer, so the
@@ -183,6 +236,8 @@ endif
 # surface for data that is never executed, and it is invisible to section flags.
 ELF_HARDENING_FLAGS :=
 ifeq ($(IS_LINUX),yes)
+# A Linux container may cross-compile a PE binary. IS_LINUX identifies the
+# build host, so the compiler-derived target guard is also required.
 ifneq ($(IS_MINGW),yes)
 ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code
 endif
@@ -197,9 +252,20 @@ endif
 # instead of the system libstdc++ (scripts/msan.sh overrides both vars).
 CXX_STDLIB ?= -lstdc++
 CXX_STDLIB_FLAGS ?=
-LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
-LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
-LDFLAGS_TSAN = -lm $(CXX_STDLIB) -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) \
+	$(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS) $(EXTRA_LDFLAGS)
+LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(LIBGIT2_LIBS) \
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS_TSAN = -lm $(CXX_STDLIB) -lpthread -lz $(TSAN_SANITIZE) $(LIBGIT2_LIBS) \
+	$(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+# nosan: no ASan/UBSan — required for macOS 'leaks' tool (incompatible with ASan malloc replacement).
+# Keep every test API identical to the sanitizer/TSan runners; changing the
+# allocator instrumentation must not silently compile a different test suite.
+CFLAGS_NOSAN  = $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) \
+	$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
+	$(INCREMENTAL_TEST_DEFINE) -g -O1
+LDFLAGS_NOSAN = -lm $(CXX_STDLIB) -lpthread -lz $(LIBGIT2_LIBS) $(WIN32_LIBS) \
+	$(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
 # ── Source files ─────────────────────────────────────────────────
 
@@ -254,7 +320,6 @@ EXTRACTION_SRCS = \
 
 # LSP resolvers (compiled as one unit via lsp_all.c)
 LSP_SRCS = $(CBM_DIR)/lsp_all.c
-
 # Header/source dependencies of the lsp_all unity object. lsp_all.c #includes
 # every lsp/*.c resolver, which in turn include cbm.h — and CBMCall is copied
 # BY VALUE across the lsp -> pipeline boundary (cbm_calls_push). This object is
@@ -345,6 +410,9 @@ PIPELINE_SRCS = \
     src/pipeline/pass_gitdiff.c \
     src/pipeline/pass_configures.c \
     src/pipeline/pass_configlink.c \
+    src/pipeline/pass_normalize.c \
+    src/pipeline/httplink.c \
+    src/pipeline/pass_httplinks.c \
     src/pipeline/pass_route_nodes.c \
     src/pipeline/pass_enrichment.c \
     src/pipeline/pass_envscan.c \
@@ -367,6 +435,12 @@ SEMANTIC_SRCS = src/semantic/semantic.c src/semantic/ast_profile.c src/semantic/
 # nomic-embed-code pretrained vectors (assembler blob)
 UNIXCODER_BLOB_SRC = vendored/nomic/code_vectors_blob.S
 
+# Depindex module (dependency/reference API indexing)
+DEPINDEX_SRCS = src/depindex/depindex.c
+
+# PageRank module (node + edge ranking)
+PAGERANK_SRCS = src/pagerank/pagerank.c
+
 # Traces module (new)
 TRACES_SRCS = src/traces/traces.c
 
@@ -374,7 +448,9 @@ TRACES_SRCS = src/traces/traces.c
 WATCHER_SRCS = src/watcher/watcher.c
 
 # Git context module (new)
-GIT_SRCS = src/git/git_context.c
+GIT_SRCS = src/git/git_command.c \
+    src/git/git_context.c \
+    src/git/git_snapshot.c
 
 # CLI module (new)
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
@@ -475,7 +551,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(DEPINDEX_SRCS) $(PAGERANK_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -496,7 +572,10 @@ PROJECT_HDRS = $(wildcard src/*.h src/*/*.h $(CBM_DIR)/*.h $(CBM_DIR)/lsp/*.h te
 # ── Test sources ─────────────────────────────────────────────────
 
 TEST_FOUNDATION_SRCS = \
-    tests/test_main.c \
+    tests/test_foundation_main.c \
+    $(TEST_FOUNDATION_CASE_SRCS)
+
+TEST_FOUNDATION_CASE_SRCS = \
     tests/test_arena.c \
     tests/test_hash_table.c \
     tests/test_dyn_array.c \
@@ -506,11 +585,12 @@ TEST_FOUNDATION_SRCS = \
     tests/test_workspace.c \
     tests/test_platform.c \
     tests/test_diagnostics.c \
-    tests/test_complexity.c \
     tests/test_dump_verify.c \
     tests/test_subprocess.c \
     tests/test_private_file_lock.c \
     tests/test_lock_registry.c
+
+TEST_MAIN_SRC = tests/test_main.c
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
@@ -530,7 +610,8 @@ TEST_STORE_SRCS = \
     tests/test_store_bulk.c \
     tests/test_store_pragmas.c \
     tests/test_store_checkpoint.c \
-    tests/test_dump_verify_io.c
+    tests/test_dump_verify_io.c \
+    tests/test_schema_declared_property_keys.c
 
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
@@ -559,7 +640,34 @@ TEST_DISCOVER_SRCS = \
 
 TEST_GRAPH_BUFFER_SRCS = tests/test_graph_buffer.c
 
-TEST_PIPELINE_SRCS = tests/test_registry.c tests/test_pipeline.c tests/test_cross_repo.c tests/test_fqn.c tests/test_route_canon.c tests/test_path_alias.c tests/test_configlink.c tests/test_infrascan.c tests/test_worker_pool.c tests/test_parallel.c tests/test_index_resilience.c tests/test_call_reference_contract.c tests/repro/repro_call_scope_usages.c tests/repro/repro_call_argument_usages.c tests/repro/repro_reference_precision.c tests/repro/repro_lexical_binding_precision.c tests/repro/repro_call_argument_matrix_a.c tests/repro/repro_call_argument_matrix_b.c tests/repro/repro_call_node_behaviors.c tests/repro/repro_language_registry.c tests/repro/repro_call_node_manifest.c tests/repro/repro_lsp_ordered_signatures.c tests/repro/repro_lsp_ordered_local.c tests/repro/repro_ts_overload_return_chains.c tests/repro/repro_harness_cleanup.c tests/repro/repro_runner_filter.c
+TEST_PIPELINE_SRCS = \
+    tests/test_complexity.c \
+    tests/test_registry.c \
+    tests/test_pipeline.c \
+    tests/test_cross_repo.c \
+    tests/test_fqn.c \
+    tests/test_route_canon.c \
+    tests/test_path_alias.c \
+    tests/test_configlink.c \
+    tests/test_infrascan.c \
+    tests/test_worker_pool.c \
+    tests/test_parallel.c \
+    tests/test_index_resilience.c \
+    tests/test_call_reference_contract.c \
+    tests/repro/repro_call_scope_usages.c \
+    tests/repro/repro_call_argument_usages.c \
+    tests/repro/repro_reference_precision.c \
+    tests/repro/repro_lexical_binding_precision.c \
+    tests/repro/repro_call_argument_matrix_a.c \
+    tests/repro/repro_call_argument_matrix_b.c \
+    tests/repro/repro_call_node_behaviors.c \
+    tests/repro/repro_language_registry.c \
+    tests/repro/repro_call_node_manifest.c \
+    tests/repro/repro_lsp_ordered_signatures.c \
+    tests/repro/repro_lsp_ordered_local.c \
+    tests/repro/repro_ts_overload_return_chains.c \
+    tests/repro/repro_harness_cleanup.c \
+    tests/repro/repro_runner_filter.c
 
 TEST_WATCHER_SRCS = tests/test_watcher.c
 
@@ -613,9 +721,18 @@ TEST_MEM_SRCS = tests/test_mem.c
 TEST_UI_SRCS = tests/test_ui.c
 TEST_HTTPD_SRCS = tests/test_httpd.c
 
-TEST_SECURITY_SRCS = tests/test_security.c
+TEST_DEPINDEX_SRCS = tests/test_depindex.c
 
+TEST_PAGERANK_SRCS = tests/test_pagerank.c
+
+TEST_TOKEN_REDUCTION_SRCS = tests/test_token_reduction.c
+
+TEST_TOOL_CONSOLIDATION_SRCS = tests/test_tool_consolidation.c
+TEST_INPUT_VALIDATION_SRCS = tests/test_input_validation.c
+
+TEST_SECURITY_SRCS = tests/test_security.c
 TEST_YAML_SRCS = tests/test_yaml.c
+TEST_HTTPLINK_SRCS = tests/test_httplink.c
 
 TEST_SEMANTIC_SRCS = tests/test_semantic.c
 TEST_AST_PROFILE_SRCS = tests/test_ast_profile.c
@@ -702,8 +819,57 @@ TEST_REPRO_SRCS = \
     tests/repro/repro_lsp_java_cs.c \
     tests/repro/repro_lsp_kt_php_rust.c
 
-ALL_TEST_SRCS =$(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DAEMON_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_PERL_LSP_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SEMANTIC_SRCS) $(TEST_AST_PROFILE_SRCS) $(TEST_SLAB_ALLOC_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
-
+ALL_TEST_SRCS = \
+    $(TEST_MAIN_SRC) \
+    $(TEST_FOUNDATION_CASE_SRCS) \
+    $(TEST_EXTRACTION_SRCS) \
+    $(TEST_STORE_SRCS) \
+    $(TEST_CYPHER_SRCS) \
+    $(TEST_MCP_SRCS) \
+    $(TEST_DAEMON_SRCS) \
+    $(TEST_DISCOVER_SRCS) \
+    $(TEST_GRAPH_BUFFER_SRCS) \
+    $(TEST_PIPELINE_SRCS) \
+    $(TEST_WATCHER_SRCS) \
+    $(TEST_LZ4_SRCS) \
+    $(TEST_ZSTD_SRCS) \
+    $(TEST_ARTIFACT_SRCS) \
+    $(TEST_SQLITE_WRITER_SRCS) \
+    $(TEST_GO_LSP_SRCS) \
+    $(TEST_C_LSP_SRCS) \
+    $(TEST_PHP_LSP_SRCS) \
+    $(TEST_CS_LSP_SRCS) \
+    $(TEST_CS_LSP_BENCH_SRCS) \
+    $(TEST_PERL_LSP_SRCS) \
+    $(TEST_SCOPE_SRCS) \
+    $(TEST_TYPE_REP_SRCS) \
+    $(TEST_PY_LSP_SRCS) \
+    $(TEST_PY_LSP_BENCH_SRCS) \
+    $(TEST_PY_LSP_STRESS_SRCS) \
+    $(TEST_PY_LSP_SCALE_SRCS) \
+    $(TEST_TS_LSP_SRCS) \
+    $(TEST_JAVA_LSP_SRCS) \
+    $(TEST_KOTLIN_LSP_SRCS) \
+    $(TEST_RUST_LSP_SRCS) \
+    $(TEST_TRACES_SRCS) \
+    $(TEST_HTTPLINK_SRCS) \
+    $(TEST_CLI_SRCS) \
+    $(TEST_MEM_SRCS) \
+    $(TEST_UI_SRCS) \
+    $(TEST_HTTPD_SRCS) \
+    $(TEST_DEPINDEX_SRCS) \
+    $(TEST_PAGERANK_SRCS) \
+    $(TEST_TOKEN_REDUCTION_SRCS) \
+    $(TEST_TOOL_CONSOLIDATION_SRCS) \
+    $(TEST_INPUT_VALIDATION_SRCS) \
+    $(TEST_SECURITY_SRCS) \
+    $(TEST_YAML_SRCS) \
+    $(TEST_SEMANTIC_SRCS) \
+    $(TEST_AST_PROFILE_SRCS) \
+    $(TEST_SLAB_ALLOC_SRCS) \
+    $(TEST_SIMHASH_SRCS) \
+    $(TEST_STACK_OVERFLOW_SRCS) \
+    $(TEST_INTEGRATION_SRCS)
 
 # ── Build directories ────────────────────────────────────────────
 
@@ -712,10 +878,10 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
-GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
-GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -DCBM_ENABLE_TEST_SEAMS=1 -DCBM_SANITIZED_BUILD=1 $(TSAN_SANITIZE)
 
 # Object files for grammars + ts_runtime + lsp_all + preprocessor
@@ -728,25 +894,52 @@ TS_RUNTIME_OBJ_TSAN = $(BUILD_DIR)/tsan_ts_runtime.o
 LSP_OBJ_TSAN = $(BUILD_DIR)/tsan_lsp_all.o
 PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
+# Grammar wrappers include generated parser/scanner C files. Compiler-generated
+# dependency files keep incremental builds correct after grammar refreshes and
+# branch/worktree switches. The v1 stamp forces pre-depfile objects to rebuild
+# once; subsequent builds invalidate only the grammar whose included files moved.
+GRAMMAR_DEP_STAMP = $(BUILD_DIR)/.grammar-deps-v1
+GRAMMAR_DEPFILES = $(addsuffix .d,$(GRAMMAR_OBJS_TEST) $(GRAMMAR_OBJS_TSAN))
+
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security
+.PHONY: test test-par test-focused test-compositional test-repro test-foundation test-tsan \
+        test-syntax test-daemon-smoke \
+        test-leak test-analyze test-memory test-gmalloc cbm \
+        cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck \
+        lint-format lint-source-safety install test-runner-nosan security \
+		native-extraction-benchmark
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 # ── Foundation-only test (fast, no extraction) ───────────────────
 
-$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) $(LDFLAGS_TEST)
+$(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) \
+                              $(MIMALLOC_OBJ_TEST) $(TS_RUNTIME_OBJ_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -o $@ $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) \
+		$(MIMALLOC_OBJ_TEST) $(TS_RUNTIME_OBJ_TEST) $(LDFLAGS_TEST)
 
 test-foundation: $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
 
+# Fast C syntax check for selected test or production translation units. Reuse
+# the nosan test flags so gated *_for_testing declarations and both test include
+# roots cannot drift from the real test builds. Example:
+#   make -f Makefile.cbm test-syntax TEST_SYNTAX_SRCS="tests/test_mcp.c src/mcp/mcp.c"
+TEST_SYNTAX_SRCS ?=
+test-syntax:
+	@test -n "$(strip $(TEST_SYNTAX_SRCS))" || \
+		(echo "TEST_SYNTAX_SRCS is required for test-syntax"; exit 2)
+	$(CC) $(CFLAGS_NOSAN) $(TEST_INCLUDE_FLAGS) -fsyntax-only $(TEST_SYNTAX_SRCS)
+
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
-$(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
+$(GRAMMAR_DEP_STAMP): | $(BUILD_DIR)
+	@touch $@
+
+$(GRAMMAR_OBJS_TEST): $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TEST) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
@@ -757,8 +950,8 @@ $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
-$(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
+$(GRAMMAR_OBJS_TSAN): $(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_TSAN) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(BUILD_DIR)/tsan_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
@@ -837,6 +1030,67 @@ $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
 endif
 
+# ── Nosan build: ASan-free test runner for macOS heap leak detection ─────────
+#
+# WHY THIS EXISTS:
+#   'make test-leak' uses Apple's 'leaks --atExit' tool to find heap leaks.
+#   But leaks cannot inspect a process that uses a custom malloc (such as ASan).
+#   The regular test-runner is built with -fsanitize=address,undefined, which
+#   replaces malloc → leaks aborts with "unable to inspect heap ranges".
+#
+# HOW IT WORKS:
+#   We rebuild all ASan-instrumented vendored objects without -fsanitize flags
+#   into $(NOSAN_DIR), then link test-runner-nosan against them.
+#   The resulting binary runs the full test suite under Apple's heap profiler.
+#   Full leak report is written to $(LEAK_LOG) = build/c/leak-report.txt.
+#
+# HOW TO USE:
+#   make test-leak          # runs full suite + heap check, saves report to LEAK_LOG
+#   cat build/c/leak-report.txt   # review complete leak report after run
+#
+# WHICH OBJECTS NEED NOSAN VARIANTS (use SANITIZE in their *_TEST flags):
+#   sqlite3, lsp_all, preprocessor, grammar/*.c, ts_runtime
+# WHICH ARE REUSED AS-IS (never use SANITIZE):
+#   mimalloc  (MIMALLOC_CFLAGS_TEST has no -fsanitize)
+#   tre        (only on Windows; TRE_CFLAGS has no -fsanitize)
+#
+NOSAN_DIR            = $(BUILD_DIR)/nosan
+# Keeps -DCBM_ENABLE_TEST_SEAMS=1 for the same reason GRAMMAR_CFLAGS_TEST and
+# GRAMMAR_CFLAGS_TSAN do: the nosan objects are the TEST build minus sanitizers,
+# and test-runner-nosan is linked with the seam define. Dropping it here compiles
+# the seam bodies out of nosan/lsp_all.o while tests still reference them, which
+# fails the leaks/scribble/gmalloc link with undefined
+# _cbm_ts_lsp_test_budget_remaining / _cbm_ts_lsp_test_budget_warned.
+# CBM_SANITIZED_BUILD is deliberately absent — this variant has no sanitizer.
+GRAMMAR_CFLAGS_NOSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -Isrc -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+                       -DCBM_ENABLE_TEST_SEAMS=1
+GRAMMAR_OBJS_NOSAN   = $(patsubst $(CBM_DIR)/%.c,$(NOSAN_DIR)/%.o,$(GRAMMAR_SRCS))
+GRAMMAR_DEPFILES += $(addsuffix .d,$(GRAMMAR_OBJS_NOSAN))
+
+$(NOSAN_DIR):
+	mkdir -p $(NOSAN_DIR)
+
+# Grammar C files (tree-sitter parsers) — recompiled without ASan/UBSan
+$(GRAMMAR_OBJS_NOSAN): $(NOSAN_DIR)/%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -MMD -MP -MF $@.d -c -o $@ $<
+
+$(NOSAN_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
+
+$(NOSAN_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(NOSAN_DIR)
+	$(CC) $(GRAMMAR_CFLAGS_NOSAN) -c -o $@ $<
+
+$(NOSAN_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(NOSAN_DIR)
+	$(CXX) $(CXXFLAGS_COMMON) -g -O1 -w -I$(CBM_DIR)/vendored -c -o $@ $<
+
+$(NOSAN_DIR)/sqlite3.o: $(SQLITE3_SRC) | $(NOSAN_DIR)
+	$(CC) $(SQLITE3_CFLAGS_TEST) -c -o $@ $<
+
+OBJS_VENDORED_NOSAN = $(MIMALLOC_OBJ_TEST) $(NOSAN_DIR)/sqlite3.o $(TRE_OBJ_TEST) \
+                      $(GRAMMAR_OBJS_NOSAN) $(NOSAN_DIR)/ts_runtime.o \
+                      $(NOSAN_DIR)/lsp_all.o $(NOSAN_DIR)/preprocessor.o \
+                      $(NOSAN_LZ4_OBJ) $(NOSAN_ZSTD_OBJ) $(UNIXCODER_OBJ)
+
 # Vendored LZ4 (test build)
 LZ4_OBJ_TEST = $(BUILD_DIR)/test_lz4.o $(BUILD_DIR)/test_lz4hc.o
 LZ4_OBJ_TSAN = $(BUILD_DIR)/tsan_lz4.o $(BUILD_DIR)/tsan_lz4hc.o
@@ -865,6 +1119,17 @@ $(BUILD_DIR)/test_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 $(BUILD_DIR)/tsan_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
 	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 $(TSAN_SANITIZE) -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
+# Vendored LZ4/zstd (NOSAN build — sanitizer-free so `leaks --atExit` can walk the
+# heap on macOS; ASan replaces malloc and is incompatible with the leaks tool).
+NOSAN_LZ4_OBJ  = $(NOSAN_DIR)/lz4.o $(NOSAN_DIR)/lz4hc.o
+NOSAN_ZSTD_OBJ = $(NOSAN_DIR)/zstd.o
+$(NOSAN_DIR)/lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(NOSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -c -o $@ $<
+$(NOSAN_DIR)/lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(NOSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+$(NOSAN_DIR)/zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(NOSAN_DIR)
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+
 # nomic-embed-code pretrained vector blob
 UNIXCODER_OBJ = $(BUILD_DIR)/unixcoder_blob.o
 $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUILD_DIR)
@@ -874,11 +1139,18 @@ OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(
 OBJS_VENDORED_TSAN = $(MIMALLOC_OBJ_TSAN) $(SQLITE3_OBJ_TSAN) $(TRE_OBJ_TSAN) $(GRAMMAR_OBJS_TSAN) $(TS_RUNTIME_OBJ_TSAN) $(LSP_OBJ_TSAN) $(PP_OBJ_TSAN) $(LZ4_OBJ_TSAN) $(ZSTD_OBJ_TSAN) $(UNIXCODER_OBJ)
 
 $(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ \
+	$(CC) $(CFLAGS_TEST) $(TEST_INCLUDE_FLAGS) -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TEST) \
 		$(LDFLAGS_TEST)
+
+$(BUILD_DIR)/test-runner-nosan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_NOSAN) | $(BUILD_DIR) $(NOSAN_DIR)
+	$(CC) $(CFLAGS_NOSAN) $(TEST_INCLUDE_FLAGS) -o $@ \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_NOSAN) \
+		$(LDFLAGS_NOSAN)
 
 test: $(BUILD_DIR)/test-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner
@@ -897,6 +1169,47 @@ test-focused: $(BUILD_DIR)/test-runner
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
 
+# Cross-parent interaction canaries. Keep this target small: each row pairs a
+# classifier or policy from one side of the merge with the publication action
+# that consumes it, while the full suite remains the exhaustive gate.
+test-compositional: $(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=pipeline \
+		CBM_ONLY_TEST=incremental_frontier_full_fallback_failure_preserves_dirty_ledger \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=input_validation \
+		CBM_ONLY_TEST=path_project_autoindex_honors_dep_limit_and_refreshes_rank \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=daemon_application \
+		CBM_ONLY_TEST=daemon_application_auto_index_honors_tracked_file_limit \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=pagerank \
+		CBM_ONLY_TEST=pagerank_refresh_defer_exact_delta_reindexes_does_not_defer_containment \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=pagerank \
+		CBM_ONLY_TEST=pagerank_refresh_defer_all_incremental_reindexes_defers_full_fallback \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=tool_query_graph_uses_active_relationship_query_with_ready_overlay \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=watcher_publication_reopens_cached_store_generation \
+		$(BUILD_DIR)/test-runner
+# These two established stdio-notification oracles use POSIX pipe/alarm
+# fixtures and are not registered by tests/test_mcp.c on native Windows.
+ifneq ($(OS),Windows_NT)
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=mcp_index_repository_inprocess_sends_list_changed \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=mcp_autoindex_thread_sends_list_changed \
+		$(BUILD_DIR)/test-runner
+endif
+	cd $(CURDIR) && CBM_ONLY_SUITE=daemon_runtime \
+		CBM_ONLY_TEST=daemon_runtime_request_cancel_is_exact_and_session_remains_usable \
+		$(BUILD_DIR)/test-runner
+	cd $(CURDIR) && CBM_ONLY_SUITE=mcp \
+		CBM_ONLY_TEST=tool_index_repository_lock_wait_honors_request_cancel \
+		$(BUILD_DIR)/test-runner
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
 # and TEST_REPRO_SRCS instead of ALL_TEST_SRCS. Exits non-zero while any bug is
@@ -921,6 +1234,14 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 	cd $(CURDIR) && $(BUILD_DIR)/test-repro-runner
 
 # ── TSan full test ───────────────────────────────────────────────
+#
+# ThreadSanitizer build for data-race detection in the parallel pipeline.
+# Mirrors test-runner but links vendored objects compiled with
+# -fsanitize=thread and links the test mimalloc object (MI_OVERRIDE=0 —
+# does NOT override malloc, so TSan intercepts the real malloc/free) to
+# satisfy the unconditional mi_* calls in src/foundation/mem.c.
+#
+# Cannot be combined with ASan/UBSan. Uses the system allocator.
 
 # Every threaded production surface that runs clean AND stable under TSan:
 # allocator concurrency (mem, slab_alloc), the parallel extraction worker pool
@@ -944,6 +1265,11 @@ test-repro: $(BUILD_DIR)/test-repro-runner
 TEST_TSAN_SUITES ?= mem slab_alloc parallel worker_pool watcher httpd pipeline \
                     diagnostics mcp mcp_mutation_guard subprocess daemon daemon_application \
                     daemon_runtime daemon_ipc daemon_frontend
+# Keep the project suppression separate from the caller's ordinary TSan knobs.
+# Advanced runs can point this at a combined suppression file without replacing
+# halt/report/history settings supplied through TSAN_OPTIONS.
+TSAN_PROJECT_OPTIONS ?= suppressions=$(CURDIR)/tests/tsan.supp
+TSAN_WORKERS ?= 4
 # halt_on_error: a race is a bug, stop at the first one.
 #
 # report_thread_leaks=0: this disables TSan's thread-HYGIENE check only —
@@ -962,16 +1288,127 @@ TSAN_OPTIONS ?= halt_on_error=1:report_thread_leaks=0
 # invoke test-runner-tsan directly so release gates cannot drift accidentally.
 
 $(BUILD_DIR)/test-runner-tsan: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TSAN) $(PROJECT_HDRS) | $(BUILD_DIR)
-	$(CC) $(CFLAGS_TSAN) -Itests -Itests/repro -o $@ \
+	$(CC) $(CFLAGS_TSAN) $(TEST_INCLUDE_FLAGS) -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
 		$(OBJS_VENDORED_TSAN) \
 		$(LDFLAGS_TSAN)
 
 test-tsan: $(BUILD_DIR)/test-runner-tsan
-	@echo "ThreadSanitizer workers: 4"
-	cd $(CURDIR) && CBM_WORKERS=4 TSAN_OPTIONS="$(TSAN_OPTIONS)" \
+	@echo "Running ThreadSanitizer with $(TSAN_WORKERS) workers. Reports go to stderr."
+	cd $(CURDIR) && CBM_WORKERS=$(TSAN_WORKERS) \
+		TSAN_OPTIONS="$(TSAN_OPTIONS):$(TSAN_PROJECT_OPTIONS)" \
 		$(BUILD_DIR)/test-runner-tsan $(TEST_TSAN_SUITES)
+
+# ── Leak detection ───────────────────────────────────────────────
+# macOS: uses `leaks --atExit` (Apple Clang LSan not available on all versions)
+# Linux: ASAN_OPTIONS=detect_leaks=1 (GCC/Clang ASan always includes LSan)
+# Note: if false positives appear from system libraries on Linux, create lsan.supp
+#   and set LSAN_OPTIONS=suppressions=lsan.supp
+LEAK_LOG = $(BUILD_DIR)/leak-report.txt
+
+# Stream a long-running gate through tee while preserving both failure sources.
+# Make recipes use /bin/sh by default, so Bash-only PIPESTATUS is not portable
+# (notably, Debian/Ubuntu /bin/sh is dash). The pipeline's left-hand subshell
+# records its status in a per-process sidecar; the parent shell then returns the
+# command failure first, or tee's failure when the command itself succeeded.
+define run_logged_command
+	@status_file="$(1).status.$$$$"; \
+	trap 'rm -f "$$status_file"' 0 1 2 3 15; \
+	{ $(2); printf '%s\n' "$$?" > "$$status_file"; } 2>&1 | tee "$(1)"; \
+	tee_status=$$?; \
+	if test ! -s "$$status_file"; then \
+		echo "ERROR: logged command ended without recording its status" >&2; \
+		exit 1; \
+	fi; \
+	command_status=$$(sed -n '1p' "$$status_file"); \
+	if test "$$command_status" -ne 0; then exit "$$command_status"; fi; \
+	exit "$$tee_status"
+endef
+
+# Apple's leaks debugger stops descendant test binaries, so crash, socket-
+# inheritance, and UI child-process probes cannot run under `leaks --atExit`
+# without deadlocking or failing their parent. Cover the allocation-owning
+# stores, pipelines, rankers, and parallel workers explicitly instead. The test runner
+# also always includes httplink, token_reduction, depindex, pagerank,
+# tool_consolidation, and input_validation when suite arguments are present.
+TEST_LEAK_SUITES ?= arena hash_table dyn_array str_intern store_nodes store_edges \
+	store_search store_bulk store_pragmas store_checkpoint dump_verify_io \
+	graph_buffer registry pipeline worker_pool parallel slab_alloc mem \
+	integration incremental
+# Guard Malloc is inherited across exec on macOS. Keep its default gate on
+# allocation-owning, in-process surfaces: otherwise external helpers such as
+# git are instrumented too, and watcher tests observe libgmalloc/tool behavior
+# instead of the server's memory safety. CBM_ONLY_SUITE/CBM_ONLY_TEST still
+# allow an explicit narrower probe.
+TEST_GMALLOC_SUITES ?= $(TEST_LEAK_SUITES) lz4 zstd artifact sqlite_writer
+ifeq ($(UNAME_S),Darwin)
+# macOS: 'leaks' cannot inspect ASan-instrumented processes (ASan replaces malloc).
+# Use test-runner-nosan (no ASan/UBSan) so leaks can walk the heap.
+test-leak: $(BUILD_DIR)/test-runner-nosan
+	@echo "Running heap leak detection via 'leaks --atExit' on nosan build (macOS). May take 2-5 minutes."
+	@echo "Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
+	$(call run_logged_command,$(LEAK_LOG),leaks --atExit -- $(BUILD_DIR)/test-runner-nosan $(TEST_LEAK_SUITES))
+else
+test-leak: $(BUILD_DIR)/test-runner
+	@echo "Running heap leak detection via ASan/LSan (Linux). Full report saved to $(LEAK_LOG). Exit 0 = no leaks."
+	$(call run_logged_command,$(LEAK_LOG),ASAN_OPTIONS=detect_leaks=1 $(BUILD_DIR)/test-runner)
+endif
+
+# ── Memory-corruption debug (macOS) ───────────────────────────────
+# Catches uninit reads, use-after-free, and overruns that ASan/TSan can miss
+# (used to investigate the B1 custom-writer non-deterministic corruption).
+# All run the NOSAN binary: ASan replaces malloc, which would defeat these
+# libmalloc knobs. Set CBM_ONLY_SUITE=<suite> to target a slow suite, and
+# optionally CBM_ONLY_TEST=<substring> to run matching tests after suite setup.
+MEM_LOG = $(BUILD_DIR)/mem-report.txt
+ifeq ($(UNAME_S),Darwin)
+# MallocScribble=1     → freed memory filled with 0x55 (catches use-after-free).
+# MallocPreScribble=1  → freshly-allocated memory filled with 0xAA (catches
+#   uninitialized reads — the macOS MSan equivalent; makes uninit deterministic).
+test-memory: $(BUILD_DIR)/test-runner-nosan
+	@echo "Running under MallocScribble+MallocPreScribble (macOS nosan): uninit reads -> 0xAA, use-after-free -> 0x55."
+	@echo "Full report saved to $(MEM_LOG)."
+	$(call run_logged_command,$(MEM_LOG),MallocScribble=1 MallocPreScribble=1 $(BUILD_DIR)/test-runner-nosan)
+
+# Guard Malloc (libgmalloc): a guard page around EVERY allocation → crashes at
+# the exact overrun / use-after-free, with a stack trace. Stricter than scribble
+# (which only paints bytes); slower and noisier. The decisive memory tool.
+test-gmalloc: $(BUILD_DIR)/test-runner-nosan
+	@echo "Running allocation-owning suites under Guard Malloc (libgmalloc). Crashes at the exact overrun/UAF. Slow."
+	@echo "Full report saved to $(MEM_LOG)."
+	$(call run_logged_command,$(MEM_LOG),DYLD_INSERT_LIBRARIES=/usr/lib/libgmalloc.dylib $(BUILD_DIR)/test-runner-nosan $(TEST_GMALLOC_SUITES))
+else
+test-memory test-gmalloc: $(BUILD_DIR)/test-runner
+	@echo "These targets are macOS-only (MallocScribble/libgmalloc). On Linux use 'make test-leak' (ASan/LSan), or build with -fsanitize=memory (MSan) for uninit detection."
+endif
+
+# ── Static analysis (Clang analyzer only — GCC has no --analyze flag) ──────
+ifeq ($(IS_GCC),no)
+# Every test seam define is required, not optional: the test sources call the
+# *_for_testing APIs that those defines gate. Analyzing without one makes those
+# calls implicit declarations returning int, which reports false compile errors
+# and poisons the analyzer's type reasoning for the whole translation unit.
+ANALYZE_LOG = $(BUILD_DIR)/analyze-report.txt
+test-analyze: $(ALL_TEST_SRCS) $(PROD_SRCS) | $(BUILD_DIR)
+	@echo "Running Clang static analyzer..."
+	@$(CC) --analyze $(CFLAGS_COMMON) $(EDITOR_TEST_DEFINES) \
+		$(KOTLIN_DEDUP_TEST_DEFINE) $(CALL_REFERENCE_LOOKUP_TEST_DEFINE) \
+		$(INCREMENTAL_TEST_DEFINE) $(TEST_INCLUDE_FLAGS) \
+		$(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) >"$(ANALYZE_LOG)" 2>&1; \
+		analyze_status=$$?; \
+		if grep -E "warning:|error:|note:" "$(ANALYZE_LOG)"; then \
+			:; \
+		elif [ $$analyze_status -eq 0 ]; then \
+			echo "No issues found."; \
+		else \
+			cat "$(ANALYZE_LOG)"; \
+		fi; \
+		exit $$analyze_status
+else
+test-analyze:
+	@echo "Static analysis skipped: requires Clang (not GCC). Install clang and re-run."
+endif
 
 # Real-binary POSIX lifecycle smoke. The endpoint is deliberately account-wide;
 # an explicit Make invocation requires a clean rendezvous and fails rather than
@@ -986,9 +1423,12 @@ GRAMMAR_OBJS_PROD = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/prod_%.o,$(GRAMMAR_SR
 TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
+GRAMMAR_DEPFILES += $(addsuffix .d,$(GRAMMAR_OBJS_PROD))
 
-$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+-include $(GRAMMAR_DEPFILES)
+
+$(GRAMMAR_OBJS_PROD): $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_DEP_STAMP) | $(BUILD_DIR)
+	$(CC) $(GRAMMAR_CFLAGS) -MMD -MP -MF $@.d -c -o $@ $<
 
 $(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
@@ -1047,8 +1487,41 @@ $(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(
 		$(OBJS_VENDORED_PROD) \
 		$(LDFLAGS)
 
+# Extraction latency/scale probe linked under the release configuration.  It
+# deliberately excludes test API defines and sanitizer flags, unlike
+# test-runner-nosan, so measurements represent the shipped hot path while
+# remaining independent of the account-wide daemon cohort.
+NATIVE_EXTRACTION_BENCH_SRCS = \
+	benchmarks/native_extraction_benchmark_main.c \
+	$(TEST_CS_LSP_BENCH_SRCS) \
+	$(TEST_PY_LSP_BENCH_SRCS) \
+	$(TEST_PY_LSP_SCALE_SRCS)
+
+$(BUILD_DIR)/native-extraction-benchmark: $(NATIVE_EXTRACTION_BENCH_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) $(BUILD_DIR)/.build-config $(PROJECT_HDRS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_PROD) $(TEST_INCLUDE_FLAGS) -o $@ \
+		$(NATIVE_EXTRACTION_BENCH_SRCS) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_PROD) \
+		$(LDFLAGS)
+	$(call codesign_binary,$@)
+
+native-extraction-benchmark: $(BUILD_DIR)/native-extraction-benchmark
+	@echo "Built: $(BUILD_DIR)/native-extraction-benchmark"
+
 cbm: $(BUILD_DIR)/codebase-memory-mcp
 	@echo "Built: $(BUILD_DIR)/codebase-memory-mcp"
+	$(call codesign_binary,$(BUILD_DIR)/codebase-memory-mcp)
+
+# ── Install to INSTALL_DIR (default ~/.local/bin) ────────────────
+# Re-signs after copy — required on macOS 25+ where cp invalidates the
+# existing ad-hoc signature and an unsigned binary gets SIGKILL at startup.
+INSTALL_DIR ?= $(HOME)/.local/bin
+install: cbm
+	@echo "Installing to $(INSTALL_DIR)/codebase-memory-mcp ..."
+	install -d "$(INSTALL_DIR)"
+	install -m 755 "$(BUILD_DIR)/codebase-memory-mcp" "$(INSTALL_DIR)/codebase-memory-mcp"
+	$(call codesign_binary,$(INSTALL_DIR)/codebase-memory-mcp)
+	@echo "Done. Run: $(INSTALL_DIR)/codebase-memory-mcp"
 
 # ── Build with embedded UI (requires Node.js) ───────────────────
 
@@ -1110,11 +1583,14 @@ lint-tidy:
 lint-tidy-diff:
 	@scripts/lint-tidy-diff.sh "$(CLANG_TIDY)" $(LINT_SRCS) -- $(CFLAGS_COMMON) $(SYSROOT_FLAG)
 
-# cppcheck: complementary analysis (config in .cppcheck)
+# cppcheck: complementary analysis (config in .cppcheck). Analyze the
+# failpoint-enabled superset so test-only allocation and cleanup paths remain
+# checked instead of collapsing to production constant-false stubs.
 lint-cppcheck:
 	@echo "=== cppcheck ==="
 	@$(CPPCHECK) --enable=warning,style,performance,portability \
 		--std=c11 --language=c \
+		-DCBM_ENABLE_TEST_SEAMS \
 		--suppressions-list=.cppcheck \
 		--error-exitcode=1 \
 		--inline-suppr \
@@ -1152,6 +1628,11 @@ lint-no-suppress:
 	fi
 	@echo "  Checking NOLINT(misc-no-recursion) against whitelist..."
 	@scripts/check-nolint-whitelist.sh
+	@bash scripts/check-source-safety.sh
+
+lint-source-safety:
+	@bash scripts/check-source-safety.sh
+	@bash scripts/test-source-safety.sh
 
 # All linters (run with make -j3 lint for parallel execution)
 lint: lint-tidy lint-cppcheck lint-format lint-no-suppress

@@ -30,8 +30,8 @@ NETWORK:src/main.c:connect:1:loopback-v4:main_daemon_ctl_socket_connected:single
 WRITE:src/main.c:3:supervised worker response path; cache-scoped hook notice marker; test-seam-only browser-open marker at the caller-supplied test path
 WRITE:src/daemon/application.c:1:recovery truncates only its private uniquely-created per-job marker file
 
-# ── CLI: update command (user-initiated, interactive) ──────────────────────
-src/cli/cli.c:cbm_popen:sha256 checksum verification (update cmd)
+# ── CLI: release-checksum helpers used by installer fixtures ──────────────
+src/cli/cli.c:cbm_popen:sha256 checksum verification helper
 src/cli/cli.c:popen:sha256 checksum computation via shasum
 
 # ── Watcher: git status polling (repo paths validated via cbm_validate_shell_arg) ──
@@ -41,9 +41,11 @@ src/watcher/watcher.c:cbm_popen:git working tree status (git_is_dirty)
 src/watcher/watcher.c:cbm_popen:git file count (git_file_count)
 src/watcher/watcher.c:popen:via cbm_popen wrapper calls
 
-# ── Git context: git metadata resolution (repo paths validated via cbm_validate_shell_arg) ──
-src/git/git_context.c:cbm_popen:git rev-parse/symbolic-ref/merge-base metadata lookup
-src/git/git_context.c:popen:via cbm_popen wrapper call
+# ── Git: metadata resolution (repo paths validated via cbm_git_validate_repo_path) ──
+src/git/git_command.c:cbm_popen:git rev-parse/symbolic-ref/merge-base/status metadata lookup
+src/git/git_command.c:popen:via cbm_popen wrapper call
+src/git/git_snapshot.c:cbm_popen:git snapshot metadata via the same validated command builders
+src/git/git_snapshot.c:popen:via cbm_popen wrapper call
 
 # ── MCP server: search and change detection ────────────────────────────────
 src/mcp/mcp.c:cbm_popen:search_code via grep (pattern in temp file, path validated)

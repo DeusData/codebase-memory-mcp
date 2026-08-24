@@ -23,6 +23,7 @@
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include "sqlite3.h" // sqlite3_mem_methods, sqlite3_config, SQLITE_CONFIG_MALLOC — bind sqlite to mimalloc
 #endif
+#include <limits.h>
 #include <stdint.h> // uint32_t, uint64_t, int64_t
 #include <stdlib.h>
 #include <string.h>
@@ -39,12 +40,9 @@ static _Atomic uint64_t total_preprocess_ns = 0;
 static _Atomic uint64_t total_files_preprocessed = 0;
 static _Atomic uint64_t total_files = 0;
 
-// C/C++ preprocessor #define macros are extracted as Macro nodes (#375). On a
-// macro-dense codebase (e.g. the Linux kernel: ~2.4M macros, 49% of all nodes)
-// this is the dominant extraction cost, so it is gated to the full/advanced
-// index modes. Default ON to preserve behavior for direct callers/tests; the
-// pipeline sets it from the index mode before extraction. Set once pre-extract,
-// read-only during, so a relaxed atomic is sufficient.
+// Default for direct cbm_extract_file() callers. Pipelines pass this per call
+// via cbm_extract_file_with_options(), because MCP can run multiple pipelines
+// with different modes in the same process.
 static _Atomic int g_extract_macros = 1;
 void cbm_set_macro_extraction(int enabled) {
     atomic_store_explicit(&g_extract_macros, enabled ? 1 : 0, memory_order_relaxed);
@@ -70,6 +68,28 @@ static uint64_t now_ns(void) {
     struct timespec ts;
     cbm_clock_gettime(CBM_CLOCK_MONO, &ts);
     return ((uint64_t)ts.tv_sec * NSEC_PER_SEC) + (uint64_t)ts.tv_nsec;
+}
+
+static bool cbm_language_has_file_lsp(CBMLanguage language) {
+    switch (language) {
+    case CBM_LANG_GO:
+    case CBM_LANG_PYTHON:
+    case CBM_LANG_JAVASCRIPT:
+    case CBM_LANG_TYPESCRIPT:
+    case CBM_LANG_TSX:
+    case CBM_LANG_RUST:
+    case CBM_LANG_JAVA:
+    case CBM_LANG_CPP:
+    case CBM_LANG_CSHARP:
+    case CBM_LANG_PHP:
+    case CBM_LANG_KOTLIN:
+    case CBM_LANG_C:
+    case CBM_LANG_PERL:
+    case CBM_LANG_CUDA:
+        return true;
+    default:
+        return false;
+    }
 }
 
 // cbm_get_profile returns accumulated parse/extract times and file count.
@@ -345,20 +365,36 @@ void cbm_alloc_init(void) {
 
 // --- Init/Shutdown ---
 
-static int cbm_initialized = 0;
+enum {
+    CBM_LIB_INIT_UNINIT = 0,
+    CBM_LIB_INIT_INITIALIZING = 1,
+    CBM_LIB_INIT_READY = 2,
+};
+
+static _Atomic int cbm_init_state = CBM_LIB_INIT_UNINIT;
 
 int cbm_init(void) {
-    if (cbm_initialized) {
+    if (atomic_load_explicit(&cbm_init_state, memory_order_acquire) == CBM_LIB_INIT_READY) {
         return 0;
     }
-    enum { CBM_INIT_DONE = 1 };
-    cbm_initialized = CBM_INIT_DONE;
+
+    int expected = CBM_LIB_INIT_UNINIT;
+    if (!atomic_compare_exchange_strong_explicit(&cbm_init_state, &expected,
+                                                 CBM_LIB_INIT_INITIALIZING, memory_order_acq_rel,
+                                                 memory_order_acquire)) {
+        while (atomic_load_explicit(&cbm_init_state, memory_order_acquire) != CBM_LIB_INIT_READY) {
+            /* Another thread is completing library initialization. */
+        }
+        return 0;
+    }
+
     /* Defense-in-depth allocator binds (idempotent). main() calls cbm_alloc_init
      * first; this covers non-main entry points (pipeline passes call cbm_init).
      * For sqlite the SQLITE_CONFIG_MALLOC bind only takes effect if it runs
      * before sqlite initializes — main() guarantees that ordering; here it is a
      * best-effort idempotent re-assert for paths that never hit main(). */
     cbm_alloc_init();
+    atomic_store_explicit(&cbm_init_state, CBM_LIB_INIT_READY, memory_order_release);
     return 0;
 }
 
@@ -384,7 +420,7 @@ void cbm_shutdown(void) {
     // Clean up thread-local parser for the calling thread.
     // Note: other threads' TLS parsers are freed when those threads exit.
     cbm_destroy_thread_parser();
-    cbm_initialized = 0;
+    atomic_store_explicit(&cbm_init_state, CBM_LIB_INIT_UNINIT, memory_order_release);
 }
 
 // --- Bottleneck call-name classification (language-agnostic heuristics) ---
@@ -728,63 +764,55 @@ static void cbm_test_fault_inject(const char *rel_path) {
 }
 #endif
 
-/* Pre-parse nesting guard for pathologically nested input. tree-sitter's GLR
- * parser recurses once per nesting level inside stack_node_add_link
- * (vendored ts_runtime/src/stack.c) while merging ambiguous parse-stack heads.
- * The Perl grammar is genuinely ambiguous for `f(...)` (function call vs.
- * bareword), so a deeply nested call chain `f(f(f(...)))` drives that recursion
- * as deep as the nesting and overflows a small (1 MB Windows) stack *during the
- * parse* — before any of the LSP walk-depth guards can fire. Unambiguous
- * grammars (C/Java/Python) keep a single stack head and don't hit this, which is
- * why only Perl crashed on the Windows/ARM CI runners.
- *
- * This is a workaround: the proper fix is bounding the GLR stack-merge recursion
- * inside the vendored tree-sitter runtime, tracked upstream as #913. Remove this
- * guard once that lands.
- *
- * cbm_source_nesting_exceeds scans the raw bytes for the maximum bracket-nesting
- * depth and returns true as soon as it passes the cap (early-exit, O(n)). Real
- * source never nests brackets this deep, so a file that does is skipped as a
- * parse error (zero edges — graceful degradation, never a crash). Brackets in
- * strings/comments are counted too: the only consequence of a false positive is
- * skipping one absurd file, so string-awareness is not worth the cost. */
-#define CBM_PERL_MAX_PARSE_NESTING 128
+static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
+                                            CBMLanguage language, const char *project,
+                                            const char *rel_path, int64_t timeout_micros,
+                                            const char **extra_defines, const char **include_paths,
+                                            bool extract_macros, const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table);
 
-static bool cbm_source_nesting_exceeds(const char *source, int source_len, int cap) {
-    int depth = 0;
-    for (int i = 0; i < source_len; i++) {
-        char c = source[i];
-        if (c == '(' || c == '[' || c == '{') {
-            if (++depth > cap) {
-                return true;
-            }
-        } else if ((c == ')' || c == ']' || c == '}') && depth > 0) {
-            depth--;
-        }
-    }
-    return false;
-}
-
-/* Best-effort parse-coverage collection (#963). Walks only the has_error paths
- * of the tree and records the 1-based line ranges of the TOP-MOST ERROR/MISSING
- * nodes (does not descend into an error subtree — one range per failed region).
- * Bounded by CBM_MAX_ERROR_REGIONS so pathological input can't blow up the
- * output. The ranges mark where constructs were dropped; they are a detection
- * aid, never a completeness proof. */
-#define CBM_MAX_ERROR_REGIONS 64
 typedef struct {
-    uint32_t starts[CBM_MAX_ERROR_REGIONS];
-    uint32_t ends[CBM_MAX_ERROR_REGIONS];
+    uint32_t start;
+    uint32_t end;
+} cbm_line_region_t;
+
+typedef struct {
+    cbm_line_region_t *items;
     int count;
+    int capacity;
 } cbm_error_regions_t;
 
-static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
-    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
-        return;
+/* Best-effort parse-coverage collection (#963). Walks only the has_error paths
+ * and records 1-based ranges for TOP-MOST ERROR/MISSING nodes. Geometric
+ * storage makes collection O(E) amortized time and O(E) memory for E regions;
+ * E is bounded by the already-materialized parse tree rather than a silent
+ * prefix cap. */
+static bool cbm_error_regions_append(cbm_error_regions_t *acc, uint32_t start, uint32_t end) {
+    if (!acc) {
+        return false;
     }
-    acc->starts[acc->count] = ts_node_start_point(n).row + 1;
-    acc->ends[acc->count] = ts_node_end_point(n).row + 1;
-    acc->count++;
+    if (acc->count >= acc->capacity) {
+        if (acc->capacity > INT_MAX / CBM_SZ_2) {
+            return false;
+        }
+        int next_capacity = acc->capacity ? acc->capacity * CBM_SZ_2 : CBM_SZ_64;
+        if ((size_t)next_capacity > SIZE_MAX / sizeof(*acc->items)) {
+            return false;
+        }
+        cbm_line_region_t *grown = realloc(acc->items, (size_t)next_capacity * sizeof(*acc->items));
+        if (!grown) {
+            return false;
+        }
+        acc->items = grown;
+        acc->capacity = next_capacity;
+    }
+    acc->items[acc->count++] = (cbm_line_region_t){.start = start, .end = end};
+    return true;
+}
+
+static bool cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
+    return cbm_error_regions_append(acc, ts_node_start_point(n).row + 1,
+                                    ts_node_end_point(n).row + 1);
 }
 
 /* #1610: a file that does not end with a newline leaves the grammar's
@@ -820,22 +848,40 @@ static bool cbm_is_eof_terminator_miss(TSNode n, int source_len) {
     return start == end && end == (uint32_t)source_len;
 }
 
-static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int source_len) {
-    if (acc->count >= CBM_MAX_ERROR_REGIONS) {
-        return;
-    }
+static bool cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int source_len) {
     uint32_t k = ts_node_child_count(n);
-    for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
+    for (uint32_t i = 0; i < k; i++) {
         TSNode c = ts_node_child(n, i);
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
             if (cbm_is_eof_terminator_miss(c, source_len)) {
                 continue; /* absent final newline only — nothing was dropped */
             }
-            cbm_error_regions_push(acc, c); /* top-most region; do not descend */
-        } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc, source_len);
+            /* Top-most region; do not descend. */
+            if (!cbm_error_regions_push(acc, c)) {
+                return false;
+            }
+        } else if (ts_node_has_error(c) && !cbm_collect_error_regions(c, acc, source_len)) {
+            return false;
         }
     }
+    return true;
+}
+
+static void cbm_error_regions_destroy(cbm_error_regions_t *regions) {
+    if (!regions) {
+        return;
+    }
+    free(regions->items);
+    *regions = (cbm_error_regions_t){0};
+}
+
+static int cbm_line_region_compare(const void *lhs, const void *rhs) {
+    const cbm_line_region_t *a = lhs;
+    const cbm_line_region_t *b = rhs;
+    if (a->start != b->start) {
+        return (a->start > b->start) - (a->start < b->start);
+    }
+    return (a->end > b->end) - (a->end < b->end);
 }
 
 /* Recovery subtraction (#963): tree-sitter error recovery plus the
@@ -847,46 +893,46 @@ static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int so
  * Container defs (Module/Package) are ignored: a file-spanning Module node is
  * not evidence the region's constructs survived. Conservative: partially
  * covered regions stay flagged. */
-static bool cbm_region_is_recovered(uint32_t rs, uint32_t re, const CBMDefArray *defs) {
-    enum { MAX_COVER_DEFS = 256 };
-    uint32_t starts[MAX_COVER_DEFS];
-    uint32_t ends[MAX_COVER_DEFS];
-    int n = 0;
-    for (int i = 0; i < defs->count && n < MAX_COVER_DEFS; i++) {
+static bool cbm_collect_recovery_regions(const CBMDefArray *defs, cbm_error_regions_t *recovered) {
+    for (int i = 0; i < defs->count; i++) {
         const CBMDefinition *d = &defs->items[i];
         if (!d->label || strcmp(d->label, "Module") == 0 || strcmp(d->label, "Package") == 0) {
             continue;
         }
-        if (d->start_line < rs || d->start_line > re) {
-            continue; /* recovery evidence must originate inside the region */
+        uint32_t end = d->end_line < d->start_line ? d->start_line : d->end_line;
+        if (!cbm_error_regions_append(recovered, d->start_line, end)) {
+            return false;
         }
-        starts[n] = d->start_line;
-        ends[n] = d->end_line < d->start_line ? d->start_line : d->end_line;
-        n++;
     }
-    if (n == 0) {
+    if (recovered->count > 1) {
+        qsort(recovered->items, (size_t)recovered->count, sizeof(*recovered->items),
+              cbm_line_region_compare);
+    }
+    return true;
+}
+
+static bool cbm_region_is_recovered(uint32_t rs, uint32_t re,
+                                    const cbm_error_regions_t *recovered) {
+    if (!recovered || recovered->count <= 0) {
         return false;
     }
-    /* Insertion-sort by start, then sweep for gaps in [rs, re]. */
-    for (int i = 1; i < n; i++) {
-        uint32_t s = starts[i];
-        uint32_t e = ends[i];
-        int j = i - 1;
-        while (j >= 0 && starts[j] > s) {
-            starts[j + 1] = starts[j];
-            ends[j + 1] = ends[j];
-            j--;
+    int lo = 0;
+    int hi = recovered->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / CBM_SZ_2;
+        if (recovered->items[mid].start < rs) {
+            lo = mid + SKIP_ONE;
+        } else {
+            hi = mid;
         }
-        starts[j + 1] = s;
-        ends[j + 1] = e;
     }
     uint32_t covered_to = rs - 1;
-    for (int i = 0; i < n; i++) {
-        if (starts[i] > covered_to + 1) {
+    for (int i = lo; i < recovered->count && recovered->items[i].start <= re; i++) {
+        if (covered_to != UINT32_MAX && recovered->items[i].start > covered_to + 1) {
             return false; /* uncovered gap */
         }
-        if (ends[i] > covered_to) {
-            covered_to = ends[i];
+        if (recovered->items[i].end > covered_to) {
+            covered_to = recovered->items[i].end;
         }
     }
     return covered_to >= re;
@@ -1025,15 +1071,23 @@ static bool cbm_remap_preprocessed_def(CBMDefinition *def, const CBMPreprocessed
 }
 
 static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMDefArray *defs) {
+    /* One shared sort replaces the former per-region insertion sort:
+     * O(D log D + E log D + D) for disjoint top-level error regions, with
+     * O(D) auxiliary storage for D extracted definitions and E errors. */
+    cbm_error_regions_t recovered = {0};
+    if (!cbm_collect_recovery_regions(defs, &recovered)) {
+        cbm_error_regions_destroy(&recovered);
+        return; /* conservative: retain every parse-partial range */
+    }
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
-        if (!cbm_region_is_recovered(regs->starts[i], regs->ends[i], defs)) {
-            regs->starts[kept] = regs->starts[i];
-            regs->ends[kept] = regs->ends[i];
-            kept++;
+        cbm_line_region_t region = regs->items[i];
+        if (!cbm_region_is_recovered(region.start, region.end, &recovered)) {
+            regs->items[kept++] = region;
         }
     }
     regs->count = kept;
+    cbm_error_regions_destroy(&recovered);
 }
 
 /* #1071: a function-like macro invocation whose argument is a type token
@@ -1119,13 +1173,11 @@ static void cbm_subtract_macro_invocation_regions(cbm_error_regions_t *regs,
                                                   int src_len) {
     int kept = 0;
     for (int i = 0; i < regs->count; i++) {
-        bool benign =
-            cbm_span_is_macro_invocation(src, src_len, regs->starts[i], regs->ends[i], defs) &&
-            cbm_region_inside_callable(regs->starts[i], regs->ends[i], defs);
+        cbm_line_region_t region = regs->items[i];
+        bool benign = cbm_span_is_macro_invocation(src, src_len, region.start, region.end, defs) &&
+                      cbm_region_inside_callable(region.start, region.end, defs);
         if (!benign) {
-            regs->starts[kept] = regs->starts[i];
-            regs->ends[kept] = regs->ends[i];
-            kept++;
+            regs->items[kept++] = region;
         }
     }
     regs->count = kept;
@@ -1137,16 +1189,105 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
         return NULL;
     }
     enum { RANGE_MAX = 24 }; /* "4294967295-4294967295," */
+    if ((size_t)regs->count > SIZE_MAX / RANGE_MAX) {
+        return NULL;
+    }
     char *buf = (char *)cbm_arena_alloc(a, (size_t)regs->count * RANGE_MAX);
     if (!buf) {
         return NULL;
     }
     size_t off = 0;
     for (int i = 0; i < regs->count; i++) {
-        off += (size_t)snprintf(buf + off, RANGE_MAX, "%s%u-%u", i ? "," : "", regs->starts[i],
-                                regs->ends[i]);
+        off += (size_t)snprintf(buf + off, RANGE_MAX, "%s%u-%u", i ? "," : "", regs->items[i].start,
+                                regs->items[i].end);
     }
     return buf;
+}
+
+typedef struct {
+    int def_index;
+    uint32_t start_line;
+} cbm_callable_interval_t;
+
+static bool cbm_is_callable_definition(const CBMDefinition *def) {
+    return def && def->name && def->label &&
+           (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0);
+}
+
+static int cbm_callable_interval_start_compare(const void *lhs, const void *rhs) {
+    const cbm_callable_interval_t *a = lhs;
+    const cbm_callable_interval_t *b = rhs;
+    if (a->start_line != b->start_line) {
+        return (a->start_line > b->start_line) - (a->start_line < b->start_line);
+    }
+    return (a->def_index > b->def_index) - (a->def_index < b->def_index);
+}
+
+static int64_t cbm_callable_span(const CBMDefinition *def) {
+    return (int64_t)def->end_line - (int64_t)def->start_line;
+}
+
+static bool cbm_callable_heap_precedes(const CBMDefinition *defs, int lhs, int rhs) {
+    int64_t lhs_span = cbm_callable_span(&defs[lhs]);
+    int64_t rhs_span = cbm_callable_span(&defs[rhs]);
+    return lhs_span < rhs_span || (lhs_span == rhs_span && lhs < rhs);
+}
+
+static void cbm_callable_heap_push(int *heap, int *count, const CBMDefinition *defs,
+                                   int def_index) {
+    int pos = (*count)++;
+    while (pos > 0) {
+        int parent = (pos - SKIP_ONE) / CBM_SZ_2;
+        if (!cbm_callable_heap_precedes(defs, def_index, heap[parent])) {
+            break;
+        }
+        heap[pos] = heap[parent];
+        pos = parent;
+    }
+    heap[pos] = def_index;
+}
+
+static void cbm_callable_heap_pop(int *heap, int *count, const CBMDefinition *defs) {
+    int replacement = heap[--(*count)];
+    if (*count == 0) {
+        return;
+    }
+    int pos = 0;
+    while (true) {
+        int left = pos * CBM_SZ_2 + SKIP_ONE;
+        if (left >= *count) {
+            break;
+        }
+        int right = left + SKIP_ONE;
+        int child = right < *count && cbm_callable_heap_precedes(defs, heap[right], heap[left])
+                        ? right
+                        : left;
+        if (!cbm_callable_heap_precedes(defs, heap[child], replacement)) {
+            break;
+        }
+        heap[pos] = heap[child];
+        pos = child;
+    }
+    heap[pos] = replacement;
+}
+
+static int cbm_find_innermost_callable_linear(const CBMDefinition *defs, int def_count,
+                                              int call_line) {
+    int best = -1;
+    int64_t best_span = -1;
+    for (int di = 0; di < def_count; di++) {
+        const CBMDefinition *def = &defs[di];
+        if (!cbm_is_callable_definition(def) || (int64_t)def->start_line > call_line ||
+            call_line > (int64_t)def->end_line) {
+            continue;
+        }
+        int64_t span = cbm_callable_span(def);
+        if (best < 0 || span < best_span) {
+            best_span = span;
+            best = di;
+        }
+    }
+    return best;
 }
 
 /* Public entry: run the extraction and journal completion. The DONE mark on
@@ -1156,9 +1297,31 @@ static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, const char **include_paths) {
-    CBMFileResult *r =
-        cbm_extract_file_ex(source, source_len, language, project, rel_path, timeout_micros,
-                            extra_defines, include_paths, NULL, NULL);
+    return cbm_extract_file_with_options(source, source_len, language, project, rel_path,
+                                         timeout_micros, extra_defines, include_paths,
+                                         cbm_macro_extraction_enabled() != 0);
+}
+
+CBMFileResult *cbm_extract_file_with_options(const char *source, int source_len,
+                                             CBMLanguage language, const char *project,
+                                             const char *rel_path, int64_t timeout_micros,
+                                             const char **extra_defines, const char **include_paths,
+                                             bool extract_macros) {
+    return cbm_extract_file_with_options_ex(source, source_len, language, project, rel_path,
+                                            timeout_micros, extra_defines, include_paths,
+                                            extract_macros, NULL, NULL);
+}
+
+CBMFileResult *cbm_extract_file_with_options_ex(const char *source, int source_len,
+                                                CBMLanguage language, const char *project,
+                                                const char *rel_path, int64_t timeout_micros,
+                                                const char **extra_defines,
+                                                const char **include_paths, bool extract_macros,
+                                                const CBMMacroTable *macro_table,
+                                                const CBMReturnTypeTable *return_type_table) {
+    CBMFileResult *r = cbm_extract_file_impl(source, source_len, language, project, rel_path,
+                                             timeout_micros, extra_defines, include_paths,
+                                             extract_macros, macro_table, return_type_table);
     return r;
 }
 
@@ -1167,6 +1330,17 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                                    int64_t timeout_micros, const char **extra_defines,
                                    const char **include_paths, const CBMMacroTable *macro_table,
                                    const CBMReturnTypeTable *return_type_table) {
+    return cbm_extract_file_with_options_ex(
+        source, source_len, language, project, rel_path, timeout_micros, extra_defines,
+        include_paths, cbm_macro_extraction_enabled() != 0, macro_table, return_type_table);
+}
+
+static CBMFileResult *cbm_extract_file_impl(const char *source, int source_len,
+                                            CBMLanguage language, const char *project,
+                                            const char *rel_path, int64_t timeout_micros,
+                                            const char **extra_defines, const char **include_paths,
+                                            bool extract_macros, const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table) {
     // Allocate result on heap (arena inside for all string data)
     enum { SINGLE = 1 };
     CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
@@ -1208,17 +1382,6 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         result->has_error = true;
         result->error_msg = cbm_arena_strdup(a, "no tree-sitter grammar");
         cbm_index_mark_done(rel_path);
-        return result;
-    }
-
-    // Skip pathologically nested Perl before tree-sitter's recursive GLR stack
-    // merge overflows a small stack during the parse (see
-    // cbm_source_nesting_exceeds). Scoped to Perl: its ambiguous call grammar is
-    // the only one that drives that recursion to the nesting depth.
-    if (language == CBM_LANG_PERL &&
-        cbm_source_nesting_exceeds(source, source_len, CBM_PERL_MAX_PARSE_NESTING)) {
-        result->has_error = true;
-        result->error_msg = cbm_arena_strdup(a, "perl source nesting too deep; skipped");
         return result;
     }
 
@@ -1285,6 +1448,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         .rel_path = rel_path,
         .module_qn = result->module_qn,
         .root = root,
+        .extract_macros = extract_macros,
         .macro_table = macro_table,
         .return_type_table = return_type_table,
     };
@@ -1312,8 +1476,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
 
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
-    uint64_t lsp_start = now_ns();
-    {
+    if (cbm_language_has_file_lsp(language)) {
+        uint64_t lsp_start = now_ns();
         if (language == CBM_LANG_GO) {
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
@@ -1352,17 +1516,17 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (language == CBM_LANG_CSHARP) {
             cbm_run_cs_lsp(a, result, source, source_len, root);
         }
+        if (language == CBM_LANG_JAVA) {
+            cbm_run_java_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_KOTLIN) {
+            cbm_run_kotlin_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_RUST) {
+            cbm_run_rust_lsp(a, result, source, source_len, root);
+        }
+        atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
     }
-    if (language == CBM_LANG_JAVA) {
-        cbm_run_java_lsp(a, result, source, source_len, root);
-    }
-    if (language == CBM_LANG_KOTLIN) {
-        cbm_run_kotlin_lsp(a, result, source, source_len, root);
-    }
-    if (language == CBM_LANG_RUST) {
-        cbm_run_rust_lsp(a, result, source, source_len, root);
-    }
-    atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
     // Calls extracted so far all carry ORIGINAL-source line numbers; the C/C++
     // preprocessor second pass below appends calls with EXPANDED-source lines,
@@ -1413,11 +1577,15 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                         .rel_path = rel_path,
                         .module_qn = result->module_qn,
                         .root = pp_root,
+                        .extract_macros = extract_macros,
+                        .macro_table = macro_table,
+                        .return_type_table = return_type_table,
                     };
-                    // Re-run unified extraction on expanded source.
-                    // This adds macro-expanded calls; duplicates with original calls are
-                    // harmless (pipeline deduplicates by caller+callee).
-                    cbm_extract_unified(&pp_ctx);
+                    // Re-run only call extraction on expanded source. Other metadata
+                    // from included/expanded text would be attributed to this file.
+                    // Duplicated calls are harmless (pipeline deduplicates by
+                    // caller+callee).
+                    cbm_extract_unified_calls_only(&pp_ctx);
 
                     /* Stamp parser carriers before C-LSP performs any
                      * origin-sensitive rewrite. Numeric spans in the expanded
@@ -1455,9 +1623,10 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                      * the raw source line, and whose QN the raw pass did not
                      * already extract. */
                     if (ts_node_has_error(root)) {
-                        cbm_error_regions_t raw_regs = {{0}, {0}, 0};
-                        cbm_collect_error_regions(root, &raw_regs, source_len);
-                        if (raw_regs.count > 0) {
+                        cbm_error_regions_t raw_regs = {0};
+                        bool raw_regions_complete =
+                            cbm_collect_error_regions(root, &raw_regs, source_len);
+                        if (raw_regions_complete && raw_regs.count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
                             int w = defs_before;
@@ -1466,8 +1635,8 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                                 bool adopt = false;
                                 if (cbm_remap_preprocessed_def(d, preprocessed)) {
                                     for (int rj = 0; rj < raw_regs.count && !adopt; rj++) {
-                                        if (d->start_line <= raw_regs.ends[rj] &&
-                                            d->end_line >= raw_regs.starts[rj]) {
+                                        if (d->start_line <= raw_regs.items[rj].end &&
+                                            d->end_line >= raw_regs.items[rj].start) {
                                             adopt = true;
                                         }
                                     }
@@ -1493,6 +1662,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                             }
                             result->defs.count = w;
                         }
+                        cbm_error_regions_destroy(&raw_regs);
                     }
 
                     ts_tree_delete(pp_tree);
@@ -1510,13 +1680,92 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     // Bottleneck call-context metrics. Each call is attributed to the INNERMOST
     // enclosing Function/Method def by source-line range (defs and calls in one
     // CBMFileResult share the same file). Range matching is used instead of
-    // enclosing_func_qn string matching because some grammars (notably C, whose
-    // function_definition has no "name" field) attribute the call's scope to the
-    // module rather than the function — line ranges are unambiguous and
-    // language-agnostic. Bounded per file (defs x calls), not a repo-scale scan.
+    // enclosing_func_qn string matching because some grammars attribute the
+    // call's scope to the module rather than the function.
     int def_count = result->defs.count;
-    bool *has_self = def_count > 0 ? calloc((size_t)def_count, sizeof(bool)) : NULL;
-    bool *has_guarded = def_count > 0 ? calloc((size_t)def_count, sizeof(bool)) : NULL;
+
+    /* The unified raw-source walk normally emits source-ordered calls and defs.
+     * Disjoint callable intervals use a zero-scratch O(C+D) sweep. Nested
+     * intervals use a span-ordered min-heap in O((C+D) log D) time and O(D)
+     * memory; unordered definitions are sorted once. Every path preserves the
+     * former "smallest span, first def on ties" rule. If ordering or allocation
+     * assumptions fail, retain the exact O(C*D), O(D) parent bound. */
+    bool calls_source_ordered = true;
+    int previous_call_line = -1;
+    for (int ci = 0; ci < orig_calls_count; ci++) {
+        int line = result->calls.items[ci].start_line;
+        if (line <= 0) {
+            continue;
+        }
+        if (previous_call_line > line) {
+            calls_source_ordered = false;
+            break;
+        }
+        previous_call_line = line;
+    }
+
+    bool callable_starts_ordered = true;
+    bool callable_intervals_overlap = false;
+    int callable_count = 0;
+    uint32_t previous_callable_start = 0;
+    uint32_t callable_max_end = 0;
+    for (int di = 0; di < def_count; di++) {
+        const CBMDefinition *def = &result->defs.items[di];
+        if (!cbm_is_callable_definition(def)) {
+            continue;
+        }
+        if (callable_count > 0) {
+            if (def->start_line < previous_callable_start) {
+                callable_starts_ordered = false;
+            }
+            if (def->start_line <= callable_max_end) {
+                callable_intervals_overlap = true;
+            }
+        }
+        if (def->end_line > callable_max_end) {
+            callable_max_end = def->end_line;
+        }
+        previous_callable_start = def->start_line;
+        callable_count++;
+    }
+
+    bool use_direct_nonoverlap =
+        calls_source_ordered && callable_starts_ordered && !callable_intervals_overlap;
+    bool use_heap_sweep = calls_source_ordered && !use_direct_nonoverlap;
+    cbm_callable_interval_t *callable_intervals = NULL;
+    int *callable_heap = NULL;
+    if (use_heap_sweep && callable_count > 0 &&
+        (size_t)callable_count <= SIZE_MAX / sizeof(*callable_heap)) {
+        callable_heap = malloc((size_t)callable_count * sizeof(*callable_heap));
+    }
+    if (use_heap_sweep && !callable_starts_ordered && callable_count > 0 &&
+        (size_t)callable_count <= SIZE_MAX / sizeof(*callable_intervals)) {
+        callable_intervals = malloc((size_t)callable_count * sizeof(*callable_intervals));
+        if (callable_intervals) {
+            int interval_count = 0;
+            for (int di = 0; di < def_count; di++) {
+                if (cbm_is_callable_definition(&result->defs.items[di])) {
+                    callable_intervals[interval_count++] = (cbm_callable_interval_t){
+                        .def_index = di,
+                        .start_line = result->defs.items[di].start_line,
+                    };
+                }
+            }
+            qsort(callable_intervals, (size_t)callable_count, sizeof(*callable_intervals),
+                  cbm_callable_interval_start_compare);
+        }
+    }
+    if (use_heap_sweep && (!callable_heap || (!callable_starts_ordered && !callable_intervals))) {
+        free(callable_intervals);
+        free(callable_heap);
+        callable_intervals = NULL;
+        callable_heap = NULL;
+        use_heap_sweep = false;
+    }
+    int next_callable = 0;
+    int next_callable_def = 0;
+    int active_nonoverlap_def = -1;
+    int callable_heap_count = 0;
 
     // param_count is a standalone structural smell (independent of calls). Prefer
     // the parsed param_names array; fall back to counting from the signature text
@@ -1540,22 +1789,59 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (!c->callee_name || c->start_line <= 0) {
             continue;
         }
-        // Innermost enclosing Function/Method def by line range (smallest span).
         int best = -1;
-        int best_span = -1;
-        for (int di = 0; di < def_count; di++) {
-            const CBMDefinition *d = &result->defs.items[di];
-            if (!d->name || !d->label ||
-                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)) {
-                continue;
+        if (use_direct_nonoverlap) {
+            while (next_callable_def < def_count) {
+                const CBMDefinition *next_def = &result->defs.items[next_callable_def];
+                if (!cbm_is_callable_definition(next_def)) {
+                    next_callable_def++;
+                    continue;
+                }
+                if (next_def->start_line > (uint32_t)c->start_line) {
+                    break;
+                }
+                active_nonoverlap_def = next_callable_def++;
             }
-            if ((int)d->start_line <= c->start_line && c->start_line <= (int)d->end_line) {
-                int span = (int)d->end_line - (int)d->start_line;
-                if (best < 0 || span < best_span) {
-                    best_span = span;
-                    best = di;
+            if (active_nonoverlap_def >= 0 &&
+                result->defs.items[active_nonoverlap_def].end_line >= (uint32_t)c->start_line) {
+                best = active_nonoverlap_def;
+            }
+        } else if (use_heap_sweep) {
+            while (next_callable < callable_count) {
+                int next_def_index = -1;
+                uint32_t next_start = 0;
+                if (callable_intervals) {
+                    next_def_index = callable_intervals[next_callable].def_index;
+                    next_start = callable_intervals[next_callable].start_line;
+                } else {
+                    while (next_callable_def < def_count &&
+                           !cbm_is_callable_definition(&result->defs.items[next_callable_def])) {
+                        next_callable_def++;
+                    }
+                    if (next_callable_def < def_count) {
+                        next_def_index = next_callable_def;
+                        next_start = result->defs.items[next_callable_def].start_line;
+                    }
+                }
+                if (next_def_index < 0 || next_start > (uint32_t)c->start_line) {
+                    break;
+                }
+                cbm_callable_heap_push(callable_heap, &callable_heap_count, result->defs.items,
+                                       next_def_index);
+                next_callable++;
+                if (!callable_intervals) {
+                    next_callable_def++;
                 }
             }
+            while (callable_heap_count > 0 &&
+                   result->defs.items[callable_heap[0]].end_line < (uint32_t)c->start_line) {
+                cbm_callable_heap_pop(callable_heap, &callable_heap_count, result->defs.items);
+            }
+            if (callable_heap_count > 0) {
+                best = callable_heap[0];
+            }
+        } else {
+            best = cbm_find_innermost_callable_linear(result->defs.items, def_count, c->start_line);
         }
         if (best < 0) {
             continue;
@@ -1574,14 +1860,13 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             // Direct self-recursion. The call graph omits self-edges (pass_calls
             // skips source==target), so detect it here; seeds "recursive".
             d->is_recursive = true;
-            if (has_self) {
-                has_self[best] = true;
-            }
             if (in_loop) {
                 d->recursion_in_loop = true; // recursion compounded by a loop
             }
-            if (c->branch_depth > 0 && has_guarded) {
-                has_guarded[best] = true; // a self-call guarded by some conditional
+            if (c->branch_depth > 0) {
+                /* Temporary during this loop: a guarded self-call was seen.
+                 * Materialized to the public inverse meaning below. */
+                d->unguarded_recursion = true;
             }
         }
         if (in_loop && is_linear_scan_name(callee_short)) {
@@ -1591,16 +1876,17 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             d->alloc_in_loop++; // repeated allocation/append inside a loop
         }
     }
+    free(callable_intervals);
+    free(callable_heap);
 
     // Recursive with no self-call guarded by any conditional → no obvious base
     // case on the recursive path: a stronger "potentially unbounded" signal.
     for (int di = 0; di < def_count; di++) {
-        if (has_self && has_self[di] && !(has_guarded && has_guarded[di])) {
-            result->defs.items[di].unguarded_recursion = true;
+        CBMDefinition *def = &result->defs.items[di];
+        if (def->is_recursive) {
+            def->unguarded_recursion = !def->unguarded_recursion;
         }
     }
-    free(has_self);
-    free(has_guarded);
 
     uint64_t t2 = now_ns();
 
@@ -1610,21 +1896,28 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
      * miss, and a fully recovered file is not flagged at all. Detection aid
      * only: the absence of this flag is NOT a completeness guarantee. */
     if (ts_node_has_error(root)) {
-        cbm_error_regions_t regs = {{0}, {0}, 0};
-        if (strcmp(ts_node_type(root), "ERROR") == 0) {
-            cbm_error_regions_push(&regs, root); /* whole file unparseable */
-        } else {
-            cbm_collect_error_regions(root, &regs, source_len);
+        cbm_error_regions_t regs = {0};
+        /* A root that is itself ERROR means the whole file is unparseable. */
+        bool regions_complete = strcmp(ts_node_type(root), "ERROR") == 0
+                                    ? cbm_error_regions_push(&regs, root)
+                                    : cbm_collect_error_regions(root, &regs, source_len);
+        if (regions_complete) {
+            cbm_subtract_recovered_regions(&regs, &result->defs);
+            /* #1071: don't flag a benign function-like-macro call (defined in-file)
+             * that tree-sitter can't parse without the preprocessor. */
+            cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
         }
-        cbm_subtract_recovered_regions(&regs, &result->defs);
-        /* #1071: don't flag a benign function-like-macro call (defined in-file)
-         * that tree-sitter can't parse without the preprocessor. */
-        cbm_subtract_macro_invocation_regions(&regs, &result->defs, source, source_len);
-        if (regs.count > 0) {
+        if (!regions_complete) {
+            result->parse_incomplete = true;
+            result->error_region_count = 0;
+            result->error_ranges =
+                cbm_arena_strdup(a, "unknown (error-region collection allocation failed)");
+        } else if (regs.count > 0) {
             result->parse_incomplete = true;
             result->error_region_count = regs.count;
             result->error_ranges = cbm_error_ranges_str(a, &regs);
         }
+        cbm_error_regions_destroy(&regs);
     }
 
     result->imports_count = result->imports.count;

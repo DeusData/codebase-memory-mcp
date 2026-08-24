@@ -27,6 +27,7 @@
  */
 
 #include "ts_lsp.h"
+#include "foundation/platform.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3222,7 +3223,7 @@ static void resolve_jsx_element(TSLSPContext *ctx, TSNode element_node) {
              * per-file row deliberately keeps the file eligible for the
              * cross-file pass, where resolved import QNs and project defs are
              * available. */
-            const CBMRegisteredFunc *f = cbm_registry_lookup_symbol(ctx->registry, mqn, tag_name);
+            const CBMRegisteredFunc *f = ts_lookup_symbol_for_call(ctx, mqn, tag_name, (TSNode){0});
             if (f) {
                 ts_emit_resolved_call_at(ctx, f->qualified_name, "lsp_ts_jsx_import", 0.95f, tag);
                 return;
@@ -3794,8 +3795,7 @@ void ts_lsp_init(TSLSPContext *ctx, CBMArena *arena, const char *source, int sou
     ctx->dts_mode = dts_mode;
     ctx->current_scope = arena ? cbm_scope_push(arena, NULL) : NULL;
 
-    const char *debug_env = getenv("CBM_LSP_DEBUG");
-    ctx->debug = (debug_env && debug_env[0]);
+    ctx->debug = cbm_env_flag_enabled("CBM_LSP_DEBUG");
 }
 
 void ts_lsp_add_import(TSLSPContext *ctx, const char *local_name, const char *module_qn) {
@@ -5517,8 +5517,7 @@ void cbm_run_ts_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
     // Diagnostic / benchmarking knob: setting `CBM_LSP_DISABLED=1` skips the resolver.
     // This is used by the baseline-vs-LSP comparison tests to measure how many calls
     // the LSP-augmented path adds over plain tree-sitter extraction.
-    const char *disabled = getenv("CBM_LSP_DISABLED");
-    if (disabled && disabled[0] && disabled[0] != '0')
+    if (cbm_env_flag_enabled("CBM_LSP_DISABLED"))
         return;
 
     CBMTypeRegistry reg;

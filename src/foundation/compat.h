@@ -9,6 +9,7 @@
 #define CBM_COMPAT_H
 
 #include <errno.h>
+#include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdio.h>
@@ -18,6 +19,12 @@
  * it those calls become implicit declarations that conflict with the real
  * stdlib.h types and fail to compile on native ARM64 Windows. */
 #include <stdlib.h>
+#include <sys/stat.h>
+
+/* Read struct stat's modification time through one portable spelling. Windows
+ * stat exposes seconds only; Darwin and other POSIX platforms expose their
+ * native nanosecond fields under different member names. */
+int64_t cbm_stat_mtime_ns(const struct stat *st);
 
 /* ── Thread-local storage ─────────────────────────────────────── */
 /* _Thread_local is C11 standard — works on GCC, Clang, and MSVC (2019+).
@@ -56,9 +63,12 @@ ssize_t cbm_getline(char **lineptr, size_t *n, FILE *stream);
 
 /* ── fileno ───────────────────────────────────────────────────── */
 #ifdef _WIN32
+#include <io.h>
 #define cbm_fileno _fileno
+#define cbm_close_fd _close
 #else
 #define cbm_fileno fileno
+#define cbm_close_fd close
 #endif
 
 /* ── strcasestr (Windows lacks it) ────────────────────────────── */
@@ -117,9 +127,13 @@ char *cbm_mkdtemp(char *tmpl);
 /* ── mkstemp (Windows lacks it) ──────────────────────────────── */
 #ifdef _WIN32
 int cbm_mkstemp(char *tmpl);
-
+int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz);
 #else
 #define cbm_mkstemp mkstemp
+static inline int cbm_mkstemp_s(char *tmpl, size_t tmpl_sz) {
+    (void)tmpl_sz;
+    return mkstemp(tmpl);
+}
 #endif
 
 /* Rewrite an absolute path into the form the platform's file APIs accept at
@@ -193,7 +207,6 @@ static inline int cbm_unsetenv(const char *name) {
 
 /* ── pipe (Windows uses _pipe) ───────────────────────────────── */
 #ifdef _WIN32
-#include <io.h>
 #include <fcntl.h>
 #define cbm_pipe(fds) _pipe(fds, 4096, _O_BINARY)
 #else

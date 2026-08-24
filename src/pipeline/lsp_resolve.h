@@ -22,9 +22,12 @@
 #define CBM_PIPELINE_LSP_RESOLVE_H
 
 #include "cbm.h"
+#include "foundation/compat.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
+#include "foundation/hash_table.h"
 
+#include <stdbool.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +40,7 @@
  * Applies to every language whose LSP populates result->resolved_calls
  * (Go, C/C++, Python, PHP). */
 #define CBM_LSP_CONFIDENCE_FLOOR 0.6f
+#define CBM_LSP_RESOLUTION_KEY_SEP '|'
 
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Test-build-only operation counter implemented by pass_usages.c. Keeping the
@@ -78,6 +82,26 @@ static inline const char *cbm_lsp_bare_segment(const char *name) {
         seg++;
     }
     return seg;
+}
+
+static inline bool cbm_lsp_reason_join_strategy(const char *strategy) {
+    return strategy &&
+           (strcmp(strategy, "lsp_func_ptr") == 0 || strcmp(strategy, "lsp_dll_resolve") == 0 ||
+            strcmp(strategy, "lsp_method_ref_ctor") == 0 ||
+            strcmp(strategy, "lsp_method_ref_ctor_synth") == 0 ||
+            strcmp(strategy, "lsp_dict_dispatch") == 0 ||
+            strcmp(strategy, "lsp_import_alias") == 0 || strcmp(strategy, "lsp_destructor") == 0 ||
+            strcmp(strategy, "php_method_dynamic") == 0);
+}
+
+static inline bool cbm_lsp_resolution_matches_call(const CBMResolvedCall *rc, const CBMCall *call) {
+    const char *call_short = cbm_lsp_bare_segment(call->callee_name);
+    const char *resolved_short = cbm_lsp_bare_segment(rc->callee_qn);
+    if (strcmp(resolved_short, call_short) == 0) {
+        return true;
+    }
+    return rc->reason && cbm_lsp_reason_join_strategy(rc->strategy) &&
+           strcmp(cbm_lsp_bare_segment(rc->reason), call_short) == 0;
 }
 
 /* Tail helper: return the start of the final two dot-separated segments
@@ -373,16 +397,16 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
  *
  * The pointer returned aliases into `arr` and stays valid as long as the
  * underlying CBMFileResult is alive. */
-static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
-    const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
-    const cbm_gbuf_t *gbuf, const char *project_name) {
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor_in_graph(
+    const CBMResolvedCallArray *arr, const CBMCall *call, double confidence_floor,
+    bool allow_tail_match, const cbm_gbuf_t *gbuf, const char *project_name) {
     if (!arr || arr->count == 0 || !call) {
         return NULL;
     }
     if (!call->enclosing_func_qn || !call->callee_name) {
         return NULL;
     }
-
+    double floor = confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
     const CBMResolvedCall *best_exact_caller = NULL;
     int best_exact_caller_rank = 0;
     bool exact_caller_ambiguous = false;
@@ -394,7 +418,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         if (!rc->caller_qn || !rc->callee_qn) {
             continue;
         }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if ((double)rc->confidence < floor) {
             continue;
         }
         if (strcmp(rc->caller_qn, call->enclosing_func_qn) != 0) {
@@ -443,7 +467,7 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         if (!rc->caller_qn || !rc->callee_qn) {
             continue;
         }
-        if (rc->confidence < CBM_LSP_CONFIDENCE_FLOOR) {
+        if ((double)rc->confidence < floor) {
             continue;
         }
         int site_rank = cbm_pipeline_invocation_site_rank(rc, call);
@@ -481,6 +505,20 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
         return tail_exact_ambiguous ? NULL : best_tail_exact;
     }
     return tail_legacy_ambiguous ? NULL : best_tail_legacy;
+}
+
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_in_graph(
+    const CBMResolvedCallArray *arr, const CBMCall *call, bool allow_tail_match,
+    const cbm_gbuf_t *gbuf, const char *project_name) {
+    return cbm_pipeline_find_lsp_resolution_with_floor_in_graph(arr, call, 0.0, allow_tail_match,
+                                                                gbuf, project_name);
+}
+
+static inline const CBMResolvedCall *cbm_pipeline_find_lsp_resolution_with_floor(
+    const CBMResolvedCallArray *arr, const CBMCall *call, double confidence_floor,
+    bool allow_tail_match) {
+    return cbm_pipeline_find_lsp_resolution_with_floor_in_graph(arr, call, confidence_floor,
+                                                                allow_tail_match, NULL, NULL);
 }
 
 /* Graph-free compatibility entry point for resolver unit tests. Raw distinct
@@ -841,6 +879,128 @@ static inline const CBMResolvedCall *cbm_pipeline_find_lsp_reference(
     return cbm_pipeline_find_lsp_reference_in_graph(arr, usage, allow_tail_match, NULL, NULL);
 }
 
+typedef struct cbm_lsp_resolution_index {
+    CBMHashTable *entries;
+    bool complete;
+} cbm_lsp_resolution_index_t;
+
+static inline void cbm_lsp_resolution_index_free_key(const char *key, void *value, void *ud) {
+    (void)value;
+    (void)ud;
+    free((char *)key);
+}
+
+static inline void cbm_lsp_resolution_index_store(cbm_lsp_resolution_index_t *idx,
+                                                  const char *caller_qn, const char *callee_short,
+                                                  CBMResolvedCall *rc) {
+    if (!idx || !idx->entries || !caller_qn || !callee_short || !rc) {
+        if (idx) {
+            idx->complete = false;
+        }
+        return;
+    }
+    char key[CBM_SZ_1K];
+    int written =
+        snprintf(key, sizeof(key), "%s%c%s", caller_qn, CBM_LSP_RESOLUTION_KEY_SEP, callee_short);
+    if (written <= 0 || (size_t)written >= sizeof(key)) {
+        idx->complete = false;
+        return;
+    }
+
+    CBMResolvedCall *existing = (CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+    if (!existing) {
+        char *owned_key = cbm_strdup(key);
+        if (!owned_key) {
+            idx->complete = false;
+            return;
+        }
+        cbm_ht_set(idx->entries, owned_key, rc);
+    } else if (rc->confidence > existing->confidence) {
+        const char *stored_key = cbm_ht_get_key(idx->entries, key);
+        if (stored_key) {
+            cbm_ht_set(idx->entries, stored_key, rc);
+        } else {
+            idx->complete = false;
+        }
+    }
+}
+
+/* Build a per-file lookup table keyed by "caller_qn|callee_short".
+ *
+ * This preserves cbm_pipeline_find_lsp_resolution_with_floor() semantics:
+ * it applies the function's confidence_floor argument, requires exact caller_qn
+ * equality, compares shared callee segments with C++ `::`/`->` awareness,
+ * indexes allowed original-text reason joins, and keeps the highest-confidence
+ * entry for duplicate keys. The index changes lookup cost from O(call_count * resolved_count) to
+ * O(resolved_count + call_count) for files where every eligible key is indexed.
+ *
+ * If memory allocation or key formatting fails for any eligible entry,
+ * `complete` is cleared. A later miss then falls back to the linear helper so
+ * correctness is preserved even when the optimization cannot cover every row. */
+static inline void cbm_lsp_resolution_index_build(cbm_lsp_resolution_index_t *idx,
+                                                  const CBMResolvedCallArray *arr, int call_count,
+                                                  double confidence_floor) {
+    if (!idx) {
+        return;
+    }
+    idx->entries = NULL;
+    idx->complete = false;
+    if (!arr || arr->count == 0 || call_count <= 0) {
+        return;
+    }
+
+    idx->entries = cbm_ht_create((uint32_t)arr->count * 2u + (uint32_t)CBM_SZ_16);
+    if (!idx->entries) {
+        return;
+    }
+    idx->complete = true;
+
+    double floor = confidence_floor > 0.0 ? confidence_floor : (double)CBM_LSP_CONFIDENCE_FLOOR;
+    for (int i = 0; i < arr->count; i++) {
+        CBMResolvedCall *rc = &arr->items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->caller_qn || !rc->callee_qn ||
+            (double)rc->confidence < floor) {
+            continue;
+        }
+        cbm_lsp_resolution_index_store(idx, rc->caller_qn, cbm_lsp_bare_segment(rc->callee_qn), rc);
+        if (rc->reason && cbm_lsp_reason_join_strategy(rc->strategy)) {
+            cbm_lsp_resolution_index_store(idx, rc->caller_qn, cbm_lsp_bare_segment(rc->reason),
+                                           rc);
+        }
+    }
+}
+
+static inline const CBMResolvedCall *cbm_lsp_resolution_index_find(
+    const cbm_lsp_resolution_index_t *idx, const CBMResolvedCallArray *arr, const CBMCall *call,
+    double confidence_floor, bool allow_tail_match) {
+    if (!call || !call->enclosing_func_qn || !call->callee_name) {
+        return NULL;
+    }
+    if (idx && idx->entries) {
+        char key[CBM_SZ_1K];
+        int written = snprintf(key, sizeof(key), "%s%c%s", call->enclosing_func_qn,
+                               CBM_LSP_RESOLUTION_KEY_SEP, cbm_lsp_bare_segment(call->callee_name));
+        if (written > 0 && (size_t)written < sizeof(key)) {
+            const CBMResolvedCall *hit = (const CBMResolvedCall *)cbm_ht_get(idx->entries, key);
+            if (hit || (idx->complete && !allow_tail_match)) {
+                return hit;
+            }
+        }
+    }
+    return cbm_pipeline_find_lsp_resolution_with_floor(arr, call, confidence_floor,
+                                                       allow_tail_match);
+}
+
+static inline void cbm_lsp_resolution_index_free(cbm_lsp_resolution_index_t *idx) {
+    if (!idx || !idx->entries) {
+        return;
+    }
+    cbm_ht_foreach(idx->entries, cbm_lsp_resolution_index_free_key, NULL);
+    cbm_ht_free(idx->entries);
+    idx->entries = NULL;
+    idx->complete = false;
+}
+
 /* Resolve an LSP-emitted callee_qn to a graph-buffer node.
  *
  * Per-file LSPs sometimes emit `callee_qn` as the raw package-shaped
@@ -950,6 +1110,29 @@ static inline const cbm_gbuf_node_t *cbm_pipeline_lsp_target_node_policy(
         return NULL;
     }
     return callable_ambiguous ? NULL : unique_callable;
+}
+
+/* Whether an unresolved LSP target is explicitly inside the indexed project.
+ *
+ * Cross-file registries can resolve a declaration to a project-qualified QN
+ * that is not itself a graph node. C/C++ forward declarations are the common
+ * case: the declaration QN belongs to the caller translation unit while the
+ * canonical definition node belongs to another file. In that case the textual
+ * registry resolver remains a valid canonical-definition fallback.
+ *
+ * Unqualified targets are deliberately not assumed to be internal. Python and
+ * other language resolvers use those QNs for third-party libraries (for example
+ * starlette.routing.Route), where a weak short-name fallback would manufacture
+ * a project edge. Explicit `external.*` targets are also excluded naturally.
+ */
+static inline bool cbm_lsp_resolution_targets_project(const CBMResolvedCall *resolution,
+                                                      const char *project_name) {
+    if (!resolution || !resolution->callee_qn || !project_name || !project_name[0]) {
+        return false;
+    }
+    size_t project_len = strlen(project_name);
+    return strncmp(resolution->callee_qn, project_name, project_len) == 0 &&
+           resolution->callee_qn[project_len] == '.';
 }
 
 #endif /* CBM_PIPELINE_LSP_RESOLVE_H */

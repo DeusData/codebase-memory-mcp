@@ -4,13 +4,12 @@ set -euo pipefail
 # Full local smoke, including the release download/install/update phases that
 # plain `scripts/smoke-test.sh <binary>` skips without an artifact fixture.
 #
-# Usage: scripts/smoke-local.sh <binary> [ui]
+# Usage: scripts/smoke-local.sh <binary>
 #   <binary>  product binary to smoke (e.g. build/c/codebase-memory-mcp)
-#   ui        optional: mirror the -ui variant asset naming
 
 usage() {
     cat <<'EOF'
-Usage: scripts/smoke-local.sh <binary> [standard|ui]
+Usage: scripts/smoke-local.sh <binary>
 
 The canonical unix smoke entry: identical in local CI, PR CI, dry run and
 release. Stages a complete release fixture (binary + LICENSE + install.sh +
@@ -45,7 +44,7 @@ case "${1:-}" in
 -h|--help) usage; exit 0 ;;
 -*) echo "smoke-local: unknown option '$1'. Please consult --help." >&2; exit 2 ;;
 esac
-if [ $# -gt 2 ]; then
+if [ $# -gt 1 ]; then
     echo "smoke-local: too many arguments. Please consult --help." >&2
     exit 2
 fi

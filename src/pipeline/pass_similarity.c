@@ -25,6 +25,7 @@ enum {
 };
 #include "pipeline/worker_pool.h"
 
+#include <inttypes.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -89,26 +90,52 @@ typedef struct {
     cbm_minhash_t fp;
     const char *file_path;
     const char *ext;
-    const char *qn; /* canonical ordering + pair-ownership (determinism) */
+    const char *qualified_name;
 } fp_entry_t;
 
-/* Canonical entry order: by qualified name (unique). The label-index order
- * from collect_fp_entries is gbuf insertion order = parallel-extraction merge
- * order, which varies run to run; LSH bucket chains and the per-node edge-cap
- * truncation both inherit it, flickering WHICH SIMILAR_TO edges are emitted. */
-static int cmp_fp_entry_by_qn(const void *pa, const void *pb) {
-    const fp_entry_t *a = pa;
-    const fp_entry_t *b = pb;
-    const char *qa = a->qn ? a->qn : "";
-    const char *qb = b->qn ? b->qn : "";
-    int r = strcmp(qa, qb);
-    if (r != 0) {
-        return r;
+/* Canonical entry order must not inherit graph-buffer insertion order: parallel
+ * extraction changes merge order across runs, which otherwise changes LSH
+ * bucket chains and per-node edge-cap truncation. Qualified name is the primary
+ * identity; file path and node id provide deterministic fallbacks for malformed
+ * or colliding inputs without weakening the schedule-independent ordering. */
+static int cmp_str_empty_last(const char *a, const char *b) {
+    const char *sa = a ? a : "";
+    const char *sb = b ? b : "";
+    if (sa[0] == '\0' && sb[0] != '\0') {
+        return 1;
     }
-    if (a->node_id != b->node_id) {
-        return a->node_id < b->node_id ? -1 : 1;
+    if (sa[0] != '\0' && sb[0] == '\0') {
+        return -1;
     }
-    return 0;
+    return strcmp(sa, sb);
+}
+
+static int cmp_fp_entry(const void *a, const void *b) {
+    const fp_entry_t *ea = (const fp_entry_t *)a;
+    const fp_entry_t *eb = (const fp_entry_t *)b;
+    int c = cmp_str_empty_last(ea->qualified_name, eb->qualified_name);
+    if (c != 0) {
+        return c;
+    }
+    c = cmp_str_empty_last(ea->file_path, eb->file_path);
+    if (c != 0) {
+        return c;
+    }
+    return (ea->node_id > eb->node_id) - (ea->node_id < eb->node_id);
+}
+
+static int cmp_lsh_entry_ptr(const void *a, const void *b) {
+    const cbm_lsh_entry_t *const *ea = (const cbm_lsh_entry_t *const *)a;
+    const cbm_lsh_entry_t *const *eb = (const cbm_lsh_entry_t *const *)b;
+    int c = cmp_str_empty_last((*ea)->qualified_name, (*eb)->qualified_name);
+    if (c != 0) {
+        return c;
+    }
+    c = cmp_str_empty_last((*ea)->file_path, (*eb)->file_path);
+    if (c != 0) {
+        return c;
+    }
+    return ((*ea)->node_id > (*eb)->node_id) - ((*ea)->node_id < (*eb)->node_id);
 }
 
 /* Collect all Function/Method nodes with fingerprints from graph buffer. */
@@ -144,15 +171,12 @@ static int collect_fp_entries(cbm_gbuf_t *gbuf, fp_entry_t **out_entries) {
                 .fp = fp,
                 .file_path = n->file_path,
                 .ext = file_ext(n->file_path),
-                .qn = n->qualified_name,
+                .qualified_name = n->qualified_name,
             };
         }
     }
-    /* Canonicalize (determinism) — see cmp_fp_entry_by_qn. Avoid passing the
-     * NULL empty-set buffer to qsort: libc treats zero elements as a no-op,
-     * but the standard function contract still requires a valid base pointer. */
     if (count > 1) {
-        qsort(entries, (size_t)count, sizeof(fp_entry_t), cmp_fp_entry_by_qn);
+        qsort(entries, (size_t)count, sizeof(*entries), cmp_fp_entry);
     }
     *out_entries = entries;
     return count;
@@ -196,6 +220,10 @@ typedef struct {
     sim_edge_buf_t *worker_bufs;
     _Atomic int next_idx;
     _Atomic int *edge_counts; /* shared atomic array, one per entry */
+    _Atomic uint64_t omitted_candidates;
+    _Atomic uint64_t noisy_bucket_visits;
+    _Atomic bool query_allocation_failed;
+    double threshold; /* Jaccard cutoff; <=0 = use CBM_MINHASH_JACCARD_THRESHOLD */
 } sim_query_ctx_t;
 
 enum { SIM_CAND_CAP = 4096 };
@@ -206,6 +234,8 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
 
     /* Thread-local candidate buffer (stack-allocated) */
     const cbm_lsh_entry_t *cands[SIM_CAND_CAP];
+    uint64_t omitted_candidates = 0;
+    uint64_t noisy_bucket_visits = 0;
 
     while (true) {
         int i = atomic_fetch_add_explicit(&sc->next_idx, SKIP_ONE, memory_order_relaxed);
@@ -219,7 +249,18 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
         }
 
         const fp_entry_t *src = &sc->entries[i];
-        int cand_count = cbm_lsh_query_into(sc->lsh, &src->fp, cands, SIM_CAND_CAP);
+        cbm_lsh_query_result_t query =
+            cbm_lsh_query_into_result(sc->lsh, &src->fp, cands, SIM_CAND_CAP);
+        if (query.allocation_failed) {
+            atomic_store_explicit(&sc->query_allocation_failed, true, memory_order_relaxed);
+            break;
+        }
+        omitted_candidates += (uint64_t)query.omitted;
+        noisy_bucket_visits += (uint64_t)query.noisy_buckets;
+        int cand_count = query.written;
+        if (cand_count > 1) {
+            qsort(cands, (size_t)cand_count, sizeof(cands[0]), cmp_lsh_entry_ptr);
+        }
 
         int emitted = 0;
         for (int c = 0; c < cand_count; c++) {
@@ -230,11 +271,16 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             if (strcmp(src->ext, cand->file_ext) != 0) {
                 continue;
             }
-            /* Pair ownership by canonical QN order, not node id: ids are
-             * assigned in parallel-merge order and vary run to run, which
-             * flipped which side owned a pair and (with the per-source edge
-             * cap) flickered the emitted set (determinism). */
-            if (!src->qn || !cand->qualified_name || strcmp(src->qn, cand->qualified_name) >= 0) {
+            /* Give each unordered pair one schedule-independent owner. Node ids
+             * alone are unsuitable because parallel merge order assigns them. */
+            int endpoint_order = cmp_str_empty_last(src->qualified_name, cand->qualified_name);
+            if (endpoint_order == 0) {
+                endpoint_order = cmp_str_empty_last(src->file_path, cand->file_path);
+            }
+            if (endpoint_order == 0) {
+                endpoint_order = (src->node_id > cand->node_id) - (src->node_id < cand->node_id);
+            }
+            if (endpoint_order >= 0) {
                 continue;
             }
 
@@ -244,7 +290,10 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             }
 
             double jaccard = cbm_minhash_jaccard(&src->fp, cand->fingerprint);
-            if (jaccard < CBM_MINHASH_JACCARD_THRESHOLD) {
+            /* Configurable threshold (#41): sc carries the tunable value from
+             * the pipeline ctx; <=0 (unset) falls back to the default. */
+            double threshold = sc->threshold > 0.0 ? sc->threshold : CBM_MINHASH_JACCARD_THRESHOLD;
+            if (jaccard < threshold) {
                 continue;
             }
 
@@ -257,6 +306,24 @@ static void sim_query_worker(int worker_id, void *ctx_ptr) {
             atomic_fetch_add_explicit(&sc->edge_counts[i], emitted, memory_order_relaxed);
         }
     }
+    if (omitted_candidates > 0) {
+        atomic_fetch_add_explicit(&sc->omitted_candidates, omitted_candidates,
+                                  memory_order_relaxed);
+    }
+    if (noisy_bucket_visits > 0) {
+        atomic_fetch_add_explicit(&sc->noisy_bucket_visits, noisy_bucket_visits,
+                                  memory_order_relaxed);
+    }
+}
+
+static void free_sim_edge_bufs(sim_edge_buf_t *worker_bufs, int worker_count) {
+    if (!worker_bufs) {
+        return;
+    }
+    for (int w = 0; w < worker_count; w++) {
+        free(worker_bufs[w].edges);
+    }
+    free(worker_bufs);
 }
 
 /* Merge worker edge buffers into gbuf. Returns total edge count. Frees worker buffers. */
@@ -271,9 +338,8 @@ static int merge_sim_edges(cbm_gbuf_t *gbuf, sim_edge_buf_t *worker_bufs, int wo
             cbm_gbuf_insert_edge(gbuf, de->source_id, de->target_id, "SIMILAR_TO", props);
             total++;
         }
-        free(worker_bufs[w].edges);
     }
-    free(worker_bufs);
+    free_sim_edge_bufs(worker_bufs, worker_count);
     return total;
 }
 
@@ -314,7 +380,7 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .fingerprint = &entries[i].fp,
             .file_path = entries[i].file_path,
             .file_ext = entries[i].ext,
-            .qualified_name = entries[i].qn,
+            .qualified_name = entries[i].qualified_name,
         };
         cbm_lsh_insert(lsh, &lsh_entries[i]);
     }
@@ -329,6 +395,9 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
     int worker_count = cbm_default_worker_count(false);
     sim_edge_buf_t *worker_bufs = calloc((size_t)worker_count, sizeof(sim_edge_buf_t));
 
+    uint64_t omitted_candidates = 0;
+    uint64_t noisy_bucket_visits = 0;
+    bool query_allocation_failed = false;
     {
         sim_query_ctx_t sc = {
             .entries = entries,
@@ -336,12 +405,39 @@ int cbm_pipeline_pass_similarity(cbm_pipeline_ctx_t *ctx) {
             .lsh = lsh,
             .worker_bufs = worker_bufs,
             .edge_counts = edge_counts,
+            .threshold = ctx->similarity_threshold, /* #41 tunable; <=0 = default */
         };
         atomic_init(&sc.next_idx, 0);
+        atomic_init(&sc.omitted_candidates, 0);
+        atomic_init(&sc.noisy_bucket_visits, 0);
+        atomic_init(&sc.query_allocation_failed, false);
         cbm_parallel_for_opts_t opts = {.max_workers = worker_count, .force_pthreads = false};
         cbm_parallel_for(worker_count, sim_query_worker, &sc, opts);
+        omitted_candidates = atomic_load_explicit(&sc.omitted_candidates, memory_order_relaxed);
+        noisy_bucket_visits = atomic_load_explicit(&sc.noisy_bucket_visits, memory_order_relaxed);
+        query_allocation_failed =
+            atomic_load_explicit(&sc.query_allocation_failed, memory_order_relaxed);
     }
     CBM_PROF_END_N("similarity", "3_query_parallel", t_query_emit, entry_count);
+
+    if (query_allocation_failed) {
+        cbm_log_error("pass.similarity.alloc_failed", "phase", "query_dedup");
+        free_sim_edge_bufs(worker_bufs, worker_count);
+        free(edge_counts);
+        free(lsh_entries);
+        free(entries);
+        cbm_lsh_free(lsh);
+        return CBM_NOT_FOUND;
+    }
+    if (omitted_candidates > 0 || noisy_bucket_visits > 0) {
+        char omitted_buf[CBM_SZ_32];
+        char noisy_buf[CBM_SZ_32];
+        snprintf(omitted_buf, sizeof(omitted_buf), "%" PRIu64, omitted_candidates);
+        snprintf(noisy_buf, sizeof(noisy_buf), "%" PRIu64, noisy_bucket_visits);
+        cbm_log_warn("pass.similarity.candidates_partial", "omitted_candidates", omitted_buf,
+                     "noisy_bucket_visits", noisy_buf, "candidate_capacity", itoa_log(SIM_CAND_CAP),
+                     "noisy_bucket_limit", itoa_log(CBM_LSH_MAX_BUCKET_SIZE));
+    }
 
     CBM_PROF_START(t_merge);
     int total_edges = merge_sim_edges(gbuf, worker_bufs, worker_count);

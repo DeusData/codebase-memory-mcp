@@ -1,6 +1,7 @@
 # Mirrors the Ubuntu CI environment exactly:
 #   - Ubuntu 24.04 (same as GitHub Actions ubuntu-latest / ubuntu-24.04-arm)
 #   - GCC (system default) with ASan + UBSan + LeakSanitizer
+#   - Clang 18.1.3 for explicit historical benchmark comparisons
 #   - libsqlite3-dev + zlib1g-dev (same as CI "Install deps" step)
 #
 # Build:  docker build -t cbm-test test-infrastructure/
@@ -10,13 +11,17 @@
 # digest of ubuntu:noble as of 2026-07-23; bump deliberately, never to a tag.
 FROM ubuntu:noble@sha256:4fbb8e6a8395de5a7550b33509421a2bafbc0aab6c06ba2cef9ebffbc7092d90
 
-# Minimal: gcc + zlib only. sqlite3 is vendored (compiled from source with ASan).
+# GCC remains the CI/default toolchain. Clang 18 is installed alongside it so
+# benchmark specs can select the earlier Linux cohort's compiler explicitly;
+# merely building this image never changes a candidate's compiler.
+# sqlite3 is vendored (compiled from source with ASan).
 # curl + zsh mirror the GitHub runner images: the self-update tests shell out
 # to curl, and the shell-activation tests exercise zsh rc files. zip backs
 # scripts/package-release.sh (.mcpb bundles), which the MCPB bundle contract
 # exercises on every leg.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc g++ make \
+    clang-18 \
     zlib1g-dev \
     pkg-config \
     python3 \

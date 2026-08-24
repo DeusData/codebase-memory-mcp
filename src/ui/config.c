@@ -10,6 +10,7 @@
 #include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat_fs_internal.h"
 #include "foundation/compat.h"
 
 #include <yyjson/yyjson.h>
@@ -38,6 +39,43 @@ void cbm_ui_config_path(char *buf, int bufsz) {
         dir = cbm_tmpdir();
     }
     snprintf(buf, (size_t)bufsz, "%s/config.json", dir);
+}
+
+bool cbm_ui_parse_enabled(const char *value, bool *enabled_out) {
+    if (!value || !enabled_out) {
+        return false;
+    }
+    if (value[0] == 't' && strcmp(value, "true") == 0) {
+        *enabled_out = true;
+        return true;
+    }
+    if (value[0] == 'f' && strcmp(value, "false") == 0) {
+        *enabled_out = false;
+        return true;
+    }
+    return false;
+}
+
+bool cbm_ui_parse_port(const char *value, int *port_out) {
+    if (!value || !value[0] || !port_out) {
+        return false;
+    }
+    unsigned port = 0;
+    for (const char *cursor = value; *cursor; cursor++) {
+        if (*cursor < '0' || *cursor > '9') {
+            return false;
+        }
+        unsigned digit = (unsigned)(*cursor - '0');
+        if (port > ((unsigned)CBM_UI_MAX_PORT - digit) / 10U) {
+            return false;
+        }
+        port = port * 10U + digit;
+    }
+    if (port == 0U) {
+        return false;
+    }
+    *port_out = (int)port;
+    return true;
 }
 
 /* ── Load ────────────────────────────────────────────────────── */
@@ -153,7 +191,7 @@ void cbm_ui_config_load(cbm_ui_config_t *cfg) {
     yyjson_val *v_port = yyjson_obj_get(root, "ui_port");
     if (yyjson_is_int(v_port)) {
         int64_t port = yyjson_get_int(v_port);
-        if (port > 0 && port <= 65535) {
+        if (port > 0 && port <= CBM_UI_MAX_PORT) {
             cfg->ui_port = (int)port;
         }
     }
@@ -187,51 +225,13 @@ static bool config_parent_directory(const char *path, char *directory, size_t di
 #ifdef _WIN32
 static volatile LONG g_config_temp_sequence = 0;
 
-typedef struct {
-    DWORD Flags;
-    HANDLE RootDirectory;
-    DWORD FileNameLength;
-    WCHAR FileName[1];
-} config_file_rename_info_ex_t;
-
-#define CONFIG_FILE_RENAME_INFO_EX_CLASS ((FILE_INFO_BY_HANDLE_CLASS)22)
-#define CONFIG_FILE_RENAME_REPLACE 0x00000001U
-#define CONFIG_FILE_RENAME_POSIX 0x00000002U
-
-/* Publish the still-open temp file over the destination with POSIX rename
- * semantics: MoveFileExW's legacy replace cannot supersede a destination that
- * a reader holds open (its name lingers until the last handle closes, even
- * with FILE_SHARE_DELETE), so a config save racing an open reader failed.
- * The POSIX form frees the name immediately. The rename target must be the
- * bare drive path — the NT layer rejects the \\?\ prefix here — and the name
- * buffer is NUL-terminated in an over-allocated buffer because filter
- * drivers read FileName as NUL-terminated despite FileNameLength. */
-static bool config_posix_rename_handle(HANDLE file, const wchar_t *target_path) {
-    size_t chars = wcslen(target_path);
-    if (chars >= 4U && wcsncmp(target_path, L"\\\\?\\", 4) == 0) {
-        target_path += 4;
-        chars -= 4U;
-    }
-    if (chars == 0U || chars > (size_t)UINT32_MAX / sizeof(wchar_t)) {
-        return false;
-    }
-    size_t bytes = chars * sizeof(wchar_t);
-    size_t allocation = offsetof(config_file_rename_info_ex_t, FileName) + bytes + sizeof(wchar_t);
-    config_file_rename_info_ex_t *rename = calloc(1U, allocation);
-    if (!rename) {
-        return false;
-    }
-    rename->Flags = CONFIG_FILE_RENAME_POSIX | CONFIG_FILE_RENAME_REPLACE;
-    rename->RootDirectory = NULL;
-    rename->FileNameLength = (DWORD)bytes;
-    memcpy(rename->FileName, target_path, bytes);
-    rename->FileName[chars] = L'\0';
-    bool renamed = SetFileInformationByHandle(file, CONFIG_FILE_RENAME_INFO_EX_CLASS, rename,
-                                              (DWORD)allocation) != 0;
-    free(rename);
-    return renamed;
-}
-
+/* Publish the completed temp file while its DELETE-capable handle remains
+ * open. Legacy MoveFileExW cannot supersede a destination generation that a
+ * reader still names—even when that reader allowed FILE_SHARE_DELETE—so a
+ * config save racing an open reader otherwise fails until the reader closes.
+ * The shared FileRenameInfoEx POSIX-semantics seam frees the destination name
+ * immediately. config_write_atomic retains ownership and attempts to close the
+ * temp handle after every create outcome; the helper never consumes it. */
 static bool config_write_atomic(const char *path, const char *json, size_t json_length) {
     wchar_t *wide_path = cbm_path_to_wide(path);
     if (!wide_path) {
@@ -269,11 +269,9 @@ static bool config_write_atomic(const char *path, const char *json, size_t json_
     if (ok) {
         ok = FlushFileBuffers(file) != 0;
     }
-    bool published = ok && config_posix_rename_handle(file, wide_path);
-    if (file != INVALID_HANDLE_VALUE && !CloseHandle(file)) {
-        ok = false;
-    }
-    if (ok && !published) {
+    bool published = ok && cbm_windows_replace_open_file(file, wide_path, NULL);
+    bool closed = file == INVALID_HANDLE_VALUE || CloseHandle(file) != 0;
+    if (ok && !published && closed) {
         /* Error-driven fallback, not a version probe: POSIX rename needs
          * NTFS-class filesystem support, so exFAT/SMB-homed configs land
          * here, keeping the pre-POSIX behavior (replace can fail while a
@@ -281,7 +279,11 @@ static bool config_write_atomic(const char *path, const char *json, size_t json_
         published = MoveFileExW(temporary, wide_path,
                                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
     }
-    ok = ok && published;
+    /* A failed close prevents the name-based fallback because native handle
+     * ownership is then ambiguous. It cannot undo a handle-based publication,
+     * however, so never report an already-committed config generation as
+     * failed or invite the caller to retry it. */
+    ok = published;
     if (!ok && temporary) {
         (void)DeleteFileW(temporary);
     }
@@ -380,7 +382,7 @@ static bool config_write_atomic(const char *path, const char *json, size_t json_
 #endif
 
 bool cbm_ui_config_save(const cbm_ui_config_t *cfg) {
-    if (!cfg || cfg->ui_port <= 0 || cfg->ui_port > 65535) {
+    if (!cfg || cfg->ui_port <= 0 || cfg->ui_port > CBM_UI_MAX_PORT) {
         cbm_log_error("ui.config.write_fail", "reason", "invalid_config");
         return false;
     }

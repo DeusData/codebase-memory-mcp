@@ -8,7 +8,9 @@
 #include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "foundation/win_utf8.h"
 
+#include <limits.h>
 #include <stdlib.h>
 
 #include <stdio.h>
@@ -25,6 +27,66 @@ enum {
     WS_MIN_DEPTH_POSIX = 2,
     WS_MIN_DEPTH_WINDOWS = 1,
 };
+
+/* Canonicalize and compare paths in one shared foundation implementation so
+ * every workspace, MCP, UI, and CLI containment decision has identical
+ * symlink/junction and component-boundary semantics. */
+static bool ws_resolve_canonical_path(const char *path, char *out, size_t out_sz) {
+    if (!cbm_canonical_path(path, out, out_sz)) {
+        return false;
+    }
+#ifdef _WIN32
+    cbm_normalize_path_sep(out);
+#endif
+    return true;
+}
+
+bool cbm_canonical_path_has_root(const char *root_path, const char *candidate_path) {
+    if (!root_path || !candidate_path) {
+        return false;
+    }
+#ifdef _WIN32
+    wchar_t *wide_root = cbm_utf8_to_wide(root_path);
+    wchar_t *wide_candidate = cbm_utf8_to_wide(candidate_path);
+    bool contained = false;
+    if (wide_root && wide_candidate) {
+        size_t root_len = wcslen(wide_root);
+        size_t candidate_len = wcslen(wide_candidate);
+        bool prefix_equal = root_len <= candidate_len && root_len <= INT_MAX &&
+                            CompareStringOrdinal(wide_candidate, (int)root_len, wide_root,
+                                                 (int)root_len, TRUE) == CSTR_EQUAL;
+        bool root_ends_separator =
+            root_len > 0 && (wide_root[root_len - 1] == L'/' || wide_root[root_len - 1] == L'\\');
+        bool boundary = root_ends_separator || root_len == candidate_len ||
+                        (root_len < candidate_len &&
+                         (wide_candidate[root_len] == L'/' || wide_candidate[root_len] == L'\\'));
+        contained = prefix_equal && boundary;
+    }
+    free(wide_root);
+    free(wide_candidate);
+    return contained;
+#else
+    size_t root_len = strlen(root_path);
+    size_t candidate_len = strlen(candidate_path);
+    bool prefix_equal =
+        root_len <= candidate_len && strncmp(candidate_path, root_path, root_len) == 0;
+    bool root_ends_separator = root_len > 0 && root_path[root_len - 1] == '/';
+    bool boundary = root_ends_separator || root_len == candidate_len ||
+                    (root_len < candidate_len && candidate_path[root_len] == '/');
+    return prefix_equal && boundary;
+#endif
+}
+
+bool cbm_path_within_root(const char *root_path, const char *abs_path) {
+    if (!root_path || !abs_path) {
+        return false;
+    }
+    char real_root[CBM_SZ_4K];
+    char real_file[CBM_SZ_4K];
+    return ws_resolve_canonical_path(root_path, real_root, sizeof(real_root)) &&
+           ws_resolve_canonical_path(abs_path, real_file, sizeof(real_file)) &&
+           cbm_canonical_path_has_root(real_root, real_file);
+}
 
 static bool ws_is_sep(char c) {
     return c == '/' || c == '\\';
@@ -566,12 +628,7 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
 /* Callers should not each re-derive these; a caller that resolved the home
  * directory differently would classify the same path differently. */
 const char *cbm_workspace_home_dir(void) {
-    const char *home = getenv("HOME");
-    if (home && home[0]) {
-        return home;
-    }
-    home = getenv("USERPROFILE");
-    return (home && home[0]) ? home : NULL;
+    return cbm_get_home_dir();
 }
 
 const char *cbm_workspace_cache_dir(void) {

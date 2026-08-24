@@ -21,7 +21,6 @@
 /* ── Node type classification ────────────────────────────────────── */
 
 enum {
-    WALK_STACK_CAP = 2048,
     HALSTEAD_SET_SIZE = 512,
     HALSTEAD_SET_MASK = 511,
     PROFILE_FIELD_COUNT = 25,
@@ -29,11 +28,6 @@ enum {
     BASE_DECIMAL_AST = 10,
     HALSTEAD_HASH_MUL = 31,
 };
-
-typedef struct {
-    TSNode node;
-    int depth;
-} profile_frame_t;
 
 static bool is_control_if(const char *k) {
     return strcmp(k, "if_statement") == 0 || strcmp(k, "if_expression") == 0 ||
@@ -142,7 +136,7 @@ static bool is_param_name(const char *ident, const char *source, const char **pa
 /* ── Main computation ────────────────────────────────────────────── */
 
 /* Count control-flow statement kinds (if/for/while/switch/try/return). */
-static void accumulate_control_flow(const char *kind, cbm_ast_profile_t *out, bool *in_return) {
+static void accumulate_control_flow(const char *kind, cbm_ast_profile_t *out) {
     if (is_control_if(kind)) {
         out->if_count++;
     }
@@ -160,7 +154,6 @@ static void accumulate_control_flow(const char *kind, cbm_ast_profile_t *out, bo
     }
     if (is_return(kind)) {
         out->return_count++;
-        *in_return = true;
     }
 }
 
@@ -240,6 +233,30 @@ static void accumulate_data_flow(TSNode node, const char *kind, uint32_t child_c
     }
 }
 
+/*
+ * Return true only for the syntax subtree explicitly assigned to an if/while
+ * condition field. Treating the entire control statement as condition context
+ * would misclassify identifiers in its body.
+ */
+static bool starts_condition_scope(const TSTreeCursor *cursor, TSNode node) {
+    /*
+     * The cursor already resolved the current node's field while traversing.
+     * Most AST nodes are not condition fields, so reject them before asking
+     * Tree-sitter to reconstruct the parent and search its field map. This
+     * preserves one O(N) walk while avoiding two parent/field lookups per node.
+     */
+    const char *field = ts_tree_cursor_current_field_name(cursor);
+    if (!field || strcmp(field, "condition") != 0) {
+        return false;
+    }
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(parent)) {
+        return false;
+    }
+    const char *parent_kind = ts_node_type(parent);
+    return is_control_if(parent_kind) || is_control_while(parent_kind);
+}
+
 bool cbm_ast_profile_compute(TSNode func_body, const char *source, const char **param_names,
                              int param_count, cbm_ast_profile_t *out) {
     if (ts_node_is_null(func_body)) {
@@ -254,63 +271,83 @@ bool cbm_ast_profile_compute(TSNode func_body, const char *source, const char **
     memset(op_set, 0, sizeof(op_set));
     memset(operand_set, 0, sizeof(operand_set));
 
-    int total_depth = 0;
-    int node_count = 0;
-    bool in_return = false;
-    bool in_condition = false;
+    uint64_t total_depth = 0;
+    uint64_t node_count = 0;
+    uint32_t depth = 0;
+    uint32_t return_scope_depth = 0;
+    uint32_t condition_scope_depth = 0;
 
-    profile_frame_t stack[WALK_STACK_CAP];
-    int top = 0;
-    stack[top++] = (profile_frame_t){func_body, 0};
-
-    while (top > 0) {
-        profile_frame_t frame = stack[--top];
-        TSNode node = frame.node;
-        int depth = frame.depth;
+    /*
+     * A tree cursor retains no caller-owned frontier: every AST node is
+     * visited once in O(N) time with O(1) explicit scratch memory. Scope
+     * counters are incremented on descent and decremented on ascent, so data
+     * flow context follows syntax ancestry without a second parent-chain walk.
+     */
+    TSTreeCursor cursor = ts_tree_cursor_new(func_body);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
         uint32_t child_count = ts_node_child_count(node);
         const char *kind = ts_node_type(node);
+        bool condition_root = starts_condition_scope(&cursor, node);
 
         if (!ts_node_is_named(node) && child_count == 0) {
             /* Anonymous leaf (punctuation, keywords) — skip. */
-            goto push_children;
+        } else {
+            node_count++;
+            total_depth += depth;
+
+            uint16_t stored_depth = depth > UINT16_MAX ? UINT16_MAX : (uint16_t)depth;
+            if (stored_depth > out->max_nesting_depth) {
+                out->max_nesting_depth = stored_depth;
+            }
+
+            accumulate_control_flow(kind, out);
+            accumulate_expressions(kind, out);
+            accumulate_halstead(kind, child_count, op_set, operand_set, out);
+            accumulate_data_flow(node, kind, child_count, source, param_names, param_count,
+                                 return_scope_depth > 0,
+                                 condition_scope_depth > 0 || condition_root, out);
         }
 
-        node_count++;
-        total_depth += depth;
-
-        if ((uint16_t)depth > out->max_nesting_depth) {
-            out->max_nesting_depth = (uint16_t)depth;
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            if (is_return(kind)) {
+                return_scope_depth++;
+            }
+            if (condition_root) {
+                condition_scope_depth++;
+            }
+            depth++;
+            continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            continue;
         }
 
-        accumulate_control_flow(kind, out, &in_return);
-        accumulate_expressions(kind, out);
-        accumulate_halstead(kind, child_count, op_set, operand_set, out);
-        accumulate_data_flow(node, kind, child_count, source, param_names, param_count, in_return,
-                             in_condition, out);
-
-        /* Track context for data flow: are we inside a condition? */
-        if (is_control_if(kind) || is_control_while(kind)) {
-            in_condition = true;
+        bool found_sibling = false;
+        while (ts_tree_cursor_goto_parent(&cursor)) {
+            depth--;
+            TSNode exited_parent = ts_tree_cursor_current_node(&cursor);
+            if (is_return(ts_node_type(exited_parent))) {
+                return_scope_depth--;
+            }
+            if (starts_condition_scope(&cursor, exited_parent)) {
+                condition_scope_depth--;
+            }
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                found_sibling = true;
+                break;
+            }
         }
-
-    push_children:
-        /* Reset context flags when leaving return/condition scope */
-        if (is_return(kind)) {
-            in_return = false;
-        }
-        if (child_count > 0 && (is_control_if(kind) || is_control_while(kind))) {
-            in_condition = false;
-        }
-
-        /* Push children in reverse order */
-        for (int i = (int)child_count - SKIP_ONE; i >= 0 && top < WALK_STACK_CAP; i--) {
-            stack[top++] = (profile_frame_t){ts_node_child(node, (uint32_t)i), depth + SKIP_ONE};
+        if (!found_sibling) {
+            break;
         }
     }
+    ts_tree_cursor_delete(&cursor);
 
     /* Compute averages */
     if (node_count > 0) {
-        out->avg_nesting_depth_x10 = (uint16_t)((total_depth * DEPTH_SCALE) / node_count);
+        uint64_t average = (total_depth * DEPTH_SCALE) / node_count;
+        out->avg_nesting_depth_x10 = average > UINT16_MAX ? UINT16_MAX : (uint16_t)average;
     }
 
     return node_count > 0;
