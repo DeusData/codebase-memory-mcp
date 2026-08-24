@@ -312,6 +312,34 @@ TEST(daemon_application_new_session_does_not_retain_initial_store) {
     PASS();
 }
 
+TEST(daemon_application_final_cancel_does_not_reject_an_already_accepted_peer) {
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *first = app_test_open(&callbacks, 3001);
+
+    if (first) {
+        callbacks.session_cancel(callbacks.context, first);
+    }
+    cbm_daemon_runtime_application_session_t *accepted_peer = app_test_open(&callbacks, 3002);
+
+    if (first) {
+        callbacks.session_close(callbacks.context, first);
+    }
+    if (accepted_peer) {
+        callbacks.session_cancel(callbacks.context, accepted_peer);
+        callbacks.session_close(callbacks.context, accepted_peer);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+
+    ASSERT_NOT_NULL(application);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(accepted_peer);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_request_cancel_is_scoped_to_exact_token) {
     char root[APP_TEST_PATH_CAP];
     (void)snprintf(root, sizeof(root), "%s/cbm-app-request-cancel-XXXXXX", cbm_tmpdir());
@@ -5272,6 +5300,7 @@ TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death) {
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
+    RUN_TEST(daemon_application_final_cancel_does_not_reject_an_already_accepted_peer);
     RUN_TEST(daemon_application_request_cancel_is_scoped_to_exact_token);
     RUN_TEST(daemon_application_requires_immutable_explicit_context);
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);

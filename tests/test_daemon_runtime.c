@@ -1304,7 +1304,9 @@ static bool runtime_test_fixture_permanent = false;
 static bool runtime_test_fixture_start_configured(
     runtime_test_fixture_t *fixture, const char *tag, const cbm_daemon_build_identity_t *identity,
     uint32_t max_clients, uint64_t lease_timeout_ms,
-    const cbm_daemon_runtime_application_callbacks_t *application, bool fingerprint_cache_enabled) {
+    const cbm_daemon_runtime_application_callbacks_t *application,
+    const cbm_daemon_runtime_ephemeral_stop_callbacks_t *ephemeral_stop,
+    bool fingerprint_cache_enabled) {
     memset(fixture, 0, sizeof(*fixture));
     if (!th_secure_runtime_parent_new(fixture->parent, sizeof(fixture->parent), tag)) {
         return runtime_test_fixture_start_failed(tag, "temporary-directory",
@@ -1378,6 +1380,9 @@ static bool runtime_test_fixture_start_configured(
     if (application) {
         config.application = *application;
     }
+    if (ephemeral_stop) {
+        config.ephemeral_stop = *ephemeral_stop;
+    }
     fixture->service = cbm_daemon_runtime_service_start(&config);
     if (!fixture->service) {
         return runtime_test_fixture_start_failed(tag, "service-start",
@@ -1394,7 +1399,7 @@ static bool runtime_test_fixture_start_limited(runtime_test_fixture_t *fixture, 
                                                const cbm_daemon_build_identity_t *identity,
                                                uint32_t max_clients) {
     return runtime_test_fixture_start_configured(fixture, tag, identity, max_clients, 5000, NULL,
-                                                 false);
+                                                 NULL, false);
 }
 
 static bool runtime_test_fixture_start(runtime_test_fixture_t *fixture, const char *tag,
@@ -1437,7 +1442,7 @@ static bool runtime_test_fixture_start_application(runtime_test_fixture_t *fixtu
                                                    runtime_application_context_t *context) {
     cbm_daemon_runtime_application_callbacks_t application = runtime_application_callbacks(context);
     return runtime_test_fixture_start_configured(fixture, tag, identity, 8, 5000, &application,
-                                                 false);
+                                                 NULL, false);
 }
 
 static void runtime_test_fixture_finish(runtime_test_fixture_t *fixture) {
@@ -2683,7 +2688,7 @@ TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval) {
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_test_fixture_t fixture;
     bool started = runtime_test_fixture_start_configured(&fixture, "idle-connection", &identity, 8,
-                                                         20, NULL, false);
+                                                         20, NULL, NULL, false);
     cbm_daemon_runtime_connect_result_t result = {0};
     cbm_daemon_runtime_client_t *client = NULL;
     bool remained_connected = false;
@@ -2826,9 +2831,9 @@ TEST(daemon_runtime_final_disconnect_preserves_accepted_slow_hello) {
         owner = NULL;
         service_stayed_running =
             cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
-        sent = cbm_daemon_ipc_send_frame(slow_hello, CBM_DAEMON_FRAME_REQUEST,
-                                         CBM_DAEMON_RUNTIME_OP_HELLO, hello,
-                                         (uint32_t)sizeof(hello));
+        sent =
+            cbm_daemon_ipc_send_frame(slow_hello, CBM_DAEMON_FRAME_REQUEST,
+                                      CBM_DAEMON_RUNTIME_OP_HELLO, hello, (uint32_t)sizeof(hello));
         int received = sent ? cbm_daemon_ipc_receive_frame(slow_hello, RUNTIME_TEST_TIMEOUT_MS,
                                                            &response_frame, &response_payload)
                             : 0;
@@ -3129,6 +3134,68 @@ TEST(daemon_runtime_final_disconnect_preserves_blocked_provisional_session) {
     ASSERT_EQ(atomic_load(&context.opened), 2);
     ASSERT_EQ(atomic_load(&context.cancelled), 2);
     ASSERT_EQ(atomic_load(&context.closed), 2);
+    PASS();
+}
+
+typedef struct {
+    atomic_bool bootstraps_pending;
+    atomic_uint checks;
+} runtime_ephemeral_stop_test_context_t;
+
+static cbm_daemon_runtime_ephemeral_stop_result_t runtime_test_prepare_ephemeral_stop(
+    void *opaque) {
+    runtime_ephemeral_stop_test_context_t *context = opaque;
+    (void)atomic_fetch_add_explicit(&context->checks, 1U, memory_order_relaxed);
+    return atomic_load_explicit(&context->bootstraps_pending, memory_order_acquire)
+               ? CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_DEFER
+               : CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY;
+}
+
+TEST(daemon_runtime_ephemeral_stop_waits_for_preaccept_bootstrap) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_ephemeral_stop_test_context_t context;
+    atomic_init(&context.bootstraps_pending, true);
+    atomic_init(&context.checks, 0U);
+    cbm_daemon_runtime_ephemeral_stop_callbacks_t ephemeral_stop = {
+        .context = &context,
+        .prepare = runtime_test_prepare_ephemeral_stop,
+    };
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_configured(&fixture, "preaccept-bootstrap", &identity,
+                                                         8, 5000, NULL, &ephemeral_stop, false);
+    cbm_daemon_runtime_connect_result_t first_result = {0};
+    cbm_daemon_runtime_client_t *first =
+        started ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                    RUNTIME_TEST_TIMEOUT_MS, &first_result)
+                : NULL;
+    bool first_closed = first && cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
+    bool stayed_running =
+        first_closed && !cbm_daemon_runtime_service_wait_exited(fixture.service, 300U) &&
+        cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+
+    cbm_daemon_runtime_connect_result_t second_result = {0};
+    cbm_daemon_runtime_client_t *second =
+        stayed_running ? cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                           RUNTIME_TEST_TIMEOUT_MS, &second_result)
+                       : NULL;
+    bool second_closed = second && cbm_daemon_runtime_client_close(second, RUNTIME_TEST_TIMEOUT_MS);
+    bool still_deferred = second_closed && cbm_daemon_runtime_service_state(fixture.service) ==
+                                               CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    atomic_store_explicit(&context.bootstraps_pending, false, memory_order_release);
+    bool exited =
+        started && cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_NOT_NULL(first);
+    ASSERT_TRUE(first_closed);
+    ASSERT_TRUE(stayed_running);
+    ASSERT_NOT_NULL(second);
+    ASSERT_TRUE(second_closed);
+    ASSERT_TRUE(still_deferred);
+    ASSERT_TRUE(exited);
+    ASSERT_TRUE(atomic_load_explicit(&context.checks, memory_order_relaxed) >= 3U);
     PASS();
 }
 
@@ -3837,9 +3904,9 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     cbm_daemon_build_identity_t identity =
         runtime_test_identity("2.4.0", runtime_test_self_build());
     runtime_test_fixture_t fixture = {0};
-    bool started =
-        application && runtime_test_fixture_start_configured(&fixture, "non-index-child-cancel",
-                                                             &identity, 8, 5000, &callbacks, false);
+    bool started = application && runtime_test_fixture_start_configured(
+                                      &fixture, "non-index-child-cancel", &identity, 8, 5000,
+                                      &callbacks, NULL, false);
     cbm_daemon_runtime_connect_result_t first_result = {0};
     cbm_daemon_runtime_connect_result_t second_result = {0};
     cbm_daemon_runtime_client_t *first =
@@ -4627,7 +4694,7 @@ TEST(daemon_runtime_copied_image_peer_fingerprint_reuses_exact_cache_record) {
     runtime_test_fixture_t fixture;
     runtime_test_fixture_permanent = true;
     bool started = runtime_test_fixture_start_configured(&fixture, "copied-peer-cache", &identity,
-                                                         8, 5000, NULL, true);
+                                                         8, 5000, NULL, NULL, true);
     runtime_test_fixture_permanent = false;
     char image_path[RUNTIME_TEST_PATH_CAP] = {0};
     int image_path_written =
@@ -4935,7 +5002,7 @@ TEST(daemon_runtime_service_reuses_cached_active_image_fingerprint) {
      * Cache authority follows the bound image identity and epoch, not storage
      * co-location. */
     bool started = runtime_test_fixture_start_configured(&fixture, "active-image-cache", &identity,
-                                                         8, 5000, NULL, true);
+                                                         8, 5000, NULL, NULL, true);
     bool cache_hit =
         started && cbm_daemon_runtime_service_active_image_cache_hit_for_testing(fixture.service);
     runtime_test_fixture_finish(&fixture);
@@ -5036,6 +5103,7 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_application_response_roundtrip_is_byte_exact);
     RUN_TEST(daemon_runtime_application_transports_tools_list_changed_disposition);
     RUN_TEST(daemon_runtime_final_disconnect_preserves_blocked_provisional_session);
+    RUN_TEST(daemon_runtime_ephemeral_stop_waits_for_preaccept_bootstrap);
     RUN_TEST(daemon_runtime_request_cancel_is_exact_and_session_remains_usable);
     RUN_TEST(daemon_runtime_presend_request_cancel_is_sticky_and_nonterminal);
     RUN_TEST(daemon_runtime_allows_only_one_unstarted_application_token);

@@ -214,6 +214,7 @@ struct cbm_daemon_runtime_service {
     uint32_t request_timeout_ms;
     uint32_t shutdown_timeout_ms;
     cbm_daemon_runtime_application_callbacks_t application;
+    cbm_daemon_runtime_ephemeral_stop_callbacks_t ephemeral_stop;
     /* Owned only by the convenience start() path. start_reserved() callers
      * retain their externally managed participant guard. */
     cbm_daemon_ipc_participant_guard_t *owned_participant_guard;
@@ -1234,9 +1235,20 @@ static void runtime_service_stop_ephemeral_if_idle_locked(cbm_daemon_runtime_ser
     if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING && !service->permanent &&
         service->admitted_total > 0 && service->committed_clients == 0 &&
         service->active_connections <= connections_finishing) {
-        runtime_service_begin_stopping_locked(service,
-                                              runtime_deadline_after(service->shutdown_timeout_ms),
-                                              false, "last_accepted_client_disconnected");
+        cbm_daemon_runtime_ephemeral_stop_result_t prepared =
+            service->ephemeral_stop.prepare
+                ? service->ephemeral_stop.prepare(service->ephemeral_stop.context)
+                : CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY;
+        if (prepared == CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_DEFER) {
+            return;
+        }
+        const char *reason = "last_accepted_client_disconnected";
+        if (prepared != CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY) {
+            cbm_log_error("daemon.runtime_stop_guard_failed", "component", "bootstrap");
+            reason = "bootstrap_stop_guard_failed";
+        }
+        runtime_service_begin_stopping_locked(
+            service, runtime_deadline_after(service->shutdown_timeout_ms), false, reason);
     }
 }
 
@@ -2247,6 +2259,7 @@ static void *runtime_accept_loop(void *opaque) {
     for (;;) {
         runtime_reap_completed_workers(service);
         cbm_mutex_lock(&service->mutex);
+        runtime_service_stop_ephemeral_if_idle_locked(service, 0);
         cbm_daemon_runtime_service_state_t state = service->state;
         cbm_mutex_unlock(&service->mutex);
         if (state == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
@@ -2298,6 +2311,11 @@ static bool runtime_application_callbacks_valid(
     bool all = application->session_open && application->request && application->request_cancel &&
                application->session_cancel && application->session_close;
     return !any || all;
+}
+
+static bool runtime_ephemeral_stop_callbacks_valid(
+    const cbm_daemon_runtime_ephemeral_stop_callbacks_t *ephemeral_stop) {
+    return ephemeral_stop && (ephemeral_stop->prepare || !ephemeral_stop->context);
 }
 
 static bool runtime_participant_guard_release_complete(
@@ -2387,6 +2405,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
         config->shutdown_timeout_ms == 0 ||
         config->shutdown_timeout_ms == CBM_DAEMON_IPC_WAIT_FOREVER ||
         !runtime_application_callbacks_valid(&config->application) ||
+        !runtime_ephemeral_stop_callbacks_valid(&config->ephemeral_stop) ||
         !cbm_daemon_runtime_hello_request_encode(validation, &config->identity)) {
         cbm_log_error("daemon.runtime.start_failed", "stage", "config_validation");
         return NULL;
@@ -2461,6 +2480,7 @@ cbm_daemon_runtime_service_t *cbm_daemon_runtime_service_start_reserved(
     service->request_timeout_ms = config->request_timeout_ms;
     service->shutdown_timeout_ms = config->shutdown_timeout_ms;
     service->application = config->application;
+    service->ephemeral_stop = config->ephemeral_stop;
     service->permanent = config->permanent;
     service->state = CBM_DAEMON_RUNTIME_SERVICE_STARTING;
 

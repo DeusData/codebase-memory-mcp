@@ -82,6 +82,10 @@ typedef struct {
     const char *executable_path;
     uint32_t connect_timeout_ms;
     uint32_t startup_timeout_ms;
+    /* The caller already holds cbm_version_cohort_bootstrap_activity_acquire()
+     * across preprocessing and this bootstrap attempt. Exact-build admission
+     * still occurs here; only the duplicate activity lock is skipped. */
+    bool bootstrap_activity_held;
     /* `daemon start` only: an absent endpoint is replaced by a PERMANENT
      * generation instead of an ephemeral one. Client bootstraps leave this
      * false — they must never mint permanence implicitly. */

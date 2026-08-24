@@ -367,11 +367,19 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
 
 static cbm_daemon_bootstrap_probe_status_t bootstrap_probe(
     const cbm_daemon_bootstrap_config_t *config, const cbm_daemon_bootstrap_ops_t *ops,
-    cbm_daemon_runtime_client_t **client_out, cbm_daemon_runtime_connect_result_t *connect_result) {
+    uint64_t deadline_ms, cbm_daemon_runtime_client_t **client_out,
+    cbm_daemon_runtime_connect_result_t *connect_result) {
     memset(connect_result, 0, sizeof(*connect_result));
     *client_out = NULL;
-    return ops->probe(ops->context, config->endpoint, config->identity, config->connect_timeout_ms,
-                      client_out, connect_result);
+    uint64_t now_ms = cbm_now_ms();
+    if (now_ms >= deadline_ms) {
+        return CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
+    }
+    uint64_t remaining_ms = deadline_ms - now_ms;
+    uint32_t timeout_ms = remaining_ms < config->connect_timeout_ms ? (uint32_t)remaining_ms
+                                                                    : config->connect_timeout_ms;
+    return ops->probe(ops->context, config->endpoint, config->identity, timeout_ms, client_out,
+                      connect_result);
 }
 
 static bool bootstrap_probe_is_finishable(cbm_daemon_bootstrap_probe_status_t probe) {
@@ -441,7 +449,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     cbm_daemon_runtime_client_t *client = NULL;
     cbm_daemon_runtime_connect_result_t connect_result;
     cbm_daemon_bootstrap_probe_status_t probe =
-        bootstrap_probe(config, ops, &client, &connect_result);
+        bootstrap_probe(config, ops, deadline, &client, &connect_result);
     if (bootstrap_probe_is_finishable(probe)) {
         cbm_daemon_bootstrap_status_t status =
             bootstrap_finish_probe(probe, client, &connect_result, ops, result_out);
@@ -469,7 +477,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
              * replacements from being launched. */
             generation_observed = true;
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
             continue;
         }
 
@@ -481,7 +489,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
         if (lock_status == 0) {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
             continue;
         }
         if (lock_status != 1 || !startup_lock) {
@@ -490,7 +498,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
 
         lock_acquired = true;
-        probe = bootstrap_probe(config, ops, &client, &connect_result);
+        probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
         if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
             probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
             generation_observed = true;
@@ -524,7 +532,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
          * bootstrap against a daemon that is trying to cleanly stand down. */
         do {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, deadline, &client, &connect_result);
             if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
                 probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
                 generation_observed = true;
@@ -604,6 +612,7 @@ typedef struct bootstrap_production_cohort {
 
 typedef struct {
     bootstrap_production_cohort_t *cohort;
+    bool bootstrap_activity_held;
 #ifdef _WIN32
     DWORD spawn_error;
 #elif defined(__APPLE__)
@@ -681,15 +690,17 @@ static cbm_version_cohort_status_t bootstrap_production_cohort_acquire(
         free(cohort);
         return CBM_VERSION_COHORT_IO;
     }
-    cbm_version_cohort_status_t status = cbm_version_cohort_acquire(
-        cohort->manager, identity, deadline_ms, &cohort->lease, conflict_out);
+    bootstrap_production_context_t *production = context;
+    cbm_version_cohort_status_t status =
+        (production && production->bootstrap_activity_held ? cbm_version_cohort_acquire
+                                                           : cbm_version_cohort_bootstrap_acquire)(
+            cohort->manager, identity, deadline_ms, &cohort->lease, conflict_out);
     if (status == CBM_VERSION_COHORT_CONFLICT) {
         (void)cbm_version_cohort_log_conflict(conflict_out);
     }
     if (status == CBM_VERSION_COHORT_OK || cohort->lease) {
         *cohort_out = cohort;
-        if (context) {
-            bootstrap_production_context_t *production = context;
+        if (production) {
             production->cohort = cohort;
         }
         return status;
@@ -1031,7 +1042,9 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
 
 cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute(
     const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result_out) {
-    bootstrap_production_context_t context = {0};
+    bootstrap_production_context_t context = {
+        .bootstrap_activity_held = config && config->bootstrap_activity_held,
+    };
     const cbm_daemon_bootstrap_ops_t ops = {
         .context = &context,
         .cohort_acquire = bootstrap_production_cohort_acquire,

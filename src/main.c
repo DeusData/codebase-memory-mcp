@@ -1444,8 +1444,7 @@ static int main_local_transition_acquire(const cbm_daemon_ipc_endpoint_t *endpoi
     }
 }
 
-static bool main_version_cohort_close(cbm_version_cohort_lease_t **lease,
-                                      cbm_version_cohort_manager_t **manager) {
+static bool main_version_cohort_lease_close(cbm_version_cohort_lease_t **lease) {
     bool ok = true;
     uint64_t deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
     while (lease && *lease) {
@@ -1460,7 +1459,13 @@ static bool main_version_cohort_close(cbm_version_cohort_lease_t **lease,
             cbm_usleep(1000);
         }
     }
-    deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
+    return ok;
+}
+
+static bool main_version_cohort_close(cbm_version_cohort_lease_t **lease,
+                                      cbm_version_cohort_manager_t **manager) {
+    bool ok = main_version_cohort_lease_close(lease);
+    uint64_t deadline = main_deadline_after(MAIN_COORDINATION_CLEANUP_MS);
     while (manager && *manager) {
         cbm_private_file_lock_status_t status = cbm_version_cohort_manager_free(manager);
         if (status != CBM_PRIVATE_FILE_LOCK_OK) {
@@ -1619,6 +1624,16 @@ static void main_report_client_failure(cbm_daemon_process_role_t role, const cha
     (void)fprintf(stderr, "codebase-memory-mcp: %s\n", detail);
 }
 
+/* #1582: name the directory and validation rule behind an endpoint refusal;
+ * MCP clients otherwise see only a transport close. */
+static void main_report_endpoint_failure(cbm_daemon_process_role_t role) {
+    const char *why = cbm_daemon_ipc_validation_detail();
+    char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+    (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s",
+                   (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
+    main_report_client_failure(role, message);
+}
+
 static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
                                                  const cbm_daemon_bootstrap_result_t *result) {
     main_report_client_failure(role, (result && result->message[0])
@@ -1669,14 +1684,23 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
  * that per-command cost. Only supervised index workers stay in-process. */
 static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json) {
     cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+    cbm_version_cohort_manager_t *activity_manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_version_cohort_lease_t *activity_lease = NULL;
+    cbm_version_cohort_status_t activity_status =
+        activity_manager ? cbm_version_cohort_bootstrap_activity_acquire(
+                               activity_manager, main_deadline_after(MAIN_MCP_STARTUP_TIMEOUT_MS),
+                               &activity_lease)
+                         : CBM_VERSION_COHORT_IO;
     char executable_path[MAIN_PATH_CAP] = {0};
     cbm_daemon_build_identity_t identity;
     bool prepared =
-        endpoint &&
+        activity_status == CBM_VERSION_COHORT_OK &&
         cbm_http_server_resolve_binary_path(NULL, executable_path, sizeof(executable_path)) &&
         main_build_identity(&identity, NULL) == MAIN_BUILD_IDENTITY_OK;
     if (!prepared) {
         (void)fprintf(stderr, "error: daemon-backed CLI coordination could not be prepared\n");
+        (void)main_version_cohort_close(&activity_lease, &activity_manager);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return NULL;
     }
@@ -1685,12 +1709,21 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         .endpoint = endpoint,
         .identity = &identity,
         .executable_path = executable_path,
-        .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
+        .connect_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
         .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
+        .bootstrap_activity_held = true,
     };
     cbm_daemon_bootstrap_result_t bootstrap;
     cbm_daemon_bootstrap_status_t status = main_client_bootstrap_with_upgrade(&config, &bootstrap);
+    bool activity_closed = main_version_cohort_close(&activity_lease, &activity_manager);
     cbm_daemon_ipc_endpoint_free(endpoint);
+    if (!activity_closed) {
+        if (bootstrap.client) {
+            (void)cbm_daemon_runtime_client_close(bootstrap.client, MAIN_CLOSE_TIMEOUT_MS);
+        }
+        (void)fprintf(stderr, "error: daemon-backed CLI bootstrap activity cleanup failed\n");
+        return NULL;
+    }
     if (status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap.client) {
         (void)fprintf(stderr, "error: %s\n",
                       bootstrap.message[0] ? bootstrap.message
@@ -2591,18 +2624,6 @@ int main(int argc, char **argv) {
         return EXIT_SUCCESS; /* hook adapters are contractually fail-open */
     }
 
-    /* Hook augmentation is contractually fail-open and time-bounded. It is
-     * daemon-backed but CONNECT-ONLY: a hook never spawns a daemon (a cold
-     * spawn cannot fit the fail-open budget and livelocks against the
-     * last-client-exit teardown), it recycles whichever daemon an MCP
-     * session or `daemon start` already brought up. Arm the deadline before
-     * hashing and IPC. */
-    if (role == CBM_DAEMON_PROCESS_HOOK_CLIENT) {
-#ifndef _WIN32
-        cbm_hook_augment_arm_deadline();
-#endif
-    }
-
     if (role == CBM_DAEMON_PROCESS_STATELESS) {
         int result = handle_subcommand(argc, argv, NULL, NULL);
         return result >= 0 ? result : EXIT_FAILURE;
@@ -2781,12 +2802,39 @@ int main(int argc, char **argv) {
         return exit_code;
     }
 
+    bool client_bootstrap =
+        role == CBM_DAEMON_PROCESS_MCP_CLIENT || role == CBM_DAEMON_PROCESS_HOOK_CLIENT;
+    cbm_daemon_ipc_endpoint_t *endpoint = client_bootstrap ? main_daemon_endpoint_new() : NULL;
+    cbm_version_cohort_manager_t *client_cohort_manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_version_cohort_lease_t *bootstrap_activity_lease = NULL;
+    cbm_version_cohort_status_t bootstrap_activity_status =
+        client_cohort_manager ? cbm_version_cohort_bootstrap_activity_acquire(
+                                    client_cohort_manager,
+                                    main_deadline_after(role == CBM_DAEMON_PROCESS_HOOK_CLIENT
+                                                            ? MAIN_HOOK_REQUEST_TIMEOUT_MS
+                                                            : MAIN_MCP_STARTUP_TIMEOUT_MS),
+                                    &bootstrap_activity_lease)
+                              : CBM_VERSION_COHORT_IO;
+    if (client_bootstrap && bootstrap_activity_status != CBM_VERSION_COHORT_OK) {
+        if (endpoint) {
+            main_report_client_failure(role, "client bootstrap activity admission failed");
+        } else {
+            main_report_endpoint_failure(role);
+        }
+        (void)main_version_cohort_close(&bootstrap_activity_lease, &client_cohort_manager);
+        cbm_daemon_ipc_endpoint_free(endpoint);
+        return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
+    }
+
     char executable_path[MAIN_PATH_CAP];
     cbm_daemon_build_identity_t identity;
     main_build_fingerprint_cache_t fingerprint_cache;
     if (!main_resolve_executable(argv[0], executable_path)) {
         main_report_client_failure(
             role, "exact executable identity could not be verified (executable-path)");
+        (void)main_version_cohort_close(&bootstrap_activity_lease, &client_cohort_manager);
+        cbm_daemon_ipc_endpoint_free(endpoint);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     main_build_identity_status_t identity_status =
@@ -2799,6 +2847,8 @@ int main(int argc, char **argv) {
             main_build_identity_status_name(identity_status), validation_detail[0] ? " - " : "",
             validation_detail, main_build_identity_status_guidance(identity_status));
         main_report_client_failure(role, message);
+        (void)main_version_cohort_close(&bootstrap_activity_lease, &client_cohort_manager);
+        cbm_daemon_ipc_endpoint_free(endpoint);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
     cbm_http_server_set_binary_path(executable_path);
@@ -2944,17 +2994,11 @@ int main(int argc, char **argv) {
         return result;
     }
 
-    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     if (!endpoint) {
-        /* #1582: this is where an ownership/ancestry refusal lands, and it was
-         * the silent one — stderr only, so an MCP client saw a transport that
-         * closed with no explanation. Include the validation detail, which
-         * names the directory and the rule that refused. */
-        const char *why = cbm_daemon_ipc_validation_detail();
-        char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
-        (void)snprintf(message, sizeof(message), "secure daemon endpoint could not be created%s%s",
-                       (why && why[0]) ? ": " : "", (why && why[0]) ? why : "");
-        main_report_client_failure(role, message);
+        endpoint = main_daemon_endpoint_new();
+    }
+    if (!endpoint) {
+        main_report_endpoint_failure(role);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
     }
 
@@ -2995,7 +3039,6 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    cbm_version_cohort_manager_t *client_cohort_manager = cbm_version_cohort_manager_new(endpoint);
     cbm_version_cohort_lease_t *client_cohort_lease = NULL;
     cbm_daemon_conflict_t client_cohort_conflict;
     cbm_version_cohort_status_t client_cohort_status =
@@ -3020,6 +3063,7 @@ int main(int argc, char **argv) {
             client_cohort_status == CBM_VERSION_COHORT_CONFLICT) {
             main_hook_report_conflicted_daemon(hook_dialect);
         }
+        (void)main_version_cohort_lease_close(&bootstrap_activity_lease);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         cbm_daemon_ipc_endpoint_free(endpoint);
         return role == CBM_DAEMON_PROCESS_HOOK_CLIENT ? EXIT_SUCCESS : EXIT_FAILURE;
@@ -3030,7 +3074,16 @@ int main(int argc, char **argv) {
         cbm_daemon_runtime_connect_result_t hook_connect;
         cbm_daemon_runtime_client_t *hook_client = cbm_daemon_runtime_client_connect(
             endpoint, &identity, MAIN_HOOK_CONNECT_TIMEOUT_MS, &hook_connect);
+        bool activity_closed = main_version_cohort_lease_close(&bootstrap_activity_lease);
         cbm_daemon_ipc_endpoint_free(endpoint);
+        if (!activity_closed) {
+            if (hook_client) {
+                (void)cbm_daemon_runtime_client_close(hook_client, MAIN_HOOK_CLOSE_TIMEOUT_MS);
+            }
+            main_report_client_failure(role, "client bootstrap activity cleanup failed");
+            (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+            return EXIT_SUCCESS;
+        }
         if (!hook_client) {
             if (hook_connect.status == CBM_DAEMON_RUNTIME_CONNECT_CONFLICT) {
                 char conflict_detail[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
@@ -3045,11 +3098,11 @@ int main(int argc, char **argv) {
             (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
             return EXIT_SUCCESS;
         }
-#ifdef _WIN32
-        /* Windows keeps the upstream fixed augmentation budget, armed only
-         * after the authenticated connection. */
+        /* Bound daemon-backed augmentation, not preprocessing: firing while
+         * hashing or reporting an absent daemon silently loses the actionable
+         * fail-open notice. Bootstrap has its own bounded waits, and hook
+         * runners retain their outer process timeout. */
         cbm_hook_augment_arm_deadline();
-#endif
         /* Fail-open: a hook must never block the caller's tool use, so the
          * exit code is EXIT_SUCCESS even when augmentation failed — the
          * frontend already emitted any visible notice. */
@@ -3064,13 +3117,23 @@ int main(int argc, char **argv) {
         .endpoint = endpoint,
         .identity = &identity,
         .executable_path = executable_path,
-        .connect_timeout_ms = MAIN_CONNECT_TIMEOUT_MS,
+        .connect_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
         .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
+        .bootstrap_activity_held = true,
     };
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =
         main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result);
+    bool activity_closed = main_version_cohort_lease_close(&bootstrap_activity_lease);
     cbm_daemon_ipc_endpoint_free(endpoint);
+    if (!activity_closed) {
+        if (bootstrap_result.client) {
+            (void)cbm_daemon_runtime_client_close(bootstrap_result.client, MAIN_CLOSE_TIMEOUT_MS);
+        }
+        main_report_client_failure(role, "client bootstrap activity cleanup failed");
+        (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
+        return EXIT_FAILURE;
+    }
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
         main_report_client_bootstrap_failure(role, &bootstrap_result);
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);

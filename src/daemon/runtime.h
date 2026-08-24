@@ -188,6 +188,24 @@ typedef struct {
     cbm_daemon_runtime_application_session_close_fn session_close;
 } cbm_daemon_runtime_application_callbacks_t;
 
+typedef enum {
+    CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_ERROR = -1,
+    CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_DEFER = 0,
+    CBM_DAEMON_RUNTIME_EPHEMERAL_STOP_READY = 1,
+} cbm_daemon_runtime_ephemeral_stop_result_t;
+
+typedef cbm_daemon_runtime_ephemeral_stop_result_t (*cbm_daemon_runtime_ephemeral_stop_prepare_fn)(
+    void *context);
+
+typedef struct {
+    void *context;
+    /* Called only after an ephemeral service has admitted a client and become
+     * idle. READY commits external authority to stop; the owner must retain it
+     * until service teardown. DEFER is retried after the bounded accept poll;
+     * ERROR is logged and stops fail-loudly. The callback must not block. */
+    cbm_daemon_runtime_ephemeral_stop_prepare_fn prepare;
+} cbm_daemon_runtime_ephemeral_stop_callbacks_t;
+
 typedef struct {
     const cbm_daemon_ipc_endpoint_t *endpoint;
     cbm_daemon_build_identity_t identity;
@@ -211,6 +229,7 @@ typedef struct {
      * required. Function pointers and context are copied; the context's owner
      * must keep it alive until service_free returns true. */
     cbm_daemon_runtime_application_callbacks_t application;
+    cbm_daemon_runtime_ephemeral_stop_callbacks_t ephemeral_stop;
     /* Born via `daemon start`: the service does not begin stopping when its
      * last committed client disconnects; only the stop/drain ops or an
      * explicit process kill end it. */

@@ -68,6 +68,30 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
                                                        cbm_version_cohort_lease_t **lease_out,
                                                        cbm_daemon_conflict_t *conflict_out);
 
+/* Client bootstrap admission additionally retains a shared activity claim
+ * until the runtime connection has committed or the attempt fails. This lets
+ * an ephemeral daemon distinguish not-yet-accepted clients from its own
+ * exact-build lifetime lease. */
+cbm_version_cohort_status_t cbm_version_cohort_bootstrap_acquire(
+    cbm_version_cohort_manager_t *manager, const cbm_daemon_build_identity_t *identity,
+    uint64_t deadline_ms, cbm_version_cohort_lease_t **lease_out,
+    cbm_daemon_conflict_t *conflict_out);
+
+/* Frontends may announce bootstrap activity before executable/cache identity
+ * preprocessing. Complete exact-build admission separately with
+ * cbm_version_cohort_acquire(), then retain this lease until runtime admission
+ * commits or the attempt fails. */
+cbm_version_cohort_status_t cbm_version_cohort_bootstrap_activity_acquire(
+    cbm_version_cohort_manager_t *manager, uint64_t deadline_ms,
+    cbm_version_cohort_lease_t **lease_out);
+
+/* Nonblocking daemon-side drain claim. BUSY means at least one bootstrap is
+ * still before committed runtime admission. OK returns an exclusive lease
+ * that must remain held while the daemon commits to stopping, then be released
+ * with cbm_version_cohort_lease_release(). */
+cbm_version_cohort_status_t cbm_version_cohort_bootstrap_drain_try_acquire(
+    cbm_version_cohort_manager_t *manager, cbm_version_cohort_lease_t **lease_out);
+
 /* Binary activation takes the lifetime file EX. It therefore refuses while
  * any CLI/bootstrap/daemon participant is active and blocks new admissions
  * for the complete install/update/uninstall mutation window. */

@@ -2790,12 +2790,11 @@ static void application_session_cancel(void *context,
             }
         }
         if (final_live_session && !application->permanent) {
-            /* The daemon runtime cannot close this allocation until an
-             * in-flight callback joins. Stop new admission now and cancel
-             * watcher/UI jobs that are not owned by session->active_job.
-             * A PERMANENT generation deliberately outlives its sessions and
-             * keeps admitting new ones; only the stop/drain paths latch it. */
-            application->stopping = true;
+            /* Cancel generation work with no live application owner, but leave
+             * admission to the runtime. An already-accepted peer may still be
+             * verifying its image and therefore have no application session
+             * yet; explicit application shutdown latches stopping only after
+             * the runtime has drained those peers. */
             application_cancel_jobs_locked(application);
             application_update_cancel_locked(application);
             reap_update = reap_update || application->update_thread_started;

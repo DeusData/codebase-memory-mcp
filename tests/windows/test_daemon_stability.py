@@ -20,12 +20,13 @@ that guard the daemon's PRODUCT contract under stress and misuse:
   one-shot client storms with its pid UNCHANGED (no silent restart) and stay
   responsive afterwards.
 * Concurrent cold start: parallel one-shots racing with no daemon must all
-  succeed, and the ephemeral daemon they share must retire afterwards.
+  succeed for both CLI and MCP frontends, and each shared ephemeral daemon must
+  retire afterwards.
 
 Every daemon this guard starts carries a kill-by-pid backstop so a stuck
-daemon can never hang the suite. Each section runs under its OWN cache
-directory: daemon coordination is cache-scoped, so sections are isolated from
-each other and from any interactive CBM use on the host.
+daemon can never hang the suite. The guard runs under one owner-private runtime
+directory, isolated from interactive CBM use, and gives each section its own
+cache directory.
 
 Exit code: 0 == all sections green, 1 == regression, 2 == setup error.
 
@@ -46,9 +47,11 @@ import time
 STATUS_POLL_S = 0.5
 
 
-def run_cli(binary, cache, args, stdin=None, timeout=90):
+def run_cli(binary, cache, args, stdin=None, timeout=90, extra_env=None):
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = cache
+    if extra_env:
+        env.update(extra_env)
     return subprocess.run([binary] + args, capture_output=True, timeout=timeout,
                           env=env, input=stdin)
 
@@ -125,7 +128,9 @@ def section_hook_fail_open(binary, work):
         "cwd": work.replace("\\", "/"),
         "tool_input": {"pattern": "anything"},
     }).encode("utf-8")
-    first = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60)
+    deadline = {"CBM_HOOK_DEADLINE_MS": "50"}
+    first = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60,
+                    extra_env=deadline)
     first_out = (first.stdout or b"").decode("utf-8", "replace")
     first_err = (first.stderr or b"").decode("utf-8", "replace")
     marker = os.path.join(cache, ".hook-daemon-absent-notice")
@@ -141,7 +146,8 @@ def section_hook_fail_open(binary, work):
     if not os.path.exists(marker):
         print("RED: the absent-daemon notice did not stamp its rate-limit marker: %s" % marker)
         return False
-    second = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60)
+    second = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60,
+                     extra_env=deadline)
     second_out = (second.stdout or b"").decode("utf-8", "replace")
     if second.returncode != 0 or "systemMessage" in second_out:
         print("RED: the second absent-daemon hook call must stay silent (rate-limited), "
@@ -294,11 +300,11 @@ def section_crash_recovery(binary, work):
         kill_pid(second_pid)
 
 
-def _parallel_one_shots(binary, cache, count):
+def _parallel_runs(binary, cache, args, count, stdin=None):
     results = [None] * count
 
     def _one(index):
-        results[index] = run_cli(binary, cache, ["cli", "list_projects", "{}"], timeout=120)
+        results[index] = run_cli(binary, cache, args, stdin=stdin, timeout=120)
 
     threads = [threading.Thread(target=_one, args=(i,)) for i in range(count)]
     for thread in threads:
@@ -325,7 +331,7 @@ def section_churn_stability(binary, work):
                       % (round_index, out_text(one)[:300]))
                 return False
         for wave in range(2):
-            results = _parallel_one_shots(binary, cache, 6)
+            results = _parallel_runs(binary, cache, ["cli", "list_projects", "{}"], 6)
             for index, result in enumerate(results):
                 if result is None or result.returncode != 0:
                     print("RED: parallel churn wave %d client %d failed (rc=%s):\n"
@@ -356,7 +362,7 @@ def section_churn_stability(binary, work):
 def section_cold_storm(binary, work):
     cache = os.path.join(work, "cache-storm")
     os.makedirs(cache, exist_ok=True)
-    results = _parallel_one_shots(binary, cache, 6)
+    results = _parallel_runs(binary, cache, ["cli", "list_projects", "{}"], 6)
     for index, result in enumerate(results):
         if result is None or result.returncode != 0:
             print("RED: cold-storm client %d failed (racing daemon spawn):\n%s"
@@ -378,6 +384,25 @@ def section_cold_storm(binary, work):
     return True
 
 
+def section_cold_mcp_storm(binary, work):
+    cache = os.path.join(work, "cache-mcp-storm")
+    os.makedirs(cache, exist_ok=True)
+    body = (b'{"jsonrpc":"2.0","id":1,"method":"initialize",'
+            b'"params":{"capabilities":{}}}')
+    request = b"Content-Length: %d\r\n\r\n" % len(body) + body
+    results = _parallel_runs(binary, cache, [], 6, stdin=request)
+    for index, result in enumerate(results):
+        if result is None or result.returncode != 0 or b'"result"' not in result.stdout:
+            print("RED: cold MCP-storm client %d failed (racing daemon spawn):\n%s"
+                  % (index, out_text(result)[:300] if result else "(no result)"))
+            return False
+    if not wait_status_not_running(binary, cache, 90):
+        print("RED: the ephemeral daemon shared by the cold MCP storm never retired")
+        return False
+    print("PASS: 6 racing cold MCP clients initialized and the shared ephemeral daemon retired")
+    return True
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: python test_daemon_stability.py <binary>")
@@ -387,7 +412,9 @@ def main():
         print("FAIL: binary not found: %s" % binary)
         return 2
 
-    work = tempfile.mkdtemp(prefix="cbm_daemon_stab_")
+    work = tempfile.mkdtemp(prefix="cbmst-", dir="/tmp" if os.name != "nt" else None)
+    previous_runtime_dir = os.environ.get("CBM_RUNTIME_DIR")
+    os.environ["CBM_RUNTIME_DIR"] = work
     sections = [
         section_params,
         section_hook_fail_open,
@@ -396,6 +423,7 @@ def main():
         section_crash_recovery,
         section_churn_stability,
         section_cold_storm,
+        section_cold_mcp_storm,
     ]
     try:
         for section in sections:
@@ -406,6 +434,10 @@ def main():
         print("\nGREEN: daemon stability, parameters, and failure modes behave.")
         return 0
     finally:
+        if previous_runtime_dir is None:
+            os.environ.pop("CBM_RUNTIME_DIR", None)
+        else:
+            os.environ["CBM_RUNTIME_DIR"] = previous_runtime_dir
         shutil.rmtree(work, ignore_errors=True)
 
 

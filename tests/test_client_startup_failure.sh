@@ -17,7 +17,9 @@ if ! LC_ALL=C grep -a -q -F 'CBM_TEST_DAEMON_RUNTIME_PARENT' "${BINARY}"; then
   exit 2
 fi
 
-tmpdir="$(mktemp -d)"
+# Keep the daemon socket below sockaddr_un's short macOS path limit so this
+# test reaches the intended invalid-parent refusal.
+tmpdir="$(mktemp -d /tmp/cbm-client-startup.XXXXXX)"
 cleanup() {
   rm -rf "${tmpdir}"
 }
