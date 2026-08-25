@@ -149,11 +149,11 @@ struct cbm_daemon_application_job {
     cbm_daemon_application_job_t *next;
 };
 
-/* A watcher-triggered physical job is owned by the exact live sessions that
- * currently subscribe to its project/root watch. The callback waiting for the
- * job is only a storage waiter; it is deliberately not an ownership
- * subscription, so the worker is cancelled when the last matching session
- * disconnects even while unrelated daemon sessions remain alive. */
+/* A watcher-triggered physical job is normally owned by the exact live
+ * sessions subscribed to its project/root watch. In permanent daemon mode the
+ * watcher itself additionally owns the physical job so background indexing can
+ * continue while no client session is connected. The callback remains a
+ * storage waiter in both modes and releases daemon ownership on completion. */
 struct cbm_daemon_application_watch_job_subscription {
     cbm_daemon_application_session_t *session;
     cbm_daemon_application_job_t *job;
@@ -424,7 +424,19 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
     if (watch->subscribers > 0) {
         watch->subscribers--;
     }
-    if (watch->subscribers == 0) {
+
+    /*
+     * A permanent daemon owns the physical project watch independently of
+     * individual client sessions. Session disconnect releases only that
+     * session's logical subscription; the watcher remains available for
+     * background change detection while the daemon generation is alive.
+     *
+     * Non-permanent applications retain the historical session-scoped
+     * lifecycle and remove the physical watch after the final subscriber.
+     * Project deletion/pruning and daemon shutdown remove persistent watches
+     * through their dedicated lifecycle paths.
+     */
+    if (!session->application->permanent && watch->subscribers == 0) {
         application_remove_watch_locked(session->application, watch);
     }
 }
@@ -3375,10 +3387,13 @@ static int application_background_index(cbm_daemon_application_t *application,
     cbm_mutex_lock(&application->mutex);
     cbm_daemon_application_watch_t *watch =
         require_live_watch ? application_find_watch_locked(application, project_name) : NULL;
-    bool watch_live = !require_live_watch ||
-                      (watch && watch->subscribers > 0 && strcmp(watch->root, canonical_root) == 0);
+    bool watch_live =
+        !require_live_watch ||
+        (watch && strcmp(watch->root, canonical_root) == 0 &&
+         (watch->subscribers > 0 || application->permanent));
     size_t watch_owner_count = 0;
     bool watch_subscriptions_ok = true;
+    bool watcher_owns_job = false;
     cbm_daemon_application_job_t *job =
         watch_live ? application_job_subscribe_locked(application, project_key, canonical_root,
                                                       args, &subscribe_status)
@@ -3386,16 +3401,28 @@ static int application_background_index(cbm_daemon_application_t *application,
     if (job && require_live_watch) {
         watch_subscriptions_ok = application_watch_job_subscribe_sessions_locked(
             application, watch, job, &watch_owner_count);
-        if (watch_subscriptions_ok && watch_owner_count > 0) {
-            job->watcher_waiters++;
-        } else if (!watch_subscriptions_ok) {
+
+        if (!watch_subscriptions_ok) {
             subscribe_status = APPLICATION_JOB_SUBSCRIBE_ALLOCATION_FAILED;
-        }
-        /* application_job_subscribe_locked() lends the caller one ordinary
-         * subscriber. A watcher callback is only a storage waiter: exact live
-         * session subscriptions above own the physical work. */
-        application_job_unsubscribe_locked(job);
-        if (!watch_subscriptions_ok || watch_owner_count == 0) {
+            application_job_unsubscribe_locked(job);
+            job = NULL;
+        } else if (application->permanent) {
+            /*
+             * The ordinary subscription acquired above is retained as daemon
+             * ownership. This allows the physical watcher to run indexing even
+             * while no client session currently owns the project watch.
+             */
+            watcher_owns_job = true;
+            job->watcher_waiters++;
+        } else if (watch_owner_count > 0) {
+            /*
+             * Historical non-permanent behavior: exact live sessions own the
+             * physical work; the watcher callback itself is only a waiter.
+             */
+            job->watcher_waiters++;
+            application_job_unsubscribe_locked(job);
+        } else {
+            application_job_unsubscribe_locked(job);
             job = NULL;
         }
     }
@@ -3427,6 +3454,10 @@ static int application_background_index(cbm_daemon_application_t *application,
                 application_watch_job_unsubscribe_job_locked(application, job);
                 if (job->watcher_waiters > 0) {
                     job->watcher_waiters--;
+                }
+                if (watcher_owns_job) {
+                    application_job_unsubscribe_locked(job);
+                    watcher_owns_job = false;
                 }
             } else {
                 application_job_unsubscribe_locked(job);

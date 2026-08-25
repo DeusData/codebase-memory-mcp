@@ -3621,6 +3621,107 @@ TEST(daemon_application_watcher_job_follows_exact_live_watch_owners) {
     PASS();
 }
 
+
+TEST(daemon_application_permanent_watch_survives_disconnect_and_indexes_without_session) {
+    app_watch_race_fixture_t fixture;
+    bool fixture_ready = app_watch_race_fixture_init(&fixture, 47);
+
+    if (fixture_ready) {
+        cbm_daemon_application_set_permanent(fixture.application, true);
+    }
+
+    int watch_before_disconnect =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    if (fixture.session) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, fixture.session);
+    }
+
+    int watch_after_cancel =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    if (fixture.session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, fixture.session);
+        fixture.session = NULL;
+    }
+
+    int watch_after_close =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    /*
+     * No client session remains at this point. A permanent daemon-owned
+     * physical watch must nevertheless be allowed to launch its background
+     * indexing job.
+     */
+    app_watcher_index_thread_t request = {
+        .application = fixture.application,
+        .project = fixture.project,
+        .root = fixture.root,
+        .pause_before_subscribe = false,
+        .result = -1,
+    };
+    atomic_init(&request.ready, false);
+    atomic_init(&request.proceed, true);
+    atomic_init(&request.done, false);
+
+    cbm_thread_t thread;
+    bool thread_started =
+        fixture_ready &&
+        watch_after_close == 1 &&
+        cbm_thread_create(&thread, 0, app_watcher_index_thread, &request) == 0;
+
+    bool worker_started =
+        thread_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+
+    int watch_during_job =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    /*
+     * The fake worker deliberately waits until the test releases it.
+     * Let the daemon-owned watcher job finish normally.
+     */
+    if (worker_started) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+
+    bool request_done =
+        thread_started && app_wait_for_atomic_bool(&request.done, true);
+
+    bool thread_joined =
+        request_done && cbm_thread_join(&thread) == 0;
+
+    int watch_after_job =
+        fixture_ready ? cbm_watcher_watch_count(fixture.watcher) : -1;
+
+    int destroys_before_cleanup =
+        fixture_ready ? atomic_load(&fixture.fake.destroys) : -1;
+
+    bool cleaned = app_watch_race_fixture_finish(&fixture);
+
+    ASSERT_TRUE(fixture_ready);
+    ASSERT_EQ(watch_before_disconnect, 1);
+
+    /* Permanent mode: disconnect must not unwatch the project. */
+    ASSERT_EQ(watch_after_cancel, 1);
+    ASSERT_EQ(watch_after_close, 1);
+
+    /* No session exists, yet the watcher still owns background indexing. */
+    ASSERT_TRUE(thread_started);
+    ASSERT_TRUE(worker_started);
+    ASSERT_EQ(watch_during_job, 1);
+
+    ASSERT_TRUE(request_done);
+    ASSERT_TRUE(thread_joined);
+    ASSERT_EQ(request.result, 0);
+    ASSERT_EQ(destroys_before_cleanup, 1);
+
+    /* Completing the background job must not consume the persistent watch. */
+    ASSERT_EQ(watch_after_job, 1);
+
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 TEST(daemon_application_late_watcher_session_owns_active_watcher_job) {
     app_watch_race_fixture_t fixture;
     bool fixture_ready = app_watch_race_fixture_init(&fixture, 45);
@@ -5116,6 +5217,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_stale_watcher_callback_is_rejected_at_job_admission);
     RUN_TEST(daemon_application_final_cancel_drains_admitted_watcher_job);
     RUN_TEST(daemon_application_watcher_job_follows_exact_live_watch_owners);
+    RUN_TEST(daemon_application_permanent_watch_survives_disconnect_and_indexes_without_session);
     RUN_TEST(daemon_application_late_watcher_session_owns_active_watcher_job);
     RUN_TEST(daemon_application_serializes_adr_mutation_with_index_job);
     RUN_TEST(daemon_application_reserved_mutation_delays_worker_start);
