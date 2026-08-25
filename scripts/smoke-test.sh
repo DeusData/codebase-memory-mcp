@@ -1704,11 +1704,18 @@ if ! grep -q 'existing_section' "$FAKE_HOME/.codex/config.toml"; then
 fi
 echo "OK 8f-h: Codex TOML (MCP + preserved existing)"
 
-# 8i: Fresh Codex installs do not create global instructions. Exercise the
-# complete legacy lifecycle in a second HOME so Codex-only reinstalls cannot
-# perturb the all-agent fixture that the remaining Phase 8 checks inspect.
-if [ -e "$FAKE_HOME/.codex/AGENTS.md" ]; then
-  echo "FAIL 8i: fresh Codex install created global AGENTS.md"
+# 8i: Codex keeps only a tiny global activation pointer; the installed skill
+# owns all detailed behavior. Exercise the complete lifecycle in a second HOME
+# so Codex-only reinstalls cannot perturb the all-agent fixture below.
+CODEX_POINTER_EXPECTED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' > "$CODEX_POINTER_EXPECTED"
+if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] ||
+   [ "$(smoke_file_sha256 "$FAKE_HOME/.codex/AGENTS.md")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ]; then
+  echo "FAIL 8i: fresh Codex install did not create the exact activation pointer"
   exit 1
 fi
 
@@ -1724,15 +1731,17 @@ HOME="$CODEX_LIFECYCLE_HOME" \
   APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
   "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_FRESH_LOG" 2>&1
-if [ -e "$CODEX_INSTRUCTIONS" ] ||
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
    ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
-   [ ! -s "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ] ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
    ! grep -q 'SessionStart' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
    ! grep -q 'SubagentStart' "$CODEX_LIFECYCLE_ROOT/config.toml"; then
-  echo "FAIL 8i: isolated fresh Codex install changed instructions or lost another surface"
+  echo "FAIL 8i: isolated fresh Codex install lost the pointer or another surface"
   exit 1
 fi
 
@@ -1742,8 +1751,15 @@ printf '%s\n' \
   'legacy managed guidance' \
   '<!-- codebase-memory-mcp:end -->' \
   '# Keep this line' > "$CODEX_INSTRUCTIONS"
-CODEX_EXPECTED=$(smoke_mktemp_file)
-printf '%s\n' '# Personal Codex guidance' '# Keep this line' > "$CODEX_EXPECTED"
+CODEX_EXPECTED_MIGRATED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_EXPECTED_MIGRATED"
+CODEX_EXPECTED_USER=$(smoke_mktemp_file)
+printf '%s\n' '# Personal Codex guidance' '# Keep this line' > "$CODEX_EXPECTED_USER"
 CODEX_LEGACY_SHA=$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")
 
 CODEX_PLAN=$(smoke_mktemp_file)
@@ -1753,14 +1769,13 @@ HOME="$CODEX_LIFECYCLE_HOME" \
   APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
   "$BINARY" install --plan --skip-binary --clients=codex > "$CODEX_PLAN"
-CODEX_CLEANUP_PATH=$(json_get "$CODEX_PLAN" \
-  "next((x.get('path','') for x in d.get('cleanup_actions_planned', []) if x.get('agent') == 'Codex CLI' and x.get('kind') == 'instructions' and x.get('operation') == 'remove_managed_block_if_present'), '')")
-CODEX_PLANS_INSTRUCTIONS=$(json_get "$CODEX_PLAN" \
-  "any(str(x).replace('\\\\','/').endswith('/.codex/AGENTS.md') for x in d.get('instruction_files_planned', []))")
-if ! exact_path_match "$CODEX_CLEANUP_PATH" "$CODEX_INSTRUCTIONS" ||
-   [ "$CODEX_PLANS_INSTRUCTIONS" != "False" ] ||
+CODEX_INSTRUCTION_PATH=$(json_get "$CODEX_PLAN" \
+  "next((str(x) for x in d.get('instruction_files_planned', []) if str(x).replace('\\\\','/').endswith('/.codex/AGENTS.md')), '')")
+CODEX_CLEANUP_COUNT=$(json_get "$CODEX_PLAN" "len(d.get('cleanup_actions_planned', []))")
+if ! exact_path_match "$CODEX_INSTRUCTION_PATH" "$CODEX_INSTRUCTIONS" ||
+   [ "$CODEX_CLEANUP_COUNT" != "0" ] ||
    [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
-  echo "FAIL 8i: Codex plan receipt or no-mutation contract is wrong"
+  echo "FAIL 8i: Codex plan did not describe a non-mutating pointer upsert"
   exit 1
 fi
 
@@ -1771,9 +1786,9 @@ HOME="$CODEX_LIFECYCLE_HOME" \
   APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
   "$BINARY" install --dry-run --skip-binary --clients=codex -y > "$CODEX_DRY_LOG" 2>&1
-if ! grep -q 'managed block if present' "$CODEX_DRY_LOG" ||
+if ! grep -q 'managed activation pointer' "$CODEX_DRY_LOG" ||
    [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
-  echo "FAIL 8i: Codex dry-run did not preview byte-identical legacy cleanup"
+  echo "FAIL 8i: Codex dry-run did not preview a byte-identical pointer migration"
   exit 1
 fi
 
@@ -1785,8 +1800,9 @@ HOME="$CODEX_LIFECYCLE_HOME" \
   LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
   "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_MIGRATE_LOG" 2>&1
 if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
-   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != "$(smoke_file_sha256 "$CODEX_EXPECTED")" ]; then
-  echo "FAIL 8i: Codex migration changed user-owned AGENTS.md bytes"
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ]; then
+  echo "FAIL 8i: Codex migration did not replace only the legacy managed block"
   exit 1
 fi
 
@@ -1797,23 +1813,30 @@ HOME="$CODEX_LIFECYCLE_HOME" \
   LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
   "$BINARY" install --skip-binary --clients=codex -y > /dev/null 2>&1
 if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
-   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != "$(smoke_file_sha256 "$CODEX_EXPECTED")" ]; then
-  echo "FAIL 8i: Codex reinstall restored global managed instructions"
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ] ||
+   [ "$(grep -c '<!-- codebase-memory-mcp:start -->' "$CODEX_INSTRUCTIONS")" -ne 1 ]; then
+  echo "FAIL 8i: Codex reinstall changed or duplicated the activation pointer"
   exit 1
 fi
 CODEX_UNINSTALL_LOG=$(smoke_mktemp_file)
-HOME="$CODEX_LIFECYCLE_HOME" \
-  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
-  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
-  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
-  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
-  "$BINARY" uninstall -y -n > "$CODEX_UNINSTALL_LOG" 2>&1 || true
-if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
-   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != "$(smoke_file_sha256 "$CODEX_EXPECTED")" ]; then
-  echo "FAIL 8i: Codex uninstall changed user-owned AGENTS.md bytes"
+if ! HOME="$CODEX_LIFECYCLE_HOME" \
+     CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+     XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+     APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+     LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+     "$BINARY" uninstall -y -n > "$CODEX_UNINSTALL_LOG" 2>&1; then
+  echo "FAIL 8i: Codex uninstall returned nonzero"
+  cat "$CODEX_UNINSTALL_LOG"
   exit 1
 fi
-echo "OK 8i: isolated Codex fresh/plan/dry-run/migration/reinstall/uninstall lifecycle"
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ]; then
+  echo "FAIL 8i: Codex uninstall did not remove only the activation pointer"
+  exit 1
+fi
+echo "OK 8i: isolated Codex activation-pointer lifecycle"
 
 # 8j-l: Gemini MCP + hooks + merge
 CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")

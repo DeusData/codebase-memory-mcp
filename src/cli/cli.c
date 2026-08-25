@@ -1389,18 +1389,7 @@ static const char skill_content[] =
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
 
 static const char codex_instructions_content[] =
-    "# Codebase Knowledge Graph\n"
-    "\n"
-    "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
-    "Use the MCP tools to explore and understand the code:\n"
-    "\n"
-    "- `search_graph` — find functions, classes, routes by pattern\n"
-    "- `trace_path` — trace who calls a function or what it calls\n"
-    "- `get_code_snippet` — read function source code\n"
-    "- `query_graph` — run Cypher queries for complex patterns\n"
-    "- `get_architecture` — high-level project summary\n"
-    "\n"
-    "Always prefer graph tools over grep for code discovery.\n";
+    "For structural codebase exploration, use the installed `codebase-memory` skill.\n";
 
 /* Old skill names — cleaned up during install to remove stale directories. */
 static const char *old_skill_names[] = {
@@ -7522,8 +7511,7 @@ static void print_detected_agents(const cbm_detected_agents_t *a, const char *ho
  * behavior (it is the same code path with mutations disabled). */
 typedef struct {
     char agent[CLI_BUF_32];
-    /* mcp_config | instructions | skills | hook | cleanup_instructions */
-    char kind[CLI_BUF_32];
+    char kind[CLI_BUF_32]; /* mcp_config | instructions | skills | hook */
     char path[CLI_BUF_1K];
 } cbm_plan_entry_t;
 
@@ -7861,17 +7849,21 @@ static bool install_generic_agent_config(const char *label, const char *binary_p
     return mcp_installed;
 }
 
-static void cleanup_codex_legacy_instructions(const char *path, bool dry_run) {
-    if (!path || !cbm_file_exists(path)) {
-        return;
+static bool install_codex_activation_pointer(const char *path, bool dry_run) {
+    if (!path) {
+        return false;
     }
     if (g_install_plan) {
-        plan_record("Codex CLI", "cleanup_instructions", path);
-        return;
+        plan_record("Codex CLI", "instructions", path);
+        return true;
     }
-    printf("  instructions cleanup: %s (managed block if present)\n", path);
-    if (!dry_run && cbm_remove_instructions(path) != CLI_OK) {
-        record_agent_config_error(false, "Codex CLI", "legacy_instructions_cleanup", path);
+    return dry_run || cbm_upsert_instructions(path, codex_instructions_content) == CLI_OK;
+}
+
+static void report_codex_activation_pointer_install(const char *path, bool installed) {
+    printf("  instructions: %s (managed activation pointer)\n", path);
+    if (!installed) {
+        record_agent_config_error(false, "Codex CLI", "instructions_install", path);
     }
 }
 
@@ -8812,6 +8804,8 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        /* A broken hook config must not keep legacy full guidance active. */
+        bool pointer_installed = install_codex_activation_pointer(ip, dry_run);
         char command[CLI_BUF_8K];
         char command_windows[CLI_BUF_8K];
         char hooks_json[CLI_BUF_1K];
@@ -8839,11 +8833,16 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             record_agent_config_error_with_reason(
                 false, "Codex CLI", commands_ok ? "hook_preflight" : "hook_command_build", cp,
                 reason);
+            if (!g_install_plan) {
+                report_codex_activation_pointer_install(ip, pointer_installed);
+            }
             goto codex_install_done;
         }
         install_generic_agent_config("Codex CLI", binary_path, cp, NULL, dry_run,
                                      cbm_upsert_codex_mcp);
-        cleanup_codex_legacy_instructions(ip, dry_run);
+        if (!g_install_plan) {
+            report_codex_activation_pointer_install(ip, pointer_installed);
+        }
         install_agent_skill("Codex CLI", skills_dir, force, dry_run);
         install_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -9931,10 +9930,9 @@ static bool cli_binary_is_externally_managed(const char *self_path, bool self_pa
 }
 
 /* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
- * the config / instruction / skill / agent / hook files `install` WOULD write
- * plus conditional cleanup actions, produced by running the real install
- * dispatch in record-only mode (no mutation, no network). Returns a heap JSON
- * string (caller frees) or NULL. */
+ * the config / instruction / skill / agent / hook files `install` WOULD write, produced by
+ * running the real install dispatch in record-only mode (no mutation, no
+ * network). Returns a heap JSON string (caller frees) or NULL. */
 static char *cbm_build_install_plan_json_options(const char *home, const char *binary_path,
                                                  bool skip_config) {
     if (!home || !binary_path) {
@@ -10010,18 +10008,10 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_val *agent_files = yyjson_mut_arr(doc);
     yyjson_mut_val *prompt_files = yyjson_mut_arr(doc);
     yyjson_mut_val *hooks = yyjson_mut_arr(doc);
-    yyjson_mut_val *cleanups = yyjson_mut_arr(doc);
     for (int i = 0; i < plan.count; i++) {
         cbm_plan_entry_t *e = &plan.items[i];
         if (strcmp(e->kind, "mcp_config") == 0) {
             yyjson_mut_arr_add_strcpy(doc, configs, e->path);
-        } else if (strcmp(e->kind, "cleanup_instructions") == 0) {
-            yyjson_mut_val *cleanup = yyjson_mut_obj(doc);
-            yyjson_mut_obj_add_strcpy(doc, cleanup, "agent", e->agent);
-            yyjson_mut_obj_add_str(doc, cleanup, "kind", "instructions");
-            yyjson_mut_obj_add_str(doc, cleanup, "operation", "remove_managed_block_if_present");
-            yyjson_mut_obj_add_strcpy(doc, cleanup, "path", e->path);
-            yyjson_mut_arr_add_val(cleanups, cleanup);
         } else if (strcmp(e->kind, "hook") == 0) {
             yyjson_mut_val *h = yyjson_mut_obj(doc);
             yyjson_mut_obj_add_strcpy(doc, h, "agent", e->agent);
@@ -10046,7 +10036,6 @@ static char *cbm_build_install_plan_json_options(const char *home, const char *b
     yyjson_mut_obj_add_val(doc, root, "agent_files_planned", agent_files);
     yyjson_mut_obj_add_val(doc, root, "prompt_files_planned", prompt_files);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
-    yyjson_mut_obj_add_val(doc, root, "cleanup_actions_planned", cleanups);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
     yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
@@ -10730,6 +10719,17 @@ static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, bool dry_run,
     }
 }
 
+static bool uninstall_codex_activation_pointer(const char *path, bool dry_run) {
+    return path && (dry_run || cbm_remove_instructions(path) == CLI_OK);
+}
+
+static void report_codex_activation_pointer_uninstall(const char *path, bool removed) {
+    printf("  instructions: removed managed activation pointer\n");
+    if (!removed) {
+        record_agent_config_error(true, "Codex CLI", "instructions_uninstall", path);
+    }
+}
+
 static void uninstall_agent_skill(const char *label, const char *skills_dir, bool dry_run) {
     int removed = cbm_remove_skills(skills_dir, dry_run);
     printf("  %s skill: %d removed\n", label, removed);
@@ -11164,6 +11164,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        bool pointer_removed = uninstall_codex_activation_pointer(ip, dry_run);
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
         char hook_command[CLI_BUF_8K];
         char hook_command_windows[CLI_BUF_8K];
@@ -11184,10 +11185,12 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                                      ? NULL
                                      : cbm_toml_codex_hook_failure_name(preflight_failure);
             record_agent_config_error_with_reason(true, "Codex CLI", "hook_preflight", cp, reason);
+            report_codex_activation_pointer_uninstall(ip, pointer_removed);
             goto codex_toml_done;
         }
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, NULL}, dry_run,
                                   cbm_remove_codex_mcp_owned);
+        report_codex_activation_pointer_uninstall(ip, pointer_removed);
         if (!dry_run &&
             cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
                                               CBM_TOML_CODEX_HOOK_REMOVE, false) != CLI_OK) {
