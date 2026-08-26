@@ -5166,15 +5166,14 @@ typedef struct {
     const CBMLSPDef *def;
 } KotlinSignatureParseContext;
 
-static const CBMType *kt_signature_parse_type(CBMArena *arena, const char *text, void *parser_ctx) {
-    const KotlinSignatureParseContext *ctx = (const KotlinSignatureParseContext *)parser_ctx;
-    const CBMLSPDef *def = ctx ? ctx->def : NULL;
+/* Normalize a type as written to a bare name: trim, drop nullability, drop
+ * type arguments. Returns NULL when nothing is left. */
+static char *kt_clean_type_text(CBMArena *arena, const char *text) {
     if (!text || !text[0])
-        return cbm_type_unknown();
-
+        return NULL;
     char *clean = cbm_arena_strdup(arena, text);
     if (!clean)
-        return cbm_type_unknown();
+        return NULL;
     while (*clean && isspace((unsigned char)*clean))
         clean++;
     char *end = clean + strlen(clean);
@@ -5185,7 +5184,14 @@ static const CBMType *kt_signature_parse_type(CBMArena *arena, const char *text,
     char *generic = strchr(clean, '<');
     if (generic)
         *generic = '\0';
-    if (!clean[0])
+    return clean[0] ? clean : NULL;
+}
+
+static const CBMType *kt_signature_parse_type(CBMArena *arena, const char *text, void *parser_ctx) {
+    const KotlinSignatureParseContext *ctx = (const KotlinSignatureParseContext *)parser_ctx;
+    const CBMLSPDef *def = ctx ? ctx->def : NULL;
+    char *clean = kt_clean_type_text(arena, text);
+    if (!clean)
         return cbm_type_unknown();
 
     const char *qualified = kt_cross_builtin_return_qn(clean);
@@ -5201,6 +5207,58 @@ static const CBMType *kt_signature_parse_type(CBMArena *arena, const char *text,
         }
     }
     return cbm_type_named(arena, qualified);
+}
+
+/* Resolve a property's declared type to a project type QN.
+ *
+ * A property annotation is written unqualified whether the type is same-package
+ * or imported, and the def carries no import list of its own — so joining the
+ * declaring package is right for the first case and wrong for the second.
+ * Prefer the same-package QN when such a type actually exists, then fall back
+ * to the project-wide short-name index. `type_short` maps an ambiguous short
+ * name to "" so a name owned by two packages resolves to nothing rather than
+ * to an arbitrary winner. */
+static const CBMType *kt_property_type(CBMArena *arena, const CBMLSPDef *d,
+                                       const CBMHashTable *type_qns,
+                                       const CBMHashTable *type_short) {
+    if (!d || !d->return_types || !d->return_types[0])
+        return NULL;
+    const char *first = d->return_types;
+    const char *bar = strchr(first, '|');
+    if (bar)
+        first = cbm_arena_strndup(arena, first, (size_t)(bar - first));
+    char *clean = kt_clean_type_text(arena, first);
+    if (!clean)
+        return NULL;
+
+    const char *builtin = kt_cross_builtin_return_qn(clean);
+    if (builtin)
+        return cbm_type_named(arena, builtin);
+    if (strchr(clean, '.'))
+        return cbm_type_named(arena, clean);
+
+    const char *ns = (d->namespace_name && d->namespace_name[0])
+                         ? d->namespace_name
+                         : (d->def_module_qn && d->def_module_qn[0] ? d->def_module_qn : NULL);
+    if (ns) {
+        const char *same_pkg = kt_join_dot(arena, ns, clean);
+        if (type_qns && same_pkg && cbm_ht_get((CBMHashTable *)type_qns, same_pkg)) {
+            return cbm_type_named(arena, same_pkg);
+        }
+    }
+    if (type_short) {
+        const char *hit = (const char *)cbm_ht_get((CBMHashTable *)type_short, clean);
+        if (hit && hit[0]) {
+            return cbm_type_named(arena, hit);
+        }
+        if (hit) {
+            return NULL; /* ambiguous short name — fail closed */
+        }
+    }
+    if (ns) {
+        return cbm_type_named(arena, kt_join_dot(arena, ns, clean));
+    }
+    return cbm_type_named(arena, clean);
 }
 
 static const CBMType *kt_cross_return_type(CBMArena *arena, const CBMLSPDef *d) {
@@ -5307,6 +5365,31 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
 
 void cbm_kotlin_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *defs,
                                   int def_count, CBMHashTable **out_field_map) {
+    /* Pass 0: index the project's type QNs, plus a short-name -> QN map used to
+     * qualify a property annotation that names an imported type. Ambiguous
+     * short names are pinned to "" so they resolve to nothing. */
+    CBMHashTable *type_qns = cbm_ht_create(64);
+    CBMHashTable *type_short = cbm_ht_create(64);
+    if (type_qns && type_short) {
+        for (int i = 0; i < def_count; i++) {
+            const CBMLSPDef *d = &defs[i];
+            if (!d->qualified_name || !d->short_name || !d->label) {
+                continue;
+            }
+            if (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Interface") != 0 &&
+                strcmp(d->label, "Enum") != 0 && strcmp(d->label, "Type") != 0) {
+                continue;
+            }
+            cbm_ht_set(type_qns, d->qualified_name, (void *)d->qualified_name);
+            const char *prev = (const char *)cbm_ht_get(type_short, d->short_name);
+            if (!prev) {
+                cbm_ht_set(type_short, d->short_name, (void *)d->qualified_name);
+            } else if (strcmp(prev, d->qualified_name) != 0) {
+                cbm_ht_set(type_short, d->short_name, (void *)"");
+            }
+        }
+    }
+
     /* Pass 1: bucket property (Variable) defs by receiver type, so a class
      * registers WITH its fields. Cross registration previously dropped
      * properties entirely (pxc_map_label filtered the label), which left
@@ -5353,7 +5436,10 @@ void cbm_kotlin_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const C
                 fl->qns = nq;
                 fl->cap = new_cap;
             }
-            const CBMType *ft = kt_cross_return_type(arena, d);
+            /* A property's declared type arrives as written, so it needs
+             * cleaning (generics, nullability) and qualification against the
+             * project's types before it can be looked up. */
+            const CBMType *ft = kt_property_type(arena, d, type_qns, type_short);
             fl->names[fl->count] = d->short_name;
             /* The declared type when the def carries one; a generic named type
              * otherwise, so the field's EXISTENCE is still visible to
@@ -5369,6 +5455,11 @@ void cbm_kotlin_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const C
     for (int i = 0; i < def_count; i++) {
         kt_register_cross_def(reg, arena, &defs[i], field_map);
     }
+    /* The type indexes only qualify property annotations in pass 1; nothing
+     * downstream holds a reference. Values are borrowed def strings, so
+     * freeing the tables frees no payload. */
+    cbm_ht_free(type_qns);
+    cbm_ht_free(type_short);
     if (out_field_map) {
         /* Ownership transfers: the caller keeps the map alive for the resolve
          * walk (property references need each field's real def QN). */

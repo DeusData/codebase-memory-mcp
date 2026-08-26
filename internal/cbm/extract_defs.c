@@ -195,6 +195,9 @@ static void extract_variables(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec
 static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_variables(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                     const CBMLangSpec *spec);
+static void push_var_def_typed(CBMExtractCtx *ctx, const char *name, TSNode node,
+                               const char *type_text);
+static const char *resolve_kotlin_var_type(CBMArena *a, TSNode node, const char *source);
 static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const char *class_qn,
                                   const CBMLangSpec *spec);
@@ -4482,6 +4485,51 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     // Extract class-level variables (field declarations)
     extract_class_variables(ctx, node, class_qn, spec);
 
+    // Kotlin primary-constructor properties: `class Foo(private val bar: Bar)`
+    // declares bar as a member, reachable from every instance method, but it
+    // lives on the class line rather than in the class body — so
+    // extract_class_variables never sees it. Without these defs a member call
+    // through an injected dependency has no receiver type to resolve against.
+    if (ctx->language == CBM_LANG_KOTLIN) {
+        TSNode pc = cbm_find_child_by_kind(node, "primary_constructor");
+        if (!ts_node_is_null(pc)) {
+            // Older grammars wrap the params in a `class_parameters` node;
+            // newer ones put `class_parameter` directly under the constructor.
+            TSNode wrapped = cbm_find_child_by_kind(pc, "class_parameters");
+            TSNode container = ts_node_is_null(wrapped) ? pc : wrapped;
+            uint32_t pcount = ts_node_named_child_count(container);
+            for (uint32_t k = 0; k < pcount; k++) {
+                TSNode p = ts_node_named_child(container, k);
+                if (ts_node_is_null(p) || strcmp(ts_node_type(p), "class_parameter") != 0) {
+                    continue;
+                }
+                // Only `val`/`var` parameters become properties; a plain
+                // constructor parameter is scoped to the initializer. Matched
+                // on text because the binding keyword's node kind differs
+                // across tree-sitter-kotlin versions.
+                const char *ptext = cbm_node_text(a, p, ctx->source);
+                if (!ptext || (!strstr(ptext, "val ") && !strstr(ptext, "var "))) {
+                    continue;
+                }
+                TSNode name_node = ts_node_child_by_field_name(p, TS_FIELD("name"));
+                if (ts_node_is_null(name_node)) {
+                    name_node = cbm_find_child_by_kind(p, "simple_identifier");
+                }
+                if (ts_node_is_null(name_node)) {
+                    continue;
+                }
+                const char *pname = cbm_node_text(a, name_node, ctx->source);
+                if (!pname || !pname[0]) {
+                    continue;
+                }
+                const char *saved_parent = ctx->var_parent_class;
+                ctx->var_parent_class = class_qn;
+                push_var_def_typed(ctx, pname, p, resolve_kotlin_var_type(a, p, ctx->source));
+                ctx->var_parent_class = saved_parent;
+            }
+        }
+    }
+
     // C# 12 primary-constructor parameters: declared on the class line
     // (`class Foo(IBar bar, IBaz baz) : Base { ... }`) and bound to implicit
     // captured fields accessible from any instance member. Tree-sitter c-sharp
@@ -5185,9 +5233,16 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
 /* `qn_name` is the name as it should appear in the qualified name, which differs
  * from `name` only where a language scopes a variable below the module — Nix,
  * whose binding names are attrpaths (`a.b.c = …` is name `c`, QN suffix `a.b.c`).
- * Pass NULL to use `name` for both. */
-static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name,
-                            TSNode node) {
+ * Pass NULL to use `name` for both.
+ *
+ * `type_text` is the declared type as written, or NULL where the language
+ * extractor has none to hand. Cross-file resolution needs it: a property whose
+ * type is unknown registers as a bare placeholder on its receiver, so member
+ * calls through that property miss the typed lookup and fall to name-only
+ * matching. Carried as return_type, which is the single type slot every
+ * registrar already reads. */
+static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn_name, TSNode node,
+                            const char *type_text) {
     if (!name || !name[0] || strcmp(name, "_") == 0) {
         return;
     }
@@ -5195,6 +5250,9 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
     def.name = name;
+    if (type_text && type_text[0]) {
+        def.return_type = type_text;
+    }
     /* Java/Go: directory-based module (package), so a Go package-level var in
      * myapp/db/conn.go is proj.myapp.db.Var, matching its siblings. */
     def.qualified_name = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
@@ -5213,7 +5271,13 @@ static void push_var_def_qn(CBMExtractCtx *ctx, const char *name, const char *qn
 }
 
 static void push_var_def(CBMExtractCtx *ctx, const char *name, TSNode node) {
-    push_var_def_qn(ctx, name, NULL, node);
+    push_var_def_qn(ctx, name, NULL, node, NULL);
+}
+
+/* As push_var_def, for extractors that can see the declaration's type. */
+static void push_var_def_typed(CBMExtractCtx *ctx, const char *name, TSNode node,
+                               const char *type_text) {
+    push_var_def_qn(ctx, name, NULL, node, type_text);
 }
 
 // Helper: extract name from a declarator chain (C/C++/ObjC)
@@ -5704,6 +5768,40 @@ static TSNode resolve_kotlin_var_name(TSNode node) {
     return null_node;
 }
 
+/* Declared type of a Kotlin `val`/`var`, as written. The annotation hangs off
+ * the variable_declaration (`val x: T`), so a property_declaration has to be
+ * unwrapped first. Returns NULL for an inferred type (`val x = f()`) — the
+ * initializer is an expression, and inferring through it is the type pass's
+ * job, not the extractor's. */
+static const char *resolve_kotlin_var_type(CBMArena *a, TSNode node, const char *source) {
+    TSNode holder = cbm_find_child_by_kind(node, "variable_declaration");
+    if (ts_node_is_null(holder)) {
+        holder = node;
+    }
+    static const char *type_kinds[] = {"type", "user_type", "nullable_type", NULL};
+    for (const char **k = type_kinds; *k; k++) {
+        TSNode t = cbm_find_child_by_kind(holder, *k);
+        if (!ts_node_is_null(t)) {
+            return cbm_node_text(a, t, source);
+        }
+    }
+    /* Unannotated but directly constructed (`val logger = Logger()`) — by far
+     * the most common inferred property in practice. Only a bare capitalized
+     * callee is taken: anything else is a factory or a chain whose result type
+     * the extractor has no business guessing. */
+    TSNode init = cbm_find_child_by_kind(node, "call_expression");
+    if (!ts_node_is_null(init) && ts_node_named_child_count(init) > 0) {
+        TSNode callee = ts_node_named_child(init, 0);
+        if (!ts_node_is_null(callee) && strcmp(ts_node_type(callee), "simple_identifier") == 0) {
+            const char *text = cbm_node_text(a, callee, source);
+            if (text && text[0] >= 'A' && text[0] <= 'Z') {
+                return text;
+            }
+        }
+    }
+    return NULL;
+}
+
 static void extract_vars_jvm(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     switch (ctx->language) {
     case CBM_LANG_SCALA: {
@@ -5721,7 +5819,8 @@ static void extract_vars_jvm(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     case CBM_LANG_KOTLIN: {
         TSNode name_node = resolve_kotlin_var_name(node);
         if (!ts_node_is_null(name_node)) {
-            push_var_def(ctx, cbm_node_text(a, name_node, ctx->source), node);
+            push_var_def_typed(ctx, cbm_node_text(a, name_node, ctx->source), node,
+                               resolve_kotlin_var_type(a, node, ctx->source));
         }
         break;
     }
@@ -5926,7 +6025,7 @@ static void extract_vars_nix(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     cbm_nix_strip_attr_quotes(name);
     const char *scope = cbm_nix_attrpath_scope(a, attrpath, ctx->source);
     const char *qn_name = scope ? cbm_arena_sprintf(a, "%s.%s", scope, name) : name;
-    push_var_def_qn(ctx, name, qn_name, node);
+    push_var_def_qn(ctx, name, qn_name, node, NULL);
 }
 
 /* Mint every direct binding of one Nix binding container. */
