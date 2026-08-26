@@ -811,6 +811,58 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
     PASS();
 }
 
+TEST(kotlin_weak_match_on_property_is_uncallable) {
+    /* A Kotlin property is a registry symbol so reads/writes can resolve to it,
+     * which also makes its name a bare-name call candidate. Nothing can call it,
+     * so a weak short-name match onto one is never the real target. A true answer
+     * tells the caller to re-resolve against callable candidates only, not to
+     * drop the edge — see cbm_registry_resolve_callable. */
+    ASSERT_TRUE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "unique_name", "Variable"));
+    ASSERT_TRUE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "suffix_match", "Variable"));
+    ASSERT_TRUE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "field_type_hint", "Field"));
+    ASSERT_TRUE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "fuzzy", "Field"));
+    /* Callable targets are untouched whatever the strategy. */
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "unique_name", "Function"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "suffix_match", "Method"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "unique_name", "Class"));
+    /* Receiver- and import-aware strategies are kept even onto a property. */
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "same_module", "Variable"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "import_map", "Variable"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "lsp_kt_method", "Variable"));
+    /* Other languages, and no-match inputs, are unaffected. */
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_JAVA, "unique_name", "Variable"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_PYTHON, "unique_name", "Variable"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, NULL, "Variable"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "", "Variable"));
+    ASSERT_FALSE(cbm_kotlin_weak_match_is_uncallable(CBM_LANG_KOTLIN, "unique_name", NULL));
+    PASS();
+}
+
+TEST(callable_label_predicate_is_narrower_than_registry_membership) {
+    /* The narrowing in cbm_registry_resolve_callable is only safe if every label
+     * a call can legitimately bind to is admitted. Constructor calls arrive as a
+     * Class target, so Class must be callable. */
+    ASSERT_TRUE(cbm_label_is_callable_target("Function"));
+    ASSERT_TRUE(cbm_label_is_callable_target("Method"));
+    ASSERT_TRUE(cbm_label_is_callable_target("Constructor"));
+    ASSERT_TRUE(cbm_label_is_callable_target("Class"));
+    /* Registry members that are not invocable. Interface/Enum are type-like and
+     * registry-admitted, but a call never binds to them directly. */
+    ASSERT_FALSE(cbm_label_is_callable_target("Variable"));
+    ASSERT_FALSE(cbm_label_is_callable_target("Field"));
+    ASSERT_FALSE(cbm_label_is_callable_target("Interface"));
+    ASSERT_FALSE(cbm_label_is_callable_target("Enum"));
+    ASSERT_FALSE(cbm_label_is_callable_target("Table"));
+    ASSERT_FALSE(cbm_label_is_callable_target(NULL));
+    /* Callable ⊂ registry-admitted: narrowing can only ever shrink the pool, so
+     * it cannot introduce a target the default resolve would have rejected. */
+    const char *callable[] = {"Function", "Method", "Class"};
+    for (size_t i = 0; i < sizeof(callable) / sizeof(callable[0]); i++) {
+        ASSERT_TRUE(cbm_label_is_registry_symbol(callable[i]));
+    }
+    PASS();
+}
+
 TEST(tsjs_suppress_drops_weak_method_matches) {
     /* #592/#606: a TS/JS member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
@@ -946,5 +998,7 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
     RUN_TEST(tsjs_suppress_drops_weak_method_matches);
+    RUN_TEST(kotlin_weak_match_on_property_is_uncallable);
+    RUN_TEST(callable_label_predicate_is_narrower_than_registry_membership);
     RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
 }

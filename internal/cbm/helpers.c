@@ -195,6 +195,17 @@ bool cbm_label_is_registry_symbol(const char *label) {
            strcmp(label, "Field") == 0 || cbm_label_is_relation(label);
 }
 
+// True when `label` can be invoked (see cbm.h). Narrower than
+// cbm_label_is_registry_symbol on purpose: that predicate answers "may this
+// declaration be found by name", this one answers "may a call bind to it".
+bool cbm_label_is_callable_target(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+           strcmp(label, "Constructor") == 0 || strcmp(label, "Class") == 0;
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;

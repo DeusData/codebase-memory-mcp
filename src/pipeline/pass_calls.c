@@ -651,6 +651,27 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
+    /* A weak short-name match that landed on a Kotlin property is calling
+     * something that cannot be called. Re-resolve against callable candidates
+     * only rather than dropping outright: a property name often shadows a real
+     * function name (a `comment` property on one class, `fun comment(...)` on
+     * another), and the genuine target is in the same candidate pool. Drop only
+     * when narrowing finds nothing callable. The re-check below re-applies every
+     * guard the new target must also satisfy. */
+    if (cbm_kotlin_weak_match_is_uncallable(lang, res.strategy, target_node->label)) {
+        cbm_resolution_t cres = cbm_registry_resolve_callable(
+            ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count);
+        const cbm_gbuf_node_t *cnode = (cres.qualified_name && cres.qualified_name[0])
+                                           ? cbm_gbuf_find_by_qn(ctx->gbuf, cres.qualified_name)
+                                           : NULL;
+        if (!cnode || source_node->id == cnode->id ||
+            cbm_suppress_cross_language_suffix_match(lang, cnode->file_path, cres.strategy) ||
+            cbm_kotlin_weak_match_is_uncallable(lang, cres.strategy, cnode->label)) {
+            return 0;
+        }
+        res = cres;
+        target_node = cnode;
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, tsjs_drop_plain_call);
     return SKIP_ONE;

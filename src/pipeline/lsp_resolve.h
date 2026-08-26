@@ -201,11 +201,10 @@ static inline bool cbm_pipeline_usage_allows_semantic_reference(const CBMUsage *
  * rows are joined before either rule. This label check keeps sequential and
  * fused resolution aligned. */
 static inline bool cbm_pipeline_node_is_callable_target(const cbm_gbuf_node_t *node) {
-    if (!node || !node->label) {
+    if (!node) {
         return false;
     }
-    return strcmp(node->label, "Function") == 0 || strcmp(node->label, "Method") == 0 ||
-           strcmp(node->label, "Constructor") == 0 || strcmp(node->label, "Class") == 0;
+    return cbm_label_is_callable_target(node->label);
 }
 
 static inline int cbm_pipeline_qn_class_method_tail_eq(const char *qn, const char *tail) {

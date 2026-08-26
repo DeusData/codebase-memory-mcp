@@ -2542,6 +2542,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * CALLS edge across a language boundary. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_kotlin_weak_match_is_uncallable(lang, res.strategy, target_node->label)) {
+            /* Same recovery as pass_calls.c — a weak short-name match onto a
+             * Kotlin property is calling something that cannot be called, so
+             * re-resolve against callable candidates only and drop only when
+             * narrowing finds nothing. */
+            cbm_resolution_t cres = cbm_registry_resolve_callable(
+                rc->registry, call->callee_name, module_qn, imp_keys, imp_vals, imp_count);
+            const cbm_gbuf_node_t *cnode =
+                (cres.qualified_name && cres.qualified_name[0])
+                    ? cbm_gbuf_find_by_qn(rc->main_gbuf, cres.qualified_name)
+                    : NULL;
+            if (!cnode || source_node->id == cnode->id ||
+                cbm_suppress_cross_language_suffix_match(lang, cnode->file_path, cres.strategy) ||
+                cbm_kotlin_weak_match_is_uncallable(lang, cres.strategy, cnode->label)) {
+                continue;
+            }
+            res = cres;
+            target_node = cnode;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge

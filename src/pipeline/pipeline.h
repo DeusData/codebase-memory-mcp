@@ -227,6 +227,22 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
                                               const char *module_qn, const char **import_map_keys,
                                               const char **import_map_vals, int import_map_count);
 
+/* Callable-narrowed resolve for CALL consumers. Identical to the default
+ * variant except that the bare-name strategies (unique_name / qualified_suffix /
+ * suffix_match) see only candidates whose label can be invoked, so a property
+ * that merely shares a function's name cannot win the name race. The import-map
+ * and same-module strategies are NOT narrowed: a non-callable target under those
+ * is a deliberate binding, not a collision.
+ *
+ * Call this only after the default resolve produced a weak match on an
+ * uncallable target (cbm_kotlin_weak_match_is_uncallable) — it is the recovery
+ * path, not the primary one, and is uncached for the same reason as the lineage
+ * variant. Returns an empty result when no callable candidate exists, which the
+ * caller should treat as "drop the edge". */
+cbm_resolution_t cbm_registry_resolve_callable(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count);
+
 /* Per-file memoization cache for is_import_reachable. Thread-local —
  * each resolve worker owns its own cache. Call _begin at the start
  * of resolve_file_calls (or any per-file resolve loop) and _end at
@@ -282,6 +298,20 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
+
+/* True when a weak short-name strategy pointed a Kotlin CALLS edge at a property
+ * (Variable / Field). Properties are in the registry for read/write resolution,
+ * which also exposes their names to bare-name call matching; a Kotlin property is
+ * not callable, so such a match is never the real target. lsp_* / import /
+ * same-module matches are kept.
+ *
+ * A true answer means "re-resolve", not "drop": the caller retries via
+ * cbm_registry_resolve_callable and drops only if that finds no callable
+ * candidate. A property name frequently shadows a real function name, in which
+ * case the genuine target is in the same candidate pool and merely lost the name
+ * race. Pure; unit-tested in test_registry.c. */
+bool cbm_kotlin_weak_match_is_uncallable(CBMLanguage caller_lang, const char *strategy,
+                                         const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

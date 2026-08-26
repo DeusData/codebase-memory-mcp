@@ -770,4 +770,15 @@ bool cbm_label_is_relation(const char *label);
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_registry_symbol(const char *label);
 
+// True for labels that can be the target of an invocation: Function, Method,
+// Constructor, and Class (a class name in call position is a construction).
+// Registry membership is deliberately wider than this — Variable and Field are
+// admitted so that reads and writes can resolve — which also makes every
+// property name a bare-name candidate during call resolution. Consumers
+// resolving a CALL use this predicate to narrow the candidate pool to
+// declarations that can actually be called, so a property that merely shares a
+// function's name does not win the name race. `label` may be NULL (returns
+// false). Defined in helpers.c.
+bool cbm_label_is_callable_target(const char *label);
+
 #endif // CBM_H

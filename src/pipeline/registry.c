@@ -456,6 +456,43 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
 }
 
+/* Kotlin analogue of the guards above, keyed on the TARGET rather than the
+ * receiver, and reporting a fact rather than prescribing a drop. Properties are
+ * registry symbols so that reads and writes can resolve to them, which also
+ * makes every property name a candidate for bare-name call matching:
+ * `x.current()` with an unresolved receiver lands on any property named
+ * `current` anywhere in the project. A property is not callable, so such a match
+ * is never the real target.
+ *
+ * Callers do NOT drop the edge on a true answer — they re-resolve with the
+ * candidate pool narrowed to callable declarations
+ * (cbm_registry_resolve_callable) and drop only if that finds nothing. The
+ * distinction matters whenever a property name shadows a real function name: the
+ * genuine target is in the same candidate pool and merely lost the name race, so
+ * vetoing the weak winner outright would delete a real edge.
+ *
+ * Scoped to Kotlin because that is the language whose property coverage this
+ * change extends; the reasoning is not Kotlin-specific and would transfer to the
+ * other JVM languages unchanged. Pure + side-effect-free so the contract is
+ * unit-testable without a full pipeline. */
+bool cbm_kotlin_weak_match_is_uncallable(CBMLanguage caller_lang, const char *strategy,
+                                         const char *target_label) {
+    if (caller_lang != CBM_LANG_KOTLIN || !strategy || !strategy[0] || !target_label) {
+        return false;
+    }
+    if (cbm_label_is_callable_target(target_label)) {
+        return false;
+    }
+    if (strcmp(target_label, "Variable") != 0 && strcmp(target_label, "Field") != 0) {
+        return false;
+    }
+    /* Same explicit strategy list as the TS/JS guard, for the same reason: lsp_*
+     * and import/same-module strategies are receiver- or import-aware, so a
+     * non-callable target under them is a deliberate binding and is KEPT. */
+    return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
+           strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
 }
@@ -824,17 +861,49 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* Narrow `arr` to candidates that can actually be called, into caller-provided
+ * storage. Returns a qn_array_t view over `keep` (borrowed pointers, no
+ * ownership), or the original `arr` unchanged when narrowing would leave nothing
+ * to resolve against. Mirrors the stack-array pattern of
+ * resolve_multi_with_imports. */
+static qn_array_t narrow_to_callable(const cbm_registry_t *r, const qn_array_t *arr, char **keep,
+                                     int keep_cap) {
+    int kept = 0;
+    for (int i = 0; i < arr->count && kept < keep_cap; i++) {
+        if (cbm_label_is_callable_target(cbm_registry_label_of(r, arr->items[i]))) {
+            keep[kept++] = arr->items[i];
+        }
+    }
+    if (kept == 0) {
+        return *arr;
+    }
+    qn_array_t narrowed = {.items = keep, .count = kept, .cap = kept};
+    return narrowed;
+}
+
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
-                                            int import_count) {
+                                            int import_count, bool callable_only) {
     const char *lookup = simple_name(callee_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
-    if (!arr || arr->count == 0) {
+    qn_array_t *found = cbm_ht_get(r->by_name, lookup);
+    if (!found || found->count == 0) {
         return empty_result();
     }
-    if (arr->count > REG_MAX_CANDIDATES) {
+    if (found->count > REG_MAX_CANDIDATES) {
         return empty_result(); /* unresolvably ambiguous — see REG_MAX_CANDIDATES */
+    }
+
+    /* When the consumer is resolving a CALL, drop the candidates that cannot be
+     * called BEFORE any strategy below picks a winner. Doing it here rather than
+     * vetoing the winner afterwards is what lets a genuine function still resolve
+     * when a same-named property is also in the pool. */
+    char *keep_ptrs[REG_MAX_CANDIDATES];
+    qn_array_t narrowed_storage;
+    const qn_array_t *arr = found;
+    if (callable_only) {
+        narrowed_storage = narrow_to_callable(r, found, keep_ptrs, REG_MAX_CANDIDATES);
+        arr = &narrowed_storage;
     }
 
     /* Strategy 3.5: a qualified callee disambiguates among multiple same-name
@@ -869,11 +938,18 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     return empty_result();
 }
 
-/* The strategy chain shared by both public resolve variants (no caching here —
- * cbm_registry_resolve owns the per-file cache). */
+/* The strategy chain shared by all public resolve variants (no caching here —
+ * cbm_registry_resolve owns the per-file cache).
+ *
+ * callable_only narrows ONLY the bare-name strategies (3/3.5/4). Strategies 1
+ * and 2 (import_map, same_module) are deliberately left unnarrowed: they resolve
+ * a specific imported or same-module declaration, so a non-callable target under
+ * them is a deliberate binding (a property holding a function value, an invoked
+ * local) rather than a name collision. */
 static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const char *callee_name,
                                                const char *module_qn, const char **import_map_keys,
-                                               const char **import_map_vals, int import_map_count) {
+                                               const char **import_map_vals, int import_map_count,
+                                               bool callable_only) {
     /* Split callee at the first path separator: "pkg.Func" → prefix="pkg",
      * suffix="Func".  Rust/C++ use "::" rather than ".", so honor whichever
      * separator appears first ("lib::square" → prefix="lib", suffix="square").
@@ -910,7 +986,8 @@ static cbm_resolution_t registry_resolve_chain(const cbm_registry_t *r, const ch
     }
     if (!(res.qualified_name && res.qualified_name[0])) {
         /* Strategy 3+4: name lookup */
-        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count);
+        res = resolve_name_lookup(r, callee_name, module_qn, import_map_vals, import_map_count,
+                                  callable_only);
     }
     return res;
 }
@@ -934,7 +1011,7 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
     }
 
     cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
-                                                  import_map_vals, import_map_count);
+                                                  import_map_vals, import_map_count, false);
 
     /* Data relations (Table/View) are lineage-only registry members: common
      * table names (users, orders, config) collide with code identifiers across
@@ -977,7 +1054,32 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * it would poison one variant with the other's semantics. SQL files hold
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
-                                  import_map_count);
+                                  import_map_count, false);
+}
+
+cbm_resolution_t cbm_registry_resolve_callable(const cbm_registry_t *r, const char *callee_name,
+                                               const char *module_qn, const char **import_map_keys,
+                                               const char **import_map_vals, int import_map_count) {
+    if (!r || !callee_name) {
+        return empty_result();
+    }
+    /* Callable-narrowed variant for CALL consumers whose default resolution
+     * landed on a declaration that cannot be invoked (see
+     * cbm_kotlin_weak_match_is_uncallable). Uncached for the same reason as the
+     * lineage variant: the per-file cache is keyed by bare callee_name and holds
+     * the default variant's answer, so sharing it would poison one variant with
+     * the other's semantics. Only reached on the rare shadowed-name path, so the
+     * extra chain walk is bounded by the number of such call sites, not by the
+     * total call count. */
+    cbm_resolution_t res = registry_resolve_chain(r, callee_name, module_qn, import_map_keys,
+                                                  import_map_vals, import_map_count, true);
+    /* The default variant's central relation veto applies here too — a narrowed
+     * pool must not reintroduce a Table/View target. */
+    if (res.qualified_name && res.qualified_name[0] &&
+        cbm_label_is_relation(cbm_registry_label_of(r, res.qualified_name))) {
+        return empty_result();
+    }
+    return res;
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */
