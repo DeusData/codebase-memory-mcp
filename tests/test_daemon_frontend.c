@@ -76,6 +76,10 @@ enum {
     FRONTEND_BACKPRESSURE_DAEMON_TIMEOUT_S = 90,
     FRONTEND_BACKPRESSURE_RUNTIME_TIMEOUT_MS = 90000,
     FRONTEND_BACKPRESSURE_CLEANUP_TIMEOUT_MS = 30000,
+    /* Production bounds the monitor to 3 seconds. Give sanitizer runners
+     * separate process-exit and lock-release margin without widening that
+     * product contract. */
+    FRONTEND_MAINTENANCE_MUTATION_TIMEOUT_MS = 8000,
     /* The production queue is deliberately bounded below this count. Keep the
      * regression black-box: it must remain valid if the exact capacity changes
      * while still proving that overload cannot hide an already-pending EOF. */
@@ -1269,9 +1273,9 @@ TEST(daemon_local_participant_monitor_cancels_then_bounds_active_operation) {
     cbm_version_cohort_lease_t *mutation = NULL;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     cbm_version_cohort_status_t status =
-        announced ? cbm_version_cohort_reserve_for_mutation(fixture.manager, cbm_now_ms() + 5000U,
-                                                            frontend_test_quiesce_requested, NULL,
-                                                            &quiesce, &mutation)
+        announced ? cbm_version_cohort_reserve_for_mutation(
+                        fixture.manager, cbm_now_ms() + FRONTEND_MAINTENANCE_MUTATION_TIMEOUT_MS,
+                        frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
                   : CBM_VERSION_COHORT_IO;
     bool cancelled = status == CBM_VERSION_COHORT_OK &&
                      frontend_test_wait_byte(cancel_pipe[0], 'C', cbm_now_ms() + 1000U);
@@ -1357,9 +1361,9 @@ TEST(daemon_local_participant_monitor_allows_supervisor_containment_window) {
     cbm_version_cohort_lease_t *mutation = NULL;
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     cbm_version_cohort_status_t status =
-        announced ? cbm_version_cohort_reserve_for_mutation(fixture.manager, cbm_now_ms() + 5000U,
-                                                            frontend_test_quiesce_requested, NULL,
-                                                            &quiesce, &mutation)
+        announced ? cbm_version_cohort_reserve_for_mutation(
+                        fixture.manager, cbm_now_ms() + FRONTEND_MAINTENANCE_MUTATION_TIMEOUT_MS,
+                        frontend_test_quiesce_requested, NULL, &quiesce, &mutation)
                   : CBM_VERSION_COHORT_IO;
     if (status != CBM_VERSION_COHORT_OK && child > 0) {
         (void)kill(child, SIGKILL);
