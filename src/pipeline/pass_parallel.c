@@ -853,14 +853,29 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
 
         uint64_t file_t0 = extract_now_ns();
 
-        /* Export XML uses the same cache slot as every physical file, so its
-         * generated classes are composed before entering the common registry
-         * and resolution lifecycle. */
+        /* Mirror of the sequential skip: TwinCAT project descriptions carry no
+         * code, so pass_tcproj owns their meaning and the XML grammar must not
+         * mint one Class per markup element here either. */
+        if (cbm_is_twincat_project_file(fi->rel_path)) {
+            free(source);
+            continue;
+        }
+
+        /* Transform-only containers (Export XML, TwinCAT PLC XML) use the same
+         * cache slot as every physical file, so their generated units are
+         * composed before entering the common registry and resolution
+         * lifecycle. */
         CBMFileResult *result =
             fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ec->project_name,
                                                            fi->rel_path, ec->macro_table,
                                                            ec->return_type_table)
+            : fi->language == CBM_LANG_TWINCAT
+                ? cbm_pipeline_extract_twincat(source, source_len, ec->project_name, fi->rel_path,
+                                               ec->macro_table, ec->return_type_table)
+            : fi->language == CBM_LANG_PLCOPEN_XML
+                ? cbm_pipeline_extract_plcopen(source, source_len, ec->project_name, fi->rel_path,
+                                               ec->macro_table, ec->return_type_table)
                 : cbm_extract_file_ex(source, source_len, fi->language, ec->project_name,
                                       fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, ec->macro_table,
                                       ec->return_type_table);

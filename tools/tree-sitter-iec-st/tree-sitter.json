@@ -1,0 +1,53 @@
+{
+  "$schema": "https://tree-sitter.github.io/tree-sitter/assets/schemas/config.schema.json",
+  "grammars": [
+    {
+      "name": "iec61131_3_st",
+      "camelcase": "Iec61131_3St",
+      "scope": "source.iec61131-3.st",
+      "path": ".",
+      "file-types": [
+        "st",
+        "iecst",
+        "exp"
+      ],
+      "highlights": [
+        "queries/highlights.scm"
+      ],
+      "injections": [
+        "queries/injections.scm"
+      ],
+      "locals": [
+        "queries/locals.scm"
+      ],
+      "tags": [
+        "queries/tags.scm"
+      ]
+    }
+  ],
+  "metadata": {
+    "version": "0.1.2",
+    "license": "MIT",
+    "description": "IEC 61131-3 Structured Text grammar for tree-sitter (standard, dialect-extensible)",
+    "authors": [
+      {
+        "name": "HeytalePazguato",
+        "email": "Heytale.Pazguato@gmail.com"
+      }
+    ],
+    "links": {
+      "repository": "https://github.com/HeytalePazguato/tree-sitter-iec61131-3-st"
+    }
+  },
+  "bindings": {
+    "c": true,
+    "c_sharp": true,
+    "go": true,
+    "java": false,
+    "node": true,
+    "python": true,
+    "rust": true,
+    "swift": false,
+    "zig": false
+  }
+}

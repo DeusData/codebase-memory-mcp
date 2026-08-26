@@ -325,7 +325,8 @@ static const char *field_name_for_walk_node(WalkState *state, TSNode parent, TSN
 static bool is_value_field(const char *field) {
     return field && (strcmp(field, "value") == 0 || strcmp(field, "right") == 0 ||
                      strcmp(field, "initializer") == 0 || strcmp(field, "default") == 0 ||
-                     strcmp(field, "default_value") == 0 || strcmp(field, "body") == 0 ||
+                     strcmp(field, "default_value") == 0 || strcmp(field, "initial_value") == 0 ||
+                     strcmp(field, "body") == 0 ||
                      strcmp(field, "arguments") == 0 || strcmp(field, "condition") == 0 ||
                      strcmp(field, "consequence") == 0 || strcmp(field, "alternative") == 0 ||
                      strcmp(field, "expression") == 0 || strcmp(field, "result") == 0);
@@ -453,6 +454,10 @@ static const char *const meson_write_nodes[] = {"operatorunit", NULL};
 static const char *const gn_write_nodes[] = {"assignment_statement", NULL};
 static const char *const objectscript_binding_nodes[] = {"argument", "tag_parameter", NULL};
 static const char *const objectscript_write_nodes[] = {"set_argument", NULL};
+/* IEC 61131-3 ST: every VAR block entry (VAR_INPUT/VAR/VAR_GLOBAL/...) is a
+ * `variable_declaration` that binds its `names`. Its `type` and
+ * `initial_value` fields stay reads via the field barriers. */
+static const char *const iec_st_binding_nodes[] = {"variable_declaration", NULL};
 
 /* Parallel to lang_specs: occurrence semantics evolve without adding fields to
  * the positional CBMLangSpec initializer used by every language. */
@@ -499,6 +504,7 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
                                    CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = {objectscript_binding_nodes, objectscript_write_nodes,
                                        CBM_OCCURRENCE_STANDARD, true},
+    [CBM_LANG_IEC_ST] = {iec_st_binding_nodes, NULL, CBM_OCCURRENCE_STANDARD, false},
 };
 
 static bool text_equals(CBMExtractCtx *ctx, TSNode node, const char *expected) {

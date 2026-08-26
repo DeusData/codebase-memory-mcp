@@ -28,6 +28,8 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "cbm.h"
 #include "arena.h"
 #include "iris_export_xml.h"
+#include "twincat_xml.h"
+#include "plcopen_xml.h"
 #include "simhash/minhash.h"
 #include "semantic/ast_profile.h"
 
@@ -655,6 +657,179 @@ CBMFileResult *cbm_pipeline_extract_objectscript_export(
     return aggregate;
 }
 
+/* TwinCAT PLC XML containers follow the exact Studio Export lifecycle: the XML
+ * is transcoded to textual IEC 61131-3 ST (twincat_xml.c), each generated unit
+ * is extracted as CBM_LANG_IEC_ST, and the carriers are composed into one
+ * cacheable aggregate via the shared append helpers above. */
+CBMFileResult *cbm_pipeline_extract_twincat(const char *source, int source_len,
+                                            const char *project_name, const char *rel_path,
+                                            const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table) {
+    CBMArena st_arena;
+    cbm_arena_init(&st_arena);
+    int unit_count = 0;
+    char **st_units = cbm_twincat_to_st(&st_arena, source, source_len, &unit_count);
+    if (!st_units || unit_count <= 0) {
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+
+    CBMFileResult *aggregate = (CBMFileResult *)calloc(1, sizeof(CBMFileResult));
+    if (!aggregate) {
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+    cbm_arena_init(&aggregate->arena);
+    if (aggregate->arena.nblocks == 0) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+    aggregate->owned_results =
+        (CBMFileResult **)calloc((size_t)unit_count, sizeof(CBMFileResult *));
+    if (!aggregate->owned_results) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+    aggregate->cached_lang = CBM_LANG_IEC_ST;
+
+    for (int ui = 0; ui < unit_count; ui++) {
+        CBMFileResult *part = cbm_extract_file_ex(
+            st_units[ui], (int)strlen(st_units[ui]), CBM_LANG_IEC_ST, project_name, rel_path,
+            CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
+        if (!part) {
+            continue;
+        }
+
+        /* The aggregate has no single parse tree; later passes consume the
+         * extracted carriers, not a raw-XML tree. */
+        cbm_free_tree(part);
+        if (!objectscript_export_append_primary_arrays(aggregate, part) ||
+            !objectscript_export_append_secondary_arrays(aggregate, part) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->exports,
+                                                part->exports) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->constants,
+                                                part->constants) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->global_vars,
+                                                part->global_vars) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->macros,
+                                                part->macros) ||
+            !objectscript_export_append_error_ranges(aggregate, part)) {
+            cbm_free_result(part);
+            cbm_free_result(aggregate);
+            cbm_arena_destroy(&st_arena);
+            return NULL;
+        }
+
+        if (!aggregate->module_qn) {
+            aggregate->module_qn = part->module_qn;
+        }
+        if (!aggregate->namespace_name) {
+            aggregate->namespace_name = part->namespace_name;
+        }
+        if (part->has_error) {
+            aggregate->has_error = true;
+            if (!aggregate->error_msg) {
+                aggregate->error_msg = part->error_msg;
+            }
+        }
+        aggregate->is_test_file = aggregate->is_test_file || part->is_test_file;
+        aggregate->owned_results[aggregate->owned_result_count++] = part;
+    }
+
+    aggregate->imports_count = aggregate->imports.count;
+    cbm_arena_destroy(&st_arena);
+    return aggregate;
+}
+
+/* CODESYS/PLCopen TC6 XML exports follow the exact TwinCAT/Studio Export
+ * lifecycle: the XML is transcoded to textual IEC 61131-3 ST (one unit per
+ * <pou>/<dataType>, plcopen_xml.c), each generated unit is extracted as
+ * CBM_LANG_IEC_ST, and the carriers are composed into one cacheable
+ * aggregate via the shared append helpers above. */
+CBMFileResult *cbm_pipeline_extract_plcopen(const char *source, int source_len,
+                                            const char *project_name, const char *rel_path,
+                                            const CBMMacroTable *macro_table,
+                                            const CBMReturnTypeTable *return_type_table) {
+    CBMArena st_arena;
+    cbm_arena_init(&st_arena);
+    int unit_count = 0;
+    char **st_units = cbm_plcopen_to_st(&st_arena, source, source_len, &unit_count);
+    if (!st_units || unit_count <= 0) {
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+
+    CBMFileResult *aggregate = (CBMFileResult *)calloc(1, sizeof(CBMFileResult));
+    if (!aggregate) {
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+    cbm_arena_init(&aggregate->arena);
+    if (aggregate->arena.nblocks == 0) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+    aggregate->owned_results =
+        (CBMFileResult **)calloc((size_t)unit_count, sizeof(CBMFileResult *));
+    if (!aggregate->owned_results) {
+        cbm_free_result(aggregate);
+        cbm_arena_destroy(&st_arena);
+        return NULL;
+    }
+    aggregate->cached_lang = CBM_LANG_IEC_ST;
+
+    for (int ui = 0; ui < unit_count; ui++) {
+        CBMFileResult *part = cbm_extract_file_ex(
+            st_units[ui], (int)strlen(st_units[ui]), CBM_LANG_IEC_ST, project_name, rel_path,
+            CBM_EXTRACT_BUDGET, NULL, NULL, macro_table, return_type_table);
+        if (!part) {
+            continue;
+        }
+
+        /* The aggregate has no single parse tree; later passes consume the
+         * extracted carriers, not a raw-XML tree. */
+        cbm_free_tree(part);
+        if (!objectscript_export_append_primary_arrays(aggregate, part) ||
+            !objectscript_export_append_secondary_arrays(aggregate, part) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->exports,
+                                                part->exports) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->constants,
+                                                part->constants) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->global_vars,
+                                                part->global_vars) ||
+            !objectscript_export_append_strings(&aggregate->arena, &aggregate->macros,
+                                                part->macros) ||
+            !objectscript_export_append_error_ranges(aggregate, part)) {
+            cbm_free_result(part);
+            cbm_free_result(aggregate);
+            cbm_arena_destroy(&st_arena);
+            return NULL;
+        }
+
+        if (!aggregate->module_qn) {
+            aggregate->module_qn = part->module_qn;
+        }
+        if (!aggregate->namespace_name) {
+            aggregate->namespace_name = part->namespace_name;
+        }
+        if (part->has_error) {
+            aggregate->has_error = true;
+            if (!aggregate->error_msg) {
+                aggregate->error_msg = part->error_msg;
+            }
+        }
+        aggregate->is_test_file = aggregate->is_test_file || part->is_test_file;
+        aggregate->owned_results[aggregate->owned_result_count++] = part;
+    }
+
+    aggregate->imports_count = aggregate->imports.count;
+    cbm_arena_destroy(&st_arena);
+    return aggregate;
+}
+
 #undef OBJECTSCRIPT_EXPORT_APPEND_ARRAY
 
 int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -756,12 +931,29 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             continue;
         }
 
-        /* Studio Export XML is transformed to one cacheable aggregate so later
-         * passes see the same calls/usages/semantic carriers as native UDL. */
+        /* TwinCAT project descriptions carry no code. cbm_pipeline_pass_tcproj
+         * turns them into Package/DEPENDS_ON/CONTAINS_FILE/CONFIGURES; running
+         * the XML grammar over their markup as well would mint one Class per
+         * element ("Name", "PropertyGroup", "BitSize"). Their File nodes come
+         * from pass_structure, so the project pass still finds them. */
+        if (cbm_is_twincat_project_file(rel)) {
+            free(source);
+            continue;
+        }
+
+        /* Transform-only containers (Studio Export XML, TwinCAT PLC XML) are
+         * transcoded to one cacheable aggregate so later passes see the same
+         * calls/usages/semantic carriers as native source files. */
         CBMFileResult *result =
             lang == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
+            : lang == CBM_LANG_TWINCAT
+                ? cbm_pipeline_extract_twincat(source, source_len, ctx->project_name, rel,
+                                               ctx->macro_table, NULL)
+            : lang == CBM_LANG_PLCOPEN_XML
+                ? cbm_pipeline_extract_plcopen(source, source_len, ctx->project_name, rel,
+                                               ctx->macro_table, NULL)
                 : cbm_extract_file_ex(
                       source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
                       NULL /* no extra defines or include paths */, ctx->macro_table, NULL);

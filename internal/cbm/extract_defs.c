@@ -609,6 +609,47 @@ static TSNode find_first_descendant_by_kind(TSNode node,
 
 // Forward declaration for mutual recursion. Exported (see helpers.h) so the
 // unified/calls extractor shares this one resolver — see cbm_resolve_func_name.
+/* IEC 61131-3 ST: TwinCAT writes access modifiers on POU headers
+ * (`FUNCTION_BLOCK PUBLIC FB_X`, and `PUBLIC FINAL` in combination). The
+ * vendored grammar has no rule for them, so it binds the FIRST MODIFIER to the
+ * `name` field and drops the remaining tokens — including the real identifier —
+ * into an ERROR node beside it; the graph then shows a block literally called
+ * "PUBLIC". Recover the real name structurally: the ERROR node that starts on
+ * the header line after `name` holds the remaining identifiers, and the LAST of
+ * them is the POU name (`name: PUBLIC` + `ERROR(FINAL, FB_X)`). No text
+ * comparison is needed, so this works without the source buffer. The parse
+ * error itself still surfaces as a partial-parse range. */
+static TSNode iec_st_recover_pou_name(TSNode node, TSNode name_node) {
+    if (ts_node_is_null(name_node)) {
+        return name_node;
+    }
+    TSPoint name_end = ts_node_end_point(name_node);
+    uint32_t child_count = ts_node_child_count(node);
+    for (uint32_t i = 0; i < child_count; i++) {
+        TSNode err = ts_node_child(node, i);
+        if (!ts_node_is_error(err)) {
+            continue;
+        }
+        TSPoint err_start = ts_node_start_point(err);
+        /* Header-line only: a body-level ERROR must never rename the POU. */
+        if (err_start.row != name_end.row || err_start.column < name_end.column) {
+            continue;
+        }
+        TSNode found = {0};
+        uint32_t n = ts_node_child_count(err);
+        for (uint32_t j = 0; j < n; j++) {
+            TSNode id = ts_node_child(err, j);
+            if (strcmp(ts_node_type(id), "identifier") == 0) {
+                found = id;
+            }
+        }
+        if (!ts_node_is_null(found)) {
+            return found;
+        }
+    }
+    return name_node;
+}
+
 TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 
 static bool is_cpp_template_inner_kind(const char *kind) {
@@ -707,6 +748,15 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang) {
         if (lang == CBM_LANG_HASKELL && strcmp(kind, "signature") == 0) {
             TSNode null_node = {0};
             return null_node;
+        }
+
+        /* IEC ST: `FUNCTION PUBLIC F_X : INT` binds the modifier to `name`;
+         * recover the real identifier (see iec_st_recover_pou_name). */
+        if (lang == CBM_LANG_IEC_ST) {
+            TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            if (!ts_node_is_null(nm)) {
+                return iec_st_recover_pou_name(node, nm);
+            }
         }
 
         // A parameterized ObjectScript routine wraps its tag and body in a
@@ -2517,6 +2567,44 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
 
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    /* IEC 61131-3 ST: `FUNCTION_BLOCK X EXTENDS B IMPLEMENTS I1, I2` carries
+     * both heritage lists as repeated `extends`/`implements` FIELDS on the
+     * declaration node — not as a clause child, so the generic probes below
+     * miss them. Interfaces vs superclass are told apart downstream from the
+     * target node's label (cbm_semantic_base_edge_type), so both go in here.
+     * The grammar tags the `,` separators with the same field, hence the
+     * named-node filter. */
+    if (lang == CBM_LANG_IEC_ST) {
+        const char *bases[MAX_BASES];
+        int base_count = 0;
+        uint32_t cc = ts_node_child_count(node);
+        for (uint32_t i = 0; i < cc && base_count < MAX_BASES_MINUS_1; i++) {
+            const char *fn = ts_node_field_name_for_child(node, i);
+            if (!fn || (strcmp(fn, "extends") != 0 && strcmp(fn, "implements") != 0)) {
+                continue;
+            }
+            TSNode ch = ts_node_child(node, i);
+            if (!ts_node_is_named(ch)) {
+                continue;
+            }
+            char *base = cbm_node_text(a, ch, source);
+            if (base && base[0]) {
+                bases[base_count++] = base;
+            }
+        }
+        if (base_count > 0) {
+            const char **result =
+                (const char **)cbm_arena_alloc(a, (base_count + 1) * sizeof(const char *));
+            if (result) {
+                for (int i = 0; i < base_count; i++) {
+                    result[i] = bases[i];
+                }
+                result[base_count] = NULL;
+                return result;
+            }
+        }
+        return NULL;
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -4363,6 +4451,13 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             break;
         }
     }
+    /* IEC ST: `FUNCTION_BLOCK PUBLIC FB_X` — the modifier occupies the `name`
+     * field, so this runs where name_node is NON-null (unlike the fallback
+     * switch above, which only fires when no name was found at all). */
+    if (ctx->language == CBM_LANG_IEC_ST) {
+        name_node = iec_st_recover_pou_name(node, name_node);
+    }
+
     if (ts_node_is_null(name_node)) {
         return;
     }
@@ -4534,6 +4629,15 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
 // Find the body/members node inside a class node
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
+    /* IEC 61131-3 ST: METHOD/ACTION members are DIRECT children of the
+     * FUNCTION_BLOCK/PROGRAM/INTERFACE node — its `body` field holds the
+     * executable statements, so the generic field probe below would return a
+     * statement instead of a member container. TYPE declarations keep their
+     * struct/enum members one level down, in the `definition` child. */
+    if (lang == CBM_LANG_IEC_ST) {
+        TSNode def = ts_node_child_by_field_name(class_node, TS_FIELD("definition"));
+        return ts_node_is_null(def) ? class_node : def;
+    }
     // Try field names first
     static const char *body_fields[] = {"body", "members", "class_body", "declaration_list", NULL};
     for (const char **f = body_fields; *f; f++) {
@@ -6076,6 +6180,43 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 TSNode mp = cbm_find_child_by_kind(req_spec, "module_path");
                 if (!ts_node_is_null(mp)) {
                     push_var_def(ctx, cbm_node_text(a, mp, ctx->source), req_spec);
+                }
+            }
+        }
+        return;
+    /* IEC 61131-3 ST: a GVL surfaces as a top-level `global_var_declaration_block`
+     * wrapping `var_global` sections whose `variable_declaration` children carry
+     * one or more `names` fields (`a, b : BOOL;`). The default fallback would
+     * mint only the first identifier of the first declaration. */
+    case CBM_LANG_IEC_ST:
+        if (strcmp(kind, "global_var_declaration_block") == 0) {
+            uint32_t sc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < sc; i++) {
+                TSNode sec = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(sec), "var_global") != 0) {
+                    continue;
+                }
+                uint32_t dc = ts_node_named_child_count(sec);
+                for (uint32_t j = 0; j < dc; j++) {
+                    TSNode decl = ts_node_named_child(sec, j);
+                    if (strcmp(ts_node_type(decl), "variable_declaration") != 0) {
+                        continue;
+                    }
+                    uint32_t cc = ts_node_child_count(decl);
+                    for (uint32_t k = 0; k < cc; k++) {
+                        const char *fn = ts_node_field_name_for_child(decl, k);
+                        if (!fn || strcmp(fn, "names") != 0) {
+                            continue;
+                        }
+                        /* The grammar tags the `,` separators of a multi-name
+                         * declaration with the same field, so only the named
+                         * identifier children are real names. */
+                        TSNode nm = ts_node_child(decl, k);
+                        if (!ts_node_is_named(nm)) {
+                            continue;
+                        }
+                        push_var_def(ctx, cbm_node_text(a, nm, ctx->source), decl);
+                    }
                 }
             }
         }

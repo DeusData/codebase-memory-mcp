@@ -708,17 +708,28 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     if (dot && strcmp(dot, ".inc") == 0) {
         lang = cbm_disambiguate_inc(abs_path);
     }
-    /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
-     * detected by content; otherwise .xml stays XML. */
+    /* Special: ObjectScript Studio Export XML (<Export generator="...">) and
+     * CODESYS/PLCopen TC6 XML exports (<project xmlns=".../plcopen.org/xml/
+     * tc6_...">) are detected by content; otherwise .xml stays XML. The
+     * PLCopen namespace sits after the XML declaration and often after other
+     * attributes, and real exports carry long <fileHeader> lines, so this
+     * reads several KB rather than the 256 bytes the Export XML probe needs
+     * — one read that already happens, widened enough to see the root
+     * element reliably. */
     if (lang == CBM_LANG_XML) {
         FILE *xf = cbm_fopen(abs_path, "r");
         if (xf) {
-            char xbuf[CBM_SZ_256];
+            char xbuf[CBM_SZ_4K];
             size_t xn = fread(xbuf, SKIP_ONE, sizeof(xbuf) - SKIP_ONE, xf);
             (void)fclose(xf);
             xbuf[xn] = '\0';
             if (strstr(xbuf, "<Export generator=")) {
                 return CBM_LANG_OBJECTSCRIPT_EXPORT;
+            }
+            /* Accept tc6_0200/tc6_0201/any later revision via the stable
+             * namespace prefix. */
+            if (strstr(xbuf, "plcopen.org/xml")) {
+                return CBM_LANG_PLCOPEN_XML;
             }
         }
     }

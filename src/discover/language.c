@@ -279,6 +279,28 @@ static const ext_entry_t EXT_TABLE[] = {
     {".int", CBM_LANG_OBJECTSCRIPT_ROUTINE},
     {".rtn", CBM_LANG_OBJECTSCRIPT_ROUTINE},
 
+    /* IEC 61131-3 Structured Text (PLC source; TwinCAT/CODESYS exports) */
+    {".st", CBM_LANG_IEC_ST},
+    {".iecst", CBM_LANG_IEC_ST},
+
+    /* TwinCAT 3 PLC XML containers (ST inside CDATA). Extension lookup is
+     * exact-match, so the canonical mixed-case spellings are listed alongside
+     * the lowercase forms. */
+    {".TcPOU", CBM_LANG_TWINCAT},
+    {".tcpou", CBM_LANG_TWINCAT},
+    {".TcDUT", CBM_LANG_TWINCAT},
+    {".tcdut", CBM_LANG_TWINCAT},
+    {".TcGVL", CBM_LANG_TWINCAT},
+    {".tcgvl", CBM_LANG_TWINCAT},
+    {".TcIO", CBM_LANG_TWINCAT},
+    {".tcio", CBM_LANG_TWINCAT},
+
+    /* TwinCAT project files: MSBuild-style XML, indexed as XML so File nodes
+     * exist for pass_tcproj's Package/DEPENDS_ON/CONTAINS_FILE emission. */
+    {".plcproj", CBM_LANG_XML},
+    {".tsproj", CBM_LANG_XML},
+    {".xti", CBM_LANG_XML},
+
     /* Vue */
     {".vue", CBM_LANG_VUE},
 
@@ -850,6 +872,9 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_UDL] = "ObjectScript UDL",
     [CBM_LANG_OBJECTSCRIPT_ROUTINE] = "ObjectScript Routine",
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
+    [CBM_LANG_IEC_ST] = "IEC 61131-3 Structured Text",
+    [CBM_LANG_TWINCAT] = "TwinCAT PLC XML",
+    [CBM_LANG_PLCOPEN_XML] = "PLCopen XML",
 
 };
 

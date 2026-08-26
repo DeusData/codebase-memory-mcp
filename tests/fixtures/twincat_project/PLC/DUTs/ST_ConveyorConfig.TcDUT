@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <DUT Name="ST_ConveyorConfig" Id="{a1b2c3d4-0021-4000-8000-000000000021}">
+    <Declaration><![CDATA[TYPE ST_ConveyorConfig :
+STRUCT
+    tStartupDelay : TIME := T#200MS;
+    rMaxSpeed : REAL := 100.0;
+    sName : STRING(63);
+END_STRUCT
+END_TYPE]]></Declaration>
+  </DUT>
+</TcPlcObject>
