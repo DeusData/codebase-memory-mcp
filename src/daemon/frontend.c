@@ -43,9 +43,10 @@ enum {
      * dedicated fail-stop monitor responsive without continuously reopening
      * and locking the cohort marker while an MCP session is idle. */
     FRONTEND_MAINTENANCE_IDLE_POLL_MS = 500,
-    /* Once maintenance is requested, retain the existing fail-stop deadline
-     * precision while the owning thread cancels and tears down local work. */
-    FRONTEND_MAINTENANCE_GRACE_POLL_MS = 10,
+    /* Keep idle and grace waits interruptible without accumulating hundreds of
+     * short sleeps under sanitizer load. This bounds normal monitor-stop joins
+     * to 100 ms while leaving ample margin inside the mutation deadline. */
+    FRONTEND_MAINTENANCE_WAIT_SLICE_MS = 100,
     /* The owner thread may be draining a supervised process tree. Preserve the
      * supervisor's complete graceful + forced-settle window before the monitor
      * fail-stops the process, plus scheduling/teardown margin. */
@@ -109,9 +110,9 @@ static bool frontend_maintenance_monitor_wait(cbm_daemon_maintenance_monitor_t *
         if (atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
             return false;
         }
-        uint32_t sleep_ms = remaining_ms < FRONTEND_MAINTENANCE_GRACE_POLL_MS
+        uint32_t sleep_ms = remaining_ms < FRONTEND_MAINTENANCE_WAIT_SLICE_MS
                                 ? remaining_ms
-                                : FRONTEND_MAINTENANCE_GRACE_POLL_MS;
+                                : FRONTEND_MAINTENANCE_WAIT_SLICE_MS;
         cbm_usleep(sleep_ms * 1000U);
         remaining_ms -= sleep_ms;
     }
@@ -150,7 +151,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
                                     : now + FRONTEND_MAINTENANCE_GRACE_MS;
             while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire) &&
                    cbm_now_ms() < deadline) {
-                cbm_usleep(FRONTEND_MAINTENANCE_GRACE_POLL_MS * 1000U);
+                cbm_usleep(FRONTEND_MAINTENANCE_WAIT_SLICE_MS * 1000U);
             }
             if (atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
                 return NULL;
