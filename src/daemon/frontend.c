@@ -39,7 +39,13 @@ enum {
      * receiving every response while a genuinely stuck request still gets
      * cancelled and the frontend exits cleanly. */
     FRONTEND_EOF_DRAIN_MS = 15000,
-    FRONTEND_MAINTENANCE_POLL_MS = 10,
+    /* Maintenance acquisition is a file-lock operation on Windows. Keep the
+     * dedicated fail-stop monitor responsive without continuously reopening
+     * and locking the cohort marker while an MCP session is idle. */
+    FRONTEND_MAINTENANCE_IDLE_POLL_MS = 500,
+    /* Once maintenance is requested, retain the existing fail-stop deadline
+     * precision while the owning thread cancels and tears down local work. */
+    FRONTEND_MAINTENANCE_GRACE_POLL_MS = 10,
     /* The owner thread may be draining a supervised process tree. Preserve the
      * supervisor's complete graceful + forced-settle window before the monitor
      * fail-stops the process, plus scheduling/teardown margin. */
@@ -62,7 +68,6 @@ typedef struct {
 typedef struct {
     cbm_mutex_t mutex;
     cbm_daemon_runtime_client_t *client;
-    cbm_version_cohort_manager_t *cohort_manager;
     FILE *out;
     frontend_item_t queue[FRONTEND_QUEUE_CAPACITY];
     size_t head;
@@ -97,13 +102,31 @@ struct cbm_daemon_maintenance_monitor {
     char participant[FRONTEND_PARTICIPANT_NAME_CAP];
 };
 
+static bool frontend_maintenance_monitor_wait(cbm_daemon_maintenance_monitor_t *monitor,
+                                              uint32_t wait_ms) {
+    uint32_t remaining_ms = wait_ms;
+    while (remaining_ms > 0) {
+        if (atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
+            return false;
+        }
+        uint32_t sleep_ms = remaining_ms < FRONTEND_MAINTENANCE_GRACE_POLL_MS
+                                ? remaining_ms
+                                : FRONTEND_MAINTENANCE_GRACE_POLL_MS;
+        cbm_usleep(sleep_ms * 1000U);
+        remaining_ms -= sleep_ms;
+    }
+    return !atomic_load_explicit(&monitor->stopping, memory_order_acquire);
+}
+
 static void *frontend_maintenance_monitor_worker(void *opaque) {
     cbm_daemon_maintenance_monitor_t *monitor = opaque;
     while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
         cbm_version_cohort_maintenance_presence_t presence =
             cbm_version_cohort_maintenance_presence_terminal(monitor->manager);
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
-            cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
+            if (!frontend_maintenance_monitor_wait(monitor, FRONTEND_MAINTENANCE_IDLE_POLL_MS)) {
+                return NULL;
+            }
             continue;
         }
 
@@ -123,7 +146,7 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
                                     : now + FRONTEND_MAINTENANCE_GRACE_MS;
             while (!atomic_load_explicit(&monitor->stopping, memory_order_acquire) &&
                    cbm_now_ms() < deadline) {
-                cbm_usleep(FRONTEND_MAINTENANCE_POLL_MS * 1000U);
+                cbm_usleep(FRONTEND_MAINTENANCE_GRACE_POLL_MS * 1000U);
             }
             if (atomic_load_explicit(&monitor->stopping, memory_order_acquire)) {
                 return NULL;
@@ -175,19 +198,6 @@ bool cbm_daemon_maintenance_monitor_stop(cbm_daemon_maintenance_monitor_t **moni
     free(monitor);
     *monitor_io = NULL;
     return true;
-}
-
-static void frontend_exit_for_maintenance(frontend_state_t *state) {
-    cbm_version_cohort_maintenance_presence_t presence =
-        cbm_version_cohort_maintenance_presence_terminal(state->cohort_manager);
-    if (presence == CBM_VERSION_COHORT_MAINTENANCE_ABSENT) {
-        return;
-    }
-    /* Do not fclose stdin across threads. Process exit closes the authenticated
-     * kernel IPC handle, and daemon ownership then cancels only this session.
-     * Agent stdout/stderr may both be backpressured, so terminal paths must not
-     * log, write, or flush before fail-stop. */
-    _Exit(presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED ? EXIT_SUCCESS : EXIT_FAILURE);
 }
 
 static void frontend_item_free(frontend_item_t *item) {
@@ -414,15 +424,7 @@ static frontend_cancellation_route_t frontend_route_cancellation(
 
 static void *frontend_worker(void *opaque) {
     frontend_state_t *state = opaque;
-    uint64_t next_maintenance_check_ms = 0;
     for (;;) {
-        uint64_t now_ms = cbm_now_ms();
-        if (now_ms >= next_maintenance_check_ms) {
-            frontend_exit_for_maintenance(state);
-            next_maintenance_check_ms = now_ms > UINT64_MAX - FRONTEND_MAINTENANCE_POLL_MS
-                                            ? UINT64_MAX
-                                            : now_ms + FRONTEND_MAINTENANCE_POLL_MS;
-        }
         frontend_item_t item = {0};
         if (!frontend_pop_begin(state, &item)) {
             if (frontend_should_stop(state)) {
@@ -578,7 +580,6 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     }
     frontend_state_t state = {
         .client = client,
-        .cohort_manager = cohort_manager,
         .out = out,
     };
     cbm_mutex_init(&state.mutex);

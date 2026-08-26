@@ -20,6 +20,8 @@
                       * test_cli_non_ascii_arg.py guards #423/#20  (wide-argv main())
                       * test_daemon_stability.py guards the daemon parameter
                         surface, crash recovery, busy-stop refusal, and churn
+                      * test_idle_stdio_cpu.py guards idle MCP frontend CPU
+                        usage against maintenance-polling regressions
                       * test_windows_update_handoff.py guards that `update`
                         hands off to install.ps1 instead of replacing its own
                         running image (the removed launcher stub's only job)
@@ -163,6 +165,7 @@ $guards = @(
     "tests\windows\test_non_ascii_cache_dump.py",
     "tests\windows\test_daemon_lifecycle.py",
     "tests\windows\test_daemon_stability.py",
+    "tests\windows\test_idle_stdio_cpu.py",
     "tests\windows\test_hook_augment.py",
     "tests\windows\test_ui_drive_listing.py",
     "tests\windows\test_cli_non_ascii_arg.py",
