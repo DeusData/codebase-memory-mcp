@@ -131,8 +131,12 @@ static void *frontend_maintenance_monitor_worker(void *opaque) {
         }
 
         if (presence == CBM_VERSION_COHORT_MAINTENANCE_REQUESTED) {
-            if (monitor->cancel) {
-                (void)monitor->cancel(monitor->cancel_context);
+            bool cancellation_started = monitor->cancel && monitor->cancel(monitor->cancel_context);
+            if (!cancellation_started) {
+                /* With no active operation to drain, no cooperative teardown
+                 * can make further progress. Exit now so blocked stdio releases
+                 * its cohort lease within the mutation owner's deadline. */
+                _Exit(monitor->exit_code);
             }
             /* Never log, write to, or flush agent stdio from this monitor.
              * Structured logging itself writes to stderr, and this thread's
