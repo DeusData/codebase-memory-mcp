@@ -37,10 +37,10 @@ enum {
     FRONTEND_EOF_DRAIN_MS = 15000,
     /* Maintenance acquisition is a file-lock operation on Windows. Keep the
      * dedicated fail-stop monitor responsive without continuously reopening
-     * and locking the cohort marker while MCP sessions are idle. This interval
-     * leaves cancellation margin inside the shortest mutation deadline while
-     * bounding each idle frontend to one probe per interval. */
-    FRONTEND_MAINTENANCE_IDLE_POLL_MS = 1500,
+     * and locking the cohort marker while MCP sessions are idle. The shortest
+     * mutation deadline is three seconds; 500 ms preserves ample exit margin
+     * under sanitizer load while the queue worker itself remains event-driven. */
+    FRONTEND_MAINTENANCE_IDLE_POLL_MS = 500,
     /* Keep idle and grace waits interruptible without accumulating hundreds of
      * short sleeps under sanitizer load. This bounds normal monitor-stop joins
      * to 100 ms while leaving ample margin inside the mutation deadline. */
