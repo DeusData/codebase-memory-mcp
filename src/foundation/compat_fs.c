@@ -121,19 +121,23 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     return &d->entry;
 }
 
-int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+cbm_path_probe_status_t cbm_path_probe_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_PROBE_ERROR;
     }
     wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_PROBE_ERROR;
     }
     WIN32_FILE_ATTRIBUTE_DATA data;
     BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
     free(wpath);
     if (!ok) {
-        return CBM_NOT_FOUND;
+        DWORD error = GetLastError();
+        return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+                       error == ERROR_INVALID_NAME
+                   ? CBM_PATH_PROBE_NOT_FOUND
+                   : CBM_PATH_PROBE_ERROR;
     }
     memset(out, 0, sizeof(*out));
     out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -145,6 +149,9 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
      * reports all four halves as assigned-but-never-read. This form says the
      * same thing without the union, so the checker needs no exception. */
     uint64_t file_size = ((uint64_t)data.nFileSizeHigh << 32) | (uint64_t)data.nFileSizeLow;
+    if (file_size > INT64_MAX) {
+        return CBM_PATH_PROBE_ERROR;
+    }
     out->size = (int64_t)file_size;
     uint64_t written = ((uint64_t)data.ftLastWriteTime.dwHighDateTime << 32) |
                        (uint64_t)data.ftLastWriteTime.dwLowDateTime;
@@ -154,7 +161,29 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
         written >= windows_to_unix_ticks
             ? (int64_t)((written - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
             : 0;
-    return 0;
+    return CBM_PATH_PROBE_OK;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    return cbm_path_probe_info_utf8(path, out) == CBM_PATH_PROBE_OK ? 0 : CBM_NOT_FOUND;
+}
+
+bool cbm_filesystem_free_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        return false;
+    }
+    ULARGE_INTEGER available;
+    BOOL ok = GetDiskFreeSpaceExW(wpath, &available, NULL, NULL);
+    free(wpath);
+    if (!ok) {
+        return false;
+    }
+    *bytes_out = available.QuadPart;
+    return true;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -728,6 +757,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -793,13 +823,14 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
     return NULL;
 }
 
-int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+cbm_path_probe_status_t cbm_path_probe_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_PROBE_ERROR;
     }
     struct stat state;
     if (lstat(path, &state) != 0) {
-        return CBM_NOT_FOUND;
+        return errno == ENOENT || errno == ENOTDIR ? CBM_PATH_PROBE_NOT_FOUND
+                                                   : CBM_PATH_PROBE_ERROR;
     }
     memset(out, 0, sizeof(*out));
     out->is_regular = S_ISREG(state.st_mode);
@@ -813,7 +844,28 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     out->mtime_ns =
         ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
 #endif
-    return 0;
+    return CBM_PATH_PROBE_OK;
+}
+
+int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
+    return cbm_path_probe_info_utf8(path, out) == CBM_PATH_PROBE_OK ? 0 : CBM_NOT_FOUND;
+}
+
+bool cbm_filesystem_free_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    struct statvfs status;
+    if (statvfs(path, &status) != 0) {
+        return false;
+    }
+    uint64_t blocks = (uint64_t)status.f_bavail;
+    uint64_t fragment = status.f_frsize != 0 ? (uint64_t)status.f_frsize : (uint64_t)status.f_bsize;
+    if (fragment == 0) {
+        return false;
+    }
+    *bytes_out = blocks > UINT64_MAX / fragment ? UINT64_MAX : blocks * fragment;
+    return true;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -952,6 +1004,282 @@ int cbm_exec_no_shell(const char *const *argv) {
 }
 
 #endif /* _WIN32 */
+
+static uint64_t fs_add_saturated(uint64_t left, uint64_t right) {
+    return left > UINT64_MAX - right ? UINT64_MAX : left + right;
+}
+
+static bool directory_size_recursive(const char *path, unsigned int depth, uint64_t *total) {
+    enum { CBM_DIRECTORY_SCAN_MAX_DEPTH = 1024 };
+    if (!path || !total || depth > CBM_DIRECTORY_SCAN_MAX_DEPTH) {
+        return false;
+    }
+    cbm_dir_t *directory = cbm_opendir(path);
+    if (!directory) {
+        return false;
+    }
+    bool ok = true;
+    cbm_dirent_t *entry;
+    while (ok && (entry = cbm_readdir(directory)) != NULL) {
+        size_t path_len = strlen(path);
+        size_t name_len = strlen(entry->name);
+        bool separator_needed =
+            path_len > 0 && path[path_len - 1] != '/' && path[path_len - 1] != '\\';
+        if (path_len > SIZE_MAX - name_len - (separator_needed ? 2U : 1U)) {
+            ok = false;
+            break;
+        }
+        size_t child_size = path_len + name_len + (separator_needed ? 2U : 1U);
+        char *child = (char *)malloc(child_size);
+        if (!child) {
+            ok = false;
+            break;
+        }
+        int written =
+            snprintf(child, child_size, separator_needed ? "%s/%s" : "%s%s", path, entry->name);
+        cbm_path_info_t info;
+        cbm_path_probe_status_t status = written > 0 && (size_t)written < child_size
+                                             ? cbm_path_probe_info_utf8(child, &info)
+                                             : CBM_PATH_PROBE_ERROR;
+        if (status == CBM_PATH_PROBE_ERROR) {
+            ok = false;
+        } else if (status == CBM_PATH_PROBE_OK && !info.is_symlink && info.is_regular) {
+            if (info.size < 0) {
+                ok = false;
+            } else {
+                *total = fs_add_saturated(*total, (uint64_t)info.size);
+            }
+        } else if (status == CBM_PATH_PROBE_OK && !info.is_symlink && info.is_directory) {
+            ok = directory_size_recursive(child, depth + 1U, total);
+        }
+        free(child);
+    }
+    cbm_closedir(directory);
+    return ok;
+}
+
+bool cbm_directory_size_bytes(const char *path, uint64_t *bytes_out) {
+    if (!path || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    return directory_size_recursive(path, 0, bytes_out);
+}
+
+bool cbm_db_artifact_bytes(const char *db_path, uint64_t *bytes_out) {
+    if (!db_path || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    static const char *const suffixes[] = {"", "-wal", "-shm", "-journal"};
+    size_t base_len = strlen(db_path);
+    for (size_t index = 0; index < sizeof(suffixes) / sizeof(suffixes[0]); index++) {
+        size_t suffix_len = strlen(suffixes[index]);
+        if (base_len > SIZE_MAX - suffix_len - 1U) {
+            return false;
+        }
+        size_t path_size = base_len + suffix_len + 1U;
+        char *path = (char *)malloc(path_size);
+        if (!path) {
+            return false;
+        }
+        (void)snprintf(path, path_size, "%s%s", db_path, suffixes[index]);
+        cbm_path_info_t info;
+        cbm_path_probe_status_t status = cbm_path_probe_info_utf8(path, &info);
+        free(path);
+        if (status == CBM_PATH_PROBE_NOT_FOUND) {
+            continue;
+        }
+        if (status != CBM_PATH_PROBE_OK || !info.is_regular || info.is_symlink || info.size < 0) {
+            return false;
+        }
+        *bytes_out = fs_add_saturated(*bytes_out, (uint64_t)info.size);
+    }
+    return true;
+}
+
+static bool fs_optional_regular_bytes(const char *path, uint64_t *total) {
+    if (!path || !path[0]) {
+        return true;
+    }
+    cbm_path_info_t info;
+    cbm_path_probe_status_t status = cbm_path_probe_info_utf8(path, &info);
+    if (status == CBM_PATH_PROBE_NOT_FOUND) {
+        return true;
+    }
+    if (status != CBM_PATH_PROBE_OK || !info.is_regular || info.is_symlink || info.size < 0) {
+        return false;
+    }
+    *total = fs_add_saturated(*total, (uint64_t)info.size);
+    return true;
+}
+
+bool cbm_index_task_temp_bytes(const char *final_db_path, const char *stage_token,
+                               const char *log_path, const char *response_path,
+                               uint64_t *bytes_out) {
+    if (!final_db_path || !final_db_path[0] || !stage_token || !stage_token[0] || !bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    if (!fs_optional_regular_bytes(log_path, bytes_out) ||
+        !fs_optional_regular_bytes(response_path, bytes_out)) {
+        return false;
+    }
+    const char *basename = strrchr(final_db_path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(final_db_path, '\\');
+    if (backslash && (!basename || backslash > basename)) {
+        basename = backslash;
+    }
+#endif
+    basename = basename ? basename + 1 : final_db_path;
+    size_t directory_len = (size_t)(basename - final_db_path);
+    char *directory = NULL;
+    if (directory_len == 0) {
+        directory = strdup(".");
+        directory_len = 1;
+    } else {
+        directory = (char *)malloc(directory_len + 1U);
+        if (directory) {
+            memcpy(directory, final_db_path, directory_len);
+            while (directory_len > 1U && (directory[directory_len - 1U] == '/' ||
+                                          directory[directory_len - 1U] == '\\')) {
+                directory_len--;
+            }
+            directory[directory_len] = '\0';
+        }
+    }
+    size_t basename_len = strlen(basename);
+    size_t token_len = strlen(stage_token);
+    static const char stage_marker[] = ".stage.";
+    if (!directory || token_len > SIZE_MAX - sizeof(stage_marker) - 1U ||
+        basename_len > SIZE_MAX - token_len - sizeof(stage_marker) - 1U) {
+        free(directory);
+        return false;
+    }
+    size_t prefix_size = basename_len + (sizeof(stage_marker) - 1U) + token_len + 2U;
+    char *prefix = (char *)malloc(prefix_size);
+    if (!prefix) {
+        free(directory);
+        return false;
+    }
+    (void)snprintf(prefix, prefix_size, "%s%s%s.", basename, stage_marker, stage_token);
+    cbm_dir_t *dir = cbm_opendir(directory);
+    if (!dir) {
+        free(prefix);
+        free(directory);
+        return false;
+    }
+    bool ok = true;
+    cbm_dirent_t *entry;
+    while (ok && (entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, prefix, prefix_size - 1U) != 0) {
+            continue;
+        }
+        size_t name_len = strlen(entry->name);
+        if (directory_len > SIZE_MAX - name_len - 2U) {
+            ok = false;
+            break;
+        }
+        size_t path_size = directory_len + name_len + 2U;
+        char *path = (char *)malloc(path_size);
+        if (!path) {
+            ok = false;
+            break;
+        }
+        (void)snprintf(path, path_size, "%s/%s", directory, entry->name);
+        ok = fs_optional_regular_bytes(path, bytes_out);
+        free(path);
+    }
+    cbm_closedir(dir);
+    free(prefix);
+    free(directory);
+    return ok;
+}
+
+bool cbm_index_staging_cleanup(const char *final_db_path, const char *stage_token) {
+    if (!final_db_path || !final_db_path[0] || !stage_token || !stage_token[0]) {
+        return false;
+    }
+    const char *basename = strrchr(final_db_path, '/');
+#ifdef _WIN32
+    const char *backslash = strrchr(final_db_path, '\\');
+    if (backslash && (!basename || backslash > basename)) {
+        basename = backslash;
+    }
+#endif
+    basename = basename ? basename + 1 : final_db_path;
+    size_t directory_len = (size_t)(basename - final_db_path);
+    char *directory = NULL;
+    if (directory_len == 0) {
+        directory = strdup(".");
+        directory_len = 1;
+    } else {
+        directory = (char *)malloc(directory_len + 1U);
+        if (directory) {
+            memcpy(directory, final_db_path, directory_len);
+            while (directory_len > 1U && (directory[directory_len - 1U] == '/' ||
+                                          directory[directory_len - 1U] == '\\')) {
+                directory_len--;
+            }
+            directory[directory_len] = '\0';
+        }
+    }
+    static const char stage_marker[] = ".stage.";
+    size_t basename_len = strlen(basename);
+    size_t token_len = strlen(stage_token);
+    if (!directory || token_len > SIZE_MAX - sizeof(stage_marker) - 1U ||
+        basename_len > SIZE_MAX - token_len - sizeof(stage_marker) - 1U) {
+        free(directory);
+        return false;
+    }
+    size_t prefix_size = basename_len + (sizeof(stage_marker) - 1U) + token_len + 2U;
+    char *prefix = (char *)malloc(prefix_size);
+    if (!prefix) {
+        free(directory);
+        return false;
+    }
+    (void)snprintf(prefix, prefix_size, "%s%s%s.", basename, stage_marker, stage_token);
+    cbm_dir_t *dir = cbm_opendir(directory);
+    if (!dir) {
+        free(prefix);
+        free(directory);
+        return false;
+    }
+    bool ok = true;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, prefix, prefix_size - 1U) != 0) {
+            continue;
+        }
+        size_t name_len = strlen(entry->name);
+        if (directory_len > SIZE_MAX - name_len - 2U) {
+            ok = false;
+            continue;
+        }
+        size_t path_size = directory_len + name_len + 2U;
+        char *path = (char *)malloc(path_size);
+        if (!path) {
+            ok = false;
+            continue;
+        }
+        (void)snprintf(path, path_size, "%s/%s", directory, entry->name);
+        cbm_path_info_t info;
+        cbm_path_probe_status_t status = cbm_path_probe_info_utf8(path, &info);
+        if (status == CBM_PATH_PROBE_OK && !info.is_symlink && info.is_regular) {
+            if (cbm_unlink(path) != 0 && errno != ENOENT) {
+                ok = false;
+            }
+        } else if (status != CBM_PATH_PROBE_NOT_FOUND) {
+            ok = false;
+        }
+        free(path);
+    }
+    cbm_closedir(dir);
+    free(prefix);
+    free(directory);
+    return ok;
+}
 
 /* Canonicalize an EXISTING path (collapse `..`, resolve links/junctions):
  * realpath on POSIX; a final path queried from an opened handle on Windows.

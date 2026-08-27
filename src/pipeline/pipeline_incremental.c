@@ -609,17 +609,20 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
     return equal;
 }
 
-int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count) {
-    if (!project || !repo_path || !out || !out_count) {
+    const char *repo_path = cbm_pipeline_repo_path(p);
+    if (!p || !project || !repo_path || !out || !out_count) {
         return CBM_NOT_FOUND;
     }
     *out = NULL;
     *out_count = 0;
     cbm_discover_opts_t opts = {
-        .mode = (cbm_index_mode_t)mode,
+        .mode = (cbm_index_mode_t)cbm_pipeline_get_mode(p),
         .ignore_file = NULL,
         .max_file_size = 0,
+        .resource_policy = cbm_pipeline_resource_policy(p),
+        .resource_violation = cbm_pipeline_resource_violation(p),
     };
     cbm_file_info_t *fresh_files = NULL;
     int fresh_file_count = 0;
@@ -2219,13 +2222,13 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     cbm_pipeline_persist_test_run_before_final_manifest();
 #endif
-    if (cbm_pipeline_build_fresh_semantic_manifest(project, cbm_pipeline_repo_path(p),
-                                                   cbm_pipeline_get_mode(p), &manifest,
-                                                   &manifest_count) != 0 ||
-        !cbm_pipeline_semantic_manifests_equal(baseline_manifest, baseline_count, manifest,
-                                               manifest_count)) {
+    int manifest_rc =
+        cbm_pipeline_build_fresh_semantic_manifest(p, project, &manifest, &manifest_count);
+    if (manifest_rc != 0 || !cbm_pipeline_semantic_manifests_equal(
+                                baseline_manifest, baseline_count, manifest, manifest_count)) {
         cbm_log_warn("delta.abort", "reason", "semantic_inputs_changed");
-        result = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        result = manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                                            : CBM_PIPELINE_ABORT_PRESERVE_DB;
         goto out;
     }
 
@@ -2811,8 +2814,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     cbm_pipeline_persist_test_run_before_final_manifest();
 #endif
-    int manifest_rc = cbm_pipeline_build_fresh_semantic_manifest(
-        project, cbm_pipeline_repo_path(p), cbm_pipeline_get_mode(p), &manifest, &manifest_count);
+    int manifest_rc =
+        cbm_pipeline_build_fresh_semantic_manifest(p, project, &manifest, &manifest_count);
     if (manifest_rc != 0 || !cbm_pipeline_semantic_manifests_equal(
                                 baseline_manifest, baseline_count, manifest, manifest_count)) {
         cbm_log_warn("incremental.abort", "reason", "semantic_inputs_changed");
@@ -2822,7 +2825,8 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         free_mode_skipped(mode_skipped, mode_skipped_count);
         free(saved_adr);
         cbm_gbuf_free(existing);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                                          : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
     /* Step 7: atomically publish the complete staged generation. */

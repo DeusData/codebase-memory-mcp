@@ -341,7 +341,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
     free(worker_repo_path);
     cbm_index_set_worker_role_options(true, invocation.response_out, invocation.single_thread,
                                       invocation.marker_file, invocation.quarantine_file,
-                                      invocation.memory_budget_bytes);
+                                      invocation.memory_budget_bytes, invocation.stage_token);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -677,6 +677,7 @@ extern void suite_dyn_array(void);
 extern void suite_str_intern(void);
 extern void suite_log(void);
 extern void suite_str_util(void);
+extern void suite_index_policy(void);
 extern void suite_workspace(void);
 extern void suite_platform(void);
 extern void suite_diagnostics(void);
@@ -924,6 +925,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(str_intern);
     RUN_SELECTED_SUITE(log);
     RUN_SELECTED_SUITE(str_util);
+    RUN_SELECTED_SUITE(index_policy);
     RUN_SELECTED_SUITE(workspace);
     RUN_SELECTED_SUITE(platform);
     RUN_SELECTED_SUITE(diagnostics);

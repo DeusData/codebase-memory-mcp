@@ -678,7 +678,7 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
                                            const cbm_file_hash_t *right, int right_count);
 /* Re-run discovery and hash its exact semantic inputs. Used at the publication
  * boundary so late additions/deletions cannot escape a frozen file list. */
-int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
@@ -707,6 +707,9 @@ typedef struct {
      * wholesale delete+rewrite. */
     bool surfaces_in_place;
 } cbm_pipeline_generation_t;
+
+int cbm_pipeline_storage_admit(cbm_pipeline_t *p, cbm_pipeline_storage_checkpoint_t checkpoint,
+                               const char *final_path, const char *staging_path);
 
 /* Serialize and fully populate a sibling staging database, then atomically
  * replace final_db_path. The old generation is untouched on every failure or
@@ -760,6 +763,8 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

@@ -13,6 +13,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "foundation/index_policy.h"
+
 typedef struct cbm_mcp_server cbm_mcp_server_t;
 
 /* ── Version ──────────────────────────────────────────────────── */
@@ -416,6 +418,11 @@ int cbm_config_set(cbm_config_t *cfg, const char *key, const char *value);
 
 /* Delete a config key. Returns 0 on success. */
 int cbm_config_delete(cbm_config_t *cfg, const char *key);
+
+/* Load and validate the operator-controlled discovery policy. Invalid stored
+ * values fail closed instead of silently disabling a guard. */
+bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
+                                  char *error, size_t error_size);
 
 /* Well-known config keys */
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
