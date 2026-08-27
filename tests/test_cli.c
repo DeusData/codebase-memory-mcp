@@ -1158,6 +1158,223 @@ TEST(cli_activation_commands_reject_malformed_and_unknown_flags) {
     PASS();
 }
 
+TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-install-hooks-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "CLAUDE_CONFIG_DIR", "PATH"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char cache_dir[640];
+    char claude_dir[640];
+    char settings_path[768];
+    char mcp_path[768];
+    char db_path[768];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(claude_dir, sizeof(claude_dir), "%s/.claude", tmpdir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", claude_dir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/.claude.json", tmpdir);
+    snprintf(db_path, sizeof(db_path), "%s/_config.db", cache_dir);
+    test_mkdirp(claude_dir);
+    write_test_file(settings_path,
+                    "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":"
+                    "\"command\",\"command\":\"/usr/bin/foreign-hook\"}]}]}}\n");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    char *conflict_a[] = {"--hooks", "--no-hooks"};
+    char *conflict_b[] = {"--no-hooks", "--hooks"};
+    int conflict_a_rc = cli_test_cmd_install(2, conflict_a);
+    int conflict_b_rc = cli_test_cmd_install(2, conflict_b);
+
+    char *default_args[] = {"--skip-binary", "--clients=claude", "--yes"};
+    int default_rc = cli_test_cmd_install(3, default_args);
+    char *default_state = read_test_file_alloc(settings_path);
+    bool default_hook = default_state && strstr(default_state, "cbm-code-discovery-gate") &&
+                        strstr(default_state, "/usr/bin/foreign-hook");
+    free(default_state);
+
+    char *no_hooks_plan_args[] = {"--plan", "--no-hooks"};
+    int no_hooks_plan_rc = cli_test_cmd_install(2, no_hooks_plan_args);
+    char *disabled_plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *disabled_doc =
+        disabled_plan ? yyjson_read(disabled_plan, strlen(disabled_plan), 0) : NULL;
+    yyjson_val *disabled_root = disabled_doc ? yyjson_doc_get_root(disabled_doc) : NULL;
+    yyjson_val *disabled_hooks =
+        disabled_root ? yyjson_obj_get(disabled_root, "hooks_planned") : NULL;
+    yyjson_val *disabled_configs =
+        disabled_root ? yyjson_obj_get(disabled_root, "config_files_planned") : NULL;
+    bool disabled_plan_ok = disabled_hooks && yyjson_is_arr(disabled_hooks) &&
+                            yyjson_arr_size(disabled_hooks) == 0U && disabled_configs &&
+                            yyjson_is_arr(disabled_configs) &&
+                            yyjson_arr_size(disabled_configs) > 0U;
+    yyjson_doc_free(disabled_doc);
+    free(disabled_plan);
+
+    char *no_hooks_dry_args[] = {"--dry-run", "--no-hooks", "--skip-binary", "--clients=claude",
+                                 "--yes"};
+    int no_hooks_dry_rc = cli_test_cmd_install(5, no_hooks_dry_args);
+    struct stat db_status;
+    bool previews_read_only = stat(db_path, &db_status) != 0;
+
+    char *no_hooks_args[] = {"--no-hooks", "--skip-binary", "--clients=claude", "--yes"};
+    int no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    bool stored_false = cfg && !cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, true);
+    cbm_config_close(cfg);
+    char *disabled_state = read_test_file_alloc(settings_path);
+    char *disabled_mcp = read_test_file_alloc(mcp_path);
+    bool disabled_ok = disabled_state && strstr(disabled_state, "/usr/bin/foreign-hook") &&
+                       !strstr(disabled_state, "cbm-code-discovery-gate") && disabled_mcp &&
+                       strstr(disabled_mcp, "codebase-memory-mcp");
+    free(disabled_state);
+    free(disabled_mcp);
+
+    char *bare_args[] = {"--skip-binary", "--clients=claude", "--yes"};
+    int bare_disabled_rc = cli_test_cmd_install(3, bare_args);
+    disabled_state = read_test_file_alloc(settings_path);
+    bool bare_disabled = disabled_state && strstr(disabled_state, "/usr/bin/foreign-hook") &&
+                         !strstr(disabled_state, "cbm-code-discovery-gate");
+    free(disabled_state);
+
+    char *hooks_plan_args[] = {"--plan", "--hooks"};
+    char *hooks_dry_args[] = {"--dry-run", "--hooks", "--skip-binary", "--clients=claude", "--yes"};
+    int hooks_plan_rc = cli_test_cmd_install(2, hooks_plan_args);
+    int hooks_dry_rc = cli_test_cmd_install(5, hooks_dry_args);
+    cfg = cbm_config_open(cache_dir);
+    bool previews_retained_false = cfg && !cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, true);
+    cbm_config_close(cfg);
+
+    char *hooks_args[] = {"--hooks", "--skip-binary", "--clients=claude", "--yes"};
+    int hooks_rc = cli_test_cmd_install(4, hooks_args);
+    cfg = cbm_config_open(cache_dir);
+    bool stored_true = cfg && cbm_config_get_bool(cfg, CBM_CONFIG_INSTALL_HOOKS, false);
+    cbm_config_close(cfg);
+    char *enabled_state = read_test_file_alloc(settings_path);
+    bool enabled_ok = enabled_state && strstr(enabled_state, "cbm-code-discovery-gate") &&
+                      strstr(enabled_state, "/usr/bin/foreign-hook");
+    free(enabled_state);
+    int bare_enabled_rc = cli_test_cmd_install(3, bare_args);
+    bool results_ok =
+        conflict_a_rc == 1 && conflict_b_rc == 1 && default_rc == 0 && default_hook &&
+        no_hooks_plan_rc == 0 && disabled_plan_ok && no_hooks_dry_rc == 0 && previews_read_only &&
+        no_hooks_rc == 0 && stored_false && disabled_ok && bare_disabled_rc == 0 && bare_disabled &&
+        hooks_plan_rc == 0 && hooks_dry_rc == 0 && previews_retained_false && hooks_rc == 0 &&
+        stored_true && enabled_ok && bare_enabled_rc == 0 && fake.mutation_reserve_count > 0;
+
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(results_ok);
+    PASS();
+}
+
+TEST(cli_no_hooks_plan_covers_every_hook_installer_family) {
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s/cli-hook-families-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "CBM_CACHE_DIR", "PATH", "XDG_CONFIG_HOME"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    const char *const dirs[] = {".claude",          ".codex",      ".gemini",
+                                ".config/opencode", ".augment",    ".openclaw/workspace",
+                                ".hermes",          ".qwen",       ".copilot",
+                                ".factory",         ".qoder",      ".kimi-code",
+                                ".config/devin",    ".gitlab/duo", "bin"};
+    char path[768];
+    for (size_t i = 0U; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", tmpdir, dirs[i]);
+        test_mkdirp(path);
+    }
+    snprintf(path, sizeof(path), "%s/.openclaw/openclaw.json", tmpdir);
+    write_test_file(path, "{}\n");
+    snprintf(path, sizeof(path), "%s/.copilot/mcp-config.json", tmpdir);
+    write_test_file(path, "{}\n");
+
+    const char *const commands[] = {"qodercli", "kimi",   "duo",    "devin", "gemini",
+                                    "copilot",  "auggie", "hermes", "droid"};
+    char bin_dir[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/bin", tmpdir);
+    for (size_t i = 0U; i < sizeof(commands) / sizeof(commands[0]); i++) {
+#ifdef _WIN32
+        snprintf(path, sizeof(path), "%s/%s.exe", bin_dir, commands[i]);
+#else
+        snprintf(path, sizeof(path), "%s/%s", bin_dir, commands[i]);
+#endif
+        write_test_file(path, "exit 0\n");
+        chmod(path, 0700);
+    }
+
+    char cache_dir[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("PATH", bin_dir, 1);
+    char *no_hooks_args[] = {"--plan", "--no-hooks"};
+    int no_hooks_rc = cli_test_cmd_install(2, no_hooks_args);
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *hooks = root ? yyjson_obj_get(root, "hooks_planned") : NULL;
+    yyjson_val *configs = root ? yyjson_obj_get(root, "config_files_planned") : NULL;
+    yyjson_val *instructions = root ? yyjson_obj_get(root, "instruction_files_planned") : NULL;
+    const char *const detected[] = {"claude-code",    "codex",         "gemini", "opencode",
+                                    "augment-auggie", "openclaw",      "hermes", "qwen",
+                                    "copilot-cli",    "factory-droid", "qoder",  "kimi",
+                                    "gitlab-duo",     "devin"};
+    bool families = no_hooks_rc == 0 && hooks && yyjson_is_arr(hooks) &&
+                    yyjson_arr_size(hooks) == 0U && configs && yyjson_is_arr(configs) &&
+                    yyjson_arr_size(configs) > 0U && instructions && yyjson_is_arr(instructions) &&
+                    yyjson_arr_size(instructions) > 0U && plan && !strstr(plan, "cbm-augment.ts");
+    for (size_t i = 0U; families && i < sizeof(detected) / sizeof(detected[0]); i++) {
+        families = test_json_string_array_contains(root, "agents_detected", detected[i]);
+    }
+    yyjson_doc_free(doc);
+    free(plan);
+
+    char *hooks_args[] = {"--plan", "--hooks"};
+    int hooks_rc = cli_test_cmd_install(2, hooks_args);
+    char *enabled_plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *enabled_doc =
+        enabled_plan ? yyjson_read(enabled_plan, strlen(enabled_plan), 0) : NULL;
+    yyjson_val *enabled_root = enabled_doc ? yyjson_doc_get_root(enabled_doc) : NULL;
+    yyjson_val *enabled_hooks = enabled_root ? yyjson_obj_get(enabled_root, "hooks_planned") : NULL;
+    bool enabled_plan_ok =
+        enabled_hooks && yyjson_is_arr(enabled_hooks) && yyjson_arr_size(enabled_hooks) > 0U;
+    yyjson_doc_free(enabled_doc);
+    free(enabled_plan);
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(families);
+    ASSERT_EQ(hooks_rc, 0);
+    ASSERT_TRUE(enabled_plan_ok);
+    PASS();
+}
+
 TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-reset-XXXXXX");
@@ -12724,17 +12941,31 @@ TEST(cli_config_cmd_get_prints_defaults_and_rejects_unknown_keys) {
     char *get_limit[] = {"get", "auto_index_limit"};
     ASSERT_EQ(cli_config_cmd_capture(2, get_limit, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "50000\n");
+    char *get_install_hooks[] = {"get", "install_hooks"};
+    ASSERT_EQ(cli_config_cmd_capture(2, get_install_hooks, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+    char *list[] = {"list"};
+    ASSERT_EQ(cli_config_cmd_capture(1, list, out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "install_hooks"));
 
     /* Stored value round-trips. */
     char *set_watch[] = {"set", "auto_watch", "false"};
     ASSERT_EQ(cli_config_cmd_capture(3, set_watch, out, sizeof(out)), 0);
     ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "false\n");
+    char *set_install_hooks[] = {"set", "install_hooks", "false"};
+    ASSERT_EQ(cli_config_cmd_capture(3, set_install_hooks, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_install_hooks, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "false\n");
 
     /* Reset returns the key to its default. */
     char *reset_watch[] = {"reset", "auto_watch"};
     ASSERT_EQ(cli_config_cmd_capture(2, reset_watch, out, sizeof(out)), 0);
     ASSERT_EQ(cli_config_cmd_capture(2, get_watch, out, sizeof(out)), 0);
+    ASSERT_STR_EQ(out, "true\n");
+    char *reset_install_hooks[] = {"reset", "install_hooks"};
+    ASSERT_EQ(cli_config_cmd_capture(2, reset_install_hooks, out, sizeof(out)), 0);
+    ASSERT_EQ(cli_config_cmd_capture(2, get_install_hooks, out, sizeof(out)), 0);
     ASSERT_STR_EQ(out, "true\n");
 
     /* Unknown keys are errors on every subcommand, with clean stdout. */
@@ -13669,6 +13900,8 @@ SUITE(cli) {
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
+    RUN_TEST(cli_install_hooks_preference_persists_and_migrates_owned_state);
+    RUN_TEST(cli_no_hooks_plan_covers_every_hook_installer_family);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
     RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
     RUN_TEST(cli_install_config_and_path_finish_before_guard_release);
