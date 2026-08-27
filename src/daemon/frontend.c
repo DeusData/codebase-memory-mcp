@@ -28,10 +28,6 @@ enum {
      * a short FIFO drain window so EOF cannot silently discard it. A genuinely
      * active long operation is still cancelled at this deadline. */
     FRONTEND_WAIT_US = 1000,
-    /* An idle thin frontend owns no work and only needs to notice the next
-     * queue item promptly. Ten milliseconds avoids a 1 kHz wake-up loop per
-     * connected coding-agent session without perceptible request latency. */
-    FRONTEND_IDLE_WAIT_US = 10 * 1000,
     /* EOF-drain progress window. Sized to cover a cold daemon spawn plus one
      * request round-trip on the slowest platform (several seconds on Windows
      * under CI load): the drain aborts only after this long with NO item
@@ -41,8 +37,10 @@ enum {
     FRONTEND_EOF_DRAIN_MS = 15000,
     /* Maintenance acquisition is a file-lock operation on Windows. Keep the
      * dedicated fail-stop monitor responsive without continuously reopening
-     * and locking the cohort marker while an MCP session is idle. */
-    FRONTEND_MAINTENANCE_IDLE_POLL_MS = 500,
+     * and locking the cohort marker while MCP sessions are idle. This interval
+     * leaves cancellation margin inside the shortest mutation deadline while
+     * bounding each idle frontend to one probe per interval. */
+    FRONTEND_MAINTENANCE_IDLE_POLL_MS = 1500,
     /* Keep idle and grace waits interruptible without accumulating hundreds of
      * short sleeps under sanitizer load. This bounds normal monitor-stop joins
      * to 100 ms while leaving ample margin inside the mutation deadline. */
@@ -68,6 +66,7 @@ typedef struct {
 
 typedef struct {
     cbm_mutex_t mutex;
+    cbm_condvar_t changed;
     cbm_daemon_runtime_client_t *client;
     FILE *out;
     frontend_item_t queue[FRONTEND_QUEUE_CAPACITY];
@@ -213,8 +212,7 @@ static void frontend_item_free(frontend_item_t *item) {
     }
 }
 
-static bool frontend_should_stop(frontend_state_t *state) {
-    cbm_mutex_lock(&state->mutex);
+static bool frontend_should_stop_locked(const frontend_state_t *state) {
     /* The input-closed leg must also require that no item is IN FLIGHT: the
      * worker consults this while deciding whether a request failure was an
      * expected shutdown, and the final queued item after EOF has count == 0
@@ -222,8 +220,12 @@ static bool frontend_should_stop(frontend_state_t *state) {
      * term, any daemon-side failure of that last item was classified as an
      * expected stop and its response silently dropped with a success exit —
      * an unanswerable failure mode for the client. */
-    bool stopping =
-        state->stopping || (state->input_closed && state->count == 0 && !state->in_request);
+    return state->stopping || (state->input_closed && state->count == 0 && !state->in_request);
+}
+
+static bool frontend_should_stop(frontend_state_t *state) {
+    cbm_mutex_lock(&state->mutex);
+    bool stopping = frontend_should_stop_locked(state);
     cbm_mutex_unlock(&state->mutex);
     return stopping;
 }
@@ -231,6 +233,7 @@ static bool frontend_should_stop(frontend_state_t *state) {
 static void frontend_worker_mark_done(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->worker_done = true;
+    cbm_condvar_broadcast(&state->changed);
     cbm_mutex_unlock(&state->mutex);
 }
 
@@ -244,6 +247,7 @@ static bool frontend_worker_is_done(frontend_state_t *state) {
 static void frontend_input_closed(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->input_closed = true;
+    cbm_condvar_broadcast(&state->changed);
     cbm_mutex_unlock(&state->mutex);
 }
 
@@ -272,6 +276,15 @@ static void *frontend_join_watchdog(void *opaque) {
 static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
     bool popped = false;
     cbm_mutex_lock(&state->mutex);
+    while (state->count == 0 && !frontend_should_stop_locked(state)) {
+        if (cbm_condvar_wait(&state->changed, &state->mutex) != 0) {
+            state->failed = true;
+            state->stopping = true;
+            cbm_condvar_broadcast(&state->changed);
+            cbm_mutex_unlock(&state->mutex);
+            return false;
+        }
+    }
     if (!state->stopping && state->count > 0) {
         frontend_item_t *queued = &state->queue[state->head];
         cbm_daemon_runtime_application_token_t request_token =
@@ -281,6 +294,7 @@ static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
         if (!token_ready) {
             state->failed = true;
             state->stopping = true;
+            cbm_condvar_broadcast(&state->changed);
             cbm_mutex_unlock(&state->mutex);
             return false;
         }
@@ -296,6 +310,7 @@ static bool frontend_pop_begin(frontend_state_t *state, frontend_item_t *item) {
         item->request_token = request_token;
         state->active_request_token = request_token;
         popped = true;
+        cbm_condvar_broadcast(&state->changed);
     }
     cbm_mutex_unlock(&state->mutex);
     return popped;
@@ -309,6 +324,7 @@ static void frontend_end_request(frontend_state_t *state, bool failed) {
     state->active_id_str = NULL;
     state->active_request_token = CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID;
     state->failed = state->failed || failed;
+    cbm_condvar_broadcast(&state->changed);
     cbm_mutex_unlock(&state->mutex);
 }
 
@@ -435,7 +451,6 @@ static void *frontend_worker(void *opaque) {
             if (frontend_should_stop(state)) {
                 break;
             }
-            cbm_usleep(FRONTEND_IDLE_WAIT_US);
             continue;
         }
         uint8_t *response = NULL;
@@ -506,6 +521,7 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
         if (!state->stopping && !state->failed) {
             state->failed = true;
             state->stopping = true;
+            cbm_condvar_broadcast(&state->changed);
         }
         cbm_mutex_unlock(&state->mutex);
         free(id_str);
@@ -519,9 +535,9 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
      * pipelined requests (e.g. an agent issuing parallel tool calls) died with
      * rc=1 and zero output (#1522 follow-up). Waits are bounded only by the
      * stop/fail flags, which every teardown path already sets — the same
-     * condition the polling worker and watchdogs key on. */
+     * condition the worker and teardown paths key on. */
+    cbm_mutex_lock(&state->mutex);
     for (;;) {
-        cbm_mutex_lock(&state->mutex);
         bool stopped = state->stopping || state->failed;
         if (stopped) {
             cbm_mutex_unlock(&state->mutex);
@@ -543,17 +559,25 @@ static bool frontend_enqueue(frontend_state_t *state, char *message, bool conten
             };
             state->count++;
             state->queued_bytes += length;
+            cbm_condvar_broadcast(&state->changed);
             cbm_mutex_unlock(&state->mutex);
             return true;
         }
-        cbm_mutex_unlock(&state->mutex);
-        cbm_usleep(FRONTEND_WAIT_US);
+        if (cbm_condvar_wait(&state->changed, &state->mutex) != 0) {
+            state->failed = true;
+            state->stopping = true;
+            cbm_condvar_broadcast(&state->changed);
+            cbm_mutex_unlock(&state->mutex);
+            free(id_str);
+            return false;
+        }
     }
 }
 
 static bool frontend_stop_begin(frontend_state_t *state) {
     cbm_mutex_lock(&state->mutex);
     state->stopping = true;
+    cbm_condvar_broadcast(&state->changed);
     cbm_mutex_unlock(&state->mutex);
     /* Retain the client allocation until the worker is joined. This covers the
      * boundary where the worker has claimed an item but has not yet entered the
@@ -570,6 +594,7 @@ static bool frontend_cancel_for_maintenance(void *opaque) {
     if (state->in_request) {
         request_token = state->active_request_token;
     }
+    cbm_condvar_broadcast(&state->changed);
     cbm_mutex_unlock(&state->mutex);
     if (request_token == CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID) {
         return false;
@@ -588,10 +613,16 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         .out = out,
     };
     cbm_mutex_init(&state.mutex);
+    if (cbm_condvar_init(&state.changed) != 0) {
+        cbm_mutex_destroy(&state.mutex);
+        (void)cbm_daemon_runtime_client_close(client, FRONTEND_CLOSE_TIMEOUT_MS);
+        return -1;
+    }
     atomic_init(&state.completed_items, 0);
     cbm_daemon_maintenance_monitor_t *maintenance_monitor = cbm_daemon_maintenance_monitor_start(
         cohort_manager, frontend_cancel_for_maintenance, &state, EXIT_SUCCESS, "MCP frontend");
     if (!maintenance_monitor) {
+        cbm_condvar_destroy(&state.changed);
         cbm_mutex_destroy(&state.mutex);
         (void)cbm_daemon_runtime_client_close(client, FRONTEND_CLOSE_TIMEOUT_MS);
         return -1;
@@ -601,6 +632,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
         if (!cbm_daemon_maintenance_monitor_stop(&maintenance_monitor)) {
             _Exit(EXIT_FAILURE);
         }
+        cbm_condvar_destroy(&state.changed);
         cbm_mutex_destroy(&state.mutex);
         (void)cbm_daemon_runtime_client_close(client, FRONTEND_CLOSE_TIMEOUT_MS);
         return -1;
@@ -708,6 +740,7 @@ int cbm_daemon_frontend_mcp_run(cbm_daemon_runtime_client_t *client,
     if (state.failed) {
         result = -1;
     }
+    cbm_condvar_destroy(&state.changed);
     cbm_mutex_destroy(&state.mutex);
     return result;
 }

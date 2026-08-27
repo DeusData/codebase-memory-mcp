@@ -1,5 +1,5 @@
 /*
- * compat_thread.c — Portable thread, mutex, and aligned allocation.
+ * compat_thread.c — Portable thread, mutex, condition variable, and aligned allocation.
  *
  * POSIX: thin wrappers around pthreads and posix_memalign.
  * Windows: CreateThread, CRITICAL_SECTION, _aligned_malloc.
@@ -231,6 +231,47 @@ void cbm_mutex_unlock(cbm_mutex_t *m) {
 
 void cbm_mutex_destroy(cbm_mutex_t *m) {
     pthread_mutex_destroy(&m->mtx);
+}
+
+#endif
+
+/* ── Condition variable ────────────────────────────────────────── */
+
+#ifdef _WIN32
+
+int cbm_condvar_init(cbm_condvar_t *condition) {
+    InitializeConditionVariable(&condition->cv);
+    return 0;
+}
+
+int cbm_condvar_wait(cbm_condvar_t *condition, cbm_mutex_t *mutex) {
+    return SleepConditionVariableCS(&condition->cv, &mutex->cs, INFINITE) ? 0 : CBM_NOT_FOUND;
+}
+
+void cbm_condvar_broadcast(cbm_condvar_t *condition) {
+    WakeAllConditionVariable(&condition->cv);
+}
+
+void cbm_condvar_destroy(cbm_condvar_t *condition) {
+    (void)condition;
+}
+
+#else
+
+int cbm_condvar_init(cbm_condvar_t *condition) {
+    return pthread_cond_init(&condition->cv, NULL);
+}
+
+int cbm_condvar_wait(cbm_condvar_t *condition, cbm_mutex_t *mutex) {
+    return pthread_cond_wait(&condition->cv, &mutex->mtx);
+}
+
+void cbm_condvar_broadcast(cbm_condvar_t *condition) {
+    (void)pthread_cond_broadcast(&condition->cv);
+}
+
+void cbm_condvar_destroy(cbm_condvar_t *condition) {
+    (void)pthread_cond_destroy(&condition->cv);
 }
 
 #endif

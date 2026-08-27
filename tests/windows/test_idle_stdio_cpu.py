@@ -1,8 +1,9 @@
-r"""GREEN guard — an initialized, idle MCP frontend must not spin on Windows.
+r"""GREEN guard — initialized, idle MCP frontends must not spin on Windows.
 
-Regression test for #1764. The frontend used to run two independent
-maintenance observers every 10 ms. Each observer reopened and locked the
-version-cohort marker, causing substantial CPU usage while a stdio client was
+Regression test for #1764. After the duplicate maintenance observer was
+removed, each stdio frontend still woke its queue worker every 10 ms and
+reopened the version-cohort marker on a short timer. That per-session cost
+multiplied into substantial CPU usage when several coding-agent sessions were
 idle on Windows.
 
 Exit code: 0 == green, 1 == regression, 2 == setup error.
@@ -23,9 +24,15 @@ import time
 from mcp_stdio import McpError, McpServer
 
 
-SAMPLE_SECONDS = 5.0
+CLIENT_COUNT = 6
+SAMPLE_SECONDS = 8.0
 SETTLE_SECONDS = 2.0
-MAX_PERCENT_OF_ONE_CORE = 20.0
+# A coding agent keeps one frontend per active session. Guard the aggregate,
+# because a small-looking per-process polling cost still multiplies into a hot
+# core once several sessions are open. The fixed implementation measures well
+# below one percent per client on the reference machine; this bound leaves
+# ample Windows runner margin while rejecting the current multi-client churn.
+MAX_AGGREGATE_PERCENT_OF_ONE_CORE = 5.0
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 SYNCHRONIZE = 0x00100000
 WAIT_OBJECT_0 = 0
@@ -142,7 +149,7 @@ def main():
 
     binary = os.path.abspath(sys.argv[1])
     daemon_pid = 0
-    session = None
+    sessions = []
     with tempfile.TemporaryDirectory(prefix="cbm-idle-cpu-") as work:
         cache = os.path.join(work, "cache")
         runtime = os.path.join(work, "runtime")
@@ -159,35 +166,42 @@ def main():
                 print("SETUP FAIL: isolated daemon did not start:\n%s" % output_text(started)[:800])
                 return 2
 
-            session = McpServer(binary, cache_dir=cache,
-                                extra_env={"CBM_RUNTIME_DIR": runtime}, cwd=work)
-            session.start()
-            session.initialize(timeout=60)
+            for _ in range(CLIENT_COUNT):
+                session = McpServer(binary, cache_dir=cache,
+                                    extra_env={"CBM_RUNTIME_DIR": runtime}, cwd=work)
+                sessions.append(session)
+                session.start()
+                session.initialize(timeout=60)
             time.sleep(SETTLE_SECONDS)
-            if session.proc.poll() is not None:
-                print("SETUP FAIL: initialized MCP frontend exited before the CPU sample")
+            if any(session.proc.poll() is not None for session in sessions):
+                print("SETUP FAIL: an initialized MCP frontend exited before the CPU sample")
                 return 2
 
-            before_cpu = process_cpu_seconds(session.proc.pid)
+            before_cpu = sum(process_cpu_seconds(session.proc.pid) for session in sessions)
             before_wall = time.perf_counter()
             time.sleep(SAMPLE_SECONDS)
             elapsed = time.perf_counter() - before_wall
-            cpu_seconds = process_cpu_seconds(session.proc.pid) - before_cpu
+            if any(session.proc.poll() is not None for session in sessions):
+                print("SETUP FAIL: an initialized MCP frontend exited during the CPU sample")
+                return 2
+            cpu_seconds = (sum(process_cpu_seconds(session.proc.pid) for session in sessions)
+                           - before_cpu)
             percent = 100.0 * cpu_seconds / elapsed
-            print("Idle MCP frontend CPU: %.2f%% of one logical core over %.2fs"
-                  % (percent, elapsed))
-            if percent > MAX_PERCENT_OF_ONE_CORE:
-                print("RED: idle frontend CPU %.2f%% exceeds %.2f%%; "
-                      "maintenance polling is spinning" %
-                      (percent, MAX_PERCENT_OF_ONE_CORE))
+            print("Idle MCP frontend CPU: %.2f%% of one logical core total "
+                  "across %d clients (%.2f%% average) over %.2fs"
+                  % (percent, len(sessions), percent / len(sessions), elapsed))
+            if percent > MAX_AGGREGATE_PERCENT_OF_ONE_CORE:
+                print("RED: aggregate idle frontend CPU %.2f%% exceeds %.2f%%; "
+                      "per-session polling cost is multiplying" %
+                      (percent, MAX_AGGREGATE_PERCENT_OF_ONE_CORE))
                 return 1
-            print("PASS: initialized idle MCP frontend stays below the Windows CPU guard")
+            print("PASS: initialized idle MCP frontends stay below the Windows CPU guard")
             return 0
         except (McpError, OSError, subprocess.SubprocessError) as exc:
             print("SETUP FAIL: %s" % exc)
             return 2
         finally:
-            if session is not None:
+            for session in reversed(sessions):
                 session.close()
             stop_daemon(binary, env, daemon_pid)
 

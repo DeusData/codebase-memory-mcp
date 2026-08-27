@@ -1,7 +1,7 @@
 /*
  * compat_thread.h — Portable threading: pthreads on POSIX, Win32 threads on Windows.
  *
- * Provides: thread create/join, mutex, aligned allocation.
+ * Provides: thread create/join, mutex, condition variable, aligned allocation.
  * All have zero overhead on POSIX (thin inlines or macros).
  */
 #ifndef CBM_COMPAT_THREAD_H
@@ -62,6 +62,27 @@ void cbm_mutex_init(cbm_mutex_t *m);
 void cbm_mutex_lock(cbm_mutex_t *m);
 void cbm_mutex_unlock(cbm_mutex_t *m);
 void cbm_mutex_destroy(cbm_mutex_t *m);
+
+/* ── Condition variable ────────────────────────────────────────── */
+
+#ifdef _WIN32
+
+typedef struct {
+    CONDITION_VARIABLE cv;
+} cbm_condvar_t;
+
+#else
+
+typedef struct {
+    pthread_cond_t cv;
+} cbm_condvar_t;
+
+#endif
+
+int cbm_condvar_init(cbm_condvar_t *condition);
+int cbm_condvar_wait(cbm_condvar_t *condition, cbm_mutex_t *mutex);
+void cbm_condvar_broadcast(cbm_condvar_t *condition);
+void cbm_condvar_destroy(cbm_condvar_t *condition);
 
 /* ── Aligned allocation ───────────────────────────────────────── */
 
