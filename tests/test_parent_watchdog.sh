@@ -40,9 +40,11 @@ kill_hard() {
   # so a child's real parent never actually died). Force-kill through
   # TerminateProcess on the Windows pid as well. The winpid must be resolved
   # BEFORE the msys kill: kill -9 removes the pid from the MSYS process table
-  # immediately, and the mapping would be lost.
+  # immediately, and the mapping would be lost. `ps -W` exists only on MSYS —
+  # under `set -o pipefail` a failing ps would abort this helper on POSIX —
+  # so the pipeline is guarded and simply yields an empty winpid elsewhere.
   local pid="$1" winpid
-  winpid="$(ps -W 2>/dev/null | awk -v m="${pid}" '$1==m {print $4; exit}')"
+  winpid="$(ps -W 2>/dev/null | awk -v m="${pid}" '$1==m {print $4; exit}' || true)"
   kill -9 "${pid}" 2>/dev/null || true
   [[ -n "${winpid}" ]] && taskkill //F //PID "${winpid}" >/dev/null 2>&1 || true
 }
@@ -51,14 +53,14 @@ cleanup() {
   if [[ -s "${tmpdir}/child.pid" ]]; then
     local child_pid
     child_pid="$(cat "${tmpdir}/child.pid" 2>/dev/null || true)"
-    [[ -n "${child_pid}" ]] && kill_hard "${child_pid}"
+    [[ -n "${child_pid}" ]] && kill_hard "${child_pid}" || true
   fi
   # On Windows the pipe writer is an orphaned helper that outlives the wrapper
   # by design (it holds stdin open); only the test knows its PID.
   if [[ -n "${writer_pid}" ]]; then
-    kill_hard "${writer_pid}"
+    kill_hard "${writer_pid}" || true
   fi
-  [[ -n "${wrapper_pid}" ]] && kill_hard "${wrapper_pid}"
+  [[ -n "${wrapper_pid}" ]] && kill_hard "${wrapper_pid}" || true
   cbm_test_runtime_cleanup "${BINARY}"
 }
 trap cleanup EXIT
