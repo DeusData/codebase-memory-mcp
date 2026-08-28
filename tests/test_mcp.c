@@ -8914,14 +8914,14 @@ TEST(tool_manage_memory_personal_store) {
     cbm_mcp_server_free(srv);
     cbm_config_close(cfg);
     cbm_unsetenv("CBM_MEMORY_DIR");
-    remove(memory_db);
-    rmdir(memory_dir);
+    cbm_unlink(memory_db);
+    cbm_rmdir(memory_dir);
     char config_db[512];
     snprintf(config_db, sizeof(config_db), "%s/_config.db", cache_dir);
-    remove(config_db);
-    rmdir(cache_dir);
-    rmdir(repo_dir);
-    rmdir(tmp_dir);
+    cbm_unlink(config_db);
+    cbm_rmdir(cache_dir);
+    cbm_rmdir(repo_dir);
+    cbm_rmdir(tmp_dir);
 
     PASS();
 }
@@ -9002,9 +9002,9 @@ TEST(tool_manage_memory_rejects_repo_local_storage) {
     cbm_unsetenv("CBM_MEMORY_DIR");
     char config_db[512];
     snprintf(config_db, sizeof(config_db), "%s/_config.db", cache_dir);
-    remove(config_db);
-    rmdir(cache_dir);
-    rmdir(tmp_dir);
+    cbm_unlink(config_db);
+    cbm_rmdir(cache_dir);
+    cbm_rmdir(tmp_dir);
     PASS();
 }
 
