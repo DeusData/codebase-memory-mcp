@@ -78,6 +78,7 @@ enum {
 #ifdef _WIN32
 #include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
 #include <io.h>
+#include <tlhelp32.h> /* CreateToolhelp32Snapshot — parent PID discovery for the parent-death watchdog */
 #endif
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
@@ -390,7 +391,15 @@ static void signal_handler(int sig) {
  * otherwise linger forever blocked on stdin. POSIX has no portable "notify on
  * parent death" primitive (PR_SET_PDEATHSIG is Linux-only), so we poll getppid:
  * once the parent dies the process is reparented (ppid changes, typically to 1)
- * and we shut down. Windows is unaffected (job objects handle this) — #ifndef. */
+ * and we shut down.
+ *
+ * Windows used to be excluded here on the assumption that job objects cover it
+ * (#914 proved they do not): the KILL_ON_JOB_CLOSE job in subprocess.c only
+ * wraps processes CBM itself spawns. An MCP stdio server is spawned BY the
+ * client as its child, and Windows does not propagate parent termination to
+ * children, so the orphan lingers holding SQLite WAL read locks. The Windows
+ * branch below waits on a handle to the parent process instead — a signaled
+ * handle is exact (no PID-reuse window), so no polling of the PID is needed. */
 
 #ifndef _WIN32
 typedef struct {
@@ -533,6 +542,110 @@ static bool client_start_parent_watchdog(pid_t initial_ppid) {
     if (cbm_thread_detach(&watchdog) != 0) {
         atomic_store(&g_shutdown, 1);
         (void)cbm_thread_join(&watchdog);
+        return false;
+    }
+    return true;
+}
+#else /* _WIN32 */
+/* Windows parent-death watchdog — the #914 half of the story.
+ *
+ * The KILL_ON_JOB_CLOSE job in subprocess.c only contains processes CBM
+ * spawns itself; a stdio MCP server is the CLIENT's child, and Windows never
+ * propagates a parent's termination to its children, so a force-killed client
+ * leaves the server lingering on stdin while pinning SQLite WAL read locks.
+ * There is no reparenting to poll for either — instead we open a handle to
+ * the parent at startup and wait on it: the kernel signals a process handle
+ * exactly once, when the process terminates, and the held handle pins the
+ * process object, so PID reuse cannot fool the wait the way re-reading a ppid
+ * could. The 500 ms timeout exists only to re-check g_shutdown, mirroring the
+ * POSIX poll cadence.
+ *
+ * The worker path keeps its POSIX-only guard: workers are spawned by CBM's own
+ * subprocess layer inside a kill-on-close job, so containment there is already
+ * the job object's job. */
+typedef struct {
+    HANDLE parent_process;
+    bool exit_on_parent_death;
+} parent_watchdog_config_t;
+
+static void *parent_watchdog_thread(void *arg) {
+    parent_watchdog_config_t config = *(parent_watchdog_config_t *)arg;
+
+    while (!atomic_load(&g_shutdown)) {
+        DWORD wait_status = WaitForSingleObject(config.parent_process, 500);
+        if (wait_status == WAIT_OBJECT_0) {
+            static const char msg[] = "level=warn msg=parent.exited reason=handle_signaled\n";
+            (void)_write(_fileno(stderr), msg, sizeof(msg) - 1);
+            if (config.exit_on_parent_death) {
+                /* Same deliberate hard stop as the POSIX branch: a lingering
+                 * orphan must release its daemon connection, file locks and
+                 * WAL read lock through kernel handle reclamation, and no
+                 * atexit cleanup is trustworthy after the owning client is
+                 * gone. */
+                _exit(0);
+            }
+            request_shutdown();
+            break;
+        }
+        if (wait_status != WAIT_TIMEOUT) {
+            break; /* handle became unwaitable — stop watching, never spin */
+        }
+    }
+    return NULL;
+}
+
+/* Toolhelp is the documented way to learn one's own parent PID on Windows;
+ * the PEB value is not exposed through any public API. Returns 0 when the
+ * lookup itself fails; callers treat that as "no parent signal available". */
+static DWORD win_parent_pid_from_snapshot(void) {
+    DWORD parent_pid = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    PROCESSENTRY32W entry;
+    ZeroMemory(&entry, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    DWORD self_pid = GetCurrentProcessId();
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == self_pid) {
+                parent_pid = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return parent_pid;
+}
+
+static bool client_start_parent_watchdog(DWORD initial_ppid) {
+    /* Mirrors the POSIX initial_ppid <= 1 bail-out: when no trustworthy parent
+     * signal exists at startup — snapshot failed, reserved PID, or the parent
+     * already exited so the handle cannot be opened — keep running and rely on
+     * the stdin EOF path instead of watching nothing or dying on a false
+     * alarm. A watchdog thread creation failure, by contrast, is fatal: the
+     * same fail-closed choice as POSIX. */
+    if (initial_ppid == 0) {
+        return true;
+    }
+    HANDLE parent_process = OpenProcess(SYNCHRONIZE, FALSE, initial_ppid);
+    if (!parent_process) {
+        return true;
+    }
+    static parent_watchdog_config_t client_config;
+    client_config.parent_process = parent_process;
+    client_config.exit_on_parent_death = true;
+    cbm_thread_t watchdog;
+    if (cbm_thread_create(&watchdog, PARENT_WATCHDOG_STACK_SIZE, parent_watchdog_thread,
+                          &client_config) != 0) {
+        CloseHandle(parent_process);
+        return false;
+    }
+    if (cbm_thread_detach(&watchdog) != 0) {
+        atomic_store(&g_shutdown, 1);
+        (void)cbm_thread_join(&watchdog);
+        CloseHandle(parent_process);
         return false;
     }
     return true;
@@ -2527,6 +2640,11 @@ int main(int argc, char **argv) {
     cbm_alloc_init();
 #ifndef _WIN32
     pid_t process_initial_ppid = getppid();
+#else
+    /* Captured at the same instant as POSIX: the later OpenProcess in
+     * client_start_parent_watchdog must target the process that spawned us,
+     * not whatever may have recycled the PID meanwhile. */
+    DWORD process_initial_ppid = win_parent_pid_from_snapshot();
 #endif
 #ifdef _WIN32
     {
@@ -3114,7 +3232,9 @@ int main(int argc, char **argv) {
                                   "cbm-with-ui`.\n");
         }
     }
-#ifndef _WIN32
+    /* The Windows branch of this call is the #914 fix: identical placement and
+     * failure handling as POSIX (fail-closed — a client that cannot arm its
+     * parent watchdog would linger as an orphan after the editor dies). */
     if (!client_start_parent_watchdog(process_initial_ppid)) {
         (void)fprintf(stderr, "codebase-memory-mcp: parent-death watchdog could not start\n");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
@@ -3122,7 +3242,6 @@ int main(int argc, char **argv) {
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
     }
-#endif
 
     setup_signal_handlers();
     int result = cbm_daemon_frontend_mcp_run(g_daemon_client, client_cohort_manager, stdin, stdout);
