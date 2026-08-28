@@ -1261,6 +1261,8 @@ TEST(mcp_get_int_arg) {
     ASSERT_EQ(val, 5);
     val = cbm_mcp_get_int_arg(args, "missing", 42);
     ASSERT_EQ(val, 42);
+    val = cbm_mcp_get_int_arg("{\"limit\":18446744073709551615}", "limit", 0);
+    ASSERT_LTE(val, 0);
     PASS();
 }
 
@@ -2371,9 +2373,13 @@ TEST(tool_search_graph_semantic_store_error_has_no_partial_results_issue915) {
 }
 
 TEST(tool_search_graph_semantic_invalid_element_type_issue915) {
-    mcp_semantic_pagination_fixture_t fixture;
-    ASSERT_TRUE(mcp_semantic_pagination_fixture_open(&fixture));
-    cbm_mcp_server_t *srv = fixture.server;
+    cbm_mcp_server_t *srv = setup_semantic_store_error_server();
+    ASSERT_NOT_NULL(srv);
+    sqlite3 *db = cbm_store_get_db(cbm_mcp_server_store(srv));
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_create_function(db, "cbm_cosine_i8", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                                      NULL, mcp_semantic_sql_error, NULL, NULL),
+              SQLITE_OK);
 
     char *response = cbm_mcp_handle_tool(
         srv, "search_graph",
@@ -2399,7 +2405,7 @@ TEST(tool_search_graph_semantic_invalid_element_type_issue915) {
     free(combined_response);
     free(inner);
     free(response);
-    mcp_semantic_pagination_fixture_close(&fixture);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -3209,26 +3215,40 @@ TEST(mcp_resource_discovery_methods_return_empty_lists) {
 
 TEST(tool_query_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "query-bounds";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/query-bounds"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "bounded",
+                       .qualified_name = "query-bounds.bounded",
+                       .file_path = "bounded.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
 
-    char *resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"query_graph\","
-             "\"arguments\":{\"query\":\"MATCH (f:Function) RETURN f.name\"}}}");
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"query_graph\","
+                                   "\"arguments\":{\"project\":\"query-bounds\","
+                                   "\"query\":\"MATCH (f:Function) RETURN f.name\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"result\""));
     free(resp);
 
     /* Semantic pagination's overflow handling must not turn unrelated integer
-     * arguments into INT_MAX-sized work. Preserve query_graph's existing fast
-     * rejection of UINT64_MAX after its shared integer conversion. */
-    resp =
-        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\","
-                                   "\"params\":{\"name\":\"query_graph\","
-                                   "\"arguments\":{\"query\":\"MATCH (f:Function) RETURN f.name\","
-                                   "\"max_rows\":18446744073709551615}}}");
+     * arguments into INT_MAX-sized work. Preserve query_graph's bounded default
+     * after the shared getter narrows UINT64_MAX to a nonpositive value. */
+    resp = cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\","
+                                      "\"params\":{\"name\":\"query_graph\","
+                                      "\"arguments\":{\"project\":\"query-bounds\","
+                                      "\"query\":\"MATCH (f:Function) RETURN f.name\","
+                                      "\"max_rows\":18446744073709551615}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"result\""));
-    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "bounded"));
     free(resp);
 
     cbm_mcp_server_free(srv);
