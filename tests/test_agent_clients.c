@@ -49,6 +49,7 @@ static cbm_agent_client_resolve_options_t agent_options(agent_probe_t *probe) {
         .trae_config_path = NULL,
         .roo_config_path = NULL,
         .cody_config_path = NULL,
+        .omp_agent_dir = NULL,
         .is_windows = false,
         .path_exists = agent_path_exists,
         .command_exists = agent_command_exists,
@@ -161,6 +162,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
+        "omp",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -181,6 +183,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
         CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
         CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
     };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));
@@ -829,6 +832,7 @@ TEST(agent_clients_json_schemas_are_exact_and_policy_neutral) {
         {CBM_AGENT_CLIENT_IBM_BOB_IDE, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_IBM_BOB_SHELL, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_POCHI, "\"mcp\""},
+        {CBM_AGENT_CLIENT_OMP, "\"type\": \"stdio\""},
     };
     const char *binary = "/opt/Codebase Memory/bin/cbm\\\"special";
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -866,6 +870,7 @@ TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
         CBM_AGENT_CLIENT_IBM_BOB_IDE,
         CBM_AGENT_CLIENT_IBM_BOB_SHELL,
         CBM_AGENT_CLIENT_POCHI,
+        CBM_AGENT_CLIENT_OMP,
     };
     for (size_t i = 0U; i < sizeof(clients) / sizeof(clients[0]); i++) {
         const char *foreign =
@@ -929,6 +934,45 @@ TEST(agent_clients_refuse_foreign_and_preserve_modified_entries) {
     th_cleanup(dir);
     PASS();
 }
+
+TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided) {
+    agent_probe_t probe = {0};
+    cbm_agent_client_resolve_options_t options = agent_options(&probe);
+    char resolved[512];
+
+    /* Default (no env) keeps the documented ~/.omp/agent path. */
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/home/tester/.omp/agent/mcp.json");
+
+    /* Named profile directory takes precedence over the home-relative default. */
+    options.omp_agent_dir = "/home/tester/.omp/profiles/work/agent";
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/home/tester/.omp/profiles/work/agent/mcp.json");
+
+    /* PI_CODING_AGENT_DIR relocations also flow through the resolved option. */
+    options.omp_agent_dir = "/srv/omp-shared/agent";
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/srv/omp-shared/agent/mcp.json");
+    PASS();
+}
+
+TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability) {
+    const cbm_agent_client_profile_t *profile =
+        cbm_agent_client_by_id(CBM_AGENT_CLIENT_OMP);
+    ASSERT_NOT_NULL(profile);
+    ASSERT_EQ(profile->capabilities & CBM_AGENT_CAP_INSTRUCTIONS, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_MCP, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_SKILL, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_AGENT, 0U);
+    PASS();
+}
+
 
 TEST(agent_clients_remove_only_canonical_and_missing_is_noop) {
     char *dir = NULL;
@@ -1239,6 +1283,8 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_json_schemas_are_exact_and_policy_neutral);
     RUN_TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries);
     RUN_TEST(agent_clients_refuse_foreign_and_preserve_modified_entries);
+    RUN_TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided);
+    RUN_TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability);
     RUN_TEST(agent_clients_remove_only_canonical_and_missing_is_noop);
     RUN_TEST(agent_clients_registry_callbacks_apply_the_selected_schema);
     RUN_TEST(agent_clients_malformed_json_fails_byte_identically);

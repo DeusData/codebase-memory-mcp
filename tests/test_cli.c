@@ -23,6 +23,7 @@
 #include <foundation/constants.h>
 #include <foundation/platform.h>
 #include <mcp/mcp.h>
+#include <pipeline/pipeline.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
 #include <yyjson/yyjson.h>
@@ -4412,6 +4413,31 @@ TEST(cli_detect_agents_finds_codex) {
     PASS();
 }
 
+TEST(cli_detect_agents_finds_grok) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-detect-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char *saved_grok = save_test_env("GROK_HOME");
+    char *saved_path = save_test_env("PATH");
+    cbm_unsetenv("GROK_HOME");
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_detected_agents_t before = cbm_detect_agents(tmpdir);
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.grok", tmpdir);
+    test_mkdirp(dir);
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+
+    restore_test_env("GROK_HOME", saved_grok);
+    restore_test_env("PATH", saved_path);
+    test_rmdir_r(tmpdir);
+    ASSERT_FALSE(before.grok);
+    ASSERT_TRUE(agents.grok);
+    PASS();
+}
+
 /* issue #222: Cursor (~/.cursor/) must be detected so install/update registers
  * the MCP server in ~/.cursor/mcp.json — previously it was never discovered. */
 TEST(cli_detect_agents_finds_cursor_issue222) {
@@ -4527,6 +4553,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Crush",
         "Goose",
         "Mistral Vibe",
+        "Grok Build",
         "Qoder CLI",
         "Kimi Code CLI",
         "GitLab Duo CLI",
@@ -4545,14 +4572,15 @@ TEST(cli_supported_agent_surfaces_match_installers) {
         "Pochi",
         "Pi",
         "Sourcegraph Cody",
+        "Oh My Pi (omp)",
     };
-    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 43U);
+    ASSERT_EQ(sizeof(required_agents) / sizeof(required_agents[0]), 45U);
     char *data = read_test_file_alloc("README.md");
     if (!data)
         FAIL("could not read README.md for supported-agent contract");
-    if (!strstr(data, "43 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("README must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("README must describe all 45 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4565,9 +4593,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("pkg/npm/README.md");
     if (!data)
         FAIL("could not read npm README for supported-agent contract");
-    if (!strstr(data, "43 supported automatic/conditional client surfaces")) {
+    if (!strstr(data, "45 supported automatic/conditional client surfaces")) {
         free(data);
-        FAIL("npm README must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("npm README must describe all 45 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4580,9 +4608,9 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/index.html");
     if (!data)
         FAIL("could not read docs/index.html for supported-agent contract");
-    if (!strstr(data, "configures 43 automatic/conditional client surfaces")) {
+    if (!strstr(data, "configures 45 automatic/conditional client surfaces")) {
         free(data);
-        FAIL("landing page must describe all 43 automatic/conditional client surfaces accurately");
+        FAIL("landing page must describe all 45 automatic/conditional client surfaces accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4601,7 +4629,7 @@ TEST(cli_supported_agent_surfaces_match_installers) {
             FAIL("CLI help must list every automatic/conditional client surface");
         }
     }
-    if (!strstr(data, "Supported automatic/conditional client surfaces (43)")) {
+    if (!strstr(data, "Supported automatic/conditional client surfaces (45)")) {
         free(data);
         FAIL("CLI help must not describe all conditional surfaces as auto-detected");
     }
@@ -4610,10 +4638,10 @@ TEST(cli_supported_agent_surfaces_match_installers) {
     data = read_test_file_alloc("docs/llms.txt");
     if (!data)
         FAIL("could not read docs/llms.txt for supported-agent contract");
-    if (!strstr(data, "43 automatic/conditional client surfaces") ||
-        !strstr(data, "37 automatically detected") || !strstr(data, "6 conditional/explicit")) {
+    if (!strstr(data, "45 automatic/conditional client surfaces") ||
+        !strstr(data, "39 automatically detected") || !strstr(data, "6 conditional/explicit")) {
         free(data);
-        FAIL("llms.txt must describe the 43-surface 37+6 support matrix accurately");
+        FAIL("llms.txt must describe the 45-surface 39+6 support matrix accurately");
     }
     for (size_t i = 0; i < sizeof(required_agents) / sizeof(required_agents[0]); i++) {
         if (!strstr(data, required_agents[i])) {
@@ -4634,10 +4662,12 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
     char *saved_copilot = save_test_env("COPILOT_HOME");
     char *saved_crush = save_test_env("CRUSH_GLOBAL_CONFIG");
     char *saved_vibe = save_test_env("VIBE_HOME");
+    char *saved_grok = save_test_env("GROK_HOME");
     char *saved_appdata = save_test_env("APPDATA");
     cbm_unsetenv("COPILOT_HOME");
     cbm_unsetenv("CRUSH_GLOBAL_CONFIG");
     cbm_unsetenv("VIBE_HOME");
+    cbm_unsetenv("GROK_HOME");
 #ifdef _WIN32
     char appdata[512];
     snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
@@ -4658,6 +4688,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         ".config/goose",
 #endif
         ".vibe",
+        ".grok",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -4702,6 +4733,11 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "\"mistral-vibe\"",
         "/.vibe/config.toml",
         "/.vibe/AGENTS.md",
+        "\"grok\"",
+        "/.grok/config.toml",
+        "/.grok/rules/codebase-memory.md",
+        "/.grok/skills/codebase-memory/SKILL.md",
+        "/.grok/agents/codebase-memory.md",
     };
     const char *missing = NULL;
     for (size_t i = 0; json && i < sizeof(expected) / sizeof(expected[0]); i++) {
@@ -4715,6 +4751,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
     restore_test_env("COPILOT_HOME", saved_copilot);
     restore_test_env("CRUSH_GLOBAL_CONFIG", saved_crush);
     restore_test_env("VIBE_HOME", saved_vibe);
+    restore_test_env("GROK_HOME", saved_grok);
     restore_test_env("APPDATA", saved_appdata);
     test_rmdir_r(tmpdir);
 
@@ -4731,7 +4768,8 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
 
     const char *const env_names[] = {
         "PATH",       "COPILOT_HOME",      "CRUSH_GLOBAL_CONFIG", "VIBE_HOME",
-        "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG",     "APPDATA"};
+        "CODEX_HOME", "CLAUDE_CONFIG_DIR", "OPENCODE_CONFIG",     "APPDATA",
+        "GROK_HOME"};
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         saved_env[i] = save_test_env(env_names[i]);
@@ -4758,6 +4796,7 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
         ".config/goose",
 #endif
         ".vibe",
+        ".grok",
     };
     char path[768];
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
@@ -4858,6 +4897,12 @@ TEST(cli_new_agent_configs_use_documented_schemas) {
     snprintf(path, sizeof(path), "%s/.vibe/config.toml", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, vibe, 5);
     snprintf(path, sizeof(path), "%s/.vibe/AGENTS.md", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, durable_hint, 3);
+    const char *const grok[] = {"[mcp_servers.codebase-memory-mcp]", "command = \"", "args = []",
+                                binary};
+    snprintf(path, sizeof(path), "%s/.grok/config.toml", tmpdir);
+    schemas_ok = schemas_ok && test_file_contains_all(path, grok, 4);
+    snprintf(path, sizeof(path), "%s/.grok/rules/codebase-memory.md", tmpdir);
     schemas_ok = schemas_ok && test_file_contains_all(path, durable_hint, 3);
 
     for (size_t i = 0; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
@@ -5171,6 +5216,7 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         "CLINE_DATA_DIR",
         "KIRO_HOME",
         "VIBE_HOME",
+        "GROK_HOME",
         "OPENCODE_CONFIG",
         /* Linux path resolvers prefer $XDG_CONFIG_HOME over $HOME/.config;
          * CI runners export it, so an isolated-process run resolved OUTSIDE
@@ -5189,18 +5235,21 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     char cline_data_dir[512];
     char kiro_home[512];
     char vibe_home[512];
+    char grok_home[512];
     snprintf(codex_home, sizeof(codex_home), "%s/vendor-codex", tmpdir);
     snprintf(qwen_home, sizeof(qwen_home), "%s/vendor-qwen", tmpdir);
     snprintf(copilot_home, sizeof(copilot_home), "%s/vendor-copilot", tmpdir);
     snprintf(cline_data_dir, sizeof(cline_data_dir), "%s/vendor-cline-data", tmpdir);
     snprintf(kiro_home, sizeof(kiro_home), "%s/vendor-kiro", tmpdir);
     snprintf(vibe_home, sizeof(vibe_home), "%s/vendor-vibe", tmpdir);
+    snprintf(grok_home, sizeof(grok_home), "%s/vendor-grok", tmpdir);
     test_mkdirp(codex_home);
     test_mkdirp(qwen_home);
     test_mkdirp(copilot_home);
     test_mkdirp(cline_data_dir);
     test_mkdirp(kiro_home);
     test_mkdirp(vibe_home);
+    test_mkdirp(grok_home);
 
     const char *const dirs[] = {
         ".claude",
@@ -5233,6 +5282,7 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     cbm_setenv("CLINE_DATA_DIR", cline_data_dir, 1);
     cbm_setenv("KIRO_HOME", kiro_home, 1);
     cbm_setenv("VIBE_HOME", vibe_home, 1);
+    cbm_setenv("GROK_HOME", grok_home, 1);
 
     char qwen_settings[640];
     snprintf(qwen_settings, sizeof(qwen_settings), "%s/settings.json", qwen_home);
@@ -5264,6 +5314,10 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
         "/vendor-vibe/skills/codebase-memory/SKILL.md",
         "/vendor-vibe/agents/codebase-memory.toml",
         "/vendor-vibe/prompts/codebase-memory.md",
+        "/vendor-grok/skills/codebase-memory/SKILL.md",
+        "/vendor-grok/agents/codebase-memory.md",
+        "/vendor-grok/agents/codebase-memory-scout.md",
+        "/vendor-grok/agents/codebase-memory-auditor.md",
         "/.config/kilo/agents/codebase-memory.md",
         "/.factory/skills/codebase-memory/SKILL.md",
         "/.factory/droids/codebase-memory.md",
@@ -5458,6 +5512,21 @@ TEST(cli_durable_profiles_follow_current_vendor_paths) {
     free(profile);
     snprintf(path, sizeof(path), "%s/prompts/codebase-memory.md", vibe_home);
     files_ok = files_ok && test_file_contains_all(path, graph_terms, 3U);
+    snprintf(path, sizeof(path), "%s/skills/codebase-memory/SKILL.md", grok_home);
+    files_ok = files_ok && test_file_contains_all(path, graph_terms, 3);
+    snprintf(path, sizeof(path), "%s/agents/codebase-memory.md", grok_home);
+    const char *const grok_agent_terms[] = {
+        "name: codebase-memory\n",
+        "tools: read_file, grep, list_dir, search_tool, use_tool",
+        "mcpInheritance:\n  named:\n    - codebase-memory-mcp",
+        "codebase-memory-mcp__search_graph",
+        "codebase-memory-mcp__check_index_coverage",
+        "Tier 2"};
+    files_ok = files_ok && test_file_contains_all(path, grok_agent_terms, 6U);
+    profile = read_test_file_alloc(path);
+    files_ok = files_ok && profile && !strstr(profile, "codebase-memory-mcp__*") &&
+               !strstr(profile, "delete_project") && !strstr(profile, "manage_adr");
+    free(profile);
 
     snprintf(path, sizeof(path), "%s/.factory/droids/codebase-memory.md", tmpdir);
     const char *const factory_agent_terms[] = {"name: codebase-memory",
@@ -5903,6 +5972,147 @@ TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets) {
     test_rmdir_r(tmpdir);
     if (!plan_ok || !installed || !removed)
         FAIL("Vibe must install and remove matching Scout, Verify, and Auditor agent/prompt pairs");
+    PASS();
+}
+
+/* Grok Build: config.toml table, owned rules file, skill, three graph agents
+ * with named-server inheritance; hooks withheld (its passive events discard
+ * stdout); uninstall removes exactly the owned state. */
+TEST(cli_tiered_grok_installs_profiles_and_withholds_hooks) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-tiered-grok-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char grok_home[512];
+    snprintf(grok_home, sizeof(grok_home), "%s/grok", tmpdir);
+    test_mkdirp(grok_home);
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_grok = save_test_env("GROK_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("GROK_HOME", grok_home, 1);
+
+    char config_path[640];
+    char rules_path[640];
+    char skill_path[640];
+    char hooks_dir[640];
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", grok_home);
+    snprintf(rules_path, sizeof(rules_path), "%s/rules/codebase-memory.md", grok_home);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", grok_home);
+    snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", grok_home);
+    /* A pre-existing user table must survive both install and uninstall. */
+    write_test_file(config_path, "[cli]\ninstaller = \"internal\"\n");
+
+    const char *const slugs[] = {
+        "codebase-memory-scout",
+        "codebase-memory",
+        "codebase-memory-auditor",
+    };
+    const char *const tier_markers[] = {"Tier 1", "Tier 2", "Tier 3"};
+    char agent_paths[3][640];
+    for (size_t i = 0U; i < 3U; i++) {
+        snprintf(agent_paths[i], sizeof(agent_paths[i]), "%s/agents/%s.md", grok_home, slugs[i]);
+    }
+
+    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool installed = install_rc == 0;
+    const char *const mcp_terms[] = {"[mcp_servers.codebase-memory-mcp]",
+                                     "command = \"/opt/codebase-memory-mcp\"", "args = []",
+                                     "installer = \"internal\""};
+    installed = installed && test_file_contains_all(config_path, mcp_terms, 4U);
+    const char *const rules_terms[] = {"search_graph", "trace_path", "check_index_coverage"};
+    installed = installed && test_file_contains_all(rules_path, rules_terms, 3U);
+    const char *const skill_terms[] = {"name: codebase-memory", "search_graph"};
+    installed = installed && test_file_contains_all(skill_path, skill_terms, 2U);
+    for (size_t i = 0U; installed && i < 3U; i++) {
+        char name_line[128];
+        snprintf(name_line, sizeof(name_line), "name: %s\n", slugs[i]);
+        char *agent = read_test_file_alloc(agent_paths[i]);
+        installed = agent && strstr(agent, name_line) && strstr(agent, tier_markers[i]) &&
+                    strstr(agent, "tools: read_file, grep, list_dir, search_tool, use_tool") &&
+                    strstr(agent, "mcpInheritance:\n  named:\n    - codebase-memory-mcp") &&
+                    strstr(agent, "codebase-memory-mcp__check_index_coverage") &&
+                    !strstr(agent, "index_repository") && !strstr(agent, "delete_project") &&
+                    !strstr(agent, "manage_adr") && !strstr(agent, "ingest_traces");
+        free(agent);
+    }
+    struct stat state;
+    bool hooks_withheld = stat(hooks_dir, &state) != 0;
+    char *config = read_test_file_alloc(config_path);
+    size_t tables = 0U;
+    for (const char *at = config; at && (at = strstr(at, "[mcp_servers.codebase-memory-mcp]"));
+         at++) {
+        tables++;
+    }
+    bool single_table = tables == 1U;
+    free(config);
+
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    bool removed = uninstall_rc == 0;
+    for (size_t i = 0U; removed && i < 3U; i++) {
+        removed = stat(agent_paths[i], &state) != 0;
+    }
+    removed = removed && stat(skill_path, &state) != 0;
+    char *after = read_test_file_alloc(config_path);
+    removed = removed && after && !strstr(after, "codebase-memory-mcp") &&
+              strstr(after, "installer = \"internal\"");
+    free(after);
+    char *rules_after = read_test_file_alloc(rules_path);
+    removed = removed && (!rules_after || !strstr(rules_after, "search_graph"));
+    free(rules_after);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("GROK_HOME", saved_grok);
+    test_rmdir_r(tmpdir);
+    if (!installed)
+        FAIL("Grok Build must install config.toml table, rules, skill, and three graph agents");
+    if (!hooks_withheld)
+        FAIL("Grok Build must not receive hooks (passive events discard stdout)");
+    if (!single_table)
+        FAIL("Grok Build install must write exactly one MCP table");
+    if (!removed)
+        FAIL("Grok Build uninstall must remove exactly the owned state");
+    PASS();
+}
+
+/* A same-name table that is not ours (for example a remote url entry) must be
+ * left byte-identical: a second [mcp_servers.codebase-memory-mcp] header would
+ * make Grok reject the whole config.toml. */
+TEST(cli_grok_mcp_preserves_foreign_table) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-grok-foreign-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char grok_home[512];
+    snprintf(grok_home, sizeof(grok_home), "%s/.grok", tmpdir);
+    test_mkdirp(grok_home);
+    char *saved_path = save_test_env("PATH");
+    char *saved_grok = save_test_env("GROK_HOME");
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("GROK_HOME");
+
+    char config_path[640];
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", grok_home);
+    const char *foreign = "[mcp_servers.codebase-memory-mcp]\n"
+                          "url = \"https://mcp.example.com/mcp\"\n"
+                          "headers = { \"Authorization\" = \"Bearer ${TOKEN}\" }\n";
+    write_test_file(config_path, foreign);
+
+    (void)cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *after = read_test_file_alloc(config_path);
+    bool preserved = after && strcmp(after, foreign) == 0;
+    free(after);
+
+    restore_test_env("PATH", saved_path);
+    restore_test_env("GROK_HOME", saved_grok);
+    test_rmdir_r(tmpdir);
+    if (!preserved)
+        FAIL("Grok Build install must leave a foreign same-name MCP table byte-identical");
     PASS();
 }
 
@@ -6736,6 +6946,300 @@ TEST(cli_registry_installs_kimi_rovo_amp_durable_context) {
              "cleanup and no trust or permission widening");
     PASS();
 }
+TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {
+        "HOME",           "PATH",     "OMP_PROFILE",    "PI_CODING_AGENT_DIR",
+        "XDG_CONFIG_HOME", "APPDATA",
+    };
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char binary_path[640];
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+
+    char omp_default_dir[640];
+    char omp_profile_dir[640];
+    char omp_relocated_dir[640];
+    char omp_default_mcp[768];
+    char omp_profile_mcp[768];
+    char omp_relocated_mcp[768];
+    char omp_default_agent[768];
+    char omp_profile_agent[768];
+    char omp_relocated_agent[768];
+    snprintf(omp_default_dir, sizeof(omp_default_dir), "%s/.omp/agent", tmpdir);
+    snprintf(omp_profile_dir, sizeof(omp_profile_dir), "%s/.omp/profiles/work/agent", tmpdir);
+    snprintf(omp_relocated_dir, sizeof(omp_relocated_dir), "%s/custom-agent", tmpdir);
+    snprintf(omp_default_mcp, sizeof(omp_default_mcp), "%s/mcp.json", omp_default_dir);
+    snprintf(omp_profile_mcp, sizeof(omp_profile_mcp), "%s/mcp.json", omp_profile_dir);
+    snprintf(omp_relocated_mcp, sizeof(omp_relocated_mcp), "%s/mcp.json", omp_relocated_dir);
+    snprintf(omp_default_agent, sizeof(omp_default_agent), "%s/agents/codebase-memory.md",
+             omp_default_dir);
+    snprintf(omp_profile_agent, sizeof(omp_profile_agent), "%s/agents/codebase-memory.md",
+             omp_profile_dir);
+    snprintf(omp_relocated_agent, sizeof(omp_relocated_agent), "%s/agents/codebase-memory.md",
+             omp_relocated_dir);
+    test_mkdirp(omp_default_dir);
+    test_mkdirp(omp_profile_dir);
+    test_mkdirp(omp_relocated_dir);
+
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+
+    /* Case 1: documented fallback (no env overrides). */
+    char *default_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *default_doc =
+        default_plan ? yyjson_read(default_plan, strlen(default_plan), 0) : NULL;
+    yyjson_val *default_root = default_doc ? yyjson_doc_get_root(default_doc) : NULL;
+    bool default_plan_ok =
+        default_plan && strstr(default_plan, "\"omp\"") &&
+        test_json_string_array_contains(default_root, "config_files_planned", omp_default_mcp) &&
+        test_json_string_array_contains(default_root, "agent_files_planned", omp_default_agent) &&
+        !test_json_string_array_contains(default_root, "instruction_files_planned",
+                                         omp_default_dir);
+    yyjson_doc_free(default_doc);
+    free(default_plan);
+
+    /* Case 2: OMP_PROFILE=work routes to ~/.omp/profiles/<name>/agent. */
+    cbm_setenv("OMP_PROFILE", "work", 1);
+    char *profile_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *profile_doc =
+        profile_plan ? yyjson_read(profile_plan, strlen(profile_plan), 0) : NULL;
+    yyjson_val *profile_root = profile_doc ? yyjson_doc_get_root(profile_doc) : NULL;
+    bool profile_plan_ok =
+        profile_plan && strstr(profile_plan, "\"omp\"") &&
+        test_json_string_array_contains(profile_root, "config_files_planned", omp_profile_mcp) &&
+        test_json_string_array_contains(profile_root, "agent_files_planned", omp_profile_agent) &&
+        !test_json_string_array_contains(profile_root, "config_files_planned", omp_default_mcp) &&
+        !test_json_string_array_contains(profile_root, "agent_files_planned", omp_default_agent);
+    yyjson_doc_free(profile_doc);
+    free(profile_plan);
+    cbm_unsetenv("OMP_PROFILE");
+
+    /* Case 3: PI_CODING_AGENT_DIR relocates the resolved agent dir. The
+     * target must already exist on disk for the registry to recognize the
+     * client, which matches how end users opt in to a shared layout. */
+    cbm_setenv("PI_CODING_AGENT_DIR", omp_relocated_dir, 1);
+    char *relocated_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *relocated_doc =
+        relocated_plan ? yyjson_read(relocated_plan, strlen(relocated_plan), 0) : NULL;
+    yyjson_val *relocated_root = relocated_doc ? yyjson_doc_get_root(relocated_doc) : NULL;
+    bool relocated_plan_ok =
+        relocated_plan && strstr(relocated_plan, "\"omp\"") &&
+        test_json_string_array_contains(relocated_root, "config_files_planned",
+                                        omp_relocated_mcp) &&
+        test_json_string_array_contains(relocated_root, "agent_files_planned",
+                                        omp_relocated_agent);
+    yyjson_doc_free(relocated_doc);
+    free(relocated_plan);
+    cbm_unsetenv("PI_CODING_AGENT_DIR");
+
+    /* Case 4: invalid profile characters must fall back to the documented
+     * ~/.omp/agent path rather than emit something unsafe. */
+    cbm_setenv("OMP_PROFILE", "bad;name", 1);
+    char *fallback_plan = cbm_build_install_plan_json(tmpdir, binary_path);
+    yyjson_doc *fallback_doc =
+        fallback_plan ? yyjson_read(fallback_plan, strlen(fallback_plan), 0) : NULL;
+    yyjson_val *fallback_root = fallback_doc ? yyjson_doc_get_root(fallback_doc) : NULL;
+    bool fallback_plan_ok =
+        fallback_plan && strstr(fallback_plan, "\"omp\"") &&
+        test_json_string_array_contains(fallback_root, "config_files_planned", omp_default_mcp) &&
+        !test_json_string_array_contains(fallback_root, "config_files_planned", omp_profile_mcp);
+    yyjson_doc_free(fallback_doc);
+    free(fallback_plan);
+    cbm_unsetenv("OMP_PROFILE");
+
+    /* None of the plan-only invocations may have written OMP-owned content. */
+    struct stat state;
+    bool plan_did_not_mutate =
+        (stat(omp_default_mcp, &state) != 0) &&
+        (stat(omp_default_agent, &state) != 0) &&
+        (stat(omp_profile_mcp, &state) != 0) &&
+        (stat(omp_profile_agent, &state) != 0) &&
+        (stat(omp_relocated_mcp, &state) != 0) &&
+        (stat(omp_relocated_agent, &state) != 0);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!default_plan_ok || !profile_plan_ok || !relocated_plan_ok || !fallback_plan_ok ||
+        !plan_did_not_mutate) {
+        fprintf(stderr,
+                "omp diag default=%d profile=%d relocated=%d fallback=%d plan_clean=%d\n",
+                default_plan_ok, profile_plan_ok, relocated_plan_ok, fallback_plan_ok,
+                plan_did_not_mutate);
+        FAIL("OMP must resolve ~/.omp/agent under the documented fallback, honor OMP_PROFILE "
+             "named-profile layout, follow PI_CODING_AGENT_DIR relocations, and never write a "
+             "global AGENTS.md");
+    }
+    PASS();
+}
+
+
+TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-lifecycle-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR",
+                                     "XDG_CONFIG_HOME", "APPDATA"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char agent_dir[640];
+    char mcp_path[768];
+    char instructions_path[768];
+    char skill_path[768];
+    char scout_path[768];
+    char verify_path[768];
+    char auditor_path[768];
+    char binary_path[640];
+    snprintf(agent_dir, sizeof(agent_dir), "%s/.omp/profiles/work/agent", tmpdir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/mcp.json", agent_dir);
+    snprintf(instructions_path, sizeof(instructions_path), "%s/AGENTS.md", agent_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", agent_dir);
+    snprintf(scout_path, sizeof(scout_path), "%s/agents/codebase-memory-scout.md", agent_dir);
+    snprintf(verify_path, sizeof(verify_path), "%s/agents/codebase-memory.md", agent_dir);
+    snprintf(auditor_path, sizeof(auditor_path), "%s/agents/codebase-memory-auditor.md", agent_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    test_mkdirp(agent_dir);
+    const char *user_instructions = "# User safety policy\nNever publish without approval.\n";
+    write_test_file(instructions_path, user_instructions);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("OMP_PROFILE", "work", 1);
+
+    int install_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *installed_mcp = read_test_file_alloc(mcp_path);
+    char *installed_instructions = read_test_file_alloc(instructions_path);
+    bool installed =
+        install_rc == 0 && installed_mcp && strstr(installed_mcp, "codebase-memory-mcp") &&
+        strstr(installed_mcp, binary_path) && installed_instructions &&
+        strcmp(installed_instructions, user_instructions) == 0 &&
+        test_file_contains_all(skill_path,
+                               (const char *const[]){"search_graph", "trace_path",
+                                                   "Sessions and Subagents"},
+                               3U) &&
+        test_file_contains_all(scout_path,
+                               (const char *const[]){"autoloadSkills: [codebase-memory]",
+                                                   "mcp__codebase_memory_mcp_search_graph"},
+                               2U) &&
+        test_file_contains_all(verify_path,
+                               (const char *const[]){"read-summarize: false",
+                                                   "mcp__codebase_memory_mcp_trace_path"},
+                               2U) &&
+        test_file_contains_all(auditor_path,
+                               (const char *const[]){"autoloadSkills: [codebase-memory]",
+                                                   "mcp__codebase_memory_mcp_check_index_coverage"},
+                               2U);
+    free(installed_mcp);
+    free(installed_instructions);
+
+    const char *modified_verify =
+        "---\nname: codebase-memory\ndescription: User-owned OMP profile.\n---\n";
+    write_test_file(verify_path, modified_verify);
+    char *argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, argv);
+    struct stat state;
+    char *preserved_instructions = read_test_file_alloc(instructions_path);
+    char *preserved_verify = read_test_file_alloc(verify_path);
+    char *mcp_after = read_test_file_alloc(mcp_path);
+    bool uninstalled =
+        uninstall_rc == 0 && preserved_instructions &&
+        strcmp(preserved_instructions, user_instructions) == 0 && preserved_verify &&
+        strcmp(preserved_verify, modified_verify) == 0 && stat(skill_path, &state) != 0 &&
+        stat(scout_path, &state) != 0 && stat(auditor_path, &state) != 0 &&
+        (!mcp_after || !strstr(mcp_after, "codebase-memory-mcp"));
+    free(preserved_instructions);
+    free(preserved_verify);
+    free(mcp_after);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!installed || !uninstalled) {
+        fprintf(stderr, "omp lifecycle diag install=%d uninstall=%d\n", installed, uninstalled);
+        FAIL("OMP named-profile install/uninstall must use the effective directory, remove only "
+             "canonical owned files, and preserve user AGENTS.md and modified profiles");
+    }
+    PASS();
+}
+
+TEST(cli_registry_omp_relocated_dry_run_is_non_mutating) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-dry-run-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    const char *const env_names[] = {"HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR",
+                                     "XDG_CONFIG_HOME", "APPDATA"};
+    char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        saved_env[i] = save_test_env(env_names[i]);
+        cbm_unsetenv(env_names[i]);
+    }
+
+    char agent_dir[640];
+    char mcp_path[768];
+    char instructions_path[768];
+    char skill_path[768];
+    char verify_path[768];
+    char binary_path[640];
+    snprintf(agent_dir, sizeof(agent_dir), "%s/custom-agent", tmpdir);
+    snprintf(mcp_path, sizeof(mcp_path), "%s/mcp.json", agent_dir);
+    snprintf(instructions_path, sizeof(instructions_path), "%s/AGENTS.md", agent_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", agent_dir);
+    snprintf(verify_path, sizeof(verify_path), "%s/agents/codebase-memory.md", agent_dir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    test_mkdirp(agent_dir);
+    const char *user_instructions = "# Existing OMP instructions\nKeep this byte-identical.\n";
+    write_test_file(instructions_path, user_instructions);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("PI_CODING_AGENT_DIR", agent_dir, 1);
+
+    int dry_run_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    struct stat state;
+    char *instructions_after = read_test_file_alloc(instructions_path);
+    bool unchanged = dry_run_rc == 0 && instructions_after &&
+                     strcmp(instructions_after, user_instructions) == 0 &&
+                     stat(mcp_path, &state) != 0 && stat(skill_path, &state) != 0 &&
+                     stat(verify_path, &state) != 0;
+    free(instructions_after);
+
+    for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
+        restore_test_env(env_names[i], saved_env[i]);
+    }
+    test_rmdir_r(tmpdir);
+    if (!unchanged)
+        FAIL("OMP relocated dry-run must not create MCP, skill, agent, or instruction content");
+    PASS();
+}
 
 TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context) {
     char tmpdir[256];
@@ -7378,6 +7882,48 @@ TEST(cli_codex_respects_codex_home) {
         FAIL("Codex detection must honor CODEX_HOME");
     if (!plans_config || !plans_instructions)
         FAIL("Codex install plan must place config and AGENTS.md under CODEX_HOME");
+    PASS();
+}
+
+TEST(cli_grok_respects_grok_home) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-grok-home-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char grok_home[512];
+    snprintf(grok_home, sizeof(grok_home), "%s/custom-grok", tmpdir);
+    test_mkdirp(grok_home);
+    char *saved = save_test_env("GROK_HOME");
+    cbm_setenv("GROK_HOME", grok_home, 1);
+
+    cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
+    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    const char *const suffixes[] = {
+        "/config.toml",
+        "/rules/codebase-memory.md",
+        "/skills/codebase-memory/SKILL.md",
+        "/agents/codebase-memory.md",
+        "/agents/codebase-memory-scout.md",
+        "/agents/codebase-memory-auditor.md",
+    };
+    bool planned = json != NULL;
+    for (size_t i = 0U; planned && i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char expected[640];
+        snprintf(expected, sizeof(expected), "%s%s", grok_home, suffixes[i]);
+        planned = strstr(json, expected) != NULL;
+    }
+    /* Grok's passive hook events discard stdout, so no hook may be planned. */
+    bool no_hooks = json && !strstr(json, "custom-grok/hooks");
+
+    free(json);
+    restore_test_env("GROK_HOME", saved);
+    test_rmdir_r(tmpdir);
+
+    if (!agents.grok)
+        FAIL("Grok Build detection must honor GROK_HOME");
+    if (!planned || !no_hooks)
+        FAIL("Grok install plan must place config, rules, skill, and agents under GROK_HOME "
+             "and never plan a hook");
     PASS();
 }
 
@@ -9606,6 +10152,107 @@ TEST(cli_hook_augment_context_tracks_search_json_shape) {
     PASS();
 }
 
+/* Exercise the real PreToolUse + Bash route instead of calling only the
+ * tokenizer seam. This pins the event guard and the graph lookup path together.
+ */
+TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    char *project = cbm_project_name_from_path("/tmp/hookproj");
+    ASSERT_NOT_NULL(project);
+    cbm_mcp_server_set_project(srv, project);
+    cbm_store_upsert_project(st, project, "/tmp/hookproj");
+    char qualified_name[256];
+    snprintf(qualified_name, sizeof(qualified_name), "%s.mod.someIndexedSymbol", project);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "someIndexedSymbol",
+                       .qualified_name = qualified_name,
+                       .file_path = "mod.py",
+                       .start_line = 1,
+                       .end_line = 4};
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+
+    const char *input = "{\"hook_event_name\":\"PreToolUse\",\"tool_name\":\"Bash\","
+                        "\"cwd\":\"/tmp/hookproj\",\"tool_input\":{"
+                        "\"command\":\"rg -n someIndexedSymbol .\"}}";
+    char *output = cbm_hook_augment_process(srv, input);
+    bool reached = output && strstr(output, "hookSpecificOutput") &&
+                   strstr(output, "someIndexedSymbol") && strstr(output, "mod.py");
+    free(output);
+    cbm_mcp_server_free(srv);
+    free(project);
+
+    if (!reached)
+        FAIL("PreToolUse Bash must reach graph search augmentation");
+    PASS();
+}
+
+TEST(cli_hook_augment_bash_pattern_extractor) {
+    char out[256];
+
+    /* common forms */
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rg -n CreateStripeCheckout .", out,
+                                                                sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -rn CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -e CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("ag CreateStripeCheckout src/", out,
+                                                                sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("git grep CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+
+    /* value-taking flags are skipped correctly */
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -A 5 CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("rg -t py CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+
+    /* env-var prefix and wrappers */
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("FOO=bar rg CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "rtk grep -n CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "tokf run rg CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "env FOO=bar rg CreateStripeCheckout .", out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+
+    /* rtk -l <N> shadows grep's -l with a value-taking form — bail out */
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing(
+        "rtk grep -l 80 CreateStripeCheckout .", out, sizeof(out)));
+
+    /* bail-out cases */
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -f /path/patterns .", out,
+                                                                 sizeof(out)));
+    ASSERT_FALSE(
+        cbm_hook_augment_parse_bash_pattern_for_testing("grep -e FOO -e BAR .", out, sizeof(out)));
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("ls -la", out, sizeof(out)));
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing("", out, sizeof(out)));
+    ASSERT_FALSE(cbm_hook_augment_parse_bash_pattern_for_testing(NULL, out, sizeof(out)));
+
+    /* -- end-of-flags separator */
+    ASSERT_TRUE(cbm_hook_augment_parse_bash_pattern_for_testing("grep -- CreateStripeCheckout .",
+                                                                out, sizeof(out)));
+    ASSERT_STR_EQ(out, "CreateStripeCheckout");
+
+    PASS();
+}
+
 TEST(cli_hook_augment_lifecycle_output_contract) {
     static const struct {
         const char *event;
@@ -11196,7 +11843,7 @@ TEST(cli_upsert_claude_hook_fresh) {
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "PreToolUse") != NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
     ASSERT(strstr(data, "\"Read\"") != NULL);
     ASSERT(strstr(data, "\"Grep|Glob|Read\"") == NULL);
     ASSERT_EQ(test_count_substring(data, "cbm-code-discovery-gate"), 2U);
@@ -11710,7 +12357,7 @@ TEST(cli_upsert_claude_hook_existing) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
     ASSERT(strstr(data, "\"Read\"") != NULL);
     /* Existing hook preserved */
@@ -11791,7 +12438,8 @@ TEST(cli_upsert_claude_hook_replace) {
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
     ASSERT(strstr(data, "\"Grep|Glob|Read\"") == NULL);
-    ASSERT(strstr(data, "\"Grep|Glob\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") != NULL);
+    ASSERT(strstr(data, "\"Grep|Glob\"") == NULL);
     ASSERT(strstr(data, "PostToolUse") != NULL);
     ASSERT_EQ(test_count_substring(data, "cbm-code-discovery-gate"), 2U);
 
@@ -11843,7 +12491,8 @@ TEST(cli_remove_claude_hooks) {
 
     const char *data = read_test_file(settingspath);
     ASSERT_NOT_NULL(data);
-    ASSERT(strstr(data, "Grep|Glob|Read") == NULL);
+    ASSERT(strstr(data, "\"Grep|Glob|Bash\"") == NULL);
+    ASSERT(strstr(data, "\"Grep|Glob\"") == NULL);
     ASSERT(strstr(data, "cbm-code-discovery-gate") == NULL);
 
     test_rmdir_r(tmpdir);
@@ -12287,6 +12936,55 @@ TEST(cli_config_persists) {
     ASSERT_TRUE(cbm_config_get_bool(cfg, "auto_index", false));
     cbm_config_close(cfg);
 
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_config_watcher_enabled_default_and_persist) {
+    /* #335: the background watcher is on by default and can be disabled via the
+     * persisted `watcher_enabled` key. This pins the config layer only — default
+     * preservation, the accepted spellings, and persistence across reopen. That
+     * the daemon host actually honours the key (watcher never built, thread
+     * never started, no registration) is proven separately by the process-level
+     * regression in tests/test_watcher_disabled.sh, which fails if the gate in
+     * host_state_prepare() is removed. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    /* A NULL config (store failed to open) defaults to ON — a config failure
+     * must never silently disable the watcher. */
+    ASSERT_TRUE(cbm_config_watcher_enabled(NULL));
+
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+
+    /* Default: absent key → watcher runs. */
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+
+    /* Disable: false / 0 / off all turn the watcher off. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "false");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "0");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "off");
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+
+    /* Re-enable: true / 1 / on all turn it back on. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "on");
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "1");
+    ASSERT_TRUE(cbm_config_watcher_enabled(cfg));
+
+    /* Persistence: the disabled state survives close + reopen. */
+    cbm_config_set(cfg, CBM_CONFIG_WATCHER_ENABLED, "false");
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_watcher_enabled(cfg));
+
+    cbm_config_close(cfg);
     test_rmdir_r(tmpdir);
     PASS();
 }
@@ -13111,6 +13809,7 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude);
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
+    RUN_TEST(cli_detect_agents_finds_grok);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
     RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
     RUN_TEST(cli_supported_agent_surfaces_match_installers);
@@ -13128,6 +13827,8 @@ SUITE(cli) {
     RUN_TEST(cli_owned_durable_profiles_preserve_user_files);
     RUN_TEST(cli_tiered_codex_profiles_migrate_preserve_and_uninstall);
     RUN_TEST(cli_tiered_vibe_installs_matching_agent_prompt_sets);
+    RUN_TEST(cli_tiered_grok_installs_profiles_and_withholds_hooks);
+    RUN_TEST(cli_grok_mcp_preserves_foreign_table);
     RUN_TEST(cli_junie_current_durable_context_contract);
     RUN_TEST(cli_rovo_installs_documented_global_memory);
     RUN_TEST(cli_hermes_stable_shell_context_contract);
@@ -13139,6 +13840,9 @@ SUITE(cli) {
 #endif
     RUN_TEST(cli_agent_client_registry_routes_plan_install_and_uninstall);
     RUN_TEST(cli_registry_installs_kimi_rovo_amp_durable_context);
+    RUN_TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir);
+    RUN_TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content);
+    RUN_TEST(cli_registry_omp_relocated_dry_run_is_non_mutating);
     RUN_TEST(cli_registry_installs_gitlab_and_devin_lifecycle_context);
 #ifndef _WIN32
     RUN_TEST(cli_registry_hook_cleanup_is_independent_from_mcp_ownership);
@@ -13148,6 +13852,7 @@ SUITE(cli) {
     RUN_TEST(cli_openclaw_resolves_active_json5_workspace);
     RUN_TEST(cli_claude_user_scope_avoids_nested_mcp_json);
     RUN_TEST(cli_codex_respects_codex_home);
+    RUN_TEST(cli_grok_respects_grok_home);
     RUN_TEST(cli_gemini_session_hook_uses_json_for_all_sources);
     RUN_TEST(cli_gemini_installs_dedicated_graph_subagent);
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
@@ -13196,6 +13901,8 @@ SUITE(cli) {
     RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
 #endif
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
+    RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
+    RUN_TEST(cli_hook_augment_bash_pattern_extractor);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);
@@ -13301,6 +14008,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_get_int);
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
+    RUN_TEST(cli_config_watcher_enabled_default_and_persist);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32

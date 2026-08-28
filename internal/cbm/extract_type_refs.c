@@ -219,6 +219,7 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
         break;
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         extract_ts_body_type_refs(ctx, node, kind, func_qn);
         break;
     case CBM_LANG_JAVA:

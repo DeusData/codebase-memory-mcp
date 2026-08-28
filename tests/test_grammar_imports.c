@@ -25,6 +25,9 @@ typedef struct {
 } ImportCase;
 
 static const ImportCase IMPORT_CASES[] = {
+    {"arkts", CBM_LANG_ARKTS, "a.ets",
+     "import lazy { HeavyModule } from './heavy'\nimport { router } from '@kit.ArkUI'\nimport curves from '@ohos.curves'\n",
+     3, NULL},
     {"astro", CBM_LANG_ASTRO, "fixture.astro",
      "<script>\nimport confetti from \"canvas-confetti\";\nimport dayjs from \"dayjs\";\n\nconfetti();\nconsole.log(dayjs().format());\n</script>\n<div>hi</div>\n",
      2, NULL},

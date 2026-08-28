@@ -616,8 +616,8 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * defer to emit_classified_edge and suppress ONLY the plain-CALLS
      * fall-through, so every service edge stays main-identical. res.strategy may
      * be lsp_* here; the helper's explicit drop-list leaves lsp_* untouched. */
-    bool is_tsjs =
-        lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX;
+    bool is_tsjs = lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT ||
+                   lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS;
     bool tsjs_drop_plain_call =
         cbm_tsjs_suppress_weak_method_match(is_tsjs, call->is_method, res.strategy);
 

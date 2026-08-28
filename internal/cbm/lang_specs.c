@@ -167,6 +167,8 @@ extern const TSLanguage *tree_sitter_pine(void);
 extern const TSLanguage *tree_sitter_mojo(void);
 extern const TSLanguage *tree_sitter_objectscript_udl(void);
 extern const TSLanguage *tree_sitter_objectscript_routine(void);
+extern const TSLanguage *tree_sitter_arkts(void);
+extern const TSLanguage *tree_sitter_plsql(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -249,6 +251,23 @@ static const char *ts_class_types[] = {"class_declaration",
                                        "internal_module",
                                        NULL};
 static const char *ts_decorator_types[] = {"decorator", NULL};
+
+// ==================== ARKTS (HarmonyOS .ets) ====================
+// TypeScript-superset grammar (first-party tree-sitter-typescript fork).
+// Reuses the JS/TS arrays and adds the ArkUI constructs: `@Component struct`
+// components are class-like containers (struct_declaration), and their
+// decorated state members (public_field_definition) are extracted as fields
+// so @State/@Prop/@Link/... properties are findable.
+static const char *arkts_class_types[] = {"class_declaration",
+                                          "class",
+                                          "abstract_class_declaration",
+                                          "struct_declaration",
+                                          "enum_declaration",
+                                          "interface_declaration",
+                                          "type_alias_declaration",
+                                          "internal_module",
+                                          NULL};
+static const char *arkts_field_types[] = {"public_field_definition", NULL};
 
 // ==================== QML (Qt) ====================
 // QMLJS grammar is a TypeScript superset plus declarative ui_* nodes, so the
@@ -873,6 +892,14 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // the generic embedded-imports walker re-parse that slice with the JS grammar
 // so the existing ES import extractor sees real import_statement nodes.
 // Terminator: an entry whose script_node_type is NULL.
+static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
+    /* Tag-dialect CFML keeps <cfscript> bodies as opaque cf_script_content;
+     * re-parse them with the cfscript grammar through the shared included-
+     * ranges machinery so defs (and calls) inside legacy components extract
+     * with absolute coordinates. Distilled from #1412. */
+    {"cf_script_tag", "cf_script_content", CBM_LANG_CFSCRIPT},
+    {NULL, NULL, 0},
+};
 static const CBMEmbeddedLangSpec vue_embedded_imports[] = {
     {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
     {NULL, NULL, 0},
@@ -1617,6 +1644,29 @@ static const char *mojo_branch_types[] = {"if_statement",
 static const char *mojo_var_types[] = {"assignment", NULL};
 static const char *mojo_assign_types[] = {"assignment", "augmented_assignment", NULL};
 
+// ==================== PL/SQL ====================
+// Node names verified against AndreasMaierDe/tree-sitter-plsql grammar.js.
+static const char *plsql_func_types[] = {"create_function",
+                                         "create_procedure",
+                                         "function_definition",
+                                         "procedure_definition",
+                                         "function_declaration",
+                                         "procedure_declaration",
+                                         NULL};
+static const char *plsql_class_types[] = {"create_package",   "create_package_body", "create_type",
+                                          "create_type_body", "create_trigger",      NULL};
+static const char *plsql_module_types[] = {"source_file", NULL};
+static const char *plsql_call_types[] = {"ref_call", NULL};
+static const char *plsql_branch_types[] = {"if_statement",
+                                           "case_statement",
+                                           "basic_loop_statement",
+                                           "for_loop_statement",
+                                           "while_loop_statement",
+                                           "exception_handler",
+                                           NULL};
+static const char *plsql_assign_types[] = {"assignment_statement", NULL};
+static const char *plsql_throw_types[] = {"raise_statement", NULL};
+
 // InterSystems ObjectScript. Node names verified against
 // intersystems/tree-sitter-objectscript grammar.
 static const char *objectscript_udl_func_types[] = {"method", "classmethod", "query", NULL};
@@ -2077,7 +2127,7 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_CFML] = {CBM_LANG_CFML, cfml_func_types, empty_types, empty_types, cfml_module_types,
                        cfml_call_types, empty_types, empty_types, cfml_branch_types, empty_types,
                        empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_cfml,
-                       NULL},
+                       cfml_embedded_imports},
 
     // CBM_LANG_GLEAM
     [CBM_LANG_GLEAM] = {CBM_LANG_GLEAM, gleam_func_types, gleam_class_types, gleam_field_types,
@@ -2639,6 +2689,20 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
     // pipeline transcodes Export XML to UDL (iris_export_xml.c) and re-extracts
     // each class as CBM_LANG_OBJECTSCRIPT_UDL, so this language never reaches
     // cbm_lang_spec()/cbm_ts_language() directly. Left as a zero spec.
+
+    // CBM_LANG_ARKTS
+    [CBM_LANG_ARKTS] = {CBM_LANG_ARKTS, ts_func_types, arkts_class_types, arkts_field_types,
+                        js_module_types, js_call_types, js_import_types, js_import_types,
+                        js_branch_types, js_var_types,
+                        (const char *[]){"assignment_expression", "augmented_assignment_expression",
+                                         NULL},
+                        js_throw_types, NULL, ts_decorator_types, NULL,
+                        ts_env_members, tree_sitter_arkts, NULL},
+    // CBM_LANG_PLSQL — Oracle PL/SQL. AndreasMaierDe/tree-sitter-plsql (MIT).
+    [CBM_LANG_PLSQL] = {CBM_LANG_PLSQL, plsql_func_types, plsql_class_types, empty_types,
+                        plsql_module_types, plsql_call_types, empty_types, empty_types,
+                        plsql_branch_types, empty_types, plsql_assign_types, plsql_throw_types,
+                        NULL, empty_types, NULL, NULL, tree_sitter_plsql, NULL},
 
 };
 

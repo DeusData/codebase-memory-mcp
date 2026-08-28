@@ -1052,15 +1052,50 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
     }
 #endif
 
+#ifndef _WIN32
+    /* #1204: never hand back a self-resolved path we have not confirmed is
+     * executable. After an installer's atomic rename-over, the resolved image
+     * path no longer exists (Linux readlink reads "<path> (deleted)"), and an
+     * unvalidated return turns into a doomed worker spawn (ENOENT). */
+    if (resolve_self_executable(out, outsz)) {
+        if (is_executable_file(out)) {
+            return true;
+        }
+#if defined(__linux__)
+        /* Deleted image: the /proc/self/exe magic link still executes the
+         * in-memory OLD build — the only spawn that satisfies the worker's
+         * build-fingerprint gate (a rename-over leaves the on-disk path
+         * holding a DIFFERENT build). Hand back the link, not the stale
+         * path. Deliberately NOT the saved launch path: preferring it swaps
+         * an ENOENT for a fingerprint refusal. */
+        return copy_path(out, outsz, "/proc/self/exe");
+#else
+        /* macOS has no magic link. Fail closed: the supervisor logs
+         * index.supervisor.no_self_path and indexing resumes after a daemon
+         * restart, instead of spawning a missing or mismatched binary. */
+        out[0] = '\0';
+        return false;
+#endif
+    }
+#else
     if (resolve_self_executable(out, outsz)) {
         return true;
     }
+#endif
     return copy_path(out, outsz, argv0);
 }
 
 void cbm_http_server_set_binary_path(const char *path) {
     if (path) {
-        if (!cbm_http_server_resolve_binary_path(path, g_binary_path, sizeof(g_binary_path))) {
+        /* Resolve into a local buffer first: `path` may alias g_binary_path
+         * on a repeated call. Resolving in place first hits resolve's leading
+         * out[0]='\0', which zeroes the shared buffer and silently discards
+         * the very path we were asked to re-resolve — and the in-place write
+         * is one reset-reorder away from an overlapping snprintf. */
+        char resolved[sizeof(g_binary_path)];
+        if (cbm_http_server_resolve_binary_path(path, resolved, sizeof(resolved))) {
+            snprintf(g_binary_path, sizeof(g_binary_path), "%s", resolved);
+        } else {
             g_binary_path[0] = '\0';
         }
     }

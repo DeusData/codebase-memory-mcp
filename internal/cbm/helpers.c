@@ -211,6 +211,7 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         keywords = js_keywords;
         break;
     case CBM_LANG_RUST:
@@ -344,7 +345,8 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
         return has_prefix(base, "test_") || has_suffix(base, "_test.py");
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX: {
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS: {
         char noext[NOEXT_BUF];
         strip_ext(base, noext, sizeof(noext));
         return has_suffix(noext, ".test") || has_suffix(noext, ".spec") ||
@@ -509,7 +511,7 @@ bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
         return strcmp(kind, "namespace_definition") == 0;
     }
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         return strcmp(kind, "internal_module") == 0;
     }
     return false;
@@ -751,6 +753,7 @@ static const char **func_kinds_for_lang(CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         return func_kinds_js;
     case CBM_LANG_RUST:
         return func_kinds_rust;
@@ -1341,7 +1344,8 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang) {
     if (lang == CBM_LANG_PYTHON) {
         return check_script_module_level(parent, pk, "module", "expression_statement");
     }
-    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+        lang == CBM_LANG_ARKTS) {
         return check_script_module_level(parent, pk, "program", "export_statement");
     }
     if (lang == CBM_LANG_LUA) {

@@ -1058,6 +1058,7 @@ void cbm_extract_channels(CBMExtractCtx *ctx) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         extract_channels_js(ctx);
         break;
     case CBM_LANG_PYTHON:

@@ -3078,6 +3078,14 @@ uint64_t cbm_daemon_ipc_connection_peer_pid(const cbm_daemon_ipc_connection_t *c
         return 0;
     }
     return (uint64_t)peer_pid;
+#elif defined(SOL_LOCAL) && defined(LOCAL_PEEREID)
+    struct unpcbid peer_id;
+    socklen_t length = sizeof(peer_id);
+    if (getsockopt(connection->fd, SOL_LOCAL, LOCAL_PEEREID, &peer_id, &length) != 0 ||
+        length != sizeof(peer_id) || peer_id.unp_pid <= 0) {
+        return 0;
+    }
+    return (uint64_t)peer_id.unp_pid;
 #else
     return 0;
 #endif

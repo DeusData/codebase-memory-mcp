@@ -30,14 +30,29 @@ enum { MIN_PRINTABLE = 0x20 };
 /* Handler arg scan start index (skip first positional). */
 enum { HANDLER_START_IDX = 1 };
 
-/* Look up a module-level string constant by name. */
+/* Look up a module-level string constant by name. URL-builder entries share the
+ * map but are not constants: a bare `thingPath` reference is the function, not
+ * the URL it would build (issue #1009). */
 static const char *lookup_string_constant(const CBMExtractCtx *ctx, const char *name) {
     if (!name || !name[0]) {
         return NULL;
     }
     const CBMStringConstantMap *map = &ctx->string_constants;
     for (int i = 0; i < map->count; i++) {
-        if (strcmp(map->names[i], name) == 0) {
+        if (!map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
+            return map->values[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *lookup_url_builder(const CBMExtractCtx *ctx, const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    const CBMStringConstantMap *map = &ctx->string_constants;
+    for (int i = 0; i < map->count; i++) {
+        if (map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
             return map->values[i];
         }
     }
@@ -811,6 +826,32 @@ static char *extract_ada_callee(CBMArena *a, TSNode node, const char *source, co
     return NULL;
 }
 
+/* PL/SQL: ref_call → referenced_element. Package-qualified calls use
+ * ref_name_parent.ref_name (e.g. UTIL_PKG.CALC_SALARY); bare calls use
+ * ref_name alone. */
+static char *extract_plsql_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "ref_call") != 0) {
+        return NULL;
+    }
+    TSNode ref = cbm_find_child_by_kind(node, "referenced_element");
+    if (ts_node_is_null(ref)) {
+        return NULL;
+    }
+    TSNode parent = ts_node_child_by_field_name(ref, TS_FIELD("ref_name_parent"));
+    TSNode name = ts_node_child_by_field_name(ref, TS_FIELD("ref_name"));
+    if (!ts_node_is_null(parent) && !ts_node_is_null(name)) {
+        char *p = cbm_node_text(a, parent, source);
+        char *n = cbm_node_text(a, name, source);
+        if (p && n && p[0] && n[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", p, n);
+        }
+    }
+    if (!ts_node_is_null(name)) {
+        return cbm_node_text(a, name, source);
+    }
+    return cbm_node_text(a, ref, source);
+}
+
 // Solidity: a call_expression's callee is on the `function` field, wrapped in an
 // `expression` node (call_expression -> function:expression -> identifier). Descend
 // left-most through expression wrappers until we reach the identifier/member.
@@ -1354,6 +1395,9 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     if (lang == CBM_LANG_ADA) {
         return extract_ada_callee(a, node, source, nk);
     }
+    if (lang == CBM_LANG_PLSQL) {
+        return extract_plsql_callee(a, node, source, nk);
+    }
     if (lang == CBM_LANG_SOLIDITY) {
         return extract_solidity_callee(a, node, source, nk);
     }
@@ -1855,8 +1899,22 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
             ca->index = positional_idx++;
             if (is_string_like(ak) && ca->expr) {
                 ca->value = strip_quotes(ctx->arena, ca->expr);
+            } else if (strcmp(ak, "template_string") == 0) {
+                /* Flattened {} form so downstream url-arg detection joins the
+                 * canonical server route shape (issue #1006/#1009). */
+                ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
+            } else if (strcmp(ak, "call_expression") == 0) {
+                /* URL-builder helper call (issue #1009): resolve
+                 * client(buildPath(id)) through the per-file builder map. */
+                TSNode fn = ts_node_child_by_field_name(arg_node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                    if (fname) {
+                        ca->value = lookup_url_builder(ctx, fname);
+                    }
+                }
             }
             call->arg_count++;
         }
@@ -2082,6 +2140,19 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             const char *val = extract_composite_queue_field(ctx, arg);
             if (val) {
                 return val;
+            }
+        }
+
+        /* URL-builder helper call (issue #1009): `client(buildPath(id))` — the
+         * builder's returned URL was recorded in the per-file constant map. */
+        if (strcmp(ak, "call_expression") == 0) {
+            TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+            if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                const char *val = fname ? lookup_url_builder(ctx, fname) : NULL;
+                if (val) {
+                    return val;
+                }
             }
         }
 
@@ -3296,7 +3367,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // right. Bare calls (helper()) and new_expression have no member
             // receiver, so they keep is_method=false (struct is zero-init).
             if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                 ctx->language == CBM_LANG_TSX) &&
+                 ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
                 strcmp(ts_node_type(node), "call_expression") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {

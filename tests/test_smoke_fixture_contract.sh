@@ -95,6 +95,8 @@ CLIENT_HOME_OVERRIDES = (
     "CBM_TRAE_CONFIG_PATH",
     "CBM_ROO_CONFIG_PATH",
     "CBM_CODY_CONFIG_PATH",
+    "OMP_PROFILE",
+    "PI_CODING_AGENT_DIR",
 )
 
 # The C suite exercises the same install/uninstall paths as the shell fixtures,

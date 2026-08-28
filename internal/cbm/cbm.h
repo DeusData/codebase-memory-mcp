@@ -174,6 +174,8 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
+    CBM_LANG_ARKTS, // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
+    CBM_LANG_PLSQL, // Oracle PL/SQL
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -551,6 +553,7 @@ typedef struct {
 typedef struct {
     const char *names[CBM_MAX_STRING_CONSTANTS];
     const char *values[CBM_MAX_STRING_CONSTANTS];
+    bool is_url_builder[CBM_MAX_STRING_CONSTANTS];
     int count;
 } CBMStringConstantMap;
 
@@ -726,6 +729,9 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+/* Internal companion for embedded-language trees that contribute definitions
+ * to an existing host-file Module rather than minting a second Module. */
+void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
 // dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
 // per ref()/source() call. No-op unless the file parses as SQL and actually
 // contains a dbt builtin call. Defined in extract_dbt.c.

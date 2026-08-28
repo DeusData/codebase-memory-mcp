@@ -86,3 +86,7 @@ soak-results-query-leak/
 # Scorecard as a binary artifact in source). Source only, never the build.
 /pkg/go/codebase-memory-mcp
 /pkg/go/codebase-memory-mcp.exe
+
+# Nix build symlinks (nix build → ./result, ./result-1, …)
+/result
+/result-*

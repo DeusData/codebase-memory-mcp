@@ -9,12 +9,14 @@ The grammars were originally vendored as bare `parser.c`+`scanner.c` with **no r
 
 ## Summary
 
-- Grammars: **159** — vendored-from-upstream: **142**, first-party/self-maintained: **12**, registry-disagreement: **5** (nim removed 2026-06-12; objectscript_udl + objectscript_routine added 2026-06-24; mojo added 2026-07-01 — see notes below)
-- ABI distribution: **7×** ABI-13 **85×** ABI-14 **64×** ABI-15 (runtime ceiling is ABI 15; never vendor ABI 16 without a runtime upgrade)
+- Grammars: **161** — vendored-from-upstream: **143**, first-party/self-maintained: **13**, registry-disagreement: **5** (nim removed 2026-06-12; objectscript_udl + objectscript_routine added 2026-06-24; mojo added 2026-07-01; arkts added 2026-08-26; plsql added 2026-08-27 — see notes below)
+- ABI distribution: **7×** ABI-13 **86×** ABI-14 **65×** ABI-15 (runtime ceiling is ABI 15; never vendor ABI 16 without a runtime upgrade)
 - Vendored copies missing LICENSE: **0** — all upstream LICENSE files restored 2026-06-11 (first-party grammars carry the project MIT license; `move` uses the Helix-listed upstream tzakian/tree-sitter-move MIT text, `zsh` uses georgeharker/tree-sitter-zsh MIT)
-- `verdict`: VERIFIED-BOTH = our source matches *both* registries; VERIFIED-NVIM/HELIX = matches one; registry-disagreement = registries name a different repo (listed separately); `vendor-maintained` = the language vendor's own grammar, not in nvim/Helix.
+- `verdict`: VERIFIED-BOTH = our source matches *both* registries; VERIFIED-NVIM/HELIX = matches one; registry-disagreement = registries name a different repo (listed separately); `vendor-maintained` = the language vendor's own grammar, not in nvim/Helix; `community-niche` = an individual/community-maintained grammar for a niche language, not in nvim/Helix — provenance hand-verified against the upstream repository instead of a registry.
 - **objectscript_udl / objectscript_routine** (added 2026-06-24): vendored from [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript) @ `a7ffcdf` — MIT, the InterSystems-official grammars (a niche vendor language, hence `vendor-maintained`, not in nvim-treesitter/Helix). **Re-vendor note:** each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (a verbatim copy of upstream `common/scanner.h`), because this repo's shared `vendored/common/scanner.h` belongs to the cfml/fsharp grammars and differs. The generated `parser.c`/`scanner.c` are otherwise byte-for-byte upstream — on re-vendor, re-apply only that single include rename. **Local modification (2026-07-16):** in `objectscript_common.h`, two loop counters `uint8_t i` were widened to `int i` (the `reverse_marker` scan and the `html_marker_buffer` reversal) to clear CodeQL `cpp/comparison-with-wider-type` — a false positive in practice (both lengths are hard-bounded by `MARKER_BUFFER_MAX_LEN = 30`, so `uint8_t` could never wrap), fixed for cleanliness. On re-vendor, re-apply this widening too (or upstream it at intersystems/tree-sitter-objectscript).
 - **mojo** (added 2026-07-01): vendored from [lsh/tree-sitter-mojo](https://github.com/lsh/tree-sitter-mojo) @ `33193a99afe6` — MIT, ABI 15. Helix tracks `lsh/tree-sitter-mojo` as its Mojo grammar source, but the Helix-pinned commit (`3d7c53b8038f`) no longer resolves in the upstream repository after a force-push, so this vendor uses current upstream `main` rather than the stale registry SHA. Security review covered only the vendored C surface (`parser.c`, `scanner.c`, `tree_sitter/*.h`) plus upstream license/provenance metadata; no package manager hooks, workflow files, prompt/agent instruction files, or generated lockfiles were vendored.
+- **arkts** (added 2026-08-26): **first-party derivative** — a fork of [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)'s `typescript` dialect pinned @ `75b3874edb2d` (v0.23.2, the same commit our vendored typescript/tsx come from), on the tree-sitter-javascript base @ `3a837b6f3658` (v0.23.1, the version upstream's own package-lock pins), extended with ArkTS/ArkUI syntax (`@Component struct` declarations, UI-DSL trailing-closure calls with post-block attribute chains, decorated function declarations, `import lazy`, `@Extend`/`@Styles` leading-dot attribute chains, anonymous `stateStyles` style blocks). Grammar source + corpus tests live in `tools/tree-sitter-arkts/`; regenerate with `npx tree-sitter-cli@0.25.10 generate` (ABI 15). **External scanner:** `scanner.c` is a symbol-rename trampoline; `_common_scanner.h` is byte-identical (same SHA-256) to the reviewed `typescript/_common_scanner.h` already shipped. **LICENSE:** tree-sitter-typescript's MIT text **verbatim and byte-identical** (© 2017 Max Brunsfeld) — which is what MIT requires of a derivative work, and what lets the provenance audit byte-verify it against upstream rather than take a note on trust. The fork is registered in the audit's `FORKS` map. Our own copyright for the ArkTS additions, and the tree-sitter-javascript attribution (© 2014 Max Brunsfeld), live with the SOURCE in `tools/tree-sitter-arkts/grammar.js` and in `THIRD_PARTY.md`, which is what ships in the release archives.
+- **plsql** (added 2026-08-27): vendored from [AndreasMaierDe/tree-sitter-plsql](https://github.com/AndreasMaierDe/tree-sitter-plsql) @ `28aebef209be` (full: `28aebef209be57169600e1aa41ca1431cc6c916f`, upstream tip; repo dormant since 2023-02) — MIT, ABI 14, **no external scanner** (`EXTERNAL_TOKEN_COUNT 0`). Not listed in nvim-treesitter/Helix (`community-niche`, an individual-maintained grammar); provenance verified directly against upstream (pin = `git ls-remote` HEAD; vendored `parser.c` byte-identical to the pinned clone apart from the include-quote local patch below; 0 non-ASCII bytes; 0 dangerous calls). Security review covered only the vendored C surface (`parser.c`, `tree_sitter/parser.h`) plus upstream license/provenance metadata; no package manager hooks, workflow files, prompt/agent instruction files, or generated lockfiles were vendored. Known upstream limitation: `CREATE TYPE ... AS OBJECT` currently yields ERROR nodes (pinned by `plsql_create_type_as_object_limitation` in `tests/test_extraction.c` + `tests/fixtures/plsql/create_type_as_object_limitation.tps`). Originally contributed as PR #1033 by Oğuz (@ouzsrcm); re-vendored from upstream per vendoring policy with the PR's language wiring distilled on top.
 
 > ⚠️ **Pinned commit = the revision nvim-treesitter/Helix vendor** (battle-tested, canonical source), not bleeding-edge HEAD. When re-vendoring, update the pinned commit here.
 
@@ -45,6 +47,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | ispc     | added to the C-family declarator-name gate (extends tree-sitter-c) |
 | odin     | `resolve_func_name`: `procedure_declaration` → `identifier` child |
 | pascal   | `resolve_func_name`: `defProc` → `header` (`declProc`) child's `name` field |
+| plsql    | `resolve_func_name`: `fnc_name`/`prc_name` fields; `extract_class_def`: `package_name`/`type_name`/`trigger_name` fields; `extract_plsql_callee` (extract_calls.c): `ref_call` → `referenced_element`, package-qualified `ref_name_parent.ref_name`; usage vocabulary (extract_usages.c): `identifier`, with the upstream `parameter` kind (a ref_call ARGUMENT wrapper) carved out of the whole-binding rule |
 | racket   | `extract_lisp_def`: `(define …)` head-symbol forms in `list` |
 | rescript | `resolve_func_name`: `function` (arrow) → enclosing `let_binding`'s `pattern` field |
 | scheme   | `extract_lisp_def`: `(define …)` head-symbol forms in `list` |
@@ -53,7 +56,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 
 ## Local source patches (applied atop pinned upstream)
 
-The grammars below carry a small local patch to their vendored `scanner.c`, on
+The grammars below carry a small local patch to their vendored sources, on
 top of the pinned upstream commit recorded in the vendoring table below.
 Re-vendoring from upstream must re-apply these.
 
@@ -62,6 +65,7 @@ Re-vendoring from upstream must re-apply these.
 | crystal    | `crystal/scanner.c`, serialize    | guard `memcpy(&buffer[offset], state->literals.contents, literal_content_size)` with `if (literal_content_size > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source on the empty-state serialize round-trip (formal UB, harmless) |
 | rescript   | `rescript/scanner.c`, deserialize | guard `memcpy(state, buffer, n_bytes)` with `if (n_bytes > 0)` | UBSan: zero-length `memcpy` with a NULL `buffer` / `n_bytes == 0` on empty-state deserialize (formal UB, harmless). The sibling serialize copies a fixed `sizeof(ScannerState)` (always > 0, non-NULL src) and needs no guard. |
 | purescript | `purescript/scanner.c`, serialize | guard `memcpy(buffer, indents->data, to_copy)` with `if (to_copy > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source when the indent vector is empty (formal UB, harmless) |
+| plsql      | `plsql/parser.c`, include         | `#include <tree_sitter/parser.h>` → `#include "tree_sitter/parser.h"` | The older ABI-14 generator emits angle brackets; every other vendored grammar uses the quoted form, which resolves the per-grammar `tree_sitter/` header from the including file's directory |
 
 ## Vendored from verified upstream
 
@@ -157,6 +161,7 @@ Re-vendoring from upstream must re-apply these.
 | perl | 14 | tree-sitter-perl/tree-sitter-perl | `ea9667dc65a8` | VERIFIED-BOTH | ✅ |
 | php | 15 | tree-sitter/tree-sitter-php | `3f2465c217d0` | VERIFIED-BOTH | ✅ |
 | pkl | 15 | apple/tree-sitter-pkl | `f5beed1da8e5` | VERIFIED-BOTH | ✅ |
+| plsql | 14 | AndreasMaierDe/tree-sitter-plsql | `28aebef209be` | community-niche | ✅ |
 | po | 14 | tree-sitter-grammars/tree-sitter-po | `bd860a0f57f6` | VERIFIED-NVIM | ✅ |
 | pony | 14 | tree-sitter-grammars/tree-sitter-pony | `73ff874ae4c9` | VERIFIED-NVIM | ✅ |
 | powershell | 15 | airbus-cert/tree-sitter-powershell | `73800ecc8bdd` | VERIFIED-BOTH | ✅ |
@@ -234,6 +239,7 @@ upstream author (correctly retained). The table now records the true origin.
 
 | grammar | cur ABI | original upstream | license |
 |---|:---:|---|---|
+| arkts | 15 | **self-maintained fork** of tree-sitter/tree-sitter-typescript @ `75b3874edb2d` (v0.23.2; javascript base @ `3a837b6f3658` v0.23.1); grammar source in `tools/tree-sitter-arkts/` | MIT, (c) 2017 Max Brunsfeld — byte-identical to upstream; ArkTS additions (c) 2026 DeusData, see grammar.js + THIRD_PARTY.md |
 | assembly | 14 | RubixDev/tree-sitter-assembly (**repo deleted from GitHub** — our retained MIT copy, (c) 2023 RubixDev, is the surviving grant) | MIT |
 | cfml | 15 | cfmleditor/tree-sitter-cfml | MIT, (c) 2014 Gareth Edwards & Gavin Baumanis — byte-identical |
 | cfscript | 15 | cfmleditor/tree-sitter-cfml | MIT, same — byte-identical |

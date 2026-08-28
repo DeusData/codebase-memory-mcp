@@ -10048,6 +10048,8 @@ enum {
     IDXPAR_NO_QUARANTINE = 64, /* crasher missing from skipped[] */
     IDXPAR_INNOCENT_HIT = 65,  /* a good file was quarantined/skipped */
     IDXPAR_GOOD_MISSING = 66,  /* good file's Function absent from the store */
+    IDXPAR_NOT_ERROR = 67,     /* systemic failure did not report status error */
+    IDXPAR_OUTCOME_WRONG = 68, /* systemic failure outcome is not exit_nonzero */
 };
 
 #ifndef _WIN32
@@ -10106,6 +10108,94 @@ static int idxpar_recovery_check(const char *repo_dir) {
     }
     free(project);
     return code;
+}
+
+static int idxpar_exit_nonzero_recovery_check(const char *repo_dir) {
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+    cbm_setenv("CBM_TEST_EXIT_ON", "idxpar_exit_nonzero", 1);
+
+    int st_before = cbm_index_supervisor_spawn_st_count();
+    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+    int st_after = cbm_index_supervisor_spawn_st_count();
+    cbm_unsetenv("CBM_TEST_EXIT_ON");
+
+    if (st_after != st_before) {
+        free(resp);
+        return IDXPAR_ST_SPAWN;
+    }
+    if (!resp) {
+        return IDXPAR_NULL_RESP;
+    }
+    bool indexed = response_contains_json_fragment(resp, "\"status\":\"indexed\"");
+    bool offender_skipped = strstr(resp, "idxpar_exit_nonzero.py") != NULL;
+    bool innocent_hit =
+        strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
+    bool phase_error = strstr(resp, "\"phase\":\"error\"") != NULL ||
+                       strstr(resp, "quarantined after error") != NULL;
+    free(resp);
+    if (!indexed) {
+        return IDXPAR_NOT_INDEXED;
+    }
+    if (!offender_skipped || !phase_error) {
+        return IDXPAR_NO_QUARANTINE;
+    }
+    if (innocent_hit) {
+        return IDXPAR_INNOCENT_HIT;
+    }
+
+    char *project = cbm_project_name_from_path(repo_dir);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    int code = IDXPAR_OK;
+    if (srv && project) {
+        char q[512];
+        snprintf(q, sizeof(q),
+                 "{\"project\":\"%s\",\"name_pattern\":\"idxpar_good_fn\",\"label\":\"Function\"}",
+                 project);
+        char *sr = cbm_mcp_handle_tool(srv, "search_graph", q);
+        if (!sr || !strstr(sr, "idxpar_good_fn")) {
+            code = IDXPAR_GOOD_MISSING;
+        }
+        free(sr);
+    }
+    if (srv) {
+        cbm_mcp_server_free(srv);
+    }
+    free(project);
+    return code;
+}
+
+static int idxpar_systemic_exit_nonzero_give_up_check(const char *repo_dir) {
+    cbm_index_supervisor_mark_host();
+    cbm_unsetenv("CBM_INDEX_SUPERVISOR");
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "5", 1);
+    cbm_setenv("CBM_INDEX_WORKER_TIMEOUT_S", "30", 1);
+    cbm_setenv("CBM_TEST_EXIT_ON", "idxpar_", 1);
+
+    char *resp = cbm_mcp_index_run_supervised_path(repo_dir);
+    cbm_unsetenv("CBM_TEST_EXIT_ON");
+
+    if (!resp) {
+        return IDXPAR_NULL_RESP;
+    }
+    bool is_error = response_contains_json_fragment(resp, "\"status\":\"error\"");
+    bool is_exit_nonzero = response_contains_json_fragment(resp, "\"outcome\":\"exit_nonzero\"");
+    bool innocent_hit =
+        strstr(resp, "idxpar_good_a.py") != NULL || strstr(resp, "idxpar_good_b.py") != NULL;
+    free(resp);
+
+    if (!is_error) {
+        return IDXPAR_NOT_ERROR;
+    }
+    if (!is_exit_nonzero) {
+        return IDXPAR_OUTCOME_WRONG;
+    }
+    if (innocent_hit) {
+        return IDXPAR_INNOCENT_HIT;
+    }
+    return IDXPAR_OK;
 }
 #endif /* !_WIN32 */
 
@@ -10415,6 +10505,155 @@ TEST(index_recovery_parallel_quarantines_crasher) {
         printf("    child exit code %d (61=ST spawn/RED, 62=null resp, 63=not indexed, "
                "64=no quarantine, 65=innocent hit, 66=good missing)\n",
                code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDXPAR_OK);
+    PASS();
+#endif
+}
+
+TEST(index_recovery_quarantines_exit_nonzero) {
+#ifdef _WIN32
+    SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
+#else
+    char tmp_dir[CBM_SZ_256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-exit-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        FAIL("mkdtemp failed");
+    }
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-exit-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp cache failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char p1[CBM_SZ_512];
+    char p2[CBM_SZ_512];
+    char pc[CBM_SZ_512];
+    snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
+    snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
+    snprintf(pc, sizeof(pc), "%s/idxpar_exit_nonzero.py", tmp_dir);
+    FILE *f = fopen(p1, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
+    fclose(f);
+    f = fopen(p2, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
+    fclose(f);
+    f = fopen(pc, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def idxpar_bad_fn():\n    return 'exit'\n", f);
+    fclose(f);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(120);
+        _exit(idxpar_exit_nonzero_recovery_check(tmp_dir));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    remove(p1);
+    remove(p2);
+    remove(pc);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+
+    if (signalled) {
+        printf("    child killed by signal %d\n", sig);
+    } else if (code != IDXPAR_OK) {
+        printf("    child exit code %d\n", code);
+    }
+    ASSERT_FALSE(signalled);
+    ASSERT_EQ(code, IDXPAR_OK);
+    PASS();
+#endif
+}
+
+TEST(index_recovery_systemic_exit_nonzero_gives_up) {
+#ifdef _WIN32
+    SKIP_PLATFORM("parallel-recovery guard needs fork isolation (POSIX-only)");
+#else
+    char tmp_dir[CBM_SZ_256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-idxpar-sys-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        FAIL("mkdtemp failed");
+    }
+    char cache[CBM_SZ_256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-idxpar-sys-cache-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp cache failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char p1[CBM_SZ_512];
+    char p2[CBM_SZ_512];
+    snprintf(p1, sizeof(p1), "%s/idxpar_good_a.py", tmp_dir);
+    snprintf(p2, sizeof(p2), "%s/idxpar_good_b.py", tmp_dir);
+    FILE *f = fopen(p1, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def idxpar_good_fn():\n    return 'ok'\n", f);
+    fclose(f);
+    f = fopen(p2, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("def idxpar_good_fn_b():\n    return 'ok'\n", f);
+    fclose(f);
+
+    int code = -1;
+    bool signalled = false;
+    int sig = 0;
+    fflush(NULL);
+    pid_t pid = fork();
+    if (pid == 0) {
+        alarm(120);
+        _exit(idxpar_systemic_exit_nonzero_give_up_check(tmp_dir));
+    }
+    ASSERT_TRUE(pid > 0);
+    int status = 0;
+    (void)waitpid(pid, &status, 0);
+    if (WIFEXITED(status)) {
+        code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        signalled = true;
+        sig = WTERMSIG(status);
+    }
+
+    char *project = cbm_project_name_from_path(tmp_dir);
+    cleanup_project_db(cache, project);
+    free(project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    remove(p1);
+    remove(p2);
+    cbm_rmdir(cache);
+    cbm_rmdir(tmp_dir);
+
+    if (signalled) {
+        printf("    child killed by signal %d\n", sig);
+    } else if (code != IDXPAR_OK) {
+        printf("    child exit code %d\n", code);
     }
     ASSERT_FALSE(signalled);
     ASSERT_EQ(code, IDXPAR_OK);
@@ -11407,6 +11646,8 @@ SUITE(mcp) {
     RUN_TEST(sequential_service_edge_props_are_valid_json_issue898);
     RUN_TEST(index_second_inprocess_run_survives_issue773);
     RUN_TEST(index_recovery_parallel_quarantines_crasher);
+    RUN_TEST(index_recovery_quarantines_exit_nonzero);
+    RUN_TEST(index_recovery_systemic_exit_nonzero_gives_up);
     RUN_TEST(tool_manage_adr_not_found_rich_error);
     RUN_TEST(tool_manage_adr_get_accepts_abs_path);
     RUN_TEST(tool_manage_adr_get_accepts_symlink_path);

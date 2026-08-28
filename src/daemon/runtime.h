@@ -16,6 +16,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define CBM_DAEMON_SEMVER_SIZE 12U
+
 /* Detailed post-admission operation ABI. It is deliberately absent from the
  * stable endpoint HELLO: an exact executable fingerprint already selects this
  * layout, while conflicting generations must remain able to diagnose each
@@ -262,7 +264,7 @@ typedef struct {
     uint8_t client_count; /* entries in client_pids, capped at the wire limit */
     uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-    char semantic_version[12];
+    char semantic_version[CBM_DAEMON_SEMVER_SIZE];
 } cbm_daemon_runtime_status_t;
 
 typedef struct {

@@ -143,8 +143,9 @@ void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint
 
 static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
                                                          CBMLanguage lang) {
-    if (!r)
+    if (!r) {
         return NULL;
+    }
     switch (lang) {
     case CBM_LANG_GO:
         return r->go;
@@ -177,17 +178,17 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
- * owns source, module_qn, all_defs, imp_keys, imp_vals.
- * NOTE: all_defs is read-only in practice but typed non-const to match
+ * owns source, module_qn, defs, imp_names, imp_qns.
+ * NOTE: defs is read-only in practice but typed non-const to match
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *all_defs, int def_count,
-                     const char **imp_keys, const char **imp_vals, int imp_count);
+                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
+                     const char **imp_qns, int imp_count);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
-                        CBMLSPDef *all_defs, int def_count, const char **imp_keys,
-                        const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
+                        CBMLSPDef *defs, int def_count, const char **imp_names,
+                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
 
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the

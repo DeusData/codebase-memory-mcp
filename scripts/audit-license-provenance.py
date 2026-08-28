@@ -22,6 +22,13 @@ GRAMMARS = os.path.join(ROOT, "internal/cbm/vendored/grammars")
 
 FIRST_PARTY = {"cobol", "form", "janet", "magma", "protobuf", "wolfram"}
 FORKS = {  # self-maintained forks: vendored LICENSE must match the original upstream
+    # arkts: our own ArkTS fork of tree-sitter-typescript. The vendored LICENSE is
+    # upstream's MIT verbatim, which is what MIT requires of a derivative; our own
+    # copyright and the fork's provenance live where our SOURCE is (grammar.js
+    # header, MANIFEST.md, THIRD_PARTY.md) rather than inside upstream's notice.
+    # This is a routing entry, NOT an exemption -- check_upstream still byte-verifies
+    # against the real upstream repository.
+    "arkts": "tree-sitter/tree-sitter-typescript",
     "cfml": "cfmleditor/tree-sitter-cfml",
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",

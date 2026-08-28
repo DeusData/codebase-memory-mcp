@@ -311,6 +311,10 @@ static const char *dialect_tool_prefix(cbm_graph_profile_dialect_t dialect) {
         return "codebase-memory-mcp_";
     case CBM_GRAPH_DIALECT_KIRO:
         return "@codebase-memory-mcp/";
+    case CBM_GRAPH_DIALECT_OMP:
+        return "mcp__codebase_memory_mcp_";
+    case CBM_GRAPH_DIALECT_GROK:
+        return "codebase-memory-mcp__";
     default:
         return NULL;
     }
@@ -618,6 +622,27 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
             return false;
         }
         return true;
+    case CBM_GRAPH_DIALECT_GROK:
+        /* Grok Build children reach MCP only through the search_tool/use_tool
+         * dispatcher and inherit servers by NAME (mcpInheritance), never by
+         * tool, so the tier allowlist is spelled out in the body as the exact
+         * `server__tool` ids the dispatcher accepts. Handoff inherits nothing. */
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools: read_file, grep, list_dir") ||
+            (direct && !profile_buffer_append(buffer, ", search_tool, use_tool")) ||
+            !profile_buffer_append(
+                buffer, direct ? "\nmcpInheritance:\n  named:\n    - codebase-memory-mcp\n---\n"
+                               : "\nmcpInheritance: none\n---\n") ||
+            (direct && (!profile_buffer_append(
+                            buffer, "Reach the graph only through `search_tool`/`use_tool`. "
+                                    "The only allowed tool ids are ") ||
+                        !append_csv_mcp_tools(buffer, dialect, tier) ||
+                        !profile_buffer_append(
+                            buffer, "; never call any other codebase-memory-mcp tool.\n\n"))) ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     case CBM_GRAPH_DIALECT_AUGMENT:
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "---\n") && profile_buffer_append(buffer, prompt);
@@ -634,6 +659,16 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         return append_yaml_identity(buffer, slug, description) &&
                profile_buffer_append(buffer, "tools:\n  - readFile\n---\n") &&
                profile_buffer_append(buffer, prompt);
+    case CBM_GRAPH_DIALECT_OMP:
+        if (!append_yaml_identity(buffer, slug, description) ||
+            !profile_buffer_append(buffer, "tools:\n  - read\n  - grep\n  - glob\n") ||
+            (direct && !append_yaml_mcp_tools(buffer, dialect, tier)) ||
+            !profile_buffer_append(
+                buffer, "read-summarize: false\nautoloadSkills: [codebase-memory]\n---\n") ||
+            !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     default:
         return false;
     }

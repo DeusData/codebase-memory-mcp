@@ -202,6 +202,26 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      "fn foo() -> Int:\n    return 1\n\nstruct A:\n    fn bar(self) -> Int:\n        return foo()\n",
      2,
      {"foo", "A", NULL}},
+    {"arkts",
+     CBM_LANG_ARKTS,
+     "a.ets",
+     "@Component\nstruct Card {\n  @State title: string = ''\n\n  build() {\n    Column() {\n"
+     "      Text(this.title).fontSize(20)\n    }\n  }\n}\n\n@Builder\nfunction rowCard() {\n"
+     "  Row() {}\n}\n",
+     2,
+     {"Card", "build", "rowCard"}},
+    {"plsql",
+     CBM_LANG_PLSQL,
+     "emp_pkg.pkb",
+     "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+     "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+     "  BEGIN\n"
+     "    RETURN util_pkg.calc_salary(p_name);\n"
+     "  END;\n"
+     "END emp_pkg;\n"
+     "/\n",
+     2,
+     {"emp_pkg", "hire", NULL}},
     {"smali",
      CBM_LANG_SMALI,
      "A.smali",

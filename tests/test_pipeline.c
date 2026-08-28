@@ -12069,6 +12069,394 @@ TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant) {
     PASS();
 }
 
+TEST(pipeline_ensemble_routing_edges) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* Production class with two items */
+    snprintf(path, sizeof(path), "%s/MyProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.MyProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.MyProduction\">\n"
+               "  <Item Name=\"MyService\" ClassName=\"MyApp.MyService\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"MyOperation\" ClassName=\"MyApp.MyOperation\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    /* Service class with OnProcessInput that routes to MyOperation via literal */
+    snprintf(path, sizeof(path), "%s/MyService.cls", tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen service");
+    }
+    fprintf(f, "Class MyApp.MyService Extends Ens.BusinessService\n"
+               "{\n"
+               "Method OnProcessInput(pRequest As %%Library.Object,"
+               " Output pResponse As %%Library.Object) As %%Status\n"
+               "{\n"
+               "    Do ..SendRequestSync(\"MyOperation\", pRequest, .pResponse)\n"
+               "    Quit $$$OK\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Route nodes with __route__ensemble__ qn emitted for both production items */
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int ens_route_count = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strstr(routes[i].qualified_name, "__route__ensemble__") != NULL)
+            ens_route_count++;
+    }
+    ASSERT_GTE(ens_route_count, 2);
+    cbm_store_free_nodes(routes, route_count);
+
+    /* At least one ASYNC_CALLS edge from SendRequestSync literal match */
+    int async_calls = cbm_store_count_edges_by_type(s, project, "ASYNC_CALLS");
+    ASSERT_GTE(async_calls, 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_attr_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* The first item declares no ClassName. Attribute lookup used to scan
+     * forward from the tag with no bound, so it inherited ClassName from the
+     * SECOND item and emitted a Route for an item that does not name a class,
+     * pairing it with the wrong implementation. Only the well-formed item may
+     * produce a Route. */
+    snprintf(path, sizeof(path), "%s/AttrProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.AttrProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.AttrProduction\">\n"
+               "  <Item Name=\"NoClass\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"Real\" ClassName=\"MyApp.Real\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int ens_route_count = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strstr(routes[i].qualified_name, "__route__ensemble__") != NULL)
+            ens_route_count++;
+    }
+    ASSERT_EQ(ens_route_count, 1);
+    cbm_store_free_nodes(routes, route_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_ensemble_routing_settings_targets) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_set_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* A production whose ONLY routing information is declarative: a
+     * TargetConfigNames setting on the router item. No class file defines
+     * SendRequestSync anywhere, so every ASYNC_CALLS edge this run produces
+     * must have come from the settings path. */
+    snprintf(path, sizeof(path), "%s/RouterProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.RouterProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.RouterProduction\">\n"
+               "  <Item Name=\"Router\" ClassName=\"MyApp.Router\" Enabled=\"true\">\n"
+               "    <Setting Target=\"Host\" Name=\"TargetConfigNames\">OpA,OpB</Setting>\n"
+               "  </Item>\n"
+               "  <Item Name=\"OpA\" ClassName=\"MyApp.OpA\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"OpB\" ClassName=\"MyApp.OpB\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    /* Router -> OpA and Router -> OpB, both derived from TargetConfigNames.
+     * Before the Route-qn fix this was 0: the settings loop looked the source
+     * item up by its bare qn, which cbm_gbuf_find_by_qn (an exact hashtable
+     * lookup) never matches, so every edge was skipped by `continue`. */
+    int async_calls = cbm_store_count_edges_by_type(s, project, "ASYNC_CALLS");
+    ASSERT_EQ(async_calls, 2);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_ensemble_routing_unterminated_item_is_safe) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens_bad_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    /* Truncated XData: an <Item that never closes. The parser used to set
+     * item_end to the buffer's NUL terminator and then advance by
+     * strlen("</Item>"), reading 7 bytes past the allocation and scanning
+     * unbounded heap from there. Under ASan this aborts the run. */
+    snprintf(path, sizeof(path), "%s/BadProduction.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.BadProduction Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.BadProduction\">\n"
+               "  <Item Name=\"Orphan\" ClassName=\"MyApp.Orphan\" Enabled=\"true\">\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    /* The well-formed prefix is still honoured: the item is parsed and its
+     * Route node emitted. Malformed input degrades, it does not disappear. */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int ens_route_count = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strstr(routes[i].qualified_name, "__route__ensemble__") != NULL)
+            ens_route_count++;
+    }
+    ASSERT_EQ(ens_route_count, 1);
+    cbm_store_free_nodes(routes, route_count);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(pipeline_ensemble_routing_method_scoping) {
+    /* Verifies scan_source_for_send_targets scopes to the calling method body.
+     * Two methods in the same class each route to a different operation; each
+     * must produce exactly one edge to its own target with no cross-contamination. */
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_ens2_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("failed to create temp dir");
+
+    char path[512];
+
+    snprintf(path, sizeof(path), "%s/TwoProd.cls", tmpdir);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen production");
+    }
+    fprintf(f, "Class MyApp.TwoProd Extends Ens.Production\n"
+               "{\n"
+               "XData ProductionDefinition\n"
+               "{\n"
+               "<Production Name=\"MyApp.TwoProd\">\n"
+               "  <Item Name=\"OperationA\" ClassName=\"MyApp.OpA\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"OperationB\" ClassName=\"MyApp.OpB\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "  <Item Name=\"TwoSvc\" ClassName=\"MyApp.TwoMethodService\" Enabled=\"true\">\n"
+               "  </Item>\n"
+               "</Production>\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/TwoMethodService.cls", tmpdir);
+    f = fopen(path, "w");
+    if (!f) {
+        th_rmtree(tmpdir);
+        FAIL("fopen service");
+    }
+    fprintf(f, "Class MyApp.TwoMethodService Extends Ens.BusinessService\n"
+               "{\n"
+               "Method MethodOne(pRequest As %%Library.Object,"
+               " Output pResponse As %%Library.Object) As %%Status\n"
+               "{\n"
+               "    Do ..SendRequestSync(\"OperationA\", pRequest, .pResponse)\n"
+               "    Quit $$$OK\n"
+               "}\n"
+               "Method MethodTwo(pRequest As %%Library.Object,"
+               " Output pResponse As %%Library.Object) As %%Status\n"
+               "{\n"
+               "    Do ..SendRequestSync(\"OperationB\", pRequest, .pResponse)\n"
+               "    Quit $$$OK\n"
+               "}\n"
+               "}\n");
+    fclose(f);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/ens2.db", tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_node_t *m1_nodes = NULL, *m2_nodes = NULL;
+    int m1_count = 0, m2_count = 0;
+    cbm_store_find_nodes_by_name(s, project, "MethodOne", &m1_nodes, &m1_count);
+    cbm_store_find_nodes_by_name(s, project, "MethodTwo", &m2_nodes, &m2_count);
+    ASSERT_GTE(m1_count, 1);
+    ASSERT_GTE(m2_count, 1);
+
+    cbm_node_t *route_nodes = NULL;
+    int rn_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &route_nodes, &rn_count);
+    int64_t route_a_id = 0, route_b_id = 0;
+    for (int i = 0; i < rn_count; i++) {
+        if (route_nodes[i].qualified_name) {
+            if (strstr(route_nodes[i].qualified_name, "__route__ensemble__") &&
+                strstr(route_nodes[i].qualified_name, "OperationA"))
+                route_a_id = route_nodes[i].id;
+            if (strstr(route_nodes[i].qualified_name, "__route__ensemble__") &&
+                strstr(route_nodes[i].qualified_name, "OperationB"))
+                route_b_id = route_nodes[i].id;
+        }
+    }
+    cbm_store_free_nodes(route_nodes, rn_count);
+    ASSERT_NEQ(route_a_id, 0);
+    ASSERT_NEQ(route_b_id, 0);
+
+    cbm_edge_t *m1_edges = NULL;
+    int m1_ec = 0;
+    cbm_store_find_edges_by_source_type(s, m1_nodes[0].id, "ASYNC_CALLS", &m1_edges, &m1_ec);
+    int m1_to_a = 0, m1_to_b = 0;
+    for (int i = 0; i < m1_ec; i++) {
+        if (m1_edges[i].target_id == route_a_id)
+            m1_to_a++;
+        if (m1_edges[i].target_id == route_b_id)
+            m1_to_b++;
+    }
+    ASSERT_GTE(m1_to_a, 1);
+    ASSERT_EQ(m1_to_b, 0);
+
+    cbm_edge_t *m2_edges = NULL;
+    int m2_ec = 0;
+    cbm_store_find_edges_by_source_type(s, m2_nodes[0].id, "ASYNC_CALLS", &m2_edges, &m2_ec);
+    int m2_to_a = 0, m2_to_b = 0;
+    for (int i = 0; i < m2_ec; i++) {
+        if (m2_edges[i].target_id == route_a_id)
+            m2_to_a++;
+        if (m2_edges[i].target_id == route_b_id)
+            m2_to_b++;
+    }
+    ASSERT_GTE(m2_to_b, 1);
+    ASSERT_EQ(m2_to_a, 0);
+
+    cbm_store_free_edges(m1_edges, m1_ec);
+    cbm_store_free_edges(m2_edges, m2_ec);
+    cbm_store_free_nodes(m1_nodes, m1_count);
+    cbm_store_free_nodes(m2_nodes, m2_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -12380,6 +12768,12 @@ SUITE(pipeline) {
     /* Project name edge cases */
     RUN_TEST(project_name_special_chars);
     RUN_TEST(project_name_trailing_slash);
+    /* Ensemble routing pass */
+    RUN_TEST(pipeline_ensemble_routing_edges);
+    RUN_TEST(pipeline_ensemble_routing_method_scoping);
+    RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
+    RUN_TEST(pipeline_ensemble_routing_settings_targets);
+    RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the

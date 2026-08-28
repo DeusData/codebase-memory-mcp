@@ -18,7 +18,7 @@ release-owned runtime assets. Chocolatey retains the complete extracted runtime
 set and exposes its executable through a PATH shim.
 
 Full indexes an average repository in milliseconds, the Linux kernel (28M LOC) in
-3 minutes. Answers structural queries in under 1ms. Supports 159 languages via
+3 minutes. Answers structural queries in under 1ms. Supports 161 languages via
 vendored tree-sitter grammars. No hosted service or API key. Plug and play across
 11 coding agents including Claude Code, Codex CLI, Gemini CLI, and Zed.
 

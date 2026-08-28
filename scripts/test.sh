@@ -266,6 +266,9 @@ bash "$ROOT/tests/test_shell_line_endings.sh"
 echo "=== Step 0v: nomic blob generator contract ==="
 bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
 
+echo "=== Step 0w: published language-count contract ==="
+bash "$ROOT/tests/test_language_count_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
@@ -330,6 +333,15 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 # admission path is understood, gating on it would make an unexplained red, and
 # skipping it silently would hide the gap. Run it by hand:
 #   make -f Makefile.cbm cbm TEST_SEAMS=1 && bash tests/test_hook_conflict_notice.sh
+
+# Step 5e: watcher_enabled kill-switch process regression (#335). Reuses the
+# prod binary built in Step 5; drives a real daemon against an isolated cache
+# and proves watcher_enabled=false stops the watcher from being built, started
+# or registered, while auto_index and manual index_repository keep working.
+# Every wait is a bounded poll on an asserted state (a closed daemon lifecycle),
+# never a fixed sleep — see the header of the test for why.
+echo "=== Step 5e: watcher_enabled kill-switch regression (#335) ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string
