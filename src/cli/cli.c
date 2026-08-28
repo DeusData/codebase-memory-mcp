@@ -7663,6 +7663,93 @@ static void uninstall_tiered_profile_prompts(const char *label, const char *veri
                                              cbm_graph_profile_dialect_t dialect,
                                              const char *legacy_verify_content, bool dry_run);
 
+static int remove_claude_owned_hook_scripts(const char *config_dir, const char *binary_path,
+                                            bool uninstall) {
+    char current_gate[CLI_BUF_8K];
+    char current_session[CLI_BUF_8K];
+    char current_subagent[CLI_BUF_8K];
+    char released_gate[CLI_BUF_8K];
+    const char *const gate_legacy[] = {released_gate};
+    const char *const session_legacy[] = {cmm_released_session_script};
+    const char *const subagent_legacy[] = {cmm_released_subagent_script};
+    size_t gate_legacy_count =
+        cbm_build_released_gate_script(binary_path, released_gate, sizeof(released_gate)) == CLI_OK
+            ? 1U
+            : 0U;
+    static const struct {
+        const char *name;
+        const char *legacy_name;
+        const char *prefix;
+    } hook_types[] = {
+        {CMM_HOOK_GATE_SCRIPT, CMM_HOOK_GATE_SCRIPT_LEGACY, cmm_gate_script_prefix},
+        {CMM_SESSION_REMINDER_SCRIPT, CMM_SESSION_REMINDER_SCRIPT_LEGACY,
+         cmm_session_script_prefix},
+        {CMM_SUBAGENT_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY,
+         cmm_subagent_script_prefix},
+    };
+    struct {
+        const char *name;
+        const char *legacy_name;
+        const char *current;
+        const char *const *legacy;
+        size_t legacy_count;
+        bool current_valid;
+    } owned_scripts[] = {
+        {hook_types[0].name, hook_types[0].legacy_name, current_gate, gate_legacy,
+         gate_legacy_count,
+         cbm_build_current_hook_script(hook_types[0].prefix, binary_path, current_gate,
+                                       sizeof(current_gate)) == CLI_OK},
+        {hook_types[1].name, hook_types[1].legacy_name, current_session, session_legacy, 1U,
+         cbm_build_current_hook_script(hook_types[1].prefix, binary_path, current_session,
+                                       sizeof(current_session)) == CLI_OK},
+        {hook_types[2].name, hook_types[2].legacy_name, current_subagent, subagent_legacy, 1U,
+         cbm_build_current_hook_script(hook_types[2].prefix, binary_path, current_subagent,
+                                       sizeof(current_subagent)) == CLI_OK},
+    };
+    char hooks_dir[CLI_BUF_1K];
+    int hooks_written = snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
+    bool hooks_dir_valid = hooks_written > 0 && (size_t)hooks_written < sizeof(hooks_dir);
+    int rc = CLI_OK;
+    const char *op = uninstall ? "hook_script_uninstall" : "hook_script_disable";
+    for (size_t i = 0; i < sizeof(owned_scripts) / sizeof(owned_scripts[0]); i++) {
+        char script_path[CLI_BUF_1K];
+        int script_written = hooks_dir_valid ? snprintf(script_path, sizeof(script_path), "%s/%s",
+                                                        hooks_dir, owned_scripts[i].name)
+                                             : CLI_ERR;
+        bool script_path_valid = script_written > 0 && (size_t)script_written < sizeof(script_path);
+        if (!owned_scripts[i].current_valid) {
+            record_agent_config_error(uninstall, "Claude Code", op, owned_scripts[i].name);
+            rc = CLI_ERR;
+            continue;
+        }
+        if (!script_path_valid ||
+            cbm_remove_owned_hook_script(script_path, owned_scripts[i].current,
+                                         owned_scripts[i].legacy,
+                                         owned_scripts[i].legacy_count) < CLI_OK) {
+            record_agent_config_error(uninstall, "Claude Code", op,
+                                      script_path_valid ? script_path : owned_scripts[i].name);
+            rc = CLI_ERR;
+        }
+#ifdef _WIN32
+        if (!hooks_dir_valid ||
+            cbm_remove_owned_legacy_hook_script(hooks_dir, owned_scripts[i].legacy_name,
+                                                owned_scripts[i].current, owned_scripts[i].legacy,
+                                                owned_scripts[i].legacy_count) != CLI_OK) {
+            char legacy_path[CLI_BUF_1K];
+            int written = hooks_dir_valid ? snprintf(legacy_path, sizeof(legacy_path), "%s/%s",
+                                                     hooks_dir, owned_scripts[i].legacy_name)
+                                          : CLI_ERR;
+            record_agent_config_error(uninstall, "Claude Code", "legacy_hook_script_uninstall",
+                                      written > 0 && (size_t)written < sizeof(legacy_path)
+                                          ? legacy_path
+                                          : owned_scripts[i].legacy_name);
+            rc = CLI_ERR;
+        }
+#endif
+    }
+    return rc;
+}
+
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
                                        bool dry_run) {
     char config_dir[CLI_BUF_1K];
@@ -7752,6 +7839,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
             if (cbm_remove_claude_subagent_hooks(settings_path) != CLI_OK) {
                 record_agent_config_error(false, "Claude Code", "hook_disable", settings_path);
             }
+            remove_claude_owned_hook_scripts(config_dir, binary_path, false);
         }
         print_hooks_skipped();
         goto claude_hooks_done;
@@ -10787,86 +10875,7 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
             record_agent_config_error(true, "Claude Code", "subagent_hook_uninstall",
                                       settings_path);
         }
-        char current_gate[CLI_BUF_8K];
-        char current_session[CLI_BUF_8K];
-        char current_subagent[CLI_BUF_8K];
-        char released_gate[CLI_BUF_8K];
-        const char *const gate_legacy[] = {released_gate};
-        const char *const session_legacy[] = {cmm_released_session_script};
-        const char *const subagent_legacy[] = {cmm_released_subagent_script};
-        size_t gate_legacy_count = cbm_build_released_gate_script(installed_binary, released_gate,
-                                                                  sizeof(released_gate)) == CLI_OK
-                                       ? 1U
-                                       : 0U;
-        static const struct {
-            const char *name;
-            const char *legacy_name;
-            const char *prefix;
-        } hook_types[] = {
-            {CMM_HOOK_GATE_SCRIPT, CMM_HOOK_GATE_SCRIPT_LEGACY, cmm_gate_script_prefix},
-            {CMM_SESSION_REMINDER_SCRIPT, CMM_SESSION_REMINDER_SCRIPT_LEGACY,
-             cmm_session_script_prefix},
-            {CMM_SUBAGENT_REMINDER_SCRIPT, CMM_SUBAGENT_REMINDER_SCRIPT_LEGACY,
-             cmm_subagent_script_prefix},
-        };
-        struct {
-            const char *name;
-            const char *legacy_name;
-            const char *current;
-            const char *const *legacy;
-            size_t legacy_count;
-            bool current_valid;
-        } owned_scripts[] = {
-            {hook_types[0].name, hook_types[0].legacy_name, current_gate, gate_legacy,
-             gate_legacy_count,
-             cbm_build_current_hook_script(hook_types[0].prefix, installed_binary, current_gate,
-                                           sizeof(current_gate)) == CLI_OK},
-            {hook_types[1].name, hook_types[1].legacy_name, current_session, session_legacy, 1U,
-             cbm_build_current_hook_script(hook_types[1].prefix, installed_binary, current_session,
-                                           sizeof(current_session)) == CLI_OK},
-            {hook_types[2].name, hook_types[2].legacy_name, current_subagent, subagent_legacy, 1U,
-             cbm_build_current_hook_script(hook_types[2].prefix, installed_binary, current_subagent,
-                                           sizeof(current_subagent)) == CLI_OK},
-        };
-        char hooks_dir[CLI_BUF_1K];
-        int hooks_written = snprintf(hooks_dir, sizeof(hooks_dir), "%s/hooks", config_dir);
-        bool hooks_dir_valid = hooks_written > 0 && (size_t)hooks_written < sizeof(hooks_dir);
-        for (size_t i = 0; i < sizeof(owned_scripts) / sizeof(owned_scripts[0]); i++) {
-            char script_path[CLI_BUF_1K];
-            int script_written = hooks_dir_valid
-                                     ? snprintf(script_path, sizeof(script_path), "%s/%s",
-                                                hooks_dir, owned_scripts[i].name)
-                                     : CLI_ERR;
-            bool script_path_valid =
-                script_written > 0 && (size_t)script_written < sizeof(script_path);
-            if (!owned_scripts[i].current_valid) {
-                record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
-                                          owned_scripts[i].name);
-                continue;
-            }
-            if (!script_path_valid ||
-                cbm_remove_owned_hook_script(script_path, owned_scripts[i].current,
-                                             owned_scripts[i].legacy,
-                                             owned_scripts[i].legacy_count) < CLI_OK) {
-                record_agent_config_error(true, "Claude Code", "hook_script_uninstall",
-                                          script_path_valid ? script_path : owned_scripts[i].name);
-            }
-#ifdef _WIN32
-            if (!hooks_dir_valid ||
-                cbm_remove_owned_legacy_hook_script(
-                    hooks_dir, owned_scripts[i].legacy_name, owned_scripts[i].current,
-                    owned_scripts[i].legacy, owned_scripts[i].legacy_count) != CLI_OK) {
-                char legacy_path[CLI_BUF_1K];
-                int written = hooks_dir_valid ? snprintf(legacy_path, sizeof(legacy_path), "%s/%s",
-                                                         hooks_dir, owned_scripts[i].legacy_name)
-                                              : CLI_ERR;
-                record_agent_config_error(true, "Claude Code", "legacy_hook_script_uninstall",
-                                          written > 0 && (size_t)written < sizeof(legacy_path)
-                                              ? legacy_path
-                                              : owned_scripts[i].legacy_name);
-            }
-#endif
-        }
+        remove_claude_owned_hook_scripts(config_dir, installed_binary, true);
     }
     printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
 }

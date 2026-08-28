@@ -1176,11 +1176,23 @@ TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
     char settings_path[768];
     char mcp_path[768];
     char db_path[768];
+    char gate_path[768];
+    char session_path[768];
+    char subagent_path[768];
     snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
     snprintf(claude_dir, sizeof(claude_dir), "%s/.claude", tmpdir);
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", claude_dir);
     snprintf(mcp_path, sizeof(mcp_path), "%s/.claude.json", tmpdir);
     snprintf(db_path, sizeof(db_path), "%s/_config.db", cache_dir);
+#ifdef _WIN32
+    snprintf(gate_path, sizeof(gate_path), "%s/hooks/cbm-code-discovery-gate.cmd", claude_dir);
+    snprintf(session_path, sizeof(session_path), "%s/hooks/cbm-session-reminder.cmd", claude_dir);
+    snprintf(subagent_path, sizeof(subagent_path), "%s/hooks/cbm-subagent-reminder.cmd", claude_dir);
+#else
+    snprintf(gate_path, sizeof(gate_path), "%s/hooks/cbm-code-discovery-gate", claude_dir);
+    snprintf(session_path, sizeof(session_path), "%s/hooks/cbm-session-reminder", claude_dir);
+    snprintf(subagent_path, sizeof(subagent_path), "%s/hooks/cbm-subagent-reminder", claude_dir);
+#endif
     test_mkdirp(claude_dir);
     write_test_file(settings_path,
                     "{\"hooks\":{\"PreToolUse\":[{\"matcher\":\"Bash\",\"hooks\":[{\"type\":"
@@ -1203,6 +1215,8 @@ TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
     char *default_state = read_test_file_alloc(settings_path);
     bool default_hook = default_state && strstr(default_state, "cbm-code-discovery-gate") &&
                         strstr(default_state, "/usr/bin/foreign-hook");
+    bool default_scripts = cbm_file_exists(gate_path) && cbm_file_exists(session_path) &&
+                           cbm_file_exists(subagent_path);
     free(default_state);
 
     char *no_hooks_plan_args[] = {"--plan", "--no-hooks"};
@@ -1238,6 +1252,8 @@ TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
     bool disabled_ok = disabled_state && strstr(disabled_state, "/usr/bin/foreign-hook") &&
                        !strstr(disabled_state, "cbm-code-discovery-gate") && disabled_mcp &&
                        strstr(disabled_mcp, "codebase-memory-mcp");
+    bool no_hooks_scripts_gone = !cbm_file_exists(gate_path) && !cbm_file_exists(session_path) &&
+                               !cbm_file_exists(subagent_path);
     free(disabled_state);
     free(disabled_mcp);
 
@@ -1246,6 +1262,9 @@ TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
     disabled_state = read_test_file_alloc(settings_path);
     bool bare_disabled = disabled_state && strstr(disabled_state, "/usr/bin/foreign-hook") &&
                          !strstr(disabled_state, "cbm-code-discovery-gate");
+    bool bare_scripts_gone =
+        !cbm_file_exists(gate_path) && !cbm_file_exists(session_path) &&
+        !cbm_file_exists(subagent_path);
     free(disabled_state);
 
     char *hooks_plan_args[] = {"--plan", "--hooks"};
@@ -1264,14 +1283,36 @@ TEST(cli_install_hooks_preference_persists_and_migrates_owned_state) {
     char *enabled_state = read_test_file_alloc(settings_path);
     bool enabled_ok = enabled_state && strstr(enabled_state, "cbm-code-discovery-gate") &&
                       strstr(enabled_state, "/usr/bin/foreign-hook");
+    bool hooks_scripts_back = cbm_file_exists(gate_path) && cbm_file_exists(session_path) &&
+                              cbm_file_exists(subagent_path);
     free(enabled_state);
     int bare_enabled_rc = cli_test_cmd_install(3, bare_args);
+    bool bare_scripts_enabled = cbm_file_exists(gate_path) && cbm_file_exists(session_path) &&
+                                cbm_file_exists(subagent_path);
+
+    const char *foreign_session_script =
+#ifdef _WIN32
+        "@echo off\r\nC:\\tmp\\user-owned-session-hook.cmd\r\n";
+#else
+        "#!/bin/sh\n/usr/bin/user-owned-session-hook\n";
+#endif
+    write_test_file(session_path, foreign_session_script);
+    int foreign_no_hooks_rc = cli_test_cmd_install(4, no_hooks_args);
+    char *preserved_session = read_test_file_alloc(session_path);
+    bool foreign_session_preserved =
+        foreign_no_hooks_rc == 0 && preserved_session &&
+        strcmp(preserved_session, foreign_session_script) == 0 && !cbm_file_exists(gate_path) &&
+        !cbm_file_exists(subagent_path);
+    free(preserved_session);
+
     bool results_ok =
         conflict_a_rc == 1 && conflict_b_rc == 1 && default_rc == 0 && default_hook &&
-        no_hooks_plan_rc == 0 && disabled_plan_ok && no_hooks_dry_rc == 0 && previews_read_only &&
-        no_hooks_rc == 0 && stored_false && disabled_ok && bare_disabled_rc == 0 && bare_disabled &&
+        default_scripts && no_hooks_plan_rc == 0 && disabled_plan_ok && no_hooks_dry_rc == 0 &&
+        previews_read_only && no_hooks_rc == 0 && stored_false && disabled_ok &&
+        no_hooks_scripts_gone && bare_disabled_rc == 0 && bare_disabled && bare_scripts_gone &&
         hooks_plan_rc == 0 && hooks_dry_rc == 0 && previews_retained_false && hooks_rc == 0 &&
-        stored_true && enabled_ok && bare_enabled_rc == 0 && fake.mutation_reserve_count > 0;
+        stored_true && enabled_ok && hooks_scripts_back && bare_enabled_rc == 0 &&
+        bare_scripts_enabled && foreign_session_preserved && fake.mutation_reserve_count > 0;
 
     cbm_cli_set_activation_ops_for_test(NULL);
     cbm_set_auto_answer_for_test(0);

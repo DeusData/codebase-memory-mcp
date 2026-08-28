@@ -1694,6 +1694,7 @@ echo "OK 8e: shim installed, non-blocking, delegates to hook-augment"
 HOME="$FAKE_HOME" XDG_CONFIG_HOME="$FAKE_HOME/.config" APPDATA="$FAKE_HOME/AppData/Roaming" LOCALAPPDATA="$FAKE_HOME/AppData/Local" PATH="$FAKE_HOME/.local/bin:$PATH" \
   "$BINARY" install --no-hooks --skip-binary --clients=claude -y >/dev/null
 if grep -qE 'cbm-(code-discovery-gate|session-reminder|subagent-reminder)' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
+   [ -e "$FAKE_HOME/.claude/hooks/cbm-code-discovery-gate" ] ||
    ! grep -q 'codebase-memory-mcp' "$FAKE_HOME/.claude.json" 2>/dev/null; then
   echo "FAIL 8e-i: --no-hooks did not remove owned Claude hooks while preserving MCP"
   exit 1
