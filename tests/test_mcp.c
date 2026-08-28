@@ -1261,12 +1261,6 @@ TEST(mcp_get_int_arg) {
     ASSERT_EQ(val, 5);
     val = cbm_mcp_get_int_arg(args, "missing", 42);
     ASSERT_EQ(val, 42);
-    val = cbm_mcp_get_int_arg("{\"offset\":2147483648}", "offset", 0);
-    ASSERT_EQ(val, INT_MAX);
-    val = cbm_mcp_get_int_arg("{\"offset\":18446744073709551615}", "offset", 0);
-    ASSERT_EQ(val, INT_MAX);
-    val = cbm_mcp_get_int_arg("{\"offset\":-2147483649}", "offset", 0);
-    ASSERT_EQ(val, INT_MIN);
     PASS();
 }
 
@@ -3222,6 +3216,19 @@ TEST(tool_query_graph_basic) {
              "\"arguments\":{\"query\":\"MATCH (f:Function) RETURN f.name\"}}}");
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    free(resp);
+
+    /* Semantic pagination's overflow handling must not turn unrelated integer
+     * arguments into INT_MAX-sized work. Preserve query_graph's existing fast
+     * rejection of UINT64_MAX after its shared integer conversion. */
+    resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":15,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"query_graph\","
+                                   "\"arguments\":{\"query\":\"MATCH (f:Function) RETURN f.name\","
+                                   "\"max_rows\":18446744073709551615}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"result\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
     free(resp);
 
     cbm_mcp_server_free(srv);

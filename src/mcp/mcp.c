@@ -1556,19 +1556,7 @@ int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val)
     yyjson_val *val = yyjson_obj_get(root, key);
     int result = default_val;
     if (val && yyjson_is_int(val)) {
-        if (yyjson_is_uint(val)) {
-            uint64_t value = yyjson_get_uint(val);
-            result = value > INT_MAX ? INT_MAX : (int)value;
-        } else {
-            int64_t value = yyjson_get_sint(val);
-            if (value > INT_MAX) {
-                result = INT_MAX;
-            } else if (value < INT_MIN) {
-                result = INT_MIN;
-            } else {
-                result = (int)value;
-            }
-        }
+        result = yyjson_get_int(val);
     }
     yyjson_doc_free(doc);
     return result;
@@ -3278,6 +3266,36 @@ typedef struct {
     bool truncated;
 } semantic_page_t;
 
+/* Semantic pagination treats oversized integers as exhausted pages instead of
+ * allowing narrowing to wrap them back to the first page. Keep this behavior
+ * local: other MCP integer arguments have their own established bounds. */
+static int semantic_page_int_arg(const char *args_json, const char *key, int default_val) {
+    yyjson_doc *doc = yyjson_read(args_json, strlen(args_json), 0);
+    if (!doc) {
+        return default_val;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *val = yyjson_obj_get(root, key);
+    int result = default_val;
+    if (val && yyjson_is_int(val)) {
+        if (yyjson_is_uint(val)) {
+            uint64_t value = yyjson_get_uint(val);
+            result = value > INT_MAX ? INT_MAX : (int)value;
+        } else {
+            int64_t value = yyjson_get_sint(val);
+            if (value > INT_MAX) {
+                result = INT_MAX;
+            } else if (value < INT_MIN) {
+                result = INT_MIN;
+            } else {
+                result = (int)value;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    return result;
+}
+
 static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *vresults,
                                        int vcount, int total, bool has_more, bool truncated);
 
@@ -3791,8 +3809,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                     true);
             }
             if (sq_present) {
-                int semantic_limit = q_limit > 0 ? q_limit : CBM_DEFAULT_SEARCH_LIMIT;
-                int semantic_offset = q_offset > 0 ? q_offset : 0;
+                int semantic_limit_arg =
+                    semantic_page_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
+                int semantic_offset_arg = semantic_page_int_arg(args, "offset", 0);
+                int semantic_limit =
+                    semantic_limit_arg > 0 ? semantic_limit_arg : CBM_DEFAULT_SEARCH_LIMIT;
+                int semantic_offset = semantic_offset_arg > 0 ? semantic_offset_arg : 0;
                 char *combined = combine_bm25_semantic(bm25_json, legacy_json, vresults, vcount,
                                                        semantic_offset, semantic_limit);
                 cbm_store_free_vector_results(vresults, vcount);
@@ -3823,8 +3845,10 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
     int limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
-    int semantic_limit = limit > 0 ? limit : CBM_DEFAULT_SEARCH_LIMIT;
-    int semantic_offset = offset > 0 ? offset : 0;
+    int semantic_limit_arg = semantic_page_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
+    int semantic_offset_arg = semantic_page_int_arg(args, "offset", 0);
+    int semantic_limit = semantic_limit_arg > 0 ? semantic_limit_arg : CBM_DEFAULT_SEARCH_LIMIT;
+    int semantic_offset = semantic_offset_arg > 0 ? semantic_offset_arg : 0;
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
 
