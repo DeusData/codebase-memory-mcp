@@ -8619,21 +8619,23 @@ static int vs_build_keyword_vectors(cbm_store_t *s, const char *project, const c
  * each of the query vectors.  Returns 0.0 if the node vector is unavailable
  * or mis-sized. */
 static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
-                                  const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
+                                  const int8_t (*kw_vecs)[VS_VEC_DIM], const double *kw_magnitudes,
+                                  int actual_kw) {
     if (!node_vec || node_vec_len != VS_VEC_DIM) {
         return 0.0;
     }
+    int32_t node_norm = 0;
+    for (int d = 0; d < VS_VEC_DIM; d++) {
+        node_norm += (int32_t)node_vec[d] * (int32_t)node_vec[d];
+    }
+    double node_magnitude = sqrt((double)node_norm);
     double min_score = CBM_STORE_UNIT_POS_D;
     for (int k = 0; k < actual_kw; k++) {
         int32_t dot = 0;
-        int32_t ma = 0;
-        int32_t mb = 0;
         for (int d = 0; d < VS_VEC_DIM; d++) {
             dot += (int32_t)kw_vecs[k][d] * (int32_t)node_vec[d];
-            ma += (int32_t)kw_vecs[k][d] * (int32_t)kw_vecs[k][d];
-            mb += (int32_t)node_vec[d] * (int32_t)node_vec[d];
         }
-        double denom = sqrt((double)ma) * sqrt((double)mb);
+        double denom = kw_magnitudes[k] * node_magnitude;
         double cos_k = denom > CBM_STORE_DENOM_EPS_D ? (double)dot / denom : 0.0;
         if (cos_k < min_score) {
             min_score = cos_k;
@@ -8643,34 +8645,62 @@ static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
 }
 
 /* Append one candidate row read from the scan statement into the result
- * vector.  Grows the results array geometrically on demand.  Returns the
- * (possibly grown) results pointer, or NULL on allocation failure. */
-static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *count, int *cap,
-                                             sqlite3_stmt *stmt,
-                                             const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
+ * vector. Grows the results array geometrically on demand. */
+static int vs_append_result(cbm_vector_result_t **results, int *count, int *cap, sqlite3_stmt *stmt,
+                            const int8_t (*kw_vecs)[VS_VEC_DIM], const double *kw_magnitudes,
+                            int actual_kw) {
     if (*count >= *cap) {
         int nc = *cap < CBM_SZ_16 ? CBM_SZ_16 : *cap * ST_COL_2;
-        cbm_vector_result_t *grown = realloc(results, (size_t)nc * sizeof(cbm_vector_result_t));
+        cbm_vector_result_t *grown = realloc(*results, (size_t)nc * sizeof(cbm_vector_result_t));
         if (!grown) {
-            return NULL;
+            return CBM_STORE_ERR;
         }
-        results = grown;
+        *results = grown;
         *cap = nc;
     }
-    int idx = (*count)++;
-    results[idx].node_id = sqlite3_column_int64(stmt, 0);
+    int idx = *count;
+    cbm_vector_result_t *result = &(*results)[idx];
+    memset(result, 0, sizeof(*result));
+    result->node_id = sqlite3_column_int64(stmt, 0);
     const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
     const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
     const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_3);
     const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_4);
-    results[idx].name = name ? strdup(name) : strdup("");
-    results[idx].qualified_name = qn ? strdup(qn) : strdup("");
-    results[idx].file_path = fp ? strdup(fp) : strdup("");
-    results[idx].label = label ? strdup(label) : strdup("");
+    result->name = strdup(name ? name : "");
+    result->qualified_name = strdup(qn ? qn : "");
+    result->file_path = strdup(fp ? fp : "");
+    result->label = strdup(label ? label : "");
+    if (!result->name || !result->qualified_name || !result->file_path || !result->label) {
+        free(result->name);
+        free(result->qualified_name);
+        free(result->file_path);
+        free(result->label);
+        memset(result, 0, sizeof(*result));
+        return CBM_STORE_ERR;
+    }
     const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_6);
     int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_6);
-    results[idx].score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
-    return results;
+    result->score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, kw_magnitudes, actual_kw);
+    (*count)++;
+    return CBM_STORE_OK;
+}
+
+static int vs_result_cmp(const void *a, const void *b) {
+    const cbm_vector_result_t *ra = a;
+    const cbm_vector_result_t *rb = b;
+    if (ra->score > rb->score) {
+        return -1;
+    }
+    if (ra->score < rb->score) {
+        return 1;
+    }
+    if (ra->node_id < rb->node_id) {
+        return -1;
+    }
+    if (ra->node_id > rb->node_id) {
+        return 1;
+    }
+    return 0;
 }
 
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
@@ -8687,6 +8717,14 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     if (actual_kw == 0) {
         return CBM_STORE_OK;
     }
+    double kw_magnitudes[VS_MAX_KW] = {0};
+    for (int k = 0; k < actual_kw; k++) {
+        int32_t kw_norm = 0;
+        for (int d = 0; d < VS_VEC_DIM; d++) {
+            kw_norm += (int32_t)kw_vecs[k][d] * (int32_t)kw_vecs[k][d];
+        }
+        kw_magnitudes[k] = sqrt((double)kw_norm);
+    }
 
     /* Scan all node vectors, compute per-keyword cosine, take min.
      * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
@@ -8697,7 +8735,7 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
                       " INNER JOIN nodes n ON n.id = v.node_id"
                       " WHERE v.project = ?2"
                       " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")"
-                      " ORDER BY score DESC"
+                      " ORDER BY score DESC, n.id ASC"
                       " LIMIT ?3";
 
     sqlite3_stmt *stmt = NULL;
@@ -8707,8 +8745,9 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
-    /* Use first keyword for SQL pre-filter, fetch more candidates for re-ranking */
-    int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
+    /* Use the first keyword for SQL pre-filtering and honor the caller's exact
+     * candidate bound. Window policy belongs to the caller. */
+    int fetch_limit = limit > 0 ? limit : CBM_SZ_16;
     sqlite3_bind_blob(stmt, SKIP_ONE, kw_vecs[0], VS_VEC_DIM, SQLITE_STATIC);
     sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
     sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
@@ -8726,16 +8765,19 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
     int count = 0;
     int cap = 0;
     int step_rc = 0;
+    bool append_failed = false;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        cbm_vector_result_t *grown =
-            vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
-        if (!grown) {
+        if (vs_append_result(&results, &count, &cap, stmt, kw_vecs, kw_magnitudes, actual_kw) !=
+            CBM_STORE_OK) {
+            append_failed = true;
             break;
         }
-        results = grown;
     }
 
-    if (step_rc != SQLITE_DONE) {
+    if (append_failed) {
+        snprintf(s->errbuf, sizeof(s->errbuf), "vector_search: allocation failed");
+    } else if (step_rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "vector_search: row scan aborted");
         char rc_buf[VS_STR_BUF];
         snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
         cbm_log_warn("vector_search.step_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
@@ -8746,16 +8788,14 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         cbm_log_info("vector_search.done", "candidates", cnt_buf);
     }
     sqlite3_finalize(stmt);
+    if (append_failed || step_rc != SQLITE_DONE) {
+        cbm_store_free_vector_results(results, count);
+        return CBM_STORE_ERR;
+    }
 
     /* Re-sort by min-score (SQL sorted by first keyword only) */
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        for (int j = i + SKIP_ONE; j < count; j++) {
-            if (results[j].score > results[i].score) {
-                cbm_vector_result_t tmp = results[i];
-                results[i] = results[j];
-                results[j] = tmp;
-            }
-        }
+    if (count > 1) {
+        qsort(results, (size_t)count, sizeof(cbm_vector_result_t), vs_result_cmp);
     }
 
     /* Trim to requested limit */

@@ -423,11 +423,18 @@ static const tool_def_t TOOLS[] = {
      "property columns via "
      "fields (e.g. [\"complexity\",\"signature\",\"docstring\"]); format=\"json\" returns "
      "the SAME tree model as structured JSON. "
-     "PAGINATION: results are capped at limit (default 50). The response always includes "
-     "'total' (full match count before limit) and 'has_more' (true when total > "
-     "offset+returned). Detect truncation with has_more, then page by re-calling with "
-     "offset=offset+limit until has_more is false. Narrow first via label/file_pattern/"
-     "min_degree before paginating large result sets.",
+     "PAGINATION: Structural results are capped at limit (default 50); top-level 'total' is "
+     "the full structural match count and top-level 'has_more' reports whether structural rows "
+     "remain. Semantic results have no score threshold: they are ranked inside a fixed "
+     "250-candidate window before offset/limit slicing. The first semantic keyword selects that "
+     "bounded window; remaining keywords rerank it, so keyword order can affect saturated "
+     "results. JSON reports semantic pagination under "
+     "semantic.total, semantic.has_more, and semantic.truncated; tree output uses "
+     "semantic_total, semantic_has_more, and semantic_truncated. Semantic has_more only means "
+     "another page remains inside that window. Semantic truncated means the window filled and "
+     "corpus completeness is unknown. Advance offset by the number of semantic rows returned "
+     "while semantic has_more is true. If semantic truncated is true, narrow or rephrase the "
+     "query, or use another search mode, before claiming completeness.",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},"
      "\"query\":{\"type\":\"string\",\"description\":\"Natural-language or keyword full-text "
      "search using BM25 ranking. Tokens are split on whitespace; camelCase identifiers are "
@@ -443,13 +450,14 @@ static const tool_def_t TOOLS[] = {
      "\"type\":\"array\",\"items\":{\"type\":\"string\"},\"description\":\"MUST be an ARRAY of "
      "keyword strings (e.g. [\\\"send\\\",\\\"pubsub\\\",\\\"publish\\\"]) — NOT a single string. "
      "Each keyword is scored independently via per-keyword min-cosine; results reflect functions "
-     "that score well on ALL keywords. Requires moderate/full index mode. Results appear in the "
-     "'semantic_results' field (separate from 'results').\"},\"limit\":{\"type\":"
-     "\"integer\",\"description\":\"Max results per call. Default 50. Response carries "
-     "'total' (full match count) and 'has_more' (true if truncated) so callers can "
-     "detect the limit and paginate.\"},\"offset\":{\"type\":\"integer\",\"default\":0,"
-     "\"description\":\"Skip the first N matching nodes. Combine with 'limit' to page: "
-     "increment offset by limit and re-call while has_more is true.\"},"
+     "that score well on ALL keywords; no score threshold is applied. Requires moderate/full "
+     "index mode. Results are ranked inside the fixed 250-candidate window before pagination; "
+     "see the tool description for semantic metadata and completeness guidance.\"},\"limit\":{"
+     "\"type\":\"integer\",\"description\":\"Max rows per result set per call. Default 50. "
+     "Structural and semantic pagination have separate metadata as described above.\"},"
+     "\"offset\":{\"type\":\"integer\",\"default\":0,\"description\":\"Skip the first N matching "
+     "nodes in each requested result set. Combine with 'limit' to page, advancing by the number "
+     "of rows returned while that result set's has_more is true.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\","
      "\"description\":\"Response encoding. tree (default): prefix-grouped text rows. "
      "json: the SAME tree model as structured JSON (groups + column-ordered row arrays).\"},"
@@ -1548,7 +1556,19 @@ int cbm_mcp_get_int_arg(const char *args_json, const char *key, int default_val)
     yyjson_val *val = yyjson_obj_get(root, key);
     int result = default_val;
     if (val && yyjson_is_int(val)) {
-        result = yyjson_get_int(val);
+        if (yyjson_is_uint(val)) {
+            uint64_t value = yyjson_get_uint(val);
+            result = value > INT_MAX ? INT_MAX : (int)value;
+        } else {
+            int64_t value = yyjson_get_sint(val);
+            if (value > INT_MAX) {
+                result = INT_MAX;
+            } else if (value < INT_MIN) {
+                result = INT_MIN;
+            } else {
+                result = (int)value;
+            }
+        }
     }
     yyjson_doc_free(doc);
     return result;
@@ -3219,8 +3239,12 @@ static int extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, 
 /* Emit vector-search hits in the json-tree model: "semantic": {cols, rows}
  * — score order preserved (ranked output is never regrouped). */
 static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                  cbm_vector_result_t *vresults, int vcount) {
+                                  const cbm_vector_result_t *vresults, int vcount, int total,
+                                  bool has_more, bool truncated) {
     yyjson_mut_val *sem = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_int(doc, sem, "total", total);
+    yyjson_mut_obj_add_bool(doc, sem, "has_more", has_more);
+    yyjson_mut_obj_add_bool(doc, sem, "truncated", truncated);
     yyjson_mut_val *scols = yyjson_mut_arr(doc);
     static const char *const sem_cols[] = {"qn", "label", "file", "score"};
     for (size_t ci = 0; ci < sizeof(sem_cols) / sizeof(sem_cols[0]); ci++) {
@@ -3240,13 +3264,81 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "semantic", sem);
 }
 
+typedef enum {
+    SEMANTIC_QUERY_OK = 0,
+    SEMANTIC_QUERY_TYPE_ERROR,
+    SEMANTIC_QUERY_STORE_ERROR,
+} semantic_query_status_t;
+
+enum { SEMANTIC_CANDIDATE_WINDOW = 250 };
+
+typedef struct {
+    int start;
+    int count;
+    bool has_more;
+    bool truncated;
+} semantic_page_t;
+
+static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *vresults,
+                                       int vcount, int total, bool has_more, bool truncated);
+
+static semantic_page_t semantic_page(int total, int offset, int limit) {
+    int start = offset < total ? offset : total;
+    int remaining = total - start;
+    int count = limit < remaining ? limit : remaining;
+    return (semantic_page_t){
+        .start = start,
+        .count = count,
+        .has_more = count < remaining,
+        .truncated = total == SEMANTIC_CANDIDATE_WINDOW,
+    };
+}
+
+static char *combine_bm25_semantic(const char *bm25_output, bool json,
+                                   const cbm_vector_result_t *vresults, int vcount, int offset,
+                                   int limit) {
+    semantic_page_t page = semantic_page(vcount, offset, limit);
+    if (!json) {
+        cbm_sb_t sb;
+        cbm_sb_init(&sb);
+        cbm_sb_append(&sb, bm25_output);
+        emit_semantic_results_toon(&sb, page.count > 0 ? vresults + page.start : NULL, page.count,
+                                   vcount, page.has_more, page.truncated);
+        return cbm_sb_finish(&sb);
+    }
+
+    yyjson_doc *source = yyjson_read(bm25_output, strlen(bm25_output), 0);
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root =
+        source && doc ? yyjson_val_mut_copy(doc, yyjson_doc_get_root(source)) : NULL;
+    if (!source || !doc || !root) {
+        if (source) {
+            yyjson_doc_free(source);
+        }
+        if (doc) {
+            yyjson_mut_doc_free(doc);
+        }
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    emit_semantic_results(doc, root, page.count > 0 ? vresults + page.start : NULL, page.count,
+                          vcount, page.has_more, page.truncated);
+    char *combined = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    yyjson_doc_free(source);
+    return combined;
+}
+
 /* Run the semantic_query vector search from raw args. Sets *out_vresults /
- * *out_vcount (caller frees via cbm_store_free_vector_results when vcount>0).
- * Returns true if semantic_query was provided as a non-array (type error —
- * caller should surface to the user). */
-static bool run_semantic_query_core(const char *args, cbm_store_t *store, const char *project,
-                                    int limit, cbm_vector_result_t **out_vresults, int *out_vcount,
-                                    bool *out_present) {
+ * *out_vcount (caller frees via cbm_store_free_vector_results).
+ *
+ * The 250-candidate window bounds vector scoring cost while giving callers a
+ * useful, stable result universe to paginate. It is intentionally independent
+ * of the requested page size so changing limit cannot change ranking. */
+static semantic_query_status_t run_semantic_query_core(const char *args, cbm_store_t *store,
+                                                       const char *project,
+                                                       cbm_vector_result_t **out_vresults,
+                                                       int *out_vcount, bool *out_present) {
     enum { MAX_KW_SEARCH = 32 };
     *out_vresults = NULL;
     *out_vcount = 0;
@@ -3259,26 +3351,30 @@ static bool run_semantic_query_core(const char *args, cbm_store_t *store, const 
     if (out_present && sq_val) {
         *out_present = true;
     }
-    bool type_error = false;
     if (sq_val && !yyjson_is_arr(sq_val)) {
-        type_error = true;
+        if (args_doc) {
+            yyjson_doc_free(args_doc);
+        }
+        return SEMANTIC_QUERY_TYPE_ERROR;
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
         const char *keywords[MAX_KW_SEARCH];
         int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
-        int sem_limit = limit > 0 ? limit : CBM_SZ_16;
-        if (cbm_store_vector_search(store, project, keywords, ki, sem_limit, &vresults, &vcount) ==
-                CBM_STORE_OK &&
-            vcount > 0) {
-            *out_vresults = vresults;
-            *out_vcount = vcount;
+        int store_rc = cbm_store_vector_search(store, project, keywords, ki,
+                                               SEMANTIC_CANDIDATE_WINDOW, &vresults, &vcount);
+        if (store_rc != CBM_STORE_OK) {
+            cbm_store_free_vector_results(vresults, vcount);
+            yyjson_doc_free(args_doc);
+            return SEMANTIC_QUERY_STORE_ERROR;
         }
+        *out_vresults = vresults;
+        *out_vcount = vcount;
     }
     if (args_doc) {
         yyjson_doc_free(args_doc);
     }
-    return type_error;
+    return SEMANTIC_QUERY_OK;
 }
 
 /* ── Tree output for search_graph ───────────────────────────────────
@@ -3618,7 +3714,7 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
 
 /* Emit semantic vector-search results as a TOON table. */
 static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *vresults,
-                                       int vcount) {
+                                       int vcount, int total, bool has_more, bool truncated) {
     static const char *const cols[] = {"qn", "label", "file", "score"};
     cbm_tree_table_header(sb, "semantic", vcount, cols, 4);
     for (int v = 0; v < vcount; v++) {
@@ -3629,6 +3725,9 @@ static void emit_semantic_results_toon(cbm_sb_t *sb, const cbm_vector_result_t *
         cbm_tree_cell_real(sb, vresults[v].score, false);
         cbm_tree_row_end(sb);
     }
+    cbm_tree_scalar_int(sb, "semantic_total", total);
+    cbm_tree_scalar_bool(sb, "semantic_has_more", has_more);
+    cbm_tree_scalar_bool(sb, "semantic_truncated", truncated);
 }
 
 static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
@@ -3654,10 +3753,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool legacy_json = format_arg && strcmp(format_arg, "json") == 0;
     free(format_arg);
 
-    /* BM25 path: if `query` is set, run FTS5 full-text search with ranking
-     * and return early.  The regex/vector path below is untouched for all
-     * other callers.  If FTS5 is unavailable or the query is empty after
-     * tokenization, fall through to the regex path. */
+    /* BM25 path: if `query` is set, run FTS5 full-text search with ranking.
+     * BM25-only requests retain the fast return. A combined semantic request
+     * appends its independently paged sidecar before returning. If FTS5 is
+     * unavailable or the query is empty after tokenization, fall through to
+     * the regex/vector path. */
     char *query = cbm_mcp_get_string_arg(args, "query");
     if (query && query[0]) {
         int q_limit = cbm_mcp_get_int_arg(args, "limit", BM25_DEFAULT_LIMIT);
@@ -3667,6 +3767,41 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             bm25_search(store, project, query, q_file_pattern, q_limit, q_offset, !legacy_json);
         free(q_file_pattern);
         if (bm25_json) {
+            cbm_vector_result_t *vresults = NULL;
+            int vcount = 0;
+            bool sq_present = false;
+            semantic_query_status_t semantic_status =
+                run_semantic_query_core(args, store, project, &vresults, &vcount, &sq_present);
+            if (semantic_status != SEMANTIC_QUERY_OK) {
+                cbm_store_free_vector_results(vresults, vcount);
+                free(bm25_json);
+                free(query);
+                free(project);
+                if (semantic_status == SEMANTIC_QUERY_STORE_ERROR) {
+                    return cbm_mcp_text_result("semantic search failed", true);
+                }
+                return cbm_mcp_text_result(
+                    "semantic_query must be an array of keyword strings, e.g. "
+                    "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
+                    "into individual keywords; each is scored independently via per-keyword "
+                    "min-cosine.",
+                    true);
+            }
+            if (sq_present) {
+                int semantic_limit = q_limit > 0 ? q_limit : CBM_DEFAULT_SEARCH_LIMIT;
+                int semantic_offset = q_offset > 0 ? q_offset : 0;
+                char *combined = combine_bm25_semantic(bm25_json, legacy_json, vresults, vcount,
+                                                       semantic_offset, semantic_limit);
+                cbm_store_free_vector_results(vresults, vcount);
+                free(bm25_json);
+                free(query);
+                free(project);
+                char *result =
+                    cbm_mcp_text_result(combined ? combined : "out of memory", combined == NULL);
+                free(combined);
+                return result;
+            }
+            cbm_store_free_vector_results(vresults, vcount);
             free(query);
             free(project);
             char *result = cbm_mcp_text_result(bm25_json, false);
@@ -3685,6 +3820,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     bool include_connected = cbm_mcp_get_bool_arg(args, "include_connected");
     int limit = cbm_mcp_get_int_arg(args, "limit", CBM_DEFAULT_SEARCH_LIMIT);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
+    int semantic_limit = limit > 0 ? limit : CBM_DEFAULT_SEARCH_LIMIT;
+    int semantic_offset = offset > 0 ? offset : 0;
     int min_degree = cbm_mcp_get_int_arg(args, "min_degree", CBM_NOT_FOUND);
     int max_degree = cbm_mcp_get_int_arg(args, "max_degree", CBM_NOT_FOUND);
 
@@ -3729,9 +3866,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
         bool sq_present = false;
-        bool sq_type_error =
-            run_semantic_query_core(args, store, project, limit, &vresults, &vcount, &sq_present);
-        if (!sq_type_error) {
+        semantic_query_status_t semantic_status =
+            run_semantic_query_core(args, store, project, &vresults, &vcount, &sq_present);
+        if (semantic_status == SEMANTIC_QUERY_OK) {
             /* Semantic-only calls get semantic results only: the legacy
              * behavior also ran the UNFILTERED regex search and prepended
              * up to `limit` unrelated enriched nodes to the response. */
@@ -3774,18 +3911,17 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
                     }
                 }
             }
-            if (vcount > 0) {
-                emit_semantic_results_toon(&sb, vresults, vcount);
-            } else if (semantic_only) {
-                static const char *const sem_cols[] = {"qn", "label", "file", "score"};
-                cbm_tree_table_header(&sb, "semantic", 0, sem_cols, 4);
+            if (sq_present) {
+                semantic_page_t page = semantic_page(vcount, semantic_offset, semantic_limit);
+                emit_semantic_results_toon(&sb, page.count > 0 ? vresults + page.start : NULL,
+                                           page.count, vcount, page.has_more, page.truncated);
+            }
+            if (semantic_only && vcount == 0) {
                 cbm_tree_scalar_str(&sb, "hint",
                                     "No semantic matches. semantic_query needs a moderate/full "
                                     "index; try broader or fewer keywords.");
             }
-            if (vcount > 0) {
-                cbm_store_free_vector_results(vresults, vcount);
-            }
+            cbm_store_free_vector_results(vresults, vcount);
             if (fields_owner) {
                 yyjson_doc_free(fields_owner);
             }
@@ -3801,7 +3937,8 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
             free(text);
             return result;
         }
-        /* semantic_query type error: fall through to the shared error text. */
+        /* Semantic validation and retrieval errors share cleanup, but retain
+         * distinct user-facing failures. */
         if (fields_owner) {
             yyjson_doc_free(fields_owner);
         }
@@ -3811,6 +3948,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(qn_pattern);
         free(file_pattern);
         free(relationship);
+        if (semantic_status == SEMANTIC_QUERY_STORE_ERROR) {
+            return cbm_mcp_text_result("semantic search failed", true);
+        }
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
             "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
@@ -3822,15 +3962,18 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_vector_result_t *vresults = NULL;
     int vcount = 0;
     bool sq_present = false;
-    bool sq_type_error =
-        run_semantic_query_core(args, store, project, limit, &vresults, &vcount, &sq_present);
-    if (sq_type_error) {
+    semantic_query_status_t semantic_status =
+        run_semantic_query_core(args, store, project, &vresults, &vcount, &sq_present);
+    if (semantic_status != SEMANTIC_QUERY_OK) {
         free(project);
         free(label);
         free(name_pattern);
         free(qn_pattern);
         free(file_pattern);
         free(relationship);
+        if (semantic_status == SEMANTIC_QUERY_STORE_ERROR) {
+            return cbm_mcp_text_result("semantic search failed", true);
+        }
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
             "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
@@ -3882,10 +4025,12 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         }
     }
 
-    if (vcount > 0) {
-        emit_semantic_results(doc, root, vresults, vcount);
-        cbm_store_free_vector_results(vresults, vcount);
+    if (sq_present) {
+        semantic_page_t page = semantic_page(vcount, semantic_offset, semantic_limit);
+        emit_semantic_results(doc, root, page.count > 0 ? vresults + page.start : NULL, page.count,
+                              vcount, page.has_more, page.truncated);
     }
+    cbm_store_free_vector_results(vresults, vcount);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
