@@ -3217,19 +3217,18 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     return json;
 }
 
-/* Extract keyword strings from a yyjson array into `keywords`.  Returns the
- * number of strings copied (capped at `max_out`). */
+/* Extract keyword strings from a yyjson array into `keywords`. Returns the
+ * number copied (capped at `max_out`), or -1 when any element is not a string. */
 static int extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, int max_out) {
-    int kw_count = (int)yyjson_arr_size(sq_val);
-    if (kw_count > max_out) {
-        kw_count = max_out;
-    }
     size_t kw_idx = 0;
     size_t kw_max = 0;
     yyjson_val *kw_val;
     int ki = 0;
     yyjson_arr_foreach(sq_val, kw_idx, kw_max, kw_val) {
-        if (ki < kw_count && yyjson_is_str(kw_val)) {
+        if (!yyjson_is_str(kw_val)) {
+            return -1;
+        }
+        if (ki < max_out) {
             keywords[ki++] = yyjson_get_str(kw_val);
         }
     }
@@ -3359,6 +3358,10 @@ static semantic_query_status_t run_semantic_query_core(const char *args, cbm_sto
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
         const char *keywords[MAX_KW_SEARCH];
         int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
+        if (ki < 0) {
+            yyjson_doc_free(args_doc);
+            return SEMANTIC_QUERY_TYPE_ERROR;
+        }
         cbm_vector_result_t *vresults = NULL;
         int vcount = 0;
         int store_rc = cbm_store_vector_search(store, project, keywords, ki,

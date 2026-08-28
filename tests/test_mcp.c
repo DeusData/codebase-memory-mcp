@@ -2376,6 +2376,39 @@ TEST(tool_search_graph_semantic_store_error_has_no_partial_results_issue915) {
     PASS();
 }
 
+TEST(tool_search_graph_semantic_invalid_element_type_issue915) {
+    mcp_semantic_pagination_fixture_t fixture;
+    ASSERT_TRUE(mcp_semantic_pagination_fixture_open(&fixture));
+    cbm_mcp_server_t *srv = fixture.server;
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"semantic-page-underfull\",\"semantic_query\":[42],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(strstr(inner, "semantic_query must be an array of keyword strings"));
+    ASSERT_NULL(strstr(inner, "semantic search failed"));
+
+    char *combined_response =
+        cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"semantic-page-underfull\",\"query\":\"strong_match\","
+                            "\"semantic_query\":[\"horizontal\",42],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(combined_response);
+    ASSERT_NOT_NULL(strstr(combined_response, "\"isError\":true"));
+    char *combined_inner = extract_text_content(combined_response);
+    ASSERT_NOT_NULL(strstr(combined_inner, "semantic_query must be an array of keyword strings"));
+    ASSERT_NULL(strstr(combined_inner, "semantic search failed"));
+    ASSERT_NULL(strstr(combined_response, "\"search_mode\":\"bm25\""));
+
+    free(combined_inner);
+    free(combined_response);
+    free(inner);
+    free(response);
+    mcp_semantic_pagination_fixture_close(&fixture);
+    PASS();
+}
+
 /* callers_total/callees_total must count what the caller can enumerate: with
  * include_tests=false (default) test-file rows are hidden from the table, so
  * the totals must apply the same filter — a raw visited_count overstated the
@@ -12197,6 +12230,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_semantic_pagination_stable_window_issue915);
     RUN_TEST(tool_search_graph_semantic_pagination_envelopes_issue915);
     RUN_TEST(tool_search_graph_semantic_store_error_has_no_partial_results_issue915);
+    RUN_TEST(tool_search_graph_semantic_invalid_element_type_issue915);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
