@@ -4899,6 +4899,68 @@ TEST(extract_go_method_receiver_qualified_qn) {
     PASS();
 }
 
+TEST(extract_go_multiple_init_disambiguated) {
+    /* Go allows several init() per package (even per file); each gets a
+     * file+ordinal-suffixed QN (#495 cfg-twin pattern) so none is lost to the
+     * same-QN upsert. The ordinal — unlike a line number — must not move when
+     * code is inserted above the function: the QN is node identity, and a
+     * line-based suffix would churn nodes on every unrelated edit. */
+    CBMFileResult *r = extract("package m\n"
+                               "func init() { a() }\n"
+                               "func init() { b() }\n"
+                               "func a() {}\n"
+                               "func b() {}\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const char *first = NULL;
+    const char *second = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || strcmp(d->name, "init") != 0) {
+            continue;
+        }
+        if (!first) {
+            first = d->qualified_name;
+        } else {
+            second = d->qualified_name;
+        }
+    }
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_EQ(first, "t.init#x.go:1");
+    ASSERT_STR_EQ(second, "t.init#x.go:2");
+
+    /* Stability: an insertion ABOVE both inits must not change either QN. */
+    CBMFileResult *r2 = extract("package m\n"
+                                "import \"fmt\"\n"
+                                "var shifted = fmt.Sprint(\"pad\")\n"
+                                "func init() { a() }\n"
+                                "func init() { b() }\n"
+                                "func a() {}\n"
+                                "func b() {}\n",
+                                CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r2);
+    ASSERT_FALSE(r2->has_error);
+    int seen = 0;
+    for (int i = 0; i < r2->defs.count; i++) {
+        const CBMDefinition *d = &r2->defs.items[i];
+        if (!d->name || strcmp(d->name, "init") != 0) {
+            continue;
+        }
+        seen++;
+        if (seen == 1) {
+            ASSERT_STR_EQ(d->qualified_name, "t.init#x.go:1");
+        } else {
+            ASSERT_STR_EQ(d->qualified_name, "t.init#x.go:2");
+        }
+    }
+    ASSERT_EQ(seen, 2);
+    cbm_free_result(r2);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -6580,6 +6642,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_go_selector_call_flags_is_method);
     RUN_TEST(extract_go_method_receiver_qualified_qn);
+    RUN_TEST(extract_go_multiple_init_disambiguated);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);

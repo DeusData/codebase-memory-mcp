@@ -197,6 +197,10 @@ bool cbm_is_loop_node_type(const char *kind);
 // Is this a module-level node? (not nested inside function/class body)
 bool cbm_is_module_level(TSNode node, CBMLanguage lang);
 
+/* 1-based source-order ordinal of a Go `init` among its file's top-level
+ * `init` function_declarations (QN disambiguation, #1910). */
+int cbm_go_init_ordinal(TSNode fn_node, const char *source);
+
 // Same check, but the node's PARENT is supplied directly — avoids the
 // O(n) ts_node_parent rescan. Use at call sites iterating a known
 // parent's children (the common case). `parent` is the parent of the
