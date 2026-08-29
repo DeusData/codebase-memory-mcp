@@ -24,6 +24,12 @@ typedef struct {
     size_t block_size;  /* current block capacity */
     size_t used;        /* bytes used in current block */
     size_t total_alloc; /* cumulative bytes allocated (for stats) */
+    size_t strdup_alloc;  /* requested bytes returned by strdup/strndup helpers */
+    size_t sprintf_alloc; /* requested bytes returned by sprintf helper */
+    size_t alloc_le_64;
+    size_t alloc_le_256;
+    size_t alloc_le_4096;
+    size_t alloc_gt_4096;
 } CBMArena;
 
 /* Initialize arena with default block size. */

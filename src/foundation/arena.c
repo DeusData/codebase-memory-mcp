@@ -61,6 +61,15 @@ void *cbm_arena_alloc(CBMArena *a, size_t n) {
     }
     /* 8-byte alignment */
     n = (n + ARENA_ALIGN) & ~(size_t)ARENA_ALIGN;
+    if (n <= 64) {
+        a->alloc_le_64 += n;
+    } else if (n <= 256) {
+        a->alloc_le_256 += n;
+    } else if (n <= 4096) {
+        a->alloc_le_4096 += n;
+    } else {
+        a->alloc_gt_4096 += n;
+    }
     if (a->nblocks == 0) {
         return NULL;
     }
@@ -90,6 +99,7 @@ char *cbm_arena_strdup(CBMArena *a, const char *s) {
     size_t len = strlen(s);
     char *dst = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (dst) {
+        a->strdup_alloc += len + SKIP_ONE;
         memcpy(dst, s, len + SKIP_ONE);
     }
     return dst;
@@ -101,6 +111,7 @@ char *cbm_arena_strndup(CBMArena *a, const char *s, size_t len) {
     }
     char *dst = (char *)cbm_arena_alloc(a, len + SKIP_ONE);
     if (dst) {
+        a->strdup_alloc += len + SKIP_ONE;
         memcpy(dst, s, len);
         dst[len] = '\0';
     }
@@ -120,6 +131,7 @@ char *cbm_arena_sprintf(CBMArena *a, const char *fmt, ...) {
     if (!dst) {
         return NULL;
     }
+    a->sprintf_alloc += (size_t)needed + SKIP_ONE;
 
     va_start(args, fmt);
     vsnprintf(dst, (size_t)needed + SKIP_ONE, fmt, args);

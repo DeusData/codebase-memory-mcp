@@ -205,6 +205,9 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                                                CBMFileResult *const *results,
                                                const char *const *rels, int count);
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespace_names,
+                                                     const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
@@ -512,6 +515,9 @@ typedef struct {
     bool retain_sources_set; /* false keeps the default retain_sources policy */
     size_t retain_total_budget_bytes;
     size_t retain_per_file_max_bytes;
+    /* Optional run-scoped latch shared by repeated streaming batches. When
+     * NULL, cbm_parallel_extract_ex owns a fresh latch for this invocation. */
+    _Atomic int *backpressure_futile;
 } cbm_parallel_extract_opts_t;
 
 int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
@@ -526,6 +532,12 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
  * Registers callable symbols (Function/Method/Class) in ctx->registry. */
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count, CBMFileResult **result_cache);
+int cbm_register_definitions_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                        int file_count, CBMFileResult **result_cache);
+int cbm_create_relationship_carriers_from_cache(cbm_pipeline_ctx_t *ctx,
+                                                const cbm_file_info_t *files, int file_count,
+                                                CBMFileResult **result_cache,
+                                                CBMHashTable *namespace_map);
 
 /* Phase 4: Parallel call/usage/semantic resolution.
  * Each worker resolves calls, usages, throws, rw, inherits, decorates,
@@ -559,6 +571,13 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
                           * Typed as void* here to dodge the typedef/tag ordering
                           * problem — pass_parallel.c casts back to CBMCrossLspRegistries*. */
                          void *cross_registries);
+int cbm_parallel_resolve_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                            CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
+                            int worker_count, CBMLSPDef *all_defs, int def_count,
+                            char *const *def_modules,
+                            struct CBMModuleDefIndex *module_def_index,
+                            void *cross_registries, bool finalize_graph);
+int cbm_parallel_resolve_finalize(cbm_pipeline_ctx_t *ctx);
 
 /* Post-merge: create Route nodes for HTTP_CALLS/ASYNC_CALLS edges that
  * have url_path in properties but point to library functions instead of routes.

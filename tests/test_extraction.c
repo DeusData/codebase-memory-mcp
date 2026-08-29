@@ -6434,9 +6434,45 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
     PASS();
 }
 
+static int pointer_is_in_result_arena(const CBMFileResult *result, const void *pointer) {
+    uintptr_t value = (uintptr_t)pointer;
+    for (int i = 0; i < result->arena.nblocks; i++) {
+        uintptr_t start = (uintptr_t)result->arena.blocks[i];
+        uintptr_t end = start + result->arena.block_sizes[i];
+        if (value >= start && value < end) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(extraction_result_arrays_have_independent_ownership) {
+    char source[16384];
+    size_t used = 0;
+    for (int i = 0; i < 96; i++) {
+        int written = snprintf(source + used, sizeof(source) - used,
+                               "export function f%d() { return g%d(); }\n", i, i);
+        ASSERT(written > 0);
+        used += (size_t)written;
+        ASSERT(used < sizeof(source));
+    }
+    CBMFileResult *result = extract(source, CBM_LANG_TYPESCRIPT, "ownership", "many.ts");
+    ASSERT_NOT_NULL(result);
+    ASSERT(result->defs.count >= 96);
+    ASSERT(result->calls.count >= 96);
+    ASSERT_NOT_NULL(result->defs.items);
+    ASSERT_NOT_NULL(result->calls.items);
+    ASSERT(!pointer_is_in_result_arena(result, result->defs.items));
+    ASSERT(!pointer_is_in_result_arena(result, result->calls.items));
+    cbm_free_result(result);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
+
+    RUN_TEST(extraction_result_arrays_have_independent_ownership);
 
     /* Wide-flat-file linearity (ms-typescript hang) */
     RUN_TEST(extract_wide_flat_file_is_linear);
