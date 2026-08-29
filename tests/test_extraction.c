@@ -3529,6 +3529,26 @@ TEST(extract_java_method_annotations_issue382) {
     PASS();
 }
 
+/* Issue #1865: tree-sitter-c-sharp emits one attribute_list child for each
+ * separate bracket group. Looking up a single wrapper silently dropped every
+ * group after the first one. */
+TEST(extract_csharp_multiple_attribute_lists_issue1865) {
+    CBMFileResult *r = extract("public class OrdersController {\n"
+                               "  [HttpPost]\n"
+                               "  [Route(\"orders/{id}/confirm\")]\n"
+                               "  public void Confirm(Guid id) {}\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "OrdersController.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *m = find_def_by_name(r, "Confirm");
+    ASSERT_NOT_NULL(m);
+    ASSERT(decorators_contain(m, "HttpPost"));
+    ASSERT(decorators_contain(m, "Route"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
@@ -6318,6 +6338,7 @@ SUITE(extraction) {
     RUN_TEST(js_index_module_qn_not_collide_with_folder);
     RUN_TEST(python_regular_module_qn_unchanged);
     RUN_TEST(extract_java_method_annotations_issue382);
+    RUN_TEST(extract_csharp_multiple_attribute_lists_issue1865);
     RUN_TEST(arkts_component_struct);
     RUN_TEST(arkts_exported_struct_decorators);
     RUN_TEST(arkts_member_decorators);
