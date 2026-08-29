@@ -3015,6 +3015,25 @@ TEST(go_imports) {
     PASS();
 }
 
+/* cgo's `import "C"` is a pseudo-package, not a real import: keeping it lets the
+ * import resolver name-match "C" onto an arbitrary project symbol called C. The
+ * real imports of the same file must survive. */
+TEST(go_cgo_pseudo_import_dropped) {
+    CBMFileResult *r = extract("package m\n\n/*\nstatic int helper(void) { return 1; }\n*/\n"
+                               "import \"C\"\n\nimport \"fmt\"\n\n"
+                               "func Run() { fmt.Println(C.helper()) }\n",
+                               CBM_LANG_GO, "t", "cgo.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "fmt"));
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_NOT_NULL(r->imports.items[i].module_path);
+        ASSERT_TRUE(strcmp(r->imports.items[i].module_path, "C") != 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1935: Go struct fields were never extracted — find_class_body() returns the
  * struct_type node, whose only named child is a field_declaration_list, so the
  * member loop matched nothing and every field was silently skipped (0 Field
@@ -6752,6 +6771,7 @@ SUITE(extraction) {
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(go_cgo_pseudo_import_dropped);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);
