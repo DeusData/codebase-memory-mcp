@@ -2953,6 +2953,96 @@ TEST(daemon_application_coalesces_semantically_identical_index_requests) {
     PASS();
 }
 
+/* Regression contract: a shared daemon application must retain the workspace
+ * boundary on the owning session.  A second live client with a different root
+ * must neither inherit the first client's boundary nor require a common
+ * ancestor grant. */
+TEST(daemon_application_keeps_allowed_root_session_scoped) {
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *sessions[2] = {
+        app_test_open(&callbacks, 31), app_test_open(&callbacks, 32)};
+
+    char parent[APP_TEST_PATH_CAP];
+    char roots[2][APP_TEST_PATH_CAP];
+    (void)snprintf(parent, sizeof(parent), "%s/cbm-app-session-roots-XXXXXX", cbm_tmpdir());
+    bool paths_ok = cbm_mkdtemp(parent) != NULL;
+    for (size_t i = 0; paths_ok && i < 2; i++) {
+        int written = snprintf(roots[i], sizeof(roots[i]), "%s/%s", parent,
+                               i == 0 ? "alpha" : "beta");
+        paths_ok = written > 0 && written < (int)sizeof(roots[i]) && cbm_mkdir_p(roots[i], 0700);
+    }
+
+    uint8_t *contexts[2] = {NULL, NULL};
+    uint32_t context_lengths[2] = {0, 0};
+    uint8_t *tools[2] = {NULL, NULL};
+    uint32_t tool_lengths[2] = {0, 0};
+    char args[2][APP_TEST_PATH_CAP + 64];
+    bool encoded = paths_ok && sessions[0] && sessions[1];
+    for (size_t i = 0; encoded && i < 2; i++) {
+        int written = snprintf(args[i], sizeof(args[i]),
+                               "{\"repo_path\":\"%s\",\"mode\":\"fast\"}", roots[i]);
+        encoded = written > 0 && written < (int)sizeof(args[i]) &&
+                  app_test_context_request(roots[i], roots[i], &contexts[i],
+                                           &context_lengths[i]) &&
+                  app_test_tool_request("index_repository", args[i], &tools[i], &tool_lengths[i]);
+    }
+
+    bool requests_ok = encoded;
+    uint8_t *responses[2] = {NULL, NULL};
+    uint32_t response_lengths[2] = {0, 0};
+    for (size_t i = 0; requests_ok && i < 2; i++) {
+        uint8_t *empty = NULL;
+        uint32_t empty_length = 0;
+        requests_ok = app_test_request(&callbacks, sessions[i], contexts[i], context_lengths[i],
+                                       &empty, &empty_length) ==
+                          CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                      !empty && empty_length == 0;
+        free(empty);
+    }
+    for (size_t i = 0; requests_ok && i < 2; i++) {
+        requests_ok = app_test_request(&callbacks, sessions[i], tools[i], tool_lengths[i],
+                                       &responses[i], &response_lengths[i]) ==
+                          CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                      responses[i] && strstr((char *)responses[i], "indexed") &&
+                      !strstr((char *)responses[i], "outside the allowed root");
+    }
+
+    for (size_t i = 0; i < 2; i++) {
+        if (sessions[i]) {
+            callbacks.session_close(callbacks.context, sessions[i]);
+        }
+    }
+    (void)cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+
+    ASSERT_TRUE(requests_ok);
+    ASSERT_EQ(atomic_load(&fake.starts), 2);
+    ASSERT_EQ(atomic_load(&fake.destroys), 2);
+
+    for (size_t i = 0; i < 2; i++) {
+        free(contexts[i]);
+        free(tools[i]);
+        free(responses[i]);
+        (void)cbm_rmdir(roots[i]);
+    }
+    (void)cbm_rmdir(parent);
+    PASS();
+}
+
 TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job) {
     enum { PRIOR_SUBSCRIBERS = 16 };
     static const char stale_response[] =
@@ -5369,6 +5459,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_update_generation_retries_cancelled_check);
     RUN_TEST(daemon_application_final_disconnect_cancels_and_joins_update_generation);
     RUN_TEST(daemon_application_coalesces_semantically_identical_index_requests);
+    RUN_TEST(daemon_application_keeps_allowed_root_session_scoped);
     RUN_TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job);
     RUN_TEST(daemon_application_request_cancel_detaches_only_one_coalesced_subscriber);
     RUN_TEST(daemon_application_cancels_physical_job_only_after_final_session);
