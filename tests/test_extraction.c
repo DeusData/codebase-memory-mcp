@@ -4254,12 +4254,12 @@ TEST(extract_go_no_filename_in_module_qn) {
     ASSERT_NOT_NULL(conn);
     ASSERT_STR_EQ(conn->qualified_name, "proj.myapp.db.Conn");
 
-    /* Go method nodes keep a FLAT QN (module + name) with a separate
-     * parent_class link to the receiver type — the QN must carry the
+    /* Go method nodes carry a receiver-qualified QN (module + receiver type +
+     * name) plus the parent_class link — the QN must carry the
      * directory-based module and NOT the `.conn.` filename segment. */
     const CBMDefinition *query = find_def_by_name(r, "Query");
     ASSERT_NOT_NULL(query);
-    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Query");
+    ASSERT_STR_EQ(query->qualified_name, "proj.myapp.db.Conn.Query");
     ASSERT_EQ(strstr(query->qualified_name, ".conn."), NULL);
     /* The method's parent_class must match the type node QN (for DEFINES_METHOD). */
     ASSERT_NOT_NULL(query->parent_class);
@@ -4852,6 +4852,49 @@ TEST(extract_go_selector_call_flags_is_method) {
     }
     ASSERT_TRUE(saw_selector);
     ASSERT_TRUE(saw_bare);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_go_method_receiver_qualified_qn) {
+    /* A Go method QN carries the receiver type (proj.pkg.Recv.method), same
+     * shape as C++ out-of-line methods and Go interface members — so two
+     * same-name methods on different receivers no longer collide in the
+     * graph upsert. Free functions keep the flat package QN. */
+    CBMFileResult *r = extract("package m\n"
+                               "type Storage struct{}\n"
+                               "type Cache struct{}\n"
+                               "func (s *Storage) Close() {}\n"
+                               "func (c Cache) Close() {}\n"
+                               "func Shutdown() {}\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_storage = false;
+    bool saw_cache = false;
+    bool saw_free = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || !d->qualified_name) {
+            continue;
+        }
+        if (strcmp(d->name, "Close") == 0 && strcmp(d->qualified_name, "t.Storage.Close") == 0) {
+            ASSERT_STR_EQ(d->label, "Method");
+            ASSERT_STR_EQ(d->parent_class, "t.Storage");
+            saw_storage = true;
+        }
+        if (strcmp(d->name, "Close") == 0 && strcmp(d->qualified_name, "t.Cache.Close") == 0) {
+            ASSERT_STR_EQ(d->parent_class, "t.Cache");
+            saw_cache = true;
+        }
+        if (strcmp(d->name, "Shutdown") == 0) {
+            ASSERT_STR_EQ(d->qualified_name, "t.Shutdown");
+            saw_free = true;
+        }
+    }
+    ASSERT_TRUE(saw_storage);
+    ASSERT_TRUE(saw_cache);
+    ASSERT_TRUE(saw_free);
     cbm_free_result(r);
     PASS();
 }
@@ -6536,6 +6579,7 @@ SUITE(extraction) {
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_go_selector_call_flags_is_method);
+    RUN_TEST(extract_go_method_receiver_qualified_qn);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);

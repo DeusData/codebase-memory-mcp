@@ -4693,6 +4693,57 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+TEST(pipeline_go_method_caller_keeps_lsp_join) {
+    /* #1909: receiver-qualifying method QNs moves the def/textual-call QN to
+     * package.Type.method — go_lsp's enclosing-function QN must move with it
+     * (the ONE-formula contract), or every LSP resolution sourced from inside
+     * a method body loses its caller join and the edge dies. The callee name
+     * collides across receivers so no short-name fallback can mask the loss. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_mcall_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fxmcall\n\ngo 1.22\n");
+    write_temp_file(tmp, "svc/repo.go",
+                    "package svc\n"
+                    "\n"
+                    "type Repo struct {\n"
+                    "\tn int\n"
+                    "}\n"
+                    "\n"
+                    "func (r *Repo) Install() int {\n"
+                    "\treturn r.helper()\n"
+                    "}\n");
+    write_temp_file(tmp, "svc/helper.go",
+                    "package svc\n"
+                    "\n"
+                    "func (r *Repo) helper() int {\n"
+                    "\treturn r.n\n"
+                    "}\n");
+    write_temp_file(tmp, "other/other.go",
+                    "package other\n"
+                    "\n"
+                    "type Decoy struct{}\n"
+                    "\n"
+                    "func (d *Decoy) helper() int { return 2 }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_mcall.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Install", "helper"));
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_recv_XXXXXX");
@@ -13208,6 +13259,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_method_caller_keeps_lsp_join);
     RUN_TEST(pipeline_go_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
