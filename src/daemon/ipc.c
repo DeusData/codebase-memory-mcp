@@ -1983,6 +1983,26 @@ static bool posix_directory_sync(int dir_fd) {
     return unsupported;
 }
 
+static bool posix_socket_link_pair_unlink_if_matches(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                     const posix_socket_identity_t *identity) {
+    posix_socket_identity_t stable = {0};
+    posix_socket_identity_t anchor = {0};
+    struct stat stable_status = {0};
+    struct stat anchor_status = {0};
+    return endpoint && identity &&
+           posix_socket_path_identity_read(endpoint, endpoint->socket_name, &stable,
+                                           &stable_status) == 1 &&
+           posix_socket_path_identity_read(endpoint, endpoint->socket_anchor_name, &anchor,
+                                           &anchor_status) == 1 &&
+           stable_status.st_nlink == 2 && anchor_status.st_nlink == 2 &&
+           posix_socket_identity_equal(&stable, identity) &&
+           posix_socket_identity_equal(&anchor, identity) &&
+           posix_socket_path_unlink_inode_if_matches(endpoint->dir_fd, endpoint->socket_name,
+                                                     identity, 2) &&
+           posix_socket_path_unlink_inode_if_matches(endpoint->dir_fd, endpoint->socket_anchor_name,
+                                                     identity, 1);
+}
+
 static bool posix_socket_record_temp_name(const char *record_name, char temp_name[NAME_MAX + 1]) {
     if (!record_name || !temp_name) {
         return false;
@@ -2366,23 +2386,7 @@ static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t
                 result = -1;
                 goto cleanup_done;
             }
-            posix_socket_identity_t confirmed_stable = {0};
-            posix_socket_identity_t confirmed_anchor = {0};
-            struct stat confirmed_stable_status = {0};
-            struct stat confirmed_anchor_status = {0};
-            bool confirmed =
-                posix_socket_path_identity_read(endpoint, endpoint->socket_name, &confirmed_stable,
-                                                &confirmed_stable_status) == 1 &&
-                posix_socket_path_identity_read(endpoint, endpoint->socket_anchor_name,
-                                                &confirmed_anchor, &confirmed_anchor_status) == 1 &&
-                confirmed_stable_status.st_nlink == 2 && confirmed_anchor_status.st_nlink == 2 &&
-                posix_socket_identity_equal(&confirmed_stable, &marker.identity) &&
-                posix_socket_identity_equal(&confirmed_anchor, &marker.identity);
-            if (!confirmed ||
-                !posix_socket_path_unlink_inode_if_matches(endpoint->dir_fd, endpoint->socket_name,
-                                                           &marker.identity, 2) ||
-                !posix_socket_path_unlink_inode_if_matches(
-                    endpoint->dir_fd, endpoint->socket_anchor_name, &marker.identity, 1)) {
+            if (!posix_socket_link_pair_unlink_if_matches(endpoint, &marker.identity)) {
                 result = -1;
                 goto cleanup_done;
             }
@@ -2441,10 +2445,33 @@ static int posix_stale_generation_cleanup_locked(const cbm_daemon_ipc_endpoint_t
         goto cleanup_done;
     }
 
+    /* A hard kill can land after the stable link is durable but before either
+     * publication record exists. With startup serialized and lifetime
+     * reserved above, the exact owner-private two-name/two-link shape is
+     * sufficient authority: no unrelated socket can acquire the deterministic
+     * anchor name without being the same inode. Re-read both names immediately
+     * before inode-matched unlinking so replacement or link-count races fail
+     * closed. */
+    if (stable_state == 1 && anchor_state == 1 && stable_status.st_nlink == 2 &&
+        anchor_status.st_nlink == 2 &&
+        posix_socket_identity_equal(&stable_identity, &anchor_identity)) {
+        if (!posix_socket_link_pair_unlink_if_matches(endpoint, &stable_identity) ||
+            !posix_directory_sync(endpoint->dir_fd)) {
+            result = -1;
+            goto cleanup_done;
+        }
+        result = 1;
+        goto cleanup_done;
+    }
+
     /* The deterministic generation-local anchor lets us collect the sole
      * otherwise-untrackable crash boundary: bind/listen completed but the
-     * pending record was not yet durable. It never grants authority over the
-     * public stable path. */
+     * pending record was not yet durable. It never grants authority over a
+     * differing stable socket, so preserve both names when one is present. */
+    if (anchor_state == 1 && stable_state == 1) {
+        result = 0;
+        goto cleanup_done;
+    }
     if (anchor_state == 1) {
         if (anchor_status.st_nlink != 1 ||
             !posix_socket_path_unlink_inode_if_matches(
@@ -3141,11 +3168,11 @@ int cbm_daemon_ipc_generation_probe_under_startup_lock(
     if (!posix_startup_lock_matches_endpoint(endpoint, startup_lock) || startup_lock->prepared) {
         return -1;
     }
-    int lifetime = cbm_daemon_ipc_lifetime_reservation_probe(endpoint);
-    if (lifetime != 0) {
-        return lifetime;
+    int cleanup = cbm_daemon_ipc_stale_generation_cleanup(endpoint, startup_lock);
+    if (cleanup == 1) {
+        return 0;
     }
-    return cbm_daemon_ipc_endpoint_probe(endpoint, 0);
+    return cleanup == 0 ? 1 : -1;
 }
 
 bool cbm_daemon_ipc_startup_lock_prepare_handoff(cbm_daemon_ipc_startup_lock_t *lock) {

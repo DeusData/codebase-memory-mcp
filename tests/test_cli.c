@@ -35,6 +35,8 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #endif
 #ifdef __APPLE__
@@ -1013,6 +1015,122 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     ASSERT_TRUE(target_exists);
     ASSERT_TRUE(log_private);
     ASSERT_TRUE(event_order);
+    PASS();
+}
+
+TEST(cli_install_recovers_markerless_stale_rendezvous) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-markerless-rendezvous-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char runtime_parent[512];
+    char cache_dir[512];
+    char install_dir[512];
+    char target_path[640];
+    char activation_log[640];
+    snprintf(runtime_parent, sizeof(runtime_parent), "%s/runtime", tmpdir);
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(install_dir, sizeof(install_dir), "%s/custom/bin", tmpdir);
+    snprintf(target_path, sizeof(target_path), "%s/codebase-memory-mcp", install_dir);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson", cache_dir);
+    if (test_mkdirp(runtime_parent) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("runtime parent setup failed");
+    }
+
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *shell = getenv("SHELL");
+    char *old_shell = shell ? strdup(shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+    const char *socket_path = endpoint ? cbm_daemon_ipc_endpoint_address(endpoint) : NULL;
+    char anchor_path[1024] = {0};
+    size_t socket_length = socket_path ? strlen(socket_path) : 0;
+    bool anchor_path_ok =
+        socket_length > 5 && strcmp(socket_path + socket_length - 5, ".sock") == 0;
+    if (anchor_path_ok) {
+        int written = snprintf(anchor_path, sizeof(anchor_path), "%.*s.anc",
+                               (int)(socket_length - 5), socket_path);
+        anchor_path_ok = written > 0 && written < (int)sizeof(anchor_path);
+    }
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    size_t address_length = socket_path ? strlen(socket_path) : 0;
+    bool address_ok = address_length > 0 && address_length < sizeof(address.sun_path);
+    if (address_ok) {
+        memcpy(address.sun_path, socket_path, address_length + 1);
+    }
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    address.sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) + address_length + 1);
+#endif
+    socklen_t sockaddr_length =
+        (socklen_t)(offsetof(struct sockaddr_un, sun_path) + address_length + 1);
+    int raw_listener = address_ok && anchor_path_ok ? socket(AF_UNIX, SOCK_STREAM, 0) : -1;
+    struct stat socket_status = {0};
+    struct stat anchor_status = {0};
+    bool orphan_created =
+        raw_listener >= 0 &&
+        bind(raw_listener, (const struct sockaddr *)&address, sockaddr_length) == 0 &&
+        chmod(socket_path, 0600) == 0 && listen(raw_listener, 1) == 0 &&
+        link(socket_path, anchor_path) == 0 && lstat(socket_path, &socket_status) == 0 &&
+        lstat(anchor_path, &anchor_status) == 0 && S_ISSOCK(socket_status.st_mode) &&
+        S_ISSOCK(anchor_status.st_mode) && socket_status.st_nlink == 2 &&
+        anchor_status.st_nlink == 2 && socket_status.st_dev == anchor_status.st_dev &&
+        socket_status.st_ino == anchor_status.st_ino;
+    if (raw_listener >= 0) {
+        (void)close(raw_listener);
+    }
+
+    cbm_cli_set_activation_runtime_parent_for_test(runtime_parent);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
+    char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
+    int install_rc = orphan_created ? cli_test_cmd_install(4, install_argv) : -1;
+    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat target_status = {0};
+    struct stat log_status = {0};
+    struct stat absent_status = {0};
+    bool target_exists = stat(target_path, &target_status) == 0;
+    bool log_private = stat(activation_log, &log_status) == 0 && (log_status.st_mode & 0077) == 0;
+    const char *events = read_test_file(activation_log);
+    const char *requested = events ? strstr(events, "\"phase\":\"requested\"") : NULL;
+    const char *stopped = events ? strstr(events, "\"phase\":\"daemon_stopped\"") : NULL;
+    const char *completed = events ? strstr(events, "\"phase\":\"completed\"") : NULL;
+    bool event_order =
+        requested && stopped && completed && requested < stopped && stopped < completed;
+    errno = 0;
+    bool socket_removed = socket_path && lstat(socket_path, &absent_status) != 0 && errno == ENOENT;
+    errno = 0;
+    bool anchor_removed = lstat(anchor_path, &absent_status) != 0 && errno == ENOENT;
+
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(anchor_path_ok);
+    ASSERT_TRUE(address_ok);
+    ASSERT_TRUE(orphan_created);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(target_exists);
+    ASSERT_TRUE(log_private);
+    ASSERT_TRUE(event_order);
+    ASSERT_TRUE(socket_removed);
+    ASSERT_TRUE(anchor_removed);
     PASS();
 }
 #endif
@@ -13665,6 +13783,7 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release);
     RUN_TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup);
+    RUN_TEST(cli_install_recovers_markerless_stale_rendezvous);
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
