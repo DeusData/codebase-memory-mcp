@@ -103,17 +103,18 @@ void cbm_reset_profile(void) {
 
 // --- Growable array push functions ---
 
-#define GROW_ARRAY(arr, arena)                                                                \
-    do {                                                                                      \
-        (void)(arena);                                                                        \
-        if ((arr)->count >= (arr)->cap) {                                                     \
-            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                \
-            void *new_items = realloc((arr)->items, (size_t)new_cap * sizeof(*(arr)->items)); \
-            if (!new_items)                                                                   \
-                return;                                                                       \
-            (arr)->items = new_items;                                                         \
-            (arr)->cap = new_cap;                                                             \
-        }                                                                                     \
+#define GROW_ARRAY(arr, arena)                                                                     \
+    do {                                                                                           \
+        (void)(arena);                                                                             \
+        if ((arr)->count >= (arr)->cap) {                                                          \
+            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                     \
+            void *new_items =                                                                      \
+                cbm_arena_realloc((arena), (arr)->items, (size_t)new_cap * sizeof(*(arr)->items)); \
+            if (!new_items)                                                                        \
+                return;                                                                            \
+            (arr)->items = new_items;                                                              \
+            (arr)->cap = new_cap;                                                                  \
+        }                                                                                          \
     } while (0)
 
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {
@@ -1677,28 +1678,6 @@ void cbm_free_result(CBMFileResult *result) {
     free(result->owned_results);
     result->owned_results = NULL;
     result->owned_result_count = 0;
-#define FREE_RESULT_ARRAY(field)    \
-    do {                            \
-        free(result->field.items);  \
-        result->field.items = NULL; \
-        result->field.count = 0;    \
-        result->field.cap = 0;      \
-    } while (0)
-    FREE_RESULT_ARRAY(defs);
-    FREE_RESULT_ARRAY(calls);
-    FREE_RESULT_ARRAY(imports);
-    FREE_RESULT_ARRAY(usages);
-    FREE_RESULT_ARRAY(throws);
-    FREE_RESULT_ARRAY(rw);
-    FREE_RESULT_ARRAY(type_refs);
-    FREE_RESULT_ARRAY(env_accesses);
-    FREE_RESULT_ARRAY(type_assigns);
-    FREE_RESULT_ARRAY(impl_traits);
-    FREE_RESULT_ARRAY(resolved_calls);
-    FREE_RESULT_ARRAY(string_refs);
-    FREE_RESULT_ARRAY(infra_bindings);
-    FREE_RESULT_ARRAY(channels);
-#undef FREE_RESULT_ARRAY
     cbm_arena_destroy(&result->arena);
     free(result);
 }

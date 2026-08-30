@@ -30,6 +30,7 @@ typedef struct {
     size_t alloc_le_256;
     size_t alloc_le_4096;
     size_t alloc_gt_4096;
+    void *heap_allocations; /* private list used by cbm_arena_realloc() */
 } CBMArena;
 
 /* Initialize arena with default block size. */
@@ -40,6 +41,11 @@ void cbm_arena_init_sized(CBMArena *a, size_t block_size);
 
 /* Allocate n bytes (8-byte aligned). Returns NULL on OOM. */
 void *cbm_arena_alloc(CBMArena *a, size_t n);
+
+/* Grow a heap allocation whose lifetime is owned by this arena. Passing NULL
+ * creates a tracked allocation; subsequent calls must use the same arena.
+ * Tracked allocations are released by reset/destroy alongside bump blocks. */
+void *cbm_arena_realloc(CBMArena *a, void *ptr, size_t n);
 
 /* Allocate n bytes, zero-initialized. */
 void *cbm_arena_calloc(CBMArena *a, size_t n);

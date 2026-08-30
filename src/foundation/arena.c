@@ -18,6 +18,22 @@ enum { ARENA_ALIGN = 7, ARENA_GROW_OK = 1 };
 #include <stdarg.h>
 #include <stdio.h>
 
+typedef struct cbm_arena_heap_allocation {
+    void *ptr;
+    struct cbm_arena_heap_allocation *next;
+} cbm_arena_heap_allocation_t;
+
+static void arena_free_heap_allocations(CBMArena *a) {
+    cbm_arena_heap_allocation_t *allocation = (cbm_arena_heap_allocation_t *)a->heap_allocations;
+    while (allocation) {
+        cbm_arena_heap_allocation_t *next = allocation->next;
+        free(allocation->ptr);
+        free(allocation);
+        allocation = next;
+    }
+    a->heap_allocations = NULL;
+}
+
 void cbm_arena_init(CBMArena *a) {
     cbm_arena_init_sized(a, CBM_ARENA_DEFAULT_BLOCK_SIZE);
 }
@@ -84,6 +100,41 @@ void *cbm_arena_alloc(CBMArena *a, size_t n) {
     return ptr;
 }
 
+void *cbm_arena_realloc(CBMArena *a, void *ptr, size_t n) {
+    if (!a || n == 0) {
+        return NULL;
+    }
+    cbm_arena_heap_allocation_t *allocation = (cbm_arena_heap_allocation_t *)a->heap_allocations;
+    if (ptr) {
+        while (allocation && allocation->ptr != ptr) {
+            allocation = allocation->next;
+        }
+        if (!allocation) {
+            return NULL;
+        }
+        void *grown = realloc(ptr, n);
+        if (!grown) {
+            return NULL;
+        }
+        allocation->ptr = grown;
+        return grown;
+    }
+
+    void *created = malloc(n);
+    if (!created) {
+        return NULL;
+    }
+    allocation = (cbm_arena_heap_allocation_t *)malloc(sizeof(*allocation));
+    if (!allocation) {
+        free(created);
+        return NULL;
+    }
+    allocation->ptr = created;
+    allocation->next = (cbm_arena_heap_allocation_t *)a->heap_allocations;
+    a->heap_allocations = allocation;
+    return created;
+}
+
 void *cbm_arena_calloc(CBMArena *a, size_t n) {
     void *p = cbm_arena_alloc(a, n);
     if (p) {
@@ -140,6 +191,7 @@ char *cbm_arena_sprintf(CBMArena *a, const char *fmt, ...) {
 }
 
 void cbm_arena_reset(CBMArena *a) {
+    arena_free_heap_allocations(a);
     /* Keep first block, free the rest */
     for (int i = SKIP_ONE; i < a->nblocks; i++) {
         free(a->blocks[i]);
@@ -159,6 +211,7 @@ void cbm_arena_reset(CBMArena *a) {
 }
 
 void cbm_arena_destroy(CBMArena *a) {
+    arena_free_heap_allocations(a);
     for (int i = 0; i < a->nblocks; i++) {
         free(a->blocks[i]);
     }
