@@ -46,11 +46,20 @@ cleanup() {
 }
 trap cleanup EXIT
 
-missing="${tmpdir}/repository-does-not-exist"
+repository="${tmpdir}/source-repository"
+mkdir -p "${repository}"
+# Use enough source files to select the parallel pipeline, then request its
+# deterministic invalid-resource-mode error. The repository must exist so the
+# worker's request-scoped workspace boundary remains fail-closed on every OS.
+i=1
+while [[ ${i} -le 64 ]]; do
+  printf 'def f%s():\n    pass\n' "${i}" >"${repository}/f${i}.py"
+  i=$((i + 1))
+done
 response="${tmpdir}/worker.response"
-args="{\"repo_path\":\"${missing}\",\"mode\":\"fast\"}"
+args="{\"repo_path\":\"${repository}\",\"mode\":\"fast\"}"
 
-if ! CBM_CACHE_DIR="${tmpdir}/cache-worker" \
+if ! CBM_INDEX_RESOURCE_MODE=invalid CBM_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \
   --index-worker-build "${BUILD_FINGERPRINT}" \
   index_repository "${args}" \
@@ -67,8 +76,8 @@ if [[ ! -s "${response}" ]] || ! grep -q 'Pipeline failed' "${response}"; then
 fi
 
 set +e
-CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
-  "${BINARY}" cli index_repository --repo-path "${missing}" --mode fast \
+CBM_INDEX_RESOURCE_MODE=invalid CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
+  "${BINARY}" cli index_repository --repo-path "${repository}" --mode fast \
   >"${tmpdir}/supervisor.out" 2>"${tmpdir}/supervisor.err"
 cli_rc=$?
 set -e
