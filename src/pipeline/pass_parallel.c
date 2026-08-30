@@ -2092,6 +2092,29 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
 /* Field type hint resolution for obj.Method() with multiple candidates.
  * Strips C# field prefixes (_ / m_), capitalizes to get type name, and
  * checks if TypeName.Method or ITypeName.Method exists among candidates. */
+/* #1927: the hint may only bind a candidate whose OWNING dot-segment — the
+ * segment immediately before the method name — EQUALS the hinted type. The
+ * previous raw strstr() accepted the hinted name anywhere in the QN, so a
+ * single-letter receiver (`f.Close()` → hint "F") matched nearly every
+ * candidate ("F" ⊂ "…FileStore.Close", the method name included) and rebound
+ * a call whose resolution had already failed to an arbitrary project symbol
+ * at PP_FIELD_HINT_CONF. Segment equality keeps the intended
+ * variable-named-after-its-type case (`repo.Find()` → `Repo.Find`,
+ * lrp_go_s8_field_type_hint) and picks the candidate whose owner actually
+ * carries the name instead of whichever QN contains the letters. */
+static bool fth_owner_segment_is(const char *candidate_qn, const char *type_name) {
+    const char *last_dot = strrchr(candidate_qn, '.');
+    if (!last_dot || last_dot == candidate_qn) {
+        return false;
+    }
+    const char *seg_start = last_dot;
+    while (seg_start > candidate_qn && seg_start[-1] != '.') {
+        seg_start--;
+    }
+    size_t seg_len = (size_t)(last_dot - seg_start);
+    return seg_len > 0 && strncmp(seg_start, type_name, seg_len) == 0 && type_name[seg_len] == '\0';
+}
+
 static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const char *callee_name,
                                 int64_t source_id) {
     if (!res->qualified_name || res->candidate_count <= SKIP_ONE) {
@@ -2131,7 +2154,8 @@ static void try_field_type_hint(resolve_ctx_t *rc, cbm_resolution_t *res, const 
     int cand_count = 0;
     cbm_registry_find_by_name(rc->registry, method, &cands, &cand_count);
     for (int ci = 0; ci < cand_count; ci++) {
-        if (strstr(cands[ci], type_name) || strstr(cands[ci], iface_name)) {
+        if (fth_owner_segment_is(cands[ci], type_name) ||
+            fth_owner_segment_is(cands[ci], iface_name)) {
             const cbm_gbuf_node_t *better = cbm_gbuf_find_by_qn(rc->main_gbuf, cands[ci]);
             if (better && better->id != source_id) {
                 res->qualified_name = cands[ci];
