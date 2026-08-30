@@ -3015,6 +3015,52 @@ TEST(go_imports) {
     PASS();
 }
 
+TEST(extract_go_native_channels) {
+    /* #1930: `x <- v` and `<-x` are channel operations by grammar — record
+     * them as gochan Channel emits/listens, package-qualified by tail
+     * identifier. Arithmetic unary minus must not be mistaken for a receive. */
+    CBMFileResult *r = extract("package pipe\n"
+                               "\n"
+                               "type Stage struct {\n"
+                               "\tout chan int\n"
+                               "}\n"
+                               "\n"
+                               "func (s *Stage) Push(v int) {\n"
+                               "\ts.out <- v\n"
+                               "}\n"
+                               "\n"
+                               "func (s *Stage) Pull() int {\n"
+                               "\treturn <-s.out\n"
+                               "}\n"
+                               "\n"
+                               "func Neg(v int) int { return -v }\n",
+                               CBM_LANG_GO, "t", "pipe.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int emits = 0;
+    int listens = 0;
+    for (int i = 0; i < r->channels.count; i++) {
+        const CBMChannel *ch = &r->channels.items[i];
+        ASSERT_NOT_NULL(ch->transport);
+        if (strcmp(ch->transport, "gochan") != 0) {
+            continue;
+        }
+        ASSERT_NOT_NULL(ch->channel_name);
+        size_t len = strlen(ch->channel_name);
+        ASSERT_TRUE(len > 4 && strcmp(ch->channel_name + len - 4, ".out") == 0);
+        ASSERT_NOT_NULL(ch->enclosing_func_qn);
+        if (ch->direction == CBM_CHANNEL_EMIT) {
+            emits++;
+        } else {
+            listens++;
+        }
+    }
+    ASSERT_EQ(emits, 1);
+    ASSERT_EQ(listens, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1935: Go struct fields were never extracted — find_class_body() returns the
  * struct_type node, whose only named child is a field_declaration_list, so the
  * member loop matched nothing and every field was silently skipped (0 Field
@@ -6752,6 +6798,7 @@ SUITE(extraction) {
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(extract_go_native_channels);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);
