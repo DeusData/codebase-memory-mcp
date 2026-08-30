@@ -703,6 +703,30 @@ const CBMRegisteredFunc *cbm_registry_lookup_method_aliased(const CBMTypeRegistr
     return NULL;
 }
 
+/* #495/#1911: a build-constrained twin carries a `#`-suffixed QN
+ * (`pkg.name#unix`, Rust cfg / Go //go:build), so the exact `pkg.name` key
+ * misses it. A SOLE suffixed variant is still an exact symbol — return it.
+ * Several variants are genuinely ambiguous without the caller's own build
+ * configuration — fail closed and let the multi-candidate registry path
+ * handle the call at its honest confidence. */
+static const CBMRegisteredFunc *lookup_func_sole_tau_variant(const CBMTypeRegistry *reg,
+                                                             const char *qn, size_t qn_len) {
+    const CBMRegisteredFunc *sole = NULL;
+    for (; reg; reg = reg->fallback) {
+        for (int i = 0; i < reg->func_count; i++) {
+            const char *cand = reg->funcs[i].qualified_name;
+            if (!cand || strncmp(cand, qn, qn_len) != 0 || cand[qn_len] != '#') {
+                continue;
+            }
+            if (sole) {
+                return NULL; /* two constrained twins — ambiguous */
+            }
+            sole = &reg->funcs[i];
+        }
+    }
+    return sole;
+}
+
 const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
                                                     const char *package_qn, const char *name) {
     if (!reg || !package_qn || !name)
@@ -722,7 +746,11 @@ const CBMRegisteredFunc *cbm_registry_lookup_symbol(const CBMTypeRegistry *reg,
     memcpy(buf + pkg_len + 1, name, name_len);
     buf[total_len] = '\0';
 
-    return cbm_registry_lookup_func(reg, buf);
+    const CBMRegisteredFunc *r = cbm_registry_lookup_func(reg, buf);
+    if (r) {
+        return r;
+    }
+    return lookup_func_sole_tau_variant(reg, buf, total_len);
 }
 
 // Count parameters in a FUNC signature.

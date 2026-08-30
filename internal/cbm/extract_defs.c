@@ -3778,6 +3778,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         def.is_test = rust_def_is_test(def.decorators);
     }
 
+    // Go: same move for build-constrained twin files (//go:build lines,
+    // GOOS/GOARCH filename suffixes) — fold the per-file constraint τ into
+    // func/method QNs so both variants survive the upsert (#1911). Types and
+    // vars stay plain, keeping parent_class / DEFINES_METHOD joins intact.
+    // MUST mirror go_tau_scope_qn in extract_unified.c exactly, or body calls
+    // in constrained files detach to the File node.
+    if (ctx->language == CBM_LANG_GO && ctx->go_build_tau) {
+        def.qualified_name = cbm_arena_sprintf(a, "%s#%s", def.qualified_name, ctx->go_build_tau);
+    }
+
     // C++/CUDA: GoogleTest macros are test functions (#1266).
     if (is_gtest) {
         def.is_test = true;

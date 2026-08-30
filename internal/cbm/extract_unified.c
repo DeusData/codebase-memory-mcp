@@ -920,6 +920,17 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
                                        ctx->language);
 }
 
+/* #1911: fold the per-file Go build constraint into the scope QN. MUST mirror
+ * the def-side formula in extract_defs.c exactly — the two produce the same
+ * string for the same function, or body calls in build-constrained files
+ * detach to the File node. */
+static const char *go_tau_scope_qn(CBMExtractCtx *ctx, const char *fqn) {
+    if (!fqn || ctx->language != CBM_LANG_GO || !ctx->go_build_tau) {
+        return fqn;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s#%s", fqn, ctx->go_build_tau);
+}
+
 // Compute class QN for scope tracking.
 static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
     if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -2069,7 +2080,7 @@ static bool push_pre_node_scope(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
     if (ts_node_is_null(label)) {
         return false;
     }
-    const char *fqn = compute_func_qn(ctx, label, spec, state);
+    const char *fqn = go_tau_scope_qn(ctx, compute_func_qn(ctx, label, spec, state));
     if (!fqn) {
         return false;
     }
@@ -2199,7 +2210,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
             }
         }
         if (!skip_nested) {
-            const char *fqn = compute_func_qn(ctx, node, spec, state);
+            const char *fqn = go_tau_scope_qn(ctx, compute_func_qn(ctx, node, spec, state));
             if (fqn && push_function_scope(state, depth, fqn, node)) {
                 const char *node_kind = ts_node_type(node);
                 bool split_signature = (ctx->language == CBM_LANG_DART &&

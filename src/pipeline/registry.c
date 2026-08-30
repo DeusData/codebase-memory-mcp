@@ -646,8 +646,23 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
 
     /* Index by simple name.
-     * No array dedup needed: exact-map check above guarantees uniqueness. */
+     * No array dedup needed: exact-map check above guarantees uniqueness.
+     * #495/#1911: a build-constrained twin QN carries a `#τ` suffix
+     * (`pkg.Flush#linux`, Rust cfg / Go //go:build); the SIMPLE name is the
+     * part before it — identifiers cannot contain '#' — or callers looking up
+     * `Flush` would never find the constrained definition. */
     const char *simple = simple_name(qualified_name);
+    char simple_buf[CBM_SZ_256];
+    const char *hash = strchr(simple, '#');
+    if (hash) {
+        size_t n = (size_t)(hash - simple);
+        if (n == 0 || n >= sizeof(simple_buf)) {
+            return; /* degenerate `#`-leaf — nothing callable to index */
+        }
+        memcpy(simple_buf, simple, n);
+        simple_buf[n] = '\0';
+        simple = simple_buf;
+    }
     qn_array_t *arr = cbm_ht_get(r->by_name, simple);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));

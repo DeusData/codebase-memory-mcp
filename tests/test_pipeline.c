@@ -4693,6 +4693,83 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
+
+TEST(pipeline_go_buildtag_twins_both_survive) {
+    /* #1911: build-constrained twin files define the same symbols; without a
+     * constraint discriminator in the QN the upsert keeps ONE node (smallest
+     * file path wins — the 2-line stub beat the 63-line implementation on the
+     * measured repo, taking all 25 inbound CALLS with it). With τ folded into
+     * func QNs both variants survive, and callers keep resolving by simple
+     * name. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_tau_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "go.mod", "module example.com/fxtau\n\ngo 1.22\n");
+    write_temp_file(tmp, "mirror/mirror_unix.go",
+                    "//go:build unix\n"
+                    "\n"
+                    "package mirror\n"
+                    "\n"
+                    "func MirrorConfig(path string) (string, error) {\n"
+                    "\tdst := path + \".bak\"\n"
+                    "\treturn dst, nil\n"
+                    "}\n");
+    write_temp_file(tmp, "mirror/mirror_other.go",
+                    "//go:build !unix\n"
+                    "\n"
+                    "package mirror\n"
+                    "\n"
+                    "func MirrorConfig(path string) (string, error) { return \"\", nil }\n");
+    write_temp_file(tmp, "mirror/boot.go",
+                    "package mirror\n"
+                    "\n"
+                    "func Boot() (string, error) {\n"
+                    "\treturn MirrorConfig(\"cfg\")\n"
+                    "}\n");
+    /* The far more common shape: a constrained file with NO in-tree twin
+     * (unsupported platforms simply have no file). Its callers must keep
+     * resolving — the sole `#`-suffixed variant is still an exact symbol. */
+    write_temp_file(tmp, "sync/fsync_linux.go",
+                    "//go:build linux\n"
+                    "\n"
+                    "package sync\n"
+                    "\n"
+                    "func FlushDisk(fd int) error { return nil }\n");
+    write_temp_file(tmp, "sync/use.go",
+                    "package sync\n"
+                    "\n"
+                    "func UseFlush() error {\n"
+                    "\treturn FlushDisk(3)\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_tau.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Reproduce-first: RED before the fix — one node, the other twin gone. */
+    ASSERT_EQ(count_nodes_named(s, project, "MirrorConfig"), 2);
+    /* Callers of a sole constrained variant keep their edge (the dominant
+     * real-world shape). Calls into a genuine twin PAIR from an unconstrained
+     * file are ambiguous without the caller's build configuration; τ-aware
+     * resolution is the declared follow-up. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UseFlush", "FlushDisk"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -13115,6 +13192,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_buildtag_twins_both_survive);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);

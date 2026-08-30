@@ -1311,6 +1311,10 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         .root = root,
         .macro_table = macro_table,
         .return_type_table = return_type_table,
+        /* #1911: per-file Go build constraint, folded into func/method QNs by
+         * the def and scope builders so build-tag twin files stop colliding. */
+        .go_build_tau =
+            language == CBM_LANG_GO ? cbm_go_build_tau(a, source, source_len, rel_path) : NULL,
     };
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
