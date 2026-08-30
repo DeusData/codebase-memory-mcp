@@ -103,17 +103,17 @@ void cbm_reset_profile(void) {
 
 // --- Growable array push functions ---
 
-#define GROW_ARRAY(arr, arena)                                                                   \
-    do {                                                                                         \
-        (void)(arena);                                                                           \
-        if ((arr)->count >= (arr)->cap) {                                                        \
-            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                   \
-            void *new_items = realloc((arr)->items, (size_t)new_cap * sizeof(*(arr)->items));    \
-            if (!new_items)                                                                      \
-                return;                                                                          \
-            (arr)->items = new_items;                                                            \
-            (arr)->cap = new_cap;                                                                \
-        }                                                                                        \
+#define GROW_ARRAY(arr, arena)                                                                \
+    do {                                                                                      \
+        (void)(arena);                                                                        \
+        if ((arr)->count >= (arr)->cap) {                                                     \
+            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                \
+            void *new_items = realloc((arr)->items, (size_t)new_cap * sizeof(*(arr)->items)); \
+            if (!new_items)                                                                   \
+                return;                                                                       \
+            (arr)->items = new_items;                                                         \
+            (arr)->cap = new_cap;                                                             \
+        }                                                                                     \
     } while (0)
 
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {
@@ -1677,12 +1677,12 @@ void cbm_free_result(CBMFileResult *result) {
     free(result->owned_results);
     result->owned_results = NULL;
     result->owned_result_count = 0;
-#define FREE_RESULT_ARRAY(field)                                                                 \
-    do {                                                                                         \
-        free(result->field.items);                                                               \
-        result->field.items = NULL;                                                              \
-        result->field.count = 0;                                                                 \
-        result->field.cap = 0;                                                                   \
+#define FREE_RESULT_ARRAY(field)    \
+    do {                            \
+        free(result->field.items);  \
+        result->field.items = NULL; \
+        result->field.count = 0;    \
+        result->field.cap = 0;      \
     } while (0)
     FREE_RESULT_ARRAY(defs);
     FREE_RESULT_ARRAY(calls);

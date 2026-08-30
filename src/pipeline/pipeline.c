@@ -1419,11 +1419,10 @@ static int run_parallel_streaming_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t
         int *def_starts = calloc((size_t)cache_count + 1, sizeof(*def_starts));
         int batch_def_count = 0;
         CBMLSPDef *batch_defs =
-            def_starts
-                ? cbm_pxc_collect_all_defs(ctx, cache, files + offset, cache_count,
-                                           ctx->project_name,
-                                           def_modules + offset, &batch_def_count, def_starts)
-                : NULL;
+            def_starts ? cbm_pxc_collect_all_defs(ctx, cache, files + offset, cache_count,
+                                                  ctx->project_name, def_modules + offset,
+                                                  &batch_def_count, def_starts)
+                       : NULL;
         cbm_lsp_surface_row_t *batch_rows = NULL;
         int batch_row_count = 0;
         if (!def_starts ||

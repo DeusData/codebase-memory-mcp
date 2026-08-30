@@ -21,9 +21,9 @@ typedef struct {
     char *blocks[CBM_ARENA_MAX_BLOCKS];
     size_t block_sizes[CBM_ARENA_MAX_BLOCKS]; /* per-block sizes (for stats) */
     int nblocks;
-    size_t block_size;  /* current block capacity */
-    size_t used;        /* bytes used in current block */
-    size_t total_alloc; /* cumulative bytes allocated (for stats) */
+    size_t block_size;    /* current block capacity */
+    size_t used;          /* bytes used in current block */
+    size_t total_alloc;   /* cumulative bytes allocated (for stats) */
     size_t strdup_alloc;  /* requested bytes returned by strdup/strndup helpers */
     size_t sprintf_alloc; /* requested bytes returned by sprintf helper */
     size_t alloc_le_64;

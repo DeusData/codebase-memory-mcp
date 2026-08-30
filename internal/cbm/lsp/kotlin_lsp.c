@@ -3162,8 +3162,7 @@ static const CBMType *kt_eval_navigation_expression_type_at(KotlinLSPContext *ct
             if (is_member) {
                 /* A member call on an `object`/`companion object` singleton is a
                  * static dispatch; on a regular class instance it is a method. */
-                const CBMRegisteredType *recv_rt =
-                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                const CBMRegisteredType *recv_rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
                 strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
             }
             /* A call through the lambda implicit parameter `it` (e.g. inside
@@ -5240,8 +5239,7 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
         if (field_map) {
             const KtCrossFieldList *fl =
-                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map,
-                                                     d->qualified_name);
+                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map, d->qualified_name);
             if (fl && fl->count > 0) {
                 rt.field_names = fl->names;
                 rt.field_types = fl->types;

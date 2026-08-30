@@ -6325,19 +6325,18 @@ TEST(pipeline_python_cross_module_call) {
  * unique_name (candidates==1) is #1572 and is not this claim. */
 TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
-    const char *contents[] = {
-        "class Store:\n"
-        "    def commit(self):\n"
-        "        return True\n",
+    const char *contents[] = {"class Store:\n"
+                              "    def commit(self):\n"
+                              "        return True\n",
 
-        "from store import Store\n"
-        "\n"
-        "def save():\n"
-        "    return Store().commit()\n",
+                              "from store import Store\n"
+                              "\n"
+                              "def save():\n"
+                              "    return Store().commit()\n",
 
-        "export function commit() {\n"
-        "  return 1;\n"
-        "}\n"};
+                              "export function commit() {\n"
+                              "  return 1;\n"
+                              "}\n"};
 
     if (setup_lang_repo(files, contents, 3) != 0)
         FAIL("tmpdir");
@@ -12722,7 +12721,6 @@ TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
     th_rmtree(td);
     PASS();
 }
-
 
 /* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
  * `body` → findable. Each layer has its own test; this one proves they connect.

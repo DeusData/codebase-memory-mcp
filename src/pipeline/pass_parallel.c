@@ -1061,7 +1061,7 @@ static void log_extract_cache_mem(const char *phase, const cbm_file_info_t *file
         over_8m += result->arena.total_alloc >= (size_t)8 * 1024 * 1024;
         over_32m += result->arena.total_alloc >= (size_t)32 * 1024 * 1024;
         over_128m += result->arena.total_alloc >= (size_t)128 * 1024 * 1024;
-#define ADD_ARRAY_CAPACITY(field)                                                               \
+#define ADD_ARRAY_CAPACITY(field) \
     live_array_capacity += (size_t)result->field.cap * sizeof(*result->field.items)
         ADD_ARRAY_CAPACITY(defs);
         ADD_ARRAY_CAPACITY(calls);
@@ -1110,8 +1110,7 @@ static void log_extract_cache_mem(const char *phase, const cbm_file_info_t *file
     (void)snprintf(max_requested_text, sizeof(max_requested_text), "%zu",
                    max_requested / BYTES_PER_MIB);
     (void)snprintf(distribution_text, sizeof(distribution_text),
-                   "ge1m=%d,ge8m=%d,ge32m=%d,ge128m=%d", over_1m, over_8m, over_32m,
-                   over_128m);
+                   "ge1m=%d,ge8m=%d,ge32m=%d,ge128m=%d", over_1m, over_8m, over_32m, over_128m);
     (void)snprintf(size_distribution_text, sizeof(size_distribution_text),
                    "le64=%zu,le256=%zu,le4096=%zu,gt4096=%zu", alloc_le_64 / BYTES_PER_MIB,
                    alloc_le_256 / BYTES_PER_MIB, alloc_le_4096 / BYTES_PER_MIB,
@@ -1135,9 +1134,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     cbm_parallel_extract_opts_t resolved_opts = cbm_parallel_extract_resolve_opts(opts);
     _Atomic int local_bp_futile;
     atomic_init(&local_bp_futile, 0);
-    _Atomic int *bp_futile = resolved_opts.backpressure_futile
-                                 ? resolved_opts.backpressure_futile
-                                 : &local_bp_futile;
+    _Atomic int *bp_futile =
+        resolved_opts.backpressure_futile ? resolved_opts.backpressure_futile : &local_bp_futile;
 
     if (file_count == 0) {
         return 0;

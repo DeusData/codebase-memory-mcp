@@ -1225,19 +1225,18 @@ TEST(form_procedure) {
 
 /* --- Oracle PL/SQL --- */
 TEST(plsql_package_and_call) {
-    const char *src =
-        "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
-        "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
-        "    v_sal NUMBER;\n"
-        "  BEGIN\n"
-        "    v_sal := util_pkg.calc_salary(p_name);\n"
-        "    IF v_sal > 0 THEN\n"
-        "      RETURN v_sal;\n"
-        "    END IF;\n"
-        "    RAISE no_data_found;\n"
-        "  END;\n"
-        "END emp_pkg;\n"
-        "/\n";
+    const char *src = "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+                      "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+                      "    v_sal NUMBER;\n"
+                      "  BEGIN\n"
+                      "    v_sal := util_pkg.calc_salary(p_name);\n"
+                      "    IF v_sal > 0 THEN\n"
+                      "      RETURN v_sal;\n"
+                      "    END IF;\n"
+                      "    RAISE no_data_found;\n"
+                      "  END;\n"
+                      "END emp_pkg;\n"
+                      "/\n";
     CBMFileResult *r = extract(src, CBM_LANG_PLSQL, "t", "emp_pkg.pkb");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
@@ -2202,9 +2201,10 @@ TEST(dbt_source_and_two_arg_ref) {
     /* Both dbt builtins name the relation in their LAST string argument:
      * source('group','table') -> table, and the two-argument
      * ref('package','model') form -> model. */
-    CBMFileResult *r = extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
-                               "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
-                               CBM_LANG_SQL, "t", "models/stg_customers.sql");
+    CBMFileResult *r =
+        extract("SELECT * FROM {{ source('raw', 'customers') }}\n"
+                "UNION ALL SELECT * FROM {{ ref('analytics', 'legacy_customers') }}\n",
+                CBM_LANG_SQL, "t", "models/stg_customers.sql");
     ASSERT_NOT_NULL(r);
     ASSERT(has_def(r, "Model", "stg_customers"));
     ASSERT(has_usage(r, "customers"));
@@ -3223,8 +3223,8 @@ TEST(vue_embedded_structure_negative_controls_issue1410) {
 }
 
 TEST(vue_embedded_structure_host_controls_issue1410) {
-    CBMFileResult *plain = extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT,
-                                   "t", "plain.ts");
+    CBMFileResult *plain =
+        extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT, "t", "plain.ts");
     ASSERT_NOT_NULL(plain);
     ASSERT_FALSE(plain->has_error);
     ASSERT_EQ(count_defs_named(plain, "Function", "plainTs"), 1);
@@ -3682,11 +3682,11 @@ TEST(extract_java_method_annotations_issue382) {
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
-    CBMFileResult *r = extract(
-        "@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
-        "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
-        "    .width('100%')\n  }\n}\n",
-        CBM_LANG_ARKTS, "t", "Index.ets");
+    CBMFileResult *r =
+        extract("@Entry\n@Component\nstruct Index {\n  @State message: string = 'Hello'\n\n"
+                "  build() {\n    Column() {\n      Text(this.message).fontSize(20)\n    }\n"
+                "    .width('100%')\n  }\n}\n",
+                CBM_LANG_ARKTS, "t", "Index.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Struct", "Index"));
@@ -3717,12 +3717,12 @@ TEST(arkts_exported_struct_decorators) {
 }
 
 TEST(arkts_member_decorators) {
-    CBMFileResult *r = extract(
-        "@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
-        "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
-        "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
-        "  build() {\n  }\n}\n",
-        CBM_LANG_ARKTS, "t", "S.ets");
+    CBMFileResult *r =
+        extract("@Component\nstruct S {\n  @State a: number = 0\n  @Prop b: string\n"
+                "  @Link c: boolean\n  @Provide('k') d: string = ''\n  @Consume('k') e: string\n"
+                "  @StorageLink('s') f: number = 1\n  @State @Watch('onW') g: boolean = false\n\n"
+                "  build() {\n  }\n}\n",
+                CBM_LANG_ARKTS, "t", "S.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(decorators_contain(find_def_by_name(r, "a"), "State"));
@@ -3762,11 +3762,11 @@ TEST(arkts_no_phantom_builtin_defs) {
 }
 
 TEST(arkts_builder_extend_styles) {
-    CBMFileResult *r = extract(
-        "@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
-        "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
-        "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
-        CBM_LANG_ARKTS, "t", "b.ets");
+    CBMFileResult *r =
+        extract("@Builder\nfunction card(t: string) {\n  Column() {\n    Text(t)\n  }\n}\n\n"
+                "@Extend(Text)\nfunction fancy(size: number) {\n  .fontSize(size)\n}\n\n"
+                "@Styles\nfunction pressed() {\n  .backgroundColor('#eee')\n}\n",
+                CBM_LANG_ARKTS, "t", "b.ets");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Function", "card"));
@@ -5179,8 +5179,8 @@ TEST(extract_c_test_dir_marks_is_test_issue1294) {
  * not be (#1294). */
 TEST(extract_python_method_test_dir_marks_is_test_issue1294) {
     const char *src = "class Foo:\n"
-                       "    def helper(self):\n"
-                       "        pass\n";
+                      "    def helper(self):\n"
+                      "        pass\n";
 
     /* Python's LSP layer injects synthetic builtin stub Methods (str.upper,
      * dict.get, ...) into defs.items alongside real ones (py_builtins.c), so
