@@ -5,6 +5,7 @@
 #include "daemon/application_internal.h"
 
 #include "cli/cli.h"
+#include "discover/discover.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -25,6 +26,7 @@
 #include <yyjson/yyjson.h>
 
 #include <ctype.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdatomic.h>
@@ -62,7 +64,15 @@ enum {
     APPLICATION_BACKGROUND_REAP_MS = 10000,
     APPLICATION_UPDATE_VERSION_CAP = 128,
     APPLICATION_UPDATE_NOTICE_CAP = 1024,
+    APPLICATION_LARGE_FILE_THRESHOLD = 10000,
+    APPLICATION_RESOURCE_CLASSIFY_TIMEOUT_MS = 5000,
 };
+
+static const size_t APPLICATION_LARGE_SOURCE_BYTES = (size_t)512 * (size_t)1024 * (size_t)1024;
+static const size_t APPLICATION_DAILY_WORKER_RESERVATION_BYTES =
+    (size_t)384 * (size_t)1024 * (size_t)1024;
+static const size_t APPLICATION_LARGE_WORKER_BUDGET_BYTES =
+    (size_t)3072 * (size_t)1024 * (size_t)1024;
 
 /* There is deliberately NO production update-check provider. The daemon used to
  * spawn `curl` against the GitHub releases API on the first eligible session of
@@ -83,6 +93,8 @@ typedef struct cbm_daemon_application_watch cbm_daemon_application_watch_t;
 typedef struct cbm_daemon_application_session cbm_daemon_application_session_t;
 typedef struct cbm_daemon_application_job cbm_daemon_application_job_t;
 typedef struct cbm_daemon_application_mutation cbm_daemon_application_mutation_t;
+typedef struct cbm_daemon_application_admission_waiter cbm_daemon_application_admission_waiter_t;
+typedef struct cbm_daemon_application_resource_history cbm_daemon_application_resource_history_t;
 typedef struct cbm_daemon_application_watch_job_subscription
     cbm_daemon_application_watch_job_subscription_t;
 
@@ -140,6 +152,7 @@ struct cbm_daemon_application_job {
     cbm_thread_t thread;
     size_t subscribers;
     size_t watcher_waiters;
+    size_t observed_rss_bytes;
     bool thread_started;
     bool thread_done;
     bool terminal;
@@ -147,6 +160,7 @@ struct cbm_daemon_application_job {
     bool cancelled;
     bool cancel_requested;
     bool supervision_failed;
+    bool large_repository;
     cbm_daemon_application_job_t *next;
 };
 
@@ -168,6 +182,17 @@ struct cbm_daemon_application_mutation {
     cbm_daemon_application_mutation_t *next;
 };
 
+struct cbm_daemon_application_admission_waiter {
+    uint64_t ticket;
+    cbm_daemon_application_admission_waiter_t *next;
+};
+
+struct cbm_daemon_application_resource_history {
+    char *project_key;
+    size_t peak_rss_bytes;
+    cbm_daemon_application_resource_history_t *next;
+};
+
 struct cbm_daemon_application {
     cbm_mutex_t mutex;
     struct cbm_watcher *watcher;
@@ -177,11 +202,17 @@ struct cbm_daemon_application {
     cbm_daemon_application_job_t *jobs;
     cbm_daemon_application_watch_job_subscription_t *watch_job_subscriptions;
     cbm_daemon_application_mutation_t *mutations;
+    cbm_daemon_application_admission_waiter_t *admission_head;
+    cbm_daemon_application_admission_waiter_t *admission_tail;
+    cbm_daemon_application_resource_history_t *resource_history;
+    uint64_t next_admission_ticket;
     cbm_daemon_application_worker_ops_t worker_ops;
     cbm_daemon_application_update_ops_t update_ops;
     cbm_project_lock_manager_t *project_locks;
     size_t physical_job_limit;
+    size_t aggregate_memory_budget_bytes;
     size_t worker_memory_budget_bytes;
+    size_t large_worker_memory_budget_bytes;
     size_t active_mutations;
     size_t update_owners;
     cbm_daemon_application_update_worker_t update_worker;
@@ -211,7 +242,13 @@ static void *application_job_thread(void *opaque);
 static char *application_auto_index_args(const char *root_path);
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
-    const char *args_json, application_job_subscribe_status_t *status_out);
+    const char *args_json, bool large_repository, bool queue_head,
+    application_job_subscribe_status_t *status_out);
+static cbm_daemon_application_resource_history_t *application_resource_history_find_locked(
+    cbm_daemon_application_t *application, const char *project_key);
+static void application_resource_history_record_locked(cbm_daemon_application_t *application,
+                                                       const char *project_key,
+                                                       size_t peak_rss_bytes);
 
 static atomic_bool g_application_fail_next_job_thread_start_for_test = ATOMIC_VAR_INIT(false);
 
@@ -324,6 +361,13 @@ static bool application_worker_cancel_default(void *context,
     return cbm_index_worker_request_cancel((cbm_index_worker_handle_t *)worker);
 }
 
+static bool application_worker_observed_rss_default(void *context,
+                                                    cbm_daemon_application_worker_t worker,
+                                                    size_t *bytes_out) {
+    (void)context;
+    return cbm_index_worker_observed_tree_rss((cbm_index_worker_handle_t *)worker, bytes_out);
+}
+
 static const char *application_worker_log_path_default(void *context,
                                                        cbm_daemon_application_worker_t worker) {
     (void)context;
@@ -382,6 +426,27 @@ static cbm_daemon_application_watch_t *application_find_watch_locked(
         }
     }
     return NULL;
+}
+
+static cbm_daemon_application_resource_history_t *application_resource_history_ensure_locked(
+    cbm_daemon_application_t *application, const char *project_key) {
+    cbm_daemon_application_resource_history_t *history =
+        application_resource_history_find_locked(application, project_key);
+    if (history) {
+        return history;
+    }
+    history = calloc(1, sizeof(*history));
+    if (!history) {
+        return NULL;
+    }
+    history->project_key = strdup(project_key);
+    if (!history->project_key) {
+        free(history);
+        return NULL;
+    }
+    history->next = application->resource_history;
+    application->resource_history = history;
+    return history;
 }
 
 static void application_remove_watch_entry_locked(cbm_daemon_application_t *application,
@@ -1086,7 +1151,9 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     cbm_daemon_application_worker_t worker = NULL;
     application_tmp_lock();
     int start_result = application->worker_ops.start(
-        application->worker_ops.context, job->args_json, application->worker_memory_budget_bytes,
+        application->worker_ops.context, job->args_json,
+        job->large_repository ? application->large_worker_memory_budget_bytes
+                              : application->worker_memory_budget_bytes,
         marker_path, quarantine_path, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
@@ -1108,6 +1175,17 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     for (;;) {
         cbm_index_worker_poll_t state =
             application->worker_ops.poll(application->worker_ops.context, worker, &borrowed);
+        if (application->worker_ops.observed_rss) {
+            size_t observed = 0;
+            if (application->worker_ops.observed_rss(application->worker_ops.context, worker,
+                                                     &observed)) {
+                cbm_mutex_lock(&application->mutex);
+                if (job->worker == worker && observed > job->observed_rss_bytes) {
+                    job->observed_rss_bytes = observed;
+                }
+                cbm_mutex_unlock(&application->mutex);
+            }
+        }
         if (state == CBM_INDEX_WORKER_POLL_TERMINAL) {
             break;
         }
@@ -1431,7 +1509,7 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
         }
         application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
         cbm_daemon_application_job_t *retry = application_job_subscribe_locked(
-            application, project, root_path, args, &subscribe_status);
+            application, project, root_path, args, false, false, &subscribe_status);
         free(args);
         if (retry) {
             session->auto_index_job = retry;
@@ -1462,6 +1540,8 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
     job->supervision_failed = execution->supervision_failed ||
                               (execution->unsafe_terminal && execution->have_last_result &&
                                !execution->last_result.cancellation_requested);
+    application_resource_history_record_locked(application, job->project_key,
+                                               job->observed_rss_bytes);
     job->terminal = true;
     job->thread_done = true;
     for (cbm_daemon_application_session_t *session = application->sessions; session;
@@ -1549,10 +1629,240 @@ static char *application_index_project_key(const char *root_path, const char *ar
     return key;
 }
 
+/* Git can enumerate the relevant tracked/untracked set without paying a full
+ * filesystem walk through very large ignored dependency trees. The output is
+ * NUL-delimited, so unusual filenames remain unambiguous. This is a fast
+ * classification hint only: the pipeline's normal discovery remains the
+ * authority for the actual index. */
+static cbm_discover_status_t application_git_measure_bounded(const char *root_path, int max_files,
+                                                             size_t max_total_bytes,
+                                                             uint64_t deadline_ms, int *count_out,
+                                                             size_t *total_bytes_out) {
+    char output_path[APPLICATION_PATH_CAP];
+    if (!application_unique_recovery_file(output_path, "classify")) {
+        return CBM_DISCOVER_ERROR;
+    }
+    const char *argv[] = {"git", "-C",       root_path,  "ls-files",
+                          "-z",  "--cached", "--others", "--exclude-standard",
+                          NULL};
+    cbm_proc_opts_t options = {
+        .bin = "git",
+        .argv = argv,
+        .log_file = output_path,
+        .quiet_timeout_ms = APPLICATION_RESOURCE_CLASSIFY_TIMEOUT_MS,
+        .delete_log_on_exit = false,
+    };
+    cbm_proc_result_t result;
+    int run = cbm_subprocess_run(&options, &result);
+    if (run != 0 || result.outcome != CBM_PROC_CLEAN || !result.tree_quiesced) {
+        (void)cbm_unlink(output_path);
+        return CBM_DISCOVER_ERROR;
+    }
+    FILE *file = cbm_fopen(output_path, "rb");
+    if (!file) {
+        (void)cbm_unlink(output_path);
+        return CBM_DISCOVER_ERROR;
+    }
+    char relative[APPLICATION_PATH_CAP];
+    size_t length = 0;
+    int count = 0;
+    size_t total = 0;
+    cbm_discover_status_t status = CBM_DISCOVER_OK;
+    for (;;) {
+        int byte = fgetc(file);
+        if (byte == EOF) {
+            if (length != 0 || ferror(file)) {
+                status = CBM_DISCOVER_ERROR;
+            }
+            break;
+        }
+        if (cbm_now_ms() >= deadline_ms || length + 1 >= sizeof(relative)) {
+            status = CBM_DISCOVER_ERROR;
+            break;
+        }
+        if (byte != '\0') {
+            relative[length++] = (char)byte;
+            continue;
+        }
+        relative[length] = '\0';
+        length = 0;
+        const char *basename = strrchr(relative, '/');
+        basename = basename ? basename + 1 : relative;
+        if (cbm_language_for_filename(basename) == CBM_LANG_COUNT) {
+            continue;
+        }
+        char absolute[APPLICATION_PATH_CAP];
+        int written = snprintf(absolute, sizeof(absolute), "%s/%s", root_path, relative);
+        struct stat file_status;
+        if (written <= 0 || (size_t)written >= sizeof(absolute) ||
+            stat(absolute, &file_status) != 0 || !S_ISREG(file_status.st_mode)) {
+            status = CBM_DISCOVER_ERROR;
+            break;
+        }
+        size_t measured = file_status.st_size > 0 ? (size_t)file_status.st_size : 0;
+        if (count >= max_files || total > max_total_bytes || measured > max_total_bytes - total) {
+            status = CBM_DISCOVER_LIMIT_EXCEEDED;
+            break;
+        }
+        count++;
+        total += measured;
+    }
+    (void)fclose(file);
+    (void)cbm_unlink(output_path);
+    *count_out = status == CBM_DISCOVER_ERROR ? -1 : count;
+    *total_bytes_out = total;
+    return status;
+}
+
+static bool application_index_is_large_repository(const char *root_path) {
+    char mode[CBM_SZ_32];
+    const char *configured = cbm_safe_getenv("CBM_INDEX_RESOURCE_MODE", mode, sizeof(mode), NULL);
+    if (configured && strcmp(mode, "daily") == 0) {
+        return false;
+    }
+    if (configured && strcmp(mode, "large") == 0) {
+        return true;
+    }
+    if (configured && strcmp(mode, "auto") != 0) {
+        /* The worker will reject the invalid mode. Reserve the safer large
+         * lane until that contained failure is published. */
+        return true;
+    }
+    cbm_discover_opts_t options = {
+        .mode = CBM_MODE_FULL,
+        .ignore_file = NULL,
+        .max_file_size = 0,
+    };
+    int files = -1;
+    size_t bytes = 0;
+    uint64_t deadline = cbm_now_ms() + APPLICATION_RESOURCE_CLASSIFY_TIMEOUT_MS;
+    cbm_discover_status_t status = application_git_measure_bounded(
+        root_path, APPLICATION_LARGE_FILE_THRESHOLD - 1, APPLICATION_LARGE_SOURCE_BYTES - 1,
+        deadline, &files, &bytes);
+    const char *measurement = "git_files";
+    if (status == CBM_DISCOVER_ERROR) {
+        files = -1;
+        bytes = 0;
+        deadline = cbm_now_ms() + APPLICATION_RESOURCE_CLASSIFY_TIMEOUT_MS;
+        status = cbm_discover_measure_bounded(
+            root_path, &options, APPLICATION_LARGE_FILE_THRESHOLD - 1,
+            APPLICATION_LARGE_SOURCE_BYTES - 1, deadline, &files, &bytes);
+        measurement = "filesystem_fallback";
+    }
+    bool large = status != CBM_DISCOVER_OK;
+    char files_text[CBM_SZ_32];
+    char bytes_text[CBM_SZ_32];
+    (void)snprintf(files_text, sizeof(files_text), "%d", files);
+    (void)snprintf(bytes_text, sizeof(bytes_text), "%zu", bytes);
+    cbm_log_info(
+        "daemon.index.resource_mode", "selected", large ? "large" : "daily", "reason",
+        status == CBM_DISCOVER_LIMIT_EXCEEDED
+            ? "threshold"
+            : (status == CBM_DISCOVER_OK ? "within_daily_limits" : "classification_failed_closed"),
+        "files", files_text, "source_bytes", bytes_text, "measurement", measurement);
+    return large;
+}
+
 static size_t application_active_job_count_locked(cbm_daemon_application_t *application) {
     size_t count = 0;
     for (cbm_daemon_application_job_t *job = application->jobs; job; job = job->next) {
         if (!job->terminal) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static size_t application_active_observed_rss_locked(cbm_daemon_application_t *application) {
+    size_t total = 0;
+    for (cbm_daemon_application_job_t *job = application->jobs; job; job = job->next) {
+        if (!job->terminal) {
+            total = job->observed_rss_bytes > SIZE_MAX - total ? SIZE_MAX
+                                                               : total + job->observed_rss_bytes;
+        }
+    }
+    return total;
+}
+
+static cbm_daemon_application_resource_history_t *application_resource_history_find_locked(
+    cbm_daemon_application_t *application, const char *project_key) {
+    for (cbm_daemon_application_resource_history_t *history = application->resource_history;
+         history; history = history->next) {
+        if (strcmp(history->project_key, project_key) == 0) {
+            return history;
+        }
+    }
+    return NULL;
+}
+
+static void application_resource_history_record_locked(cbm_daemon_application_t *application,
+                                                       const char *project_key,
+                                                       size_t peak_rss_bytes) {
+    if (!project_key || peak_rss_bytes == 0) {
+        return;
+    }
+    cbm_daemon_application_resource_history_t *history =
+        application_resource_history_ensure_locked(application, project_key);
+    if (!history) {
+        return;
+    }
+    if (peak_rss_bytes > history->peak_rss_bytes) {
+        history->peak_rss_bytes = peak_rss_bytes;
+    }
+}
+
+/* Explicit user requests own FIFO admission tickets. Background auto-index
+ * and watcher work may coalesce with an already-running project, but cannot
+ * consume a newly freed physical slot while an explicit request is queued. */
+static void application_admission_enqueue_locked(
+    cbm_daemon_application_t *application, cbm_daemon_application_admission_waiter_t *waiter) {
+    waiter->ticket = ++application->next_admission_ticket;
+    waiter->next = NULL;
+    if (application->admission_tail) {
+        application->admission_tail->next = waiter;
+    } else {
+        application->admission_head = waiter;
+    }
+    application->admission_tail = waiter;
+}
+
+static void application_admission_remove_locked(cbm_daemon_application_t *application,
+                                                cbm_daemon_application_admission_waiter_t *waiter) {
+    cbm_daemon_application_admission_waiter_t **cursor = &application->admission_head;
+    while (*cursor && *cursor != waiter) {
+        cursor = &(*cursor)->next;
+    }
+    if (*cursor != waiter) {
+        return;
+    }
+    *cursor = waiter->next;
+    if (application->admission_tail == waiter) {
+        application->admission_tail = NULL;
+        for (cbm_daemon_application_admission_waiter_t *tail = application->admission_head; tail;
+             tail = tail->next) {
+            application->admission_tail = tail;
+        }
+    }
+    waiter->next = NULL;
+}
+
+static size_t application_admission_position_locked(
+    const cbm_daemon_application_t *application,
+    const cbm_daemon_application_admission_waiter_t *waiter) {
+    size_t position = 1;
+    for (const cbm_daemon_application_admission_waiter_t *entry = application->admission_head;
+         entry; entry = entry->next, position++) {
+        if (entry == waiter) {
+            return position;
+        }
+    }
+    return 0;
+}
+
+static size_t application_active_large_job_count_locked(cbm_daemon_application_t *application) {
+    size_t count = 0;
+    for (cbm_daemon_application_job_t *job = application->jobs; job; job = job->next) {
+        if (!job->terminal && job->large_repository) {
             count++;
         }
     }
@@ -1607,7 +1917,8 @@ static bool application_index_args_equal(const char *left, const char *right) {
  * this admission in the same critical section closes the unwatch race. */
 static cbm_daemon_application_job_t *application_job_subscribe_locked(
     cbm_daemon_application_t *application, const char *project_key, const char *root_path,
-    const char *args_json, application_job_subscribe_status_t *status_out) {
+    const char *args_json, bool large_repository, bool queue_head,
+    application_job_subscribe_status_t *status_out) {
     *status_out = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
     if (application->stopping) {
         return NULL;
@@ -1628,10 +1939,35 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
         return job;
     }
 
-    if (application_active_job_count_locked(application) >= application->physical_job_limit) {
+    size_t active_jobs = application_active_job_count_locked(application);
+    size_t active_large_jobs = application_active_large_job_count_locked(application);
+    size_t observed_rss = application_active_observed_rss_locked(application);
+    size_t reservation = application->worker_memory_budget_bytes;
+    cbm_daemon_application_resource_history_t *history =
+        application_resource_history_find_locked(application, project_key);
+    if (history && history->peak_rss_bytes > reservation) {
+        reservation = history->peak_rss_bytes;
+    }
+    bool daily_memory_busy =
+        !large_repository && application->aggregate_memory_budget_bytes > 0 &&
+        (observed_rss > application->aggregate_memory_budget_bytes ||
+         reservation > application->aggregate_memory_budget_bytes - observed_rss);
+    if ((application->admission_head && !queue_head) ||
+        active_jobs >= application->physical_job_limit || (large_repository && active_jobs > 0) ||
+        (!large_repository && active_large_jobs > 0)) {
         char limit[32];
         (void)snprintf(limit, sizeof(limit), "%zu", application->physical_job_limit);
         cbm_log_warn("daemon.index.admission_busy", "limit", limit, "project", project_key);
+        *status_out = APPLICATION_JOB_SUBSCRIBE_BUSY;
+        return NULL;
+    }
+    if (daily_memory_busy) {
+        char observed[CBM_SZ_32];
+        char reserved[CBM_SZ_32];
+        (void)snprintf(observed, sizeof(observed), "%zu", observed_rss);
+        (void)snprintf(reserved, sizeof(reserved), "%zu", reservation);
+        cbm_log_warn("daemon.index.admission_memory_busy", "project", project_key, "observed_rss",
+                     observed, "reservation", reserved);
         *status_out = APPLICATION_JOB_SUBSCRIBE_BUSY;
         return NULL;
     }
@@ -1648,6 +1984,7 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
         return NULL;
     }
     job->application = application;
+    job->large_repository = large_repository;
     job->subscribers = 1;
     job->next = application->jobs;
     application->jobs = job;
@@ -1665,17 +2002,6 @@ static cbm_daemon_application_job_t *application_job_subscribe_locked(
         return NULL;
     }
     *status_out = APPLICATION_JOB_SUBSCRIBE_OK;
-    return job;
-}
-
-static cbm_daemon_application_job_t *application_job_subscribe(
-    cbm_daemon_application_t *application, const char *project_key, const char *root_path,
-    const char *args_json, application_job_subscribe_status_t *status_out) {
-    application_jobs_reap_completed(application);
-    cbm_mutex_lock(&application->mutex);
-    cbm_daemon_application_job_t *job = application_job_subscribe_locked(
-        application, project_key, root_path, args_json, status_out);
-    cbm_mutex_unlock(&application->mutex);
     return job;
 }
 
@@ -2000,7 +2326,7 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
     if (attempt_auto_index && args) {
         application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
         cbm_daemon_application_job_t *job = application_job_subscribe_locked(
-            application, project, root_path, args, &subscribe_status);
+            application, project, root_path, args, false, false, &subscribe_status);
         if (job) {
             session->auto_index_job = job;
             session->auto_index_subscribed = true;
@@ -2214,13 +2540,42 @@ static char *application_index_execute(void *context, const char *root_path,
     }
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
     cbm_daemon_application_job_t *job = NULL;
+    bool large_repository = application_index_is_large_repository(root_path);
+    cbm_daemon_application_admission_waiter_t waiter = {0};
+    cbm_mutex_lock(&session->application->mutex);
+    application_admission_enqueue_locked(session->application, &waiter);
+    size_t initial_position = application_admission_position_locked(session->application, &waiter);
+    cbm_mutex_unlock(&session->application->mutex);
+    char ticket_text[CBM_SZ_32];
+    char position_text[CBM_SZ_32];
+    (void)snprintf(ticket_text, sizeof(ticket_text), "%" PRIu64, waiter.ticket);
+    (void)snprintf(position_text, sizeof(position_text), "%zu", initial_position);
+    cbm_log_info("daemon.index.queued", "project", project_key, "ticket", ticket_text, "position",
+                 position_text, "resource_mode", large_repository ? "large" : "daily");
     for (;;) {
-        job = application_job_subscribe(session->application, project_key, root_path, args_json,
-                                        &subscribe_status);
+        application_jobs_reap_completed(session->application);
+        cbm_mutex_lock(&session->application->mutex);
+        bool queued_cancelled = application_request_cancelled_locked(session);
+        bool queue_head = session->application->admission_head == &waiter;
+        if (queued_cancelled || session->application->stopping) {
+            application_admission_remove_locked(session->application, &waiter);
+            cbm_mutex_unlock(&session->application->mutex);
+            free(project_key);
+            return cbm_mcp_text_result(queued_cancelled
+                                           ? "index operation cancelled for this session"
+                                           : "daemon index coordinator is stopping or unavailable",
+                                       true);
+        }
+        job = application_job_subscribe_locked(session->application, project_key, root_path,
+                                               args_json, large_repository, queue_head,
+                                               &subscribe_status);
         if (job || (subscribe_status != APPLICATION_JOB_SUBSCRIBE_BUSY &&
                     subscribe_status != APPLICATION_JOB_SUBSCRIBE_CANCELLING)) {
+            application_admission_remove_locked(session->application, &waiter);
+            cbm_mutex_unlock(&session->application->mutex);
             break;
         }
+        cbm_mutex_unlock(&session->application->mutex);
         /* Physical job limit reached (or a same-project cancel still
          * draining): QUEUE instead of surfacing a raw busy error. The
          * request thread blocks for the whole index anyway, so waiting for
@@ -2229,13 +2584,6 @@ static char *application_index_execute(void *context, const char *root_path,
          * exits this loop with the error below). */
         atomic_fetch_add_explicit(&g_application_busy_queue_waits_for_test, 1,
                                   memory_order_release);
-        cbm_mutex_lock(&session->application->mutex);
-        bool queued_cancelled = application_request_cancelled_locked(session);
-        cbm_mutex_unlock(&session->application->mutex);
-        if (queued_cancelled) {
-            free(project_key);
-            return cbm_mcp_text_result("index operation cancelled for this session", true);
-        }
         cbm_usleep(APPLICATION_JOB_POLL_US);
     }
     free(project_key);
@@ -2879,6 +3227,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
     }
     cbm_mutex_init(&application->mutex);
     application->physical_job_limit = APPLICATION_DEFAULT_PHYSICAL_JOB_LIMIT;
+    application->large_worker_memory_budget_bytes = APPLICATION_LARGE_WORKER_BUDGET_BYTES;
     size_t aggregate_memory_budget_bytes = cbm_mem_budget();
     if (config) {
         if ((config->ui_readiness_secret != NULL || config->ui_readiness_secret_length != 0) &&
@@ -2912,15 +3261,30 @@ cbm_daemon_application_t *cbm_daemon_application_new(
             application->ui_readiness_secret_set = true;
         }
     }
-    /* Equal fixed slices keep admission deterministic: starting fewer jobs does
+    /* Resource tokens adapt daily indexing to one through four workers. A
+     * normal 1.5 GiB daemon budget admits four 384 MiB reservations; tighter
+     * budgets reduce concurrency instead of overcommitting. An explicit
+     * physical limit remains a hard upper bound. Equal fixed slices keep
+     * admission deterministic: starting fewer jobs does
      * not let an early worker claim memory reserved for later concurrent jobs.
      * The absurd sub-byte-per-slot case is made safe by reducing effective
      * capacity before division; normal daemon budgets are many orders larger. */
+    if (aggregate_memory_budget_bytes > 0) {
+        size_t token_limit =
+            aggregate_memory_budget_bytes / APPLICATION_DAILY_WORKER_RESERVATION_BYTES;
+        if (token_limit == 0) {
+            token_limit = 1;
+        }
+        if (application->physical_job_limit > token_limit) {
+            application->physical_job_limit = token_limit;
+        }
+    }
     if (aggregate_memory_budget_bytes > 0 &&
         application->physical_job_limit > aggregate_memory_budget_bytes) {
         application->physical_job_limit = aggregate_memory_budget_bytes;
     }
     if (aggregate_memory_budget_bytes > 0 && application->physical_job_limit > 0) {
+        application->aggregate_memory_budget_bytes = aggregate_memory_budget_bytes;
         application->worker_memory_budget_bytes =
             aggregate_memory_budget_bytes / application->physical_job_limit;
     }
@@ -2930,6 +3294,7 @@ cbm_daemon_application_t *cbm_daemon_application_new(
             .start = application_worker_start_default,
             .poll = application_worker_poll_default,
             .cancel = application_worker_cancel_default,
+            .observed_rss = application_worker_observed_rss_default,
             .log_path = application_worker_log_path_default,
             .destroy = application_worker_destroy_default,
         };
@@ -3048,6 +3413,8 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
     application->watch_job_subscriptions = NULL;
     cbm_daemon_application_mutation_t *mutations = application->mutations;
     application->mutations = NULL;
+    cbm_daemon_application_resource_history_t *resource_history = application->resource_history;
+    application->resource_history = NULL;
     cbm_mutex_unlock(&application->mutex);
     while (sessions) {
         cbm_daemon_application_session_t *next = sessions->next;
@@ -3083,6 +3450,12 @@ bool cbm_daemon_application_free_with_timeout(cbm_daemon_application_t *applicat
         free(mutations->project_key);
         free(mutations);
         mutations = next;
+    }
+    while (resource_history) {
+        cbm_daemon_application_resource_history_t *next = resource_history->next;
+        free(resource_history->project_key);
+        free(resource_history);
+        resource_history = next;
     }
     cbm_mutex_destroy(&application->mutex);
     cbm_secure_zero(application->ui_readiness_secret, sizeof(application->ui_readiness_secret));
@@ -3401,6 +3774,7 @@ static int application_background_index(cbm_daemon_application_t *application,
     }
 
     application_job_subscribe_status_t subscribe_status = APPLICATION_JOB_SUBSCRIBE_UNAVAILABLE;
+    bool large_repository = application_index_is_large_repository(canonical_root);
     application_jobs_reap_completed(application);
     cbm_mutex_lock(&application->mutex);
     cbm_daemon_application_watch_t *watch =
@@ -3410,9 +3784,10 @@ static int application_background_index(cbm_daemon_application_t *application,
     size_t watch_owner_count = 0;
     bool watch_subscriptions_ok = true;
     cbm_daemon_application_job_t *job =
-        watch_live ? application_job_subscribe_locked(application, project_key, canonical_root,
-                                                      args, &subscribe_status)
-                   : NULL;
+        watch_live
+            ? application_job_subscribe_locked(application, project_key, canonical_root, args,
+                                               large_repository, false, &subscribe_status)
+            : NULL;
     if (job && require_live_watch) {
         watch_subscriptions_ok = application_watch_job_subscribe_sessions_locked(
             application, watch, job, &watch_owner_count);
@@ -3526,6 +3901,16 @@ size_t cbm_daemon_application_worker_memory_budget_bytes(cbm_daemon_application_
     size_t budget = application->worker_memory_budget_bytes;
     cbm_mutex_unlock(&application->mutex);
     return budget;
+}
+
+size_t cbm_daemon_application_observed_index_rss_for_test(cbm_daemon_application_t *application) {
+    if (!application) {
+        return 0;
+    }
+    cbm_mutex_lock(&application->mutex);
+    size_t observed = application_active_observed_rss_locked(application);
+    cbm_mutex_unlock(&application->mutex);
+    return observed;
 }
 
 bool cbm_daemon_application_session_retains_store_for_test(

@@ -475,6 +475,32 @@ TEST(discover_bounded_count_matches_shebang_discovery) {
     PASS();
 }
 
+TEST(discover_bounded_measure_stops_on_source_bytes) {
+    char *base = th_mktempdir("cbm_disc_measure");
+    ASSERT(base != NULL);
+    th_write_file(TH_PATH(base, "first.c"), "1234567890");
+    th_write_file(TH_PATH(base, "second.py"), "1234567890");
+
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    int limited_count = -1;
+    size_t limited_bytes = 0;
+    cbm_discover_status_t limited = cbm_discover_measure_bounded(
+        base, &opts, 100, 15, cbm_now_ms() + 2000, &limited_count, &limited_bytes);
+    int exact_count = -1;
+    size_t exact_bytes = 0;
+    cbm_discover_status_t exact = cbm_discover_measure_bounded(
+        base, &opts, 100, 20, cbm_now_ms() + 2000, &exact_count, &exact_bytes);
+
+    th_cleanup(base);
+    ASSERT_EQ(limited, CBM_DISCOVER_LIMIT_EXCEEDED);
+    ASSERT_EQ(limited_count, 1);
+    ASSERT_EQ(limited_bytes, 10);
+    ASSERT_EQ(exact, CBM_DISCOVER_OK);
+    ASSERT_EQ(exact_count, 2);
+    ASSERT_EQ(exact_bytes, 20);
+    PASS();
+}
+
 TEST(discover_skips_git_dir) {
     char *base = th_mktempdir("cbm_disc_git");
     ASSERT(base != NULL);
@@ -1767,6 +1793,7 @@ SUITE(discover) {
     RUN_TEST(discover_bounded_count_is_allocation_free_and_limit_exact);
     RUN_TEST(discover_bounded_count_fails_closed_after_deadline);
     RUN_TEST(discover_bounded_count_matches_shebang_discovery);
+    RUN_TEST(discover_bounded_measure_stops_on_source_bytes);
     RUN_TEST(discover_skips_git_dir);
     RUN_TEST(discover_with_gitignore);
     RUN_TEST(discover_with_global_xdg_ignore);

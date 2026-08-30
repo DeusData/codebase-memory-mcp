@@ -36,6 +36,7 @@ typedef struct {
     cbm_index_worker_poll_t (*poll)(void *context, cbm_daemon_application_worker_t worker,
                                     const cbm_index_worker_result_t **result_out);
     bool (*cancel)(void *context, cbm_daemon_application_worker_t worker);
+    bool (*observed_rss)(void *context, cbm_daemon_application_worker_t worker, size_t *bytes_out);
     const char *(*log_path)(void *context, cbm_daemon_application_worker_t worker);
     void (*destroy)(void *context, cbm_daemon_application_worker_t worker);
 } cbm_daemon_application_worker_ops_t;

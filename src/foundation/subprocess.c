@@ -22,11 +22,17 @@
                        * non-ASCII repo path survives CreateProcess (#423/#20) */
 #include <stdlib.h>   /* free */
 #else
+#ifndef __APPLE__
+#include <dirent.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #ifdef __APPLE__
+#include <libproc.h>
 #include <spawn.h>
+#include <sys/proc_info.h>
+#include <sys/sysctl.h>
 extern char **environ;
 #endif
 #include <sys/stat.h>
@@ -423,6 +429,7 @@ struct cbm_subprocess {
     bool root_reaped;
     uint64_t force_started_ms;
     bool containment_failed;
+    size_t observed_tree_rss;
     cbm_proc_result_t result;
 
 #ifdef _WIN32
@@ -435,6 +442,116 @@ struct cbm_subprocess {
     pid_t pgid;
 #endif
 };
+
+static bool cbm_subprocess_tree_rss_sample(cbm_subprocess_t *process, size_t *bytes_out) {
+    *bytes_out = 0;
+#ifdef _WIN32
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION information;
+    memset(&information, 0, sizeof(information));
+    if (!process->job || !QueryInformationJobObject(process->job, JobObjectExtendedLimitInformation,
+                                                    &information, sizeof(information), NULL)) {
+        return false;
+    }
+    *bytes_out = (size_t)information.PeakJobMemoryUsed;
+    return true;
+#elif defined(__APPLE__)
+    int query[4] = {CTL_KERN, KERN_PROC, KERN_PROC_ALL, 0};
+    size_t length = 0;
+    if (sysctl(query, 3, NULL, &length, NULL, 0) != 0 || length == 0) {
+        return false;
+    }
+    struct kinfo_proc *processes = malloc(length);
+    if (!processes || sysctl(query, 3, processes, &length, NULL, 0) != 0) {
+        free(processes);
+        return false;
+    }
+    size_t total = 0;
+    size_t count = length / sizeof(*processes);
+    for (size_t i = 0; i < count; i++) {
+        if (processes[i].kp_eproc.e_pgid != process->pgid) {
+            continue;
+        }
+        struct rusage_info_v2 usage;
+        memset(&usage, 0, sizeof(usage));
+        if (proc_pid_rusage(processes[i].kp_proc.p_pid, RUSAGE_INFO_V2, (rusage_info_t *)&usage) ==
+            0) {
+            size_t resident = (size_t)usage.ri_resident_size;
+            total = resident > SIZE_MAX - total ? SIZE_MAX : total + resident;
+        }
+    }
+    free(processes);
+    *bytes_out = total;
+    return true;
+#else
+    DIR *directory = opendir("/proc");
+    if (!directory) {
+        return false;
+    }
+    long page_size = sysconf(_SC_PAGESIZE);
+    size_t total = 0;
+    struct dirent *entry = NULL;
+    while (page_size > 0 && (entry = readdir(directory)) != NULL) {
+        char *end = NULL;
+        long pid = strtol(entry->d_name, &end, 10);
+        if (pid <= 0 || !end || *end != '\0') {
+            continue;
+        }
+        char path[128];
+        (void)snprintf(path, sizeof(path), "/proc/%ld/stat", pid);
+        FILE *stat_file = fopen(path, "r");
+        char stat_line[4096];
+        if (!stat_file || !fgets(stat_line, sizeof(stat_line), stat_file)) {
+            if (stat_file) {
+                (void)fclose(stat_file);
+            }
+            continue;
+        }
+        (void)fclose(stat_file);
+        char *command_end = strrchr(stat_line, ')');
+        char state = 0;
+        long parent = 0;
+        long group = 0;
+        if (!command_end || sscanf(command_end + 1, " %c %ld %ld", &state, &parent, &group) != 3 ||
+            group != process->pgid) {
+            continue;
+        }
+        (void)snprintf(path, sizeof(path), "/proc/%ld/statm", pid);
+        FILE *memory_file = fopen(path, "r");
+        unsigned long pages = 0;
+        unsigned long resident_pages = 0;
+        bool read = memory_file && fscanf(memory_file, "%lu %lu", &pages, &resident_pages) == 2;
+        if (memory_file) {
+            (void)fclose(memory_file);
+        }
+        if (read) {
+            size_t resident = resident_pages > SIZE_MAX / (size_t)page_size
+                                  ? SIZE_MAX
+                                  : (size_t)resident_pages * (size_t)page_size;
+            total = resident > SIZE_MAX - total ? SIZE_MAX : total + resident;
+        }
+    }
+    (void)closedir(directory);
+    *bytes_out = total;
+    return true;
+#endif
+}
+
+bool cbm_subprocess_observed_tree_rss(cbm_subprocess_t *process, size_t *bytes_out) {
+    if (!bytes_out) {
+        return false;
+    }
+    *bytes_out = 0;
+    if (!process) {
+        return false;
+    }
+    size_t sample = 0;
+    bool sampled = cbm_subprocess_tree_rss_sample(process, &sample);
+    if (sampled && sample > process->observed_tree_rss) {
+        process->observed_tree_rss = sample;
+    }
+    *bytes_out = process->observed_tree_rss;
+    return sampled || process->observed_tree_rss > 0;
+}
 
 static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->outcome = CBM_PROC_SPAWN_FAILED;

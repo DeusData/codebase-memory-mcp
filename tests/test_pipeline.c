@@ -1052,14 +1052,13 @@ static NamedEdgePropertyObservation observe_named_edge_callee_property(
     }
     observation.database_opened = true;
 
-    static const char sql[] =
-        "SELECT e.properties, json_valid(e.properties), "
-        "CASE WHEN json_valid(e.properties) "
-        "THEN json_extract(e.properties, '$.callee') END "
-        "FROM edges e "
-        "JOIN nodes src ON src.id=e.source_id AND src.project=e.project "
-        "JOIN nodes tgt ON tgt.id=e.target_id AND tgt.project=e.project "
-        "WHERE e.project=?1 AND e.type=?2 AND src.name=?3 AND tgt.name=?4;";
+    static const char sql[] = "SELECT e.properties, json_valid(e.properties), "
+                              "CASE WHEN json_valid(e.properties) "
+                              "THEN json_extract(e.properties, '$.callee') END "
+                              "FROM edges e "
+                              "JOIN nodes src ON src.id=e.source_id AND src.project=e.project "
+                              "JOIN nodes tgt ON tgt.id=e.target_id AND tgt.project=e.project "
+                              "WHERE e.project=?1 AND e.type=?2 AND src.name=?3 AND tgt.name=?4;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
@@ -1747,13 +1746,13 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
     long_reference_name[0] = 'l';
     long_reference_name[LONG_REFERENCE_NAME_LEN] = '\0';
     char long_reference_source[1024];
-    int long_reference_source_len = snprintf(
-        long_reference_source, sizeof(long_reference_source),
-        "package parity\n"
-        "func %s() {}\n"
-        "func longPropertiesReferenceAccept(callback func()) {}\n"
-        "func longPropertiesReferenceSite() { longPropertiesReferenceAccept(%s) }\n",
-        long_reference_name, long_reference_name);
+    int long_reference_source_len =
+        snprintf(long_reference_source, sizeof(long_reference_source),
+                 "package parity\n"
+                 "func %s() {}\n"
+                 "func longPropertiesReferenceAccept(callback func()) {}\n"
+                 "func longPropertiesReferenceSite() { longPropertiesReferenceAccept(%s) }\n",
+                 long_reference_name, long_reference_name);
     if (long_reference_source_len <= 0 ||
         (size_t)long_reference_source_len >= sizeof(long_reference_source)) {
         th_rmtree(tmp);
@@ -1941,18 +1940,18 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                 named_edge_count(sequential_store, sequential_project, "CALLS",
                                  shadow_controls[i].source_name, shadow_controls[i].target_name);
         }
-        sequential_long_reference = named_edge_count(
-            sequential_store, sequential_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
-            long_reference_name);
-        sequential_long_usage = named_edge_count(sequential_store, sequential_project, "USAGE",
-                                                 "longPropertiesReferenceSite",
-                                                 long_reference_name);
-        sequential_long_calls = named_edge_count(sequential_store, sequential_project, "CALLS",
-                                                 "longPropertiesReferenceSite",
-                                                 long_reference_name);
+        sequential_long_reference =
+            named_edge_count(sequential_store, sequential_project, "CALL_REFERENCE",
+                             "longPropertiesReferenceSite", long_reference_name);
+        sequential_long_usage =
+            named_edge_count(sequential_store, sequential_project, "USAGE",
+                             "longPropertiesReferenceSite", long_reference_name);
+        sequential_long_calls =
+            named_edge_count(sequential_store, sequential_project, "CALLS",
+                             "longPropertiesReferenceSite", long_reference_name);
         sequential_long_property = observe_named_edge_callee_property(
-            sequential_db_path, sequential_project, "CALL_REFERENCE",
-            "longPropertiesReferenceSite", long_reference_name, long_reference_name);
+            sequential_db_path, sequential_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name, long_reference_name);
         cbm_store_close(sequential_store);
     }
     cbm_pipeline_free(sequential);
@@ -1990,9 +1989,9 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                 named_edge_count(parallel_store, parallel_project, "CALLS",
                                  shadow_controls[i].source_name, shadow_controls[i].target_name);
         }
-        parallel_long_reference = named_edge_count(
-            parallel_store, parallel_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
-            long_reference_name);
+        parallel_long_reference =
+            named_edge_count(parallel_store, parallel_project, "CALL_REFERENCE",
+                             "longPropertiesReferenceSite", long_reference_name);
         parallel_long_usage = named_edge_count(parallel_store, parallel_project, "USAGE",
                                                "longPropertiesReferenceSite", long_reference_name);
         parallel_long_calls = named_edge_count(parallel_store, parallel_project, "CALLS",
@@ -2472,8 +2471,8 @@ static void closure_probe_repo(const char *tmp) {
 }
 
 /* Fresh full reference build of the same tree into its own DB. */
-static void closure_fresh_full(const char *tmp, const char *db_path, int *out_nodes,
-                               int *out_edges, int *out_ref_edges, const char *project_hint) {
+static void closure_fresh_full(const char *tmp, const char *db_path, int *out_nodes, int *out_edges,
+                               int *out_ref_edges, const char *project_hint) {
     *out_nodes = -1;
     *out_edges = -2;
     *out_ref_edges = -3;
@@ -2490,9 +2489,9 @@ static void closure_fresh_full(const char *tmp, const char *db_path, int *out_no
         if (store) {
             *out_nodes = cbm_store_count_nodes(store, project);
             *out_edges = cbm_store_count_edges(store, project);
-            *out_ref_edges = named_edge_to_file_count(store, project, "CALL_REFERENCE",
-                                                      "closureProbeCaller", "closureProbeHelper",
-                                                      "lib.ts");
+            *out_ref_edges =
+                named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
+                                         "closureProbeHelper", "lib.ts");
             cbm_store_close(store);
         }
     }
@@ -2577,8 +2576,8 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     ASSERT_NOT_NULL(store);
     repaired_nodes = cbm_store_count_nodes(store, project);
     repaired_edges = cbm_store_count_edges(store, project);
-    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE",
-                                             "closureProbeCaller", "closureProbeHelper", "lib.ts");
+    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
+                                             "closureProbeHelper", "lib.ts");
     cbm_store_close(store);
 
     char full_db[512];
@@ -2634,8 +2633,8 @@ TEST(pipeline_closure_repair_removed_def_drops_dependent_edge) {
     int repaired_refs = -1;
     cbm_store_t *store = cbm_store_open_path(db);
     ASSERT_NOT_NULL(store);
-    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE",
-                                             "closureProbeCaller", "closureProbeHelper", "lib.ts");
+    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
+                                             "closureProbeHelper", "lib.ts");
     int repaired_nodes = cbm_store_count_nodes(store, project);
     int repaired_edges = cbm_store_count_edges(store, project);
     cbm_store_close(store);
@@ -2878,8 +2877,7 @@ TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
      * target_a.ts to target_b.ts. Since alias-config governance landed this
      * runs as a closure repair, and the convergence assertions below now
      * prove that route rather than being satisfied by a full rebuild. */
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
-              CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     const char *incremental_project = cbm_pipeline_project_name(incremental);
     cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
     ASSERT_NOT_NULL(incremental_store);
@@ -3067,8 +3065,8 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
     static const char canary[] = "canary-must-survive\n";
     char canary_path[PREDICTABLE_CANARIES][640];
     for (int i = 0; i < PREDICTABLE_CANARIES; i++) {
-        snprintf(canary_path[i], sizeof(canary_path[i]), "%s.stage.%ld.%d", db_path,
-                 (long)getpid(), i + 1);
+        snprintf(canary_path[i], sizeof(canary_path[i]), "%s.stage.%ld.%d", db_path, (long)getpid(),
+                 i + 1);
         ASSERT_EQ(th_write_file(canary_path[i], canary), 0);
     }
 
@@ -6249,7 +6247,7 @@ TEST(pipeline_swift_cross_package_import) {
     cbm_edge_t *edges = NULL;
     int ec = 0;
     ASSERT_EQ(cbm_store_find_edges_by_source_type(s, importer.id, "IMPORTS", &edges, &ec),
-             CBM_STORE_OK);
+              CBM_STORE_OK);
 
     bool found_exact_edge = false;
     for (int i = 0; i < ec; i++) {
@@ -9686,17 +9684,16 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
  * above for the full end-to-end proof. */
 
 TEST(pkgmap_swift_targets_registers_module) {
-    static const char src[] =
-        "// swift-tools-version:5.9\n"
-        "import PackageDescription\n"
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\", dependencies: [])]\n"
-        ")\n";
+    static const char src[] = "// swift-tools-version:5.9\n"
+                              "import PackageDescription\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
@@ -9717,8 +9714,8 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
     ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
@@ -9737,15 +9734,14 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
  * fixture in this file happens to follow `name:` with `dependencies:` or a
  * comma, so this specific shape was previously untested and unnoticed. */
 TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
-    static const char src[] =
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\")]\n"
-        ")\n";
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\")]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
@@ -9763,8 +9759,8 @@ TEST(pkgmap_swift_target_honors_literal_path) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Vendor/CoreLegacy");
@@ -9778,16 +9774,15 @@ TEST(pkgmap_swift_target_honors_literal_path) {
  * target entirely (fail closed), even though its `name:` is a valid
  * literal. */
 TEST(pkgmap_swift_target_computed_path_fails_closed) {
-    static const char src[] =
-        "let customPath = computePath()\n"
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\", path: customPath)]\n"
-        ")\n";
+    static const char src[] = "let customPath = computePath()\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", path: customPath)]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_EQ(entries.count, 0);
     cbm_pkg_entries_free(&entries);
@@ -9809,8 +9804,8 @@ TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
@@ -9839,8 +9834,8 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
@@ -9855,18 +9850,17 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
  * (Utils/UtilsPkg) name OTHER modules, not this manifest's own
  * products/targets, so neither mints an entry. */
 TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
-    static const char src[] =
-        "let package = Package(\n"
-        "    name: \"App\",\n"
-        "    targets: [.target(name: \"App\", dependencies: [\n"
-        "        \"Core\",\n"
-        "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
-        "    ])]\n"
-        ")\n";
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"App\",\n"
+                              "    targets: [.target(name: \"App\", dependencies: [\n"
+                              "        \"Core\",\n"
+                              "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+                              "    ])]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
@@ -12084,6 +12078,49 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     PASS();
 }
 
+TEST(pipeline_resource_mode_selection) {
+    const char *old_mode = getenv("CBM_INDEX_RESOURCE_MODE");
+    const char *old_batch = getenv("CBM_STREAMING_BATCH_FILES");
+    char *saved_mode = old_mode ? strdup(old_mode) : NULL;
+    char *saved_batch = old_batch ? strdup(old_batch) : NULL;
+    ASSERT_TRUE(!old_mode || saved_mode != NULL);
+    ASSERT_TRUE(!old_batch || saved_batch != NULL);
+    ASSERT_EQ(cbm_unsetenv("CBM_INDEX_RESOURCE_MODE"), 0);
+    ASSERT_EQ(cbm_unsetenv("CBM_STREAMING_BATCH_FILES"), 0);
+
+    cbm_file_info_t small[1] = {{0}};
+    small[0].size = 1024;
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(small, 1), 0);
+
+    cbm_file_info_t *many = calloc(10000, sizeof(*many));
+    ASSERT_NOT_NULL(many);
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(many, 10000), 512);
+    free(many);
+
+    small[0].size = (int64_t)512 * 1024 * 1024;
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(small, 1), 1);
+
+    cbm_file_info_t manual[600] = {{0}};
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_RESOURCE_MODE", "large", 1), 0);
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(manual, 600), 512);
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_RESOURCE_MODE", "daily", 1), 0);
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(manual, 600), 0);
+    ASSERT_EQ(cbm_setenv("CBM_INDEX_RESOURCE_MODE", "invalid", 1), 0);
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(manual, 600), -1);
+    ASSERT_EQ(cbm_setenv("CBM_STREAMING_BATCH_FILES", "37", 1), 0);
+    ASSERT_EQ(cbm_pipeline_streaming_batch_size(manual, 600), 37);
+
+    int restore_mode = saved_mode ? cbm_setenv("CBM_INDEX_RESOURCE_MODE", saved_mode, 1)
+                                  : cbm_unsetenv("CBM_INDEX_RESOURCE_MODE");
+    int restore_batch = saved_batch ? cbm_setenv("CBM_STREAMING_BATCH_FILES", saved_batch, 1)
+                                    : cbm_unsetenv("CBM_STREAMING_BATCH_FILES");
+    free(saved_mode);
+    free(saved_batch);
+    ASSERT_EQ(restore_mode, 0);
+    ASSERT_EQ(restore_batch, 0);
+    PASS();
+}
+
 /* TS cross-registry test hooks (ts_lsp.c) — extern to avoid pulling the
  * tree-sitter-typed ts_lsp.h into this store-level test. */
 extern long cbm_ts_full_registry_builds(void);
@@ -12767,6 +12804,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_run_null);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
+    RUN_TEST(pipeline_resource_mode_selection);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
     RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
     /* File persistence */

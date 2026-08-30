@@ -574,10 +574,14 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 int cbm_parallel_resolve_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, CBMLSPDef *all_defs, int def_count,
-                            char *const *def_modules,
-                            struct CBMModuleDefIndex *module_def_index,
+                            char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
                             void *cross_registries, bool finalize_graph);
 int cbm_parallel_resolve_finalize(cbm_pipeline_ctx_t *ctx);
+
+/* Stage 5C resource-mode selector. Returns zero for the daily full-cache path,
+ * a positive bounded batch size for the large-repository path, or -1 for an
+ * invalid explicit override. Exposed for deterministic policy tests. */
+int cbm_pipeline_streaming_batch_size(const cbm_file_info_t *files, int file_count);
 
 /* Post-merge: create Route nodes for HTTP_CALLS/ASYNC_CALLS edges that
  * have url_path in properties but point to library functions instead of routes.

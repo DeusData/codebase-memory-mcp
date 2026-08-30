@@ -476,6 +476,43 @@ TEST(subprocess_natural_completion_is_cached_across_polls) {
 #endif
 }
 
+TEST(subprocess_observes_contained_tree_rss) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX shell process-group RSS probe; Windows Job telemetry is compile-covered");
+#else
+    const char *argv[] = {"/bin/sh", "-c", "sleep 5 & wait", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = "/bin/sh";
+    opts.argv = argv;
+    opts.cancel_grace_ms = 100;
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
+    ASSERT_NOT_NULL(process);
+
+    size_t observed = 0;
+    uint64_t deadline = cbm_now_ms() + 2000;
+    while (cbm_now_ms() < deadline && observed == 0) {
+        (void)cbm_subprocess_observed_tree_rss(process, &observed);
+        cbm_usleep(1000);
+    }
+    bool cancelled = cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result;
+    bool terminal = poll_until_terminal(process, 2000, &result);
+    size_t cached = 0;
+    bool cached_available = cbm_subprocess_observed_tree_rss(process, &cached);
+    if (terminal) {
+        cbm_subprocess_destroy(process);
+    }
+
+    ASSERT_TRUE(observed > 0);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(cached_available);
+    ASSERT_TRUE(cached >= observed);
+    PASS();
+#endif
+}
+
 TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group probe; native Windows Job Object tree probe pending");
@@ -1177,6 +1214,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_null_bin_rejected);
     RUN_TEST(subprocess_spawn_returns_while_child_is_running);
     RUN_TEST(subprocess_natural_completion_is_cached_across_polls);
+    RUN_TEST(subprocess_observes_contained_tree_rss);
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree);

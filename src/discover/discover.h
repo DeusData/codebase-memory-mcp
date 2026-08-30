@@ -164,6 +164,15 @@ cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
                                                  const cbm_discover_opts_t *opts, int max_files,
                                                  uint64_t deadline_ms, int *count_out);
 
+/* Count indexable files and their aggregate source bytes without retaining a
+ * file array. Stops when either limit would be exceeded. This is the daemon's
+ * pre-spawn resource classifier, so a large job is identified before it can
+ * consume a daily-worker slot. */
+cbm_discover_status_t cbm_discover_measure_bounded(const char *repo_path,
+                                                   const cbm_discover_opts_t *opts, int max_files,
+                                                   size_t max_total_bytes, uint64_t deadline_ms,
+                                                   int *count_out, size_t *total_bytes_out);
+
 /* Like cbm_discover(), but also reports the directory subtrees that were
  * skipped during the walk (hardcoded ALWAYS_SKIP/FAST_SKIP dirs + gitignore
  * matches), so callers can surface which subtrees were dropped (#411).
