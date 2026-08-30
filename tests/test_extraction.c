@@ -3015,6 +3015,67 @@ TEST(go_imports) {
     PASS();
 }
 
+TEST(extract_go_cgo_export_flag) {
+    /* #1929: `//export Name` above a Go func declares its C ABI symbol; cgo
+     * requires Name == the func name, so only an exact match sets the flag. */
+    CBMFileResult *r = extract("package fx\n\n"
+                               "/*\nstatic int helper(int a) { return a + 1; }\n*/\n"
+                               "import \"C\"\n\n"
+                               "//export GoCallback\n"
+                               "func GoCallback(v int) int { return v }\n\n"
+                               "//export SomethingElse\n"
+                               "func Mismatched(v int) int { return v }\n\n"
+                               "func Plain(v int) int { return v }\n",
+                               CBM_LANG_GO, "t", "cgo.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_cb = false;
+    bool saw_mismatch = false;
+    bool saw_plain = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name) {
+            continue;
+        }
+        if (strcmp(d->name, "GoCallback") == 0) {
+            ASSERT_TRUE(d->is_cgo_export);
+            saw_cb = true;
+        }
+        if (strcmp(d->name, "Mismatched") == 0) {
+            ASSERT_FALSE(d->is_cgo_export);
+            saw_mismatch = true;
+        }
+        if (strcmp(d->name, "Plain") == 0) {
+            ASSERT_FALSE(d->is_cgo_export);
+            saw_plain = true;
+        }
+    }
+    ASSERT_TRUE(saw_cb);
+    ASSERT_TRUE(saw_mismatch);
+    ASSERT_TRUE(saw_plain);
+    /* #1929: the preamble range is flagged as unparsed — the C definitions in
+     * it are invisible to the Go grammar and coverage must say so. */
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_NOT_NULL(strstr(r->error_ranges, "3-5"));
+    cbm_free_result(r);
+
+    /* A Go file without cgo keeps a clean coverage signal. */
+    r = extract("package fx\n\nfunc Clean(v int) int { return v }\n", CBM_LANG_GO, "t", "clean.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+
+    /* `import "C"` with no preamble comment hides nothing — not flagged. */
+    r = extract("package fx\n\nimport \"C\"\n\nfunc Bare(v int) int { return v }\n", CBM_LANG_GO,
+                "t", "bare.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1935: Go struct fields were never extracted — find_class_body() returns the
  * struct_type node, whose only named child is a field_declaration_list, so the
  * member loop matched nothing and every field was silently skipped (0 Field
@@ -6752,6 +6813,7 @@ SUITE(extraction) {
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(extract_go_cgo_export_flag);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);

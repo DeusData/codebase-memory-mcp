@@ -507,6 +507,12 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    if (def->is_cgo_export && pos + 1 < bufsize) {
+        int m = snprintf(buf + pos, bufsize - pos, ",\"cgo_export\":true");
+        if (m > 0 && (size_t)m < bufsize - pos) {
+            pos += (size_t)m;
+        }
+    }
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);
@@ -2457,6 +2463,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
+        /* #1929: `C.<ident>` is the cgo pseudo-namespace — no resolution path
+         * may bind it to a project symbol. Mirrors pass_calls.c. */
+        if (cbm_go_suppress_cgo_callee(lang == CBM_LANG_GO, call->callee_name)) {
+            continue;
+        }
+
         _rc_t0 = extract_now_ns();
         try_field_type_hint(rc, &res, call->callee_name, source_node->id);
         atomic_fetch_add_explicit(&rc->time_ns_rc_hint, extract_now_ns() - _rc_t0,
@@ -2558,6 +2570,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
+        /* #1929: a Go //export function is a declared C ABI contract — a
+         * C-family caller naming it exactly binds by that contract. Mirrors
+         * pass_calls.c. */
+        if (target_node && (lang == CBM_LANG_C || lang == CBM_LANG_CPP) && call->callee_name &&
+            target_node->name && strcmp(call->callee_name, target_node->name) == 0 &&
+            target_node->properties_json &&
+            strstr(target_node->properties_json, "\"cgo_export\":true")) {
+            res.strategy = "export_linkage";
+            res.confidence = CBM_EXPORT_LINKAGE_CONF;
+        }
         if (target_node && source_node->id != target_node->id &&
             cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
             /* #725: same guard as pass_calls.c — do not emit a suffix_match

@@ -1156,6 +1156,54 @@ static void cbm_subtract_macro_invocation_regions(cbm_error_regions_t *regs,
 }
 
 /* Serialize collected regions as "start-end,start-end,..." into the arena. */
+/* #1929: the cgo preamble — the comment run directly above `import "C"` — is
+ * C source the Go grammar consumes as a comment, so every definition in it is
+ * absent from the graph while parse coverage reports the file as fully
+ * indexed. Collect that run as an unparsed region so the gap is visible. */
+static void cbm_flag_go_cgo_preamble(cbm_error_regions_t *regs, TSNode root, const char *source) {
+    uint32_t n = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(child), "import_declaration") != 0) {
+            continue;
+        }
+        /* The spec path must be exactly "C" — the three bytes '"C"' appear in
+         * the clause text only for the pseudo-package (a longer path puts
+         * other characters inside the quotes). */
+        uint32_t sb = ts_node_start_byte(child);
+        uint32_t eb = ts_node_end_byte(child);
+        bool is_cgo = false;
+        for (uint32_t b = sb; b + 2 < eb; b++) {
+            if (source[b] == '"' && source[b + 1] == 'C' && source[b + 2] == '"') {
+                is_cgo = true;
+                break;
+            }
+        }
+        if (!is_cgo) {
+            continue;
+        }
+        TSNode prev = ts_node_prev_named_sibling(child);
+        if (ts_node_is_null(prev) || strcmp(ts_node_type(prev), "comment") != 0) {
+            continue; /* no preamble — nothing hidden */
+        }
+        uint32_t end_row = ts_node_end_point(prev).row;
+        uint32_t start_row = ts_node_start_point(prev).row;
+        while (true) {
+            TSNode before = ts_node_prev_named_sibling(prev);
+            if (ts_node_is_null(before) || strcmp(ts_node_type(before), "comment") != 0) {
+                break;
+            }
+            prev = before;
+            start_row = ts_node_start_point(prev).row;
+        }
+        if (regs->count < CBM_MAX_ERROR_REGIONS) {
+            regs->starts[regs->count] = start_row + 1;
+            regs->ends[regs->count] = end_row + 1;
+            regs->count++;
+        }
+    }
+}
+
 static const char *cbm_error_ranges_str(CBMArena *a, const cbm_error_regions_t *regs) {
     if (regs->count <= 0) {
         return NULL;
@@ -1648,6 +1696,24 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
             result->parse_incomplete = true;
             result->error_region_count = regs.count;
             result->error_ranges = cbm_error_ranges_str(a, &regs);
+        }
+    }
+
+    /* #1929: a cgo file parses CLEAN — the C preamble is a comment to the Go
+     * grammar — so the block above never flags it, and coverage silently
+     * claims full indexing while every preamble definition is missing. Flag
+     * the preamble range explicitly. Detection aid only, like #963 above. */
+    if (language == CBM_LANG_GO) {
+        cbm_error_regions_t cgo_regs = {{0}, {0}, 0};
+        cbm_flag_go_cgo_preamble(&cgo_regs, root, source);
+        if (cgo_regs.count > 0) {
+            result->parse_incomplete = true;
+            result->error_region_count += cgo_regs.count;
+            const char *cgo_ranges = cbm_error_ranges_str(a, &cgo_regs);
+            result->error_ranges =
+                result->error_ranges
+                    ? cbm_arena_sprintf(a, "%s,%s", result->error_ranges, cgo_ranges)
+                    : cgo_ranges;
         }
     }
 

@@ -2055,6 +2055,35 @@ static bool rust_def_is_test(const char *const *decorators) {
     return false;
 }
 
+/* #1929: does a cgo `//export <name>` directive sit in the comment run
+ * directly above this Go func def, naming exactly this function? cgo requires
+ * the exported name to equal the func name, so anything else is not a
+ * contract for THIS def. */
+static bool go_def_has_cgo_export(CBMExtractCtx *ctx, TSNode func_node, const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    static const char kPrefix[] = "//export ";
+    size_t name_len = strlen(name);
+    TSNode prev = ts_node_prev_named_sibling(func_node);
+    while (!ts_node_is_null(prev) && strcmp(ts_node_type(prev), "comment") == 0) {
+        char *text = cbm_node_text(ctx->arena, prev, ctx->source);
+        if (text && strncmp(text, kPrefix, sizeof(kPrefix) - 1) == 0) {
+            const char *exported = text + sizeof(kPrefix) - 1;
+            size_t elen = strlen(exported);
+            while (elen > 0 && (exported[elen - 1] == '\n' || exported[elen - 1] == '\r' ||
+                                exported[elen - 1] == ' ' || exported[elen - 1] == '\t')) {
+                elen--;
+            }
+            if (elen == name_len && strncmp(exported, name, name_len) == 0) {
+                return true;
+            }
+        }
+        prev = ts_node_prev_named_sibling(prev);
+    }
+    return false;
+}
+
 static const char *rust_cfg_qualified_name(CBMArena *a, const char *base_qn,
                                            const char *const *decorators) {
     if (!decorators) {
@@ -3776,6 +3805,14 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (ctx->language == CBM_LANG_RUST) {
         def.qualified_name = rust_cfg_qualified_name(a, def.qualified_name, def.decorators);
         def.is_test = rust_def_is_test(def.decorators);
+    }
+
+    // Go: a cgo `//export Name` directive above the func declares its C ABI
+    // symbol (#1929). cgo requires Name to equal the func name; record only an
+    // exact match so the resolver upgrade cannot be spoofed by an unrelated
+    // directive in the same comment run.
+    if (ctx->language == CBM_LANG_GO) {
+        def.is_cgo_export = go_def_has_cgo_export(ctx, node, name);
     }
 
     // C++/CUDA: GoogleTest macros are test functions (#1266).
