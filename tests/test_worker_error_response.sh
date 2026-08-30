@@ -56,8 +56,14 @@ while [[ ${i} -le 64 ]]; do
   printf 'def f%s():\n    pass\n' "${i}" >"${repository}/f${i}.py"
   i=$((i + 1))
 done
+repository_arg="${repository}"
+if command -v cygpath >/dev/null 2>&1; then
+  # JSON arguments are opaque to MSYS2 argv conversion. Use a forward-slash
+  # Windows path so the native worker can canonicalize the request scope.
+  repository_arg="$(cygpath -m "${repository}")"
+fi
 response="${tmpdir}/worker.response"
-args="{\"repo_path\":\"${repository}\",\"mode\":\"fast\"}"
+args="{\"repo_path\":\"${repository_arg}\",\"mode\":\"fast\"}"
 
 if ! CBM_INDEX_RESOURCE_MODE=invalid CBM_CACHE_DIR="${tmpdir}/cache-worker" \
   "${BINARY}" cli --index-worker \
@@ -77,7 +83,7 @@ fi
 
 set +e
 CBM_INDEX_RESOURCE_MODE=invalid CBM_CACHE_DIR="${tmpdir}/cache-supervisor" \
-  "${BINARY}" cli index_repository --repo-path "${repository}" --mode fast \
+  "${BINARY}" cli index_repository --repo-path "${repository_arg}" --mode fast \
   >"${tmpdir}/supervisor.out" 2>"${tmpdir}/supervisor.err"
 cli_rc=$?
 set -e
