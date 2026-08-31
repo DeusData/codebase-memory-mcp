@@ -3454,9 +3454,11 @@ TEST(tool_index_status_freshness_sample_cap_truncates) {
     ASSERT_NOT_NULL(strstr(inner, "\"untracked_source\":"));
     ASSERT_NOT_NULL(strstr(inner, "\"count\":17"));
     ASSERT_NOT_NULL(strstr(inner, "\"truncated\":true"));
-    char sample_buf[128];
-    snprintf(sample_buf, sizeof(sample_buf), "\"paths\":[\"u00.txt\",\"u01.txt\",\"u02.txt\",\"u03.txt\",\"u04.txt\",\"u05.txt\",\"u06.txt\",\"u07.txt\",\"u08.txt\",\"u09.txt\",\"u10.txt\",\"u11.txt\",\"u12.txt\",\"u13.txt\",\"u14.txt\",\"u15.txt\"]");
-    ASSERT_NOT_NULL(strstr(inner, sample_buf));
+    static const char EXPECTED_PATHS[] =
+        "\"paths\":[\"u00.txt\",\"u01.txt\",\"u02.txt\",\"u03.txt\",\"u04.txt\",\"u05.txt\","
+        "\"u06.txt\",\"u07.txt\",\"u08.txt\",\"u09.txt\",\"u10.txt\",\"u11.txt\",\"u12.txt\","
+        "\"u13.txt\",\"u14.txt\",\"u15.txt\"]";
+    ASSERT_NOT_NULL(strstr(inner, EXPECTED_PATHS));
 
     free(inner);
     free(resp);
