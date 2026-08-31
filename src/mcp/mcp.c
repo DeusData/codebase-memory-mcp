@@ -5111,9 +5111,9 @@ static void add_worktree_status_json(yyjson_mut_doc *doc, yyjson_mut_val *freshn
  *   - equal SHA + status available + no changes       → current
  * Report-only: it never triggers indexing. Verbose-only and read-only; the
  * live checkout is resolved fresh from the project root (never mutated). */
-static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                     cbm_store_t *store, const char *project,
-                                     const char *root_path, const char *indexed_generation) {
+static void add_index_freshness_json(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_store_t *store,
+                                     const char *project, const char *root_path,
+                                     const char *indexed_generation) {
     yyjson_mut_val *freshness = yyjson_mut_obj(doc);
     if (indexed_generation && indexed_generation[0]) {
         yyjson_mut_obj_add_strcpy(doc, freshness, "indexed_generation", indexed_generation);

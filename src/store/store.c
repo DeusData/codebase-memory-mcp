@@ -3853,8 +3853,8 @@ int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverag
         "ignored_files_stored, ignored_files_total, coverage_version, "
         "hash_records_complete FROM index_coverage_meta WHERE project = ?1;";
     bool has_checkout_column = coverage_meta_has_checkout_column(s);
-    if (sqlite3_prepare_v2(s->db, has_checkout_column ? SQL_FULL : SQL_LEGACY, CBM_NOT_FOUND,
-                           &stmt, NULL) != SQLITE_OK) {
+    if (sqlite3_prepare_v2(s->db, has_checkout_column ? SQL_FULL : SQL_LEGACY, CBM_NOT_FOUND, &stmt,
+                           NULL) != SQLITE_OK) {
         store_set_error_sqlite(s, "coverage meta get prepare");
         return CBM_STORE_ERR;
     }
