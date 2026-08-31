@@ -794,12 +794,47 @@ typedef struct {
 } cbm_error_regions_t;
 
 static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
+    TSPoint start = ts_node_start_point(n);
+    TSPoint end = ts_node_end_point(n);
+    uint32_t start_line = start.row + 1;
+    uint32_t end_line = end.row + 1;
+
+    /* A node that ends at column 0 stopped right after the previous line's
+     * newline, so it holds no text on the row it points at. Counting that row
+     * named a line past the end of the file whenever the region ran to EOF:
+     * scripts/setup-windows.ps1 has 326 lines and reported "245-327". */
+    if (end.column == 0 && end.row > start.row) {
+        end_line = end.row;
+    }
+
+    /* One line can carry several error nodes, and repeating the same line range
+     * says nothing new. Line 113 of scripts/setup-windows.ps1 has two error
+     * nodes, at columns 25-29 and 31-32, and the report read "113-113,113-113".
+     * Drop the repeat.
+     *
+     * Only an EXACT repeat of the range already open is dropped. Do not merge
+     * ranges that merely overlap. Each range is judged separately later by
+     * cbm_region_is_recovered, which asks whether definitions starting inside
+     * that range cover it. Two ranges with the same numbers always get the same
+     * verdict, so collapsing them changes nothing. Two DIFFERENT ranges do not:
+     * merging 3-3 into 2-3 hands the wider range's covering definition to an
+     * error the definition does not explain, and a real parse failure then
+     * disappears from the report. tests/test_parse_coverage.c pins that case in
+     * perl_malformed_source_remains_partial_issue1838.
+     *
+     * This runs BEFORE the cap check, so a dropped repeat never counts as a
+     * range the cap threw away. */
+    if (acc->count > 0 && start_line == acc->starts[acc->count - 1] &&
+        end_line == acc->ends[acc->count - 1]) {
+        return;
+    }
+
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         acc->dropped++;
         return;
     }
-    acc->starts[acc->count] = ts_node_start_point(n).row + 1;
-    acc->ends[acc->count] = ts_node_end_point(n).row + 1;
+    acc->starts[acc->count] = start_line;
+    acc->ends[acc->count] = end_line;
     acc->count++;
 }
 
