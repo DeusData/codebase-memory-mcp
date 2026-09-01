@@ -230,23 +230,15 @@ void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc, y
     char memory_dir_buf[CBM_SZ_1K];
     snprintf(memory_dir_buf, sizeof(memory_dir_buf), "%s",
              memory_dir_resolved ? memory_dir_resolved : "");
-    const char *default_scope =
-        cfg ? cbm_config_get(cfg, CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "project") : "project";
-    char default_scope_buf[CBM_SZ_256];
-    snprintf(default_scope_buf, sizeof(default_scope_buf), "%s",
-             default_scope ? default_scope : "");
     yyjson_mut_obj_add_str(doc, root, "storage", "personal");
     yyjson_mut_obj_add_bool(doc, root, "local_only", true);
     yyjson_mut_obj_add_bool(doc, root, "external_transmission", false);
-    yyjson_mut_obj_add_str(doc, root, "network_sync", "disabled");
     yyjson_mut_obj_add_str(doc, root, "repo_upload", "disabled");
     yyjson_mut_obj_add_str(doc, root, "sensitive_data_logging", "disabled");
     yyjson_mut_obj_add_str(doc, root, "delete_semantics", "selected repo/branch/doc row only");
     yyjson_mut_obj_add_str(doc, root, "promote_semantics",
                            "local branch doc copy to base branch doc");
-    yyjson_mut_obj_add_str(doc, root, "sync_semantics", "disabled; no network sync exists");
     yyjson_mut_obj_add_bool(doc, root, "enabled", cbm_memory_enabled(cfg));
-    yyjson_mut_obj_add_strcpy(doc, root, "default_scope", default_scope_buf);
     yyjson_mut_obj_add_str(doc, root, "cache_env", "CBM_CACHE_DIR");
     yyjson_mut_obj_add_str(doc, root, "memory_env", "CBM_MEMORY_DIR");
     yyjson_mut_obj_add_str(doc, root, "dir_mode", "0700");
