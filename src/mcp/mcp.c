@@ -736,21 +736,12 @@ static const tool_def_t TOOLS[] = {
      "including case, so 'Purpose' and 'PURPOSE' are different sections.\","
      "\"additionalProperties\":{\"type\":\"string\"}}},\"additionalProperties\":false,"
      "\"required\":[\"project\"]}"},
-}
-
-     "\"string\",\"enum\":[\"get\",\"update\",\"sections\"]},\"scope\":{\"type\":\"string\","
-     "\"enum\":[\"project\",\"personal\"],\"default\":\"project\"},\"branch\":{\"type\":\"string\"}"
-     ","
-     "\"content\":{\"type\":\"string\"},\"sections\":{\"type\":\"array\",\"items\":{\"type\":"
-     "\"string\"}}},"
-     "\"required\":[\"project\"]"
-     "}"},
 
     {"manage_memory", "Manage personal repo memory",
      "Create or update local personal memory stored outside source repos",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"settings\",\"bootstrap\",\"delete\","
-     "\"list\",\"promote\",\"sync\"]},"
+     "\"list\",\"promote\"]},"
      "\"doc_type\":{\"type\":\"string\",\"default\":\"adr\"},\"branch\":{\"type\":\"string\"},"
      "\"content\":{\"type\":\"string\"},\"reveal_paths\":{\"type\":\"boolean\",\"default\":false},"
      "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
@@ -12257,6 +12248,7 @@ static char *adr_section_updates_error(const adr_section_updates_t *u) {
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
     return json;
+}
 
 #define MEMORY_EMPTY_HINT                                                       \
     "No personal memory yet. Explore with get_architecture/search_graph, then " \
@@ -12266,7 +12258,6 @@ static void memory_add_privacy_json(yyjson_mut_doc *doc, yyjson_mut_val *root) {
     yyjson_mut_obj_add_str(doc, root, "storage", "personal");
     yyjson_mut_obj_add_bool(doc, root, "local_only", true);
     yyjson_mut_obj_add_bool(doc, root, "external_transmission", false);
-    yyjson_mut_obj_add_str(doc, root, "network_sync", "disabled");
     yyjson_mut_obj_add_str(doc, root, "repo_upload", "disabled");
     yyjson_mut_obj_add_str(doc, root, "sensitive_data_logging", "disabled");
 }
@@ -12386,12 +12377,6 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
     } else if (strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) {
         yyjson_mut_obj_add_str(doc, root_obj, "status", "missing_content");
         yyjson_mut_obj_add_str(doc, root_obj, "error", "content is required for update/store");
-        is_error = true;
-    } else if (strcmp(mode_str, "sync") == 0) {
-        yyjson_mut_obj_add_str(doc, root_obj, "status", "sync_disabled");
-        yyjson_mut_obj_add_str(doc, root_obj, "sync_semantics", "disabled; no network sync exists");
-        yyjson_mut_obj_add_str(doc, root_obj, "promote_hint",
-                               "Use mode=promote only for local branch-to-base memory copy.");
         is_error = true;
     } else if (strcmp(mode_str, "promote") == 0) {
         char *db_path = NULL;

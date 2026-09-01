@@ -8741,6 +8741,8 @@ TEST(detect_changes_zero_overlap_falls_back_issue1363) {
     free(project);
     cbm_mcp_server_free(srv);
     th_rmtree(repo);
+    PASS();
+}
 
 TEST(tool_manage_memory_personal_store) {
     char tmp_dir[256];
@@ -8759,7 +8761,6 @@ TEST(tool_manage_memory_personal_store) {
     cbm_config_t *cfg = cbm_config_open(cache_dir);
     ASSERT_NOT_NULL(cfg);
     ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MEMORY_ENABLED, "true"), 0);
-    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MEMORY_DEFAULT_SCOPE, "personal"), 0);
 
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -8777,7 +8778,6 @@ TEST(tool_manage_memory_personal_store) {
     ASSERT_NOT_NULL(strstr(resp, "CBM_MEMORY_DIR"));
     ASSERT_NOT_NULL(strstr(resp, "repo_upload"));
     ASSERT_NOT_NULL(strstr(resp, "local_only"));
-    ASSERT_NOT_NULL(strstr(resp, "network_sync"));
     ASSERT_NOT_NULL(strstr(resp, "paths_redacted"));
     ASSERT_NOT_NULL(strstr(resp, "external_transmission"));
     ASSERT_NOT_NULL(strstr(resp, "sensitive_data_logging"));
@@ -8834,16 +8834,6 @@ TEST(tool_manage_memory_personal_store) {
     free(resp);
 
     resp = cbm_mcp_server_handle(
-        srv, "{\"jsonrpc\":\"2.0\",\"id\":1351,\"method\":\"tools/call\","
-             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
-             "\"mode\":\"sync\"}}}");
-    ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "sync_disabled"));
-    ASSERT_NOT_NULL(strstr(resp, "no network sync exists"));
-    ASSERT_NULL(strstr(resp, tmp_dir));
-    free(resp);
-
-    resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":136,\"method\":\"tools/call\","
              "\"params\":{\"name\":\"manage_memory\",\"arguments\":{\"project\":\"memory-proj\","
              "\"mode\":\"update\",\"branch\":\"feature\",\"content\":\"## PURPOSE\\nFeature "
@@ -8859,7 +8849,6 @@ TEST(tool_manage_memory_personal_store) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "promoted"));
     ASSERT_NOT_NULL(strstr(resp, "local_only"));
-    ASSERT_NOT_NULL(strstr(resp, "network_sync"));
     ASSERT_NOT_NULL(strstr(resp, "from_key_redacted"));
     ASSERT_NOT_NULL(strstr(resp, "to_key_redacted"));
     ASSERT_NULL(strstr(resp, tmp_dir));
