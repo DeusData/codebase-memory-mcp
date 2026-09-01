@@ -5545,12 +5545,10 @@ static int arch_compute_cycles(cbm_store_t *store, const char *project, int64_t 
     *scanned_edges = ecount;
     scc_graph_t g;
     if (!scc_build(src, tgt, ecount, &g)) {
-        free(src);
-        free(tgt);
+        cbm_store_free_call_edges(src, tgt);
         return CBM_STORE_OK; /* no edges = no cycles, not an error */
     }
-    free(src);
-    free(tgt);
+    cbm_store_free_call_edges(src, tgt);
 
     int *comp = malloc((size_t)g.nverts * sizeof(int));
     if (!comp) {

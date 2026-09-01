@@ -3142,6 +3142,11 @@ int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edge
     return CBM_STORE_OK;
 }
 
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt) {
+    free(src);
+    free(tgt);
+}
+
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out,
                                    int *count) {
     bind_id_t b = {source_id};
@@ -8232,6 +8237,10 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count) {
     return cbm_leiden(nodes, node_count, edges, edge_count, 1.0, out, out_count);
+}
+
+void cbm_leiden_free(cbm_louvain_result_t *result) {
+    free(result);
 }
 
 /* ── Architecture: community clusters via Leiden ───────────────── */
