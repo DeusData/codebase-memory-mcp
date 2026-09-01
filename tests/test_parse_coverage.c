@@ -104,6 +104,22 @@ static const char *PY_CLEAN = "def ok():\n"
                               "def ok2():\n"
                               "    return 2\n";
 
+/* Perl formats have a line-oriented body terminated by a lone dot.  The
+ * following named sub pins the important recovery boundary: a grammar must
+ * both accept the format and resume normal declaration parsing afterwards. */
+static const char *PERL_FORMAT_WITH_FOLLOWING_SUB = "package Report;\n"
+                                                    "format REPORT =\n"
+                                                    "@<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n"
+                                                    "$headline\n"
+                                                    ".\n"
+                                                    "sub after_format { return 1; }\n";
+
+/* A grammar refresh must not hide real Perl syntax loss. */
+static const char *PERL_MALFORMED = "package Broken;\n"
+                                    "sub before_error { return 1; }\n"
+                                    "} ] } ]\n"
+                                    "sub after_error { return 2; }\n";
+
 /* ── Tests ────────────────────────────────────────────────────────────────── */
 
 TEST(c_ifdef_split_brace_sets_parse_incomplete) {
@@ -418,6 +434,42 @@ TEST(width_bearing_error_at_eof_still_flagged_issue1610) {
     PASS();
 }
 
+/* #1838: tree-sitter-perl v1.0.0 rejects a valid line-oriented format and
+ * reports the file as partial.  The supported upstream v1.2.1 grammar accepts
+ * the format and preserves declaration extraction beyond its dot terminator. */
+TEST(perl_format_followed_by_named_sub_is_complete_issue1838) {
+    CBMFileResult *r = do_extract(PERL_FORMAT_WITH_FOLLOWING_SUB, CBM_LANG_PERL, "report.pl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool partial = r->parse_incomplete;
+    int error_regions = r->error_region_count;
+    bool has_error_ranges = r->error_ranges != NULL;
+    bool has_following_sub = has_def(r, "after_format");
+    if (partial || error_regions != 0 || has_error_ranges || !has_following_sub) {
+        fprintf(stderr,
+                "  Perl format result: partial=%d regions=%d ranges=%s following_sub=%d\n",
+                partial,
+                error_regions,
+                r->error_ranges ? r->error_ranges : "(none)",
+                has_following_sub);
+        cbm_free_result(r);
+        FAIL("a valid Perl format and its following named sub must parse completely");
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perl_malformed_source_remains_partial_issue1838) {
+    CBMFileResult *r = do_extract(PERL_MALFORMED, CBM_LANG_PERL, "broken.pl");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -437,4 +489,6 @@ SUITE(parse_coverage) {
     RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(perl_format_followed_by_named_sub_is_complete_issue1838);
+    RUN_TEST(perl_malformed_source_remains_partial_issue1838);
 }

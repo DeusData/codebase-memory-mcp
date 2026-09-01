@@ -748,6 +748,15 @@ TEST(lang_ext_scheme) {
     PASS();
 }
 
+TEST(lang_ext_chialisp) {
+    ASSERT_EQ(cbm_language_for_extension(".clsp"), CBM_LANG_CHIALISP);
+    ASSERT_EQ(cbm_language_for_extension(".clib"), CBM_LANG_CHIALISP);
+    ASSERT_EQ(cbm_language_for_extension(".clinc"), CBM_LANG_CHIALISP);
+    /* .clj stays Clojure — the Chialisp extensions must not widen it. */
+    ASSERT_EQ(cbm_language_for_extension(".clj"), CBM_LANG_CLOJURE);
+    PASS();
+}
+
 TEST(lang_ext_fennel) {
     ASSERT_EQ(cbm_language_for_extension(".fnl"), CBM_LANG_FENNEL);
     PASS();
@@ -1338,6 +1347,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_d);
     RUN_TEST(lang_ext_nim);
     RUN_TEST(lang_ext_scheme);
+    RUN_TEST(lang_ext_chialisp);
     RUN_TEST(lang_ext_fennel);
     RUN_TEST(lang_ext_fish);
     RUN_TEST(lang_ext_awk);

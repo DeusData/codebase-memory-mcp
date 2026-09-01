@@ -52,9 +52,15 @@ License summary:
 - `clojure` ([sogaiu/tree-sitter-clojure](https://github.com/sogaiu/tree-sitter-clojure)) is **CC0-1.0**;
   `fennel` is **CC0-1.0**; `jinja2` and `just` are **Apache-2.0**;
   `pine` is **ISC** (declared by its upstream).
-- The grammars authored in-house for this project (`cobol`, `form`, `janet`,
-  `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own license,
-  (c) DeusData. Seven further grammars (`arkts`, `assembly`, `cfml`,
+- The grammars authored in-house for this project (`chialisp`, `cobol`, `form`,
+  `janet`, `magma`, `protobuf`, `wolfram`) are **MIT** under the project's own
+  license, (c) DeusData. Each ships the repository's own LICENSE, byte-identical
+  to the root copy; they carry no third-party copyright because there is no
+  third party. `chialisp` is a generic s-expression grammar for the Chia
+  smart-coin language, written for this project because no usable public
+  grammar exists; its source and corpus tests live in
+  `tools/tree-sitter-chialisp/`.
+- Seven further grammars (`arkts`, `assembly`, `cfml`,
   `cfscript`, `dotenv`, `pine`, `qml`) are self-maintained forks that retain
   their original upstream authors' licenses — see the manifest for per-grammar
   provenance. `arkts` is a first-party derivative of

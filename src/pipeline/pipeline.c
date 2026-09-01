@@ -946,6 +946,9 @@ static void predump_complexity(cbm_pipeline_ctx_t *ctx) {
 static void predump_ensemble(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_ensemble_routing(ctx);
 }
+static void predump_importance(cbm_pipeline_ctx_t *ctx) {
+    cbm_pipeline_pass_importance(ctx);
+}
 
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
@@ -953,12 +956,23 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         const char *name;
         bool moderate_only; /* true = skip in fast mode */
     } passes[] = {
-        {predump_deco, "decorator_tags", false},   {predump_cfg, "configlink", false},
-        {predump_route, "route_match", false},     {predump_ensemble, "ensemble_routing", false},
-        {predump_sim, "similarity", true},         {predump_sem, "semantic_edges", true},
+        {predump_deco, "decorator_tags", false},
+        {predump_cfg, "configlink", false},
+        {predump_route, "route_match", false},
+        {predump_ensemble, "ensemble_routing", false},
+        {predump_sim, "similarity", true},
+        {predump_sem, "semantic_edges", true},
         {predump_complexity, "complexity", false},
+        /* Importance runs LAST: it reads CALLS/USAGE (extraction) and TESTS
+         * (pass_tests, which run_post_extraction runs before this loop), so
+         * every edge type its score depends on already exists here. */
+        {predump_importance, "importance", false},
     };
-    enum { PREDUMP_PASS_COUNT = 7 };
+    /* Derived from the table, never hand-written. A hand-written count that
+     * lags a newly appended entry silently skips the LAST pass while every
+     * test stays green — exactly the failure this expression makes
+     * impossible. */
+    enum { PREDUMP_PASS_COUNT = (int)(sizeof(passes) / sizeof(passes[0])) };
     struct timespec t;
     for (int i = 0; i < PREDUMP_PASS_COUNT && !check_cancel(p); i++) {
         /* "moderate_only" passes (similarity/semantic edges) run in FULL,
@@ -1239,7 +1253,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
         all_defs = def_modules
-                       ? cbm_pxc_collect_all_defs(cache, files, file_count, ctx->project_name,
+                       ? cbm_pxc_collect_all_defs(ctx, cache, files, file_count, ctx->project_name,
                                                   def_modules, &def_count, def_starts)
                        : NULL;
     }
@@ -1524,22 +1538,6 @@ static void discard_generation_stage(const char *stage_path) {
     cbm_remove_db_sidecars(stage_path);
 }
 
-static int generation_rebuild_fts(cbm_store_t *store) {
-    if (cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');") !=
-        CBM_STORE_OK) {
-        return CBM_STORE_ERR;
-    }
-    if (cbm_store_exec(store,
-                       "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                       "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                       "FROM nodes;") == CBM_STORE_OK) {
-        return CBM_STORE_OK;
-    }
-    return cbm_store_exec(store,
-                          "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                          "SELECT id, name, qualified_name, label, file_path FROM nodes;");
-}
-
 typedef struct {
     bool quarantined;
     char backup_path[CBM_SZ_4K];
@@ -1809,7 +1807,10 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     cbm_log_info("publish.timing", "block", "coverage_replace", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
-    if (fts_wholesale && generation_rebuild_fts(store) != CBM_STORE_OK) {
+    /* The column list lives in cbm_store_fts_rebuild() alone — see the delta
+     * merge, which must index the SAME columns or prose goes missing on the
+     * warm path while a full reindex looks perfect. */
+    if (fts_wholesale && cbm_store_fts_rebuild(store, NULL, 0) != CBM_STORE_OK) {
         ok = false;
     }
     cbm_log_info("publish.timing", "block", "fts", "elapsed_ms", itoa_buf((int)elapsed_ms(t_pub)));

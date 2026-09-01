@@ -174,8 +174,9 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
-    CBM_LANG_ARKTS, // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
-    CBM_LANG_PLSQL, // Oracle PL/SQL
+    CBM_LANG_ARKTS,    // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
+    CBM_LANG_PLSQL,    // Oracle PL/SQL
+    CBM_LANG_CHIALISP, // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -259,9 +260,13 @@ typedef struct {
     uint32_t site_start_byte;           // exact AST occurrence span; end > start when present
     uint32_t site_end_byte;             // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;      // raw source or C-family preprocessed buffer
-    bool is_method;                     // method/member call with a non-self receiver. Perl:
+    bool is_method;                     // method/member call with an UNRESOLVED receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
-                                        // x.foo() whose receiver is not this/super. Default false.
+                                        // x.foo() whose receiver is not this/super. Python:
+                                        // x.foo() where x is not self/cls/super() and is not
+                                        // rooted in an imported name. Read by the weak-member
+                                        // guard and by the pxc synthetic-carrier dedup key in
+                                        // pass_lsp_cross.c. Default false.
     bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
                                         // C++ operator). Never fall back to textual resolution.
 } CBMCall;

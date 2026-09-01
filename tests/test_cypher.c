@@ -2031,6 +2031,64 @@ TEST(cypher_exec_count_distinct_issue239) {
  * function like split(...) or list indexing [..]) must FAIL LOUDLY with a clear
  * "unsupported function" error rather than silently projecting an empty column
  * (which looks like a valid-but-blank result and hides the real problem). */
+/* issue #1919: a variable the WITH clause dropped must be REFUSED, not projected
+ * as an empty column. `g` does not survive `WITH f.name AS caller`, so naming it
+ * afterwards is a query fault. The old code answered NULL for the unbound name,
+ * rendered it "", and exited clean — a column of nothing that reads as "the graph
+ * holds no such data" rather than "your query named something out of scope".
+ * Same principle as #373: fail loudly instead of projecting a blank column. */
+TEST(cypher_rejects_projection_of_dropped_with_var_issue1919) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function)-[:CALLS]->(g) WITH f.name AS caller RETURN caller, g.name", "test",
+        0, &r);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(r.error);
+    /* The message has to name the offending variable — an error that does not
+     * say which name is wrong sends the reader back to guessing. */
+    ASSERT_TRUE(strstr(r.error, "g") != NULL);
+    ASSERT_TRUE(strstr(r.error, "scope") != NULL);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* The guard must NOT reject an OPTIONAL MATCH target that simply did not match.
+ * `g` is a declared pattern variable there, so it stays in scope; it is merely
+ * unbound at run time, and projecting "" for it is the documented convention.
+ * This is the line between the two cases, and the reason the check reads the
+ * query's declared variables rather than the run-time bindings. */
+TEST(cypher_optional_match_target_still_allowed_issue1919) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function) OPTIONAL MATCH (f)-[:CALLS]->(g) RETURN f.name, g.name", "test", 0,
+        &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_TRUE(r.row_count > 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* An alias the WITH created is in scope afterwards, and a name carried through
+ * unchanged is too. Both must keep working. */
+TEST(cypher_with_alias_stays_in_scope_issue1919) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(
+        s, "MATCH (f:Function)-[:CALLS]->(g) WITH f.name AS caller, g AS callee RETURN caller, callee.name",
+        "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(r.error);
+    ASSERT_TRUE(r.row_count > 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_unsupported_func_errors_issue373) {
     cbm_store_t *s = setup_cypher_store();
 
@@ -4126,6 +4184,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_label_alternation_issue242);
     RUN_TEST(cypher_exec_count_distinct_issue239);
     RUN_TEST(cypher_exec_unsupported_func_errors_issue373);
+    RUN_TEST(cypher_rejects_projection_of_dropped_with_var_issue1919);
+    RUN_TEST(cypher_optional_match_target_still_allowed_issue1919);
+    RUN_TEST(cypher_with_alias_stays_in_scope_issue1919);
     RUN_TEST(cypher_exec_unknown_func_return_errors);
     RUN_TEST(cypher_exec_inline_props);
     RUN_TEST(cypher_parse_where_starts_with);

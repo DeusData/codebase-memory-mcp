@@ -3892,7 +3892,132 @@ static const char *qn_safe_segment(CBMArena *a, const char *name) {
     return out;
 }
 
-static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
+/* UTF-8 sequence classification: a lead byte's high bits name the sequence
+ * length, and every continuation byte matches 10xxxxxx. */
+enum {
+    UTF8_CONT_MASK = 0xC0,  /* isolate the two high bits ... */
+    UTF8_CONT_MARK = 0x80,  /* ... which are 10 on a continuation byte */
+    UTF8_LEAD2_MASK = 0xE0, /* 110xxxxx → 2-byte sequence */
+    UTF8_LEAD2_MARK = 0xC0,
+    UTF8_LEAD3_MASK = 0xF0, /* 1110xxxx → 3-byte sequence */
+    UTF8_LEAD3_MARK = 0xE0,
+    UTF8_LEAD4_MASK = 0xF8, /* 11110xxx → 4-byte sequence */
+    UTF8_LEAD4_MARK = 0xF0,
+    UTF8_LEN_1 = 1,
+    UTF8_LEN_2 = 2,
+    UTF8_LEN_3 = 3,
+    UTF8_LEN_4 = 4,
+};
+
+/* Bytes the sequence starting with `lead` occupies (1 for ASCII or a byte that
+ * is not a valid lead). */
+static size_t utf8_sequence_len(unsigned char lead) {
+    if ((lead & UTF8_LEAD2_MASK) == UTF8_LEAD2_MARK) {
+        return UTF8_LEN_2;
+    }
+    if ((lead & UTF8_LEAD3_MASK) == UTF8_LEAD3_MARK) {
+        return UTF8_LEN_3;
+    }
+    if ((lead & UTF8_LEAD4_MASK) == UTF8_LEAD4_MARK) {
+        return UTF8_LEN_4;
+    }
+    return UTF8_LEN_1;
+}
+
+/* Drop a trailing PARTIAL UTF-8 sequence left behind by a byte-length cut, so
+ * a capped prose value never ends mid-codepoint (#1017's rule, applied to the
+ * prose bodies below rather than to comments). */
+static void utf8_trim_partial_tail(char *text) {
+    size_t n = strlen(text);
+    if (n == 0) {
+        return;
+    }
+    size_t i = n;
+    while (i > 0 && ((unsigned char)text[i - UTF8_LEN_1] & UTF8_CONT_MASK) == UTF8_CONT_MARK) {
+        i--;
+    }
+    if (i == 0) {
+        text[0] = '\0'; /* continuation bytes only — not decodable */
+        return;
+    }
+    size_t need = utf8_sequence_len((unsigned char)text[i - UTF8_LEN_1]);
+    if (i - UTF8_LEN_1 + need > n) {
+        text[i - UTF8_LEN_1] = '\0';
+    }
+}
+
+/* Collapse `len` bytes of raw prose into a single-spaced value capped at
+ * MAX_COMMENT_LEN (the same 500-byte ceiling docstrings already use, which
+ * leaves room inside the 2 KB properties buffer that carries it).
+ *
+ * The output buffer is FIXED at that cap, so a section body of any size costs a
+ * bounded copy rather than a copy of the whole section. Returns NULL when
+ * nothing but whitespace was there. */
+static char *collapse_prose(CBMArena *a, const char *src, size_t len) {
+    if (!src || len == 0) {
+        return NULL;
+    }
+    char *out = (char *)cbm_arena_alloc(a, MAX_COMMENT_LEN + NULL_TERM);
+    if (!out) {
+        return NULL;
+    }
+    size_t w = 0;
+    bool in_ws = true; /* start true so leading whitespace is swallowed */
+    for (size_t i = 0; i < len && w < MAX_COMMENT_LEN; i++) {
+        unsigned char c = (unsigned char)src[i];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+            in_ws = true;
+            continue;
+        }
+        if (in_ws && w > 0) {
+            out[w++] = ' ';
+            if (w >= MAX_COMMENT_LEN) {
+                break;
+            }
+        }
+        in_ws = false;
+        out[w++] = (char)c;
+    }
+    out[w] = '\0';
+    utf8_trim_partial_tail(out);
+    return out[0] ? out : NULL;
+}
+
+static bool is_markdown_heading_kind(const char *kind) {
+    return strcmp(kind, "atx_heading") == 0 || strcmp(kind, "setext_heading") == 0;
+}
+
+/* #518: a Markdown heading node is only the title line — the section's prose
+ * lives in the blocks that FOLLOW it. Collect that prose as the Section's
+ * docstring so the node carries the text a reader would search for; nodes_fts
+ * indexes it from there (`body`), which is the whole point of the issue.
+ *
+ * tree-sitter-markdown wraps a heading and its content in a `section` node,
+ * with nested subsections as further `section` children that own their own
+ * text. Stopping at either a `section` or another heading therefore gives each
+ * Section exactly its OWN body under both that shape and a flat one. The bytes
+ * between are contiguous in the source, so one slice beats concatenation. */
+static const char *extract_markdown_section_body(CBMArena *a, TSNode heading, const char *source) {
+    uint32_t start = ts_node_end_byte(heading);
+    uint32_t end = start;
+    for (TSNode sib = ts_node_next_sibling(heading); !ts_node_is_null(sib);
+         sib = ts_node_next_sibling(sib)) {
+        const char *sk = ts_node_type(sib);
+        if (strcmp(sk, "section") == 0 || is_markdown_heading_kind(sk)) {
+            break;
+        }
+        end = ts_node_end_byte(sib);
+    }
+    if (end <= start) {
+        return NULL;
+    }
+    return collapse_prose(a, source + start, (size_t)(end - start));
+}
+
+/* Push a config-language definition that carries prose. push_simple_class_def
+ * delegates here with no docstring. */
+static void push_simple_class_def_doc(CBMExtractCtx *ctx, TSNode node, char *name,
+                                      const char *label, const char *docstring) {
     CBMArena *a = ctx->arena;
     CBMDefinition def;
     memset(&def, 0, sizeof(def));
@@ -3903,7 +4028,12 @@ static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, c
     def.start_line = ts_node_start_point(node).row + TS_LINE_OFFSET;
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.is_exported = true;
+    def.docstring = docstring;
     cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+static void push_simple_class_def(CBMExtractCtx *ctx, TSNode node, char *name, const char *label) {
+    push_simple_class_def_doc(ctx, node, name, label, NULL);
 }
 
 // Find TOML table key name from children.
@@ -4064,6 +4194,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     CBMArena *a = ctx->arena;
     char *name = NULL;
     const char *label = "Class";
+    const char *docstring = NULL;
 
     if (ctx->language == CBM_LANG_TOML &&
         (strcmp(kind, "table") == 0 || strcmp(kind, "table_array_element") == 0)) {
@@ -4079,6 +4210,8 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
         // label rather than degrade it to match a test. The markdown repro asserts
         // "Class"; that assertion is the inaccurate side and is flagged for review.
         label = "Section";
+        // #518: index what the section SAYS, not just its title.
+        docstring = extract_markdown_section_body(a, node, ctx->source);
     } else if (ctx->language == CBM_LANG_HCL && strcmp(kind, "block") == 0) {
         name = find_hcl_block_name(a, node, ctx->source);
     } else {
@@ -4086,7 +4219,7 @@ static bool extract_config_class_def(CBMExtractCtx *ctx, TSNode node, const char
     }
 
     if (name && name[0]) {
-        push_simple_class_def(ctx, node, name, label);
+        push_simple_class_def_doc(ctx, node, name, label, docstring);
     }
     return true;
 }
@@ -4676,6 +4809,20 @@ static TSNode find_class_member_body(TSNode class_node, CBMLanguage lang) {
 
     TSNode declarations = cbm_find_child_by_kind(body, "enum_body_declarations");
     return ts_node_is_null(declarations) ? body : declarations;
+}
+
+/* Go structs keep their field_declaration nodes one level below the body that
+ * find_class_body() returns: type_spec's `type` child is a struct_type whose
+ * only named child is a field_declaration_list. Interfaces need no such step --
+ * interface_type holds its method specs directly, which is why interface members
+ * extracted correctly while every struct field was silently skipped. Normalize
+ * here, the same way the Java enum_body_declarations step above does. */
+static TSNode go_normalize_struct_body(TSNode body) {
+    if (ts_node_is_null(body) || strcmp(ts_node_type(body), "struct_type") != 0) {
+        return body;
+    }
+    TSNode list = cbm_find_child_by_kind(body, "field_declaration_list");
+    return ts_node_is_null(list) ? body : list;
 }
 
 // Dart: resolve method name from method_signature/function_signature.
@@ -6206,12 +6353,9 @@ static bool is_helm_values_file(const char *rel) {
     return strcmp(b, "values.yaml") == 0 || strcmp(b, "values.yml") == 0;
 }
 
-// Extract ONLY top-level keys of a YAML document (no leaf explosion). Used for
-// Helm values.yaml so each chart's tunables surface as a handful of structured
-// Variables instead of one node per nested leaf (#338).
-static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
-    CBMArena *a = ctx->arena;
-    // Descend stream -> document -> block_node down to the first block_mapping.
+// Descend stream -> document -> block_node to a YAML document's top-level
+// block_mapping. Returns a null node when the document has none.
+static TSNode find_yaml_toplevel_mapping(TSNode root) {
     TSNode bm = {0};
     TSNode cur = root;
     for (int depth = 0; depth < 6 && ts_node_is_null(bm); depth++) {
@@ -6235,6 +6379,126 @@ static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
         }
         cur = next;
     }
+    return bm;
+}
+
+// Descend to a JSON document's top-level object. Returns a null node if absent.
+static TSNode find_json_toplevel_object(TSNode root) {
+    if (strcmp(ts_node_type(root), "object") == 0) {
+        return root;
+    }
+    TSNode obj = cbm_find_child_by_kind(root, "object");
+    if (!ts_node_is_null(obj)) {
+        return obj;
+    }
+    uint32_t n = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode inner = cbm_find_child_by_kind(ts_node_named_child(root, i), "object");
+        if (!ts_node_is_null(inner)) {
+            return inner;
+        }
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+/* #519: a config file's own prose sits in a top-level `description` (or one of
+ * its usual synonyms) — META.yaml, action.yml, an OpenAPI document,
+ * package.json. Nothing indexed it: the VALUE is not a definition, so no node
+ * carried it and BM25 could not see it at all. Checked in priority order; the
+ * first key present wins. */
+static const char *const config_desc_keys[] = {"description", "summary", "purpose", NULL};
+
+// Strip one layer of matching surrounding quotes. Operates on arena text.
+static char *strip_surrounding_quotes(char *t) {
+    if (!t) {
+        return t;
+    }
+    size_t n = strlen(t);
+    if (n >= PAIR_CHARS && (t[0] == '"' || t[0] == '\'') && t[n - SKIP_CHAR] == t[0]) {
+        t[n - SKIP_CHAR] = '\0';
+        return t + SKIP_CHAR;
+    }
+    return t;
+}
+
+// Normalise a config scalar into an indexable value: drop a YAML block-scalar
+// header (`|`/`>` plus its chomping and indent modifiers), collapse whitespace
+// to the shared MAX_COMMENT_LEN cap, then unquote.
+static const char *config_scalar_value(CBMArena *a, const char *raw) {
+    if (!raw) {
+        return NULL;
+    }
+    while (*raw == ' ' || *raw == '\t' || *raw == '\n' || *raw == '\r') {
+        raw++;
+    }
+    if (*raw == '|' || *raw == '>') {
+        while (*raw && *raw != '\n') {
+            raw++;
+        }
+    }
+    char *v = collapse_prose(a, raw, strlen(raw));
+    return v ? strip_surrounding_quotes(v) : NULL;
+}
+
+// Value of `pair` when its key is `want`, else NULL. A YAML block_mapping_pair
+// and a JSON pair both expose key/value fields, so one reader serves both.
+static const char *config_pair_value_if_key(CBMExtractCtx *ctx, TSNode pair, const char *want) {
+    TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+    TSNode val = ts_node_child_by_field_name(pair, TS_FIELD("value"));
+    if (ts_node_is_null(key) || ts_node_is_null(val)) {
+        return NULL;
+    }
+    char *kt = cbm_node_text(ctx->arena, key, ctx->source);
+    if (!kt || strcmp(strip_surrounding_quotes(kt), want) != 0) {
+        return NULL;
+    }
+    return config_scalar_value(ctx->arena, cbm_node_text(ctx->arena, val, ctx->source));
+}
+
+// First non-empty description value among `container`'s direct pairs, scanned
+// in config_desc_keys priority order.
+static const char *config_container_description(CBMExtractCtx *ctx, TSNode container,
+                                                const char *pair_kind) {
+    uint32_t n = ts_node_named_child_count(container);
+    for (const char *const *k = config_desc_keys; *k; k++) {
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode pair = ts_node_named_child(container, i);
+            if (strcmp(ts_node_type(pair), pair_kind) != 0) {
+                continue;
+            }
+            const char *v = config_pair_value_if_key(ctx, pair, *k);
+            if (v && v[0]) {
+                return v;
+            }
+        }
+    }
+    return NULL;
+}
+
+/* #519 entry point: the file-level description a config document declares about
+ * itself, promoted onto the Module node by cbm_extract_definitions so
+ * nodes_fts.body indexes it and the file is findable by what it SAYS it does,
+ * not only by its path. NULL for every other language. */
+static const char *extract_config_module_description(CBMExtractCtx *ctx) {
+    if (ctx->language == CBM_LANG_YAML) {
+        TSNode bm = find_yaml_toplevel_mapping(ctx->root);
+        return ts_node_is_null(bm) ? NULL
+                                   : config_container_description(ctx, bm, "block_mapping_pair");
+    }
+    if (ctx->language == CBM_LANG_JSON) {
+        TSNode obj = find_json_toplevel_object(ctx->root);
+        return ts_node_is_null(obj) ? NULL : config_container_description(ctx, obj, "pair");
+    }
+    return NULL;
+}
+
+// Extract ONLY top-level keys of a YAML document (no leaf explosion). Used for
+// Helm values.yaml so each chart's tunables surface as a handful of structured
+// Variables instead of one node per nested leaf (#338).
+static void extract_yaml_toplevel_keys(CBMExtractCtx *ctx, TSNode root) {
+    CBMArena *a = ctx->arena;
+    TSNode bm = find_yaml_toplevel_mapping(root);
     if (ts_node_is_null(bm)) {
         return;
     }
@@ -6437,6 +6701,9 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
     }
 
     TSNode body = find_class_member_body(class_node, ctx->language);
+    if (ctx->language == CBM_LANG_GO) {
+        body = go_normalize_struct_body(body);
+    }
     if (ts_node_is_null(body)) {
         return;
     }
@@ -6723,6 +6990,13 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
 
         char *name = cbm_node_text(a, name_node, ctx->source);
         if (!name || !name[0]) {
+            continue;
+        }
+
+        /* Go: `_` is the blank identifier, used for explicit struct padding in
+         * generated code. It is not a referenceable field, and emitting it gives
+         * every `_` in the repository a same-named node to collide with. */
+        if (ctx->language == CBM_LANG_GO && strcmp(name, "_") == 0) {
             continue;
         }
 
@@ -7285,36 +7559,85 @@ static bool lisp_is_def_head(const char *t) {
     return false;
 }
 
+/* Basename stem (no directory, no extension) of a path, into an arena string.
+ * A Chialisp `(mod ...)` has no name of its own — the file IS the puzzle — so
+ * the module entry point is named after the file that holds it. */
+static char *lisp_path_stem(CBMArena *a, const char *path) {
+    if (!path) {
+        return NULL;
+    }
+    const char *slash = strrchr(path, '/');
+    const char *base = slash ? slash + SKIP_CHAR : path;
+    const char *dot = strrchr(base, '.');
+    size_t len = (dot && dot != base) ? (size_t)(dot - base) : strlen(base);
+    return cbm_arena_strndup(a, base, len);
+}
+
 static void extract_lisp_def(CBMExtractCtx *ctx, TSNode node) {
     CBMArena *a = ctx->arena;
+    bool chialisp = (ctx->language == CBM_LANG_CHIALISP);
     if (ts_node_named_child_count(node) < 2) {
         return;
     }
-    char *head = cbm_node_text(a, ts_node_named_child(node, 0), ctx->source);
-    if (!lisp_is_def_head(head)) {
+    TSNode head_node =
+        chialisp ? cbm_lisp_named_child_skip_comments(node, 0) : ts_node_named_child(node, 0);
+    if (ts_node_is_null(head_node)) {
         return;
     }
-    TSNode target = ts_node_named_child(node, 1);
-    const char *tk = ts_node_type(target);
-    TSNode name_node = target;
-    // (define (foo args) ...) — the name is the head symbol of the nested list.
-    if ((strcmp(tk, "list") == 0 || strcmp(tk, "list_lit") == 0) &&
-        ts_node_named_child_count(target) > 0) {
-        name_node = ts_node_named_child(target, 0);
-    }
-    if (ts_node_is_null(name_node)) {
+    char *head = cbm_node_text(a, head_node, ctx->source);
+    if (!(chialisp ? cbm_chialisp_is_def_head(head) : lisp_is_def_head(head))) {
         return;
     }
-    char *name = cbm_node_text(a, name_node, ctx->source);
+    /* A def head inside `(q ...)`/`(qq ...)` is quoted DATA — Chialisp macros
+     * embed puzzle-shaped literals there — so it must not mint a node. */
+    if (chialisp && cbm_lisp_node_in_quote(a, node, ctx->source)) {
+        return;
+    }
+    char *name = NULL;
+    if (chialisp && strcmp(head, "mod") == 0) {
+        /* A top-level `(mod (ARGS) ...)` is the puzzle entry point; its second
+         * form is the curried-argument LIST, so the generic nested-name path
+         * below would name the module after its first curried argument. */
+        name = lisp_path_stem(a, ctx->rel_path);
+    } else {
+        TSNode target =
+            chialisp ? cbm_lisp_named_child_skip_comments(node, 1) : ts_node_named_child(node, 1);
+        if (ts_node_is_null(target)) {
+            return;
+        }
+        const char *tk = ts_node_type(target);
+        TSNode name_node = target;
+        // (define (foo args) ...) — the name is the head symbol of the nested list.
+        if ((strcmp(tk, "list") == 0 || strcmp(tk, "list_lit") == 0) &&
+            ts_node_named_child_count(target) > 0) {
+            name_node = ts_node_named_child(target, 0);
+        }
+        if (ts_node_is_null(name_node)) {
+            return;
+        }
+        name = cbm_node_text(a, name_node, ctx->source);
+    }
     if (!name || !name[0]) {
         return;
     }
     /* struct/record/type defining forms produce a type node, not a callable
      * (Racket `(struct point ...)`, Clojure `(defrecord ...)`, etc.). */
     const char *lisp_label = "Function";
-    if (strcmp(head, "struct") == 0 || strcmp(head, "define-struct") == 0 ||
-        strcmp(head, "define-record-type") == 0 || strcmp(head, "defrecord") == 0 ||
-        strcmp(head, "deftype") == 0) {
+    if (chialisp) {
+        /* Chialisp label map. `Constant` is admitted to the cross-file registry
+         * by cbm_label_is_registry_symbol, so a constant defined in an included
+         * .clib resolves from every puzzle that includes it. */
+        if (strcmp(head, "mod") == 0) {
+            lisp_label = "Module";
+        } else if (strcmp(head, "defconstant") == 0 || strcmp(head, "defconst") == 0 ||
+                   strcmp(head, "embed-file") == 0 || strcmp(head, "compile-file") == 0) {
+            lisp_label = "Constant";
+        } else if (strcmp(head, "defmacro") == 0 || strcmp(head, "defmac") == 0) {
+            lisp_label = "Macro";
+        }
+    } else if (strcmp(head, "struct") == 0 || strcmp(head, "define-struct") == 0 ||
+               strcmp(head, "define-record-type") == 0 || strcmp(head, "defrecord") == 0 ||
+               strcmp(head, "deftype") == 0) {
         lisp_label = "Struct";
     } else if (strcmp(head, "definterface") == 0 || strcmp(head, "defprotocol") == 0) {
         lisp_label = "Interface";
@@ -7497,9 +7820,20 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         }
 
         if ((ctx->language == CBM_LANG_CLOJURE || ctx->language == CBM_LANG_RACKET ||
-             ctx->language == CBM_LANG_SCHEME) &&
+             ctx->language == CBM_LANG_SCHEME || ctx->language == CBM_LANG_CHIALISP) &&
             (strcmp(kind, "list") == 0 || strcmp(kind, "list_lit") == 0)) {
             extract_lisp_def(ctx, node);
+            if (ctx->language == CBM_LANG_CHIALISP) {
+                /* Chialisp nests every helper `(defun ...)` inside the top-level
+                 * `(mod ...)`, and a .clib wraps its defuns in one enclosing
+                 * list. `list` is also chialisp_func_types, so the generic
+                 * function_node_types match below would fire on this same node
+                 * and `continue` WITHOUT descending — losing every nested def.
+                 * Push the children here and skip that match. Gated to Chialisp;
+                 * the other lisps keep their existing fall-through. */
+                wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
+                continue;
+            }
             // fall through: descend into children so nested defs are captured too
         }
 
@@ -7618,6 +7952,8 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.end_line = ts_node_end_point(ctx->root).row + TS_LINE_OFFSET;
     mod.is_exported = true;
     mod.is_test = ctx->result->is_test_file;
+    // #519: index what a config file declares itself to be, not only its path.
+    mod.docstring = extract_config_module_description(ctx);
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     cbm_extract_definitions_without_module(ctx);

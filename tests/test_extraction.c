@@ -1286,6 +1286,156 @@ TEST(plsql_create_type_as_object_limitation) {
     PASS();
 }
 
+/* --- Chialisp ---
+ *
+ * Three defects in the only public Chialisp grammar
+ * (Quexington/tree-sitter-chialisp) motivated writing our own, and each is
+ * pinned below as a parse-level assertion rather than a note: comments that
+ * required CRLF to terminate, `(include foo.clib)` rejected because of the dot
+ * in the filename, and `(defconstant NAME <expr>)` accepting only a primitive.
+ * All three desynchronised the rest of the file, so a regression here shows up
+ * as `has_error` plus missing defs, not as one lost node. */
+TEST(chialisp_puzzle_defs_and_labels) {
+    const char *src = "; a Chialisp puzzle\n"
+                      "(mod (ARG)\n"
+                      "  (include condition_codes.clib)\n"
+                      "  (defconstant TWO 2)\n"
+                      "  (defconstant HASH (sha256 1))\n"
+                      "  (defun-inline square (x) (* x x))\n"
+                      "  (defun apply_twice (v) (square (square v)))\n"
+                      "  (defmacro assert items (f items))\n"
+                      "  (apply_twice ARG)\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "puzzles/my_puzzle.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* `mod` has no name of its own — the puzzle is named by its file. */
+    ASSERT(has_def(r, "Module", "my_puzzle"));
+    /* Defs are NESTED inside `(mod ...)`; a walk that stops at the module
+     * loses every one of them. */
+    ASSERT(has_def(r, "Function", "square"));
+    ASSERT(has_def(r, "Function", "apply_twice"));
+    ASSERT(has_def(r, "Macro", "assert"));
+    /* `defconstant` binds an arbitrary EXPRESSION, not just a primitive. */
+    ASSERT(has_def(r, "Constant", "TWO"));
+    ASSERT(has_def(r, "Constant", "HASH"));
+    /* A dotted include filename resolves as one symbol. */
+    ASSERT(has_import(r, "condition_codes.clib"));
+    /* Real calls survive; CLVM primitives and def heads do not become calls. */
+    ASSERT(has_call(r, "square"));
+    ASSERT(has_call(r, "apply_twice"));
+    ASSERT(!has_call(r, "sha256"));
+    ASSERT(!has_call(r, "defun"));
+    ASSERT(!has_call(r, "mod"));
+    ASSERT(!has_call(r, "include"));
+    /* A parameter list is a `list` too — but it binds, it does not invoke. */
+    ASSERT(!has_call(r, "x"));
+    ASSERT(!has_call(r, "v"));
+    ASSERT(!has_call(r, "items"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_comment_line_endings) {
+    /* LF, CRLF, and a comment closed by EOF with no trailing newline. The
+     * public grammar's comment rule was `/;.*\r\n/`, so an LF file lost every
+     * form after the first comment. */
+    const char *lf = "(mod (A)\n; note\n(defun f (x) x)\n)\n";
+    const char *crlf = "(mod (A)\r\n; note\r\n(defun f (x) x)\r\n)\r\n";
+    const char *eof = "(mod (A)\n(defun f (x) x)\n)\n; trailing comment, no newline";
+    const char *srcs[] = {lf, crlf, eof};
+    for (int i = 0; i < 3; i++) {
+        CBMFileResult *r = extract(srcs[i], CBM_LANG_CHIALISP, "t", "c.clsp");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_FALSE(r->parse_incomplete);
+        ASSERT(has_def(r, "Function", "f"));
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+TEST(chialisp_library_defs_and_quoted_data) {
+    /* A .clib wraps its definitions in one enclosing list, and its macros embed
+     * puzzle-shaped literals under `(q ...)`. Those literals are DATA: a def
+     * head or call symbol inside one must mint nothing. */
+    const char *src = "(\n"
+                      "  (defconstant TWO 2)\n"
+                      "  (defmacro emit () (q . (defun ghost (x) (real_helper x))))\n"
+                      "  (defun real_helper (x) (+ x TWO))\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "curry.clib");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Constant", "TWO"));
+    ASSERT(has_def(r, "Macro", "emit"));
+    ASSERT(has_def(r, "Function", "real_helper"));
+    ASSERT(!has_def_any(r, "ghost"));
+    ASSERT(!has_call(r, "real_helper"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_export_names_do_not_duplicate_defs) {
+    /* `(export foo)` names a function already defined in the same file. As a
+     * def head it would mint a SECOND node for `foo`; as a call head it would
+     * mint a phantom call. It is neither. */
+    const char *src = "(\n"
+                      "  (defun foo (x) x)\n"
+                      "  (export foo)\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "e.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int foo_defs = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "foo") == 0) {
+            foo_defs++;
+        }
+    }
+    ASSERT_EQ(foo_defs, 1);
+    ASSERT(!has_call(r, "export"));
+    ASSERT(!has_call(r, "foo"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_comment_before_def_head_keeps_the_name) {
+    /* Comments are NAMED nodes and so occupy named-child indices. A comment
+     * between the head and the name shifts them by one; defs and call-scope
+     * must skip comments the same way or they stop describing the same tree. */
+    const char *src = "(mod ()\n"
+                      "  (defun ; why this exists\n"
+                      "     documented (x) (* x 2))\n"
+                      "  (defun caller () (documented 21))\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "d.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Function", "documented"));
+    ASSERT(has_def(r, "Function", "caller"));
+    ASSERT(has_call(r, "documented"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(chialisp_dialect_sigil_is_not_a_file_import) {
+    /* `(include *standard-cl-26*)` selects a dialect; recording it as an import
+     * invents a dependency on a file that does not exist. The compiler filters
+     * `*...*` names and so must we. */
+    const char *src = "(mod ()\n"
+                      "  (include *standard-cl-26*)\n"
+                      "  (include curry.clib)\n"
+                      ")\n";
+    CBMFileResult *r = extract(src, CBM_LANG_CHIALISP, "t", "s.clsp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "curry.clib"));
+    ASSERT(!has_import(r, "standard-cl-26"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Wolfram --- */
 TEST(wolfram_function) {
     CBMFileResult *r =
@@ -2861,6 +3011,59 @@ TEST(go_imports) {
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
     ASSERT(has_import(r, "fmt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1935: Go struct fields were never extracted — find_class_body() returns the
+ * struct_type node, whose only named child is a field_declaration_list, so the
+ * member loop matched nothing and every field was silently skipped (0 Field
+ * nodes for ~5055 declarations on the measured repo). Interfaces hold their
+ * method specs directly and always worked. The blank identifier `_` is struct
+ * padding, not a referenceable field, and must stay out (241 collision edges
+ * on two generated structs otherwise). */
+TEST(extract_go_struct_fields_have_nodes) {
+    CBMFileResult *r = extract("package fxf\n\n"
+                               "type Config struct {\n"
+                               "\tName    string\n"
+                               "\tTimeout int\n"
+                               "\tNested  *Config\n"
+                               "\t_       [8]byte\n"
+                               "}\n\n"
+                               "type Reader interface {\n"
+                               "\tRead(p []byte) (int, error)\n"
+                               "\tClose() error\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "cfg.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* RED before the descend fix: count is 0. The blank identifier must not
+     * bring it to 4. */
+    ASSERT_EQ(count_defs_with_label(r, "Field"), 3);
+    ASSERT_TRUE(has_def(r, "Field", "Name"));
+    ASSERT_TRUE(has_def(r, "Field", "Timeout"));
+    ASSERT_TRUE(has_def(r, "Field", "Nested"));
+    ASSERT_FALSE(has_def(r, "Field", "_"));
+    /* Each field carries its declared type in return_type. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->label || strcmp(d->label, "Field") != 0) {
+            continue;
+        }
+        ASSERT_NOT_NULL(d->return_type);
+        if (strcmp(d->name, "Name") == 0) {
+            ASSERT_TRUE(strcmp(d->return_type, "string") == 0);
+        }
+        if (strcmp(d->name, "Timeout") == 0) {
+            ASSERT_TRUE(strcmp(d->return_type, "int") == 0);
+        }
+        if (strcmp(d->name, "Nested") == 0) {
+            ASSERT_TRUE(strcmp(d->return_type, "*Config") == 0);
+        }
+    }
+    /* Interface members keep extracting exactly as before. */
+    ASSERT_TRUE(has_def(r, "Method", "Read"));
+    ASSERT_TRUE(has_def(r, "Method", "Close"));
     cbm_free_result(r);
     PASS();
 }
@@ -4572,6 +4775,75 @@ TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
     PASS();
 }
 
+/* Python receiver-aware flag (#1276; same intent as the Perl and TS/JS flags).
+ * Pins BOTH directions: an unknown receiver (a parameter, or an attribute of
+ * self) IS flagged so the resolver can suppress a weak short-name match, while
+ * self/cls/super() and import-bound receivers — Python's canonical cross-file
+ * call shape — are NOT, so their true edges survive. */
+TEST(extract_python_member_call_flags_is_method) {
+    CBMFileResult *r = extract("from pkg import helper\n"
+                               "import tools as toolkit\n"
+                               "\n"
+                               "class C(Base):\n"
+                               "    def run(self, external):\n"
+                               "        external.commit()\n"
+                               "        self.client.send()\n"
+                               "        self.helper()\n"
+                               "        super ( ).render()\n"
+                               "        helper.compute()\n"
+                               "        toolkit.format()\n"
+                               "        helper()\n",
+                               CBM_LANG_PYTHON, "t", "x.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int external = 0;
+    int nested = 0;
+    int self_call = 0;
+    int super_call = 0;
+    int imported_module = 0;
+    int imported_alias = 0;
+    int bare = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *cn = r->calls.items[i].callee_name;
+        if (strcmp(cn, "external.commit") == 0) {
+            /* parameter receiver — unknown type */
+            external++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "self.client.send") == 0) {
+            /* receiver is `self.client`, an attribute of unknown type — NOT self */
+            nested++;
+            ASSERT_TRUE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "self.helper") == 0) {
+            self_call++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strstr(cn, "render") != NULL) {
+            super_call++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "helper.compute") == 0) {
+            imported_module++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "toolkit.format") == 0) {
+            /* aliased import: local_name is "toolkit" */
+            imported_alias++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        } else if (strcmp(cn, "helper") == 0) {
+            bare++;
+            ASSERT_FALSE(r->calls.items[i].is_method);
+        }
+    }
+    /* Each shape must appear exactly once, so a missed extraction cannot make
+     * the loop above pass vacuously. */
+    ASSERT_EQ(external, 1);
+    ASSERT_EQ(nested, 1);
+    ASSERT_EQ(self_call, 1);
+    ASSERT_EQ(super_call, 1);
+    ASSERT_EQ(imported_module, 1);
+    ASSERT_EQ(imported_alias, 1);
+    ASSERT_EQ(bare, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* TS/JS/TSX receiver-aware flag (#592/#606; same intent as the Perl flag above).
  * A member call x.foo() with a non-this/super receiver is flagged is_method so
  * the resolver can suppress a weak short-name match (`re.test()` must not bind a
@@ -6033,6 +6305,208 @@ TEST(iris_export_xml_multi_class) {
     PASS();
 }
 
+/* ── #518 / #519: prose that BM25 can index ────────────────────────
+ *
+ * A Section carried only its heading and a config Module only its path, so a
+ * question asked in words could not reach either. Both now carry the prose in
+ * `docstring`, which is what nodes_fts indexes into its `body` column. */
+
+/* First Module-labelled definition, or NULL. */
+static const CBMDefinition *find_module_def(CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Module") == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+TEST(markdown_section_body_becomes_docstring_issue518) {
+    CBMFileResult *r = extract("# Installation\n"
+                               "Run the bootstrap script to provision a workstation.\n"
+                               "It installs the toolchain and seeds the cache.\n",
+                               CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_by_name(r, "Installation");
+    ASSERT_NOT_NULL(d);
+    ASSERT_STR_EQ(d->label, "Section");
+    ASSERT_NOT_NULL(d->docstring);
+    /* The prose — not the heading — is what makes the section findable. */
+    ASSERT_NOT_NULL(strstr(d->docstring, "bootstrap script"));
+    ASSERT_NOT_NULL(strstr(d->docstring, "seeds the cache"));
+    /* Newlines collapse to single spaces so the 500-byte cap buys real words. */
+    ASSERT_NULL(strchr(d->docstring, '\n'));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_body_stops_at_next_heading_issue518) {
+    CBMFileResult *r = extract("# Alpha\n"
+                               "alphatext belongs to the first section.\n"
+                               "\n"
+                               "# Beta\n"
+                               "betatext belongs to the second section.\n",
+                               CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *alpha = find_def_by_name(r, "Alpha");
+    const CBMDefinition *beta = find_def_by_name(r, "Beta");
+    ASSERT_NOT_NULL(alpha);
+    ASSERT_NOT_NULL(beta);
+    ASSERT_NOT_NULL(alpha->docstring);
+    ASSERT_NOT_NULL(beta->docstring);
+    /* Each section owns ITS body: bleeding across the boundary would make every
+     * heading match every word in the file. */
+    ASSERT_NOT_NULL(strstr(alpha->docstring, "alphatext"));
+    ASSERT_NULL(strstr(alpha->docstring, "betatext"));
+    ASSERT_NOT_NULL(strstr(beta->docstring, "betatext"));
+    ASSERT_NULL(strstr(beta->docstring, "alphatext"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_body_heading_only_has_no_docstring_issue518) {
+    CBMFileResult *r = extract("# Lonely\n", CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_by_name(r, "Lonely");
+    ASSERT_NOT_NULL(d);
+    /* An empty body stays NULL rather than "": append_json_string drops empty
+     * values, so an empty string would be a difference with no observable
+     * meaning — and a docstring key that promises prose it does not have. */
+    ASSERT_NULL(d->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(markdown_section_body_capped_utf8_safe_issue518) {
+    /* 400 three-byte codepoints (1200 bytes) guarantees the 500-byte cut lands
+     * mid-sequence unless the backoff works. */
+    char src[4096];
+    int pos = snprintf(src, sizeof(src), "# Unicode\n");
+    for (int i = 0; i < 400; i++) {
+        pos += snprintf(src + pos, sizeof(src) - (size_t)pos, "\xe2\x9c\x93");
+    }
+    snprintf(src + pos, sizeof(src) - (size_t)pos, "\n");
+
+    CBMFileResult *r = extract(src, CBM_LANG_MARKDOWN, "t", "README.md");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_by_name(r, "Unicode");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->docstring);
+    size_t n = strlen(d->docstring);
+    ASSERT_LTE((int)n, 500); /* MAX_COMMENT_LEN — fits the 2 KB properties buffer */
+    ASSERT_GT((int)n, 0);
+    /* Every byte must belong to a COMPLETE sequence: walk the string and check
+     * each lead byte is followed by its full continuation run. */
+    for (size_t i = 0; i < n;) {
+        unsigned char c = (unsigned char)d->docstring[i];
+        size_t need;
+        if ((c & 0x80) == 0) {
+            need = 1;
+        } else if ((c & 0xE0) == 0xC0) {
+            need = 2;
+        } else if ((c & 0xF0) == 0xE0) {
+            need = 3;
+        } else if ((c & 0xF8) == 0xF0) {
+            need = 4;
+        } else {
+            FAIL("stray UTF-8 continuation byte at a sequence start");
+        }
+        ASSERT_LTE((int)(i + need), (int)n); /* no truncated tail sequence */
+        i += need;
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(yaml_toplevel_description_promoted_to_module_issue519) {
+    CBMFileResult *r = extract("name: my-action\n"
+                               "description: Provisions an ephemeral build runner.\n"
+                               "runs:\n"
+                               "  using: node20\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    ASSERT_NOT_NULL(strstr(mod->docstring, "ephemeral build runner"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(yaml_block_scalar_description_promoted_issue519) {
+    CBMFileResult *r = extract("name: my-action\n"
+                               "description: |\n"
+                               "  Provisions an ephemeral build runner\n"
+                               "  and tears it down afterwards.\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    /* The `|` indicator itself must not survive into the indexed text. */
+    ASSERT_NOT_NULL(strstr(mod->docstring, "tears it down"));
+    ASSERT_NULL(strchr(mod->docstring, '|'));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(yaml_summary_promoted_when_no_description_issue519) {
+    CBMFileResult *r = extract("name: thing\n"
+                               "summary: Aggregates telemetry from every shard.\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    ASSERT_NOT_NULL(strstr(mod->docstring, "every shard"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(json_toplevel_description_promoted_to_module_issue519) {
+    CBMFileResult *r = extract("{\n"
+                               "  \"name\": \"widget\",\n"
+                               "  \"description\": \"Renders dashboards from graph queries.\"\n"
+                               "}\n",
+                               CBM_LANG_JSON, "t", "package.json");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->docstring);
+    ASSERT_NOT_NULL(strstr(mod->docstring, "Renders dashboards"));
+    /* The JSON string quotes are stripped — they are not part of the value. */
+    ASSERT_NULL(strchr(mod->docstring, '"'));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(config_description_only_at_top_level_issue519) {
+    /* A nested `description` describes the nested thing, not the file. */
+    CBMFileResult *r = extract("name: chart\n"
+                               "values:\n"
+                               "  description: nestedonly\n",
+                               CBM_LANG_YAML, "t", "META.yaml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT(mod->docstring == NULL || strstr(mod->docstring, "nestedonly") == NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(non_config_language_module_has_no_promoted_description_issue519) {
+    /* The promotion is config-only: a Python file's Module node must not pick
+     * up a variable that merely happens to be called `description`. */
+    CBMFileResult *r =
+        extract("description = 'not a config file'\n", CBM_LANG_PYTHON, "t", "conf.py");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->docstring);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(extraction) {
     /* Initialize extraction library */
     cbm_init();
@@ -6048,6 +6522,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
+    RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
@@ -6170,6 +6645,12 @@ SUITE(extraction) {
     RUN_TEST(plsql_package_and_call);
     RUN_TEST(plsql_standalone_function);
     RUN_TEST(plsql_create_type_as_object_limitation);
+    RUN_TEST(chialisp_puzzle_defs_and_labels);
+    RUN_TEST(chialisp_comment_line_endings);
+    RUN_TEST(chialisp_library_defs_and_quoted_data);
+    RUN_TEST(chialisp_export_names_do_not_duplicate_defs);
+    RUN_TEST(chialisp_comment_before_def_head_keeps_the_name);
+    RUN_TEST(chialisp_dialect_sigil_is_not_a_file_import);
     RUN_TEST(wolfram_function);
     RUN_TEST(magma_function);
 
@@ -6291,6 +6772,7 @@ SUITE(extraction) {
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);
     RUN_TEST(c_imports);
@@ -6386,6 +6868,18 @@ SUITE(extraction) {
     RUN_TEST(extract_python_method_test_dir_marks_is_test_issue1294);
     RUN_TEST(docstring_utf8_truncation_boundary_issue1017);
     RUN_TEST(extract_ts_decorators_survive_interleaved_comment);
+
+    /* #518/#519 — prose carried into docstring so nodes_fts can index it */
+    RUN_TEST(markdown_section_body_becomes_docstring_issue518);
+    RUN_TEST(markdown_section_body_stops_at_next_heading_issue518);
+    RUN_TEST(markdown_section_body_heading_only_has_no_docstring_issue518);
+    RUN_TEST(markdown_section_body_capped_utf8_safe_issue518);
+    RUN_TEST(yaml_toplevel_description_promoted_to_module_issue519);
+    RUN_TEST(yaml_block_scalar_description_promoted_issue519);
+    RUN_TEST(yaml_summary_promoted_when_no_description_issue519);
+    RUN_TEST(json_toplevel_description_promoted_to_module_issue519);
+    RUN_TEST(config_description_only_at_top_level_issue519);
+    RUN_TEST(non_config_language_module_has_no_promoted_description_issue519);
 
     cbm_shutdown();
 }

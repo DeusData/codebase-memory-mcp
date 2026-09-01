@@ -2258,6 +2258,19 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
 
     if (strcmp(subcommand, "status") == 0) {
         if (!active) {
+            if (status.muted_endpoint_holder_pid != 0) {
+                /* Alive process, dead runtime (2026-08-29 zombie class).
+                 * "not running" here sent the operator hunting through
+                 * processes, pipes, and logs by hand; name the holder and the
+                 * recovery instead. */
+                printf("daemon: not responding (endpoint held by pid %llu)\n",
+                       (unsigned long long)status.muted_endpoint_holder_pid);
+                printf("hint: that process holds the daemon endpoint but answered nothing; "
+                       "its runtime is likely dead. Terminate pid %llu, then run "
+                       "`codebase-memory-mcp daemon start`.\n",
+                       (unsigned long long)status.muted_endpoint_holder_pid);
+                return EXIT_FAILURE;
+            }
             printf("daemon: not running\n");
             printf("hint: `codebase-memory-mcp daemon start` keeps a daemon warm so CLI "
                    "commands and hooks skip the per-command startup cost.\n");

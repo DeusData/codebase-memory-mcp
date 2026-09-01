@@ -210,6 +210,17 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
                 continue;
             }
             tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+            /* #1928: the registry fallback is a bare-name guess — never let it
+             * bind a reference across a language boundary (the LSP-backed
+             * semantic branch above is not affected). */
+            if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+                continue;
+            }
+            /* #1942: a bare Go reference can never denote a struct field. */
+            if (tgt &&
+                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+                continue;
+            }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
                                                       cbm_pipeline_node_is_callable_target(tgt))) {
                 continue;
@@ -270,7 +281,7 @@ static int resolve_throw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
 /* Resolve READS/WRITES edges for one file's extracted read/write accesses. */
 static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result, const char *rel,
                             const char *module_qn, const char **imp_keys, const char **imp_vals,
-                            int imp_count) {
+                            int imp_count, CBMLanguage lang) {
     int resolved = 0;
     for (int r = 0; r < result->rw.count; r++) {
         CBMReadWrite *rw = &result->rw.items[r];
@@ -291,6 +302,15 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
 
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
         if (!tgt || src->id == tgt->id) {
+            continue;
+        }
+        /* #1928: every resolution here is a bare-name registry guess — never
+         * let it bind a read/write across a language boundary. */
+        if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
+            continue;
+        }
+        /* #1942: a bare Go reference can never denote a struct field. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
             continue;
         }
 
@@ -359,7 +379,8 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                                               imp_count, files[i].language);
         throw_resolved +=
             resolve_throw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
-        rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count);
+        rw_resolved += resolve_rw_edges(ctx, result, rel, module_qn, imp_keys, imp_vals, imp_count,
+                                        files[i].language);
 
         free(module_qn);
         free_import_map(imp_keys, imp_vals, imp_count);

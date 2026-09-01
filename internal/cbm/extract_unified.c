@@ -329,14 +329,48 @@ static bool lisp_head_is_def(const char *t) {
  * forms, ...), so push_boundary_scopes pushes no scope for them. Mirrors
  * extract_lisp_def() in extract_defs.c. */
 static const char *compute_lisp_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    bool chialisp = (ctx->language == CBM_LANG_CHIALISP);
     if (ts_node_named_child_count(node) < 2) {
         return NULL;
     }
-    char *head = cbm_node_text(ctx->arena, ts_node_named_child(node, 0), ctx->source);
-    if (!lisp_head_is_def(head)) {
+    /* Chialisp reads its head and name through the comment-skipping accessor —
+     * the SAME one extract_lisp_def() uses. When these two disagree (one
+     * skipping comments, the other not), a doc comment between a def head and
+     * its name shifts the named-child indices for only one of them, and the
+     * call scope silently stops matching the def it belongs to. */
+    TSNode head_node =
+        chialisp ? cbm_lisp_named_child_skip_comments(node, 0) : ts_node_named_child(node, 0);
+    if (ts_node_is_null(head_node)) {
         return NULL;
     }
-    TSNode target = ts_node_named_child(node, 1);
+    char *head = cbm_node_text(ctx->arena, head_node, ctx->source);
+    if (!(chialisp ? cbm_chialisp_is_def_head(head) : lisp_head_is_def(head))) {
+        return NULL;
+    }
+    if (chialisp && cbm_lisp_node_in_quote(ctx->arena, node, ctx->source)) {
+        return NULL;
+    }
+    if (chialisp && head && strcmp(head, "mod") == 0) {
+        /* `mod`'s second form is the curried-arg list, not a name; the puzzle
+         * entry point is named by its file, so in-body top-level calls
+         * attribute to the entry rather than to a curried argument. Mirrors the
+         * lisp_path_stem() naming in extract_defs.c. */
+        const char *path = ctx->rel_path;
+        const char *slash = path ? strrchr(path, '/') : NULL;
+        const char *base = slash ? slash + 1 : path;
+        if (!base || !base[0]) {
+            return NULL;
+        }
+        const char *dot = strrchr(base, '.');
+        size_t len = (dot && dot != base) ? (size_t)(dot - base) : strlen(base);
+        char *stem = cbm_arena_strndup(ctx->arena, base, len);
+        return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, stem);
+    }
+    TSNode target =
+        chialisp ? cbm_lisp_named_child_skip_comments(node, 1) : ts_node_named_child(node, 1);
+    if (ts_node_is_null(target)) {
+        return NULL;
+    }
     const char *tk = ts_node_type(target);
     TSNode name_node = target;
     /* (define (foo args) ...) — the name is the head symbol of the nested list. */
@@ -746,7 +780,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * lives here (we have ctx->source). Non-def lists return NULL → no scope
      * pushed → the in-body call sources to the enclosing def, not the Module. */
     if (ctx->language == CBM_LANG_CLOJURE || ctx->language == CBM_LANG_SCHEME ||
-        ctx->language == CBM_LANG_RACKET) {
+        ctx->language == CBM_LANG_RACKET || ctx->language == CBM_LANG_CHIALISP) {
         return compute_lisp_func_qn(ctx, node);
     }
 

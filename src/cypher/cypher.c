@@ -4894,6 +4894,164 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
 
 /* ── Main entry point ─────────────────────────────────────────── */
 
+/* ── Is every name a RETURN or WITH item uses actually in scope? ──
+ *
+ * An unbound variable resolves to NULL and renders as "" on purpose: an
+ * OPTIONAL MATCH target that found no row has to project a blank rather than
+ * drop the row. The cost of that convention is that a name the query NEVER
+ * carried through looks exactly the same on screen. A typo, or a variable a
+ * WITH dropped, then reads as "the graph holds no such data" instead of "your
+ * query named something that is not there" (#1919). Same failure shape as
+ * #373, and the same answer: say so out loud.
+ *
+ * The check runs on the parsed query, not on the run-time bindings, and that
+ * is the whole trick. It asks whether the query DECLARED the name — a
+ * different question from whether a row happened to bind it. So the OPTIONAL
+ * MATCH convention above is untouched: a target that did not match is still
+ * declared, still legal, and still projects "".
+ */
+
+/* Cap for one query's declared names. CYP_MAX_VARS is the binding cap for
+ * nodes alone; a pattern also names edges, so this is the roomier of the two.
+ * A query that overruns it skips the check rather than guessing — a wrong
+ * refusal costs the caller a working query, which is worse than the silence
+ * this guard removes. */
+enum { CYP_SCOPE_MAX_NAMES = 32 };
+
+static bool scope_holds(const char *const *names, int count, const char *want) {
+    for (int i = 0; i < count; i++) {
+        if (names[i] && strcmp(names[i], want) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Every name the query's patterns declare, plus an UNWIND alias.
+ * Answers -1 when there are more names than the cap holds. */
+static int collect_declared_names(const cbm_query_t *q, const char **out, int cap) {
+    int n = 0;
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        const cbm_pattern_t *pat = &q->patterns[pi];
+        for (int ni = 0; ni < pat->node_count; ni++) {
+            const char *var = pat->nodes[ni].variable;
+            if (var && !scope_holds(out, n, var)) {
+                if (n >= cap) {
+                    return -1;
+                }
+                out[n++] = var;
+            }
+        }
+        for (int ri = 0; ri < pat->rel_count; ri++) {
+            const char *var = pat->rels[ri].variable;
+            if (var && !scope_holds(out, n, var)) {
+                if (n >= cap) {
+                    return -1;
+                }
+                out[n++] = var;
+            }
+        }
+    }
+    if (q->unwind_alias && !scope_holds(out, n, q->unwind_alias)) {
+        if (n >= cap) {
+            return -1;
+        }
+        out[n++] = q->unwind_alias;
+    }
+    return n;
+}
+
+/* What a WITH leaves behind: its alias where it made one, and the plain
+ * variable where it carried one through whole. `WITH f.name AS caller` leaves
+ * `caller` and nothing else — `f` is gone, which is the case #1919 is about. */
+static int collect_with_names(const cbm_return_clause_t *wc, const char **out, int cap) {
+    int n = 0;
+    for (int i = 0; i < wc->count; i++) {
+        const cbm_return_item_t *item = &wc->items[i];
+        const char *name = NULL;
+        if (item->alias) {
+            name = item->alias;
+        } else if (item->variable && !item->property && !item->func) {
+            name = item->variable;
+        }
+        if (name && !scope_holds(out, n, name)) {
+            if (n >= cap) {
+                return -1;
+            }
+            out[n++] = name;
+        }
+    }
+    return n;
+}
+
+/* Build the message. It names the variable and the clause, because an error
+ * that does not say WHICH name is wrong sends the reader back to guessing. */
+static char *scope_error(const char *var, const char *clause, const char *why) {
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf), "variable '%s' is not in scope for %s — %s", var, clause, why);
+    return heap_strdup(buf);
+}
+
+/* The variable this item really references, or NULL when it references none.
+ * Two items carry a placeholder in that field rather than a name the query
+ * declared: `count(*)` stores "*", and a CASE expression stores "CASE". Both
+ * would read as an unknown variable, so neither is checkable here. */
+static const char *scope_checkable_var(const cbm_return_item_t *item) {
+    if (item->kase || !item->variable) {
+        return NULL;
+    }
+    if (strcmp(item->variable, "*") == 0) {
+        return NULL;
+    }
+    return item->variable;
+}
+
+/* Answers NULL when the query is fine, or a heap message naming the first
+ * variable that is not in scope. Checks one query; the caller walks a UNION. */
+static char *check_projection_scope(const cbm_query_t *q) {
+    const char *declared[CYP_SCOPE_MAX_NAMES];
+    int declared_n = collect_declared_names(q, declared, CYP_SCOPE_MAX_NAMES);
+    if (declared_n < 0) {
+        return NULL; /* too many names to model — stay quiet rather than guess */
+    }
+
+    /* A WITH still reads the pattern variables. */
+    if (q->with_clause && !q->with_clause->star) {
+        for (int i = 0; i < q->with_clause->count; i++) {
+            const char *var = scope_checkable_var(&q->with_clause->items[i]);
+            if (var && !scope_holds(declared, declared_n, var)) {
+                return scope_error(var, "WITH", "no pattern in this query names it");
+            }
+        }
+    }
+
+    if (!q->ret || q->ret->star) {
+        return NULL;
+    }
+
+    /* A RETURN after a WITH reads only what the WITH left behind. */
+    const char *after_with[CYP_SCOPE_MAX_NAMES];
+    const char *const *scope = declared;
+    int scope_n = declared_n;
+    if (q->with_clause) {
+        scope_n = collect_with_names(q->with_clause, after_with, CYP_SCOPE_MAX_NAMES);
+        if (scope_n < 0) {
+            return NULL;
+        }
+        scope = after_with;
+    }
+
+    for (int i = 0; i < q->ret->count; i++) {
+        const char *var = scope_checkable_var(&q->ret->items[i]);
+        if (var && !scope_holds(scope, scope_n, var)) {
+            return scope_error(var, "RETURN",
+                               q->with_clause ? "the WITH clause did not carry it through"
+                                              : "no pattern in this query names it");
+        }
+    }
+    return NULL;
+}
+
 int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *project, int max_rows,
                        cbm_cypher_result_t *out) {
     memset(out, 0, sizeof(*out));
@@ -4909,6 +5067,15 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (cbm_cypher_parse(query, &q, &err) < 0) {
         out->error = err;
         return CBM_NOT_FOUND;
+    }
+
+    for (const cbm_query_t *sq = q; sq; sq = sq->union_next) {
+        char *scope_err = check_projection_scope(sq);
+        if (scope_err) {
+            cbm_query_free(q);
+            out->error = scope_err;
+            return CBM_NOT_FOUND;
+        }
     }
 
     result_builder_t rb = {0};

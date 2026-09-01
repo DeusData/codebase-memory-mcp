@@ -23,6 +23,9 @@ void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
                                                    cbm_mcp_auto_index_count_test_hook_fn hook,
                                                    void *context);
 #endif
+void cbm_mcp_server_set_search_scan_command_for_test(cbm_mcp_server_t *srv, const char *command);
+void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint64_t timeout_ms,
+                                                     bool override_set);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use

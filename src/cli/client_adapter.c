@@ -265,17 +265,23 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
 
     adapter_sb_t sb = {0};
     emit_header(&sb, "OpenCode");
-    sb_append(&sb, "// OpenCode already reaches every tool over MCP; this adds only the\n"
-                   "// automatic graph lookup before a grep/glob, which other clients get\n"
-                   "// through their own hook configuration.\n");
+    sb_append(&sb, "// OpenCode already reaches every tool over MCP; this module adds the\n"
+                   "// context surfaces other clients get through hook configuration: graph\n"
+                   "// lookup after grep/glob, index-coverage notes after read, session-start\n"
+                   "// tier routing (carried on the first tool result of each session, since\n"
+                   "// OpenCode documents no context-output lifecycle hook), and reinjection\n"
+                   "// after compaction via the documented experimental surface.\n");
     sb_append(&sb, "import { spawn } from 'node:child_process';\n\n");
     sb_append(&sb, "const BIN = '");
     sb_append(&sb, bin);
     sb_append(&sb, "';\n\n");
 
-    /* hook-augment requires hook_event_name and accepts Grep/Glob only under
-     * PreToolUse; omitting it makes the whole hook a silent no-op. */
-    sb_append(&sb, "function augment(tool, args) {\n"
+    /* hook-augment requires hook_event_name; its default dialect accepts
+     * Grep/Glob under PreToolUse, Read under PostToolUse, and the
+     * SessionStart lifecycle event — and emits the Claude JSON envelope, so
+     * the plugin unwraps additionalContext instead of pasting raw JSON into
+     * the tool output. Every failure path resolves to '' (fail open). */
+    sb_append(&sb, "function augment(payload) {\n"
                    "  return new Promise((resolve) => {\n"
                    "    const child = spawn(BIN, ['hook-augment'], {\n"
                    "      stdio: ['pipe', 'pipe', 'ignore'],\n"
@@ -284,27 +290,67 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
                    "    let out = '';\n"
                    "    child.stdout.on('data', (d) => (out += d.toString()));\n"
                    "    child.on('error', () => resolve(''));\n"
-                   "    child.on('close', () => resolve(out));\n"
-                   "    child.stdin.end(JSON.stringify({\n"
-                   "      hook_event_name: 'PreToolUse',\n"
-                   "      tool_name: tool,\n"
-                   "      tool_input: args ?? {},\n"
-                   "    }));\n"
+                   "    child.on('close', () => {\n"
+                   "      try {\n"
+                   "        const ctx = JSON.parse(out)?.hookSpecificOutput?.additionalContext;\n"
+                   "        resolve(typeof ctx === 'string' ? ctx : '');\n"
+                   "      } catch { resolve(''); }\n"
+                   "    });\n"
+                   "    child.stdin.end(JSON.stringify(payload));\n"
                    "  });\n"
                    "}\n\n");
 
     sb_append(&sb,
-              "export const CodebaseMemory = async () => ({\n"
-              "  'tool.execute.after': async (input, output) => {\n"
-              "    const tool = input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' "
-              ": null;\n"
-              "    if (!tool) return;\n"
-              "    const extra = await augment(tool, output?.args);\n"
-              "    if (extra && typeof output?.output === 'string') {\n"
-              "      output.output += '\\n' + extra;\n"
-              "    }\n"
-              "  },\n"
-              "});\n");
+              "export const CodebaseMemory = async (ctx) => {\n"
+              "  const dir = ctx?.directory;\n"
+              "  const seen = new Set();\n"
+              "  const lifecycle = () =>\n"
+              "    augment({ hook_event_name: 'SessionStart', cwd: dir });\n"
+              "  return {\n"
+              "    'tool.execute.after': async (input, output) => {\n"
+              "      if (typeof output?.output !== 'string') return;\n"
+              "      const pieces = [];\n"
+              "      const sid = input?.sessionID;\n"
+              "      if (typeof sid === 'string' && !seen.has(sid)) {\n"
+              "        seen.add(sid);\n"
+              "        pieces.push(await lifecycle());\n"
+              "      }\n"
+              "      const args = output?.args ?? {};\n"
+              "      const search =\n"
+              "        input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
+              "      if (search) {\n"
+              "        pieces.push(await augment({\n"
+              "          hook_event_name: 'PreToolUse',\n"
+              "          tool_name: search,\n"
+              "          tool_input: args,\n"
+              "          cwd: dir,\n"
+              "        }));\n"
+              "      } else if (input?.tool === 'read') {\n"
+              "        const filePath = args.filePath ?? args.file_path ?? args.path;\n"
+              "        if (typeof filePath === 'string' && filePath) {\n"
+              "          pieces.push(await augment({\n"
+              "            hook_event_name: 'PostToolUse',\n"
+              "            tool_name: 'Read',\n"
+              "            tool_input: { file_path: filePath },\n"
+              "            cwd: dir,\n"
+              "          }));\n"
+              "        }\n"
+              "      }\n"
+              "      const extra = pieces.filter(Boolean).join('\\n');\n"
+              "      if (extra) {\n"
+              "        output.output += '\\n' + extra;\n"
+              "      }\n"
+              "    },\n"
+              "    // Documented (experimental) compaction surface: output.context is the\n"
+              "    // mutable array of context strings for the rebuilt session.\n"
+              "    'experimental.session.compacting': async (_input, output) => {\n"
+              "      const note = await lifecycle();\n"
+              "      if (note && Array.isArray(output?.context)) {\n"
+              "        output.context.push(note);\n"
+              "      }\n"
+              "    },\n"
+              "  };\n"
+              "};\n");
 
     if (sb.failed) {
         free(sb.buf);

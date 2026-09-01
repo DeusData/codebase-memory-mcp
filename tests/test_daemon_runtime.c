@@ -382,6 +382,9 @@ static bool runtime_test_copy_executable(const char *source, const char *destina
     return ok;
 }
 
+/* PATH must be a copy of this runner: the child runs the
+ * __cbm_runtime_image_holder mode, which blocks reading the release pipe
+ * wired to its stdin. */
 static pid_t runtime_test_spawn_blocked_executable(const char *path, int *release_fd_out) {
     int ready[2] = {-1, -1};
     int input[2] = {-1, -1};
@@ -427,7 +430,7 @@ static pid_t runtime_test_spawn_blocked_executable(const char *path, int *releas
     if (input[0] != STDIN_FILENO) {
         (void)posix_spawn_file_actions_addclose(&actions, input[0]);
     }
-    char *const child_argv[] = {(char *)path, NULL};
+    char *const child_argv[] = {(char *)path, "__cbm_runtime_image_holder", NULL};
     pid_t child = -1;
     if (posix_spawn(&child, path, &actions, NULL, child_argv, environ) != 0) {
         child = -1;
@@ -3943,6 +3946,224 @@ TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop) {
     PASS();
 }
 
+#if defined(CBM_ENABLE_TEST_SEAMS)
+static atomic_int runtime_test_containment_fired;
+static atomic_bool runtime_test_containment_component_exact;
+
+static void runtime_test_containment_hook(const char *component) {
+    if (component && strcmp(component, "application_request_join") == 0) {
+        atomic_store_explicit(&runtime_test_containment_component_exact, true,
+                              memory_order_release);
+    }
+    atomic_fetch_add_explicit(&runtime_test_containment_fired, 1, memory_order_release);
+}
+
+/* 2026-08-29 zombie regression: a disconnecting worker joined its in-flight
+ * application request with no deadline. A handler that ignored cancellation
+ * therefore wedged the disconnect path forever and the dead generation kept
+ * the endpoint. The join must now reach the containment boundary in bounded
+ * time; the seam hook stands in for the terminal process stop so the harness
+ * can then supply cooperation and prove a clean join and teardown. */
+TEST(daemon_runtime_abandoned_request_join_reaches_containment_in_bounded_time) {
+    static const uint8_t request[] = {'w', 'e', 'd', 'g', 'e'};
+    enum { JOIN_BOUND_MS = 150, CONTAINMENT_OBSERVED_MAX_MS = 5000 };
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    runtime_application_context_t context;
+    runtime_application_context_init(&context, true);
+    atomic_store_explicit(&context.ignore_first_request_cancel, true, memory_order_release);
+    atomic_store(&runtime_test_containment_fired, 0);
+    atomic_store(&runtime_test_containment_component_exact, false);
+    atomic_bool request_thread_completed;
+    atomic_init(&request_thread_completed, false);
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start_application(&fixture, "application-abandoned-join",
+                                                          &identity, &context);
+    cbm_daemon_runtime_connect_result_t result = {0};
+    cbm_daemon_runtime_client_t *client = NULL;
+    runtime_application_client_call_t call = {
+        .request = request,
+        .request_length = (uint32_t)sizeof(request),
+        .completed = &request_thread_completed,
+        .status = CBM_DAEMON_RUNTIME_APPLICATION_OK,
+    };
+    cbm_thread_t request_thread;
+    int request_thread_create_rc = -1;
+    int request_thread_join_rc = -1;
+    bool request_thread_started = false;
+    bool callback_started = false;
+    bool close_begun = false;
+    bool containment_observed = false;
+    uint64_t containment_elapsed_ms = UINT64_MAX;
+    bool exited_after_release = false;
+
+    cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(JOIN_BOUND_MS);
+    cbm_daemon_runtime_set_containment_hook_for_testing(runtime_test_containment_hook);
+
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &result);
+    }
+    if (client) {
+        call.client = client;
+        request_thread_create_rc = cbm_thread_create(
+            &request_thread, 128U * 1024U, runtime_application_client_request_thread, &call);
+        request_thread_started = request_thread_create_rc == 0;
+        callback_started =
+            request_thread_started &&
+            runtime_test_wait_atomic_bool(&context.first_request_started, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (callback_started) {
+        uint64_t containment_started_ms = cbm_now_ms();
+        close_begun = cbm_daemon_runtime_client_close_begin(client);
+        uint64_t deadline = cbm_now_ms() + CONTAINMENT_OBSERVED_MAX_MS;
+        while (atomic_load_explicit(&runtime_test_containment_fired, memory_order_acquire) == 0 &&
+               cbm_now_ms() < deadline) {
+            struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000000};
+            (void)cbm_nanosleep(&pause, NULL);
+        }
+        containment_observed =
+            atomic_load_explicit(&runtime_test_containment_fired, memory_order_acquire) > 0;
+        containment_elapsed_ms = cbm_now_ms() - containment_started_ms;
+    }
+
+    /* Cooperation after the boundary: the reap waits for the released handler
+     * so join and teardown stay provably leak-free under the sanitizers. */
+    atomic_store_explicit(&context.release_first_request, true, memory_order_release);
+    if (request_thread_started) {
+        request_thread_join_rc = cbm_thread_join(&request_thread);
+    }
+    if (client) {
+        (void)cbm_daemon_runtime_client_close_finish(client, RUNTIME_TEST_TIMEOUT_MS);
+        client = NULL;
+    }
+    if (started) {
+        exited_after_release =
+            cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    free(call.response);
+    runtime_test_fixture_finish(&fixture);
+    cbm_daemon_runtime_set_containment_hook_for_testing(NULL);
+    cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(0);
+
+    ASSERT_TRUE(started);
+    ASSERT_EQ(result.status, CBM_DAEMON_RUNTIME_CONNECT_ACCEPTED);
+    ASSERT_EQ(request_thread_create_rc, 0);
+    ASSERT_TRUE(callback_started);
+    ASSERT_TRUE(close_begun);
+    ASSERT_TRUE(containment_observed);
+    ASSERT_TRUE(containment_elapsed_ms <= CONTAINMENT_OBSERVED_MAX_MS);
+    ASSERT_EQ(atomic_load(&runtime_test_containment_fired), 1);
+    ASSERT_TRUE(atomic_load(&runtime_test_containment_component_exact));
+    ASSERT_EQ(request_thread_join_rc, 0);
+    ASSERT_TRUE(exited_after_release);
+    ASSERT_EQ(atomic_load(&context.opened), 1);
+    ASSERT_EQ(atomic_load(&context.requests), 1);
+    ASSERT_EQ(atomic_load(&context.cancelled), 1);
+    ASSERT_EQ(atomic_load(&context.closed), 1);
+    PASS();
+}
+#endif
+
+typedef struct {
+    cbm_daemon_ipc_listener_t *listener;
+    cbm_daemon_ipc_connection_t *held[2];
+    atomic_int held_count;
+    atomic_bool stop;
+} runtime_mute_holder_t;
+
+/* Accepts up to two transport connections and never answers a frame: the
+ * kernel-level shape of the 2026-08-29 zombie (endpoint owned, runtime dead). */
+static void *runtime_test_mute_holder_thread(void *opaque) {
+    runtime_mute_holder_t *holder = opaque;
+    while (!atomic_load_explicit(&holder->stop, memory_order_acquire) &&
+           atomic_load_explicit(&holder->held_count, memory_order_acquire) < 2) {
+        cbm_daemon_ipc_connection_t *connection = NULL;
+        int accepted = cbm_daemon_ipc_accept(holder->listener, 50, &connection);
+        if (accepted == 1 && connection) {
+            int index = atomic_load_explicit(&holder->held_count, memory_order_acquire);
+            holder->held[index] = connection;
+            atomic_store_explicit(&holder->held_count, index + 1, memory_order_release);
+        }
+    }
+    return NULL;
+}
+
+static uint64_t runtime_test_self_process_id(void) {
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
+}
+
+/* 2026-08-29 zombie regression: a held endpoint that answers nothing must
+ * name its holder. Both the HELLO connect and the one-shot status probe
+ * fail against a mute holder, and both must report the holder's
+ * kernel-authenticated pid instead of plain absence. */
+TEST(daemon_runtime_mute_endpoint_holder_pid_is_reported) {
+    enum { MUTE_CONNECT_TIMEOUT_MS = 500 };
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    char parent[RUNTIME_TEST_PATH_CAP] = {0};
+    char key[CBM_DAEMON_KEY_SIZE] = {0};
+    char runtime_dir[RUNTIME_TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    runtime_mute_holder_t holder = {0};
+    atomic_init(&holder.held_count, 0);
+    atomic_init(&holder.stop, false);
+    cbm_thread_t holder_thread;
+    bool holder_started = false;
+
+    bool prepared = th_secure_runtime_parent_new(parent, sizeof(parent), "mute-holder") &&
+                    cbm_daemon_rendezvous_key(key);
+    endpoint = prepared ? cbm_daemon_ipc_endpoint_new(key, parent) : NULL;
+    bool runtime_dir_copied =
+        endpoint &&
+        runtime_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    holder.listener = endpoint ? cbm_daemon_ipc_listen(endpoint) : NULL;
+    holder_started =
+        holder.listener &&
+        cbm_thread_create(&holder_thread, 0, runtime_test_mute_holder_thread, &holder) == 0;
+
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    cbm_daemon_runtime_client_t *client = NULL;
+    cbm_daemon_runtime_status_t status = {0};
+    bool status_active = true;
+    if (holder_started) {
+        client = cbm_daemon_runtime_client_connect(endpoint, &identity, MUTE_CONNECT_TIMEOUT_MS,
+                                                   &connect_result);
+        status_active = cbm_daemon_runtime_request_status(endpoint, &identity,
+                                                          MUTE_CONNECT_TIMEOUT_MS, &status);
+    }
+
+    atomic_store_explicit(&holder.stop, true, memory_order_release);
+    if (holder_started) {
+        (void)cbm_thread_join(&holder_thread);
+    }
+    for (size_t index = 0; index < 2; index++) {
+        if (holder.held[index]) {
+            cbm_daemon_ipc_connection_close(holder.held[index]);
+        }
+    }
+    if (holder.listener) {
+        cbm_daemon_ipc_listener_close(holder.listener);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    (void)cbm_rmdir(runtime_dir);
+    (void)cbm_rmdir(parent);
+
+    ASSERT_TRUE(prepared);
+    ASSERT_TRUE(runtime_dir_copied);
+    ASSERT_TRUE(holder_started);
+    ASSERT_NULL(client);
+    ASSERT_EQ(connect_result.status, CBM_DAEMON_RUNTIME_CONNECT_ERROR);
+    ASSERT_EQ(connect_result.muted_endpoint_holder_pid, runtime_test_self_process_id());
+    ASSERT_FALSE(status_active);
+    ASSERT_EQ(status.muted_endpoint_holder_pid, runtime_test_self_process_id());
+    PASS();
+}
+
 TEST(daemon_runtime_application_busy_cap_and_malformed_are_isolated) {
     static const uint8_t blocking_request[] = {'f', 'i', 'r', 's', 't'};
     static const uint8_t busy_request[] = {'b', 'u', 's', 'y'};
@@ -4518,10 +4739,20 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
     int replacement_written =
         setup ? snprintf(replacement_path, sizeof(replacement_path), "%s/replacement", directory)
               : -1;
+    /* The copied image is this runner in holder mode, not a system utility:
+     * a multi-call coreutils /bin/cat (uutils) prints "unknown program" and
+     * exits when executed under the copied name. */
     setup = setup && image_written > 0 && image_written < (int)sizeof(image_path) &&
             replacement_written > 0 && replacement_written < (int)sizeof(replacement_path) &&
-            runtime_test_copy_executable("/bin/cat", image_path) &&
-            runtime_test_copy_executable("/bin/echo", replacement_path);
+            runtime_test_copy_self_image(image_path);
+
+    FILE *replacement_file = setup ? cbm_fopen(replacement_path, "wb") : NULL;
+    bool replacement_written_ok =
+        replacement_file && fputs("cbm-posix-replacement-image", replacement_file) >= 0;
+    if (replacement_file) {
+        replacement_written_ok = fclose(replacement_file) == 0 && replacement_written_ok;
+    }
+    setup = setup && replacement_written_ok;
 
     char original[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
     char replacement[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
@@ -4782,6 +5013,10 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request);
     RUN_TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_other_session);
     RUN_TEST(daemon_runtime_noncooperative_callback_does_not_detach_or_unbound_stop);
+#if defined(CBM_ENABLE_TEST_SEAMS)
+    RUN_TEST(daemon_runtime_abandoned_request_join_reaches_containment_in_bounded_time);
+#endif
+    RUN_TEST(daemon_runtime_mute_endpoint_holder_pid_is_reported);
     RUN_TEST(daemon_runtime_application_busy_cap_and_malformed_are_isolated);
     RUN_TEST(daemon_runtime_malformed_and_zero_cancel_close_only_offending_connections);
 }

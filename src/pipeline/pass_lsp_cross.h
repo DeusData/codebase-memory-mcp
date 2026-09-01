@@ -54,10 +54,19 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * receives per-file prefix offsets: file i's defs occupy
  * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
  * needs the per-file slices, which the flat array does not otherwise
- * record. */
-CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
-                                    int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts);
+ * record.
+ *
+ * `ctx` (nullable) enables cross-file base-class resolution: for the
+ * languages whose cross registrars read embedded_types as qualified names
+ * (Python, JS/TS/TSX), every CBMDefinition.base_classes spelling is resolved
+ * to a project QN through ctx->registry plus the file's import map — the same
+ * inputs pass_semantic uses to draw its INHERITS edge, so the LSP's
+ * inheritance view and the graph's cannot diverge. Pass NULL to keep the raw
+ * source spelling (surface-probe paths that build no registry). */
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                    const cbm_file_info_t *files, int file_count,
+                                    const char *project_name, char **def_modules, int *out_count,
+                                    int *out_def_starts);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,

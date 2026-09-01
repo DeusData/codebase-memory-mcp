@@ -503,9 +503,19 @@ static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
     Sleep(INFINITE);
     return 25;
 #else
-    (void)argc;
-    (void)argv;
-    return -1;
+    /* POSIX copied-image holder: block reading stdin until the parent closes
+     * the release pipe, exactly like the cat(1) donor this replaced. A system
+     * utility cannot serve as the copied image — a multi-call coreutils
+     * binary (uutils cat) refuses to execute under the copied name. */
+    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
+        return -1;
+    }
+    char release[16];
+    ssize_t count;
+    do {
+        count = read(STDIN_FILENO, release, sizeof(release));
+    } while (count > 0 || (count < 0 && errno == EINTR));
+    return count == 0 ? 0 : 25;
 #endif
 }
 
@@ -768,6 +778,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
 extern void suite_index_resilience(void);
@@ -1041,6 +1052,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(importance);
     RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
     RUN_SELECTED_SUITE(call_reference_contract);
