@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <GVL Name="GVL_Main" Id="{a1b2c3d4-0030-4000-8000-000000000030}">
+    <Declaration><![CDATA[{attribute 'qualified_only'}
+VAR_GLOBAL
+    rMaxSpeed : REAL := 250.0;
+    bEmergencyStop : BOOL;
+END_VAR
+VAR_GLOBAL CONSTANT
+    nMAX_AXES : UDINT := 8;
+END_VAR]]></Declaration>
+  </GVL>
+</TcPlcObject>

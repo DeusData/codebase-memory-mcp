@@ -1,0 +1,81 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="FB_Conveyor" Id="{a1b2c3d4-0001-4000-8000-000000000001}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION_BLOCK FB_Conveyor EXTENDS FB_Base IMPLEMENTS I_Device
+VAR_INPUT
+    bEnable : BOOL;
+    rSetSpeed : REAL := 0.0;
+END_VAR
+VAR_OUTPUT
+    bRunning : BOOL;
+END_VAR
+VAR
+    fbMotor : FB_Motor;
+    tonDelay : TON;
+    eState : E_ConveyorState;
+    stConfig : ST_ConveyorConfig;
+    _rSpeed : REAL;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[tonDelay(IN := bEnable, PT := stConfig.tStartupDelay);
+fbMotor(bEnable := bEnable);
+bRunning := fbMotor.bActive AND NOT F_IsError(fbMotor);
+UpdateState();]]></ST>
+    </Implementation>
+    <Method Name="Start" Id="{a1b2c3d4-0002-4000-8000-000000000002}">
+      <Declaration><![CDATA[METHOD Start : BOOL
+VAR_INPUT
+    rSpeed : REAL;
+END_VAR]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[IF rSpeed > GVL_Main.rMaxSpeed THEN
+    rSpeed := GVL_Main.rMaxSpeed;
+END_IF
+fbMotor.SetSpeed(rSpeed := rSpeed);
+Start := TRUE;]]></ST>
+      </Implementation>
+    </Method>
+    <Method Name="UpdateState" Id="{a1b2c3d4-0003-4000-8000-000000000003}">
+      <Declaration><![CDATA[METHOD PRIVATE UpdateState]]></Declaration>
+      <Implementation>
+        <ST><![CDATA[CASE eState OF
+    E_ConveyorState.Idle:
+        IF bEnable THEN
+            eState := E_ConveyorState.Starting;
+        END_IF
+    E_ConveyorState.Starting:
+        tonDelay(IN := TRUE, PT := T#500MS);
+        IF tonDelay.Q THEN
+            eState := E_ConveyorState.Running;
+        END_IF
+END_CASE]]></ST>
+      </Implementation>
+    </Method>
+    <Action Name="A_Reset" Id="{a1b2c3d4-0004-4000-8000-000000000004}">
+      <Implementation>
+        <ST><![CDATA[eState := E_ConveyorState.Idle;
+bRunning := FALSE;]]></ST>
+      </Implementation>
+    </Action>
+    <Property Name="Speed" Id="{a1b2c3d4-0005-4000-8000-000000000005}">
+      <Declaration><![CDATA[PROPERTY Speed : REAL]]></Declaration>
+      <Get Name="Get" Id="{a1b2c3d4-0006-4000-8000-000000000006}">
+        <Declaration><![CDATA[VAR
+END_VAR]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[Speed := _rSpeed;]]></ST>
+        </Implementation>
+      </Get>
+      <Set Name="Set" Id="{a1b2c3d4-0007-4000-8000-000000000007}">
+        <Declaration><![CDATA[VAR
+END_VAR]]></Declaration>
+        <Implementation>
+          <ST><![CDATA[_rSpeed := Speed;]]></ST>
+        </Implementation>
+      </Set>
+    </Property>
+    <LineIds Name="FB_Conveyor">
+      <LineId Id="3" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

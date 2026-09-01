@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcSmProject xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" TcSmVersion="1.0" TcVersion="3.1.4024.12">
+  <Project ProjectGUID="{c3d4e5f6-0001-4000-8000-000000001000}" ShowHideConfigurations="#x106">
+    <System>
+      <Tasks>
+        <Task Id="3" Priority="20" CycleTime="100000" AmsPort="350" AdtTasks="true">
+          <Name>PlcTask</Name>
+        </Task>
+      </Tasks>
+    </System>
+    <Plc>
+      <Project GUID="{b2c3d4e5-0001-4000-8000-000000000100}" Name="Demo" PrjFilePath="PLC\Demo.plcproj" TmcFilePath="PLC\Demo.tmc" ReloadTmc="true" AmsPort="851" FileArchiveSettings="#x000e" SymbolicMapping="true">
+        <Instance Id="#x08502000" TcSmClass="TComPlcObjDef" KeepUnrestoredLinks="2" TmcPath="PLC\Demo.tmc" TmcHash="{00000000-0000-0000-0000-000000000000}">
+          <Name>Demo Instance</Name>
+        </Instance>
+      </Project>
+    </Plc>
+  </Project>
+</TcSmProject>

@@ -1079,6 +1079,21 @@ TEST(lang_ext_plsql) {
     PASS();
 }
 
+TEST(lang_ext_iec_st) {
+    ASSERT_EQ(cbm_language_for_extension(".st"), CBM_LANG_IEC_ST);
+    ASSERT_EQ(cbm_language_for_extension(".iecst"), CBM_LANG_IEC_ST);
+    PASS();
+}
+
+TEST(lang_ext_twincat) {
+    ASSERT_EQ(cbm_language_for_extension(".TcPOU"), CBM_LANG_TWINCAT);
+    ASSERT_EQ(cbm_language_for_extension(".tcpou"), CBM_LANG_TWINCAT);
+    ASSERT_EQ(cbm_language_for_extension(".TcDUT"), CBM_LANG_TWINCAT);
+    ASSERT_EQ(cbm_language_for_extension(".TcGVL"), CBM_LANG_TWINCAT);
+    ASSERT_EQ(cbm_language_for_extension(".TcIO"), CBM_LANG_TWINCAT);
+    PASS();
+}
+
 TEST(lang_ext_squirrel) {
     ASSERT_EQ(cbm_language_for_extension(".nut"), CBM_LANG_SQUIRREL);
     PASS();
@@ -1406,6 +1421,8 @@ SUITE(language) {
     RUN_TEST(lang_ext_mojo);
     RUN_TEST(lang_ext_arkts);
     RUN_TEST(lang_ext_plsql);
+    RUN_TEST(lang_ext_iec_st);
+    RUN_TEST(lang_ext_twincat);
     RUN_TEST(lang_ext_squirrel);
     RUN_TEST(lang_ext_func);
     RUN_TEST(lang_ext_rst);

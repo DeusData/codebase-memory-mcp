@@ -1,0 +1,59 @@
+{
+  "name": "tree-sitter-iec61131-3-st",
+  "version": "0.1.2",
+  "description": "IEC 61131-3 Structured Text grammar for tree-sitter (standard, dialect-extensible)",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/HeytalePazguato/tree-sitter-iec61131-3-st.git"
+  },
+  "license": "MIT",
+  "author": {
+    "name": "HeytalePazguato",
+    "email": "Heytale.Pazguato@gmail.com"
+  },
+  "main": "bindings/node",
+  "types": "bindings/node",
+  "keywords": [
+    "incremental",
+    "parsing",
+    "tree-sitter",
+    "iec61131_3_st"
+  ],
+  "files": [
+    "grammar.js",
+    "tree-sitter.json",
+    "binding.gyp",
+    "prebuilds/**",
+    "bindings/node/*",
+    "queries/*",
+    "src/**",
+    "*.wasm"
+  ],
+  "dependencies": {
+    "node-addon-api": "^8.5.0",
+    "node-gyp-build": "^4.8.4"
+  },
+  "devDependencies": {
+    "prebuildify": "^6.0.1",
+    "tree-sitter": "^0.25.0",
+    "tree-sitter-cli": "^0.26.8",
+    "web-tree-sitter": "^0.26.0"
+  },
+  "peerDependencies": {
+    "tree-sitter": "^0.25.0"
+  },
+  "peerDependenciesMeta": {
+    "tree-sitter": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "install": "node-gyp-build",
+    "prestart": "tree-sitter build --wasm",
+    "start": "tree-sitter playground",
+    "build:wasm": "tree-sitter build --wasm -o tree-sitter-iec61131_3_st.wasm .",
+    "test": "node --test bindings/node/*_test.js",
+    "test:wasm": "node scripts/wasm-smoke.mjs"
+  }
+}

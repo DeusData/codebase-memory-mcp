@@ -238,6 +238,14 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      "/\n",
      2,
      {"emp_pkg", "hire", NULL}},
+    {"iec_st",
+     CBM_LANG_IEC_ST,
+     "a.st",
+     "FUNCTION_BLOCK FB_Motor\nVAR_INPUT\n    bEnable : BOOL;\nEND_VAR\n\nMETHOD Start : "
+     "BOOL\nStart := TRUE;\nEND_METHOD\n\nEND_FUNCTION_BLOCK\n\nFUNCTION F_Add : INT\nVAR_INPUT\n "
+     "   a : INT;\n    b : INT;\nEND_VAR\nF_Add := a + b;\nEND_FUNCTION\n",
+     2,
+     {"FB_Motor", "Start", "F_Add", NULL}},
     {"smali",
      CBM_LANG_SMALI,
      "A.smali",

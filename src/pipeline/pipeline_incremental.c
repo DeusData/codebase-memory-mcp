@@ -325,7 +325,9 @@ static bool semantic_manifest_package_control(const char *name) {
            strcmp(name, "composer.json") == 0 || strcmp(name, "pubspec.yaml") == 0 ||
            strcmp(name, "pom.xml") == 0 || strcmp(name, "build.gradle") == 0 ||
            strcmp(name, "build.gradle.kts") == 0 || strcmp(name, "mix.exs") == 0 ||
-           (len >= 8 && strcmp(name + len - 8, ".gemspec") == 0);
+           (len >= 8 && strcmp(name + len - 8, ".gemspec") == 0) ||
+           (len >= 8 && strcmp(name + len - 8, ".plcproj") == 0) ||
+           (len >= 7 && strcmp(name + len - 7, ".tsproj") == 0);
 }
 
 static int semantic_manifest_walk_controls(semantic_manifest_builder_t *builder,

@@ -1,0 +1,20 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="MAIN" Id="{a1b2c3d4-0010-4000-8000-000000000010}" SpecialFunc="None">
+    <Declaration><![CDATA[PROGRAM MAIN
+VAR
+    fbConveyor : FB_Conveyor;
+    bStartCmd : BOOL;
+    nCycles : UDINT;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[fbConveyor(bEnable := bStartCmd AND NOT GVL_Main.bEmergencyStop);
+IF fbConveyor.Start(rSpeed := 50.0) THEN
+    nCycles := nCycles + 1;
+END_IF]]></ST>
+    </Implementation>
+    <LineIds Name="MAIN">
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

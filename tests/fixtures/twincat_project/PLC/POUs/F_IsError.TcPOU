@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1" ProductVersion="3.1.4024.12">
+  <POU Name="F_IsError" Id="{a1b2c3d4-0011-4000-8000-000000000011}" SpecialFunc="None">
+    <Declaration><![CDATA[FUNCTION F_IsError : BOOL
+VAR_INPUT
+    fb : FB_Motor;
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[F_IsError := fb.nErrorId <> 0;]]></ST>
+    </Implementation>
+    <LineIds Name="F_IsError">
+      <LineId Id="2" Count="0" />
+    </LineIds>
+  </POU>
+</TcPlcObject>

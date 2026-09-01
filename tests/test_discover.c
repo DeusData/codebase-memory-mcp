@@ -1669,10 +1669,66 @@ TEST(shebang_oversized_first_line_unindexed) {
     PASS();
 }
 
+static CBMLanguage discover_language_of(const cbm_file_info_t *files, int count,
+                                        const char *rel_path) {
+    for (int i = 0; i < count; i++) {
+        if (strcmp(files[i].rel_path, rel_path) == 0) {
+            return files[i].language;
+        }
+    }
+    return CBM_LANG_COUNT;
+}
+
+/* A CODESYS/PLCopen TC6 XML export classifies as CBM_LANG_PLCOPEN_XML by
+ * content sniff, even when the namespace sits well past the 256-byte window
+ * the ObjectScript Export probe used to use (issue: a regression that
+ * narrows the sniff buffer back down must fail here). .plcproj/.tsproj and a
+ * plain non-PLCopen .xml file must all still classify as CBM_LANG_XML. */
+TEST(discover_plcopen_xml_content_sniff) {
+    char *base = th_mktempdir("cbm_disc_plcopen");
+    ASSERT(base != NULL);
+
+    /* Pad well past the old 256-byte sniff window before the namespace
+     * declaration, mimicking a real export's long <fileHeader> line. */
+    char padding[600];
+    memset(padding, 'a', sizeof(padding) - 1);
+    padding[sizeof(padding) - 1] = '\0';
+    char plcopen_xml[2048];
+    snprintf(plcopen_xml, sizeof(plcopen_xml),
+             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+             "<!-- %s -->\n"
+             "<project xmlns=\"http://www.plcopen.org/xml/tc6_0201\">\n"
+             "  <types><pous/></types>\n"
+             "</project>\n",
+             padding);
+    ASSERT(strlen(plcopen_xml) > 256);
+    th_write_file(TH_PATH(base, "export.xml"), plcopen_xml);
+
+    th_write_file(TH_PATH(base, "project.plcproj"),
+                  "<Project><ItemGroup><Compile Include=\"x.TcPOU\"/></ItemGroup></Project>\n");
+    th_write_file(TH_PATH(base, "project.tsproj"), "<TcSmProject></TcSmProject>\n");
+    th_write_file(TH_PATH(base, "plain.xml"), "<root><child/></root>\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_discover(base, &opts, &files, &count), 0);
+
+    ASSERT_EQ(discover_language_of(files, count, "export.xml"), CBM_LANG_PLCOPEN_XML);
+    ASSERT_EQ(discover_language_of(files, count, "project.plcproj"), CBM_LANG_XML);
+    ASSERT_EQ(discover_language_of(files, count, "project.tsproj"), CBM_LANG_XML);
+    ASSERT_EQ(discover_language_of(files, count, "plain.xml"), CBM_LANG_XML);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(discover) {
     RUN_TEST(discover_prunes_the_cache_tree);
+    RUN_TEST(discover_plcopen_xml_content_sniff);
     /* Directory skip — always */
     RUN_TEST(skip_git);
     RUN_TEST(skip_node_modules);
