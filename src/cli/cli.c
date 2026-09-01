@@ -1378,7 +1378,7 @@ static const char skill_content[] =
     "`memory_dir=<user data dir>`. Enable with `codebase-memory-mcp config set memory_enabled "
     "true`.\n"
     "\n"
-    "## 17 MCP Tools\n"
+    "## 18 MCP Tools\n"
     "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
     "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
     "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
