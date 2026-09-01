@@ -1021,7 +1021,7 @@ codebase-memory-mcp config set doc_candidates false      # skip doc<->code candi
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set watch_non_git true        # also poll non-git project roots (default: false)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
-codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limitcodebase-memory-mcp config set auto_update false         # disable startup update checks
+codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config get memory_dir                # local personal memory directory
 codebase-memory-mcp config set memory_enabled true       # opt in to local per-repo memory
 codebase-memory-mcp config set memory_dir ~/private/cbm  # override personal memory dir
@@ -1034,7 +1034,6 @@ is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 Default memory config:
 - `memory_enabled=false`: `manage_memory` storage is opt-in. When not configured, existing project ADR/index behavior is unchanged.
-- `memory_default_scope=project`: LLM workflows keep project-scoped behavior unless local personal memory is explicitly enabled.
 - `memory_dir=<user data dir>`: global user-home memory DB location, override with config or `CBM_MEMORY_DIR`. The path must be absolute and outside the source repo.
 
 ### Personal memory privacy and storage boundaries
@@ -1046,11 +1045,7 @@ Default memory config:
 - **No external transmission:** `manage_memory` does not upload memory, does not write to git, does not call network APIs, and does not sync to the repo. Responses redact repo identity and storage keys. Paths are redacted unless `reveal_paths=true` is passed to `mode="settings"`.
 - **No sensitive-data logging:** memory content, storage keys, repo IDs, and memory paths are not logged by the memory tool. Content is returned only to the caller for explicit `get`/`sections` requests.
 - **Delete semantics:** `mode="delete"` removes only the selected repo/branch/doc row from `memory.db`. It does not delete other branches, other repos, the DB file, SQLite free pages, filesystem backups, or user copies.
-- **Promote/sync semantics:** `mode="promote"` is a local-only copy from the current branch doc to the base branch doc in the same `memory.db`. `mode="sync"` is disabled and returns `sync_disabled`; there is no network sync feature.
-
-Default update config:
-- `auto_update=true`: MCP startup checks GitHub for newer releases and shows a one-shot notice.
-- Set `auto_update=false` to disable network update checks. Manual `codebase-memory-mcp update` still works.
+- **Promote semantics:** `mode="promote"` is a local-only copy from the current branch doc to the base branch doc in the same `memory.db`.
 
 ### Environment Variables
 
