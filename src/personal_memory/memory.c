@@ -88,16 +88,23 @@ static bool memory_path_is_absolute(const char *path) {
 static bool memory_path_contains_dir(const char *root, const char *path) {
     char r[CBM_SZ_1K];
     char p[CBM_SZ_1K];
+    char cr[CBM_SZ_1K];
+    char cp[CBM_SZ_1K];
     memory_copy_norm(r, sizeof(r), root);
     memory_copy_norm(p, sizeof(p), path);
-    size_t rlen = strlen(r);
+    /* Canonicalize both paths so a symlinked memory_dir pointing into the
+     * repo cannot bypass the boundary check. Falls back to the lexical
+     * comparison when canonicalization fails (e.g. path does not exist yet). */
+    const char *rr = cbm_canonical_path(r, cr, sizeof(cr)) ? cr : r;
+    const char *pp = cbm_canonical_path(p, cp, sizeof(cp)) ? cp : p;
+    size_t rlen = strlen(rr);
     if (rlen == 0) {
         return false;
     }
-    if (strcmp(r, p) == 0) {
+    if (strcmp(rr, pp) == 0) {
         return true;
     }
-    return strncmp(p, r, rlen) == 0 && (r[rlen - 1] == '/' || p[rlen] == '/');
+    return strncmp(pp, rr, rlen) == 0 && (rr[rlen - 1] == '/' || pp[rlen] == '/');
 }
 
 bool cbm_memory_storage_allowed(struct cbm_config *cfg, const char *root_path, char *reason,
