@@ -85,6 +85,42 @@ static bool memory_path_is_absolute(const char *path) {
     return false;
 }
 
+/* Canonicalize a path that may not exist yet by resolving its parent
+ * directory (which must exist) and appending the remaining tail. This
+ * handles the common macOS case where /tmp is a symlink to /private/tmp
+ * and the memory dir (e.g. /tmp/foo/.cbm-memory) has not been created yet. */
+static bool memory_canonicalize_maybe_missing(const char *in, char *out, size_t out_sz) {
+    if (cbm_canonical_path(in, out, out_sz)) {
+        return true;
+    }
+    /* Path does not exist. Resolve the longest existing prefix. */
+    char parent[CBM_SZ_1K];
+    snprintf(parent, sizeof(parent), "%s", in);
+    const char *tail = "";
+    for (;;) {
+        char *slash = strrchr(parent, '/');
+        if (!slash) {
+            break;
+        }
+        if (slash == parent) {
+            /* Root "/" — resolve it directly. */
+            break;
+        }
+        *slash = '\0';
+        tail = in + (slash - parent) + 1;
+        if (cbm_canonical_path(parent, out, out_sz)) {
+            size_t len = strlen(out);
+            if (len + 1 + strlen(tail) + 1 > out_sz) {
+                return false;
+            }
+            out[len] = '/';
+            strcpy(out + len + 1, tail);
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool memory_path_contains_dir(const char *root, const char *path) {
     char r[CBM_SZ_1K];
     char p[CBM_SZ_1K];
@@ -93,10 +129,12 @@ static bool memory_path_contains_dir(const char *root, const char *path) {
     memory_copy_norm(r, sizeof(r), root);
     memory_copy_norm(p, sizeof(p), path);
     /* Canonicalize both paths so a symlinked memory_dir pointing into the
-     * repo cannot bypass the boundary check. Falls back to the lexical
-     * comparison when canonicalization fails (e.g. path does not exist yet). */
-    const char *rr = cbm_canonical_path(r, cr, sizeof(cr)) ? cr : r;
-    const char *pp = cbm_canonical_path(p, cp, sizeof(cp)) ? cp : p;
+     * repo cannot bypass the boundary check. For paths that do not exist
+     * yet (common: the memory dir is created on first write), resolve the
+     * parent directory and append the tail to avoid mismatches caused by
+     * symlinked prefixes (e.g. /tmp -> /private/tmp on macOS). */
+    const char *rr = memory_canonicalize_maybe_missing(r, cr, sizeof(cr)) ? cr : r;
+    const char *pp = memory_canonicalize_maybe_missing(p, cp, sizeof(cp)) ? cp : p;
     size_t rlen = strlen(rr);
     if (rlen == 0) {
         return false;
