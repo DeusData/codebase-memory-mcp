@@ -314,6 +314,14 @@ static const RFile kTsInferredImportedMethod[] = {
      "}\n"},
 };
 
+/* A standard-library class constructed through an inferred local variable must
+ * retain the bare stdlib QN so subsequent member dispatch finds Map.get. */
+static const char kTsInferredStdlibMethod[] =
+    "function lookup(id: string): string {\n"
+    "    const m = new Map<string, string>();\n"
+    "    return m.get(id);\n"
+    "}\n";
+
 /* lsp_ts_jsx — <Comp/> JSX element whose tag is a module-local component
  * function (ts_lsp.c:2643-2647). TSX only (jsx_mode); the tag's first letter is
  * uppercase so it is NOT treated as an intrinsic HTML element; it resolves via
@@ -395,6 +403,11 @@ TEST(repro_lsp_ts_inferred_import_receiver) {
         "lsp_ts_method");
 }
 
+TEST(repro_lsp_ts_inferred_stdlib_receiver) {
+    return assert_lsp_strategy("main.ts", kTsInferredStdlibMethod,
+                               "lsp_ts_method");
+}
+
 TEST(repro_lsp_ts_jsx) {
     return assert_lsp_strategy("app.tsx", kTsxJsx, "lsp_ts_jsx");
 }
@@ -429,6 +442,7 @@ SUITE(repro_lsp_ts) {
     RUN_TEST(repro_lsp_ts_namespace);
     RUN_TEST(repro_lsp_ts_import);
     RUN_TEST(repro_lsp_ts_inferred_import_receiver);
+    RUN_TEST(repro_lsp_ts_inferred_stdlib_receiver);
     RUN_TEST(repro_lsp_ts_jsx);
     RUN_TEST(repro_lsp_ts_jsx_import);
     RUN_TEST(repro_lsp_ts_default);
