@@ -209,6 +209,71 @@ TEST(cypher_parse_simple_node) {
     PASS();
 }
 
+/* Trailing input must be an error, never a silent drop. The parser used to
+ * stop at the first thing it did not understand and report success, so the
+ * engine answered from the fragment it had parsed. */
+TEST(cypher_parse_rejects_trailing_tokens) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name AS n BANANA SPLIT 99", &q, &err);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(err);
+    ASSERT_NULL(q);
+
+    /* The message must name what actually stopped the parse, and must not
+     * mention WITH: this query has no WITH in it anywhere. */
+    ASSERT(strstr(err, "BANANA") != NULL);
+    ASSERT(strstr(err, "WITH") == NULL);
+
+    free(err);
+    PASS();
+}
+
+/* Only one WITH is supported. A second one used to take the rest of the
+ * query with it — the filter and the RETURN both vanished, and every row
+ * came back unfiltered under the default projection. */
+TEST(cypher_parse_rejects_second_with_clause) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) "
+                              "OPTIONAL MATCH (a)-[:CALLS]->(f) "
+                              "WITH f, count(a) AS calls "
+                              "OPTIONAL MATCH (b)-[:USAGE]->(f) "
+                              "WITH f, calls, count(b) AS usages "
+                              "WHERE calls = 0 AND usages = 0 "
+                              "RETURN f.name AS n",
+                              &q, &err);
+    ASSERT_NEQ(rc, 0);
+    ASSERT_NOT_NULL(err);
+    ASSERT_NULL(q);
+
+    /* Here the note earns its place. The parse stops at OPTIONAL, and the
+     * reason is the second WITH further along, which the reader cannot see
+     * from the stopping point alone. */
+    ASSERT(strstr(err, "only one WITH clause is supported") != NULL);
+
+    free(err);
+    PASS();
+}
+
+/* The guard must not reject a query that is simply finished. One WITH, a
+ * WHERE after it and a RETURN is the shape the grammar does support. */
+TEST(cypher_parse_accepts_single_with_clause) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) "
+                              "WITH f, f.name AS n "
+                              "WHERE n = 'buildTree' "
+                              "RETURN n",
+                              &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_NULL(err);
+    ASSERT_NOT_NULL(q);
+
+    cbm_query_free(q);
+    PASS();
+}
+
 TEST(cypher_parse_relationship_outbound) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -4102,6 +4167,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_lex_full_query);
     /* Parser */
     RUN_TEST(cypher_parse_simple_node);
+    RUN_TEST(cypher_parse_rejects_trailing_tokens);
+    RUN_TEST(cypher_parse_rejects_second_with_clause);
+    RUN_TEST(cypher_parse_accepts_single_with_clause);
     RUN_TEST(cypher_parse_relationship_outbound);
     RUN_TEST(cypher_parse_relationship_inbound);
     RUN_TEST(cypher_parse_relationship_any);

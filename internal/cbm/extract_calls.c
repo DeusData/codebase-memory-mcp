@@ -21,8 +21,6 @@
 enum { LEAN_MAX_PARENT_DEPTH = 20 };
 /* Max positional args to scan for URL/string. */
 enum { MAX_POSITIONAL_SCAN = 3 };
-/* Max positional args to scan for handler ref. */
-enum { MAX_HANDLER_SCAN = 4 };
 /* Max string arg length before rejection. */
 enum { MAX_STRING_ARG_LEN = CBM_SZ_512 };
 /* Min printable ASCII (space). */
@@ -2349,8 +2347,17 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
 }
 
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
+    /* The LAST eligible argument wins, and every argument is examined.
+     * Express, Fastify, gin and Laravel all put middleware between the route
+     * path and the handler, so the first function-shaped argument is usually a
+     * middleware. Taking the first one pointed the HANDLES edge at the
+     * middleware; stopping the scan early missed the handler outright when the
+     * middleware was written inline, because an arrow function matches none of
+     * the kinds below. Nothing that follows a handler matches them either — an
+     * options argument is an object node — so the last match is the handler. */
+    const char *handler = NULL;
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
+    for (uint32_t ai = HANDLER_START_IDX; ai < nc; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
         if (strcmp(ts_node_type(arg2), "argument") == 0 && ts_node_named_child_count(arg2) > 0) {
@@ -2362,17 +2369,18 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
-            return cbm_node_text(ctx->arena, arg2, ctx->source);
+            handler = cbm_node_text(ctx->arena, arg2, ctx->source);
+            continue;
         }
         if (is_string_like(ak2)) {
             const char *h =
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
-                return h;
+                handler = h;
             }
         }
     }
-    return NULL;
+    return handler;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.

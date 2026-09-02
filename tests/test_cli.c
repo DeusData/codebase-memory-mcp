@@ -13492,7 +13492,7 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
  * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
  * install silently recreated them. The selector restricts it.
  *
- * The vocabulary is the part that makes it usable: 26 clients ship, with tokens
+ * The vocabulary is the part that makes it usable: clients ship with tokens
  * nobody would guess (factory-droid, mistral-vibe, copilot-cli). A selector
  * whose accepted values can only be learned by reading our source is not a
  * usable selector, so this pins that every client is listed and that an unknown
@@ -13521,6 +13521,12 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     cbm_detected_agents_t typo = all;
     ASSERT_FALSE(cbm_cli_clients_apply_selection_for_testing("claude,codx", &typo));
 
+    /* Registry-backed clients share the public selector vocabulary. */
+    cbm_detected_agents_t registry = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("qoder", &registry));
+    ASSERT_FALSE(registry.claude_code);
+    ASSERT_FALSE(registry.cursor);
+
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
     for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
@@ -13529,6 +13535,34 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
         cbm_detected_agents_t one = all;
         ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing(token, &one));
     }
+    PASS();
+}
+
+TEST(cli_clients_selector_filters_registry_installs_issue1798) {
+    char *tmpdir = th_mktempdir("cbm_cli_clients_registry");
+    ASSERT_NOT_NULL(tmpdir);
+
+    char qoder_dir[512];
+    char settings_path[512];
+    ASSERT(snprintf(qoder_dir, sizeof(qoder_dir), "%s/.qoder", tmpdir) > 0);
+    ASSERT(snprintf(settings_path, sizeof(settings_path), "%s/settings.json", qoder_dir) > 0);
+    ASSERT_EQ(test_mkdirp(qoder_dir), 0);
+
+    cbm_cli_set_client_selection_for_testing("cursor");
+    int excluded_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    struct stat settings_state;
+    bool excluded = stat(settings_path, &settings_state) != 0;
+
+    cbm_cli_set_client_selection_for_testing("qoder");
+    int included_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool included = stat(settings_path, &settings_state) == 0;
+    cbm_cli_set_client_selection_for_testing(NULL);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(excluded_rc, 0);
+    ASSERT_TRUE(excluded);
+    ASSERT_EQ(included_rc, 0);
+    ASSERT_TRUE(included);
     PASS();
 }
 
@@ -13679,6 +13713,7 @@ SUITE(cli) {
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
+    RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);

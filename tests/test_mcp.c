@@ -3629,6 +3629,69 @@ TEST(trace_evidence_strategy_class_vocabulary_is_closed) {
     PASS();
 }
 
+/* A confidence the code cannot read must be reported as "not recorded", not
+ * as a recorded zero.
+ *
+ * The emitter reserves ev_conf < 0 for "no confidence on this edge" and
+ * prints "-" (text) or null (json). The reader set ev_conf with
+ * strtod(colon + 1, NULL), and strtod answers 0.0 for text it cannot read --
+ * so a malformed value passed the ev_conf >= 0.0 test and printed 0.00, the
+ * one value the surrounding code goes out of its way to keep meaningful.
+ * A caller then cannot tell "the resolver was certain this is wrong" from
+ * "nobody wrote a number here". */
+TEST(tool_trace_path_unreadable_confidence_reports_not_recorded) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "badconf-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/badconf");
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "badconf-proj.src.caller",
+                         .file_path = "src/a.c",
+                         .start_line = 1,
+                         .end_line = 5};
+    cbm_node_t callee = {.project = proj,
+                         .label = "Function",
+                         .name = "target",
+                         .qualified_name = "badconf-proj.src.target",
+                         .file_path = "src/a.c",
+                         .start_line = 10,
+                         .end_line = 20};
+    int64_t id_caller = cbm_store_upsert_node(st, &caller);
+    int64_t id_callee = cbm_store_upsert_node(st, &callee);
+    ASSERT_GT(id_caller, 0);
+    ASSERT_GT(id_callee, 0);
+    /* The strategy reads fine; only the confidence is malformed. */
+    cbm_edge_t e = {.project = proj,
+                    .source_id = id_caller,
+                    .target_id = id_callee,
+                    .type = "CALLS",
+                    .properties_json = "{\"callee\":\"target\",\"confidence\":null,"
+                                       "\"strategy\":\"lsp_trait_dispatch\",\"candidates\":1}"};
+    ASSERT_GT(cbm_store_insert_edge(st, &e), 0);
+
+    char *ev = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":93,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_path\",\"arguments\":{\"function_name\":\"caller\","
+             "\"project\":\"badconf-proj\",\"direction\":\"outbound\",\"include_evidence\":true}}}");
+    ASSERT_NOT_NULL(ev);
+    char *ev_txt = extract_text_content(ev);
+    ASSERT_NOT_NULL(ev_txt);
+    /* Positive controls: the hop and its readable class still come through, so
+     * a failure below is about the confidence and not a broken request. */
+    ASSERT_NOT_NULL(strstr(ev_txt, "target"));
+    ASSERT_NOT_NULL(strstr(ev_txt, "lsp"));
+    /* The claim: an unreadable confidence is never published as 0.00. */
+    ASSERT_NULL(strstr(ev_txt, "0.00"));
+    free(ev_txt);
+    free(ev);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* Distilled from #559 (@vvenegasv). The indexer already records
  * {strategy, confidence} on every CALLS edge (pass_calls.c:355) and the store
  * reads it back, but no tool ever surfaced it — an agent could see THAT A->B
@@ -5345,22 +5408,25 @@ TEST(search_code_file_pattern_prefilter_boundaries) {
     ASSERT_FALSE(cbm_search_code_file_pattern_can_prefilter("src\\*.pas"));
     ASSERT_FALSE(cbm_search_code_file_pattern_can_prefilter("*.c++"));
     ASSERT_FALSE(cbm_search_code_file_pattern_can_prefilter("*R&D*.go"));
+
+    ASSERT_TRUE(cbm_search_code_windows_path_matches_prefilter("src/UnitMain.PAS", "*.pas"));
+    ASSERT_TRUE(cbm_search_code_windows_path_matches_prefilter("types/index.D.TS", "*.d.ts"));
+    ASSERT_FALSE(cbm_search_code_windows_path_matches_prefilter("src/UnitMain.pas.bak", "*.pas"));
+    ASSERT_FALSE(cbm_search_code_windows_path_matches_prefilter("types/index.ts", "*.d.ts"));
     PASS();
 }
 
-TEST(search_code_windows_prefilter_precedes_content_scan) {
+TEST(search_code_windows_scope_prefilter_removes_pipeline_filter) {
 #ifdef _WIN32
     char command[CBM_SZ_4K];
     cbm_search_code_build_grep_cmd(command, sizeof(command), false, true, "*.go", "C:/tmp/pattern",
                                    "C:/tmp/filelist", "C:/tmp/root");
 
-    const char *prefilter = strstr(command, "Where-Object { $_ -like '*.go' }");
     const char *content_scan = strstr(command, "ForEach-Object { Select-String");
     const char *postfilter = strstr(command, "Where-Object { $_.Path -like '**.go' }");
-    ASSERT_NOT_NULL(prefilter);
+    ASSERT_NULL(strstr(command, "Where-Object { $_ -like '*.go' }"));
     ASSERT_NOT_NULL(content_scan);
     ASSERT_NOT_NULL(postfilter);
-    ASSERT_TRUE(prefilter < content_scan);
     ASSERT_TRUE(content_scan < postfilter);
 
     cbm_search_code_build_grep_cmd(command, sizeof(command), false, true, "*handler*.go",
@@ -12806,6 +12872,105 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  #1466 — autoindex.skip must report the effective numeric limit
+ * ══════════════════════════════════════════════════════════════════ */
+
+static char autoindex_skip_log[1024];
+
+/* Keeps only the too_many_files skip line, so later lines cannot displace it. */
+static void autoindex_skip_capture_log(const char *line) {
+    if (line && strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
+        snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
+    }
+}
+
+/* Drive initialize → maybe_auto_index over a fresh project holding more tracked
+ * files than auto_index_limit, and capture the resulting skip warning.
+ * Returns false on fixture setup failure. */
+static bool autoindex_skip_warning(char *out, size_t out_size) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(cache)) {
+        return false;
+    }
+
+    char repodir[512];
+    snprintf(repodir, sizeof(repodir), "%s/repo", cache);
+    char file_a[640];
+    char file_b[640];
+    snprintf(file_a, sizeof(file_a), "%s/a.py", repodir);
+    snprintf(file_b, sizeof(file_b), "%s/b.py", repodir);
+    if (th_mkdir_p(repodir) != 0 || th_write_file(file_a, "def a():\n    return 1\n") != 0 ||
+        th_write_file(file_b, "def b():\n    return 2\n") != 0) {
+        th_rmtree(cache);
+        return false;
+    }
+
+    const char *saved = getenv("CBM_CACHE_DIR");
+    char *saved_copy = saved ? strdup(saved) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char old_cwd[1024];
+    if (!cbm_getcwd(old_cwd, sizeof(old_cwd)) || cbm_chdir(repodir) != 0) {
+        restore_cache_dir(saved_copy);
+        free(saved_copy);
+        th_rmtree(cache);
+        return false;
+    }
+
+    bool ok = false;
+    cbm_config_t *cfg = cbm_config_open(cache);
+    if (cfg) {
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "1");
+
+        cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+        if (srv) {
+            autoindex_skip_log[0] = '\0';
+            CBMLogLevel prev_level = cbm_log_get_level();
+            cbm_log_set_level(CBM_LOG_WARN);
+            cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+            cbm_log_set_sink_ex(autoindex_skip_capture_log, CBM_LOG_SINK_REPLACE);
+
+            cbm_mcp_server_set_config(srv, cfg);
+            char *resp = cbm_mcp_server_handle(
+                srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+            free(resp);
+            cbm_mcp_server_free(srv);
+
+            cbm_log_set_sink(NULL);
+            cbm_log_set_level(prev_level);
+
+            snprintf(out, out_size, "%s", autoindex_skip_log);
+            ok = true;
+        }
+        cbm_config_close(cfg);
+    }
+
+    (void)cbm_chdir(old_cwd);
+    restore_cache_dir(saved_copy);
+    free(saved_copy);
+    th_rmtree(cache);
+    return ok;
+}
+
+/* RED before the fix: the warning carries `limit=auto_index_limit`, the config
+ * key constant, instead of the configured value. */
+TEST(autoindex_skip_reports_numeric_limit_issue1466) {
+    char warning[1024];
+    if (!autoindex_skip_warning(warning, sizeof(warning))) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    /* Not vacuous: the skip path must actually have been taken. */
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "files=2"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=1"));
+    ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
  * ══════════════════════════════════════════════════════════════════ */
@@ -13870,6 +14035,7 @@ SUITE(mcp) {
     RUN_TEST(trace_evidence_strategy_class_vocabulary_is_closed);
     RUN_TEST(tool_trace_path_evidence_is_opt_in_and_class_mapped);
     RUN_TEST(tool_trace_path_evidence_columns_match_header_issue1542);
+    RUN_TEST(tool_trace_path_unreadable_confidence_reports_not_recorded);
     RUN_TEST(tool_trace_call_path_depth_clamped);
     RUN_TEST(tool_trace_call_path_distinct_defs_not_over_unioned);
     RUN_TEST(tool_trace_call_path_dts_stub_unions_with_impl);
@@ -13904,7 +14070,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
-    RUN_TEST(search_code_windows_prefilter_precedes_content_scan);
+    RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
@@ -14019,6 +14185,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_default_registers_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
+    RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without

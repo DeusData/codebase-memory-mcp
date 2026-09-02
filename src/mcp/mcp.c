@@ -6498,7 +6498,16 @@ static bool bfs_edge_evidence_for_hop(cbm_traverse_result_t *tr, int64_t hop_nod
         if (conf) {
             const char *colon = strchr(conf, ':');
             if (colon) {
-                *confidence_out = strtod(colon + 1, NULL);
+                /* strtod answers 0.0 for text it cannot read, and the caller
+                 * publishes any value >= 0 as a recorded confidence. So a
+                 * malformed value used to print as 0.00 — the one number the
+                 * surrounding code works to keep meaningful. Keep the -1 when
+                 * the end pointer never moved: nothing was read. */
+                char *end = NULL;
+                double parsed = strtod(colon + 1, &end);
+                if (end != colon + 1) {
+                    *confidence_out = parsed;
+                }
             }
         }
         return true;
@@ -9747,6 +9756,36 @@ bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern) {
     return true;
 }
 
+bool cbm_search_code_windows_path_matches_prefilter(const char *path, const char *file_pattern) {
+    if (!path || !cbm_search_code_file_pattern_can_prefilter(file_pattern)) {
+        return false;
+    }
+
+    const char *suffix = file_pattern + 1;
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    if (path_len < suffix_len) {
+        return false;
+    }
+
+    const unsigned char *candidate = (const unsigned char *)path + path_len - suffix_len;
+    const unsigned char *expected = (const unsigned char *)suffix;
+    for (size_t i = 0; i < suffix_len; i++) {
+        unsigned char left = candidate[i];
+        unsigned char right = expected[i];
+        if (left >= 'A' && left <= 'Z') {
+            left = (unsigned char)(left - 'A' + 'a');
+        }
+        if (right >= 'A' && right <= 'Z') {
+            right = (unsigned char)(right - 'A' + 'a');
+        }
+        if (left != right) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Build the grep/search command string based on scoped vs recursive mode.
  * On Windows, uses PowerShell Select-String with tab-delimited output.
  * On POSIX, uses grep with colon-delimited output. */
@@ -9767,30 +9806,16 @@ void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bo
     const char *sm = use_regex ? "" : " -SimpleMatch";
     if (scoped) {
         if (file_pattern) {
-            if (cbm_search_code_file_pattern_can_prefilter(file_pattern)) {
-                snprintf(
-                    cmd, cmd_sz,
-                    "powershell -Command \"" CBM_PS_UTF8_PRELUDE
-                    "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                    "Get-Content -Encoding UTF8 -LiteralPath '%s'"
-                    " | Where-Object { $_ -like '%s' }"
-                    " | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
-                    "-ErrorAction SilentlyContinue }"
-                    " | Where-Object { $_.Path -like '*%s' }"
-                    " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                    tmpfile, filelist, file_pattern, sm, file_pattern);
-            } else {
-                snprintf(
-                    cmd, cmd_sz,
-                    "powershell -Command \"" CBM_PS_UTF8_PRELUDE
-                    "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                    "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
-                    "-LiteralPath $_ -Pattern $pat%s "
-                    "-ErrorAction SilentlyContinue }"
-                    " | Where-Object { $_.Path -like '*%s' }"
-                    " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                    tmpfile, filelist, sm, file_pattern);
-            }
+            snprintf(
+                cmd, cmd_sz,
+                "powershell -Command \"" CBM_PS_UTF8_PRELUDE
+                "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
+                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
+                "-LiteralPath $_ -Pattern $pat%s "
+                "-ErrorAction SilentlyContinue }"
+                " | Where-Object { $_.Path -like '*%s' }"
+                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+                tmpfile, filelist, sm, file_pattern);
         } else {
             snprintf(
                 cmd, cmd_sz,
@@ -10433,8 +10458,8 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
  * created inside the private scratch directory; this function never opens or
  * closes it, so the list is never reachable through a predictable pathname. */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  FILE *fl, bool has_path_filter, cbm_regex_t *path_regex,
-                                  int *out_written) {
+                                  FILE *fl, const char *file_pattern, bool has_path_filter,
+                                  cbm_regex_t *path_regex, int *out_written) {
     *out_written = 0;
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
@@ -10471,6 +10496,12 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
                     continue;
                 }
             }
+#ifdef _WIN32
+            if (cbm_search_code_file_pattern_can_prefilter(file_pattern) &&
+                !cbm_search_code_windows_path_matches_prefilter(indexed_files[fi], file_pattern)) {
+                continue;
+            }
+#endif
             size_t root_len = strlen(root_path);
             size_t file_len = strlen(indexed_files[fi]);
             if (root_len > SIZE_MAX - file_len - 2) {
@@ -10954,8 +10985,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     uint64_t scope_t0 = metrics.include_phase_timings ? cbm_now_ms() : 0;
     if (!scan_cancellation_latched && !scan_deadline_latched) {
-        scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, has_path_filter,
-                                       has_path_filter ? &path_regex : NULL, &scoped_written);
+        scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, file_pattern,
+                                       has_path_filter, has_path_filter ? &path_regex : NULL,
+                                       &scoped_written);
     }
     /* Close before grep runs: this is what flushes the records the helper wrote
      * through the descriptor. Clearing the field hands ownership to
@@ -12896,10 +12928,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 #endif
     if (!cbm_mcp_auto_index_within_file_limit(srv->session_root, file_limit, &file_count)) {
         char files[32];
+        char limit[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);
+        (void)snprintf(limit, sizeof(limit), "%d", file_limit);
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", CBM_CONFIG_AUTO_INDEX_LIMIT);
+                     files, "limit", limit);
         return;
     }
 

@@ -89,6 +89,14 @@ TEST(lang_ext_csharp) {
     ASSERT_EQ(cbm_language_for_extension(".cs"), CBM_LANG_CSHARP);
     PASS();
 }
+/* Blazor components were unmapped, so a .razor file was never discovered at
+ * all: indexing a Blazor app produced no nodes for any component, and reaching
+ * them required an undocumented extra_extensions entry in a per-project
+ * .codebase-memory.json. */
+TEST(lang_ext_razor) {
+    ASSERT_EQ(cbm_language_for_extension(".razor"), CBM_LANG_CSHARP);
+    PASS();
+}
 TEST(lang_ext_php) {
     ASSERT_EQ(cbm_language_for_extension(".php"), CBM_LANG_PHP);
     PASS();
@@ -1197,6 +1205,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_h);
     RUN_TEST(lang_ext_ixx);
     RUN_TEST(lang_ext_csharp);
+    RUN_TEST(lang_ext_razor);
     RUN_TEST(lang_ext_php);
     RUN_TEST(lang_ext_lua);
     RUN_TEST(lang_ext_scala);
