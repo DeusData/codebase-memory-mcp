@@ -17178,7 +17178,6 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
     char *result = cbm_mcp_text_result(json, is_error);
     free(json);
     return result;
-
 }
 
 static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
@@ -17880,7 +17879,6 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         srv->autoindex_active = true;
     }
 }
-
 
 /* ── Server request handler ───────────────────────────────────── */
 
