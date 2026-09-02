@@ -423,6 +423,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 #define CBM_CONFIG_AUTO_INDEX "auto_index"
 #define CBM_CONFIG_AUTO_INDEX_LIMIT "auto_index_limit"
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
+#define CBM_CONFIG_INSTALL_HOOKS "install_hooks"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather

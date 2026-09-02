@@ -109,6 +109,8 @@ The `install` command automatically strips macOS quarantine attributes and ad-ho
 
 The `install` command auto-detects installed coding agents and configures their documented MCP entries plus durable instructions, skills, and lifecycle hooks where supported.
 
+Hooks are enabled by default. Run `codebase-memory-mcp install --no-hooks` to remove CBM-managed hooks while keeping MCP registration and other integration files; the choice persists for later installs and updates. Run `codebase-memory-mcp install --hooks` to re-enable them, or inspect the current preference with `codebase-memory-mcp config get install_hooks`.
+
 ### Session Coordination Daemon
 
 CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and the final session shuts it down. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
