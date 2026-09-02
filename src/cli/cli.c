@@ -7785,7 +7785,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_INDEX_CONFIG_MAX_FILES, "off", "Max accepted source files per index, or off"},
     {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
     {CBM_CONFIG_MEMORY_ENABLED, "false", "Enable opt-in local personal repo memory"},
-    {CBM_CONFIG_MEMORY_DIR, "user-data", "Directory for local personal memory.db (overridden by CBM_MEMORY_DIR)"},
+    {CBM_CONFIG_MEMORY_DIR, "user-data",
+     "Directory for local personal memory.db (overridden by CBM_MEMORY_DIR)"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
