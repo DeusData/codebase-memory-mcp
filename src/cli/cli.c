@@ -6865,7 +6865,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
     {CBM_CONFIG_MEMORY_ENABLED, "false", "Enable opt-in local personal repo memory"},
-    {CBM_CONFIG_MEMORY_DIR, "user-data", "Directory for local personal memory.db (overridden by CBM_MEMORY_DIR)"},
+    {CBM_CONFIG_MEMORY_DIR, "user-data",
+     "Directory for local personal memory.db (overridden by CBM_MEMORY_DIR)"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing
