@@ -241,6 +241,20 @@ static void ei_cleanup(EILangProj *lp, cbm_store_t *store) {
 
 /* Index `files`, check IMPORTS count >= `floor`.  Dumps a diagnostic on
  * failure so failures are self-diagnosable without re-running manually. */
+/* Exact-count variant of ei_edge_present: a fabricated EXTRA edge must fail
+ * the probe, so a floor is not enough (#1932's negative-assertion gap). */
+static int ei_edge_count_is(const EILangFile *files, int nfiles, const char *edge_type,
+                            int expected) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge_type) : -1;
+    if (got != expected) {
+        fprintf(stderr, "  [%s] FAIL count=%d expected==%d\n", edge_type, got, expected);
+    }
+    ei_cleanup(&lp, store);
+    return got == expected;
+}
+
 static int ei_edge_present(const EILangFile *files, int nfiles, const char *edge_type, int floor) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
@@ -510,6 +524,34 @@ TEST(ei_go_two_consumers_same_package) {
         {"b/b.go", "package b\n\nimport \"example.com/two/util\"\n\n"
                    "func Run() int { return util.Helper(2) }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 4, "IMPORTS", 2));
+    PASS();
+}
+
+TEST(ei_go_import_never_binds_symbol) {
+    /* #1934: a Go import path names a package, never a symbol. `os/exec` is
+     * external (not in the graph), so the ONLY correct outcome is no edge —
+     * but Strategy 3's symbol-name fallback matched the path's last segment
+     * against any project definition named `exec` and bound the import to a
+     * test harness's method. Exact count: the internal `util` import (edge 1,
+     * via Strategy 1 → the package Folder) must be the whole IMPORTS
+     * relation; the fallback edge onto harness.exec (reproduce-first RED:
+     * count 2) must not exist. */
+    static const EILangFile f[] = {
+        {"go.mod", "module example.com/fxi\n\ngo 1.22\n"},
+        {"util/util.go", "package util\n\nfunc Tag() string { return \"t\" }\n"},
+        {"helper/harness.go", "package helper\n\ntype harness struct{ n int }\n\n"
+                              "func (h *harness) exec(cmd string) error { return nil }\n"},
+        /* Same-package decoy: the field-measured survivor bound os/exec to a
+         * method in the IMPORTER'S OWN package (Strategy 1b's sibling-file
+         * resolution accepts symbol labels too), so the fixture needs the
+         * collision both cross-package and same-package. */
+        {"app/aux.go", "package app\n\ntype runner struct{ n int }\n\n"
+                       "func (r *runner) exec(cmd string) error { return nil }\n"},
+        {"app/run.go", "package app\n\nimport (\n\t\"os/exec\"\n\n"
+                       "\t\"example.com/fxi/util\"\n)\n\n"
+                       "func Run() error {\n\t_ = util.Tag()\n"
+                       "\treturn exec.Command(\"true\").Run()\n}\n"}};
+    ASSERT_TRUE(ei_edge_count_is(f, 5, "IMPORTS", 1));
     PASS();
 }
 
@@ -1037,6 +1079,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_subpackage_import);
     RUN_TEST(ei_go_blank_import);
     RUN_TEST(ei_go_two_consumers_same_package);
+    RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */

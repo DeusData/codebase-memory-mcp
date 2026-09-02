@@ -516,6 +516,11 @@ TEST(resolve_budget_override_when_total_unknown) {
     PASS();
 }
 
+/* CBM_MEM_BUDGET_MB is an aggregate ceiling the parent divides across job
+ * slots. A lower explicit value still wins; a raise is clipped to the per-slot
+ * share so N workers cannot oversubscribe the host (#1654). The source stays
+ * CBM_MEM_BUDGET_MB so the clip is the user's aggregate, not a silent
+ * daemon_worker_cap rewrite of a fraction-derived default. */
 TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
     size_t total = 8192 * CBM_TEST_MB;
     size_t worker_cap = 16 * CBM_TEST_MB;
@@ -524,10 +529,15 @@ TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
     ASSERT_STR_EQ(lower.source, "CBM_MEM_BUDGET_MB");
     ASSERT_FALSE(lower.hard_capped);
 
-    cbm_mem_budget_t capped = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
-    ASSERT_EQ(capped.budget, worker_cap);
-    ASSERT_STR_EQ(capped.source, "daemon_worker_cap");
-    ASSERT_TRUE(capped.hard_capped);
+    cbm_mem_budget_t raised = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
+    ASSERT_EQ(raised.budget, worker_cap);
+    ASSERT_STR_EQ(raised.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_TRUE(raised.hard_capped);
+
+    cbm_mem_budget_t fraction = cbm_mem_resolve_budget_capped(total, 0.5, NULL, worker_cap);
+    ASSERT_EQ(fraction.budget, worker_cap);
+    ASSERT_STR_EQ(fraction.source, "daemon_worker_cap");
+    ASSERT_TRUE(fraction.hard_capped);
     PASS();
 }
 

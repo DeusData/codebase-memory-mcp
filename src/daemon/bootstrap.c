@@ -359,11 +359,20 @@ static cbm_daemon_bootstrap_status_t bootstrap_finish_probe(
 
 static cbm_daemon_bootstrap_probe_status_t bootstrap_probe(
     const cbm_daemon_bootstrap_config_t *config, const cbm_daemon_bootstrap_ops_t *ops,
-    cbm_daemon_runtime_client_t **client_out, cbm_daemon_runtime_connect_result_t *connect_result) {
+    cbm_daemon_runtime_client_t **client_out, cbm_daemon_runtime_connect_result_t *connect_result,
+    uint64_t *muted_holder_pid_io) {
     memset(connect_result, 0, sizeof(*connect_result));
     *client_out = NULL;
-    return ops->probe(ops->context, config->endpoint, config->identity, config->connect_timeout_ms,
-                      client_out, connect_result);
+    cbm_daemon_bootstrap_probe_status_t status =
+        ops->probe(ops->context, config->endpoint, config->identity, config->connect_timeout_ms,
+                   client_out, connect_result);
+    /* Sticky across probes: a later fast-path probe never attempts a connect
+     * and reports no holder, but a mute holder seen once must survive into
+     * the final timeout diagnostic. */
+    if (muted_holder_pid_io && connect_result->muted_endpoint_holder_pid != 0) {
+        *muted_holder_pid_io = connect_result->muted_endpoint_holder_pid;
+    }
+    return status;
 }
 
 static bool bootstrap_probe_is_finishable(cbm_daemon_bootstrap_probe_status_t probe) {
@@ -432,8 +441,9 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
 
     cbm_daemon_runtime_client_t *client = NULL;
     cbm_daemon_runtime_connect_result_t connect_result;
+    uint64_t muted_holder_pid = 0;
     cbm_daemon_bootstrap_probe_status_t probe =
-        bootstrap_probe(config, ops, &client, &connect_result);
+        bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
     if (bootstrap_probe_is_finishable(probe)) {
         cbm_daemon_bootstrap_status_t status =
             bootstrap_finish_probe(probe, client, &connect_result, ops, result_out);
@@ -461,7 +471,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
              * replacements from being launched. */
             generation_observed = true;
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
             continue;
         }
 
@@ -473,7 +483,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
         if (lock_status == 0) {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
             continue;
         }
         if (lock_status != 1 || !startup_lock) {
@@ -482,7 +492,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
         }
 
         lock_acquired = true;
-        probe = bootstrap_probe(config, ops, &client, &connect_result);
+        probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
         if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
             probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
             generation_observed = true;
@@ -516,7 +526,7 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
          * bootstrap against a daemon that is trying to cleanly stand down. */
         do {
             bootstrap_pause(deadline);
-            probe = bootstrap_probe(config, ops, &client, &connect_result);
+            probe = bootstrap_probe(config, ops, &client, &connect_result, &muted_holder_pid);
             if (probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
                 probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL) {
                 generation_observed = true;
@@ -545,7 +555,16 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     }
 
     result_out->status = CBM_DAEMON_BOOTSTRAP_FAILED;
-    if (generation_observed) {
+    if (muted_holder_pid != 0) {
+        /* The one diagnostic the 2026-08-29 zombie recovery had to assemble by
+         * hand from process, pipe, and log correlation: name the pid that
+         * holds the endpoint without answering, and say what to do with it. */
+        (void)snprintf(result_out->message, sizeof(result_out->message),
+                       "CBM daemon endpoint is held by pid %llu but that process answered no "
+                       "rendezvous within %u ms; the daemon runtime is likely dead — stop that "
+                       "process, then retry",
+                       (unsigned long long)muted_holder_pid, config->startup_timeout_ms);
+    } else if (generation_observed) {
         (void)snprintf(result_out->message, sizeof(result_out->message),
                        "CBM daemon is active or starting but could not accept this client "
                        "within %u ms",
@@ -576,6 +595,16 @@ cbm_daemon_bootstrap_probe_status_t cbm_daemon_bootstrap_classify_failed_connect
         }
         /* Capacity, admission, and other protocol-level rejections prove an
          * existing generation answered. Never reinterpret them as absence. */
+        return CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
+    }
+    if (connect_result->status == CBM_DAEMON_RUNTIME_CONNECT_ERROR &&
+        connect_result->muted_endpoint_holder_pid != 0) {
+        /* The transport connected to a live process that answered nothing.
+         * That endpoint is OWNED, whatever the advisory locks read right now
+         * (a wedged generation can hold pipes while its lock files churn).
+         * Classifying this as absence made the 2026-08-29 zombie invisible:
+         * the starter spawned doomed competitors for 30 s and then reported a
+         * bare timeout with no holder named. */
         return CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED;
     }
     if (lifetime_status == 1) {

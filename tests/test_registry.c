@@ -811,21 +811,69 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
     PASS();
 }
 
-TEST(tsjs_suppress_drops_weak_method_matches) {
-    /* #592/#606: a TS/JS member call whose receiver the LSP could not type, that
+TEST(cross_language_ref_drops_go_vs_c) {
+    /* #1928: the USAGE/WRITES/READS analog of #725. Reference edges carry no
+     * import-closure evidence, so EVERY registry strategy is a bare-name
+     * guess and no strategy-level carve-out applies — the predicate takes no
+     * strategy at all. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.c"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "driver/mock.hpp"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_C, "pkg/events/event.go"));
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_PYTHON, "web/src/pages/Editor.js"));
+    /* Same language → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "pkg/state/state.go"));
+    /* C and C++ are one family: .h maps to CBM_LANG_CPP, and a .c file
+     * referencing its own header's declarations is not a boundary. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_C, "bpf/probe.h"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_CPP, "driver/compat.c"));
+    /* …but Go into a header is still a boundary. */
+    ASSERT_TRUE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "bpf/probe.h"));
+    /* JS/TS/TSX/ArkTS are one family. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_JAVASCRIPT, "lib/util.ts"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx"));
+    /* Unknown caller/target language or no path → nothing to judge → keep. */
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_COUNT, "store.py"));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, NULL));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, ""));
+    ASSERT_FALSE(cbm_suppress_cross_language_ref(CBM_LANG_GO, "Makefile.inc.unknownext"));
+    PASS();
+}
+
+TEST(go_bare_ref_never_binds_field) {
+    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
+     * field access is always a selector expression. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "err", "Field"));
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "config", "Field"));
+    /* A selector-shaped reference may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "t.err", "Field"));
+    /* Bare references to non-fields are untouched. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Function"));
+    /* Other languages reference their own members bare inside methods —
+     * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, "_count", "Field"));
+    /* Degenerate inputs → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, NULL, "Field"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "", "Field"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", NULL));
+    PASS();
+}
+
+TEST(dynamic_suppress_drops_weak_method_matches) {
+    /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
      * The strategies that actually reach the guards are the registry's
      * suffix_match / unique_name and the parallel field_type_hint; "fuzzy" is
      * covered defensively (cbm_registry_fuzzy_resolve is not wired into the
      * resolvers today) so a future wiring cannot silently reintroduce it. */
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "suffix_match"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "unique_name"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "field_type_hint"));
-    ASSERT_TRUE(cbm_tsjs_suppress_weak_method_match(true, true, "fuzzy"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_member_match(true, true, "fuzzy"));
     PASS();
 }
 
-TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
+TEST(dynamic_suppress_keeps_high_confidence_and_non_methods) {
     /* Keep every receiver-/import-aware strategy. Because the PARALLEL resolver
      * runs lsp_* strategies through this same guard variable, an explicit
      * drop-list must never touch them — asserting the lsp_* keeps here is the
@@ -833,23 +881,23 @@ TEST(tsjs_suppress_keeps_high_confidence_and_non_methods) {
      * enumerates the resolver's non-weak strategies: registry
      * {import_map, import_map_suffix, same_module, qualified_suffix}, parallel
      * {callee_suffix, service_pattern}, and lsp_*. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "same_module"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "import_map_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "qualified_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "callee_suffix"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "service_pattern"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_method"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_cross"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, "lsp_ts_local"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_ts_method"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, "lsp_ts_local"));
     /* A bare call (is_method=false) is a free-function call → never suppressed. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "unique_name"));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, false, "suffix_match"));
-    /* Non-TS/JS languages are never affected. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(false, true, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, false, "suffix_match"));
+    /* Languages outside the caller's guard set are never affected. */
+    ASSERT_FALSE(cbm_suppress_weak_member_match(false, true, "suffix_match"));
     /* No match (NULL/empty strategy) → nothing to suppress. */
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, NULL));
-    ASSERT_FALSE(cbm_tsjs_suppress_weak_method_match(true, true, ""));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, ""));
     PASS();
 }
 
@@ -945,6 +993,8 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
-    RUN_TEST(tsjs_suppress_drops_weak_method_matches);
-    RUN_TEST(tsjs_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(cross_language_ref_drops_go_vs_c);
+    RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(dynamic_suppress_drops_weak_method_matches);
+    RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
 }

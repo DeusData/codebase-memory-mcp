@@ -89,6 +89,77 @@ TEST(fqn_compute_basic_rs) {
     PASS();
 }
 
+TEST(fqn_compute_file_sibling_distinct) {
+    char *ts = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "__file__");
+    char *html = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.html", "__file__");
+    char *scss = cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.scss", "__file__");
+    ASSERT_NOT_NULL(ts);
+    ASSERT_NOT_NULL(html);
+    ASSERT_NOT_NULL(scss);
+    ASSERT_STR_NEQ(ts, html);
+    ASSERT_STR_NEQ(ts, scss);
+    ASSERT_STR_NEQ(html, scss);
+    free(ts);
+    free(html);
+    free(scss);
+    PASS();
+}
+
+TEST(fqn_compute_symbol_still_strips) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "BadgeComponent"),
+               "proj.app.badge.badge.component.BadgeComponent");
+    PASS();
+}
+
+TEST(fqn_module_siblings_still_share) {
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "app/badge/badge.component.ts"),
+               "proj.app.badge.badge.component");
+    ASSERT_FQN(cbm_pipeline_fqn_module("proj", "app/badge/badge.component.html"),
+               "proj.app.badge.badge.component");
+    PASS();
+}
+
+/* #769: exact __file__ QNs for component siblings. */
+TEST(fqn_compute_file_sibling_exact) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.ts", "__file__"),
+               "proj.app.badge.badge.component.ts.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.html", "__file__"),
+               "proj.app.badge.badge.component.html.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.component.scss", "__file__"),
+               "proj.app.badge.badge.component.scss.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_multi_extension) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/badge/badge.spec.ts", "__file__"),
+               "proj.app.badge.badge.spec.ts.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "archive.tar.gz", "__file__"),
+               "proj.archive.tar.gz.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_no_extension) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "Makefile", "__file__"),
+               "proj.Makefile.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "LICENSE", "__file__"),
+               "proj.LICENSE.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_dotfile) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", ".gitignore", "__file__"),
+               "proj..gitignore.__file__");
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "config/.env", "__file__"),
+               "proj.config..env.__file__");
+    PASS();
+}
+
+TEST(fqn_compute_file_index_ts) {
+    ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "app/index.ts", "__file__"),
+           "proj.app.index.ts.__file__");
+    PASS();
+}
+
 /* ── Nested paths ─────────────────────────────────────────────── */
 
 TEST(fqn_compute_nested_two_levels) {
@@ -595,6 +666,14 @@ SUITE(fqn) {
     RUN_TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964);
     RUN_TEST(fqn_module_qn_still_strips_extension);
     RUN_TEST(fqn_compute_basic_rs);
+    RUN_TEST(fqn_compute_file_sibling_distinct);
+    RUN_TEST(fqn_compute_symbol_still_strips);
+    RUN_TEST(fqn_module_siblings_still_share);
+    RUN_TEST(fqn_compute_file_sibling_exact);
+    RUN_TEST(fqn_compute_file_multi_extension);
+    RUN_TEST(fqn_compute_file_no_extension);
+    RUN_TEST(fqn_compute_file_dotfile);
+    RUN_TEST(fqn_compute_file_index_ts);
 
     /* fqn_compute: nested paths */
     RUN_TEST(fqn_compute_nested_two_levels);

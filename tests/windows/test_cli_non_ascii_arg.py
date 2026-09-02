@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 MATH_TS = (
     "export function add(a: number, b: number): number { return a + b; }\n"
@@ -67,13 +68,24 @@ def main():
         # CLI path itself works and isolating the failure to argv encoding.
         ascii_repo = os.path.join(work, "ascii_repo")
         make_fixture(ascii_repo)
-        env = dict(os.environ)
-        env["CBM_CACHE_DIR"] = os.path.join(work, "cache_ascii")
-        ctrl = subprocess.run(
-            [binary, "cli", "index_repository",
-             json.dumps({"repo_path": ascii_repo})],
-            capture_output=True, timeout=120, env=env)
-        ctrl_out = (ctrl.stdout or b"").decode("utf-8", "replace")
+        # The control is setup, not the surface under test: a cold runner can
+        # lose the first one-shot to coordination-daemon startup latency
+        # (#1952). One retry against a fresh cache separates that from a real
+        # CLI indexing failure.
+        ctrl_out = ""
+        for attempt in ("cache_ascii", "cache_ascii_retry"):
+            env = dict(os.environ)
+            env["CBM_CACHE_DIR"] = os.path.join(work, attempt)
+            ctrl = subprocess.run(
+                [binary, "cli", "index_repository",
+                 json.dumps({"repo_path": ascii_repo})],
+                capture_output=True, timeout=120, env=env)
+            ctrl_out = (ctrl.stdout or b"").decode("utf-8", "replace")
+            if '"nodes"' in ctrl_out:
+                break
+            print("SETUP: ASCII control attempt %r did not index via CLI:\n%s"
+                  % (attempt, ctrl_out[:300]))
+            time.sleep(2)
         if '"nodes"' not in ctrl_out:
             print("SETUP FAIL: ASCII control did not index via CLI:\n%s" %
                   ctrl_out[:300])

@@ -1,0 +1,232 @@
+==================
+Observed class with decorator
+==================
+
+@Observed
+class Model {
+  count: number = 0
+}
+
+---
+
+(program
+  (class_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (public_field_definition
+        (property_identifier)
+        (type_annotation
+          (predefined_type))
+        (number)))))
+
+==================
+Class with heritage and methods
+==================
+
+class Service extends Base implements Api {
+  private name: string
+
+  constructor(name: string) {
+    super()
+    this.name = name
+  }
+
+  getName(): string {
+    return this.name
+  }
+}
+
+---
+
+(program
+  (class_declaration
+    (type_identifier)
+    (class_heritage
+      (extends_clause
+        (identifier))
+      (implements_clause
+        (type_identifier)))
+    (class_body
+      (public_field_definition
+        (accessibility_modifier)
+        (property_identifier)
+        (type_annotation
+          (predefined_type)))
+      (method_definition
+        (property_identifier)
+        (formal_parameters
+          (required_parameter
+            (identifier)
+            (type_annotation
+              (predefined_type))))
+        (statement_block
+          (expression_statement
+            (call_expression
+              (super)
+              (arguments)))
+          (expression_statement
+            (assignment_expression
+              (member_expression
+                (this)
+                (property_identifier))
+              (identifier)))))
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (type_annotation
+          (predefined_type))
+        (statement_block
+          (return_statement
+            (member_expression
+              (this)
+              (property_identifier))))))))
+
+==================
+Interface and enum
+==================
+
+interface Props {
+  title: string
+  onDone?: () => void
+}
+
+enum Color {
+  Red,
+  Green = 2,
+}
+
+---
+
+(program
+  (interface_declaration
+    (type_identifier)
+    (interface_body
+      (property_signature
+        (property_identifier)
+        (type_annotation
+          (predefined_type)))
+      (property_signature
+        (property_identifier)
+        (type_annotation
+          (function_type
+            (formal_parameters)
+            (predefined_type))))))
+  (enum_declaration
+    (identifier)
+    (enum_body
+      (property_identifier)
+      (enum_assignment
+        (property_identifier)
+        (number)))))
+
+==================
+Type alias and generics
+==================
+
+type Handler<T> = (value: T) => void
+
+function identity<T>(value: T): T {
+  return value
+}
+
+---
+
+(program
+  (type_alias_declaration
+    (type_identifier)
+    (type_parameters
+      (type_parameter
+        (type_identifier)))
+    (function_type
+      (formal_parameters
+        (required_parameter
+          (identifier)
+          (type_annotation
+            (type_identifier))))
+      (predefined_type)))
+  (function_declaration
+    (identifier)
+    (type_parameters
+      (type_parameter
+        (type_identifier)))
+    (formal_parameters
+      (required_parameter
+        (identifier)
+        (type_annotation
+          (type_identifier))))
+    (type_annotation
+      (type_identifier))
+    (statement_block
+      (return_statement
+        (identifier)))))
+
+==================
+Namespace declaration
+==================
+
+namespace Util {
+  export function helper(): number {
+    return 1
+  }
+}
+
+---
+
+(program
+  (expression_statement
+    (internal_module
+      (identifier)
+      (statement_block
+        (export_statement
+          (function_declaration
+            (identifier)
+            (formal_parameters)
+            (type_annotation
+              (predefined_type))
+            (statement_block
+              (return_statement
+                (number)))))))))
+
+==================
+Async arrow and await
+==================
+
+const load = async (url: string): Promise<string> => {
+  const res = await fetch(url)
+  return res.text()
+}
+
+---
+
+(program
+  (lexical_declaration
+    (variable_declarator
+      (identifier)
+      (arrow_function
+        (formal_parameters
+          (required_parameter
+            (identifier)
+            (type_annotation
+              (predefined_type))))
+        (type_annotation
+          (generic_type
+            (type_identifier)
+            (type_arguments
+              (predefined_type))))
+        (statement_block
+          (lexical_declaration
+            (variable_declarator
+              (identifier)
+              (await_expression
+                (call_expression
+                  (identifier)
+                  (arguments
+                    (identifier))))))
+          (return_statement
+            (call_expression
+              (member_expression
+                (identifier)
+                (property_identifier))
+              (arguments))))))))

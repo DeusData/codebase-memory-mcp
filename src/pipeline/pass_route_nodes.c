@@ -33,11 +33,10 @@ enum {
 #include <stdint.h>
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
+#include "service_patterns.h" /* cbm_service_pattern_is_http_route_literal */
 
 #include <stdio.h>
 #include <string.h>
-
-bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name);
 
 /* True for characters that may appear in a ":name" route parameter. */
 static inline bool is_route_ident_char(char c) {

@@ -31,6 +31,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 SYMBOL = "someIndexedSymbol"
 SRC = "export function %s(a: number): number { return a + 1; }\n" % SYMBOL
@@ -63,9 +64,19 @@ def main():
 
         # repo_path / cwd in the forward-slash drive form Claude Code passes.
         repo_fwd = repo.replace("\\", "/")
-        idx = run_cli(binary, cache, ["cli", "index_repository",
-                                      json.dumps({"repo_path": repo_fwd})])
-        idx_out = (idx.stdout or b"").decode("utf-8", "replace")
+        # Setup, not the surface under test: retry once so a cold runner's
+        # coordination-daemon startup latency (#1952) is not misread as a
+        # broken CLI index. Reindexing the same cache is idempotent.
+        idx_out = ""
+        for attempt in (1, 2):
+            idx = run_cli(binary, cache, ["cli", "index_repository",
+                                          json.dumps({"repo_path": repo_fwd})])
+            idx_out = (idx.stdout or b"").decode("utf-8", "replace")
+            if '"nodes"' in idx_out:
+                break
+            print("SETUP: index attempt %d did not run:\n%s"
+                  % (attempt, idx_out[:300]))
+            time.sleep(2)
         if '"nodes"' not in idx_out:
             print("SETUP FAIL: index did not run:\n%s" % idx_out[:300])
             return 2
@@ -88,10 +99,17 @@ def main():
         # first — the supported way to keep hooks armed outside MCP sessions —
         # and retire it afterwards (with a kill-by-pid backstop so a stuck stop
         # can never hang CI).
-        start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
-        start_out = (start.stdout or b"").decode("utf-8", "replace")
-        print("daemon start rc=%d %r" % (start.returncode, start_out[:120]))
-        if start.returncode != 0:
+        start_out = ""
+        rc = 1
+        for attempt in (1, 2):
+            start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
+            start_out = (start.stdout or b"").decode("utf-8", "replace")
+            rc = start.returncode
+            print("daemon start attempt %d rc=%d %r" % (attempt, rc, start_out[:120]))
+            if rc == 0:
+                break
+            time.sleep(2)
+        if rc != 0:
             print("SETUP FAIL: permanent daemon did not start")
             return 2
         pid_match = re.search(r"pid (\d+)", start_out)

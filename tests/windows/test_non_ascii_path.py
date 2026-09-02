@@ -2,8 +2,8 @@
 
 Guards the fix for issue #636 / #357 (landed on main via #700) at the product
 surface (real codebase-memory-mcp process, real SQLite DB, real stdio). Two
-byte-identical TypeScript fixtures are indexed: one under an ASCII parent path,
-one under a non-ASCII parent path. The invariant under test:
+byte-identical polyglot fixtures (TypeScript + Go, #1959) are indexed: one under
+an ASCII parent path, one under a non-ASCII parent path. The invariant under test:
 
     A byte-identical fixture must produce equivalent graph counts regardless of
     whether its absolute path contains non-ASCII characters.
@@ -34,7 +34,7 @@ import sys
 import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mcp_stdio import McpServer  # noqa: E402
+from mcp_stdio import McpServer, wait_projects_with_stats  # noqa: E402
 
 MATH_TS = (
     "export function add(a: number, b: number): number { return a + b; }\n"
@@ -52,6 +52,81 @@ MAIN_TS = (
     "  return mul(3, 4);\n"
     "}\n"
     "run();\n"
+)
+
+# Dummy Go package covering the shapes the Go/cgo extraction work (#1932
+# family) showed were previously invisible to CI: struct fields and a method,
+# a build-tag twin pair sharing one function name, a cgo file (C preamble,
+# `C.` call, `//export` directive), and a channel producer/consumer pair
+# (#1959). Go qualified names embed the containing directory, so these also
+# put non-ASCII repo paths through the Go pipeline passes.
+GO_MOD = "module example.com/fixture\n\ngo 1.22\n"
+
+GO_STORE = """package gopkg
+
+type Store struct {
+	Total int
+	Name  string
+}
+
+func (s *Store) Push(x int) {
+	s.Total = s.Total + x
+}
+
+func NewStore(name string) *Store {
+	return &Store{Name: name}
+}
+"""
+
+GO_FLUSH_LINUX = """//go:build linux
+
+package gopkg
+
+func FlushDisk() int { return 1 }
+"""
+
+GO_FLUSH_WINDOWS = """//go:build windows
+
+package gopkg
+
+func FlushDisk() int { return 2 }
+"""
+
+GO_BRIDGE = """package gopkg
+
+/*
+#include <stdio.h>
+static void announce(void) { puts("hi"); }
+*/
+import "C"
+
+//export FixtureReady
+func FixtureReady() int { return 3 }
+
+func Announce() {
+	C.announce()
+}
+"""
+
+GO_EVENTS = """package gopkg
+
+func Produce(events chan string) {
+	events <- "tick"
+}
+
+func Drain(events chan string) string {
+	v := <-events
+	return v
+}
+"""
+
+GO_FILES = (
+    ("go.mod", GO_MOD),
+    ("gopkg/store.go", GO_STORE),
+    ("gopkg/flush_linux.go", GO_FLUSH_LINUX),
+    ("gopkg/flush_windows.go", GO_FLUSH_WINDOWS),
+    ("gopkg/bridge.go", GO_BRIDGE),
+    ("gopkg/events.go", GO_EVENTS),
 )
 
 # Distinct non-ASCII scripts — each must behave like the ASCII baseline.
@@ -244,6 +319,42 @@ def make_fixture(root):
     for name, text in (("math.ts", MATH_TS), ("main.ts", MAIN_TS)):
         with open(os.path.join(src, name), "wb") as f:
             f.write(text.encode("utf-8"))  # exact bytes, identical across copies
+    for rel, text in GO_FILES:
+        path = os.path.join(root, rel.replace("/", os.sep))
+        os.makedirs(os.path.dirname(path) or root, exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(text.encode("utf-8"))
+
+
+def no_project_error(index_txt, repo, cache):
+    """Assemble the venue diagnostics for an index that left no project row.
+
+    The count summary cannot explain a venue-specific empty listing; carry the
+    index response, the cache contents and the supervisor's worker logs (the
+    only record of the pipeline's own error) into the CI log.
+    """
+    try:
+        cache_entries = sorted(os.listdir(cache))
+    except OSError as exc:
+        cache_entries = ["<listdir failed: %s>" % exc]
+    log_tails = []
+    logs_dir = os.path.join(cache, "logs")
+    if os.path.isdir(logs_dir):
+        for log_name in sorted(os.listdir(logs_dir)):
+            try:
+                with open(os.path.join(logs_dir, log_name), "rb") as lf:
+                    tail = lf.read()[-800:].decode("utf-8", "replace")
+                log_tails.append("%s: %s" % (log_name, tail))
+            except OSError as exc:
+                log_tails.append("%s: <unreadable: %s>" % (log_name, exc))
+    try:
+        repo_entries = sorted(os.listdir(repo))
+    except OSError as exc:
+        repo_entries = ["<listdir failed: %s>" % exc]
+    return {"error": "no project listed after index; index said %r; "
+                     "cache holds %r; repo holds %r; worker logs: %s"
+                     % (index_txt[:400], cache_entries, repo_entries,
+                        " | ".join(log_tails) or "<none>")}
 
 
 def index_and_count(binary, repo, cache):
@@ -255,42 +366,29 @@ def index_and_count(binary, repo, cache):
         index_txt, err = s.tool_text(resp)
         if err:
             return {"error": "index tools/call error: %r" % err}
-        lp = s.call_tool("list_projects", {}, timeout=60)
-        lp_txt, _ = s.tool_text(lp)
-        projects = json.loads(lp_txt).get("projects") or []
-        if not projects:
-            # The count summary cannot explain a venue-specific empty listing;
-            # carry the index response and the cache contents into the log.
-            try:
-                cache_entries = sorted(os.listdir(cache))
-            except OSError as exc:
-                cache_entries = ["<listdir failed: %s>" % exc]
-            # The supervisor's worker logs carry the actual pipeline error.
-            log_tails = []
-            logs_dir = os.path.join(cache, "logs")
-            if os.path.isdir(logs_dir):
-                for log_name in sorted(os.listdir(logs_dir)):
-                    try:
-                        with open(os.path.join(logs_dir, log_name), "rb") as lf:
-                            tail = lf.read()[-800:].decode("utf-8", "replace")
-                        log_tails.append("%s: %s" % (log_name, tail))
-                    except OSError as exc:
-                        log_tails.append("%s: <unreadable: %s>" % (log_name, exc))
-            try:
-                repo_entries = sorted(os.listdir(repo))
-            except OSError as exc:
-                repo_entries = ["<listdir failed: %s>" % exc]
-            return {"error": "no project listed after index; index said %r; "
-                             "cache holds %r; repo holds %r; worker logs: %s"
-                             % (index_txt[:400], cache_entries, repo_entries,
-                                " | ".join(log_tails) or "<none>")}
-        p = projects[0]
-        out = {"name": p.get("name"), "nodes": p.get("nodes"),
-               "edges": p.get("edges")}
+        # The index response itself carries the synchronous, authoritative
+        # counts ("nodes"/"edges"). list_projects publishes its stats columns
+        # asynchronously — on some venues never within a one-shot session — so
+        # gating on it misreads a healthy index as a setup failure (#1952).
+        try:
+            summary = json.loads(index_txt)
+        except ValueError:
+            summary = {}
+        out = {"name": summary.get("project"), "nodes": summary.get("nodes"),
+               "edges": summary.get("edges")}
+        if out["nodes"] is None:
+            # Payload without counts: fall back to list_projects, polled
+            # because its stats row can trail the index on slow runners.
+            projects, _ = wait_projects_with_stats(s)
+            if not projects:
+                return no_project_error(index_txt, repo, cache)
+            p = projects[0]
+            out = {"name": p.get("name"), "nodes": p.get("nodes"),
+                   "edges": p.get("edges")}
         # Definition-level counts prove the parser ran (not just discovery).
         # query_graph defaults to TOON text; this scripted consumer requests
         # format="json" ({"columns":[...],"rows":[["<n>"]],...}) explicitly.
-        name = p.get("name")
+        name = out["name"]
         defs = 0
         for label in ("Function", "Class", "Method"):
             q = "MATCH (n:%s) RETURN count(n)" % label
@@ -305,6 +403,25 @@ def index_and_count(binary, repo, cache):
             except Exception:
                 pass
         out["definition_nodes"] = defs
+        # Go-file definitions separately: the Go passes derive qualified names
+        # from the containing directory, so they meet non-ASCII paths on a
+        # different route than the TS passes; a Go-specific count catches a
+        # regression that total counts could mask (#1959).
+        go_defs = 0
+        for label in ("Function", "Method"):
+            q = ("MATCH (n:%s) WHERE n.file_path CONTAINS '.go' "
+                 "RETURN count(n)" % label)
+            r = s.call_tool("query_graph",
+                            {"query": q, "project": name, "format": "json"},
+                            timeout=60)
+            t, _ = s.tool_text(r)
+            try:
+                rows = json.loads(t).get("rows") or []
+                if rows and rows[0]:
+                    go_defs += int(rows[0][0])
+            except Exception:
+                pass
+        out["go_definition_nodes"] = go_defs
         return out
 
 
@@ -331,14 +448,29 @@ def main():
 
         ascii_repo = os.path.join(work, "ascii_repo")
         make_fixture(ascii_repo)
-        base = index_and_count(binary, ascii_repo, os.path.join(work, "c_ascii"))
+        # The baseline is setup, not the surface under test: a cold runner can
+        # lose the first index to daemon startup latency (#1952). One retry
+        # against a fresh cache separates that environmental window from a
+        # real indexing failure before the guard declares a precondition skip.
+        base = {}
+        for attempt in ("c_ascii", "c_ascii_retry"):
+            base = index_and_count(binary, ascii_repo, os.path.join(work, attempt))
+            if not base.get("error") and base.get("nodes"):
+                break
+            print("SETUP: ASCII baseline attempt %r did not index: %r"
+                  % (attempt, base))
         if base.get("error") or not base.get("nodes"):
             print("SETUP FAIL: ASCII baseline did not index: %r" % base)
             return 2
-        print("baseline (ASCII): nodes=%s edges=%s definitions=%s" %
-              (base["nodes"], base["edges"], base["definition_nodes"]))
+        print("baseline (ASCII): nodes=%s edges=%s definitions=%s go=%s" %
+              (base["nodes"], base["edges"], base["definition_nodes"],
+               base["go_definition_nodes"]))
         if base["definition_nodes"] < 1:
             print("SETUP FAIL: ASCII baseline produced no definitions: %r" % base)
+            return 2
+        if base["go_definition_nodes"] < 1:
+            print("SETUP FAIL: ASCII baseline extracted no Go definitions: %r"
+                  % base)
             return 2
 
         for key, seg in NON_ASCII_SEGMENTS.items():
@@ -348,13 +480,15 @@ def main():
             ok = (not got.get("error")
                   and got.get("nodes") == base["nodes"]
                   and got.get("edges") == base["edges"]
-                  and got.get("definition_nodes") == base["definition_nodes"])
+                  and got.get("definition_nodes") == base["definition_nodes"]
+                  and got.get("go_definition_nodes") == base["go_definition_nodes"])
             status = "PASS" if ok else "FAIL"
-            print("[%s] non-ascii/%-14s nodes=%s edges=%s definitions=%s "
-                  "(baseline %s/%s/%s) name=%r" %
+            print("[%s] non-ascii/%-14s nodes=%s edges=%s definitions=%s go=%s "
+                  "(baseline %s/%s/%s/%s) name=%r" %
                   (status, key, got.get("nodes"), got.get("edges"),
-                   got.get("definition_nodes"), base["nodes"], base["edges"],
-                   base["definition_nodes"], got.get("name")))
+                   got.get("definition_nodes"), got.get("go_definition_nodes"),
+                   base["nodes"], base["edges"], base["definition_nodes"],
+                   base["go_definition_nodes"], got.get("name")))
             if not ok:
                 # The counts alone cannot explain a venue-specific failure;
                 # surface the captured error verbatim so CI logs carry the
@@ -372,7 +506,9 @@ def main():
                 if (not retry.get("error")
                         and retry.get("nodes") == base["nodes"]
                         and retry.get("edges") == base["edges"]
-                        and retry.get("definition_nodes") == base["definition_nodes"]):
+                        and retry.get("definition_nodes") == base["definition_nodes"]
+                        and retry.get("go_definition_nodes")
+                        == base["go_definition_nodes"]):
                     print("       %s retry matched baseline -- order-dependent, "
                           "not path-dependent" % key)
                 else:

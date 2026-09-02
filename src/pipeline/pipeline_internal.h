@@ -234,6 +234,14 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
 
 /* ── Testable helpers ────────────────────────────────────────────── */
 
+/* #1934: whether the import resolver's name-guess fallbacks — Strategy 1b
+ * (sibling file; its label filter admits symbols) and Strategy 3 (symbol
+ * name) — may run for imports from this language. False for Go: an import
+ * path names a package, never a symbol, so a Strategy-1 miss means the import
+ * is external and the correct result is no edge. Pure; exercised through
+ * ei_go_import_never_binds_symbol. */
+bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
+
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
 
@@ -629,6 +637,61 @@ int cbm_pipeline_pass_semantic_edges(cbm_pipeline_ctx_t *ctx);
  * worst-case nested-loop estimate (transitive_loop_depth) and flags call-graph
  * cycles (recursive). Runs on the graph buffer before the dump. */
 void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx);
+
+/* Pre-dump pass: per-symbol importance score (weighted degree).
+ *   importance = sqrt(num_refs) * priv * generic * distinct * test_penalty
+ * Stored as a numeric "importance" key inside the node's EXISTING
+ * properties_json — no schema change and no index-format bump; indexes written
+ * by older builds simply lack the key and consumers must tolerate its absence.
+ * MUST run after pass_tests and after CALLS/USAGE extraction — a pass ordered
+ * earlier would see zero TESTS edges and num_refs = 0 everywhere. It is
+ * therefore registered last in run_predump_passes and last in the incremental
+ * post-pass sequence. */
+void cbm_pipeline_pass_importance(cbm_pipeline_ctx_t *ctx);
+
+/* Gathered inputs for one symbol. Each scoring route fills this its own way
+ * (gbuf lookups, or SQL aggregates) and then calls the ONE rule below. */
+typedef struct {
+    const char *name;
+    const char *file_path;
+    int num_refs;            /* incoming CALLS + USAGE */
+    int name_distinct_files; /* distinct files the NAME is defined in */
+    bool tests_target;       /* has an incoming TESTS edge */
+} cbm_importance_inputs_t;
+
+/* THE scoring rule — single definition, shared by every route, so the two
+ * gathering strategies cannot drift apart in what a score means. */
+double cbm_pipeline_importance_score(const cbm_importance_inputs_t *in);
+
+/* Produce a copy of `json` with the numeric "importance" key set to `score`,
+ * or NULL when `json` is not a JSON object or allocation fails. Caller owns
+ * the result. IDEMPOTENT: an existing key is overwritten in place, never
+ * appended twice — every re-scoring route sees nodes that already carry it.
+ * Single definition, shared by the in-memory and SQL writers alike. */
+char *cbm_pipeline_importance_set_prop(const char *json, double score);
+
+/* gbuf-node convenience wrapper around cbm_pipeline_importance_set_prop. */
+void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score);
+
+/* Recompute importance for an ENTIRE project directly in a store, in SQL.
+ * Used by the closure-delta incremental route, whose in-RAM graph is a proxy
+ * buffer with no project-wide edges — scoring there would persist a near-zero
+ * in-degree for heavily-referenced symbols in the changed files. Must be
+ * called on the STAGING store AFTER cbm_delta_patch has merged nodes and
+ * re-linked inbound edges. Returns 0 on success; the caller treats failure as
+ * a delta-route failure and falls back to a full rebuild. */
+int cbm_pipeline_importance_recompute_store(cbm_store_t *store, const char *project);
+
+/* Work counters for the importance pass (pass_importance.c). Deltas are read
+ * by the complexity suite's linearity gate; never reset by the pass itself, so
+ * nested/repeated runs compose. g_importance_name_visits counts same-name-group
+ * member visits during distinct-file counting — the quantity that goes
+ * superlinear if the per-distinct-name memoization is ever lost. */
+extern _Atomic uint64_t g_importance_nodes;
+extern _Atomic uint64_t g_importance_name_visits;
+/* Rows rescored by the SQL-level store recompute. Lets a test prove the
+ * closure-delta route actually took that path instead of passing vacuously. */
+extern _Atomic uint64_t g_importance_store_rows;
 
 /* ── Env URL scanner (pass_envscan.c) ────────────────────────────── */
 

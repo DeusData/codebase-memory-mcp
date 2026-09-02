@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.DeusData/codebase-memory-mcp",
   "title": "Codebase Memory",
-  "description": "Codebase knowledge graph for AI agents \u2014 159 languages, sub-ms queries, 99% fewer tokens.",
+  "description": "Codebase knowledge graph for AI agents \u2014 162 languages, sub-ms queries, 99% fewer tokens.",
   "repository": {
     "url": "https://github.com/DeusData/codebase-memory-mcp",
     "source": "github"
   },
   "websiteUrl": "https://deusdata.github.io/codebase-memory-mcp/",
-  "version": "0.8.1",
+  "version": "0.10.8",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "codebase-memory-mcp",
-      "version": "0.8.1",
+      "version": "0.10.8",
       "runtimeHint": "npx",
       "transport": {
         "type": "stdio"
@@ -22,7 +22,7 @@
     {
       "registryType": "pypi",
       "identifier": "codebase-memory-mcp",
-      "version": "0.8.1",
+      "version": "0.10.8",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

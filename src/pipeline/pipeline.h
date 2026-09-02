@@ -93,6 +93,8 @@ int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
  * to NULL/0 when p is NULL or nothing was excluded. Do not free. */
 void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count);
 
+bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p);
+
 /* Committed node/edge counts captured at dump time (-1 when dump did not run).
  * Nodes are the #334 plausibility-gate axis; edges are informational only. */
 void cbm_pipeline_get_committed_counts(const cbm_pipeline_t *p, int *nodes, int *edges);
@@ -267,13 +269,16 @@ bool cbm_perl_is_builtin(const char *name);
 bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *callee_name,
                                      const char *strategy);
 
-/* Decide whether a resolved TS/JS/TSX member-call edge is weak-strategy noise to
- * drop (#592/#606): true only for TS/JS, only for a member call with a
- * non-this/super receiver (is_method), and only when the match used a weak
- * short-name strategy (suffix_match / unique_name / field_type_hint / fuzzy).
+/* Decide whether a resolved member-call edge is weak-strategy noise to drop
+ * (#592/#606/#1276): true only when the CALLER's per-language gate says the
+ * guard applies (`enabled`), only for a member call with an unresolved receiver
+ * (is_method), and only when the match used a weak short-name strategy
+ * (suffix_match / unique_name / field_type_hint / fuzzy).
  * Explicit drop-list keeps every lsp_* / import / same-module / qualified match.
+ * The language set lives at the call sites (pass_calls.c / pass_parallel.c) and
+ * must be identical in both, or the sequential and parallel resolvers diverge.
  * Pure; unit-tested in test_registry.c. */
-bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const char *strategy);
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
@@ -282,6 +287,22 @@ bool cbm_tsjs_suppress_weak_method_match(bool is_tsjs, bool is_method, const cha
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
+
+/* #1928: USAGE/WRITES/READS analog of the CALLS guard above. Reference edges
+ * resolved by the short-name registry carry no import-closure evidence, so a
+ * cross-language binding is a bare-name collision for EVERY strategy — drop
+ * it whenever the caller's language and the target file's language disagree
+ * (JS/TS family members and the C/C++ header family excepted). Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path);
+
+/* #1942: a bare (dot-less) Go reference can never denote a struct field —
+ * field access is always a selector expression, and selector references
+ * resolve on the LSP path. Drops a READS/WRITES/USAGE bind whose target is a
+ * Field when the reference text carries no '.'. Go only: other OO languages
+ * legitimately reference their own members bare inside method bodies. Pure;
+ * unit-tested in test_registry.c. */
+bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

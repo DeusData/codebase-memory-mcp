@@ -912,16 +912,16 @@ static void print_help(void) {
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
     printf("  --port=N     Set UI port (default 9749, persisted)\n");
     printf("  --tool-profile=analysis|scout  Expose a restricted inspection surface\n");
-    printf("\nSupported automatic/conditional client surfaces (43):\n");
+    printf("\nSupported automatic/conditional client surfaces (45):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf,\n");
     printf("  Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands,\n");
     printf("  Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush,\n");
-    printf("  Goose, Mistral Vibe, Qoder CLI, Kimi Code CLI, GitLab Duo CLI,\n");
+    printf("  Goose, Mistral Vibe, Grok Build, Qoder CLI, Kimi Code CLI, GitLab Duo CLI,\n");
     printf("  Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Continue / cn,\n");
     printf("  Visual Studio, TRAE, Roo Code, Amazon Q Developer IDE,\n");
     printf("  CodeBuddy Code CLI, IBM Bob IDE, IBM Bob Shell, Pochi, Pi,\n");
-    printf("  Sourcegraph Cody\n");
+    printf("  Sourcegraph Cody, Oh My Pi (omp)\n");
     printf("  Conditional/explicit targets are changed only when their documented\n");
     printf("  platform, marker, or explicit existing config path is present.\n");
     printf("  Manual/UI MCP boundaries: Qodo, Warp, JetBrains AI/ACP, Replit,\n");
@@ -2258,6 +2258,19 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
 
     if (strcmp(subcommand, "status") == 0) {
         if (!active) {
+            if (status.muted_endpoint_holder_pid != 0) {
+                /* Alive process, dead runtime (2026-08-29 zombie class).
+                 * "not running" here sent the operator hunting through
+                 * processes, pipes, and logs by hand; name the holder and the
+                 * recovery instead. */
+                printf("daemon: not responding (endpoint held by pid %llu)\n",
+                       (unsigned long long)status.muted_endpoint_holder_pid);
+                printf("hint: that process holds the daemon endpoint but answered nothing; "
+                       "its runtime is likely dead. Terminate pid %llu, then run "
+                       "`codebase-memory-mcp daemon start`.\n",
+                       (unsigned long long)status.muted_endpoint_holder_pid);
+                return EXIT_FAILURE;
+            }
             printf("daemon: not running\n");
             printf("hint: `codebase-memory-mcp daemon start` keeps a daemon warm so CLI "
                    "commands and hooks skip the per-command startup cost.\n");
@@ -2485,6 +2498,24 @@ int main(int argc, char **argv) {
 #ifndef _WIN32
         cbm_hook_augment_arm_deadline();
 #endif
+        /* Read stdin now and bail before executable-identity hashing when the
+         * event can never produce output (an un-forced PreToolUse Bash call
+         * that is not a search). The identity hash costs ~1.1 s of user CPU
+         * per invocation, and with Bash in the installed matcher nearly every
+         * agent command would pay it for nothing. A no-op touches no shared
+         * state, so it needs no identity. Anything else is handed back via
+         * the prefetch so downstream readers see stdin exactly once. */
+        if (!hook_event) {
+            char *hook_input = cbm_hook_augment_read_stdin();
+            if (!hook_input) {
+                return EXIT_SUCCESS; /* fail open, nothing to augment */
+            }
+            if (cbm_hook_augment_input_is_noop_bash(hook_input)) {
+                free(hook_input);
+                return EXIT_SUCCESS;
+            }
+            cbm_hook_augment_prefetch_stdin(hook_input);
+        }
     }
 
     if (role == CBM_DAEMON_PROCESS_STATELESS) {

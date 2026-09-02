@@ -15,6 +15,7 @@
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
+#include "foundation/workspace.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
 #include "pipeline/pipeline.h"
@@ -2086,6 +2087,266 @@ TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions) {
     ASSERT_EQ(atomic_load(&update.destroys), 1);
     ASSERT_TRUE(stopped);
     ASSERT_TRUE(cache_restored);
+    PASS();
+}
+
+TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls) {
+    app_env_backup_t cache_environment;
+    app_env_backup_t home_environment;
+    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
+                              app_env_backup_capture(&home_environment, "HOME");
+    char sensitive_raw[APP_TEST_PATH_CAP];
+    char ordinary_raw[APP_TEST_PATH_CAP];
+    char cache_raw[APP_TEST_PATH_CAP];
+    (void)snprintf(sensitive_raw, sizeof(sensitive_raw), "%s/cbm-app-sensitive-auto-home-XXXXXX",
+                   cbm_tmpdir());
+    (void)snprintf(ordinary_raw, sizeof(ordinary_raw), "%s/cbm-app-sensitive-auto-project-XXXXXX",
+                   cbm_tmpdir());
+    (void)snprintf(cache_raw, sizeof(cache_raw), "%s/cbm-app-sensitive-auto-cache-XXXXXX",
+                   cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(sensitive_raw) != NULL && cbm_mkdtemp(ordinary_raw) != NULL &&
+                   cbm_mkdtemp(cache_raw) != NULL;
+    char sensitive[APP_TEST_PATH_CAP] = {0};
+    char ordinary[APP_TEST_PATH_CAP] = {0};
+    char cache[APP_TEST_PATH_CAP] = {0};
+    bool canonical = dirs_ok && cbm_canonical_path(sensitive_raw, sensitive, sizeof(sensitive)) &&
+                     cbm_canonical_path(ordinary_raw, ordinary, sizeof(ordinary)) &&
+                     cbm_canonical_path(cache_raw, cache, sizeof(cache));
+    char sensitive_source[APP_TEST_PATH_CAP];
+    char ordinary_source[APP_TEST_PATH_CAP];
+    (void)snprintf(sensitive_source, sizeof(sensitive_source), "%s/tracked.c", sensitive);
+    (void)snprintf(ordinary_source, sizeof(ordinary_source), "%s/tracked.c", ordinary);
+    bool files_ok = canonical && app_test_create_empty_file(sensitive_source) &&
+                    app_test_create_empty_file(ordinary_source);
+    bool environments_set = environments_saved && files_ok &&
+                            cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                            cbm_setenv("HOME", sensitive, 1) == 0;
+    cbm_config_t *stored_config = environments_set ? cbm_config_open(cache) : NULL;
+    bool config_ready = stored_config &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .config = stored_config,
+        .worker_ops = &worker_ops,
+    };
+    cbm_daemon_application_t *application =
+        config_ready ? cbm_daemon_application_new(&config) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *sensitive_session =
+        application ? app_test_open(&callbacks, 4030) : NULL;
+    cbm_daemon_runtime_application_session_t *ordinary_session =
+        application ? app_test_open(&callbacks, 4031) : NULL;
+    cbm_daemon_runtime_application_session_t *approved_session =
+        application ? app_test_open(&callbacks, 4032) : NULL;
+
+    int background_baseline = cbm_daemon_application_background_initializes_for_test();
+    bool sensitive_initialized = app_test_initialize_profile(
+        &callbacks, sensitive_session, sensitive, CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool sensitive_evaluated = app_wait_for_background_initializes(background_baseline + 1);
+    bool sensitive_blocked = sensitive_initialized && sensitive_evaluated &&
+                             atomic_load(&fake.starts) == 0 &&
+                             cbm_daemon_application_active_jobs(application) == 0;
+
+    bool ordinary_initialized = app_test_initialize_profile(&callbacks, ordinary_session, ordinary,
+                                                            CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool ordinary_admitted = ordinary_initialized && app_wait_for_atomic_int(&fake.starts, 1) &&
+                             cbm_daemon_application_active_jobs(application) == 1;
+    if (ordinary_session) {
+        callbacks.session_cancel(callbacks.context, ordinary_session);
+        callbacks.session_close(callbacks.context, ordinary_session);
+        ordinary_session = NULL;
+    }
+    bool ordinary_reaped = ordinary_admitted && app_wait_for_atomic_int(&fake.cancels, 1) &&
+                           app_wait_for_atomic_int(&fake.destroys, 1) &&
+                           app_wait_for_active_jobs(application, 0);
+
+    char grant_error[APP_TEST_PATH_CAP];
+    bool approved = ordinary_reaped && cbm_workspace_grant_add(cache, sensitive, sensitive, true,
+                                                               grant_error, sizeof(grant_error));
+    bool approved_initialized =
+        approved && app_test_initialize_profile(&callbacks, approved_session, sensitive,
+                                                CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool approved_admitted = approved_initialized && app_wait_for_atomic_int(&fake.starts, 2) &&
+                             cbm_daemon_application_active_jobs(application) == 1;
+
+    if (sensitive_session) {
+        callbacks.session_cancel(callbacks.context, sensitive_session);
+        callbacks.session_close(callbacks.context, sensitive_session);
+    }
+    if (approved_session) {
+        callbacks.session_cancel(callbacks.context, approved_session);
+        callbacks.session_close(callbacks.context, approved_session);
+    }
+    if (ordinary_session) {
+        callbacks.session_cancel(callbacks.context, ordinary_session);
+        callbacks.session_close(callbacks.context, ordinary_session);
+    }
+    bool approved_reaped = approved_admitted && app_wait_for_atomic_int(&fake.cancels, 2) &&
+                           app_wait_for_atomic_int(&fake.destroys, 2) &&
+                           app_wait_for_active_jobs(application, 0);
+    if (!approved_reaped) {
+        atomic_store(&fake.allow_completion, true);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    cbm_config_close(stored_config);
+    (void)th_rmtree(sensitive);
+    (void)th_rmtree(ordinary);
+    (void)th_rmtree(cache);
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool home_restored = app_env_backup_restore(&home_environment);
+
+    ASSERT_TRUE(environments_saved);
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(files_ok);
+    ASSERT_TRUE(environments_set);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(sensitive_blocked);
+    ASSERT_TRUE(ordinary_admitted);
+    ASSERT_TRUE(ordinary_reaped);
+    ASSERT_TRUE(approved);
+    ASSERT_TRUE(approved_admitted);
+    ASSERT_TRUE(approved_reaped);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(home_restored);
+    PASS();
+}
+
+TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls) {
+    app_env_backup_t cache_environment;
+    app_env_backup_t home_environment;
+    bool environments_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR") &&
+                              app_env_backup_capture(&home_environment, "HOME");
+    char sensitive_raw[APP_TEST_PATH_CAP];
+    char ordinary_raw[APP_TEST_PATH_CAP];
+    char cache_raw[APP_TEST_PATH_CAP];
+    (void)snprintf(sensitive_raw, sizeof(sensitive_raw), "%s/cbm-app-sensitive-watch-home-XXXXXX",
+                   cbm_tmpdir());
+    (void)snprintf(ordinary_raw, sizeof(ordinary_raw), "%s/cbm-app-sensitive-watch-project-XXXXXX",
+                   cbm_tmpdir());
+    (void)snprintf(cache_raw, sizeof(cache_raw), "%s/cbm-app-sensitive-watch-cache-XXXXXX",
+                   cbm_tmpdir());
+    bool dirs_ok = cbm_mkdtemp(sensitive_raw) != NULL && cbm_mkdtemp(ordinary_raw) != NULL &&
+                   cbm_mkdtemp(cache_raw) != NULL;
+    char sensitive[APP_TEST_PATH_CAP] = {0};
+    char ordinary[APP_TEST_PATH_CAP] = {0};
+    char cache[APP_TEST_PATH_CAP] = {0};
+    bool canonical = dirs_ok && cbm_canonical_path(sensitive_raw, sensitive, sizeof(sensitive)) &&
+                     cbm_canonical_path(ordinary_raw, ordinary, sizeof(ordinary)) &&
+                     cbm_canonical_path(cache_raw, cache, sizeof(cache));
+    bool environments_set = environments_saved && canonical &&
+                            cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                            cbm_setenv("HOME", sensitive, 1) == 0;
+    cbm_config_t *stored_config = environments_set ? cbm_config_open(cache) : NULL;
+    bool config_ready = stored_config &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_INDEX, "false") == 0 &&
+                        cbm_config_set(stored_config, CBM_CONFIG_AUTO_WATCH, "true") == 0;
+    char *sensitive_project = canonical ? cbm_project_name_from_path(sensitive) : NULL;
+    char *ordinary_project = canonical ? cbm_project_name_from_path(ordinary) : NULL;
+    char sensitive_db[APP_TEST_PATH_CAP] = {0};
+    char ordinary_db[APP_TEST_PATH_CAP] = {0};
+    if (sensitive_project) {
+        (void)snprintf(sensitive_db, sizeof(sensitive_db), "%s/%s.db", cache, sensitive_project);
+    }
+    if (ordinary_project) {
+        (void)snprintf(ordinary_db, sizeof(ordinary_db), "%s/%s.db", cache, ordinary_project);
+    }
+    bool db_ready = config_ready && sensitive_project && ordinary_project &&
+                    app_test_create_empty_file(sensitive_db) &&
+                    app_test_create_empty_file(ordinary_db);
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
+    cbm_daemon_application_config_t config = {
+        .watcher = watcher,
+        .config = stored_config,
+    };
+    cbm_daemon_application_t *application =
+        db_ready && watcher ? cbm_daemon_application_new(&config) : NULL;
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *sensitive_session =
+        application ? app_test_open(&callbacks, 4033) : NULL;
+    cbm_daemon_runtime_application_session_t *ordinary_session =
+        application ? app_test_open(&callbacks, 4034) : NULL;
+    cbm_daemon_runtime_application_session_t *approved_session =
+        application ? app_test_open(&callbacks, 4035) : NULL;
+
+    bool sensitive_initialized = app_test_initialize_profile(
+        &callbacks, sensitive_session, sensitive, CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool sensitive_blocked = sensitive_initialized && cbm_watcher_watch_count(watcher) == 0;
+    bool ordinary_initialized = app_test_initialize_profile(&callbacks, ordinary_session, ordinary,
+                                                            CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool ordinary_watched = ordinary_initialized && cbm_watcher_watch_count(watcher) == 1;
+    if (ordinary_session) {
+        callbacks.session_close(callbacks.context, ordinary_session);
+        ordinary_session = NULL;
+    }
+    bool ordinary_released = ordinary_watched && cbm_watcher_watch_count(watcher) == 0;
+
+    char grant_error[APP_TEST_PATH_CAP];
+    bool approved = ordinary_released && cbm_workspace_grant_add(cache, sensitive, sensitive, true,
+                                                                 grant_error, sizeof(grant_error));
+    bool approved_initialized =
+        approved && app_test_initialize_profile(&callbacks, approved_session, sensitive,
+                                                CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL);
+    bool approved_watched = approved_initialized && cbm_watcher_watch_count(watcher) == 1;
+
+    if (sensitive_session) {
+        callbacks.session_close(callbacks.context, sensitive_session);
+    }
+    if (approved_session) {
+        callbacks.session_close(callbacks.context, approved_session);
+    }
+    if (ordinary_session) {
+        callbacks.session_close(callbacks.context, ordinary_session);
+    }
+    bool watches_released = watcher && cbm_watcher_watch_count(watcher) == 0;
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (watcher) {
+        cbm_watcher_stop(watcher);
+        cbm_watcher_free(watcher);
+    }
+    cbm_store_close(store);
+    cbm_config_close(stored_config);
+    free(sensitive_project);
+    free(ordinary_project);
+    (void)th_rmtree(sensitive);
+    (void)th_rmtree(ordinary);
+    (void)th_rmtree(cache);
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+    bool home_restored = app_env_backup_restore(&home_environment);
+
+    ASSERT_TRUE(environments_saved);
+    ASSERT_TRUE(dirs_ok);
+    ASSERT_TRUE(canonical);
+    ASSERT_TRUE(environments_set);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(db_ready);
+    ASSERT_TRUE(sensitive_blocked);
+    ASSERT_TRUE(ordinary_watched);
+    ASSERT_TRUE(ordinary_released);
+    ASSERT_TRUE(approved);
+    ASSERT_TRUE(approved_watched);
+    ASSERT_TRUE(watches_released);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(cache_restored);
+    ASSERT_TRUE(home_restored);
     PASS();
 }
 
@@ -5097,6 +5358,8 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
+    RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
+    RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

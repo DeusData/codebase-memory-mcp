@@ -15250,12 +15250,9 @@ TEST(clsp_tier2_shared_registry_readonly_c) {
     PASS();
 }
 
-/* Direct guard for the finalize-time short-name / embedded-type indexes and their
- * iterators (type_registry.c), which the Rust trait/free-func fast paths rely on.
- * Verifies: embed index yields exactly the types whose embedded_types carry a
- * matching BARE name, in ascending registry order, deduped when a type lists the
- * same bare twice; free-func index yields only free funcs (receiver_type==NULL) with
- * the given short_name, not methods. */
+/* Direct guard for the type-name / embedded-type / free-function registry
+ * indexes and their iterators (type_registry.c). Verifies that every iterator
+ * preserves ascending registry order, which is part of resolver tie-breaking. */
 TEST(registry_short_name_indexes) {
     CBMArena arena;
     cbm_arena_init(&arena);
@@ -15288,6 +15285,25 @@ TEST(registry_short_name_indexes) {
     t.short_name = "C";
     t.embedded_types = c_emb;
     cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "other.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+
+    /* Populate enough distinct names to force many hash-bucket collisions, with
+     * repeated short names spread across the registry. The differential check
+     * below compares the index against the exact former linear-scan order. */
+    for (int i = 0; i < 512; i++) {
+        memset(&t, 0, sizeof(t));
+        t.qualified_name = cbm_arena_sprintf(&arena, "bulk.mod%d.Name%d", i, i % 23);
+        ASSERT_NOT_NULL(t.qualified_name);
+        t.short_name = strrchr(t.qualified_name, '.') + 1;
+        cbm_registry_add_type(&reg, t);
+    }
 
     /* free func "helper" (x2 — different QNs), method "M.helper", free func "other". */
     CBMRegisteredFunc f;
@@ -15310,6 +15326,77 @@ TEST(registry_short_name_indexes) {
     cbm_registry_add_func(&reg, f);
 
     cbm_registry_finalize(&reg);
+    cbm_registry_build_type_short_index(&reg);
+
+    /* Qualified-name bare segment "Trait": types 0, 4, then the bare-QN type
+     * 5. The iterator is a hash prefilter, so apply the exact predicate before
+     * asserting its order just like production consumers do. */
+    CBMTypeShortIter nit;
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    {
+        int expected[] = {0, 4, 5};
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+                continue;
+            ASSERT_TRUE(exact_count < 3);
+            ASSERT_EQ(candidate, expected[exact_count++]);
+        }
+        ASSERT_EQ(exact_count, 3);
+    }
+    cbm_registry_types_by_short_name(&reg, "Missing", &nit);
+    {
+        int exact_count = 0;
+        int candidate;
+        while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+            const char *qn = reg.types[candidate].qualified_name;
+            const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+            const char *candidate_short = last_dot ? last_dot + 1 : qn;
+            if (candidate_short && strcmp(candidate_short, "Missing") == 0)
+                exact_count++;
+        }
+        ASSERT_EQ(exact_count, 0);
+    }
+
+    for (int name_i = 0; name_i < 23; name_i++) {
+        char short_name[32];
+        snprintf(short_name, sizeof(short_name), "Name%d", name_i);
+        cbm_registry_types_by_short_name(&reg, short_name, &nit);
+        int linear_i = 0;
+        for (;;) {
+            int expected = -1;
+            while (linear_i < reg.type_count) {
+                int candidate = linear_i++;
+                const char *qn = reg.types[candidate].qualified_name;
+                const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+                const char *candidate_short = last_dot ? last_dot + 1 : qn;
+                if (candidate_short && strcmp(candidate_short, short_name) == 0) {
+                    expected = candidate;
+                    break;
+                }
+            }
+
+            int actual;
+            for (;;) {
+                actual = cbm_type_short_iter_next(&nit);
+                if (actual < 0)
+                    break;
+                const char *qn = reg.types[actual].qualified_name;
+                const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+                const char *candidate_short = last_dot ? last_dot + 1 : qn;
+                if (candidate_short && strcmp(candidate_short, short_name) == 0)
+                    break;
+            }
+
+            ASSERT_EQ(actual, expected);
+            if (expected < 0)
+                break;
+        }
+    }
 
     /* Embed index for bare "Trait": types 1 (A) then 2 (B), ascending, B once. */
     CBMTypeEmbedIter it;
@@ -15338,6 +15425,70 @@ TEST(registry_short_name_indexes) {
     cbm_registry_free_funcs_by_short_name(&reg, "other", &fit);
     ASSERT_EQ(cbm_free_func_iter_next(&fit), 3);
     ASSERT_EQ(cbm_free_func_iter_next(&fit), -1);
+
+    /* A type appended after finalize is covered by the iterator tail. If the
+     * auxiliary allocation is unavailable, the iterator falls back to the same
+     * complete linear scan rather than silently dropping candidates. Keep this
+     * after the other iterator assertions because their tails intentionally
+     * expose post-finalize candidates for caller-side exact filtering too. */
+    int tail_type_i = reg.type_count;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "tail.Trait";
+    t.short_name = "Trait";
+    cbm_registry_add_type(&reg, t);
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 0);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 4);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), 5);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), tail_type_i);
+    ASSERT_EQ(cbm_type_short_iter_next(&nit), -1);
+
+    int *saved_type_short_buckets = reg.type_short_buckets;
+    reg.type_short_buckets = NULL;
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    int fallback_expected[] = {0, 4, 5, tail_type_i};
+    int fallback_count = 0;
+    int candidate;
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
+    reg.type_short_buckets = saved_type_short_buckets;
+
+    /* A failed rebuild must discard the previous auxiliary index. Re-finalize
+     * after adding the tail type so the QN boundary advances, then force arena
+     * exhaustion for the optional rebuild. The iterator must fall back to the
+     * complete linear scan instead of retaining the stale pre-tail index. */
+    cbm_registry_finalize(&reg);
+    int saved_nblocks = arena.nblocks;
+    size_t saved_used = arena.used;
+    arena.nblocks = CBM_ARENA_MAX_BLOCKS;
+    arena.used = arena.block_size;
+    cbm_registry_build_type_short_index(&reg);
+    arena.nblocks = saved_nblocks;
+    arena.used = saved_used;
+    ASSERT_NULL(reg.type_short_buckets);
+    ASSERT_NULL(reg.type_short_entries);
+    ASSERT_EQ(reg.type_short_bucket_count, 0);
+
+    cbm_registry_types_by_short_name(&reg, "Trait", &nit);
+    fallback_count = 0;
+    while ((candidate = cbm_type_short_iter_next(&nit)) >= 0) {
+        const char *qn = reg.types[candidate].qualified_name;
+        const char *last_dot = qn ? strrchr(qn, '.') : NULL;
+        const char *candidate_short = last_dot ? last_dot + 1 : qn;
+        if (!candidate_short || strcmp(candidate_short, "Trait") != 0)
+            continue;
+        ASSERT_TRUE(fallback_count < 4);
+        ASSERT_EQ(candidate, fallback_expected[fallback_count++]);
+    }
+    ASSERT_EQ(fallback_count, 4);
 
     cbm_arena_destroy(&arena);
     PASS();

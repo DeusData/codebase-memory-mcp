@@ -725,6 +725,10 @@ static void cbm_test_fault_inject(const char *rel_path) {
             /* Busy-spin: the supervisor's quiet-timeout kills + reports us. */
         }
     }
+    const char *exit_on = getenv("CBM_TEST_EXIT_ON");
+    if (exit_on && exit_on[0] && strstr(rel_path, exit_on)) {
+        exit(1); /* Nonzero exit code → CBM_PROC_EXIT_NONZERO → classified as "error" */
+    }
 }
 #endif
 
@@ -810,17 +814,37 @@ static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
  * Deliberately narrow — ZERO-WIDTH AT EOF ONLY. A MISSING or ERROR node with
  * WIDTH still counts even at EOF (a Makefile whose last recipe line is
  * unterminated really does lose the recipe), and anything before EOF is
- * untouched. */
-static bool cbm_is_eof_terminator_miss(TSNode n, int source_len) {
+ * untouched.
+ *
+ * #1746: the Dockerfile grammar places that zero-width missing newline before
+ * trailing horizontal whitespace rather than at raw EOF. Preserve the broad
+ * exact-EOF rule above; only extend it past spaces/tabs when the missing token
+ * is specifically a newline. */
+static bool cbm_is_eof_terminator_miss(TSNode n, const char *source, int source_len) {
     if (!ts_node_is_missing(n) || source_len < 0) {
         return false;
     }
     uint32_t start = ts_node_start_byte(n);
     uint32_t end = ts_node_end_byte(n);
-    return start == end && end == (uint32_t)source_len;
+    if (start != end || end > (uint32_t)source_len) {
+        return false;
+    }
+    if (end == (uint32_t)source_len) {
+        return true;
+    }
+    if (!source || strcmp(ts_node_type(n), "\n") != 0) {
+        return false;
+    }
+    for (uint32_t i = end; i < (uint32_t)source_len; i++) {
+        if (source[i] != ' ' && source[i] != '\t') {
+            return false;
+        }
+    }
+    return true;
 }
 
-static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int source_len) {
+static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, const char *source,
+                                      int source_len) {
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         return;
     }
@@ -828,12 +852,12 @@ static void cbm_collect_error_regions(TSNode n, cbm_error_regions_t *acc, int so
     for (uint32_t i = 0; i < k && acc->count < CBM_MAX_ERROR_REGIONS; i++) {
         TSNode c = ts_node_child(n, i);
         if (ts_node_is_missing(c) || strcmp(ts_node_type(c), "ERROR") == 0) {
-            if (cbm_is_eof_terminator_miss(c, source_len)) {
+            if (cbm_is_eof_terminator_miss(c, source, source_len)) {
                 continue; /* absent final newline only — nothing was dropped */
             }
             cbm_error_regions_push(acc, c); /* top-most region; do not descend */
         } else if (ts_node_has_error(c)) {
-            cbm_collect_error_regions(c, acc, source_len);
+            cbm_collect_error_regions(c, acc, source, source_len);
         }
     }
 }
@@ -1456,7 +1480,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
                      * already extract. */
                     if (ts_node_has_error(root)) {
                         cbm_error_regions_t raw_regs = {{0}, {0}, 0};
-                        cbm_collect_error_regions(root, &raw_regs, source_len);
+                        cbm_collect_error_regions(root, &raw_regs, source, source_len);
                         if (raw_regs.count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
@@ -1614,7 +1638,7 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
         if (strcmp(ts_node_type(root), "ERROR") == 0) {
             cbm_error_regions_push(&regs, root); /* whole file unparseable */
         } else {
-            cbm_collect_error_regions(root, &regs, source_len);
+            cbm_collect_error_regions(root, &regs, source, source_len);
         }
         cbm_subtract_recovered_regions(&regs, &result->defs);
         /* #1071: don't flag a benign function-like-macro call (defined in-file)

@@ -13,6 +13,17 @@
 #include <stdlib.h>
 #include <stdio.h>
 
+typedef struct {
+    int calls;
+    int cancel_on_call;
+} file_outline_cancel_probe_t;
+
+static bool file_outline_cancel_probe(void *context) {
+    file_outline_cancel_probe_t *probe = context;
+    probe->calls++;
+    return probe->calls >= probe->cancel_on_call;
+}
+
 /* ── Label allowlist / SQL drift guard ──────────────────────────── */
 
 /* CONTRACT PIN. `cbm_label_is_type_like()` is documented in cbm.h as the single
@@ -325,6 +336,156 @@ TEST(store_node_find_by_file) {
     ASSERT_EQ(rc, CBM_STORE_OK);
     ASSERT_EQ(count, 2);
     cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outline", "/tmp/outline"), CBM_STORE_OK);
+
+    cbm_node_t nodes[] = {
+        {.project = "outline",
+         .label = "Method",
+         .name = "omega",
+         .qualified_name = "outline.main.omega",
+         .file_path = "main.c",
+         .start_line = 30,
+         .end_line = 33},
+        {.project = "outline",
+         .label = "Module",
+         .name = "main",
+         .qualified_name = "outline.main",
+         .file_path = "main.c",
+         .start_line = 1,
+         .end_line = 80},
+        {.project = "outline",
+         .label = "Function",
+         .name = "zeta",
+         .qualified_name = "outline.main.zeta",
+         .file_path = "main.c",
+         .start_line = 10,
+         .end_line = 20},
+        {.project = "outline",
+         .label = "Function",
+         .name = "alpha",
+         .qualified_name = "outline.main.alpha",
+         .file_path = "main.c",
+         .start_line = 10,
+         .end_line = 15},
+        {.project = "outline",
+         .label = "Class",
+         .name = "VisibleWithoutFilter",
+         .qualified_name = "outline.main.VisibleWithoutFilter",
+         .file_path = "main.c",
+         .start_line = 5,
+         .end_line = 40},
+        {.project = "outline",
+         .label = "Function",
+         .name = "other",
+         .qualified_name = "outline.other.other",
+         .file_path = "other.c",
+         .start_line = 1,
+         .end_line = 2},
+    };
+    for (size_t i = 0; i < sizeof(nodes) / sizeof(nodes[0]); i++) {
+        ASSERT_GT(cbm_store_upsert_node(s, &nodes[i]), 0);
+    }
+
+    static const char *const labels[] = {"Function", "Method"};
+    cbm_file_outline_row_t *rows = NULL;
+    int count = 0;
+    int total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(count, 2);
+    ASSERT_STR_EQ(rows[0].name, "alpha");
+    ASSERT_STR_EQ(rows[1].name, "zeta");
+    cbm_store_free_file_outline(rows, count);
+
+    rows = NULL;
+    count = 0;
+    total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 2, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 3);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(rows[0].name, "omega");
+    cbm_store_free_file_outline(rows, count);
+
+    rows = NULL;
+    count = 0;
+    total = 0;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", NULL, 0, 10, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_OK);
+    ASSERT_EQ(total, 4);
+    ASSERT_EQ(count, 4);
+    ASSERT_STR_EQ(rows[0].name, "VisibleWithoutFilter");
+    ASSERT_STR_EQ(rows[1].name, "alpha");
+    ASSERT_STR_EQ(rows[2].name, "zeta");
+    ASSERT_STR_EQ(rows[3].name, "omega");
+    cbm_store_free_file_outline(rows, count);
+
+    file_outline_cancel_probe_t probe = {.cancel_on_call = 3};
+    rows = (cbm_file_outline_row_t *)(uintptr_t)1;
+    count = 99;
+    total = 99;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", labels, 2, 2, 0,
+                                         file_outline_cancel_probe, &probe, &rows, &count, &total),
+              CBM_STORE_CANCELLED);
+    ASSERT_NULL(rows);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(total, 0);
+    ASSERT_TRUE(probe.calls >= 3);
+
+    const char *empty_label[] = {""};
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", empty_label, 1, 1, 0, NULL, NULL,
+                                         &rows, &count, &total),
+              CBM_STORE_ERR);
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline", "main.c", NULL, 0,
+                                         CBM_STORE_FILE_OUTLINE_MAX_LIMIT + 1, 0, NULL, NULL, &rows,
+                                         &count, &total),
+              CBM_STORE_ERR);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_file_outline_fails_closed_on_text_budget_issue469) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "outline-budget", "/tmp/outline-budget"), CBM_STORE_OK);
+
+    size_t qn_size = CBM_STORE_FILE_OUTLINE_MAX_TEXT_BYTES + 64U;
+    char *large_qn = malloc(qn_size + 1U);
+    ASSERT_NOT_NULL(large_qn);
+    memset(large_qn, 'q', qn_size);
+    large_qn[qn_size] = '\0';
+    cbm_node_t node = {.project = "outline-budget",
+                       .label = "Function",
+                       .name = "oversized",
+                       .qualified_name = large_qn,
+                       .file_path = "large.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(s, &node), 0);
+    free(large_qn);
+
+    cbm_file_outline_row_t *rows = (cbm_file_outline_row_t *)(uintptr_t)1;
+    int count = 99;
+    int total = 99;
+    ASSERT_EQ(cbm_store_get_file_outline(s, "outline-budget", "large.c", NULL, 0, 1, 0, NULL, NULL,
+                                         &rows, &count, &total),
+              CBM_STORE_SCAN_LIMIT);
+    ASSERT_NULL(rows);
+    ASSERT_EQ(count, 0);
+    ASSERT_EQ(total, 0);
 
     cbm_store_close(s);
     PASS();
@@ -2227,6 +2388,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
     RUN_TEST(store_node_find_by_file);
+    RUN_TEST(store_file_outline_is_filtered_stable_bounded_and_cancellable_issue469);
+    RUN_TEST(store_file_outline_fails_closed_on_text_budget_issue469);
     RUN_TEST(store_node_find_not_found);
     RUN_TEST(store_node_count_empty);
     RUN_TEST(store_node_delete_by_file);
