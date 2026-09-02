@@ -437,7 +437,8 @@ static bool application_session_workspace_allowed(const cbm_daemon_application_s
     bool allowed =
         root && root[0] &&
         cbm_workspace_root_allowed(root, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
-                                   cbm_mcp_server_allowed_root(session->mcp), boundary_error,
+                                   cbm_mcp_server_allowed_root(session->mcp),
+                                   getenv("PATH_ALLOW_BROAD"), boundary_error,
                                    sizeof(boundary_error));
     if (!allowed) {
         cbm_log_warn("daemon.workspace.skipped", "operation", operation, "detail",
