@@ -4743,9 +4743,14 @@ TEST(extract_perl_method_call_flags_is_method) {
 /* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
  * be unaffected: a Go method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
-    CBMFileResult *r = extract("package m\n"
-                               "func run(o Obj) { o.Commit(); helper() }\n",
-                               CBM_LANG_GO, "t", "x.go");
+    /* Rust is flag-exempt: only Perl, Python, TS/JS and Go set is_method.
+     * Guards the blast radius of the receiver-aware flags for every other
+     * language. */
+    CBMFileResult *r = extract("fn run(o: Obj) {\n"
+                               "    o.commit();\n"
+                               "    helper();\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "x.rs");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     for (int i = 0; i < r->calls.count; i++) {
@@ -4820,6 +4825,33 @@ TEST(extract_python_member_call_flags_is_method) {
     ASSERT_EQ(imported_module, 1);
     ASSERT_EQ(imported_alias, 1);
     ASSERT_EQ(bare, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_go_selector_call_flags_is_method) {
+    /* Go selector calls are flagged so the weak-match guard can fire when the
+     * Go LSP cannot type the receiver; bare calls stay unflagged. */
+    CBMFileResult *r = extract("package m\n"
+                               "func run(o Obj) { o.Commit(); helper() }\n",
+                               CBM_LANG_GO, "t", "x.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool saw_selector = false;
+    bool saw_bare = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strstr(c->callee_name, "Commit") != NULL) {
+            ASSERT_TRUE(c->is_method);
+            saw_selector = true;
+        }
+        if (c->callee_name && strcmp(c->callee_name, "helper") == 0) {
+            ASSERT_FALSE(c->is_method);
+            saw_bare = true;
+        }
+    }
+    ASSERT_TRUE(saw_selector);
+    ASSERT_TRUE(saw_bare);
     cbm_free_result(r);
     PASS();
 }
@@ -6503,6 +6535,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
+    RUN_TEST(extract_go_selector_call_flags_is_method);
     RUN_TEST(extract_ts_member_call_flags_is_method);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
