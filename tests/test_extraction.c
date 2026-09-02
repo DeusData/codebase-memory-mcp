@@ -1810,6 +1810,24 @@ TEST(swift_chained_call) {
     PASS();
 }
 
+/* A Swift force-unwrap is the one thing that reaches the scanner's suppressor
+ * path -- the rule that stops `try!` emitting its `!` as a token of its own.
+ * That path shifted an int by up to TOKEN_COUNT bits, which runs past the
+ * width of the type once the index reaches 31.
+ *
+ * This test cannot go red here. The normal test build prints the UBSan
+ * message and carries on, which is why the bug survived. The Windows
+ * CLANGARM64 leg runs UBSan in trap mode, where the same shift is an
+ * illegal-instruction crash, so parsing this file at all is the check. */
+TEST(swift_force_unwrap_scanner_shift) {
+    CBMFileResult *r =
+        extract("func load() { let u = cached! }\n", CBM_LANG_SWIFT, "t", "Load.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Objective-C --- */
 TEST(objc_interface) {
     CBMFileResult *r =
@@ -3906,6 +3924,75 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* Return the file's Module definition (extraction pushes it first), or NULL. */
+static const CBMDefinition *find_module_def(CBMFileResult *r) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].label && strcmp(r->defs.items[i].label, "Module") == 0) {
+            return &r->defs.items[i];
+        }
+    }
+    return NULL;
+}
+
+/* Blazor: a routable component declares its route with a `@page` directive in
+ * MARKUP, above the `@code` block. The C# grammar recovers `@code` (that is why
+ * .razor already yields methods via extra_extensions) but never sees the
+ * directive, so a routable page contributes no Route node and
+ * get_architecture(routes) is empty for a whole Blazor app.
+ *
+ * The route hangs off the file's Module definition, not off a class: a .razor
+ * component's class is implicit — it is never written in the source — so there
+ * is no class node to carry it. The Module's qualified name already IS the
+ * component's identity (t.Pages.Counter), and insert_def_into_gbuf creates
+ * Route+HANDLES for any definition carrying route_path, whatever its label. */
+TEST(extract_blazor_page_directive_routes_component) {
+    CBMFileResult *r = extract("@page \"/counter\"\n"
+                               "@inject NavigationManager Nav\n"
+                               "\n"
+                               "<h1>Counter</h1>\n"
+                               "<button @onclick=\"Increment\">Click</button>\n"
+                               "\n"
+                               "@code {\n"
+                               "    private int count;\n"
+                               "    private void Increment() { count++; }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Counter.razor");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* The markup must not cost us the @code block we already extract today. */
+    ASSERT_NOT_NULL(find_def_by_name(r, "Increment"));
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->route_path);
+    ASSERT_STR_EQ(mod->route_path, "/counter");
+    /* A routable Blazor page is reached by navigation, i.e. GET. */
+    ASSERT_NOT_NULL(mod->route_method);
+    ASSERT_STR_EQ(mod->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The directive scan must not fire on every .razor file. A non-routable
+ * component (no @page) has to stay route-free, or every shared component in the
+ * tree becomes a bogus Route node. */
+TEST(extract_blazor_component_without_page_has_no_route) {
+    CBMFileResult *r = extract("@inject IJSRuntime JS\n"
+                               "\n"
+                               "<div class=\"card\">@Title</div>\n"
+                               "\n"
+                               "@code {\n"
+                               "    private void Refresh() { }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "Shared/Card.razor");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* A comment between decorators must not drop the decorators above it.
  * Comments are NAMED tree-sitter nodes, so the prev-sibling walk used to stop
  * at one — a documented route (@Post + @HttpCode above an explanatory comment)
@@ -3966,6 +4053,49 @@ TEST(extract_ts_url_builder_issue1009) {
     ASSERT_NOT_NULL(c2);
     ASSERT_NOT_NULL(c2->first_string_arg);
     ASSERT_STR_EQ(c2->first_string_arg, "/api/v1/arrows/{}");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A route registration names its middleware before its handler, and every
+ * framework here puts the handler last. The handler scan took the FIRST
+ * argument that looked like a function reference, so a named middleware won
+ * and the HANDLES edge pointed at the middleware instead of the handler. */
+TEST(extract_ts_route_handler_after_named_middleware) {
+    CBMFileResult *r = extract("function requireAuth(req: any, res: any, next: any) { next(); }\n"
+                               "function rateLimit(req: any, res: any, next: any) { next(); }\n"
+                               "function listUsers(req: any, res: any) { res.json([]); }\n"
+                               "routerGet(\"/users\", requireAuth, rateLimit, listUsers);\n",
+                               CBM_LANG_TYPESCRIPT, "t", "routes.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *c = find_call_by_callee(r, "routerGet");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/users");
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "listUsers");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same route with its middleware written inline. An arrow function is not
+ * one of the kinds the handler scan accepts, so three of them pushed the real
+ * handler past the scan bound and no handler came back at all. */
+TEST(extract_ts_route_handler_after_inline_middleware) {
+    CBMFileResult *r = extract("function listOrders(req: any, res: any) { res.json([]); }\n"
+                               "routerGet(\"/orders\",\n"
+                               "  (req: any, res: any, next: any) => { next(); },\n"
+                               "  (req: any, res: any, next: any) => { next(); },\n"
+                               "  (req: any, res: any, next: any) => { next(); },\n"
+                               "  listOrders);\n",
+                               CBM_LANG_TYPESCRIPT, "t", "orders.ts");
+    ASSERT_NOT_NULL(r);
+    const CBMCall *c = find_call_by_callee(r, "routerGet");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/orders");
+    ASSERT_NOT_NULL(c->second_arg_name);
+    ASSERT_STR_EQ(c->second_arg_name, "listOrders");
     cbm_free_result(r);
     PASS();
 }
@@ -6291,16 +6421,6 @@ TEST(iris_export_xml_multi_class) {
  * question asked in words could not reach either. Both now carry the prose in
  * `docstring`, which is what nodes_fts indexes into its `body` column. */
 
-/* First Module-labelled definition, or NULL. */
-static const CBMDefinition *find_module_def(CBMFileResult *r) {
-    for (int i = 0; i < r->defs.count; i++) {
-        if (strcmp(r->defs.items[i].label, "Module") == 0) {
-            return &r->defs.items[i];
-        }
-    }
-    return NULL;
-}
-
 TEST(markdown_section_body_becomes_docstring_issue518) {
     CBMFileResult *r = extract("# Installation\n"
                                "Run the bootstrap script to provision a workstation.\n"
@@ -6661,6 +6781,7 @@ SUITE(extraction) {
     RUN_TEST(swift_method_call);
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
+    RUN_TEST(swift_force_unwrap_scanner_shift);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);
@@ -6808,10 +6929,14 @@ SUITE(extraction) {
     RUN_TEST(arkts_lazy_import);
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_blazor_page_directive_routes_component);
+    RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_ts_template_string_url_issue1006);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_route_handler_after_named_middleware);
+    RUN_TEST(extract_ts_route_handler_after_inline_middleware);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
     RUN_TEST(extract_c_url_builder_gated_issue1009);
     RUN_TEST(extract_ts_url_builder_mixed_returns_issue1009);

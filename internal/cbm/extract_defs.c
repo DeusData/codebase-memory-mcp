@@ -1450,8 +1450,12 @@ static const char *find_route_path_literal(CBMArena *a, TSNode node, const char 
 
 // Extract route path from decorator arguments (first string that starts with /).
 static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
+    /* Every argument is checked. Java and Kotlin put no order on annotation
+     * attributes, so `path` can sit anywhere in the list. Stopping early left
+     * a real route unread and formed no Route node. Each argument's own
+     * subtree walk stays bounded by find_route_path_literal below. */
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = 0; ai < nc && ai < DECORATOR_SCAN_LIMIT; ai++) {
+    for (uint32_t ai = 0; ai < nc; ai++) {
         TSNode arg = ts_node_named_child(args, ai);
         /* Spring/Kotlin frequently uses named or array-valued annotation args:
          *   @RequestMapping(value = ["/internal/v1"])
@@ -7902,6 +7906,89 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
     extract_variables(ctx, ctx->root, spec);
 }
 
+/* True when rel_path names a Blazor component file. */
+static bool cbm_path_is_razor(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    size_t len = strlen(rel_path);
+    static const char suffix[] = ".razor";
+    size_t slen = sizeof(suffix) - 1U;
+    return len > slen && strcmp(rel_path + (len - slen), suffix) == 0;
+}
+
+/* Match `@page "/route"` on ONE line; returns the route text or NULL.
+ *
+ * Deliberately strict: the directive must be the first token on the line and be
+ * followed by whitespace and a double-quoted path beginning with '/', so
+ * neither `@pageSize` nor a `@page` mentioned in markup prose can match.
+ *
+ * A blank line is rejected up front rather than falling through the length
+ * check, which keeps every later comparison reachable on some path — the
+ * all-whitespace case would otherwise leave `line_end - p` provably zero. */
+static const char *razor_page_route_on_line(CBMArena *a, const char *line, const char *line_end) {
+    static const char directive[] = "@page";
+    const size_t dlen = sizeof(directive) - 1U;
+
+    const char *p = line;
+    while (p < line_end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p == line_end) {
+        return NULL; /* blank line — nothing can follow */
+    }
+    if ((size_t)(line_end - p) <= dlen || strncmp(p, directive, dlen) != 0) {
+        return NULL;
+    }
+    p += dlen;
+    if (*p != ' ' && *p != '\t') {
+        return NULL; /* `@pageSize` and friends */
+    }
+    while (p < line_end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p == line_end || *p != '"') {
+        return NULL;
+    }
+    p++;
+    const char *route = p;
+    while (p < line_end && *p != '"') {
+        p++;
+    }
+    if (p == line_end || p == route || *route != '/') {
+        return NULL; /* unterminated, empty, or not a rooted path */
+    }
+    return cbm_arena_strndup(a, route, (size_t)(p - route));
+}
+
+/* Blazor route directive: `@page "/counter"` lives in MARKUP above the `@code`
+ * block. Tree-sitter's C# grammar recovers `@code` but never parses the
+ * directive, so there is no AST node to read it from — this scans the raw
+ * source instead. That is why routes need no Razor grammar.
+ *
+ * A component may declare several routes; the first is taken, because
+ * CBMDefinition carries a single route_path. */
+static const char *cbm_razor_page_route(CBMArena *a, const char *source, int source_len) {
+    if (!source || source_len <= 0) {
+        return NULL;
+    }
+    const char *end = source + source_len;
+    const char *line = source;
+
+    while (line < end) {
+        const char *nl = memchr(line, '\n', (size_t)(end - line));
+        const char *route = razor_page_route_on_line(a, line, nl ? nl : end);
+        if (route) {
+            return route;
+        }
+        if (!nl) {
+            break;
+        }
+        line = nl + 1;
+    }
+    return NULL;
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -7923,6 +8010,17 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.is_test = ctx->result->is_test_file;
     // #519: index what a config file declares itself to be, not only its path.
     mod.docstring = extract_config_module_description(ctx);
+    /* A routable Blazor component carries its route on the module def: the
+     * component's class is implicit in a .razor file, so there is no class node
+     * to hang it on, and the module QN already is the component's identity.
+     * insert_def_into_gbuf creates Route+HANDLES for any def with route_path. */
+    if (ctx->language == CBM_LANG_CSHARP && cbm_path_is_razor(ctx->rel_path)) {
+        const char *route = cbm_razor_page_route(a, ctx->source, ctx->source_len);
+        if (route) {
+            mod.route_path = route;
+            mod.route_method = "GET"; /* a routable page is reached by navigation */
+        }
+    }
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     cbm_extract_definitions_without_module(ctx);

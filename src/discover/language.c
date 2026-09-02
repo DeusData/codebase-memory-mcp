@@ -50,6 +50,11 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* C# */
     {".cs", CBM_LANG_CSHARP},
+    /* Blazor components. The C# grammar recovers the @code block; the
+     * surrounding markup parses as ERROR regions and is reported via
+     * parse_partial, which is why this is a best-effort mapping rather
+     * than a dedicated grammar. */
+    {".razor", CBM_LANG_CSHARP},
 
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},

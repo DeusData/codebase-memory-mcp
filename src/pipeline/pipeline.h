@@ -311,7 +311,7 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
  * Field when the reference text carries no '.'. Go only: other OO languages
  * legitimately reference their own members bare inside method bodies. Pure;
  * unit-tested in test_registry.c. */
-bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label);
+bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);

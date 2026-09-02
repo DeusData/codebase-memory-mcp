@@ -292,6 +292,10 @@ typedef struct {
     uint32_t site_start_byte;             // exact reference-token span; end > start when present
     uint32_t site_end_byte;               // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;        // raw source or C-family preprocessed buffer
+    bool is_member_access;                // token is the member half of a selector/attribute
+                                          // (Go x.f — field_identifier). The extractor strips
+                                          // the receiver, so this is the only surviving record
+                                          // of selector shape (#1962). Default false.
 } CBMUsage;
 
 typedef struct {
@@ -303,6 +307,9 @@ typedef struct {
     const char *var_name;          // variable name
     const char *enclosing_func_qn; // QN of enclosing function
     bool is_write;                 // true = write, false = read
+    bool is_member_access;         // var_name is the field half of a selector/member LHS
+                                   // (`t.err = x` → "err"); the receiver is stripped here,
+                                   // so this is the only record of selector shape (#1962)
 } CBMReadWrite;
 
 typedef struct {

@@ -840,22 +840,23 @@ TEST(cross_language_ref_drops_go_vs_c) {
 }
 
 TEST(go_bare_ref_never_binds_field) {
-    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
-     * field access is always a selector expression. */
-    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "err", "Field"));
-    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "config", "Field"));
-    /* A selector-shaped reference may bind a field. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "t.err", "Field"));
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression. The extractor strips the
+     * receiver before the resolver runs (resolve_lhs_write_name writes the
+     * trailing name; is_reference_node records the inner field_identifier),
+     * so the selector-vs-bare distinction arrives as the recorded
+     * is_member_access signal, never as a dot in the reference text. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, false, "Field"));
+    /* The member half of a selector may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, true, "Field"));
     /* Bare references to non-fields are untouched. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Variable"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Function"));
     /* Other languages reference their own members bare inside methods —
      * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, "_count", "Field"));
-    /* Degenerate inputs → nothing to judge. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, NULL, "Field"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "", "Field"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", NULL));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
     PASS();
 }
 

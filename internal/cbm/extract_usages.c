@@ -2673,6 +2673,10 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.ref_name = name;
         usage.enclosing_func_qn = state->enclosing_func_qn;
         usage.lexical_scope_id = usage_lexical_scope_id_for_node(ctx, state, node);
+        /* The member half of a selector is its own reference node
+         * (field_identifier); record that shape — the name alone cannot carry
+         * it, and the Go Field guard keys on it (#1962). */
+        usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }

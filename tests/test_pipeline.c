@@ -4923,6 +4923,17 @@ static void write_go_bare_field_fixture(const char *tmp, int pad_files) {
                     "\terr := errors.New(\"x\")\n"
                     "\treturn err\n"
                     "}\n");
+    /* #1962: genuine selector references from a sibling file of the same
+     * package. `t.err = nil` writes the field through a selector; `t.n` reads
+     * it. The extractor strips the receiver on both paths, so only the
+     * is_member_access signal can distinguish these from Run's bare local. */
+    write_temp_file(tmp, "state/reset.go",
+                    "package state\n"
+                    "\n"
+                    "func (t *Tracker) Reset() int {\n"
+                    "\tt.err = nil\n"
+                    "\treturn t.n\n"
+                    "}\n");
     for (int i = 0; i < pad_files; i++) {
         char name[64];
         char body[128];
@@ -4962,6 +4973,11 @@ TEST(pipeline_go_bare_ref_never_binds_field) {
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+    /* #1962, reproduce-first: RED while the guard is a blanket veto — genuine
+     * selector references must reach the field (write via `t.err = nil`,
+     * value use via `t.n`). */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -4993,6 +5009,10 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+    /* #1962 parallel twin: resolve_file_rw / resolve_file_usages must honour
+     * the member-access signal exactly like the sequential resolvers. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
