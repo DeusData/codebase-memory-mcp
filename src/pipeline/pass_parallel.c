@@ -2488,12 +2488,16 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * #606 direction.
          *
          * This language set MUST match the one in pass_calls.c exactly — see the
-         * note there. ArkTS belongs to the JS/TS family (#1842). */
+         * note there. ArkTS belongs to the JS/TS family (#1842). Go (#1906)
+         * composes via its own predicate (different drop-list — see
+         * cbm_go_suppress_weak_method_match), mirrored in pass_calls.c. */
         bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                     lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                     lang == CBM_LANG_ARKTS;
         bool drop_plain_call =
-            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
+            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+            cbm_go_suppress_weak_method_match(lang == CBM_LANG_GO, call->is_method, res.strategy,
+                                              res.confidence);
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve

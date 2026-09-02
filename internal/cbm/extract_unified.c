@@ -899,6 +899,41 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
         }
     }
 
+    /* Go method `func (s *Storage) Close() {...}`: the def extractor records
+     * this as Method "proj.pkg.Storage.Close" (receiver-qualified, mirroring
+     * the C++ out-of-line rule above). The call-scope QN must match — a bare
+     * "proj.pkg.Close" names a node that no longer exists, so every call
+     * inside the method body would fall back to File-node attribution
+     * (calls_find_source). Same ONE-formula contract as the def side:
+     * cbm_go_receiver_type_name + cbm_fqn_compute_source_lang. */
+    if (ctx->language == CBM_LANG_GO && strcmp(ts_node_type(node), "method_declaration") == 0) {
+        TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
+        if (!ts_node_is_null(recv)) {
+            char *recv_type = cbm_go_receiver_type_name(ctx->arena, recv, ctx->source);
+            if (recv_type && recv_type[0]) {
+                const char *type_qn = cbm_fqn_compute_source_lang(
+                    ctx->arena, ctx->project, ctx->rel_path, recv_type, ctx->language);
+                return cbm_arena_sprintf(ctx->arena, "%s.%s", type_qn, name);
+            }
+        }
+    }
+
+    /* Go init(): the def extractor folds the file basename and the init's
+     * per-file ordinal into the QN so every init in a package survives the
+     * upsert (#1910, the #495 cfg-twin pattern; ordinal, not line, so the QN
+     * is stable under edits above the function). Mirror the exact formula
+     * here, or init-body calls fall back to File-node attribution
+     * (calls_find_source). */
+    if (ctx->language == CBM_LANG_GO && strcmp(name, "init") == 0 &&
+        strcmp(ts_node_type(node), "function_declaration") == 0) {
+        const char *base_qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
+                                                          name, ctx->language);
+        const char *base = strrchr(ctx->rel_path, '/');
+        base = base ? base + 1 : ctx->rel_path;
+        return cbm_arena_sprintf(ctx->arena, "%s#%s:%d", base_qn, base,
+                                 cbm_go_init_ordinal(node, ctx->source));
+    }
+
     /* Nix: a binding's own attrpath contributes scope (`a.b.fn = …`), and the def
      * extractor bakes it into the def QN. Compose it identically here — otherwise
      * an in-body call sources to a QN one or more segments short of the def, and

@@ -3512,7 +3512,7 @@ static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpe
  * Walks to the parameter_declaration's `type` field, unwrapping pointer_type
  * and generic_type, and returns the type_identifier text (e.g. "OrderService").
  * Returns NULL if no type_identifier is found. */
-static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
     uint32_t nc = ts_node_child_count(recv);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode child = ts_node_child(recv, i);
@@ -3724,13 +3724,42 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
          * (and downstream Go IMPLEMENTS/OVERRIDE) link the method to its owning
          * struct/type node.  The parent QN must match the type's node QN, which
          * is computed the same way (cbm_fqn_compute on the type name). */
-        char *recv_type = go_receiver_type_name(a, recv, ctx->source);
+        char *recv_type = cbm_go_receiver_type_name(a, recv, ctx->source);
         if (recv_type && recv_type[0]) {
             /* Must match the Go type node QN (directory-based module) so the
              * DEFINES_METHOD edge links the method to its owning type. */
             def.parent_class = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path,
                                                            recv_type, ctx->language);
+            /* Receiver-qualify the method QN (proj.pkg.Recv.method) — same
+             * shape as the C++ out-of-line path below and Go interface
+             * members. With the flat proj.pkg.method QN every same-name
+             * method in a package collided in the graph upsert: one body
+             * survived and the twins' call edges accreted onto it. The
+             * call-scope side (compute_func_qn in extract_unified.c) mirrors
+             * this formula, and go_lsp consumers read the def QN and
+             * parent_class (receiver_type) verbatim, so resolution joins
+             * stay exact. */
+            def.qualified_name = cbm_arena_sprintf(a, "%s.%s", def.parent_class, name);
         }
+    }
+
+    /* Go allows any number of init() functions per package — even several in
+     * one file — and they all run at start-up. On the flat QN they all
+     * collided and the graph upsert kept ONE node per package, silently
+     * dropping the rest (#1910). Disambiguate with the #495 cfg-twin pattern:
+     * fold the file basename and the init's per-file ordinal into the QN.
+     * The ordinal (not the line) keeps the QN stable when code is edited
+     * above the function — the QN is node identity, and a line suffix would
+     * churn nodes on every unrelated insertion. Nothing ever joins on the
+     * plain QN — calling init explicitly is illegal in Go — and the
+     * call-scope side (compute_func_qn in extract_unified.c) computes the
+     * same cbm_go_init_ordinal so init-body calls keep their attribution. */
+    if (ctx->language == CBM_LANG_GO && strcmp(def.label, "Function") == 0 &&
+        strcmp(name, "init") == 0) {
+        const char *base = strrchr(ctx->rel_path, '/');
+        base = base ? base + 1 : ctx->rel_path;
+        def.qualified_name = cbm_arena_sprintf(a, "%s#%s:%d", def.qualified_name, base,
+                                               cbm_go_init_ordinal(node, ctx->source));
     }
 
     // C++/CUDA: out-of-line method definition (`Foo::bar` in a .cc/.cpp). The

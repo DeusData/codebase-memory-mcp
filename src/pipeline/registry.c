@@ -464,6 +464,33 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
 }
 
+bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
+                                       double confidence) {
+    if (!is_go || !is_method || !strategy || !strategy[0]) {
+        return false;
+    }
+    /* Go analog of the TS/JS guard above, same failure class: a selector call
+     * whose receiver the Go LSP could not type reaches the registry and a bare
+     * short-name strategy binds it to an arbitrary same-named project symbol
+     * (`f.Close()` on an os.File -> a project `Close`, suffix_match over 15
+     * candidates). Unlike the TS/JS list, field_type_hint is KEPT: a Go struct
+     * field carries a declared type, so the parallel resolver's field-type
+     * hint is receiver-aware for Go (lrp_go_s8_field_type_hint), not a
+     * heuristic. */
+    if (strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "fuzzy") == 0) {
+        return true;
+    }
+    /* unique_name is dropped only when PENALIZED: resolve_name_lookup scales
+     * CONF_UNIQUE_NAME by DEFAULT_CONFIDENCE exactly when the lone candidate
+     * is not reachable through the caller's imports — the stdlib/vendor
+     * hijack shape (`io.Copy` -> a project `Copy`). An unpenalized
+     * unique_name target sits inside the caller's import closure (or the
+     * file has no imports, e.g. a same-package call) and must be kept —
+     * dropping it kills genuinely-typed lone-candidate calls that never
+     * enter the field-type-hint upgrade (candidate_count == 1). */
+    return strcmp(strategy, "unique_name") == 0 && confidence < CONF_UNIQUE_NAME;
+}
+
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
            lang == CBM_LANG_ARKTS;
