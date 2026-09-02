@@ -464,6 +464,16 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
 }
 
+bool cbm_go_suppress_cgo_callee(bool is_go, const char *callee_name) {
+    /* #1929/#1926: `C.<ident>` in a Go file names the cgo pseudo-namespace.
+     * `"C"` is reserved by go/build — no project symbol can ever be behind it,
+     * so ANY binding the general resolver produces for such a callee is
+     * fabricated. Veto before resolution instead of after: the pseudo-package
+     * is a standing hijack surface of exactly the #1906 shape. */
+    return is_go && callee_name && callee_name[0] == 'C' && callee_name[1] == '.' &&
+           callee_name[2] != '\0';
+}
+
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
            lang == CBM_LANG_ARKTS;

@@ -280,6 +280,15 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
+/* #1929: confidence for a C-family call bound to a Go //export function by
+ * its declared ABI symbol — a contract, not a name guess. */
+#define CBM_EXPORT_LINKAGE_CONF 0.95
+
+/* #1929: `C.<ident>` in a Go file names the cgo pseudo-namespace — never a
+ * project symbol ("C" is reserved by go/build). Veto the callee before any
+ * resolution path can bind it. Pure; unit-tested in test_registry.c. */
+bool cbm_go_suppress_cgo_callee(bool is_go, const char *callee_name);
+
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
  * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX

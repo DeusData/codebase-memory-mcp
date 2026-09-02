@@ -4693,6 +4693,142 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* #1929: does a CALLS edge src→tgt (by node names) carry this strategy? */
+static bool call_edge_with_strategy_exists(cbm_store_t *s, const char *project,
+                                           const char *src_name, const char *tgt_name,
+                                           const char *strategy) {
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"strategy\":\"%s\"", strategy);
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            if (!edges[j].properties_json || !strstr(edges[j].properties_json, needle)) {
+                continue;
+            }
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
+TEST(pipeline_go_cgo_export_binds_by_contract) {
+    /* #1929: a C caller of a Go //export function used to bind by short-name
+     * luck (unique_name @ 0.38–0.75, or die in a weak-match guard). The
+     * directive is a declared ABI contract — the edge must carry
+     * export_linkage at contract confidence. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_exp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fxexp\n\ngo 1.22\n");
+    write_temp_file(tmp, "bridge/bridge.go",
+                    "package bridge\n"
+                    "\n"
+                    "/*\n"
+                    "static int shim(int v) { return v; }\n"
+                    "*/\n"
+                    "import \"C\"\n"
+                    "\n"
+                    "//export NotifyEvent\n"
+                    "func NotifyEvent(v int) int {\n"
+                    "\treturn v + 1\n"
+                    "}\n");
+    write_temp_file(tmp, "probe/probe.c",
+                    "extern int NotifyEvent(int v);\n"
+                    "\n"
+                    "static int pump(void) {\n"
+                    "    return NotifyEvent(7);\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_exp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Reproduce-first: RED before the fix — the edge exists but as a
+     * unique_name guess; with the contract it must be export_linkage. */
+    ASSERT_TRUE(
+        call_edge_with_strategy_exists(s, project, "pump", "NotifyEvent", "export_linkage"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_cgo_callee_never_binds_project_symbol) {
+    /* #1929: `C.helper()` names the cgo pseudo-namespace. A same-named project
+     * symbol must never be bound — "C" is reserved by go/build. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_cveto_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fxveto\n\ngo 1.22\n");
+    write_temp_file(tmp, "fx/cgo_use.go",
+                    "package fx\n"
+                    "\n"
+                    "/*\n"
+                    "static int helper(int a) { return a + 1; }\n"
+                    "*/\n"
+                    "import \"C\"\n"
+                    "\n"
+                    "func Run(a int) int {\n"
+                    "\treturn int(C.helper(C.int(a)))\n"
+                    "}\n");
+    write_temp_file(tmp, "decoy/decoy.go",
+                    "package decoy\n"
+                    "\n"
+                    "func helper(a int) int { return a - 1 }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_cveto.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Reproduce-first: RED before the veto — Run binds the decoy helper. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "Run", "helper"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -13115,6 +13251,8 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_cgo_export_binds_by_contract);
+    RUN_TEST(pipeline_go_cgo_callee_never_binds_project_symbol);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);

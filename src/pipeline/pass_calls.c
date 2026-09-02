@@ -486,6 +486,11 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
 
     /* LSP-resolved calls take precedence over registry-textual matching.
      * Unique-tail fallbacks are JVM-only (see cbm_pipeline_lsp_allow_tail_match). */
+    /* #1929: `C.<ident>` is the cgo pseudo-namespace — no resolution path may
+     * bind it to a project symbol. */
+    if (cbm_go_suppress_cgo_callee(lang == CBM_LANG_GO, call->callee_name)) {
+        return 0;
+    }
     bool allow_tail = cbm_pipeline_lsp_allow_tail_match(lang);
     const CBMResolvedCall *lsp = cbm_pipeline_find_lsp_resolution_in_graph(
         lsp_calls, call, allow_tail, ctx->gbuf, ctx->project_name);
@@ -653,6 +658,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     const cbm_gbuf_node_t *target_node = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
     if (!target_node || source_node->id == target_node->id) {
         return 0;
+    }
+    /* #1929: a Go //export function is a declared C ABI contract. A C-family
+     * caller naming it exactly binds by that contract, not by short-name luck
+     * — upgrade the strategy so the edge is honest and no weak-match guard
+     * can drop it. Mirrors pass_parallel.c. */
+    if ((lang == CBM_LANG_C || lang == CBM_LANG_CPP) && call->callee_name && target_node->name &&
+        strcmp(call->callee_name, target_node->name) == 0 && target_node->properties_json &&
+        strstr(target_node->properties_json, "\"cgo_export\":true")) {
+        res.strategy = "export_linkage";
+        res.confidence = CBM_EXPORT_LINKAGE_CONF;
     }
     /* #725: suffix_match is language-agnostic and will attach a Python
      * Store.commit() call to a JS function named commit (or a Bash main

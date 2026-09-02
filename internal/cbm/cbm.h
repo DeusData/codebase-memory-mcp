@@ -221,6 +221,11 @@ typedef struct {
     bool is_abstract;
     bool is_test;
     bool is_entry_point;
+    /* #1929: a cgo `//export Name` directive names this Go function's C
+     * symbol — a declared ABI contract (cgo requires Name to equal the func
+     * name). C-family callers bind it by contract (export_linkage) instead of
+     * short-name luck. Go only; false elsewhere. */
+    bool is_cgo_export;
     const char *structural_profile; // AST structural profile (arena-allocated) or NULL
     const char *body_tokens; // space-separated raw identifier tokens from body (arena) or NULL
     /* Rust only: raw trait path from the exact `impl Trait for Type` block

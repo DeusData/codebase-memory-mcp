@@ -283,6 +283,12 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
         return;
     }
     size_t pos = (size_t)n;
+    if (def->is_cgo_export && pos + 1 < bufsize) {
+        int m = snprintf(buf + pos, bufsize - pos, ",\"cgo_export\":true");
+        if (m > 0 && (size_t)m < bufsize - pos) {
+            pos += (size_t)m;
+        }
+    }
     append_json_string(buf, bufsize, &pos, "docstring", def->docstring);
     append_json_string(buf, bufsize, &pos, "signature", def->signature);
     append_json_string(buf, bufsize, &pos, "return_type", def->return_type);

@@ -811,6 +811,22 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
     PASS();
 }
 
+TEST(go_cgo_callee_veto) {
+    /* #1929: `C.<ident>` in a Go file is the cgo pseudo-namespace — veto. */
+    ASSERT_TRUE(cbm_go_suppress_cgo_callee(true, "C.helper"));
+    ASSERT_TRUE(cbm_go_suppress_cgo_callee(true, "C.int"));
+    /* Not the pseudo-namespace: ordinary selectors and identifiers. */
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(true, "c.helper"));
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(true, "Cfg.load"));
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(true, "C"));
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(true, "C."));
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(true, "helper"));
+    /* Other languages never hit the veto (a C++ class named C is legal). */
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(false, "C.helper"));
+    ASSERT_FALSE(cbm_go_suppress_cgo_callee(true, NULL));
+    PASS();
+}
+
 TEST(cross_language_ref_drops_go_vs_c) {
     /* #1928: the USAGE/WRITES/READS analog of #725. Reference edges carry no
      * import-closure evidence, so EVERY registry strategy is a bare-name
@@ -993,6 +1009,7 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(go_cgo_callee_veto);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
