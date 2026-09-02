@@ -623,12 +623,20 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * language gated on only one resolver produces an edge on the sequential
      * path and not the parallel one (or vice versa), breaking MT determinism.
      * ArkTS belongs to the JS/TS family here (#1842); dropping it would
-     * reintroduce the #592/#606 false-edge class for .ets files. */
+     * reintroduce the #592/#606 false-edge class for .ets files.
+     *
+     * Go (#1906) rides the same deferred-drop plumbing through its OWN
+     * predicate: its drop-list differs (field_type_hint is receiver-aware for
+     * Go, and unique_name drops only when import-unreachability-penalized), so
+     * it composes via cbm_go_suppress_weak_method_match instead of widening
+     * the shared gate. Same lockstep rule: mirror pass_parallel.c. */
     bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                 lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                 lang == CBM_LANG_ARKTS;
     bool drop_plain_call =
-        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
+        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+        cbm_go_suppress_weak_method_match(lang == CBM_LANG_GO, call->is_method, res.strategy,
+                                          res.confidence);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library

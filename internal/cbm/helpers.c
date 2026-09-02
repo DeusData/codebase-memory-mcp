@@ -1734,6 +1734,42 @@ int cbm_classify_string(const char *str, int len) {
  * canonical parameter shape of server-side route paths
  * (`/things/${id}/x` -> "/things/{}/x"). Returns NULL when the node yields
  * no text or exceeds the route-sized buffer. */
+/* 1-based source-order ordinal of a top-level Go `init` function_declaration
+ * among the file's `init`s. Both the definition extractor and compute_func_qn
+ * fold it into the QN (`pkg.init#file.go:N`, #1910), so it must be computed
+ * from the tree on both sides with this one formula. Unlike a line number,
+ * the ordinal is stable under edits above the function — QNs are node
+ * identity, and a line-based suffix would churn nodes on every unrelated
+ * insertion (the #495 cfg suffix and the GoogleTest derivation are both
+ * edit-stable for the same reason). */
+int cbm_go_init_ordinal(TSNode fn_node, const char *source) {
+    TSNode root = fn_node;
+    for (TSNode p = ts_node_parent(root); !ts_node_is_null(p); p = ts_node_parent(p)) {
+        root = p;
+    }
+    int ordinal = 0;
+    uint32_t n = ts_node_named_child_count(root);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode child = ts_node_named_child(root, i);
+        if (strcmp(ts_node_type(child), "function_declaration") != 0) {
+            continue;
+        }
+        TSNode name = ts_node_child_by_field_name(child, TS_FIELD("name"));
+        if (ts_node_is_null(name)) {
+            continue;
+        }
+        uint32_t start = ts_node_start_byte(name);
+        if (ts_node_end_byte(name) - start != 4 || memcmp(source + start, "init", 4) != 0) {
+            continue;
+        }
+        ordinal++;
+        if (ts_node_eq(child, fn_node)) {
+            return ordinal;
+        }
+    }
+    return ordinal;
+}
+
 const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *source) {
     enum { TPL_BUF = 512 };
     char buf[TPL_BUF];

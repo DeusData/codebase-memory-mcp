@@ -1859,15 +1859,24 @@ static void process_function(GoLSPContext* ctx, TSNode func_node) {
     char* func_name = lsp_node_text(ctx, name_node);
     if (!func_name || !func_name[0]) return;
 
-    // Enclosing-function QN must be the BARE package.Func form (no receiver
-    // type segment). The textual call events (extract_unified.c) source calls
-    // as package_qn.func_name — methods included — and the defs pass creates
-    // the graph Method node under the same QN, so any other form breaks the
-    // caller-QN join in cbm_pipeline_find_lsp_resolution and the LSP-resolved
-    // call silently falls back to the registry short-name resolver. The
-    // receiver type still reaches the registry via the def's parent_class /
-    // method->receiver_type; it just does not appear in the caller QN.
+    // Enclosing-function QN must be EXACTLY the QN the textual call events
+    // (extract_unified.c compute_func_qn) and the defs pass produce, or the
+    // caller-QN join in cbm_pipeline_find_lsp_resolution breaks and the
+    // LSP-resolved call silently falls back to the registry short-name
+    // resolver. Since #1909 receiver-qualified Go method QNs, that shared
+    // form is package_qn.ReceiverType.method for methods (the ONE-formula
+    // contract: cbm_go_receiver_type_name) and package_qn.func for functions.
     ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->package_qn, func_name);
+    if (strcmp(ts_node_type(func_node), "method_declaration") == 0) {
+        TSNode recv = ts_node_child_by_field_name(func_node, "receiver", 8);
+        if (!ts_node_is_null(recv)) {
+            char *recv_type = cbm_go_receiver_type_name(ctx->arena, recv, ctx->source);
+            if (recv_type && recv_type[0]) {
+                ctx->enclosing_func_qn = cbm_arena_sprintf(ctx->arena, "%s.%s.%s", ctx->package_qn,
+                                                           recv_type, func_name);
+            }
+        }
+    }
 
     // Push function scope
     CBMScope* saved_scope = ctx->current_scope;

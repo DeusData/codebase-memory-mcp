@@ -280,6 +280,15 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
+/* Go analog of the TS/JS guard, same failure class: a selector call whose
+ * receiver the Go LSP could not type must not be bound by a receiver-blind
+ * short-name strategy. Drops suffix_match / fuzzy always, and unique_name only
+ * when its confidence is import-unreachability-penalized (the stdlib/vendor
+ * hijack shape). field_type_hint is deliberately NOT dropped for Go — struct
+ * fields carry declared types, so the hint is receiver-aware there. */
+bool cbm_go_suppress_weak_method_match(bool is_go, bool is_method, const char *strategy,
+                                       double confidence);
+
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572
  * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX

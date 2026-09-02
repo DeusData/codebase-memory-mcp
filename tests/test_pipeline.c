@@ -4693,6 +4693,318 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+TEST(pipeline_go_method_caller_keeps_lsp_join) {
+    /* #1909: receiver-qualifying method QNs moves the def/textual-call QN to
+     * package.Type.method — go_lsp's enclosing-function QN must move with it
+     * (the ONE-formula contract), or every LSP resolution sourced from inside
+     * a method body loses its caller join and the edge dies. The callee name
+     * collides across receivers so no short-name fallback can mask the loss. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_mcall_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fxmcall\n\ngo 1.22\n");
+    write_temp_file(tmp, "svc/repo.go",
+                    "package svc\n"
+                    "\n"
+                    "type Repo struct {\n"
+                    "\tn int\n"
+                    "}\n"
+                    "\n"
+                    "func (r *Repo) Install() int {\n"
+                    "\treturn r.helper()\n"
+                    "}\n");
+    write_temp_file(tmp, "svc/helper.go",
+                    "package svc\n"
+                    "\n"
+                    "func (r *Repo) helper() int {\n"
+                    "\treturn r.n\n"
+                    "}\n");
+    write_temp_file(tmp, "other/other.go",
+                    "package other\n"
+                    "\n"
+                    "type Decoy struct{}\n"
+                    "\n"
+                    "func (d *Decoy) helper() int { return 2 }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_mcall.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Install", "helper"));
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* go.mod makes project imports resolvable — real Go repos always have one,
+     * and import reachability (the unique_name penalty) depends on it. */
+    write_temp_file(tmp, "go.mod", "module example.com/myapp\n\ngo 1.22\n");
+    /* The lone project symbol named "Close" — a real method. */
+    write_temp_file(tmp, "storage/storage.go",
+                    "package storage\n"
+                    "\n"
+                    "type Storage struct{ open bool }\n"
+                    "\n"
+                    "func NewStorage() *Storage { return &Storage{open: true} }\n"
+                    "\n"
+                    "func (s *Storage) Close() {\n"
+                    "\ts.open = false\n"
+                    "}\n"
+                    "\n"
+                    "func Boot() {\n"
+                    "\ts := NewStorage()\n"
+                    "\ts.Close()\n"
+                    "}\n");
+    /* Cross-package control target: imported by hash.go, so the caller file
+     * has a non-empty import map (like any real Go file) and unreachable
+     * unique_name candidates get the import penalty. */
+    write_temp_file(tmp, "util/util.go",
+                    "package util\n"
+                    "\n"
+                    "func Tag() string { return \"t\" }\n");
+    /* Stdlib receiver: `f.Close()` closes an *os.File, NOT the project method.
+     * The Go LSP cannot bind it to a project symbol → the registry would guess
+     * Close by short name (weak). This is the false edge to suppress —
+     * the exact shape that attached every file/rows/gzip Close in a real Go
+     * repo to one unrelated project method. */
+    write_temp_file(tmp, "hash/hash.go",
+                    "package hash\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"os\"\n"
+                    "\n"
+                    "\t\"example.com/myapp/util\"\n"
+                    ")\n"
+                    "\n"
+                    "func FileLen(path string) int64 {\n"
+                    "\tf, err := os.Open(path)\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\tdefer f.Close()\n"
+                    "\tst, err := f.Stat()\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\treturn st.Size()\n"
+                    "}\n"
+                    "\n"
+                    "func localHelper() int { return 1 }\n"
+                    "\n"
+                    "func CallsLocal() int { return localHelper() }\n"
+                    "\n"
+                    "func UsesUtil() string { return util.Tag() }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) The false edge is suppressed (reproduce-first: RED before the fix). */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "FileLen", "Close"));
+    /* (2) The same-package typed-receiver call survives (LSP / same_module —
+     * both outside the weak drop-list). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Boot", "Close"));
+    /* (3) The bare local call survives (is_method stays false for bare calls). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsLocal", "localHelper"));
+    /* (4) The import-qualified cross-package call survives (import-aware
+     * strategies are outside the drop-list). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UsesUtil", "Tag"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_multi_init_nodes_survive) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_init_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* Two files, one package, one init() each — Go runs both at start-up.
+     * Pre-fix both collapsed onto one QN and the upsert kept one node
+     * (reproduce-first: RED asserts node count == 2). */
+    write_temp_file(tmp, "go.mod", "module example.com/reg\n\ngo 1.22\n");
+    write_temp_file(tmp, "reg/a.go",
+                    "package reg\n"
+                    "\n"
+                    "var handlers = map[string]func(){}\n"
+                    "\n"
+                    "func init() { handlers[\"a\"] = handleA }\n"
+                    "\n"
+                    "func handleA() {}\n");
+    write_temp_file(tmp, "reg/b.go",
+                    "package reg\n"
+                    "\n"
+                    "func init() { handlers[\"b\"] = handleB }\n"
+                    "\n"
+                    "func handleB() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_init.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Both init functions survive as distinct nodes. */
+    cbm_node_t *inits = NULL;
+    int ic = 0;
+    cbm_store_find_nodes_by_name(s, project, "init", &inits, &ic);
+    ASSERT_EQ(ic, 2);
+    cbm_store_free_nodes(inits, ic);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_parallel_field_hint_requires_owner_segment) {
+    /* #1927: try_field_type_hint (parallel resolver only) matched the hinted
+     * type name as a raw SUBSTRING of the candidate QN. A single-letter
+     * receiver — `f.Close()` on an *os.File — hints "F", and "F" is a
+     * substring of "…FileStore.Close", so a stdlib call was rebound to an
+     * arbitrary project method at PP_FIELD_HINT_CONF and presented as
+     * field_type_hint (the one weak strategy the Go selector guard trusts).
+     * The hint must fire only when the candidate's OWNING segment — the
+     * dot-segment immediately before the method — EQUALS the hinted type;
+     * otherwise the resolution stays a weak short-name match and the Go
+     * guard (#1906) drops it. >= 50 files forces pass_parallel.c, the only
+     * path that runs try_field_type_hint(). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_fth_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "go.mod", "module example.com/fxhint\n\ngo 1.22\n");
+    /* Two project methods named Close → the registry resolves f.Close() as an
+     * ambiguous short-name match (candidate_count 2), the shape the hint
+     * upgrades. FileStore's QN carries the capital F the buggy substring
+     * latches onto; Conn is the second candidate. */
+    write_temp_file(tmp, "filestore/filestore.go",
+                    "package filestore\n"
+                    "\n"
+                    "type FileStore struct{ open bool }\n"
+                    "\n"
+                    "func (fs *FileStore) Close() {\n"
+                    "\tfs.open = false\n"
+                    "}\n");
+    write_temp_file(tmp, "conn/conn.go",
+                    "package conn\n"
+                    "\n"
+                    "type Conn struct{ live bool }\n"
+                    "\n"
+                    "func (cn *Conn) Close() {\n"
+                    "\tcn.live = false\n"
+                    "}\n");
+    /* Two project methods named Find → same ambiguity, but here the receiver
+     * variable IS named after its type (`finder`), the case the hint exists
+     * for: the owning segment of Finder.Find equals the hinted "Finder". */
+    write_temp_file(tmp, "finder/finder.go",
+                    "package finder\n"
+                    "\n"
+                    "type Finder struct{ n int }\n"
+                    "\n"
+                    "func NewFinder() *Finder { return &Finder{n: 1} }\n"
+                    "\n"
+                    "func (fi *Finder) Find(id int) int {\n"
+                    "\treturn fi.n + id\n"
+                    "}\n");
+    write_temp_file(tmp, "locator/locator.go",
+                    "package locator\n"
+                    "\n"
+                    "type Locator struct{ n int }\n"
+                    "\n"
+                    "func (lo *Locator) Find(id int) int {\n"
+                    "\treturn lo.n - id\n"
+                    "}\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"os\"\n"
+                    "\n"
+                    "\txf \"example.com/fxhint/finder\"\n"
+                    ")\n"
+                    "\n"
+                    "func Lookup(path string) int64 {\n"
+                    "\tf, err := os.Open(path)\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\tdefer f.Close()\n"
+                    "\tst, err := f.Stat()\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\treturn st.Size()\n"
+                    "}\n"
+                    "\n"
+                    "func UseFinder(id int) int {\n"
+                    "\tfinder := xf.NewFinder()\n"
+                    "\treturn finder.Find(id)\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_fth.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) Reproduce-first: RED before the fix. The substring hint rebinds the
+     * stdlib f.Close() to FileStore.Close ("F" ⊂ QN) at high confidence and
+     * the Go guard keeps it. With segment equality the upgrade is refused,
+     * the match stays suffix_match, and the Go guard drops it. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "Lookup", "Close"));
+    /* (2) The intended hint case survives: `finder` names its type, so the
+     * owning segment of Finder.Find equals the hint. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UseFinder", "Find"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -13135,6 +13447,10 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_method_caller_keeps_lsp_join);
+    RUN_TEST(pipeline_go_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_parallel_field_hint_requires_owner_segment);
+    RUN_TEST(pipeline_go_multi_init_nodes_survive);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
