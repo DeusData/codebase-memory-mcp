@@ -8919,7 +8919,10 @@ static void install_gemini_config(const char *home, const char *binary_path, boo
     if (!g_install_hooks) {
         if (!dry_run) {
             int tool_result = cbm_remove_gemini_hooks(cp);
-            int coverage_result = cbm_remove_gemini_coverage_hook(cp, binary_path);
+            int coverage_result = CLI_OK;
+#ifndef _WIN32
+            coverage_result = cbm_remove_gemini_coverage_hook(cp, binary_path);
+#endif
             int session_result = cbm_remove_gemini_session_hooks(cp);
             if (tool_result != CLI_OK || coverage_result != CLI_OK || session_result != CLI_OK) {
                 record_agent_config_error(false, "Gemini CLI", "hook_disable", cp);
