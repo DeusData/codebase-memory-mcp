@@ -4693,6 +4693,150 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+TEST(pipeline_go_method_caller_keeps_lsp_join) {
+    /* #1909: receiver-qualifying method QNs moves the def/textual-call QN to
+     * package.Type.method — go_lsp's enclosing-function QN must move with it
+     * (the ONE-formula contract), or every LSP resolution sourced from inside
+     * a method body loses its caller join and the edge dies. The callee name
+     * collides across receivers so no short-name fallback can mask the loss. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_mcall_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fxmcall\n\ngo 1.22\n");
+    write_temp_file(tmp, "svc/repo.go",
+                    "package svc\n"
+                    "\n"
+                    "type Repo struct {\n"
+                    "\tn int\n"
+                    "}\n"
+                    "\n"
+                    "func (r *Repo) Install() int {\n"
+                    "\treturn r.helper()\n"
+                    "}\n");
+    write_temp_file(tmp, "svc/helper.go",
+                    "package svc\n"
+                    "\n"
+                    "func (r *Repo) helper() int {\n"
+                    "\treturn r.n\n"
+                    "}\n");
+    write_temp_file(tmp, "other/other.go",
+                    "package other\n"
+                    "\n"
+                    "type Decoy struct{}\n"
+                    "\n"
+                    "func (d *Decoy) helper() int { return 2 }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_mcall.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Install", "helper"));
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* go.mod makes project imports resolvable — real Go repos always have one,
+     * and import reachability (the unique_name penalty) depends on it. */
+    write_temp_file(tmp, "go.mod", "module example.com/myapp\n\ngo 1.22\n");
+    /* The lone project symbol named "Close" — a real method. */
+    write_temp_file(tmp, "storage/storage.go",
+                    "package storage\n"
+                    "\n"
+                    "type Storage struct{ open bool }\n"
+                    "\n"
+                    "func NewStorage() *Storage { return &Storage{open: true} }\n"
+                    "\n"
+                    "func (s *Storage) Close() {\n"
+                    "\ts.open = false\n"
+                    "}\n"
+                    "\n"
+                    "func Boot() {\n"
+                    "\ts := NewStorage()\n"
+                    "\ts.Close()\n"
+                    "}\n");
+    /* Cross-package control target: imported by hash.go, so the caller file
+     * has a non-empty import map (like any real Go file) and unreachable
+     * unique_name candidates get the import penalty. */
+    write_temp_file(tmp, "util/util.go",
+                    "package util\n"
+                    "\n"
+                    "func Tag() string { return \"t\" }\n");
+    /* Stdlib receiver: `f.Close()` closes an *os.File, NOT the project method.
+     * The Go LSP cannot bind it to a project symbol → the registry would guess
+     * Close by short name (weak). This is the false edge to suppress —
+     * the exact shape that attached every file/rows/gzip Close in a real Go
+     * repo to one unrelated project method. */
+    write_temp_file(tmp, "hash/hash.go",
+                    "package hash\n"
+                    "\n"
+                    "import (\n"
+                    "\t\"os\"\n"
+                    "\n"
+                    "\t\"example.com/myapp/util\"\n"
+                    ")\n"
+                    "\n"
+                    "func FileLen(path string) int64 {\n"
+                    "\tf, err := os.Open(path)\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\tdefer f.Close()\n"
+                    "\tst, err := f.Stat()\n"
+                    "\tif err != nil {\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "\treturn st.Size()\n"
+                    "}\n"
+                    "\n"
+                    "func localHelper() int { return 1 }\n"
+                    "\n"
+                    "func CallsLocal() int { return localHelper() }\n"
+                    "\n"
+                    "func UsesUtil() string { return util.Tag() }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* (1) The false edge is suppressed (reproduce-first: RED before the fix). */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "FileLen", "Close"));
+    /* (2) The same-package typed-receiver call survives (LSP / same_module —
+     * both outside the weak drop-list). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "Boot", "Close"));
+    /* (3) The bare local call survives (is_method stays false for bare calls). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "CallsLocal", "localHelper"));
+    /* (4) The import-qualified cross-package call survives (import-aware
+     * strategies are outside the drop-list). */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "UsesUtil", "Tag"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -13135,6 +13279,8 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_method_caller_keeps_lsp_join);
+    RUN_TEST(pipeline_go_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);

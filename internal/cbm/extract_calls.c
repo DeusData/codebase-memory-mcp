@@ -3627,6 +3627,24 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     }
                 }
             }
+            // Go receiver-aware guard (same direction as the TS/JS flag above).
+            // Flag a selector call x.foo(). The Go AST cannot separate a method
+            // call on a value from a package-qualified call — but every selector
+            // call the Go LSP or the import/qualified registry strategies CAN
+            // place never reaches the weak short-name guards, so the flag only
+            // bites on unresolvable receivers (`f.Close()` on an os.File,
+            // `sha256.New()` behind an unindexed import), where a project-wide
+            // short-name match fabricates an edge to an unrelated project
+            // symbol sharing the name. Bare calls (helper()) keep
+            // is_method=false and resolve same-module/import paths as before.
+            if (ctx->language == CBM_LANG_GO &&
+                strcmp(ts_node_type(node), "call_expression") == 0) {
+                TSNode gofn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(gofn) &&
+                    strcmp(ts_node_type(gofn), "selector_expression") == 0) {
+                    call.is_method = true;
+                }
+            }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
             // ObjectScript stores args under oref_method/method_args, not the
