@@ -103,19 +103,18 @@ void cbm_reset_profile(void) {
 
 // --- Growable array push functions ---
 
-#define GROW_ARRAY(arr, arena)                                                                   \
-    do {                                                                                         \
-        if ((arr)->count >= (arr)->cap) {                                                        \
-            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                   \
-            void *new_items = cbm_arena_alloc((arena), (size_t)new_cap * sizeof(*(arr)->items)); \
-            if (!new_items)                                                                      \
-                return;                                                                          \
-            if ((arr)->items && (arr)->count > 0) {                                              \
-                memcpy(new_items, (arr)->items, (size_t)(arr)->count * sizeof(*(arr)->items));   \
-            }                                                                                    \
-            (arr)->items = new_items;                                                            \
-            (arr)->cap = new_cap;                                                                \
-        }                                                                                        \
+#define GROW_ARRAY(arr, arena)                                                                     \
+    do {                                                                                           \
+        (void)(arena);                                                                             \
+        if ((arr)->count >= (arr)->cap) {                                                          \
+            int new_cap = (arr)->cap == 0 ? CBM_SZ_32 : (arr)->cap * PAIR_LEN;                     \
+            void *new_items =                                                                      \
+                cbm_arena_realloc((arena), (arr)->items, (size_t)new_cap * sizeof(*(arr)->items)); \
+            if (!new_items)                                                                        \
+                return;                                                                            \
+            (arr)->items = new_items;                                                              \
+            (arr)->cap = new_cap;                                                                  \
+        }                                                                                          \
     } while (0)
 
 void cbm_defs_push(CBMDefArray *arr, CBMArena *a, CBMDefinition def) {

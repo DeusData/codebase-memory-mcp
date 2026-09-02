@@ -1449,6 +1449,23 @@ static bool main_set_client_context(cbm_daemon_runtime_client_t *client, const c
            CBM_DAEMON_RUNTIME_APPLICATION_OK;
 }
 
+/* A daemon worker inherits the daemon process environment, whose
+ * CBM_ALLOWED_ROOT belongs to whichever frontend started that daemon. The
+ * daemon has already authorized and canonicalized repo_path before spawning
+ * this single-request worker, so replace that stale process boundary with the
+ * exact request root. This is worker-local and fail-closed: it never mutates
+ * the concurrent daemon and cannot broaden the job beyond the one canonical
+ * repository encoded in the immutable worker argv. */
+static bool main_install_index_worker_request_scope(const char *args_json) {
+    char *repo_path = cbm_mcp_get_string_arg(args_json, "repo_path");
+    char canonical[MAIN_PATH_CAP];
+    bool installed = repo_path && repo_path[0] &&
+                     cbm_canonical_path(repo_path, canonical, sizeof(canonical)) &&
+                     cbm_setenv("CBM_ALLOWED_ROOT", canonical, 1) == 0;
+    free(repo_path);
+    return installed;
+}
+
 /* Parse a strict MAJOR.MINOR.PATCH triple; false for anything else (dev
  * builds and prereleases never participate in auto-drain decisions). */
 static bool main_semver_triple(const char *text, long out[3]) {
@@ -2723,6 +2740,11 @@ int main(int argc, char **argv) {
         char *worker_repo_path = cbm_mcp_get_string_arg(invocation.args_json, "repo_path");
         cbm_index_worker_log_begin(invocation.args_json, worker_repo_path);
         free(worker_repo_path);
+        if (!main_install_index_worker_request_scope(invocation.args_json)) {
+            (void)fprintf(stderr,
+                          "CBM index worker could not start: request workspace scope invalid\n");
+            return EXIT_FAILURE;
+        }
         cbm_daemon_ipc_endpoint_t *worker_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
         cbm_project_lock_manager_t *worker_project_locks =
             worker_endpoint ? cbm_project_lock_manager_new(worker_endpoint) : NULL;

@@ -2096,13 +2096,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespace_names,
+                                                     const char *const *rels, int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
-        const CBMFileResult *r = results[i];
-        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+        const char *namespace_name = namespace_names ? namespace_names[i] : NULL;
+        if (!namespace_name || !namespace_name[0] || !rels[i]) {
             continue;
         }
         if (!map) {
@@ -2118,7 +2118,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(r->namespace_name);
+        char *key = strdup(namespace_name);
         if (!key) {
             free(file_qn);
             continue;
@@ -2155,6 +2155,22 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
             free(file_qn); /* content copied into combined */
         }
     }
+    return map;
+}
+
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    const char **namespace_names = calloc((size_t)count, sizeof(*namespace_names));
+    if (!namespace_names && count > 0) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        namespace_names[i] = results[i] ? results[i]->namespace_name : NULL;
+    }
+    CBMHashTable *map =
+        cbm_pipeline_namespace_map_build_names(project_name, namespace_names, rels, count);
+    free(namespace_names);
     return map;
 }
 

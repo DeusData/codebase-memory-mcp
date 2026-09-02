@@ -37,6 +37,9 @@ int cbm_daemon_application_background_initializes_for_test(void);
  * that a request QUEUED rather than erroring or starting. */
 int cbm_daemon_application_busy_queue_waits_for_test(void);
 
+/* Sum of sampled process-group RSS high-water marks for active index jobs. */
+size_t cbm_daemon_application_observed_index_rss_for_test(cbm_daemon_application_t *application);
+
 /* Build the JSON-RPC error substituted for a reply too large to frame (#1375).
  * Exposed because the alternative — driving a real >10 MiB reply — needs a
  * ~20k-node index, a fixture cost the unit suite should not carry. The

@@ -28,6 +28,28 @@
 
 enum { CBM_TLD_MAX_DEPTH = 256 }; /* recursion-depth cap (cycle/stack guard) */
 
+typedef struct {
+    int64_t id;
+    const char *qualified_name;
+} tld_target_t;
+
+static int compare_tld_target(const void *a, const void *b) {
+    const tld_target_t *ta = a;
+    const tld_target_t *tb = b;
+    const char *aq = ta->qualified_name ? ta->qualified_name : "";
+    const char *bq = tb->qualified_name ? tb->qualified_name : "";
+    int by_name = strcmp(aq, bq);
+    return by_name != 0 ? by_name : (ta->id > tb->id) - (ta->id < tb->id);
+}
+
+static int compare_node_qn(const void *a, const void *b) {
+    const cbm_gbuf_node_t *na = *(cbm_gbuf_node_t *const *)a;
+    const cbm_gbuf_node_t *nb = *(cbm_gbuf_node_t *const *)b;
+    const char *aq = na && na->qualified_name ? na->qualified_name : "";
+    const char *bq = nb && nb->qualified_name ? nb->qualified_name : "";
+    return strcmp(aq, bq);
+}
+
 /* Int → string for structured logging (thread-safe ring buffer). */
 static const char *itoa_cx(int val) {
     enum { RING = 2, MASK = 1 };
@@ -121,8 +143,36 @@ static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int 
     const cbm_gbuf_edge_t **edges = NULL;
     int ne = 0;
     cbm_gbuf_find_edges_by_source_type(gb, id, "CALLS", &edges, &ne);
+    tld_target_t *targets = ne > 0 ? malloc((size_t)ne * sizeof(*targets)) : NULL;
+    if (ne > 0 && !targets) {
+        /* Preserve the pass's prior best-effort behavior under allocation
+         * pressure; determinism is guaranteed whenever the tiny sort buffer
+         * can be allocated. */
+        for (int i = 0; i < ne; i++) {
+            int64_t c = edges[i]->target_id;
+            if (c == id) {
+                recursive[id] = true;
+                continue;
+            }
+            int ct = tld_dfs(gb, c, loop_depth, tld, state, recursive, maxid, depth + 1);
+            if (ct > best) {
+                best = ct;
+            }
+        }
+        tld[id] = loop_depth[id] + best;
+        state[id] = 2;
+        return tld[id];
+    }
+    int nt = 0;
     for (int i = 0; i < ne; i++) {
-        int64_t c = edges[i]->target_id;
+        const cbm_gbuf_node_t *callee = cbm_gbuf_find_by_id(gb, edges[i]->target_id);
+        if (callee) {
+            targets[nt++] = (tld_target_t){edges[i]->target_id, callee->qualified_name};
+        }
+    }
+    qsort(targets, (size_t)nt, sizeof(*targets), compare_tld_target);
+    for (int i = 0; i < nt; i++) {
+        int64_t c = targets[i].id;
         if (c == id) {
             recursive[id] = true; /* direct self-recursion */
             continue;
@@ -132,6 +182,7 @@ static int tld_dfs(const cbm_gbuf_t *gb, int64_t id, const int *loop_depth, int 
             best = ct;
         }
     }
+    free(targets);
     tld[id] = loop_depth[id] + best;
     state[id] = 2;
     return tld[id];
@@ -185,16 +236,28 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     seed_loop_depths(gb, "Function", loop_depth, recursive, nptr, maxid);
     seed_loop_depths(gb, "Method", loop_depth, recursive, nptr, maxid);
 
+    cbm_gbuf_node_t **ordered = malloc(sz * sizeof(*ordered));
+    if (!ordered) {
+        free(loop_depth);
+        free(tld);
+        free(state);
+        free(recursive);
+        free(nptr);
+        return;
+    }
     int updated = 0;
     for (int64_t id = 1; id <= maxid; id++) {
-        if (!nptr[id]) {
-            continue; /* only Function/Method nodes */
+        if (nptr[id]) {
+            ordered[updated++] = nptr[id];
         }
+    }
+    qsort(ordered, (size_t)updated, sizeof(*ordered), compare_node_qn);
+    for (int i = 0; i < updated; i++) {
+        int64_t id = ordered[i]->id;
         if (state[id] != 2) {
             tld_dfs(gb, id, loop_depth, tld, state, recursive, maxid, 0);
         }
         append_complexity_props(nptr[id], tld[id], recursive[id]);
-        updated++;
     }
 
     cbm_log_info("pass.complexity", "functions", itoa_cx(updated));
@@ -204,4 +267,5 @@ void cbm_pipeline_pass_complexity(cbm_pipeline_ctx_t *ctx) {
     free(state);
     free(recursive);
     free(nptr);
+    free(ordered);
 }

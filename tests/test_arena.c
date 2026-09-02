@@ -45,6 +45,38 @@ TEST(arena_alloc_zero) {
     PASS();
 }
 
+TEST(arena_realloc_tracks_lifetime) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    unsigned char *p = (unsigned char *)cbm_arena_realloc(&a, NULL, 16);
+    ASSERT_NOT_NULL(p);
+    for (int i = 0; i < 16; i++) {
+        p[i] = (unsigned char)i;
+    }
+    p = (unsigned char *)cbm_arena_realloc(&a, p, 64);
+    ASSERT_NOT_NULL(p);
+    for (int i = 0; i < 16; i++) {
+        ASSERT_EQ(p[i], (unsigned char)i);
+    }
+    ASSERT_NOT_NULL(a.heap_allocations);
+    cbm_arena_reset(&a);
+    ASSERT_NULL(a.heap_allocations);
+    p = (unsigned char *)cbm_arena_realloc(&a, NULL, 32);
+    ASSERT_NOT_NULL(p);
+    cbm_arena_destroy(&a);
+    ASSERT_NULL(a.heap_allocations);
+    PASS();
+}
+
+TEST(arena_realloc_rejects_foreign_pointer) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    unsigned char foreign = 0;
+    ASSERT_NULL(cbm_arena_realloc(&a, &foreign, 16));
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(arena_alloc_null_arena) {
     void *p = cbm_arena_alloc(NULL, 16);
     ASSERT_NULL(p);
@@ -432,6 +464,8 @@ SUITE(arena) {
     RUN_TEST(arena_init_sized);
     RUN_TEST(arena_alloc_basic);
     RUN_TEST(arena_alloc_zero);
+    RUN_TEST(arena_realloc_tracks_lifetime);
+    RUN_TEST(arena_realloc_rejects_foreign_pointer);
     RUN_TEST(arena_alloc_null_arena);
     RUN_TEST(arena_alloc_alignment);
     RUN_TEST(arena_alloc_grows_blocks);

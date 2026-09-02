@@ -1319,6 +1319,7 @@ typedef struct {
     atomic_bool scripted;
     atomic_int hold_destroy_attempt;
     atomic_bool release_destroy;
+    atomic_size_t observed_rss;
     atomic_int project_lock_attempts;
     atomic_int project_lock_acquisitions;
     cbm_project_lock_manager_t *project_locks;
@@ -1329,6 +1330,7 @@ typedef struct {
     char marker_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     char quarantine_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     char quarantine_seen[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
+    char repo_paths[APP_FAKE_MAX_ATTEMPTS][APP_TEST_PATH_CAP];
     size_t memory_budgets[APP_FAKE_MAX_ATTEMPTS];
 } app_fake_worker_context_t;
 
@@ -1351,6 +1353,7 @@ static void app_fake_worker_context_init(app_fake_worker_context_t *context) {
     atomic_init(&context->scripted, false);
     atomic_init(&context->hold_destroy_attempt, -1);
     atomic_init(&context->release_destroy, false);
+    atomic_init(&context->observed_rss, 0);
     atomic_init(&context->project_lock_attempts, 0);
     atomic_init(&context->project_lock_acquisitions, 0);
 }
@@ -1393,6 +1396,12 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
     atomic_init(&worker->cancelled, false);
     worker->result.exit_code = -1;
     if (worker->attempt < APP_FAKE_MAX_ATTEMPTS) {
+        char *repo_path = cbm_mcp_get_string_arg(args_json, "repo_path");
+        if (repo_path) {
+            (void)snprintf(context->repo_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
+                           repo_path);
+        }
+        free(repo_path);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
@@ -1474,6 +1483,17 @@ static cbm_index_worker_poll_t app_fake_worker_poll(void *opaque,
         return CBM_INDEX_WORKER_POLL_TERMINAL;
     }
     return CBM_INDEX_WORKER_POLL_RUNNING;
+}
+
+static bool app_fake_worker_observed_rss(void *opaque, cbm_daemon_application_worker_t worker,
+                                         size_t *bytes_out) {
+    (void)worker;
+    app_fake_worker_context_t *context = opaque;
+    if (!context || !bytes_out) {
+        return false;
+    }
+    *bytes_out = atomic_load(&context->observed_rss);
+    return true;
 }
 
 static bool app_fake_worker_cancel(void *opaque, cbm_daemon_application_worker_t handle) {
@@ -2950,6 +2970,95 @@ TEST(daemon_application_coalesces_semantically_identical_index_requests) {
     free(tools[1]);
     free(project);
     (void)cbm_rmdir(root);
+    PASS();
+}
+
+/* Regression contract: a shared daemon application must retain the workspace
+ * boundary on the owning session.  A second live client with a different root
+ * must neither inherit the first client's boundary nor require a common
+ * ancestor grant. */
+TEST(daemon_application_keeps_allowed_root_session_scoped) {
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *sessions[2] = {app_test_open(&callbacks, 31),
+                                                             app_test_open(&callbacks, 32)};
+
+    char parent[APP_TEST_PATH_CAP];
+    char roots[2][APP_TEST_PATH_CAP];
+    (void)snprintf(parent, sizeof(parent), "%s/cbm-app-session-roots-XXXXXX", cbm_tmpdir());
+    bool paths_ok = cbm_mkdtemp(parent) != NULL;
+    for (size_t i = 0; paths_ok && i < 2; i++) {
+        int written =
+            snprintf(roots[i], sizeof(roots[i]), "%s/%s", parent, i == 0 ? "alpha" : "beta");
+        paths_ok = written > 0 && written < (int)sizeof(roots[i]) && cbm_mkdir_p(roots[i], 0700);
+    }
+
+    uint8_t *contexts[2] = {NULL, NULL};
+    uint32_t context_lengths[2] = {0, 0};
+    uint8_t *tools[2] = {NULL, NULL};
+    uint32_t tool_lengths[2] = {0, 0};
+    char args[2][APP_TEST_PATH_CAP + 64];
+    bool encoded = paths_ok && sessions[0] && sessions[1];
+    for (size_t i = 0; encoded && i < 2; i++) {
+        int written = snprintf(args[i], sizeof(args[i]), "{\"repo_path\":\"%s\",\"mode\":\"fast\"}",
+                               roots[i]);
+        encoded = written > 0 && written < (int)sizeof(args[i]) &&
+                  app_test_context_request(roots[i], roots[i], &contexts[i], &context_lengths[i]) &&
+                  app_test_tool_request("index_repository", args[i], &tools[i], &tool_lengths[i]);
+    }
+
+    bool requests_ok = encoded;
+    uint8_t *responses[2] = {NULL, NULL};
+    uint32_t response_lengths[2] = {0, 0};
+    for (size_t i = 0; requests_ok && i < 2; i++) {
+        uint8_t *empty = NULL;
+        uint32_t empty_length = 0;
+        requests_ok =
+            app_test_request(&callbacks, sessions[i], contexts[i], context_lengths[i], &empty,
+                             &empty_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+            !empty && empty_length == 0;
+        free(empty);
+    }
+    for (size_t i = 0; requests_ok && i < 2; i++) {
+        requests_ok =
+            app_test_request(&callbacks, sessions[i], tools[i], tool_lengths[i], &responses[i],
+                             &response_lengths[i]) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+            responses[i] && strstr((char *)responses[i], "indexed") &&
+            !strstr((char *)responses[i], "outside the allowed root");
+    }
+
+    for (size_t i = 0; i < 2; i++) {
+        if (sessions[i]) {
+            callbacks.session_close(callbacks.context, sessions[i]);
+        }
+    }
+    (void)cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+
+    ASSERT_TRUE(requests_ok);
+    ASSERT_EQ(atomic_load(&fake.starts), 2);
+    ASSERT_EQ(atomic_load(&fake.destroys), 2);
+
+    for (size_t i = 0; i < 2; i++) {
+        free(contexts[i]);
+        free(tools[i]);
+        free(responses[i]);
+        (void)cbm_rmdir(roots[i]);
+    }
+    (void)cbm_rmdir(parent);
     PASS();
 }
 
@@ -5138,9 +5247,345 @@ TEST(daemon_application_queues_explicit_index_behind_physical_job_limit) {
     PASS();
 }
 
+TEST(daemon_application_explicit_index_queue_is_fifo) {
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .worker_ops = &worker_ops,
+        .physical_job_limit = 1,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    char roots[3][APP_TEST_PATH_CAP];
+    bool roots_ok = true;
+    for (int i = 0; i < 3; i++) {
+        (void)snprintf(roots[i], sizeof(roots[i]), "%s/cbm-app-fifo-%d-XXXXXX", cbm_tmpdir(), i);
+        roots_ok = roots_ok && cbm_mkdtemp(roots[i]) != NULL;
+    }
+    app_index_thread_t first = {
+        .application = application,
+        .project = "fifo-first",
+        .root = roots[0],
+        .result = -1,
+    };
+    cbm_thread_t first_thread;
+    bool first_started = application && roots_ok &&
+                         cbm_thread_create(&first_thread, 0, app_index_thread, &first) == 0;
+    bool first_admitted = first_started && app_wait_for_atomic_int(&fake.starts, 1);
+
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *sessions[2] = {
+        app_test_open(&callbacks, 61),
+        app_test_open(&callbacks, 62),
+    };
+    uint8_t *contexts[2] = {NULL, NULL};
+    uint32_t context_lengths[2] = {0, 0};
+    uint8_t *tools[2] = {NULL, NULL};
+    uint32_t tool_lengths[2] = {0, 0};
+    bool sessions_ok = first_admitted && sessions[0] && sessions[1];
+    for (int i = 0; i < 2 && sessions_ok; i++) {
+        char args[APP_TEST_PATH_CAP + 32];
+        (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", roots[i + 1]);
+        sessions_ok = app_test_context_request(roots[i + 1], roots[i + 1], &contexts[i],
+                                               &context_lengths[i]) &&
+                      app_test_tool_request("index_repository", args, &tools[i], &tool_lengths[i]);
+        uint8_t *response = NULL;
+        uint32_t response_length = 0;
+        sessions_ok =
+            sessions_ok &&
+            app_test_request(&callbacks, sessions[i], contexts[i], context_lengths[i], &response,
+                             &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+        free(response);
+    }
+
+    app_session_request_thread_t requests[2] = {
+        {.callbacks = &callbacks,
+         .session = sessions[0],
+         .payload = tools[0],
+         .payload_length = tool_lengths[0],
+         .status = -1},
+        {.callbacks = &callbacks,
+         .session = sessions[1],
+         .payload = tools[1],
+         .payload_length = tool_lengths[1],
+         .status = -1},
+    };
+    cbm_thread_t request_threads[2];
+    bool request_started[2] = {false, false};
+    bool queued_in_order = sessions_ok;
+    for (int i = 0; i < 2 && queued_in_order; i++) {
+        int baseline = cbm_daemon_application_busy_queue_waits_for_test();
+        request_started[i] = cbm_thread_create(&request_threads[i], 0, app_session_request_thread,
+                                               &requests[i]) == 0;
+        uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+        while (request_started[i] && cbm_now_ms() < deadline &&
+               cbm_daemon_application_busy_queue_waits_for_test() <= baseline) {
+            cbm_usleep(1000);
+        }
+        queued_in_order =
+            request_started[i] && cbm_daemon_application_busy_queue_waits_for_test() > baseline;
+    }
+
+    atomic_store(&fake.allow_completion, true);
+    bool joined = true;
+    for (int i = 0; i < 2; i++) {
+        if (request_started[i]) {
+            joined = cbm_thread_join(&request_threads[i]) == 0 && joined;
+        }
+    }
+    if (first_started) {
+        joined = cbm_thread_join(&first_thread) == 0 && joined;
+    }
+    bool responses_ok = joined;
+    for (int i = 0; i < 2; i++) {
+        responses_ok = responses_ok && requests[i].status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                       requests[i].response &&
+                       strstr((char *)requests[i].response, "indexed") != NULL;
+    }
+    const char *second_name = strrchr(roots[1], '/');
+    const char *third_name = strrchr(roots[2], '/');
+    const char *second_started_name = strrchr(fake.repo_paths[1], '/');
+    const char *third_started_name = strrchr(fake.repo_paths[2], '/');
+    bool fifo = atomic_load(&fake.starts) == 3 && second_name && third_name &&
+                second_started_name && third_started_name &&
+                strcmp(second_started_name, second_name) == 0 &&
+                strcmp(third_started_name, third_name) == 0;
+
+    for (int i = 0; i < 2; i++) {
+        if (sessions[i]) {
+            callbacks.session_close(callbacks.context, sessions[i]);
+        }
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    for (int i = 0; i < 2; i++) {
+        free(contexts[i]);
+        free(tools[i]);
+        free(requests[i].response);
+    }
+    for (int i = 0; i < 3; i++) {
+        (void)cbm_rmdir(roots[i]);
+    }
+
+    ASSERT_TRUE(roots_ok);
+    ASSERT_TRUE(first_started);
+    ASSERT_TRUE(first_admitted);
+    ASSERT_TRUE(sessions_ok);
+    ASSERT_TRUE(queued_in_order);
+    ASSERT_TRUE(responses_ok);
+    ASSERT_TRUE(fifo);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_cancelled_queue_head_is_removed) {
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops, .physical_job_limit = 1};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_application_set_permanent(application, true);
+    char roots[3][APP_TEST_PATH_CAP];
+    bool roots_ok = true;
+    for (int i = 0; i < 3; i++) {
+        (void)snprintf(roots[i], sizeof(roots[i]), "%s/cbm-app-queue-cancel-%d-XXXXXX",
+                       cbm_tmpdir(), i);
+        roots_ok = roots_ok && cbm_mkdtemp(roots[i]) != NULL;
+    }
+    app_index_thread_t first = {
+        .application = application,
+        .project = "queue-cancel-first",
+        .root = roots[0],
+        .result = -1,
+    };
+    cbm_thread_t first_thread;
+    bool first_started = application && roots_ok &&
+                         cbm_thread_create(&first_thread, 0, app_index_thread, &first) == 0;
+    bool first_admitted = first_started && app_wait_for_atomic_int(&fake.starts, 1);
+
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 63);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    char args[APP_TEST_PATH_CAP + 32];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", roots[1]);
+    bool session_ok = first_admitted && session &&
+                      app_test_context_request(roots[1], roots[1], &context, &context_length) &&
+                      app_test_tool_request("index_repository", args, &tool, &tool_length);
+    uint8_t *context_response = NULL;
+    uint32_t context_response_length = 0;
+    session_ok = session_ok &&
+                 app_test_request(&callbacks, session, context, context_length, &context_response,
+                                  &context_response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(context_response);
+    int baseline = cbm_daemon_application_busy_queue_waits_for_test();
+    app_session_request_thread_t queued = {
+        .callbacks = &callbacks,
+        .session = session,
+        .payload = tool,
+        .payload_length = tool_length,
+        .status = -1,
+    };
+    cbm_thread_t request_thread;
+    bool request_started =
+        session_ok &&
+        cbm_thread_create(&request_thread, 0, app_session_request_thread, &queued) == 0;
+    bool parked = false;
+    if (request_started) {
+        uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+        while (cbm_now_ms() < deadline) {
+            if (cbm_daemon_application_busy_queue_waits_for_test() > baseline) {
+                parked = true;
+                break;
+            }
+            cbm_usleep(1000);
+        }
+    }
+    if (parked) {
+        callbacks.session_cancel(callbacks.context, session);
+    }
+    bool request_joined = request_started && cbm_thread_join(&request_thread) == 0;
+    bool cancelled_without_start = request_joined && atomic_load(&fake.starts) == 1;
+    atomic_store(&fake.allow_completion, true);
+    if (first_started) {
+        (void)cbm_thread_join(&first_thread);
+    }
+    bool first_completed = app_wait_for_atomic_int(&fake.destroys, 1);
+    int next = cancelled_without_start && first_completed
+                   ? cbm_daemon_application_index(application, "queue-cancel-next", roots[2])
+                   : -1;
+    int final_starts = atomic_load(&fake.starts);
+
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    free(context);
+    free(tool);
+    free(queued.response);
+    for (int i = 0; i < 3; i++) {
+        (void)cbm_rmdir(roots[i]);
+    }
+
+    ASSERT_TRUE(roots_ok);
+    ASSERT_TRUE(first_started);
+    ASSERT_TRUE(first_admitted);
+    ASSERT_TRUE(session_ok);
+    ASSERT_TRUE(request_started);
+    ASSERT_TRUE(parked);
+    ASSERT_TRUE(cancelled_without_start);
+    ASSERT_TRUE(first_completed);
+    ASSERT_EQ(next, 0);
+    ASSERT_EQ(final_starts, 2);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_daily_capacity_adapts_to_memory_tokens) {
+    cbm_daemon_application_config_t config = {
+        .physical_job_limit = 4,
+        .aggregate_memory_budget_bytes = (size_t)768 * (size_t)1024 * (size_t)1024,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    size_t limit = cbm_daemon_application_physical_job_limit(application);
+    size_t worker_budget = cbm_daemon_application_worker_memory_budget_bytes(application);
+    cbm_daemon_application_free(application);
+
+    ASSERT_EQ(limit, 2);
+    ASSERT_EQ(worker_budget, (size_t)384 * (size_t)1024 * (size_t)1024);
+    PASS();
+}
+
+TEST(daemon_application_observed_rss_blocks_unsafe_daily_admission) {
+    const size_t observed_rss = (size_t)500 * (size_t)1024 * (size_t)1024;
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.observed_rss, observed_rss);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .observed_rss = app_fake_worker_observed_rss,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .worker_ops = &worker_ops,
+        .physical_job_limit = 4,
+        .aggregate_memory_budget_bytes = (size_t)768 * (size_t)1024 * (size_t)1024,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    char roots[2][APP_TEST_PATH_CAP];
+    bool roots_ok = true;
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(roots[i], sizeof(roots[i]), "%s/cbm-app-rss-gate-%d-XXXXXX", cbm_tmpdir(),
+                       i);
+        roots_ok = roots_ok && cbm_mkdtemp(roots[i]) != NULL;
+    }
+    app_index_thread_t first = {
+        .application = application,
+        .project = "rss-first",
+        .root = roots[0],
+        .result = -1,
+    };
+    cbm_thread_t first_thread;
+    bool started = application && roots_ok &&
+                   cbm_thread_create(&first_thread, 0, app_index_thread, &first) == 0;
+    bool sampled = false;
+    if (started && app_wait_for_atomic_int(&fake.starts, 1)) {
+        uint64_t deadline = cbm_now_ms() + APP_TEST_TIMEOUT_MS;
+        while (cbm_now_ms() < deadline) {
+            if (cbm_daemon_application_observed_index_rss_for_test(application) >= observed_rss) {
+                sampled = true;
+                break;
+            }
+            cbm_usleep(1000);
+        }
+    }
+    int second = sampled ? cbm_daemon_application_index(application, "rss-second", roots[1]) : -1;
+    bool no_unsafe_start = atomic_load(&fake.starts) == 1;
+    atomic_store(&fake.allow_completion, true);
+    if (started) {
+        (void)cbm_thread_join(&first_thread);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    for (int i = 0; i < 2; i++) {
+        (void)cbm_rmdir(roots[i]);
+    }
+
+    ASSERT_TRUE(roots_ok);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(sampled);
+    ASSERT_EQ(second, 1);
+    ASSERT_TRUE(no_unsafe_start);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
     enum { DEFAULT_CAP_RUNNING = 4, DEFAULT_CAP_TOTAL = 5 };
-    const size_t aggregate_budget = 4099;
+    const size_t aggregate_budget = (size_t)1536 * (size_t)1024 * (size_t)1024 + (size_t)3;
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
     cbm_daemon_application_worker_ops_t worker_ops = {
@@ -5212,6 +5657,67 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
         assigned_budget += fake.memory_budgets[i];
     }
     ASSERT_TRUE(assigned_budget <= aggregate_budget);
+    PASS();
+}
+
+TEST(daemon_application_large_repository_uses_single_slot_and_large_budget) {
+    app_env_backup_t mode_environment;
+    bool mode_saved = app_env_backup_capture(&mode_environment, "CBM_INDEX_RESOURCE_MODE");
+    bool mode_set = mode_saved && cbm_setenv("CBM_INDEX_RESOURCE_MODE", "large", 1) == 0;
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = mode_set ? cbm_daemon_application_new(&config) : NULL;
+    char first_root[APP_TEST_PATH_CAP];
+    char second_root[APP_TEST_PATH_CAP];
+    snprintf(first_root, sizeof(first_root), "%s/cbm-app-large-first-XXXXXX", cbm_tmpdir());
+    snprintf(second_root, sizeof(second_root), "%s/cbm-app-large-second-XXXXXX", cbm_tmpdir());
+    bool roots_ok = cbm_mkdtemp(first_root) != NULL && cbm_mkdtemp(second_root) != NULL;
+    app_index_thread_t first = {
+        .application = application,
+        .project = "large-first",
+        .root = first_root,
+        .result = -1,
+    };
+    cbm_thread_t thread;
+    bool started =
+        application && roots_ok && cbm_thread_create(&thread, 0, app_index_thread, &first) == 0;
+    bool admitted = started && app_wait_for_atomic_int(&fake.starts, 1);
+    bool daily_set = admitted && cbm_setenv("CBM_INDEX_RESOURCE_MODE", "daily", 1) == 0;
+    int second =
+        daily_set ? cbm_daemon_application_index(application, "large-second", second_root) : -1;
+    bool one_worker = atomic_load(&fake.starts) == 1;
+    size_t assigned_budget = fake.memory_budgets[0];
+    atomic_store(&fake.allow_completion, true);
+    if (started) {
+        (void)cbm_thread_join(&thread);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    bool mode_restored = app_env_backup_restore(&mode_environment);
+    (void)cbm_rmdir(first_root);
+    (void)cbm_rmdir(second_root);
+
+    ASSERT_TRUE(mode_saved);
+    ASSERT_TRUE(mode_set);
+    ASSERT_TRUE(roots_ok);
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(admitted);
+    ASSERT_TRUE(daily_set);
+    ASSERT_EQ(second, 1);
+    ASSERT_TRUE(one_worker);
+    ASSERT_EQ(assigned_budget, (size_t)3072 * 1024 * 1024);
+    ASSERT_EQ(first.result, 0);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(mode_restored);
     PASS();
 }
 
@@ -5369,6 +5875,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_update_generation_retries_cancelled_check);
     RUN_TEST(daemon_application_final_disconnect_cancels_and_joins_update_generation);
     RUN_TEST(daemon_application_coalesces_semantically_identical_index_requests);
+    RUN_TEST(daemon_application_keeps_allowed_root_session_scoped);
     RUN_TEST(daemon_application_fresh_request_does_not_reuse_terminal_subscribed_job);
     RUN_TEST(daemon_application_request_cancel_detaches_only_one_coalesced_subscriber);
     RUN_TEST(daemon_application_cancels_physical_job_only_after_final_session);
@@ -5392,7 +5899,12 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_cancellation_between_recovery_attempts_stops_retry);
     RUN_TEST(daemon_application_thread_start_failure_rolls_back_job_reservation);
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
+    RUN_TEST(daemon_application_explicit_index_queue_is_fifo);
+    RUN_TEST(daemon_application_cancelled_queue_head_is_removed);
+    RUN_TEST(daemon_application_daily_capacity_adapts_to_memory_tokens);
+    RUN_TEST(daemon_application_observed_rss_blocks_unsafe_daily_admission);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
+    RUN_TEST(daemon_application_large_repository_uses_single_slot_and_large_budget);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
 }

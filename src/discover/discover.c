@@ -413,6 +413,8 @@ typedef struct {
     int count;
     int capacity;
     int max_files;
+    size_t max_total_bytes;
+    size_t total_bytes;
     uint64_t deadline_ms;
     bool count_only;
     bool collect_excluded;
@@ -504,8 +506,15 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
         fl->limit_exceeded = true;
         return;
     }
+    size_t measured_size = size > 0 ? (size_t)size : 0;
+    if (fl->count_only && (fl->total_bytes > fl->max_total_bytes ||
+                           measured_size > fl->max_total_bytes - fl->total_bytes)) {
+        fl->limit_exceeded = true;
+        return;
+    }
     if (fl->count_only) {
         fl->count++;
+        fl->total_bytes += measured_size;
         return;
     }
     if (fl->count >= fl->capacity) {
@@ -1117,7 +1126,8 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
                                            int *excluded_count_out,
                                            cbm_ignored_file_t **ignored_out, int *ignored_count_out,
                                            int *ignored_total_out, bool count_only, int max_files,
-                                           uint64_t deadline_ms) {
+                                           size_t max_total_bytes, uint64_t deadline_ms,
+                                           size_t *total_bytes_out) {
     if (excluded_out) {
         *excluded_out = NULL;
     }
@@ -1132,6 +1142,9 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     }
     if (ignored_total_out) {
         *ignored_total_out = 0;
+    }
+    if (total_bytes_out) {
+        *total_bytes_out = 0;
     }
     if (!repo_path || !out || !count || (count_only && max_files < 0)) {
         return CBM_DISCOVER_ERROR;
@@ -1206,6 +1219,7 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     /* Walk */
     file_list_t fl = {
         .max_files = count_only ? max_files : -1,
+        .max_total_bytes = count_only ? max_total_bytes : SIZE_MAX,
         .deadline_ms = count_only ? deadline_ms : 0,
         .count_only = count_only,
         .collect_excluded = !count_only && excluded_out != NULL,
@@ -1224,6 +1238,9 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         cbm_discover_free_excluded(fl.excluded, fl.excluded_count);
         cbm_discover_free_ignored(fl.ignored, fl.ignored_count);
         *count = fl.count;
+        if (total_bytes_out) {
+            *total_bytes_out = fl.total_bytes;
+        }
         if (fl.failed) {
             return CBM_DISCOVER_ERROR;
         }
@@ -1269,7 +1286,7 @@ int cbm_discover_ex2(const char *repo_path, const cbm_discover_opts_t *opts, cbm
                      cbm_ignored_file_t **ignored_out, int *ignored_count_out,
                      int *ignored_total_out) {
     return discover_impl(repo_path, opts, out, count, excluded_out, excluded_count_out, ignored_out,
-                         ignored_count_out, ignored_total_out, false, 0, 0);
+                         ignored_count_out, ignored_total_out, false, 0, SIZE_MAX, 0, NULL);
 }
 
 cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
@@ -1283,10 +1300,36 @@ cbm_discover_status_t cbm_discover_count_bounded(const char *repo_path,
     }
     cbm_file_info_t *files = NULL;
     int count = 0;
-    cbm_discover_status_t status = discover_impl(repo_path, opts, &files, &count, NULL, NULL, NULL,
-                                                 NULL, NULL, true, max_files, deadline_ms);
+    cbm_discover_status_t status =
+        discover_impl(repo_path, opts, &files, &count, NULL, NULL, NULL, NULL, NULL, true,
+                      max_files, SIZE_MAX, deadline_ms, NULL);
     cbm_discover_free(files, count);
     *count_out = status == CBM_DISCOVER_ERROR ? -1 : count;
+    return status;
+}
+
+cbm_discover_status_t cbm_discover_measure_bounded(const char *repo_path,
+                                                   const cbm_discover_opts_t *opts, int max_files,
+                                                   size_t max_total_bytes, uint64_t deadline_ms,
+                                                   int *count_out, size_t *total_bytes_out) {
+    if (count_out) {
+        *count_out = -1;
+    }
+    if (total_bytes_out) {
+        *total_bytes_out = 0;
+    }
+    if (!repo_path || !count_out || !total_bytes_out || max_files < 0) {
+        return CBM_DISCOVER_ERROR;
+    }
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    size_t total_bytes = 0;
+    cbm_discover_status_t status =
+        discover_impl(repo_path, opts, &files, &count, NULL, NULL, NULL, NULL, NULL, true,
+                      max_files, max_total_bytes, deadline_ms, &total_bytes);
+    cbm_discover_free(files, count);
+    *count_out = status == CBM_DISCOVER_ERROR ? -1 : count;
+    *total_bytes_out = total_bytes;
     return status;
 }
 

@@ -779,6 +779,10 @@ bool cbm_index_worker_request_cancel(cbm_index_worker_handle_t *handle) {
            cbm_subprocess_request_cancel(handle->process);
 }
 
+bool cbm_index_worker_observed_tree_rss(cbm_index_worker_handle_t *handle, size_t *bytes_out) {
+    return handle && cbm_subprocess_observed_tree_rss(handle->process, bytes_out);
+}
+
 const char *cbm_index_worker_response_path(const cbm_index_worker_handle_t *handle) {
     return handle ? handle->response_path : NULL;
 }

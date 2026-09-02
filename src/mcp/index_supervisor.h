@@ -179,6 +179,7 @@ cbm_index_worker_poll_t cbm_index_worker_poll(cbm_index_worker_handle_t *handle,
  * bounded containment failure is explicitly surfaced in the result). The
  * owner must stop concurrent cancellation producers before destroy. */
 bool cbm_index_worker_request_cancel(cbm_index_worker_handle_t *handle);
+bool cbm_index_worker_observed_tree_rss(cbm_index_worker_handle_t *handle, size_t *bytes_out);
 
 /* Borrowed diagnostic paths, stable until destroy. Every start uses securely
  * created unique files, so concurrent jobs in one daemon cannot collide. The

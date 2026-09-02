@@ -890,6 +890,67 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     return is_upstream_config_key(sr->key_path);
 }
 
+static CBMHashTable *cbm_pipeline_collect_infra_route_denials(const cbm_file_info_t *files,
+                                                              CBMFileResult **result_cache,
+                                                              int file_count,
+                                                              CBMHashTable *denied) {
+    if (!denied) {
+        denied = cbm_ht_create(16);
+    }
+    if (!denied) {
+        return NULL;
+    }
+    for (int i = 0; i < file_count; i++) {
+        if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
+            is_ci_tooling_config(files[i].rel_path)) {
+            continue;
+        }
+        for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
+            const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+            if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://") ||
+                !route_sr_denied(sr) || cbm_ht_has(denied, sr->value)) {
+                continue;
+            }
+            char *owned = strdup(sr->value);
+            if (owned) {
+                cbm_ht_set(denied, owned, owned);
+            }
+        }
+    }
+    return denied;
+}
+
+static void cbm_pipeline_emit_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
+                                           CBMFileResult **result_cache, int file_count,
+                                           CBMHashTable *denied) {
+    for (int i = 0; i < file_count; i++) {
+        if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
+            is_ci_tooling_config(files[i].rel_path)) {
+            continue;
+        }
+        for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
+            const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+            if (sr->kind == CBM_STRREF_URL && sr->value && strstr(sr->value, "://") &&
+                (!denied || !cbm_ht_has(denied, sr->value))) {
+                try_upsert_infra_route(gbuf, sr, files[i].rel_path);
+            }
+        }
+    }
+}
+
+static void free_owned_string_entry(const char *key, void *value, void *userdata) {
+    (void)value;
+    (void)userdata;
+    free((void *)key);
+}
+
+static void cbm_pipeline_free_infra_route_denials(CBMHashTable *denied) {
+    if (denied) {
+        cbm_ht_foreach(denied, free_owned_string_entry, NULL);
+        cbm_ht_free(denied);
+    }
+}
+
 static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
     /* DENY-WINS-BY-VALUE: the same URL is often extracted as several string_refs
@@ -898,29 +959,10 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
      * per-ref guard — e.g. a denied full path `registries.terraform-registry.url`
      * is defeated by a sibling leaf `url`. So pass 1 collects every URL value
      * denied under ANY of its refs; pass 2 mints only values never denied. (#521) */
-    CBMHashTable *denied = cbm_ht_create(16);
-    for (int pass = 0; pass < 2; pass++) {
-        for (int i = 0; i < file_count; i++) {
-            if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
-                is_ci_tooling_config(files[i].rel_path)) {
-                continue;
-            }
-            for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
-                const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
-                if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
-                    continue;
-                }
-                if (pass == 0) {
-                    if (denied && route_sr_denied(sr)) {
-                        cbm_ht_set(denied, sr->value, (void *)1);
-                    }
-                } else if (!denied || !cbm_ht_has(denied, sr->value)) {
-                    try_upsert_infra_route(gbuf, sr, files[i].rel_path);
-                }
-            }
-        }
-    }
-    cbm_ht_free(denied);
+    CBMHashTable *denied =
+        cbm_pipeline_collect_infra_route_denials(files, result_cache, file_count, NULL);
+    cbm_pipeline_emit_infra_routes(gbuf, files, result_cache, file_count, denied);
+    cbm_pipeline_free_infra_route_denials(denied);
 }
 
 /* Run decorator_tags, configlink, and route matching passes. */
@@ -1167,10 +1209,359 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return rc;
 }
 
+enum {
+    CBM_LARGE_REPOSITORY_FILE_THRESHOLD = 10000,
+    CBM_LARGE_REPOSITORY_BATCH_FILES = 512,
+};
+
+static const size_t CBM_LARGE_REPOSITORY_SOURCE_BYTES = (size_t)512 * (size_t)1024 * (size_t)1024;
+
+int cbm_pipeline_streaming_batch_size(const cbm_file_info_t *files, int file_count) {
+    char value[CBM_SZ_32];
+    if (cbm_safe_getenv("CBM_STREAMING_BATCH_FILES", value, sizeof(value), NULL) != NULL) {
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+        if (!end || *end != '\0' || parsed <= 0 || parsed > 4096) {
+            cbm_log_error("pipeline.streaming.invalid_batch", "value", value);
+            return -1;
+        }
+        return parsed > file_count ? file_count : (int)parsed;
+    }
+
+    char mode[CBM_SZ_32];
+    const char *configured = cbm_safe_getenv("CBM_INDEX_RESOURCE_MODE", mode, sizeof(mode), NULL);
+    if (configured && strcmp(mode, "daily") != 0 && strcmp(mode, "large") != 0 &&
+        strcmp(mode, "auto") != 0) {
+        cbm_log_error("pipeline.resource_mode.invalid", "value", mode);
+        return -1;
+    }
+    if (configured && strcmp(mode, "daily") == 0) {
+        cbm_log_info("pipeline.resource_mode", "selected", "daily", "reason", "manual");
+        return 0;
+    }
+
+    size_t source_bytes = 0;
+    for (int i = 0; files && i < file_count; i++) {
+        size_t file_size = files[i].size > 0 ? (size_t)files[i].size : 0;
+        source_bytes = file_size > SIZE_MAX - source_bytes ? SIZE_MAX : source_bytes + file_size;
+    }
+    bool large = (configured && strcmp(mode, "large") == 0) ||
+                 file_count >= CBM_LARGE_REPOSITORY_FILE_THRESHOLD ||
+                 source_bytes >= CBM_LARGE_REPOSITORY_SOURCE_BYTES;
+    if (!large) {
+        cbm_log_info("pipeline.resource_mode", "selected", "daily", "reason", "auto");
+        return 0;
+    }
+    cbm_log_info(
+        "pipeline.resource_mode", "selected", "large", "reason",
+        configured && strcmp(mode, "large") == 0
+            ? "manual"
+            : (file_count >= CBM_LARGE_REPOSITORY_FILE_THRESHOLD ? "file_count" : "source_bytes"));
+    return file_count < CBM_LARGE_REPOSITORY_BATCH_FILES ? file_count
+                                                         : CBM_LARGE_REPOSITORY_BATCH_FILES;
+}
+
+static void free_result_cache(CBMFileResult **cache, int count) {
+    if (!cache) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        cbm_free_result(cache[i]);
+    }
+    free(cache);
+}
+
+static int append_surface_rows(cbm_lsp_surface_row_t **all_rows, int *all_count, int *all_cap,
+                               cbm_lsp_surface_row_t *rows, int count) {
+    if (count <= 0) {
+        free(rows);
+        return 0;
+    }
+    if (*all_count > INT32_MAX - count) {
+        cbm_store_free_lsp_surfaces(rows, count);
+        return -1;
+    }
+    int needed = *all_count + count;
+    if (needed > *all_cap) {
+        int new_cap = *all_cap > 0 ? *all_cap : 256;
+        while (new_cap < needed && new_cap <= INT32_MAX / 2) {
+            new_cap *= 2;
+        }
+        if (new_cap < needed) {
+            new_cap = needed;
+        }
+        cbm_lsp_surface_row_t *grown = realloc(*all_rows, (size_t)new_cap * sizeof(**all_rows));
+        if (!grown) {
+            cbm_store_free_lsp_surfaces(rows, count);
+            return -1;
+        }
+        *all_rows = grown;
+        *all_cap = new_cap;
+    }
+    memcpy(*all_rows + *all_count, rows, (size_t)count * sizeof(*rows));
+    *all_count = needed;
+    free(rows); /* element ownership transferred */
+    return 0;
+}
+
+static int rehydrate_surface_defs(CBMArena *arena, const cbm_lsp_surface_row_t *rows, int row_count,
+                                  CBMLSPDef **out_defs, int *out_count) {
+    CBMLSPDef *defs = NULL;
+    int count = 0;
+    int cap = 0;
+    for (int i = 0; i < row_count; i++) {
+        CBMLSPDef *file_defs = NULL;
+        int file_count = cbm_lsp_surface_defs_from_json(arena, rows[i].defs_json, &file_defs);
+        if (file_count < 0 || count > INT32_MAX - file_count) {
+            free(defs);
+            return -1;
+        }
+        int needed = count + file_count;
+        if (needed > cap) {
+            int new_cap = cap > 0 ? cap : 1024;
+            while (new_cap < needed && new_cap <= INT32_MAX / 2) {
+                new_cap *= 2;
+            }
+            if (new_cap < needed) {
+                new_cap = needed;
+            }
+            CBMLSPDef *grown = realloc(defs, (size_t)new_cap * sizeof(*defs));
+            if (!grown) {
+                free(defs);
+                return -1;
+            }
+            defs = grown;
+            cap = new_cap;
+        }
+        if (file_count > 0) {
+            memcpy(defs + count, file_defs, (size_t)file_count * sizeof(*defs));
+            count += file_count;
+        }
+    }
+    *out_defs = defs;
+    *out_count = count;
+    return 0;
+}
+
+static int run_parallel_streaming_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
+                                           const cbm_file_info_t *files, int file_count,
+                                           int worker_count, int batch_size, struct timespec *t) {
+    cbm_log_info("pipeline.mode", "mode", "parallel_streaming", "workers", itoa_buf(worker_count),
+                 "files", itoa_buf(file_count), "batch_files", itoa_buf(batch_size));
+    int rc = CBM_NOT_FOUND;
+    _Atomic int64_t shared_ids;
+    atomic_init(&shared_ids, cbm_gbuf_next_id(p->gbuf));
+    char **namespace_names = calloc((size_t)file_count, sizeof(*namespace_names));
+    const char **rels = calloc((size_t)file_count, sizeof(*rels));
+    char **def_modules = calloc((size_t)file_count, sizeof(*def_modules));
+    cbm_lsp_surface_row_t *surface_rows = NULL;
+    int surface_count = 0;
+    int surface_cap = 0;
+    CBMHashTable *infra_denied = NULL;
+    CBMHashTable *namespace_map = NULL;
+    CBMLSPDef *all_defs = NULL;
+    int def_count = 0;
+    CBMArena all_defs_arena;
+    bool all_defs_arena_live = false;
+    CBMModuleDefIndex *module_def_index = NULL;
+    CBMArena cross_lsp_arena;
+    bool cross_lsp_arena_live = false;
+    CBMCrossLspRegistries cross_registries = {0};
+    CBMFileResult **cache = NULL;
+    int cache_count = 0;
+    if (!namespace_names || !rels || !def_modules) {
+        goto cleanup;
+    }
+    for (int i = 0; i < file_count; i++) {
+        rels[i] = files[i].rel_path;
+    }
+
+    cbm_parallel_extract_opts_t extract_opts = {
+        .retain_sources = false,
+        .retain_sources_set = true,
+    };
+    _Atomic int streaming_bp_futile;
+    atomic_init(&streaming_bp_futile, 0);
+    extract_opts.backpressure_futile = &streaming_bp_futile;
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    for (int offset = 0; offset < file_count; offset += batch_size) {
+        cache_count = file_count - offset < batch_size ? file_count - offset : batch_size;
+        cache = calloc((size_t)cache_count, sizeof(*cache));
+        if (!cache) {
+            goto cleanup;
+        }
+        rc = cbm_parallel_extract_ex(ctx, files + offset, cache_count, cache, &shared_ids,
+                                     worker_count, &extract_opts);
+        if (rc != 0 || check_cancel(p)) {
+            goto cleanup;
+        }
+        cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+        rc = cbm_register_definitions_from_cache(ctx, files + offset, cache_count, cache);
+        if (rc != 0) {
+            goto cleanup;
+        }
+        /* Registry linking inserts serial edges into the main graph. Carry its
+         * new watermark into the next extraction batch so worker-local IDs
+         * cannot collide with those edges. */
+        atomic_store(&shared_ids, cbm_gbuf_next_id(p->gbuf));
+        for (int i = 0; i < cache_count; i++) {
+            if (cache[i] && cache[i]->namespace_name) {
+                namespace_names[offset + i] = strdup(cache[i]->namespace_name);
+                if (!namespace_names[offset + i]) {
+                    goto cleanup;
+                }
+            }
+        }
+        infra_denied = cbm_pipeline_collect_infra_route_denials(files + offset, cache, cache_count,
+                                                                infra_denied);
+
+        int *def_starts = calloc((size_t)cache_count + 1, sizeof(*def_starts));
+        int batch_def_count = 0;
+        CBMLSPDef *batch_defs =
+            def_starts ? cbm_pxc_collect_all_defs(ctx, cache, files + offset, cache_count,
+                                                  ctx->project_name, def_modules + offset,
+                                                  &batch_def_count, def_starts)
+                       : NULL;
+        cbm_lsp_surface_row_t *batch_rows = NULL;
+        int batch_row_count = 0;
+        if (!def_starts ||
+            cbm_lsp_surface_build_rows(ctx->project_name, cache, files + offset, cache_count,
+                                       batch_defs, def_starts, &batch_rows,
+                                       &batch_row_count) != 0 ||
+            append_surface_rows(&surface_rows, &surface_count, &surface_cap, batch_rows,
+                                batch_row_count) != 0) {
+            free(batch_defs);
+            free(def_starts);
+            goto cleanup;
+        }
+        free(batch_defs);
+        free(def_starts);
+        free_result_cache(cache, cache_count);
+        cache = NULL;
+        cache_count = 0;
+        cbm_mem_collect();
+        cbm_log_info("pipeline.streaming.pass_a_batch", "completed",
+                     itoa_buf(offset + batch_size > file_count ? file_count : offset + batch_size),
+                     "total", itoa_buf(file_count), "rss_mb",
+                     itoa_buf((int)(cbm_mem_rss() / (1024 * 1024))));
+    }
+    cbm_log_info("pass.timing", "pass", "streaming_pass_a", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(*t)));
+    log_phase_mem("streaming_pass_a");
+
+    namespace_map = cbm_pipeline_namespace_map_build_names(
+        ctx->project_name, (const char *const *)namespace_names, rels, file_count);
+    cbm_arena_init(&all_defs_arena);
+    all_defs_arena_live = true;
+    if (rehydrate_surface_defs(&all_defs_arena, surface_rows, surface_count, &all_defs,
+                               &def_count) != 0) {
+        goto cleanup;
+    }
+    module_def_index = all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    cbm_arena_init(&cross_lsp_arena);
+    cross_lsp_arena_live = true;
+    if (all_defs) {
+        cross_registries.go = cbm_go_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        cross_registries.python =
+            cbm_py_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        cross_registries.c = cbm_c_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        cross_registries.cs = cbm_cs_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+        cross_registries.ts = cbm_ts_build_cross_registry(&cross_lsp_arena, all_defs, def_count);
+    }
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    for (int offset = 0; offset < file_count; offset += batch_size) {
+        cache_count = file_count - offset < batch_size ? file_count - offset : batch_size;
+        cache = calloc((size_t)cache_count, sizeof(*cache));
+        if (!cache) {
+            goto cleanup;
+        }
+        rc = cbm_parallel_extract_ex(ctx, files + offset, cache_count, cache, &shared_ids,
+                                     worker_count, &extract_opts);
+        if (rc != 0 || check_cancel(p)) {
+            goto cleanup;
+        }
+        cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+        rc = cbm_create_relationship_carriers_from_cache(ctx, files + offset, cache_count, cache,
+                                                         namespace_map);
+        if (rc != 0) {
+            goto cleanup;
+        }
+        cbm_pipeline_emit_infra_routes(p->gbuf, files + offset, cache, cache_count, infra_denied);
+        cbm_pipeline_process_infra_bindings(p->gbuf, files + offset, cache, cache_count);
+        /* Carrier/infra creation materializes serial nodes and edges between
+         * the two parallel phases. This mirrors the full-cache pipeline's
+         * registry watermark handoff. */
+        atomic_store(&shared_ids, cbm_gbuf_next_id(p->gbuf));
+        rc = cbm_parallel_resolve_ex(ctx, files + offset, cache_count, cache, &shared_ids,
+                                     worker_count, all_defs, def_count, def_modules + offset,
+                                     module_def_index, &cross_registries, false);
+        if (rc != 0) {
+            goto cleanup;
+        }
+        cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+        free_result_cache(cache, cache_count);
+        cache = NULL;
+        cache_count = 0;
+        cbm_mem_collect();
+        cbm_log_info("pipeline.streaming.pass_b_batch", "completed",
+                     itoa_buf(offset + batch_size > file_count ? file_count : offset + batch_size),
+                     "total", itoa_buf(file_count), "rss_mb",
+                     itoa_buf((int)(cbm_mem_rss() / (1024 * 1024))));
+    }
+    rc = cbm_parallel_resolve_finalize(ctx);
+    if (rc != 0) {
+        goto cleanup;
+    }
+    cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
+    cbm_log_info("pass.timing", "pass", "streaming_pass_b", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(*t)));
+    log_phase_mem("streaming_pass_b");
+    cbm_pipeline_set_lsp_surfaces(ctx->pipeline, surface_rows, surface_count);
+    surface_rows = NULL;
+    surface_count = 0;
+
+    cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    cbm_pipeline_pass_k8s(ctx, files, file_count);
+    cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
+    rc = check_cancel(p) ? CBM_NOT_FOUND : 0;
+
+cleanup:
+    free_result_cache(cache, cache_count);
+    cbm_pipeline_namespace_map_free(namespace_map);
+    cbm_pipeline_free_infra_route_denials(infra_denied);
+    cbm_pxc_free_module_def_index(module_def_index);
+    if (cross_lsp_arena_live) {
+        cbm_arena_destroy(&cross_lsp_arena);
+    }
+    free(all_defs);
+    if (all_defs_arena_live) {
+        cbm_arena_destroy(&all_defs_arena);
+    }
+    cbm_store_free_lsp_surfaces(surface_rows, surface_count);
+    for (int i = 0; i < file_count; i++) {
+        free(namespace_names ? namespace_names[i] : NULL);
+        free(def_modules ? def_modules[i] : NULL);
+    }
+    free(namespace_names);
+    free(rels);
+    free(def_modules);
+    return rc;
+}
+
 /* Run the parallel pipeline path: extract, registry, resolve, infra, k8s. */
 static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                  const cbm_file_info_t *files, int file_count, int worker_count,
                                  struct timespec *t) {
+    int batch_size = cbm_pipeline_streaming_batch_size(files, file_count);
+    if (batch_size < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (batch_size > 0 && batch_size < file_count) {
+        return run_parallel_streaming_pipeline(p, ctx, files, file_count, worker_count, batch_size,
+                                               t);
+    }
     cbm_log_info("pipeline.mode", "mode", "parallel", "workers", itoa_buf(worker_count), "files",
                  itoa_buf(file_count));
     _Atomic int64_t shared_ids;
@@ -1184,6 +1575,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
     cbm_log_info("pass.timing", "pass", "parallel_extract", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
+    log_phase_mem("parallel_extract");
     if (rc != 0 || check_cancel(p)) {
         for (int i = 0; i < file_count; i++) {
             cbm_free_result(cache[i]);
@@ -1200,6 +1592,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_mem_collect();
     cbm_log_info("mem.collect", "phase", "post_extract", "rss_mb",
                  itoa_buf((int)(cbm_mem_rss() / (1024 * 1024))));
+    log_phase_mem("post_extract_collect");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_build_registry_from_cache(ctx, files, file_count, cache);
     cbm_log_info("pass.timing", "pass", "registry_build", "elapsed_ms",
@@ -1353,6 +1746,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
     }
     free(cache);
+    log_phase_mem("post_resolve_release");
     if (rc != 0) {
         return rc;
     }
@@ -2126,10 +2520,12 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (rc != 0) {
         return rc;
     }
+    log_phase_mem("tests_and_history");
 
     CBM_PROF_START(t_predump);
     run_predump_passes(p, ctx);
     CBM_PROF_END("pipeline", "3_predump_passes_total", t_predump);
+    log_phase_mem("predump");
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     if (cbm_pipeline_persist_test_take_cancel_after_predump()) {
@@ -2145,6 +2541,7 @@ static int run_post_extraction(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     CBM_PROF_START(t_dump);
     rc = dump_and_persist_hashes(p, baseline_manifest, baseline_count, &t);
     CBM_PROF_END("pipeline", "4_dump_and_persist", t_dump);
+    log_phase_mem("dump_and_persist");
     return rc;
 }
 
@@ -2159,6 +2556,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     pass_structure(p, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    log_phase_mem("structure");
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
@@ -2243,6 +2641,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     CBM_PROF_END_N("pipeline", "1_discover", t_discover, file_count);
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
+    log_phase_mem("discover");
     if (rc != 0 || check_cancel(p)) {
         rc = CBM_NOT_FOUND;
         goto cleanup;
@@ -2262,6 +2661,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
         goto cleanup;
     }
+    log_phase_mem("semantic_manifest");
 
     /* Check for existing DB → try incremental or delete for reindex */
     rc = try_incremental_or_delete_db(p, files, file_count, baseline_manifest, baseline_count,
@@ -2347,6 +2747,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     CBM_PROF_END("pipeline", "TOTAL", t_pipeline_total);
 
 cleanup:
+    log_phase_mem("pre_cleanup");
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
     cbm_discover_free(files, file_count);
@@ -2369,6 +2770,7 @@ cleanup:
     cbm_set_user_lang_config(NULL);
     cbm_userconfig_free(p->userconfig);
     p->userconfig = NULL;
+    log_phase_mem("post_cleanup");
     return rc;
 }
 

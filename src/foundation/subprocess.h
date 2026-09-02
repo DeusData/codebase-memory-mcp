@@ -125,6 +125,12 @@ cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t
  * performs signal delivery/escalation. */
 bool cbm_subprocess_request_cancel(cbm_subprocess_t *process);
 
+/* Return the largest observed resident byte total for the complete contained
+ * process tree. The sample is refreshed on each call while the tree is live;
+ * after exit the cached high-water mark remains available until destroy.
+ * false means the platform sample was unavailable and leaves *bytes_out zero. */
+bool cbm_subprocess_observed_tree_rss(cbm_subprocess_t *process, size_t *bytes_out);
+
 /* Release a terminal handle. This never waits or implicitly cancels; passing a
  * still-running handle violates the API contract. NULL is a no-op. */
 void cbm_subprocess_destroy(cbm_subprocess_t *process);

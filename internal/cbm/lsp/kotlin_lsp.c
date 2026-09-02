@@ -412,28 +412,13 @@ static void kt_emit_resolved_kind(KotlinLSPContext *ctx, const char *callee_qn,
         return;
     }
 
-    CBMResolvedCallArray *arr = ctx->resolved_calls;
-    if (arr->count >= arr->cap) {
-        int new_cap = arr->cap == 0 ? 16 : arr->cap * 2;
-        CBMResolvedCall *new_items = (CBMResolvedCall *)cbm_arena_alloc(
-            ctx->arena, (size_t)new_cap * sizeof(CBMResolvedCall));
-        if (!new_items) {
-            return;
-        }
-        if (arr->items && arr->count > 0) {
-            memcpy(new_items, arr->items, (size_t)arr->count * sizeof(CBMResolvedCall));
-        }
-        arr->items = new_items;
-        arr->cap = new_cap;
-    }
-    CBMResolvedCall *rc = &arr->items[arr->count];
-    memset(rc, 0, sizeof(CBMResolvedCall));
-    rc->caller_qn = ctx->enclosing_func_qn;
-    rc->callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
-    rc->strategy = strategy;
-    rc->confidence = confidence;
-    rc->kind = kind;
-    arr->count++;
+    CBMResolvedCall rc = {0};
+    rc.caller_qn = ctx->enclosing_func_qn;
+    rc.callee_qn = cbm_arena_strdup(ctx->arena, callee_qn);
+    rc.strategy = strategy;
+    rc.confidence = confidence;
+    rc.kind = kind;
+    cbm_resolvedcall_push(ctx->resolved_calls, ctx->arena, rc);
 }
 
 static void kt_stamp_resolved_site(KotlinLSPContext *ctx, int first, TSNode site) {
@@ -3177,8 +3162,7 @@ static const CBMType *kt_eval_navigation_expression_type_at(KotlinLSPContext *ct
             if (is_member) {
                 /* A member call on an `object`/`companion object` singleton is a
                  * static dispatch; on a regular class instance it is a method. */
-                const CBMRegisteredType *recv_rt =
-                    cbm_registry_lookup_type(ctx->registry, recv_qn);
+                const CBMRegisteredType *recv_rt = cbm_registry_lookup_type(ctx->registry, recv_qn);
                 strat = (recv_rt && recv_rt->is_object) ? "lsp_kt_static" : "lsp_kt_method";
             }
             /* A call through the lambda implicit parameter `it` (e.g. inside
@@ -5255,8 +5239,7 @@ static void kt_register_cross_def(CBMTypeRegistry *reg, CBMArena *arena, const C
         rt.is_interface = (strcmp(d->label, "Interface") == 0) || d->is_interface;
         if (field_map) {
             const KtCrossFieldList *fl =
-                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map,
-                                                     d->qualified_name);
+                (const KtCrossFieldList *)cbm_ht_get((CBMHashTable *)field_map, d->qualified_name);
             if (fl && fl->count > 0) {
                 rt.field_names = fl->names;
                 rt.field_types = fl->types;

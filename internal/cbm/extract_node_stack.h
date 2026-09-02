@@ -4,10 +4,12 @@
  * Replaces fixed-size TSNode stack[] arrays that silently drop AST subtrees
  * when the stack overflows (GitHub issue #199).
  *
- * Uses the arena allocator for zero-fragmentation growth: old blocks are
- * abandoned (freed when the arena is destroyed at end of file extraction).
- * Initial capacity matches the previous fixed caps so small files allocate
- * no extra memory.
+ * The common capacity lives inline in the traversal's own stack frame. Only an
+ * unusually broad AST spills into the result arena. Call-site capacities
+ * historically mirrored fixed stack limits (usually 512, sometimes 4096), so
+ * allocating every traversal there made temporary work survive with durable
+ * extraction results across the whole repository. Inline storage preserves the
+ * same traversal order and geometric growth without that lifetime inversion.
  */
 #ifndef CBM_EXTRACT_NODE_STACK_H
 #define CBM_EXTRACT_NODE_STACK_H
@@ -20,19 +22,24 @@ typedef struct {
     TSNode *items;
     int count;
     int cap;
+    TSNode inline_items[128];
 } TSNodeStack;
 
-/* Initialize a stack with the given initial capacity, arena-allocated. */
+enum { TS_NSTACK_INLINE_CAP = 128 };
+
+/* Initialize with inline storage; arena is used only if the stack spills. */
 static inline void ts_nstack_init(TSNodeStack *s, CBMArena *arena, int initial_cap) {
-    s->items = (TSNode *)cbm_arena_alloc(arena, (size_t)initial_cap * sizeof(TSNode));
+    (void)arena;
+    (void)initial_cap;
+    s->items = s->inline_items;
     s->count = 0;
-    s->cap = s->items ? initial_cap : 0;
+    s->cap = TS_NSTACK_INLINE_CAP;
 }
 
 /* Push a node onto the stack, growing 2x if needed. */
 static inline void ts_nstack_push(TSNodeStack *s, CBMArena *arena, TSNode node) {
     if (s->count >= s->cap) {
-        int new_cap = s->cap ? s->cap * 2 : 512;
+        int new_cap = s->cap ? s->cap * 2 : TS_NSTACK_INLINE_CAP;
         TSNode *new_items = (TSNode *)cbm_arena_alloc(arena, (size_t)new_cap * sizeof(TSNode));
         if (!new_items)
             return; /* OOM: best-effort, stop growing */
