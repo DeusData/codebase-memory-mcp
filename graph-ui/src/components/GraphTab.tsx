@@ -27,6 +27,7 @@ import { ResizeHandle } from "./ResizeHandle";
 import { ErrorBoundary } from "./ErrorBoundary";
 import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
 import { colorForStatus } from "../lib/colors";
+import { EDGE_RENDER_LIMIT, sampleEdges } from "../lib/edgeBudget";
 
 /* Persist panel widths */
 function loadWidth(key: string, fallback: number): number {
@@ -62,6 +63,19 @@ interface GraphTabProps {
 export function formatGraphLimitNotice(data: GraphData | null): string | null {
   if (!data || data.total_nodes <= data.nodes.length) return null;
   return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes (${data.edges.length.toLocaleString("en-US")} edges). Raise the node budget or use filters.`;
+}
+
+/** Filtered graph data, plus how many edges matched the current filters
+ * before the render budget (EDGE_RENDER_LIMIT) sampled them down. */
+export interface FilteredGraphData extends GraphData {
+  edgeFilterTotal: number;
+}
+
+export function formatEdgeLimitNotice(
+  data: FilteredGraphData | null,
+): string | null {
+  if (!data || data.edgeFilterTotal <= data.edges.length) return null;
+  return `Rendering ${data.edges.length.toLocaleString("en-US")} of ${data.edgeFilterTotal.toLocaleString("en-US")} edges (render budget). Use filters to narrow further.`;
 }
 
 export function GraphTab({ project }: GraphTabProps) {
@@ -130,7 +144,7 @@ export function GraphTab({ project }: GraphTabProps) {
   }, [data]);
 
   /* Compute filtered data */
-  const filteredData: GraphData | null = useMemo(() => {
+  const filteredData: FilteredGraphData | null = useMemo(() => {
     if (!data) return null;
 
     /* Status-based filters (dead-code view) */
@@ -147,28 +161,44 @@ export function GraphTab({ project }: GraphTabProps) {
 
     const nodes = data.nodes.filter(keep).map(paint);
     const nodeIds = new Set(nodes.map((n) => n.id));
-    const edges = data.edges.filter(
+    const filteredEdges = data.edges.filter(
       (e) =>
         enabledEdgeTypes.has(e.type) &&
         nodeIds.has(e.source) &&
         nodeIds.has(e.target),
     );
+    /* Cap what actually reaches EdgeLines — a deterministic sample so the
+     * geometry buffers built downstream stay bounded on huge graphs (#2039)
+     * regardless of how many edges survived filtering. */
+    const edges = sampleEdges(filteredEdges, EDGE_RENDER_LIMIT);
 
     const linked_projects = data.linked_projects?.map((lp) => {
       const lpNodes = lp.nodes.filter(keep).map(paint);
       const lpIds = new Set(lpNodes.map((n) => n.id));
-      const lpEdges = lp.edges.filter(
-        (e) =>
-          enabledEdgeTypes.has(e.type) && lpIds.has(e.source) && lpIds.has(e.target),
+      const lpEdges = sampleEdges(
+        lp.edges.filter(
+          (e) =>
+            enabledEdgeTypes.has(e.type) && lpIds.has(e.source) && lpIds.has(e.target),
+        ),
+        EDGE_RENDER_LIMIT,
       );
-      const crossEdges = lp.cross_edges.filter(
-        (e) =>
-          enabledEdgeTypes.has(e.type) && nodeIds.has(e.source) && lpIds.has(e.target),
+      const crossEdges = sampleEdges(
+        lp.cross_edges.filter(
+          (e) =>
+            enabledEdgeTypes.has(e.type) && nodeIds.has(e.source) && lpIds.has(e.target),
+        ),
+        EDGE_RENDER_LIMIT,
       );
       return { ...lp, nodes: lpNodes, edges: lpEdges, cross_edges: crossEdges };
     });
 
-    return { nodes, edges, total_nodes: data.total_nodes, linked_projects };
+    return {
+      nodes,
+      edges,
+      total_nodes: data.total_nodes,
+      linked_projects,
+      edgeFilterTotal: filteredEdges.length,
+    };
   }, [
     data,
     enabledLabels,
@@ -178,6 +208,7 @@ export function GraphTab({ project }: GraphTabProps) {
     hideEntryPoints,
     hideTests,
   ]);
+  const edgeLimitNotice = formatEdgeLimitNotice(filteredData);
 
   /* Re-read the persisted budget when the project changes… */
   useEffect(() => {
@@ -481,6 +512,9 @@ export function GraphTab({ project }: GraphTabProps) {
               )}
               {limitNotice && (
                 <p className="text-amber-300/80 mt-0.5">{limitNotice}</p>
+              )}
+              {edgeLimitNotice && (
+                <p className="text-amber-300/80 mt-0.5">{edgeLimitNotice}</p>
               )}
               {highlightedIds && highlightedIds.size > 0 && (
                 <p className="text-cyan-400/50 mt-0.5">
