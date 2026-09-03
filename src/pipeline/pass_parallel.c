@@ -2492,8 +2492,13 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                     lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                     lang == CBM_LANG_ARKTS;
+        /* Bare-call local-binding suppression — see the note in pass_calls.c.
+         * This gate MUST stay identical to the one there. */
+        bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
         bool drop_plain_call =
-            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
+            cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+            cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                                 call->callee_is_locally_bound, res.strategy);
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -2670,9 +2675,10 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
-            /* #1942: a bare Go reference can never denote a struct field. */
-            if (tgt &&
-                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+            /* #1942/#1962: a bare Go reference can never denote a struct
+             * field; the member half of a selector may. */
+            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      tgt->label)) {
                 continue;
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
@@ -2760,8 +2766,9 @@ static void resolve_file_rw(resolve_ctx_t *rc, resolve_worker_state_t *ws, CBMFi
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
-        /* #1942: a bare Go reference can never denote a struct field. */
-        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
+        /* #1942/#1962: a bare Go reference can never denote a struct field;
+         * a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
             continue;
         }
         const char *etype = rw->is_write ? "WRITES" : "READS";

@@ -246,14 +246,14 @@ static void process_body_type_ref(CBMExtractCtx *ctx, TSNode node, const char *f
 // Walk function body for type references (casts, type assertions, local var types, generics).
 static void walk_body_type_refs(CBMExtractCtx *ctx, TSNode root, const char *func_qn) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         process_body_type_ref(ctx, node, func_qn);
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }
@@ -290,8 +290,8 @@ static void walk_type_refs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *s
     }
 
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, 4096);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, 4096);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -302,7 +302,7 @@ static void walk_type_refs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *s
         }
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_ONE; i >= 0; i--) {
-            ts_nstack_push(&stack, ctx->arena, ts_node_child(node, (uint32_t)i));
+            ts_nstack_push(&stack, ts_node_child(node, (uint32_t)i));
         }
     }
 }

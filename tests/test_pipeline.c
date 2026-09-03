@@ -4857,6 +4857,17 @@ static void write_go_bare_field_fixture(const char *tmp, int pad_files) {
                     "\terr := errors.New(\"x\")\n"
                     "\treturn err\n"
                     "}\n");
+    /* #1962: genuine selector references from a sibling file of the same
+     * package. `t.err = nil` writes the field through a selector; `t.n` reads
+     * it. The extractor strips the receiver on both paths, so only the
+     * is_member_access signal can distinguish these from Run's bare local. */
+    write_temp_file(tmp, "state/reset.go",
+                    "package state\n"
+                    "\n"
+                    "func (t *Tracker) Reset() int {\n"
+                    "\tt.err = nil\n"
+                    "\treturn t.n\n"
+                    "}\n");
     for (int i = 0; i < pad_files; i++) {
         char name[64];
         char body[128];
@@ -4896,6 +4907,11 @@ TEST(pipeline_go_bare_ref_never_binds_field) {
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+    /* #1962, reproduce-first: RED while the guard is a blanket veto — genuine
+     * selector references must reach the field (write via `t.err = nil`,
+     * value use via `t.n`). */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -4927,6 +4943,10 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
     ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+    /* #1962 parallel twin: resolve_file_rw / resolve_file_usages must honour
+     * the member-access signal exactly like the sequential resolvers. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -5082,6 +5102,60 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     PASS();
 }
 
+/* Python bare-call local-binding suppression, sequential path. The bare-call
+ * counterpart of the receiver guard above: `run` is a PARAMETER, so `run()`
+ * cannot be the module-level `run` and must not bind SatoriLive.run.
+ *
+ * The positive control is deliberately a CROSS-FILE bare call with no import,
+ * so it resolves by a weak short-name strategy — one this guard could have
+ * killed. Asserting a same-file (same_module) edge instead would prove nothing,
+ * because no guard in this codebase touches same_module for any input.
+ * Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_python_bare_local_binding_suppresses_weak_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_bare_seq_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "live.py",
+                    "class SatoriLive:\n"
+                    "    def run(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "helpers.py",
+                    "def compute_widget_total():\n"
+                    "    return 7\n");
+    write_temp_file(tmp, "gate.py",
+                    "def _run_with_heavy_slot(run):\n"
+                    "    return run()\n"
+                    "\n"
+                    "def uses_free_function():\n"
+                    "    return compute_widget_total()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: the callee is shadowed by a parameter. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "run"));
+    /* POSITIVE: an unshadowed cross-file bare call survives. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "uses_free_function", "compute_widget_total"));
+    /* Tripwire: a run that emitted no edges at all would satisfy the negative
+     * assertion vacuously. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Parallel Python regression for #1276. The field-type heuristic capitalizes
  * the receiver token and previously promoted accelerator.print() to
  * MockAccelerator.print at 0.85; ordinary suffix matching also selected one
@@ -5166,6 +5240,78 @@ TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges) {
     /* POSITIVE: import-bound and bare local calls survive the parallel path too. */
     ASSERT_TRUE(cross_file_call_exists(s, project, "train", "compute"));
     ASSERT_TRUE(cross_file_call_exists(s, project, "train", "local_helper"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel counterpart. >= 50 files forces pass_parallel.c, which is wired with
+ * the same gate: a guard wired on only one resolver produces an edge on the
+ * sequential path and not the parallel one, breaking MT determinism. #1386
+ * wired both and tested only the sequential path, and the `parallel` suite is
+ * exactly what catches that. Same both-directions pin as the sequential test. */
+TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_bare_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "live.py",
+                    "class SatoriLive:\n"
+                    "    def run(self):\n"
+                    "        return 1\n"
+                    "\n"
+                    "class BatchJob:\n"
+                    "    def execute(self):\n"
+                    "        return 2\n");
+    write_temp_file(tmp, "helpers.py",
+                    "def compute_widget_total():\n"
+                    "    return 7\n");
+    write_temp_file(tmp, "gate.py",
+                    "def _run_with_heavy_slot(run, execute):\n"
+                    "    run()\n"
+                    "    return execute()\n"
+                    "\n"
+                    "def uses_free_function():\n"
+                    "    return compute_widget_total()\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_bare_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: both callees are shadowed by parameters. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "run"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "execute"));
+    /* POSITIVE: the unshadowed cross-file bare call survives the parallel path. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "uses_free_function", "compute_widget_total"));
+    /* Tripwire against a vacuous pass. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -13121,6 +13267,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
+    RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
+    RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);

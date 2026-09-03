@@ -7464,6 +7464,12 @@ static const char *detect_arch(void) {
 
 /* ── Agent config install/refresh (shared by install + update) ── */
 
+/* Set by `install --clients=...` after validation and consumed by both the
+ * legacy detector and the registry-backed client path (#1558, #1798). */
+static const char *g_client_selection = NULL;
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
+static bool cli_clients_selects_registry_client(const char *spec, cbm_agent_client_id_t client_id);
+static void cli_clients_print_list(FILE *out);
 static void print_detected_registry_agents(const char *home, bool *any);
 
 /* Print detected agent names on a single line. */
@@ -8285,7 +8291,10 @@ static void print_detected_registry_agents(const char *home, bool *any) {
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (profile && cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (profile &&
+            (!g_client_selection ||
+             cli_clients_selects_registry_client(g_client_selection, profile->id)) &&
+            cbm_agent_client_detect(profile->id, &registry.options)) {
             printf(" %s", profile->display_name);
             *any = true;
         }
@@ -8671,7 +8680,10 @@ static void install_agent_client_registry(const char *home, const char *binary_p
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (!profile || !cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (!profile ||
+            (g_client_selection &&
+             !cli_clients_selects_registry_client(g_client_selection, profile->id)) ||
+            !cbm_agent_client_detect(profile->id, &registry.options)) {
             continue;
         }
         if (!g_install_plan) {
@@ -9545,13 +9557,6 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     }
 }
 
-/* #1558: set by `install --clients=...` after validation, consumed at the one
- * place detection happens. Validation runs in cbm_cmd_install so an unknown
- * token fails before anything is written, not midway through configuring. */
-static const char *g_client_selection = NULL;
-static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
-static void cli_clients_print_list(FILE *out);
-
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
@@ -9679,9 +9684,9 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
  * Codex had to revert the OpenCode and Cursor integrations by hand, and the
  * next install silently recreated them. `--clients=claude,codex` restricts it.
  *
- * The table is the flag's vocabulary AND its documentation: 26 clients ship
- * here, with tokens nobody would guess (factory-droid, mistral-vibe,
- * copilot-cli), so `--clients=help` prints every token. A selector whose
+ * The tables are the flag's vocabulary AND its documentation, with tokens
+ * nobody would guess (factory-droid, mistral-vibe, copilot-cli), so
+ * `--clients=help` prints every token. A selector whose
  * accepted values can only be learned from the source is not a usable
  * selector, and an unrecognised token fails loudly with the list rather than
  * silently configuring nothing. */
@@ -9730,8 +9735,38 @@ static void cli_clients_print_list(FILE *out) {
     for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
         (void)fprintf(out, "  %-16s %s\n", CLI_CLIENTS[i].token, CLI_CLIENTS[i].display);
     }
+    for (size_t i = 0; i < cbm_agent_client_count(); i++) {
+        const cbm_agent_client_profile_t *profile = cbm_agent_client_at(i);
+        if (profile) {
+            (void)fprintf(out, "  %-16s %s\n", profile->stable_id, profile->display_name);
+        }
+    }
     (void)fprintf(out, "\nExample: --clients=claude,codex\n"
                        "Omit --clients to configure every detected client.\n");
+}
+
+static bool cli_clients_spec_contains(const char *spec, const char *wanted_token) {
+    char buf[CLI_BUF_1K];
+    snprintf(buf, sizeof(buf), "%s", spec ? spec : "");
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') {
+            tok++;
+        }
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') {
+            tok[--len] = '\0';
+        }
+        if (strcmp(tok, wanted_token) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cli_clients_selects_registry_client(const char *spec, cbm_agent_client_id_t client_id) {
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_id(client_id);
+    return profile && cli_clients_spec_contains(spec, profile->stable_id);
 }
 
 /* Restrict `detected` to the comma-separated token list. Returns false (after
@@ -9763,6 +9798,9 @@ static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t 
             }
         }
         if (!matched) {
+            matched = cbm_agent_client_by_stable_id(tok) != NULL;
+        }
+        if (!matched) {
             (void)fprintf(stderr, "error: unknown client: %s\n\n", tok);
             cli_clients_print_list(stderr);
             return false;
@@ -9786,6 +9824,9 @@ size_t cbm_cli_clients_count_for_testing(void) {
 }
 const char *cbm_cli_clients_token_for_testing(size_t index) {
     return index < CLI_CLIENT_COUNT ? CLI_CLIENTS[index].token : NULL;
+}
+void cbm_cli_set_client_selection_for_testing(const char *spec) {
+    g_client_selection = spec;
 }
 #endif
 
@@ -9884,6 +9925,27 @@ static const char *cli_external_manager_name(const char *self_path) {
     if (strstr(self_path, "/.cargo/bin/")) {
         return "cargo";
     }
+#ifdef __FreeBSD__
+    /* FreeBSD ports/pkg install under ${LOCALBASE} (default /usr/local). pkg owns
+     * that file, so install must not drop a second copy in ~/.local/bin or edit a
+     * shell rc, and update must defer to pkg(8). Anchor at the start so a manual
+     * `install --dir=/opt/...` elsewhere is still treated as ours; --force-binary
+     * is the escape hatch for anyone who really does self-manage that prefix.
+     *
+     * LOCALBASE is configurable, so the port passes its real PREFIX via
+     * -DCBM_PKG_PREFIX; when it is absent we fall back to the documented default. */
+#ifdef CBM_PKG_PREFIX
+    if (strncmp(self_path, CBM_PKG_PREFIX "/bin/", sizeof(CBM_PKG_PREFIX "/bin/") - 1) == 0 ||
+        strncmp(self_path, CBM_PKG_PREFIX "/sbin/", sizeof(CBM_PKG_PREFIX "/sbin/") - 1) == 0) {
+        return "FreeBSD pkg";
+    }
+#else
+    if (strncmp(self_path, "/usr/local/bin/", 15) == 0 ||
+        strncmp(self_path, "/usr/local/sbin/", 16) == 0) {
+        return "FreeBSD pkg";
+    }
+#endif
+#endif
     return NULL;
 }
 
@@ -10204,7 +10266,7 @@ int cbm_cmd_install(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--clients") == 0) {
             /* Bare `--clients` (and `--clients=help`/`list`) print the
-             * vocabulary. 26 clients ship with tokens nobody would guess. */
+             * vocabulary, including tokens users would not readily guess. */
             cli_clients_print_list(stdout);
             return 0;
         } else if (strcmp(argv[i], "--skip-binary") == 0) {
@@ -12467,6 +12529,8 @@ int cbm_cmd_update(int argc, char **argv) {
                 (void)fprintf(stderr, "  update it with: mise upgrade codebase-memory-mcp\n");
             } else if (manager && strcmp(manager, "Homebrew") == 0) {
                 (void)fprintf(stderr, "  update it with: brew upgrade codebase-memory-mcp\n");
+            } else if (manager && strcmp(manager, "FreeBSD pkg") == 0) {
+                (void)fprintf(stderr, "  update it with: pkg upgrade codebase-memory-mcp\n");
             } else {
                 (void)fprintf(stderr, "  update it through whichever tool installed it.\n");
             }

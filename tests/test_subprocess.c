@@ -21,6 +21,7 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <unistd.h>
 #else
 #include <windows.h>
@@ -190,6 +191,52 @@ TEST(subprocess_retries_transient_spawn_refusal) {
     ASSERT_EQ(cbm_subprocess_pending_spawn_eagain_for_testing(), 0);
     ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
     ASSERT_EQ(r.exit_code, 0);
+    PASS();
+#endif
+}
+
+#ifndef _WIN32
+static volatile sig_atomic_t g_spawn_backoff_alarm_count = 0;
+
+static void spawn_backoff_alarm_handler(int signal_number) {
+    (void)signal_number;
+    g_spawn_backoff_alarm_count++;
+}
+#endif
+
+TEST(subprocess_spawn_backoff_resumes_after_eintr) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX signal interruption");
+#else
+    struct sigaction action = {0};
+    struct sigaction previous_action = {0};
+    action.sa_handler = spawn_backoff_alarm_handler;
+    (void)sigemptyset(&action.sa_mask);
+    bool handler_installed = sigaction(SIGALRM, &action, &previous_action) == 0;
+
+    struct itimerval timer = {
+        .it_interval = {.tv_sec = 0, .tv_usec = 1000},
+        .it_value = {.tv_sec = 0, .tv_usec = 1000},
+    };
+    g_spawn_backoff_alarm_count = 0;
+    bool timer_started = handler_installed && setitimer(ITIMER_REAL, &timer, NULL) == 0;
+
+    uint64_t started_at = cbm_now_ms();
+    cbm_subprocess_force_spawn_eagain_for_testing(3);
+    cbm_proc_result_t result = run_sh("exit 0", 0);
+    uint64_t elapsed_ms = cbm_now_ms() - started_at;
+
+    struct itimerval disabled = {0};
+    (void)setitimer(ITIMER_REAL, &disabled, NULL);
+    if (handler_installed) {
+        (void)sigaction(SIGALRM, &previous_action, NULL);
+    }
+
+    ASSERT_TRUE(handler_installed);
+    ASSERT_TRUE(timer_started);
+    ASSERT_TRUE(g_spawn_backoff_alarm_count > 0);
+    ASSERT_TRUE(elapsed_ms >= 50);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
     PASS();
 #endif
 }
@@ -1172,6 +1219,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
     RUN_TEST(subprocess_retries_transient_spawn_refusal);
+    RUN_TEST(subprocess_spawn_backoff_resumes_after_eintr);
     RUN_TEST(subprocess_gives_up_after_the_retry_budget);
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);

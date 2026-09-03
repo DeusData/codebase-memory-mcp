@@ -21,8 +21,6 @@
 enum { LEAN_MAX_PARENT_DEPTH = 20 };
 /* Max positional args to scan for URL/string. */
 enum { MAX_POSITIONAL_SCAN = 3 };
-/* Max positional args to scan for handler ref. */
-enum { MAX_HANDLER_SCAN = 4 };
 /* Max string arg length before rejection. */
 enum { MAX_STRING_ARG_LEN = CBM_SZ_512 };
 /* Min printable ASCII (space). */
@@ -2349,8 +2347,17 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
 }
 
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
+    /* The LAST eligible argument wins, and every argument is examined.
+     * Express, Fastify, gin and Laravel all put middleware between the route
+     * path and the handler, so the first function-shaped argument is usually a
+     * middleware. Taking the first one pointed the HANDLES edge at the
+     * middleware; stopping the scan early missed the handler outright when the
+     * middleware was written inline, because an arrow function matches none of
+     * the kinds below. Nothing that follows a handler matches them either — an
+     * options argument is an object node — so the last match is the handler. */
+    const char *handler = NULL;
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
+    for (uint32_t ai = HANDLER_START_IDX; ai < nc; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
         if (strcmp(ts_node_type(arg2), "argument") == 0 && ts_node_named_child_count(arg2) > 0) {
@@ -2362,17 +2369,18 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
-            return cbm_node_text(ctx->arena, arg2, ctx->source);
+            handler = cbm_node_text(ctx->arena, arg2, ctx->source);
+            continue;
         }
         if (is_string_like(ak2)) {
             const char *h =
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
-                return h;
+                handler = h;
             }
         }
     }
-    return NULL;
+    return handler;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.
@@ -2963,6 +2971,41 @@ static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
         }
     }
     return false;
+}
+
+/* Name bound by one Python parameter node, or NULL when the shape binds none.
+ * Covers every binding form a `parameters` / `lambda_parameters` list produces:
+ * a bare `identifier`, the `name` field of default/typed parameters, and the
+ * identifier under a `*args` / `**kwargs` splat. A shape with no identifier (the
+ * bare `*` keyword separator) yields NULL and simply matches nothing. */
+/* True when the callee of a BARE Python call `foo()` is bound as a parameter of
+ * an enclosing function or lambda -- the bare-call counterpart of
+ * python_receiver_is_exempt above.
+ *
+ * A parameter binding shadows any module-level `foo` for the whole body, so
+ * resolving such a call to a project Function/Method by short name alone
+ * fabricates the edge BY CONSTRUCTION: `def _run_with_heavy_slot(run): run()`
+ * must not bind an unrelated `SatoriLive.run`. Unlike a receiver type this is
+ * decidable from the AST outright, with no flow analysis and no list of
+ * "generic-looking" callee names -- Python forbids `global` on a parameter, and
+ * a parameter is in scope for the entire body regardless of position.
+ *
+ * The answer is CARRIED BY THE WALK rather than recomputed here. The unified
+ * walk binds a def's or lambda's parameters when it opens that scope and
+ * unwinds them when it closes it, so this is an O(1) map lookup. Deciding it
+ * by ascending the tree instead -- with ts_node_parent() or with a copied walk
+ * cursor -- costs O(depth) per call, and since every level of f(f(f(...))) is
+ * itself a bare call, that is quadratic across the file: the 30,000-deep
+ * fixture in tests/test_stack_overflow.c turned it into a hang rather than a
+ * slowdown. An O(1) lookup needs no hop cap, so unlike a capped walk this can
+ * no longer fail open on deep-but-ordinary code.
+ *
+ * It still answers false if the walk's own tracking hit an allocation failure,
+ * which costs a suppression and never a true edge. */
+static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, WalkState *state,
+                                             TSNode callee_ident) {
+    const char *callee_name = cbm_node_text(ctx->arena, callee_ident, ctx->source);
+    return cbm_walk_python_param_is_bound(state, callee_name);
 }
 
 static bool is_objectscript_language(CBMLanguage language) {
@@ -3589,11 +3632,18 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // (`accelerator.print()` must not bind MockAccelerator.print).
             // Imported receivers stay unflagged: module.function() is Python's
             // canonical cross-file call and the import map resolves it.
+            // A BARE Python call foo() whose callee is bound as a parameter of an
+            // enclosing scope cannot be the module-level foo, so short-name
+            // resolution would fabricate the edge (`def f(run): run()` must not
+            // bind SatoriLive.run). Distinct from is_method: there is no receiver
+            // here, so the weak-member guard cannot see this class at all.
             if (ctx->language == CBM_LANG_PYTHON && strcmp(ts_node_type(node), "call") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
+                } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, state, fn);
                 }
             }
             // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent

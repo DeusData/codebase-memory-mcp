@@ -6561,8 +6561,19 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    /* Neither of these agents has a plugin directory, so a planned path under
+     * one would be invented. Name the two directories rather than searching the
+     * whole plan for "/plugins/": OpenCode does ship a real plugin file, and
+     * agent detection finds a command in /usr/local/bin or /opt/homebrew/bin
+     * whatever HOME and PATH say, so a blanket search passes or fails according
+     * to what the developer happens to have installed. */
+    char qoder_plugins[700];
+    char pi_plugins[700];
+    snprintf(qoder_plugins, sizeof(qoder_plugins), "%s/plugins/", qoder_dir);
+    snprintf(pi_plugins, sizeof(pi_plugins), "%s/plugins/", pi_dir);
     bool plan_ok =
-        plan && !strstr(plan, "/plugins/") && !strstr(plan, "plugin_files") &&
+        plan && !strstr(plan, qoder_plugins) && !strstr(plan, pi_plugins) &&
+        !strstr(plan, "plugin_files") &&
         test_json_string_array_contains(plan_root, "config_files_planned", qoder_settings) &&
         test_json_string_array_contains(plan_root, "config_files_planned", amazon_config) &&
         test_json_string_array_contains(plan_root, "config_files_planned", roo_config) &&
@@ -13481,8 +13492,16 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
     ASSERT_NULL(
         cbm_cli_external_manager_name_for_testing("/Users/x/.local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/cbm/codebase-memory-mcp"));
-    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("build/c/test-runner"));
+#ifdef __FreeBSD__
+    /* On FreeBSD the port/pkg owns ${LOCALBASE}/bin, so a binary there IS
+     * externally managed; elsewhere the same path is unremarkable. */
+    ASSERT_NOT_NULL(
+        cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/local/bin/codebase-memory-mcp"));
+#else
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+#endif
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(""));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(NULL));
     PASS();
@@ -13492,7 +13511,7 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
  * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
  * install silently recreated them. The selector restricts it.
  *
- * The vocabulary is the part that makes it usable: 26 clients ship, with tokens
+ * The vocabulary is the part that makes it usable: clients ship with tokens
  * nobody would guess (factory-droid, mistral-vibe, copilot-cli). A selector
  * whose accepted values can only be learned by reading our source is not a
  * usable selector, so this pins that every client is listed and that an unknown
@@ -13521,6 +13540,12 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     cbm_detected_agents_t typo = all;
     ASSERT_FALSE(cbm_cli_clients_apply_selection_for_testing("claude,codx", &typo));
 
+    /* Registry-backed clients share the public selector vocabulary. */
+    cbm_detected_agents_t registry = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("qoder", &registry));
+    ASSERT_FALSE(registry.claude_code);
+    ASSERT_FALSE(registry.cursor);
+
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
     for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
@@ -13529,6 +13554,34 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
         cbm_detected_agents_t one = all;
         ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing(token, &one));
     }
+    PASS();
+}
+
+TEST(cli_clients_selector_filters_registry_installs_issue1798) {
+    char *tmpdir = th_mktempdir("cbm_cli_clients_registry");
+    ASSERT_NOT_NULL(tmpdir);
+
+    char qoder_dir[512];
+    char settings_path[512];
+    ASSERT(snprintf(qoder_dir, sizeof(qoder_dir), "%s/.qoder", tmpdir) > 0);
+    ASSERT(snprintf(settings_path, sizeof(settings_path), "%s/settings.json", qoder_dir) > 0);
+    ASSERT_EQ(test_mkdirp(qoder_dir), 0);
+
+    cbm_cli_set_client_selection_for_testing("cursor");
+    int excluded_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    struct stat settings_state;
+    bool excluded = stat(settings_path, &settings_state) != 0;
+
+    cbm_cli_set_client_selection_for_testing("qoder");
+    int included_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool included = stat(settings_path, &settings_state) == 0;
+    cbm_cli_set_client_selection_for_testing(NULL);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(excluded_rc, 0);
+    ASSERT_TRUE(excluded);
+    ASSERT_EQ(included_rc, 0);
+    ASSERT_TRUE(included);
     PASS();
 }
 
@@ -13679,6 +13732,7 @@ SUITE(cli) {
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
+    RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);

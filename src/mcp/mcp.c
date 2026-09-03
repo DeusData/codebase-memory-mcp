@@ -754,23 +754,30 @@ typedef struct {
 } tool_annotation_def_t;
 
 /* Tool annotations are deliberately explicit. All tools operate on the local
- * repository/index domain, so none cross an open-world trust boundary. */
+ * repository/index domain, so none cross an open-world trust boundary.
+ *
+ * The ten pure query tools resolve their store through resolve_store(), whose
+ * query-only path is strictly non-mutating: a corrupt database is reported and
+ * left in place, never quarantined or rebuilt — quarantine/rebuild is reserved
+ * for write-side opens (index_repository, manage_adr writes). That is what
+ * makes readOnlyHint=true honest for them and lets plan-mode clients expose
+ * them (the "read-only analysis tools" surface described in #1100). */
 static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"index_repository", false, false, true, false},
-    {"search_graph", false, true, true, false},
-    {"query_graph", false, true, true, false},
-    {"trace_path", false, true, true, false},
-    {"get_code_snippet", false, true, true, false},
+    {"search_graph", true, false, true, false},
+    {"query_graph", true, false, true, false},
+    {"trace_path", true, false, true, false},
+    {"get_code_snippet", true, false, true, false},
     {"get_file_outline", false, true, true, false},
-    {"get_graph_schema", false, true, true, false},
+    {"get_graph_schema", true, false, true, false},
     {"compare_graphs", true, false, true, false},
-    {"get_architecture", false, true, true, false},
-    {"search_code", false, true, true, false},
+    {"get_architecture", true, false, true, false},
+    {"search_code", true, false, true, false},
     {"list_projects", true, false, true, false},
     {"delete_project", false, true, true, false},
-    {"index_status", false, true, true, false},
-    {"check_index_coverage", false, true, true, false},
-    {"detect_changes", false, true, true, false},
+    {"index_status", true, false, true, false},
+    {"check_index_coverage", true, false, true, false},
+    {"detect_changes", true, false, true, false},
     {"manage_adr", false, true, false, false},
     {"ingest_traces", false, false, false, false},
 };
@@ -1624,6 +1631,12 @@ struct cbm_mcp_server {
     bool owns_store;        /* true if we opened the store */
     char *current_project;  /* which project store is open for (heap) */
     time_t store_last_used; /* last time resolve_store was called for a named project */
+    /* Set by a query-only resolve that hit a confirmed-corrupt database and
+     * left it in place (no quarantine, no rebuild). Error builders read this
+     * so the tool reply names the corruption instead of a misleading
+     * "project not found". */
+    bool readonly_resolve_hit_corrupt;
+    char readonly_corrupt_project[CBM_SZ_1K];
 
     /* Session + auto-index state */
     char session_root[CBM_SZ_1K];     /* detected project root path */
@@ -2217,14 +2230,21 @@ typedef enum {
     STORE_RECOVERY_NONE,
     STORE_RECOVERY_BUSY,
     STORE_RECOVERY_TRY_GUARD_UNAVAILABLE,
+    /* Query-only resolve: a confirmed-corrupt database was reported and left
+     * in place. Not an error state of the recovery machinery — the caller is
+     * expected to answer with the corruption, not retry. */
+    STORE_RECOVERY_CORRUPT,
 } store_recovery_status_t;
 
 static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *project,
                                            bool mutation_already_held, bool nonblocking_recovery,
-                                           store_recovery_status_t *recovery_status) {
+                                           store_recovery_status_t *recovery_status,
+                                           bool allow_autorecovery) {
     if (recovery_status) {
         *recovery_status = STORE_RECOVERY_NONE;
     }
+    srv->readonly_resolve_hit_corrupt = false;
+    srv->readonly_corrupt_project[0] = '\0';
     if (!project) {
         return NULL; /* project is required — no implicit fallback */
     }
@@ -2254,6 +2274,38 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
     project_db_path(project, path, sizeof(path));
     srv->store = path[0] ? cbm_store_open_path_query(path) : NULL;
     if (srv->store) {
+        /* Query-only resolve: classify a failed integrity check without any
+         * mutation — no lease, no quarantine. A corrupt database is reported
+         * and left in place for a write-side open (index_repository) to
+         * quarantine and rebuild; that is what keeps the ten read-only
+         * tools' readOnlyHint=true honest. A transient failure (lock, IO, or
+         * the shallow check's own prepare-error-as-corrupt blind spot) is
+         * answered as busy and retried by the next resolve. */
+        if (!allow_autorecovery && !cbm_store_check_integrity(srv->store)) {
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            srv->store = cbm_store_open_path_query(path);
+            cbm_integrity_verdict_t verdict = srv->store
+                                                  ? cbm_store_check_integrity_verdict(srv->store)
+                                                  : CBM_INTEGRITY_TRANSIENT;
+            if (srv->store) {
+                cbm_store_close(srv->store);
+                srv->store = NULL;
+            }
+            if (verdict == CBM_INTEGRITY_CORRUPT) {
+                srv->readonly_resolve_hit_corrupt = true;
+                snprintf(srv->readonly_corrupt_project, sizeof(srv->readonly_corrupt_project), "%s",
+                         project);
+                cbm_log_warn("store.corrupt_readonly", "project", project, "path", path, "action",
+                             "left in place for a write-side rebuild");
+                if (recovery_status) {
+                    *recovery_status = STORE_RECOVERY_CORRUPT;
+                }
+            } else if (recovery_status) {
+                *recovery_status = STORE_RECOVERY_BUSY;
+            }
+            return NULL;
+        }
         /* Check DB integrity — back up (never silently delete) a corrupt DB */
         if (!cbm_store_check_integrity(srv->store)) {
             cbm_store_close(srv->store);
@@ -2358,7 +2410,8 @@ static cbm_store_t *resolve_store_internal(cbm_mcp_server_t *srv, const char *pr
 }
 
 static cbm_store_t *resolve_store(cbm_mcp_server_t *srv, const char *project) {
-    return resolve_store_internal(srv, project, false, false, NULL);
+    /* Query-only callers (every read tool): strictly non-mutating resolve. */
+    return resolve_store_internal(srv, project, false, false, NULL, false);
 }
 
 /* Forward decl — definition lives below alongside list_projects. */
@@ -2489,16 +2542,28 @@ static char *build_no_store_error(const char *project) {
                    : build_missing_project_error();
 }
 
+/* Same contract as build_no_store_error, but when the query-only resolve
+ * confirmed a corrupt database and left it in place, name that instead of a
+ * misleading "project not found". */
+static char *build_no_store_error_checked(cbm_mcp_server_t *srv, const char *project) {
+    if (srv->readonly_resolve_hit_corrupt && project &&
+        strcmp(project, srv->readonly_corrupt_project) == 0) {
+        return build_project_list_error(
+            "project store is corrupt (left untouched); run index_repository to rebuild it");
+    }
+    return build_no_store_error(project);
+}
+
 /* Bail with the right error when no store is available. */
-#define REQUIRE_STORE(store, project)                     \
-    do {                                                  \
-        if (!(store)) {                                   \
-            char *_err = build_no_store_error(project);   \
-            char *_res = cbm_mcp_text_result(_err, true); \
-            free(_err);                                   \
-            free(project);                                \
-            return _res;                                  \
-        }                                                 \
+#define REQUIRE_STORE(store, project)                                \
+    do {                                                             \
+        if (!(store)) {                                              \
+            char *_err = build_no_store_error_checked(srv, project); \
+            char *_res = cbm_mcp_text_result(_err, true);            \
+            free(_err);                                              \
+            free(project);                                           \
+            return _res;                                             \
+        }                                                            \
     } while (0)
 
 static bool project_has_adr(cbm_store_t *store, const char *project, const char *root_path) {
@@ -6496,7 +6561,16 @@ static bool bfs_edge_evidence_for_hop(cbm_traverse_result_t *tr, int64_t hop_nod
         if (conf) {
             const char *colon = strchr(conf, ':');
             if (colon) {
-                *confidence_out = strtod(colon + 1, NULL);
+                /* strtod answers 0.0 for text it cannot read, and the caller
+                 * publishes any value >= 0 as a recorded confidence. So a
+                 * malformed value used to print as 0.00 — the one number the
+                 * surrounding code works to keep meaningful. Keep the -1 when
+                 * the end pointer never moved: nothing was read. */
+                char *end = NULL;
+                double parsed = strtod(colon + 1, &end);
+                if (end != colon + 1) {
+                    *confidence_out = parsed;
+                }
             }
         }
         return true;
@@ -6505,10 +6579,13 @@ static bool bfs_edge_evidence_for_hop(cbm_traverse_result_t *tr, int64_t hop_nod
 }
 
 /* TOON table for one trace direction: callees[N]{qn,hop,...} with optional
- * risk / test / args columns. `name` is omitted (it is the qn's last
- * segment); the per-item JSON key envelope was 84% of the legacy payload. */
+ * risk / test / evidence / args columns. `name` is omitted (it is the qn's
+ * last segment); the per-item JSON key envelope was 84% of the legacy
+ * payload. include_evidence must be forwarded here — flat_trace used to
+ * drop it (#1542 leftover). */
 static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result_t *tr,
-                              bool risk_labels, bool include_tests, bool data_flow) {
+                              bool risk_labels, bool include_tests, bool data_flow,
+                              bool include_evidence) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
         if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
@@ -6516,13 +6593,18 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         }
         visible++;
     }
-    const char *cols[5] = {"qn", "hop"};
+    /* Max: qn hop risk test strategy confidence args. */
+    const char *cols[7] = {"qn", "hop"};
     int ncols = 2;
     if (risk_labels) {
         cols[ncols++] = "risk";
     }
     if (include_tests) {
         cols[ncols++] = "test";
+    }
+    if (include_evidence) {
+        cols[ncols++] = "strategy";
+        cols[ncols++] = "confidence";
     }
     if (data_flow) {
         cols[ncols++] = "args";
@@ -6542,6 +6624,23 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         }
         if (include_tests) {
             cbm_tree_cell_bool(sb, test, false);
+        }
+        if (include_evidence) {
+            const char *ev_class = NULL;
+            double ev_conf = -1.0;
+            if (bfs_edge_evidence_for_hop(tr, tr->visited[i].node.id, &ev_class, &ev_conf)) {
+                cbm_tree_cell_str(sb, ev_class ? ev_class : "", false);
+                if (ev_conf >= 0.0) {
+                    cbm_tree_cell_real(sb, ev_conf, false);
+                } else {
+                    cbm_tree_cell_str(sb, "-", false);
+                }
+            } else {
+                /* Root hop / non-CALLS: keep column count fixed, same "-"
+                 * placeholders as bfs_to_tree_table. */
+                cbm_tree_cell_str(sb, "-", false);
+                cbm_tree_cell_str(sb, "-", false);
+            }
         }
         if (data_flow) {
             size_t alen = 0;
@@ -6888,20 +6987,9 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
         if (risk_labels) {
             yyjson_mut_arr_add_str(doc, row, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
         }
-        if (data_flow) {
-            size_t alen = 0;
-            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
-            if (ea && alen > 0) {
-                yyjson_mut_val *av = yyjson_mut_rawn(doc, ea, alen);
-                if (av) {
-                    yyjson_mut_arr_add_val(row, av);
-                } else {
-                    yyjson_mut_arr_add_str(doc, row, "");
-                }
-            } else {
-                yyjson_mut_arr_add_str(doc, row, "");
-            }
-        }
+        /* Emit in header order: strategy, confidence, then args. Swapping these
+         * two blocks mislabeled every include_evidence+data_flow json row
+         * (#1542 leftover). */
         if (include_evidence) {
             const char *ev_class = NULL;
             double ev_conf = -1.0;
@@ -6919,6 +7007,20 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
                  * in a form a structured caller can test. */
                 yyjson_mut_arr_add_null(doc, row);
                 yyjson_mut_arr_add_null(doc, row);
+            }
+        }
+        if (data_flow) {
+            size_t alen = 0;
+            const char *ea = bfs_edge_args_for_hop(tr, tr->visited[i].node.id, &alen);
+            if (ea && alen > 0) {
+                yyjson_mut_val *av = yyjson_mut_rawn(doc, ea, alen);
+                if (av) {
+                    yyjson_mut_arr_add_val(row, av);
+                } else {
+                    yyjson_mut_arr_add_str(doc, row, "");
+                }
+            } else {
+                yyjson_mut_arr_add_str(doc, row, "");
             }
         }
         yyjson_mut_arr_add_val(cur_rows, row);
@@ -7333,7 +7435,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (do_outbound) {
             cbm_tree_scalar_int(&sb, "callees_total", out_total);
             if (flat_trace) {
-                bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow);
+                bfs_to_toon_table(&sb, "callees", &view_out, risk_labels, include_tests, data_flow,
+                                  include_evidence);
             } else {
                 bfs_to_tree_table(&sb, "callees", &view_out, include_tests, include_evidence);
             }
@@ -7341,7 +7444,8 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
             if (flat_trace) {
-                bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow);
+                bfs_to_toon_table(&sb, "callers", &view_in, risk_labels, include_tests, data_flow,
+                                  include_evidence);
             } else {
                 bfs_to_tree_table(&sb, "callers", &view_in, include_tests, include_evidence);
             }
@@ -9715,6 +9819,36 @@ bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern) {
     return true;
 }
 
+bool cbm_search_code_windows_path_matches_prefilter(const char *path, const char *file_pattern) {
+    if (!path || !cbm_search_code_file_pattern_can_prefilter(file_pattern)) {
+        return false;
+    }
+
+    const char *suffix = file_pattern + 1;
+    size_t path_len = strlen(path);
+    size_t suffix_len = strlen(suffix);
+    if (path_len < suffix_len) {
+        return false;
+    }
+
+    const unsigned char *candidate = (const unsigned char *)path + path_len - suffix_len;
+    const unsigned char *expected = (const unsigned char *)suffix;
+    for (size_t i = 0; i < suffix_len; i++) {
+        unsigned char left = candidate[i];
+        unsigned char right = expected[i];
+        if (left >= 'A' && left <= 'Z') {
+            left = (unsigned char)(left - 'A' + 'a');
+        }
+        if (right >= 'A' && right <= 'Z') {
+            right = (unsigned char)(right - 'A' + 'a');
+        }
+        if (left != right) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Build the grep/search command string based on scoped vs recursive mode.
  * On Windows, uses PowerShell Select-String with tab-delimited output.
  * On POSIX, uses grep with colon-delimited output. */
@@ -9735,30 +9869,16 @@ void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bo
     const char *sm = use_regex ? "" : " -SimpleMatch";
     if (scoped) {
         if (file_pattern) {
-            if (cbm_search_code_file_pattern_can_prefilter(file_pattern)) {
-                snprintf(
-                    cmd, cmd_sz,
-                    "powershell -Command \"" CBM_PS_UTF8_PRELUDE
-                    "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                    "Get-Content -Encoding UTF8 -LiteralPath '%s'"
-                    " | Where-Object { $_ -like '%s' }"
-                    " | ForEach-Object { Select-String -LiteralPath $_ -Pattern $pat%s "
-                    "-ErrorAction SilentlyContinue }"
-                    " | Where-Object { $_.Path -like '*%s' }"
-                    " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                    tmpfile, filelist, file_pattern, sm, file_pattern);
-            } else {
-                snprintf(
-                    cmd, cmd_sz,
-                    "powershell -Command \"" CBM_PS_UTF8_PRELUDE
-                    "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
-                    "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
-                    "-LiteralPath $_ -Pattern $pat%s "
-                    "-ErrorAction SilentlyContinue }"
-                    " | Where-Object { $_.Path -like '*%s' }"
-                    " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
-                    tmpfile, filelist, sm, file_pattern);
-            }
+            snprintf(
+                cmd, cmd_sz,
+                "powershell -Command \"" CBM_PS_UTF8_PRELUDE
+                "$pat = Get-Content -Encoding UTF8 -LiteralPath '%s'; "
+                "Get-Content -Encoding UTF8 -LiteralPath '%s' | ForEach-Object { Select-String "
+                "-LiteralPath $_ -Pattern $pat%s "
+                "-ErrorAction SilentlyContinue }"
+                " | Where-Object { $_.Path -like '*%s' }"
+                " | ForEach-Object { $_.Path + [char]9 + $_.LineNumber + [char]9 + $_.Line }\"",
+                tmpfile, filelist, sm, file_pattern);
         } else {
             snprintf(
                 cmd, cmd_sz,
@@ -10401,8 +10521,8 @@ static void classify_all_grep_hits(grep_match_t *gm, int gm_count, cbm_store_t *
  * created inside the private scratch directory; this function never opens or
  * closes it, so the list is never reachable through a predictable pathname. */
 static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, const char *root_path,
-                                  FILE *fl, bool has_path_filter, cbm_regex_t *path_regex,
-                                  int *out_written) {
+                                  FILE *fl, const char *file_pattern, bool has_path_filter,
+                                  cbm_regex_t *path_regex, int *out_written) {
     *out_written = 0;
     cbm_store_t *pre_store = resolve_store(srv, project);
     if (!pre_store) {
@@ -10439,6 +10559,12 @@ static bool write_scoped_filelist(cbm_mcp_server_t *srv, const char *project, co
                     continue;
                 }
             }
+#ifdef _WIN32
+            if (cbm_search_code_file_pattern_can_prefilter(file_pattern) &&
+                !cbm_search_code_windows_path_matches_prefilter(indexed_files[fi], file_pattern)) {
+                continue;
+            }
+#endif
             size_t root_len = strlen(root_path);
             size_t file_len = strlen(indexed_files[fi]);
             if (root_len > SIZE_MAX - file_len - 2) {
@@ -10922,8 +11048,9 @@ static char *handle_search_code(cbm_mcp_server_t *srv, const char *args) {
 
     uint64_t scope_t0 = metrics.include_phase_timings ? cbm_now_ms() : 0;
     if (!scan_cancellation_latched && !scan_deadline_latched) {
-        scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, has_path_filter,
-                                       has_path_filter ? &path_regex : NULL, &scoped_written);
+        scoped = write_scoped_filelist(srv, project, root_path, scratch.filelist, file_pattern,
+                                       has_path_filter, has_path_filter ? &path_regex : NULL,
+                                       &scoped_written);
     }
     /* Close before grep runs: this is what flushes the records the helper wrote
      * through the descriptor. Clearing the field hands ownership to
@@ -11563,7 +11690,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
-        char *err = build_no_store_error(project);
+        char *err = build_no_store_error_checked(srv, project);
         char *res = cbm_mcp_text_result(err, true);
         free(err);
         free(project);
@@ -12333,7 +12460,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
      * the UI are visible to each other (#256). */
     store_recovery_status_t recovery_status = STORE_RECOVERY_NONE;
     cbm_store_t *resolved =
-        resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status);
+        resolve_store_internal(srv, project, mutation_held, !write_request, &recovery_status, true);
     if (!resolved) {
         char *res = NULL;
         if (recovery_status == STORE_RECOVERY_BUSY) {
@@ -12342,7 +12469,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
             res =
                 cbm_mcp_text_result("project recovery requires a nonblocking mutation guard", true);
         } else {
-            char *err = build_no_store_error(project);
+            char *err = build_no_store_error_checked(srv, project);
             res = cbm_mcp_text_result(err, true);
             free(err);
         }
@@ -12394,7 +12521,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
                     invalidate_cached_store(srv);
                     resolved = NULL;
                     store = NULL;
-                    resolved = resolve_store_internal(srv, project, true, false, NULL);
+                    resolved = resolve_store_internal(srv, project, true, false, NULL, true);
                 }
                 if (resolved) {
                     store = open_adr_store_for_write(srv, resolved, &owned_rw);
@@ -12864,10 +12991,12 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
 #endif
     if (!cbm_mcp_auto_index_within_file_limit(srv->session_root, file_limit, &file_count)) {
         char files[32];
+        char limit[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);
+        (void)snprintf(limit, sizeof(limit), "%d", file_limit);
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", CBM_CONFIG_AUTO_INDEX_LIMIT);
+                     files, "limit", limit);
         return;
     }
 
