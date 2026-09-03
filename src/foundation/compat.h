@@ -96,6 +96,9 @@ static inline int cbm_nanosleep(const struct timespec *req, struct timespec *rem
 #define cbm_nanosleep nanosleep
 #endif
 
+/* Sleeps for the full requested duration even when POSIX signals interrupt it. */
+int cbm_nanosleep_full(const struct timespec *req);
+
 /* ── gmtime_r (Windows lacks it) ─────────────────────────────── */
 #ifdef _WIN32
 static inline struct tm *cbm_gmtime_r(const time_t *timep, struct tm *result) {

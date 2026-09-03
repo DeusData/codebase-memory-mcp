@@ -902,6 +902,8 @@ static void print_help(void) {
     printf("                                      Run one tool locally, then exit\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] "
            "[--dir=<path>] [--skip-config]\n");
+    printf("                                      [--clients=<tokens>]  Run "
+           "'install --clients' to list tokens\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");

@@ -77,7 +77,9 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 
 The grammars below carry a small local patch to their vendored sources, on
 top of the pinned upstream commit recorded in the vendoring table below.
-Re-vendoring from upstream must re-apply these.
+Re-vendoring from upstream must re-apply these, unless the reason column
+names an upstream commit that already carries the change — then drop the
+row instead.
 
 | grammar | location | patch | reason |
 |---|---|---|---|
@@ -85,6 +87,7 @@ Re-vendoring from upstream must re-apply these.
 | rescript   | `rescript/scanner.c`, deserialize | guard `memcpy(state, buffer, n_bytes)` with `if (n_bytes > 0)` | UBSan: zero-length `memcpy` with a NULL `buffer` / `n_bytes == 0` on empty-state deserialize (formal UB, harmless). The sibling serialize copies a fixed `sizeof(ScannerState)` (always > 0, non-NULL src) and needs no guard. |
 | purescript | `purescript/scanner.c`, serialize | guard `memcpy(buffer, indents->data, to_copy)` with `if (to_copy > 0)` | UBSan: zero-length `memcpy` with a NULL/0-size source when the indent vector is empty (formal UB, harmless) |
 | plsql      | `plsql/parser.c`, include         | `#include <tree_sitter/parser.h>` → `#include "tree_sitter/parser.h"` | The older ABI-14 generator emits angle brackets; every other vendored grammar uses the quoted form, which resolves the per-grammar `tree_sitter/` header from the including file's directory |
+| swift      | `swift/scanner.c`, `OP_SYMBOL_SUPPRESSOR` + `eat_operators` | `1UL <<` / `1 <<` → `1ULL <<` | UBSan: `1 << suppressor` shifts an `int` by up to `TOKEN_COUNT` bits, undefined once the index reaches 31, while the mask it feeds is `uint64_t`. `1UL << FAKE_TRY_BANG` is the same defect on Windows, where `unsigned long` is 32 bits and `FAKE_TRY_BANG` is 32; the CLANGARM64 leg runs UBSan in trap mode, so there it is an illegal instruction rather than a log line. Upstream already carries both changes: `fb63a7004f07` (2026-04-06, upstream #558) for `eat_operators`, `6ab8d1d74ebd` (2026-08-10) for the `OP_SYMBOL_SUPPRESSOR` entry. Our pin `8abb3e8b3325` (2026-03-20) predates both, so this is a backport rather than a local invention — a re-vendor past 2026-08-10 should delete this row, not re-apply it |
 
 ## Vendored from verified upstream
 
