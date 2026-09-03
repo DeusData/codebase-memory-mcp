@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useThree } from "@react-three/fiber";
 import * as THREE from "three";
 import type { GraphNode } from "../lib/types";
@@ -72,7 +72,125 @@ function getPointSprite(): THREE.CanvasTexture {
   return pointSprite;
 }
 
-/* ── Point-sprite mode for very large clouds ──────────────────── */
+/* ── Point-sprite mode: allocate-once / refill-in-place geometry ──────
+ *
+ * Same failure mode as EdgeLines (#2039): a fresh BufferGeometry + fresh
+ * Float32Arrays on every render, previously handed to declarative JSX
+ * (<bufferGeometry><bufferAttribute args={[positions,3]}/>...), orphans the
+ * previously-uploaded GPU buffer every time `args` changes (R3F reconstructs
+ * the attribute instance, but plain BufferAttribute has no dispose() to
+ * release its WebGL buffer). We own the geometry directly instead: allocate
+ * once per capacity, refill the same TypedArrays in place, and dispose
+ * explicitly on growth/unmount. */
+
+interface PointBuffers {
+  geometry: THREE.BufferGeometry;
+  positionAttr: THREE.BufferAttribute;
+  colorAttr: THREE.BufferAttribute;
+  capacity: number;
+}
+
+export function createPointBuffers(capacity: number): PointBuffers {
+  const geometry = new THREE.BufferGeometry();
+  const n = Math.max(1, capacity);
+  const positionAttr = new THREE.BufferAttribute(new Float32Array(n * 3), 3);
+  const colorAttr = new THREE.BufferAttribute(new Float32Array(n * 3), 3);
+  positionAttr.setUsage(THREE.DynamicDrawUsage);
+  colorAttr.setUsage(THREE.DynamicDrawUsage);
+  geometry.setAttribute("position", positionAttr);
+  geometry.setAttribute("color", colorAttr);
+  geometry.setDrawRange(0, 0);
+  return { geometry, positionAttr, colorAttr, capacity: n };
+}
+
+export function fillPointBuffers(
+  buffers: PointBuffers,
+  nodes: GraphNode[],
+  highlightedIds: Set<number> | null,
+  opacity: number,
+  boost: number,
+): void {
+  const positions = buffers.positionAttr.array as Float32Array;
+  const colors = buffers.colorAttr.array as Float32Array;
+  const tempColor = new THREE.Color();
+  for (let i = 0; i < nodes.length; i++) {
+    const n = nodes[i];
+    positions[i * 3] = n.x;
+    positions[i * 3 + 1] = n.y;
+    positions[i * 3 + 2] = n.z;
+    const [r, g, b] = nodeColor(n, highlightedIds, opacity, boost, tempColor);
+    colors[i * 3] = r;
+    colors[i * 3 + 1] = g;
+    colors[i * 3 + 2] = b;
+  }
+  buffers.positionAttr.needsUpdate = true;
+  buffers.colorAttr.needsUpdate = true;
+  buffers.geometry.setDrawRange(0, nodes.length);
+  /* Points.raycast() computes geometry.boundingSphere lazily ONLY the first
+   * time it is null — mutating positions in place afterward (as every
+   * refill here does) leaves that sphere stale, which can break hover/click
+   * raycasting and even frustum-cull the whole cloud once the node set has
+   * moved outside it. Recompute on every refill (cheap relative to the fill
+   * itself, and NodePoints only exists above POINT_MODE_THRESHOLD anyway). */
+  buffers.geometry.computeBoundingSphere();
+}
+
+export function usePointGeometry(
+  nodes: GraphNode[],
+  highlightedIds: Set<number> | null,
+  opacity: number,
+  boost: number,
+): THREE.BufferGeometry {
+  /* Records the exact (by-reference) deps the mount initializer below filled
+   * the buffers with, so the effect's first run — which always fires with
+   * those same references, since it belongs to the same render — can skip
+   * redoing that fill (see EdgeLines.useEdgeGeometry for the same pattern). */
+  const initialFillDeps = useRef<
+    [GraphNode[], Set<number> | null, number, number] | null
+  >(null);
+
+  const [buffers, setBuffers] = useState<PointBuffers>(() => {
+    const buf = createPointBuffers(nodes.length);
+    fillPointBuffers(buf, nodes, highlightedIds, opacity, boost);
+    initialFillDeps.current = [nodes, highlightedIds, opacity, boost];
+    return buf;
+  });
+  const latest = useRef(buffers);
+  latest.current = buffers;
+
+  useEffect(() => {
+    const init = initialFillDeps.current;
+    initialFillDeps.current = null;
+    if (
+      init &&
+      init[0] === nodes &&
+      init[1] === highlightedIds &&
+      init[2] === opacity &&
+      init[3] === boost
+    ) {
+      /* Same references the initializer just filled with — skip the
+       * redundant refill. */
+      return;
+    }
+    setBuffers((prev) => {
+      let buf = prev;
+      if (nodes.length > buf.capacity) {
+        prev.geometry.dispose();
+        buf = createPointBuffers(nodes.length);
+      }
+      fillPointBuffers(buf, nodes, highlightedIds, opacity, boost);
+      return buf;
+    });
+  }, [nodes, highlightedIds, opacity, boost]);
+
+  useEffect(() => {
+    return () => {
+      latest.current.geometry.dispose();
+    };
+  }, []);
+
+  return buffers.geometry;
+}
 
 function NodePoints({
   nodes,
@@ -83,6 +201,7 @@ function NodePoints({
   boost,
 }: Required<NodeCloudProps>) {
   const { raycaster } = useThree();
+  const geometry = usePointGeometry(nodes, highlightedIds, opacity, boost);
 
   /* Widen the raycast threshold while points are on screen */
   useEffect(() => {
@@ -93,27 +212,9 @@ function NodePoints({
     };
   }, [raycaster]);
 
-  const { positions, colors } = useMemo(() => {
-    const positions = new Float32Array(nodes.length * 3);
-    const colors = new Float32Array(nodes.length * 3);
-    const tempColor = new THREE.Color();
-    for (let i = 0; i < nodes.length; i++) {
-      const n = nodes[i];
-      positions[i * 3] = n.x;
-      positions[i * 3 + 1] = n.y;
-      positions[i * 3 + 2] = n.z;
-      const [r, g, b] = nodeColor(n, highlightedIds, opacity, boost, tempColor);
-      colors[i * 3] = r;
-      colors[i * 3 + 1] = g;
-      colors[i * 3 + 2] = b;
-    }
-    return { positions, colors };
-  }, [nodes, highlightedIds, opacity, boost]);
-
   return (
     <points
-      /* Remount when the buffer size changes so stale attributes never linger */
-      key={nodes.length}
+      geometry={geometry}
       onPointerOver={(e) => {
         e.stopPropagation();
         if (e.index !== undefined && e.index < nodes.length) {
@@ -128,10 +229,6 @@ function NodePoints({
         }
       }}
     >
-      <bufferGeometry>
-        <bufferAttribute attach="attributes-position" args={[positions, 3]} />
-        <bufferAttribute attach="attributes-color" args={[colors, 3]} />
-      </bufferGeometry>
       <pointsMaterial
         vertexColors
         size={4}
@@ -160,9 +257,26 @@ function NodeSpheres({
   const tempColor = useMemo(() => new THREE.Color(), []);
   const detail = sphereDetail(nodes.length);
 
-  /* Build instance color attributes — dim non-highlighted nodes */
-  const colors = useMemo(() => {
-    const arr = new Float32Array(nodes.length * 3);
+  /* One InstancedBufferAttribute per nodes.length epoch — the instancedMesh
+   * below remounts (via `key`) when the count changes, which cleanly
+   * disposes geometry/material/attributes together through R3F's normal
+   * unmount path. Within an epoch, highlight/opacity/boost changes refill
+   * this SAME attribute's array in place (never replaced), attached via
+   * <primitive> so R3F never tries to reconstruct or auto-dispose it — see
+   * the EdgeLines/NodePoints comments for why replacing an attribute leaks
+   * its GPU buffer (#2039). */
+  const colorAttr = useMemo(() => {
+    const attr = new THREE.InstancedBufferAttribute(
+      new Float32Array(Math.max(1, nodes.length) * 3),
+      3,
+    );
+    attr.setUsage(THREE.DynamicDrawUsage);
+    return attr;
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- capacity only, refilled below
+  }, [nodes.length]);
+
+  useEffect(() => {
+    const arr = colorAttr.array as Float32Array;
     for (let i = 0; i < nodes.length; i++) {
       const [r, g, b] = nodeColor(
         nodes[i],
@@ -175,8 +289,8 @@ function NodeSpheres({
       arr[i * 3 + 1] = g;
       arr[i * 3 + 2] = b;
     }
-    return arr;
-  }, [nodes, highlightedIds, tempColor, opacity, boost]);
+    colorAttr.needsUpdate = true;
+  }, [nodes, highlightedIds, opacity, boost, tempColor, colorAttr]);
 
   /* Node positions are static (the layout is server-computed), so instance
    * matrices only change with the node set or the highlight — never rebuild
@@ -201,7 +315,10 @@ function NodeSpheres({
 
   return (
     <instancedMesh
-      /* Remount when the instance count changes so buffers are re-sized */
+      /* Remount when the instance count changes so buffers are re-sized —
+       * this is a full unmount/remount (not an in-place attribute swap), so
+       * R3F's normal dispose-on-unmount path correctly frees the old
+       * geometry/material/instance buffers. */
       key={nodes.length}
       ref={meshRef}
       args={[undefined, undefined, nodes.length]}
@@ -222,10 +339,7 @@ function NodeSpheres({
     >
       <sphereGeometry args={detail} />
       <meshBasicMaterial vertexColors toneMapped={false} />
-      <instancedBufferAttribute
-        attach="geometry-attributes-color"
-        args={[colors, 3]}
-      />
+      <primitive object={colorAttr} attach="geometry-attributes-color" />
     </instancedMesh>
   );
 }
