@@ -4079,6 +4079,41 @@ static const CBMCall *find_call_by_callee(CBMFileResult *r, const char *callee) 
     return NULL;
 }
 
+/* #1892: the Swift grammar declares no "arguments" field, so the generic field
+ * lookup read nothing and every Swift call lost its arguments. Without the URL
+ * the service-pattern table cannot raise an HTTP_CALLS edge or a Route node,
+ * even though Alamofire/Moya/URLSession are already listed in it. */
+TEST(swift_call_string_arg_issue1892) {
+    CBMFileResult *r =
+        extract("func listWidgets() { AF.request(\"https://example.com/api/v1/widgets\") }\n",
+                CBM_LANG_SWIFT, "t", "Client.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "AF.request");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "https://example.com/api/v1/widgets");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Swift labels its arguments, and each one sits in a value_argument node that
+ * leads with the label. Reading the first child alone would return `with`
+ * rather than the path. */
+TEST(swift_labeled_call_string_arg_issue1892) {
+    CBMFileResult *r =
+        extract("func fetch() { URLSession.shared.dataTask(with: \"/api/v1/widgets/1\") }\n",
+                CBM_LANG_SWIFT, "t", "Fetch.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "URLSession.shared.dataTask");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/widgets/1");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1009: URL-builder helper pattern — a function returning a URL-shaped
  * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
  * the per-file constant map and resolved at the call site, for both return
@@ -7022,6 +7057,8 @@ SUITE(extraction) {
     RUN_TEST(swift_constructor_call);
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);
+    RUN_TEST(swift_call_string_arg_issue1892);
+    RUN_TEST(swift_labeled_call_string_arg_issue1892);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
     RUN_TEST(dart_top_level_function);

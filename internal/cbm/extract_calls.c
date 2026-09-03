@@ -61,7 +61,8 @@ static const char *lookup_url_builder(const CBMExtractCtx *ctx, const char *name
 static int is_string_like(const char *kind) {
     return (strcmp(kind, "string") == 0 || strcmp(kind, "string_literal") == 0 ||
             strcmp(kind, "interpreted_string_literal") == 0 ||
-            strcmp(kind, "raw_string_literal") == 0 || strcmp(kind, "string_content") == 0);
+            strcmp(kind, "raw_string_literal") == 0 || strcmp(kind, "string_content") == 0 ||
+            strcmp(kind, "line_string_literal") == 0);
 }
 
 /* Strip surrounding quotes from a string, return arena-allocated copy */
@@ -2286,6 +2287,18 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
         if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
             arg = ts_node_named_child(arg, 0);
         }
+        /* Swift wraps each argument in a value_argument that may lead with its
+         * label, so `data(from: url)` would otherwise yield the label `from`
+         * rather than the value. Step past a leading value_argument_label. */
+        if (strcmp(ts_node_type(arg), "value_argument") == 0 &&
+            ts_node_named_child_count(arg) > 0) {
+            TSNode val = ts_node_named_child(arg, 0);
+            if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
+                ts_node_named_child_count(arg) > 1) {
+                val = ts_node_named_child(arg, 1);
+            }
+            arg = val;
+        }
         const char *ak = ts_node_type(arg);
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
@@ -3080,6 +3093,19 @@ static TSNode objectscript_call_args(TSNode node) {
                                            : cbm_find_child_by_kind(macro_function, "method_args");
 }
 
+/* Swift models a call as a target expression plus a call_suffix, and its grammar
+ * declares no "arguments" field at all, so the generic field lookup finds
+ * nothing for every Swift call. Reach the argument list through the suffix
+ * instead. A trailing closure has a call_suffix with no value_arguments, which
+ * returns a null node and leaves the call without a string argument, as before. */
+static TSNode swift_call_args(TSNode node) {
+    TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+    if (ts_node_is_null(suffix)) {
+        return (TSNode){0};
+    }
+    return cbm_find_child_by_kind(suffix, "value_arguments");
+}
+
 static bool node_has_token(TSNode node, const char *token) {
     uint32_t count = ts_node_child_count(node);
     for (uint32_t i = 0; i < count; i++) {
@@ -3675,6 +3701,10 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // generic "arguments" field; macro arguments add one wrapper.
             if (ts_node_is_null(args) && is_objectscript_language(ctx->language)) {
                 args = objectscript_call_args(node);
+            }
+            // Swift has no "arguments" field either; its args hang off call_suffix.
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_SWIFT) {
+                args = swift_call_args(node);
             }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
