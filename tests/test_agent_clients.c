@@ -1178,7 +1178,7 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     ASSERT_NOT_NULL(strstr(js, "Type.Object("));
     ASSERT_NOT_NULL(strstr(js, "Type.String("));
     /* A numeric registry property must remain numeric in the generated schema. */
-    ASSERT_NOT_NULL(strstr(js, "depth: Type.Integer("));
+    ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
     /* TypeBox import should be present. */
     ASSERT_NOT_NULL(strstr(js, "import { Type } from 'typebox';"));
     /* Raw JSON output is required so the bridge can parse the MCP result; the
