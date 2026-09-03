@@ -592,6 +592,18 @@ int cbm_store_find_edges_by_target_type(cbm_store_t *s, int64_t target_id, const
 int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char *type,
                                  cbm_edge_t **out, int *count);
 
+/* Find edges of ANY type in `project` whose source_id AND target_id are both
+ * in `ids` (n_ids entries) — e.g. a sampled node set for a rendered subgraph.
+ * Only id/source_id/target_id/type are populated (project and
+ * properties_json are left NULL); the caller doesn't need them and skipping
+ * properties avoids a strdup+free per row across a potentially multi-million-
+ * edge project. Works on a read-only store handle (cbm_store_open_path_query):
+ * membership is tested via a private TEMP table rather than a giant IN(...)
+ * placeholder list or a serialized id blob. Free the result with
+ * cbm_store_free_edges(). */
+int cbm_store_find_edges_among(cbm_store_t *s, const char *project, const int64_t *ids, int n_ids,
+                               cbm_edge_t **out, int *count);
+
 /* Count all edges in project. */
 int cbm_store_count_edges(cbm_store_t *s, const char *project);
 
@@ -697,6 +709,17 @@ void cbm_store_free_coverage(cbm_coverage_row_t *rows, int count);
 /* ── Search ─────────────────────────────────────────────────────── */
 
 int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_search_output_t *out);
+
+/* Sample up to `limit` nodes for `project`, ordered by total degree (any
+ * edge type, in+out) DESC, then name, then id — for callers (e.g. the
+ * layout sampler) that want well-connected nodes rather than an
+ * alphabetical page. Does NOT change cbm_store_search's own (name, id)
+ * pagination order. Populates *out the same way cbm_store_search does
+ * (out->total = project's total node count, in_degree/out_degree per the
+ * CALLS/USAGE/CALL_REFERENCE/INHERITS/IMPLEMENTS family). Free with
+ * cbm_store_search_free(). */
+int cbm_store_search_by_degree(cbm_store_t *s, const char *project, int limit,
+                               cbm_search_output_t *out);
 
 /* Free a search output's allocated memory. */
 void cbm_store_search_free(cbm_search_output_t *out);

@@ -1339,6 +1339,122 @@ TEST(store_batch_count_degrees) {
     PASS();
 }
 
+/* ── search_by_degree (well-connected node sampling for #2039) ───── */
+
+/* Hub (degree 6: 3 in + 3 out), Mid (degree 2), three Leaf* nodes (degree 1
+ * each), and an Island node with no edges at all (degree 0). Hub must sort
+ * first, Island must sort last. */
+static cbm_store_t *setup_degree_store(int64_t *hub, int64_t *mid, int64_t leaves[3],
+                                       int64_t *island) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "deg", "/tmp/deg");
+
+    cbm_node_t nhub = {
+        .project = "deg", .label = "Function", .name = "Hub", .qualified_name = "deg.Hub"};
+    cbm_node_t nmid = {
+        .project = "deg", .label = "Function", .name = "Mid", .qualified_name = "deg.Mid"};
+    cbm_node_t nisland = {.project = "deg",
+                          .label = "Function",
+                          .name = "Island",
+                          .qualified_name = "deg.Island"};
+    *hub = cbm_store_upsert_node(s, &nhub);
+    *mid = cbm_store_upsert_node(s, &nmid);
+    *island = cbm_store_upsert_node(s, &nisland);
+
+    for (int i = 0; i < 3; i++) {
+        char name[16], qn[32];
+        snprintf(name, sizeof(name), "Leaf%d", i);
+        snprintf(qn, sizeof(qn), "deg.Leaf%d", i);
+        cbm_node_t nl = {
+            .project = "deg", .label = "Function", .name = name, .qualified_name = qn};
+        leaves[i] = cbm_store_upsert_node(s, &nl);
+    }
+
+    /* Hub <-> each Leaf (Hub: 3 out to leaves), Mid <-> Hub + one Leaf. */
+    cbm_edge_t e1 = {.project = "deg", .source_id = *hub, .target_id = leaves[0], .type = "CALLS"};
+    cbm_edge_t e2 = {.project = "deg", .source_id = *hub, .target_id = leaves[1], .type = "CALLS"};
+    cbm_edge_t e3 = {.project = "deg", .source_id = *hub, .target_id = leaves[2], .type = "CALLS"};
+    cbm_edge_t e4 = {.project = "deg", .source_id = *mid, .target_id = *hub, .type = "CALLS"};
+    cbm_store_insert_edge(s, &e1);
+    cbm_store_insert_edge(s, &e2);
+    cbm_store_insert_edge(s, &e3);
+    cbm_store_insert_edge(s, &e4);
+    return s;
+}
+
+TEST(store_search_by_degree_orders_high_degree_first) {
+    int64_t hub, mid, leaves[3], island;
+    cbm_store_t *s = setup_degree_store(&hub, &mid, leaves, &island);
+
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search_by_degree(s, "deg", 100, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out.count, 6); /* Hub, Mid, 3 Leaves, Island */
+    ASSERT_EQ(out.total, 6);
+
+    /* Hub (degree 4: 3 CALLS out + 1 in from Mid) sorts first. */
+    ASSERT_STR_EQ(out.results[0].node.name, "Hub");
+    /* Island (degree 0) sorts last. */
+    ASSERT_STR_EQ(out.results[out.count - 1].node.name, "Island");
+
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_by_degree_respects_limit) {
+    int64_t hub, mid, leaves[3], island;
+    cbm_store_t *s = setup_degree_store(&hub, &mid, leaves, &island);
+    (void)mid;
+    (void)leaves;
+    (void)island;
+
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search_by_degree(s, "deg", 1, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_EQ(out.total, 6); /* total is pre-LIMIT, matching cbm_store_search */
+    ASSERT_STR_EQ(out.results[0].node.name, "Hub");
+    ASSERT_EQ(out.results[0].node.id, hub);
+
+    cbm_store_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_by_degree_invalid_args) {
+    int64_t hub, mid, leaves[3], island;
+    cbm_store_t *s = setup_degree_store(&hub, &mid, leaves, &island);
+
+    cbm_search_output_t out = {0};
+    out.results = (cbm_search_result_t *)0x1; /* poison — must be reset */
+    out.count = -1;
+    ASSERT_EQ(cbm_store_search_by_degree(NULL, "deg", 10, &out), CBM_STORE_ERR);
+    ASSERT_NULL(out.results);
+    ASSERT_EQ(out.count, 0);
+
+    ASSERT_EQ(cbm_store_search_by_degree(s, NULL, 10, &out), CBM_STORE_ERR);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_search_by_degree_empty_project) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    cbm_store_upsert_project(s, "empty", "/tmp/empty");
+
+    cbm_search_output_t out = {0};
+    int rc = cbm_store_search_by_degree(s, "empty", 10, &out);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(out.count, 0);
+    ASSERT_EQ(out.total, 0);
+    cbm_store_search_free(&out);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── GlobToLike edge cases ──────────────────────────────────────── */
 
 TEST(store_glob_to_like_empty) {
@@ -1835,6 +1951,10 @@ SUITE(store_search) {
     RUN_TEST(store_ensure_case_insensitive);
     RUN_TEST(store_strip_case_flag);
     RUN_TEST(store_batch_count_degrees);
+    RUN_TEST(store_search_by_degree_orders_high_degree_first);
+    RUN_TEST(store_search_by_degree_respects_limit);
+    RUN_TEST(store_search_by_degree_invalid_args);
+    RUN_TEST(store_search_by_degree_empty_project);
     /* Edge case tests */
     RUN_TEST(store_glob_to_like_empty);
     RUN_TEST(store_glob_to_like_only_star);

@@ -3187,6 +3187,127 @@ int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char
                               bind_proj_and_type, &b, out, count);
 }
 
+/* Stages `ids` into a private TEMP table so a membership test can use an
+ * index instead of a giant IN(?,?,...) placeholder list (SQLite's bound
+ * parameter count is comfortably below a max_nodes=10M sample) or a
+ * serialized id blob that would need building and re-parsing for the same
+ * effect. TEMP objects live in a separate, private schema — backed by memory
+ * per configure_pragmas' temp_store=MEMORY — so this also works against the
+ * read-only connections cbm_store_open_path_query hands query tools: only
+ * the temp schema is written, never the (possibly read-only) main DB file.
+ * INSERT OR IGNORE tolerates a duplicate id in the input rather than failing
+ * the whole call on the INTEGER PRIMARY KEY conflict. */
+static int stage_id_sample(cbm_store_t *s, const char *table, const int64_t *ids, int n_ids) {
+    char drop_sql[CBM_SZ_128];
+    char create_sql[CBM_SZ_128];
+    char insert_sql[CBM_SZ_128];
+    snprintf(drop_sql, sizeof(drop_sql), "DROP TABLE IF EXISTS temp.%s;", table);
+    snprintf(create_sql, sizeof(create_sql), "CREATE TEMP TABLE %s (id INTEGER PRIMARY KEY);",
+             table);
+    snprintf(insert_sql, sizeof(insert_sql), "INSERT OR IGNORE INTO temp.%s (id) VALUES (?1);",
+             table);
+
+    int rc = exec_sql(s, drop_sql);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+    rc = exec_sql(s, create_sql);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    sqlite3_stmt *ins = NULL;
+    if (sqlite3_prepare_v2(s->db, insert_sql, CBM_NOT_FOUND, &ins, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "stage_id_sample insert prepare");
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, "BEGIN;") != CBM_STORE_OK) {
+        sqlite3_finalize(ins);
+        return CBM_STORE_ERR;
+    }
+    for (int i = 0; i < n_ids; i++) {
+        sqlite3_bind_int64(ins, SKIP_ONE, ids[i]);
+        int step_rc = sqlite3_step(ins);
+        sqlite3_reset(ins);
+        if (step_rc != SQLITE_DONE && step_rc != SQLITE_CONSTRAINT) {
+            store_set_error_sqlite(s, "stage_id_sample insert");
+            sqlite3_finalize(ins);
+            exec_sql(s, "ROLLBACK;");
+            return CBM_STORE_ERR;
+        }
+    }
+    sqlite3_finalize(ins);
+    return exec_sql(s, "COMMIT;");
+}
+
+int cbm_store_find_edges_among(cbm_store_t *s, const char *project, const int64_t *ids, int n_ids,
+                               cbm_edge_t **out, int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !project || !ids || n_ids <= 0 || !out || !count) {
+        return CBM_STORE_ERR;
+    }
+
+    static const char *TMP_TABLE = "cbm_edges_among_ids";
+    int rc = stage_id_sample(s, TMP_TABLE, ids, n_ids);
+    if (rc != CBM_STORE_OK) {
+        return rc;
+    }
+
+    /* No properties column: layout doesn't use edge properties, and skipping
+     * it avoids a strdup+free per row across a potentially multi-million-edge
+     * project (the cost this function exists to cut). */
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "SELECT e.source_id, e.target_id, e.type FROM edges e "
+                           "WHERE e.project = ?1 "
+                           "AND e.source_id IN (SELECT id FROM temp.cbm_edges_among_ids) "
+                           "AND e.target_id IN (SELECT id FROM temp.cbm_edges_among_ids);",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_edges_among prepare");
+        exec_sql(s, "DROP TABLE IF EXISTS temp.cbm_edges_among_ids;");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_edge_t *arr = malloc((size_t)cap * sizeof(cbm_edge_t));
+
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(cbm_edge_t));
+        }
+        memset(&arr[n], 0, sizeof(cbm_edge_t));
+        arr[n].source_id = sqlite3_column_int64(stmt, 0);
+        arr[n].target_id = sqlite3_column_int64(stmt, SKIP_ONE);
+        arr[n].type = heap_strdup((const char *)sqlite3_column_text(stmt, PAIR_LEN));
+        n++;
+    }
+    if (scan_rc != SQLITE_DONE) { /* SCANCHK:among:stmt */
+        store_set_error_sqlite(s, "find_edges_among scan");
+        sqlite3_finalize(stmt);
+        cbm_store_free_edges(arr, n);
+        exec_sql(s, "DROP TABLE IF EXISTS temp.cbm_edges_among_ids;");
+        *out = NULL;
+        *count = 0;
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    /* Don't leak the temp schema across calls sharing this handle. */
+    exec_sql(s, "DROP TABLE IF EXISTS temp.cbm_edges_among_ids;");
+
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
 int cbm_store_count_edges(cbm_store_t *s, const char *project) {
     if (!s || !s->db) {
         return 0;
@@ -5362,6 +5483,106 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
     sqlite3_finalize(main_stmt);
     like_pool_free(&like_pool);
+
+    out->results = results;
+    out->count = n;
+    return CBM_STORE_OK;
+}
+
+/* Sample up to `limit` nodes for `project`, ordered by total degree (in+out,
+ * across ANY edge type) DESC, then name, then id — a dedicated, narrower
+ * sibling of cbm_store_search for callers that want a well-connected sample
+ * rather than an alphabetical page. cbm_store_search's own (name, id)
+ * pagination order is intentionally left untouched (it's a paginated public
+ * search API — changing its default would reorder every caller's pages);
+ * this is an explicit opt-in path used by cbm_layout_compute, whose
+ * alphabetical default sample of a large graph pulls almost no edges (most
+ * neighbors alphabetically-sampled nodes are related to fall outside the
+ * sample) — see #2039.
+ *
+ * Degree is computed via a GROUP BY over edges.source_id / edges.target_id
+ * (each an indexed prefix scan via idx_edges_source_type / idx_edges_target_type
+ * for the fixed project), not a per-row correlated COUNT subquery: the
+ * latter forces evaluating COUNT() for every node in the project just to
+ * sort before LIMIT applies, which measured slower on a 435k-node/4.2M-edge
+ * project (see the commit message for both timings).
+ *
+ * Populates *out exactly like cbm_store_search: out->total is the project's
+ * total node count (pre-LIMIT), in_degree/out_degree per result use the same
+ * CALLS/USAGE/CALL_REFERENCE/INHERITS/IMPLEMENTS family cbm_store_search
+ * reports. Free with cbm_store_search_free(). */
+int cbm_store_search_by_degree(cbm_store_t *s, const char *project, int limit,
+                               cbm_search_output_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!s || !s->db || !project || !out) {
+        return CBM_STORE_ERR;
+    }
+    int lim = limit > 0 ? limit : CBM_DEFAULT_SEARCH_LIMIT;
+
+    sqlite3_stmt *cnt_stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT COUNT(*) FROM nodes WHERE project = ?1;", CBM_NOT_FOUND,
+                           &cnt_stmt, NULL) == SQLITE_OK) {
+        bind_text(cnt_stmt, SKIP_ONE, project);
+        if (sqlite3_step(cnt_stmt) == SQLITE_ROW) {
+            out->total = sqlite3_column_int(cnt_stmt, 0);
+        }
+        sqlite3_finalize(cnt_stmt);
+    }
+
+    const char *sql =
+        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+        "n.file_path, n.start_line, n.end_line, n.properties, "
+        "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
+        "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
+        "'IMPLEMENTS')) AS in_deg, "
+        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
+        "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
+        "'IMPLEMENTS')) AS out_deg "
+        "FROM nodes n "
+        "LEFT JOIN (SELECT source_id AS id, COUNT(*) AS c FROM edges "
+        "  WHERE project = ?1 GROUP BY source_id) od ON od.id = n.id "
+        "LEFT JOIN (SELECT target_id AS id, COUNT(*) AS c FROM edges "
+        "  WHERE project = ?2 GROUP BY target_id) idg ON idg.id = n.id "
+        "WHERE n.project = ?3 "
+        "ORDER BY (IFNULL(od.c, 0) + IFNULL(idg.c, 0)) DESC, n.name, n.id "
+        "LIMIT ?4;";
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "search_by_degree prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    bind_text(stmt, PAIR_LEN, project);
+    bind_text(stmt, CBM_SZ_3, project);
+    sqlite3_bind_int(stmt, CBM_SZ_4, lim);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_search_result_t *results = malloc(cap * sizeof(cbm_search_result_t));
+
+    int scan_rc;
+    while ((scan_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            results = safe_realloc(results, cap * sizeof(cbm_search_result_t));
+        }
+        memset(&results[n], 0, sizeof(cbm_search_result_t));
+        scan_node(stmt, &results[n].node);
+        results[n].in_degree = sqlite3_column_int(stmt, ST_COL_9);
+        results[n].out_degree = sqlite3_column_int(stmt, CBM_DECIMAL_BASE);
+        n++;
+    }
+    if (scan_rc != SQLITE_DONE) { /* SCANCHK:by_degree:stmt */
+        store_set_error_sqlite(s, "search_by_degree scan");
+        sqlite3_finalize(stmt);
+        out->results = results;
+        out->count = n;
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
 
     out->results = results;
     out->count = n;

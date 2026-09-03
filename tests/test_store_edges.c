@@ -4,11 +4,13 @@
  * Ported from internal/store/store_test.go (TestEdgeCRUD, TestInsertEdgeBatch,
  * TestFindEdgesByURLPath, etc.)
  */
+#include "../src/foundation/compat.h"
 #include "test_framework.h"
 #include <store/store.h>
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 
 /* Helper: create a store with project + N nodes (A, B, C, ...) */
 static cbm_store_t *setup_store_with_nodes(int n, int64_t *ids) {
@@ -460,6 +462,185 @@ TEST(store_edge_find_type_nonexistent) {
     PASS();
 }
 
+/* ── find_edges_among (scoped edge fetch for #2039) ──────────────── */
+
+/* A-B-C-D-E path graph (CALLS chain) plus a B->D IMPORTS edge so more than
+ * one type is exercised. Sampling {A,B,C} should return only edges whose
+ * BOTH endpoints are in that set: A->B and (deliberately excluded) neither
+ * C->D nor B->D nor D->E, since D and E are outside the sample. */
+static cbm_store_t *setup_among_store(int64_t *ids) {
+    int64_t discard[5];
+    if (!ids)
+        ids = discard;
+    cbm_store_t *s = setup_store_with_nodes(5, ids); /* A B C D E */
+
+    cbm_edge_t ab = {.project = "test", .source_id = ids[0], .target_id = ids[1], .type = "CALLS"};
+    cbm_edge_t bc = {.project = "test", .source_id = ids[1], .target_id = ids[2], .type = "CALLS"};
+    cbm_edge_t cd = {.project = "test", .source_id = ids[2], .target_id = ids[3], .type = "CALLS"};
+    cbm_edge_t de = {.project = "test", .source_id = ids[3], .target_id = ids[4], .type = "CALLS"};
+    cbm_edge_t bd = {
+        .project = "test", .source_id = ids[1], .target_id = ids[3], .type = "IMPORTS"};
+    cbm_store_insert_edge(s, &ab);
+    cbm_store_insert_edge(s, &bc);
+    cbm_store_insert_edge(s, &cd);
+    cbm_store_insert_edge(s, &de);
+    cbm_store_insert_edge(s, &bd);
+    return s;
+}
+
+TEST(store_find_edges_among_scopes_to_sample) {
+    int64_t ids[5];
+    cbm_store_t *s = setup_among_store(ids);
+
+    int64_t sample[3] = {ids[0], ids[1], ids[2]}; /* A, B, C — excludes D, E */
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    int rc = cbm_store_find_edges_among(s, "test", sample, 3, &edges, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 2); /* A->B, B->C only: C->D/B->D/D->E fall outside the sample */
+
+    bool saw_ab = false, saw_bc = false;
+    for (int i = 0; i < count; i++) {
+        ASSERT_NOT_NULL(edges[i].type);
+        /* No properties column fetched — must stay NULL, not garbage. */
+        ASSERT_NULL(edges[i].properties_json);
+        if (edges[i].source_id == ids[0] && edges[i].target_id == ids[1] &&
+            strcmp(edges[i].type, "CALLS") == 0)
+            saw_ab = true;
+        if (edges[i].source_id == ids[1] && edges[i].target_id == ids[2] &&
+            strcmp(edges[i].type, "CALLS") == 0)
+            saw_bc = true;
+    }
+    ASSERT_TRUE(saw_ab);
+    ASSERT_TRUE(saw_bc);
+
+    cbm_store_free_edges(edges, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_find_edges_among_no_internal_edges) {
+    int64_t ids[5];
+    cbm_store_t *s = setup_among_store(ids);
+
+    /* A and E are both in the graph but never directly connected to each
+     * other, and no other sampled node bridges them. */
+    int64_t sample[2] = {ids[0], ids[4]};
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    int rc = cbm_store_find_edges_among(s, "test", sample, 2, &edges, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_edges(edges, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_find_edges_among_invalid_args) {
+    int64_t ids[5];
+    cbm_store_t *s = setup_among_store(ids);
+    int64_t sample[1] = {ids[0]};
+    cbm_edge_t *edges = (cbm_edge_t *)0x1; /* poison — must be reset to NULL */
+    int count = -1;
+
+    ASSERT_EQ(cbm_store_find_edges_among(NULL, "test", sample, 1, &edges, &count), CBM_STORE_ERR);
+    ASSERT_NULL(edges);
+    ASSERT_EQ(count, 0);
+
+    edges = (cbm_edge_t *)0x1;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_edges_among(s, "test", sample, 0, &edges, &count), CBM_STORE_ERR);
+    ASSERT_NULL(edges);
+    ASSERT_EQ(count, 0);
+
+    edges = (cbm_edge_t *)0x1;
+    count = -1;
+    ASSERT_EQ(cbm_store_find_edges_among(s, "test", NULL, 1, &edges, &count), CBM_STORE_ERR);
+    ASSERT_NULL(edges);
+    ASSERT_EQ(count, 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Repeated calls on the same handle must not leak/collide their private TEMP
+ * table — each call re-scopes it to a fresh id set. */
+TEST(store_find_edges_among_reusable_across_calls) {
+    int64_t ids[5];
+    cbm_store_t *s = setup_among_store(ids);
+
+    int64_t first[2] = {ids[0], ids[1]};
+    cbm_edge_t *e1 = NULL;
+    int c1 = 0;
+    ASSERT_EQ(cbm_store_find_edges_among(s, "test", first, 2, &e1, &c1), CBM_STORE_OK);
+    ASSERT_EQ(c1, 1); /* A->B */
+    cbm_store_free_edges(e1, c1);
+
+    int64_t second[2] = {ids[3], ids[4]};
+    cbm_edge_t *e2 = NULL;
+    int c2 = 0;
+    ASSERT_EQ(cbm_store_find_edges_among(s, "test", second, 2, &e2, &c2), CBM_STORE_OK);
+    ASSERT_EQ(c2, 1); /* D->E */
+    cbm_store_free_edges(e2, c2);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* cbm_store_open_path_query hands out a read-only connection — layout
+ * requests go through it. cbm_store_find_edges_among must work there: it
+ * only ever writes to the private TEMP schema, never the main DB file. */
+static void tse_cleanup_db(const char *db_path) {
+    char sidecar[512];
+    unlink(db_path);
+    snprintf(sidecar, sizeof(sidecar), "%s-wal", db_path);
+    unlink(sidecar);
+    snprintf(sidecar, sizeof(sidecar), "%s-shm", db_path);
+    unlink(sidecar);
+}
+
+TEST(store_find_edges_among_readonly_connection) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cbm_test_edges_among_ro_%d.db", cbm_tmpdir(),
+            (int)getpid());
+    tse_cleanup_db(db_path);
+
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, "test", "/tmp/test"), CBM_STORE_OK);
+    int64_t ids[3];
+    char name[8], qn[32];
+    for (int i = 0; i < 3; i++) {
+        snprintf(name, sizeof(name), "%c", 'A' + i);
+        snprintf(qn, sizeof(qn), "test.%c", 'A' + i);
+        cbm_node_t node = {
+            .project = "test", .label = "Function", .name = name, .qualified_name = qn};
+        ids[i] = cbm_store_upsert_node(setup, &node);
+        ASSERT_GT(ids[i], 0);
+    }
+    cbm_edge_t ab = {.project = "test", .source_id = ids[0], .target_id = ids[1], .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(setup, &ab), 0);
+    ASSERT_EQ(cbm_store_seal_for_atomic_publish(setup), CBM_STORE_OK);
+    cbm_store_close(setup);
+
+    cbm_store_t *reader = cbm_store_open_path_query(db_path);
+    ASSERT_NOT_NULL(reader);
+
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    int rc = cbm_store_find_edges_among(reader, "test", ids, 3, &edges, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_EQ(edges[0].source_id, ids[0]);
+    ASSERT_EQ(edges[0].target_id, ids[1]);
+    cbm_store_free_edges(edges, count);
+
+    cbm_store_close(reader);
+    tse_cleanup_db(db_path);
+    PASS();
+}
+
 /* ── count_edges on empty project ──────────────────────────────── */
 
 TEST(store_edge_count_empty_project) {
@@ -654,6 +835,11 @@ SUITE(store_edges) {
     RUN_TEST(store_edge_find_source_nonexistent);
     RUN_TEST(store_edge_find_target_nonexistent);
     RUN_TEST(store_edge_find_type_nonexistent);
+    RUN_TEST(store_find_edges_among_scopes_to_sample);
+    RUN_TEST(store_find_edges_among_no_internal_edges);
+    RUN_TEST(store_find_edges_among_invalid_args);
+    RUN_TEST(store_find_edges_among_reusable_across_calls);
+    RUN_TEST(store_find_edges_among_readonly_connection);
     RUN_TEST(store_edge_count_empty_project);
     RUN_TEST(store_edge_count_by_type_missing);
     RUN_TEST(store_edge_delete_by_type_preserves_others);
