@@ -1939,9 +1939,9 @@ static char *application_auto_index_args(const char *root_path) {
         return NULL;
     }
     yyjson_mut_doc_set_root(document, root);
-    char *args = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path)
-                     ? yyjson_mut_write(document, 0, NULL)
-                     : NULL;
+    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", root_path) &&
+                   yyjson_mut_obj_add_bool(document, root, "_background", true);
+    char *args = encoded ? yyjson_mut_write(document, 0, NULL) : NULL;
     yyjson_mut_doc_free(document);
     return args;
 }
@@ -3383,7 +3383,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     yyjson_mut_doc_set_root(document, root);
-    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root);
+    bool encoded = yyjson_mut_obj_add_strcpy(document, root, "repo_path", canonical_root) &&
+                   yyjson_mut_obj_add_bool(document, root, "_background", true);
     char *default_project = cbm_project_name_from_path(canonical_root);
     bool custom_project =
         project_name[0] && (!default_project || strcmp(default_project, project_name) != 0);

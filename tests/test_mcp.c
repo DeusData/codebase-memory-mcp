@@ -12970,6 +12970,73 @@ TEST(autoindex_skip_reports_numeric_limit_issue1466) {
     PASS();
 }
 
+TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
+    char cache[256];
+    char repo[512];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-autoindex-workers-XXXXXX", cbm_tmpdir());
+    bool cache_ready = cbm_mkdtemp(cache) != NULL;
+    (void)snprintf(repo, sizeof(repo), "%s/repo", cache);
+    char source[640];
+    (void)snprintf(source, sizeof(source), "%s/main.py", repo);
+    bool repo_ready = cache_ready && th_mkdir_p(repo) == 0 &&
+                      th_write_file(source, "def background_index():\n    return True\n") == 0;
+
+    mcp_test_env_backup_t environment[] = {
+        {.name = "CBM_CACHE_DIR"},
+        {.name = "CBM_WORKERS"},
+        {.name = "CBM_INDEX_SINGLE_THREAD"},
+    };
+    bool environment_saved = true;
+    for (size_t i = 0; i < sizeof(environment) / sizeof(environment[0]); i++) {
+        const char *value = getenv(environment[i].name);
+        environment[i].present = value != NULL;
+        environment[i].value = value ? strdup(value) : NULL;
+        environment_saved = environment_saved && (!value || environment[i].value);
+    }
+    bool environment_ready =
+        environment_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+        cbm_unsetenv("CBM_WORKERS") == 0 && cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") == 0;
+
+    char old_cwd[CBM_SZ_4K] = {0};
+    bool cwd_ready = repo_ready && environment_ready && cbm_getcwd(old_cwd, sizeof(old_cwd)) &&
+                     cbm_chdir(repo) == 0;
+    cbm_config_t *config = cwd_ready ? cbm_config_open(cache) : NULL;
+    bool config_ready = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                        cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+    cbm_pipeline_worker_count_test_reset();
+    cbm_mcp_server_t *server = config_ready ? cbm_mcp_server_new(NULL) : NULL;
+    char *response = NULL;
+    if (server) {
+        cbm_mcp_server_set_config(server, config);
+        response = cbm_mcp_server_handle(
+            server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+        cbm_mcp_server_free(server); /* joins the automatic index thread */
+    }
+    int selected_workers = cbm_pipeline_worker_count_test_last();
+    bool server_ready = server != NULL;
+    bool response_ready = response != NULL;
+
+    free(response);
+    cbm_config_close(config);
+    if (cwd_ready) {
+        (void)cbm_chdir(old_cwd);
+    }
+    mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
+    bool cleaned = !cache_ready || th_rmtree(cache) == 0;
+
+    ASSERT_TRUE(cache_ready);
+    ASSERT_TRUE(repo_ready);
+    ASSERT_TRUE(environment_saved);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(cwd_ready);
+    ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(server_ready);
+    ASSERT_TRUE(response_ready);
+    ASSERT_EQ(selected_workers, cbm_default_worker_count(false));
+    ASSERT_TRUE(cleaned);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  #853 — auto_watch=false must ALSO gate the SUPERVISED fresh-index
  *          watcher registration (keystone × #849 merge interaction)
@@ -14186,6 +14253,7 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
+    RUN_TEST(mcp_auto_index_in_process_uses_background_worker_policy);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without
