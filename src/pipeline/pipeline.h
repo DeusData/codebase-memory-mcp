@@ -59,6 +59,18 @@ void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resourc
 /* Copy the exact discovery violation from the most recent run. */
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
+/* Mark work that runs without a waiting user. Background pipelines reserve
+ * CPU headroom; foreground pipelines retain the initial-index all-core policy. */
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background);
+
+/* Resolve the worker policy for this pipeline, including environment and
+ * crash-recovery overrides. */
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p);
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_worker_count_test_reset(void);
+int cbm_pipeline_worker_count_test_last(void);
+#endif
 
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);

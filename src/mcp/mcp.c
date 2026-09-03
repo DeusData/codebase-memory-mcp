@@ -10964,7 +10964,8 @@ static char *index_run_supervised_path(cbm_mcp_server_t *srv, const char *root_p
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     if (!yyjson_mut_obj_add_strcpy(doc, root, "repo_path", root_path) ||
-        !cbm_mcp_index_policy_add_to_args(doc, root, &policy)) {
+        !cbm_mcp_index_policy_add_to_args(doc, root, &policy) ||
+        !yyjson_mut_obj_add_bool(doc, root, "_background", true)) {
         yyjson_mut_doc_free(doc);
         return NULL;
     }
@@ -11108,6 +11109,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
+    bool background = cbm_mcp_get_bool_arg(args, "_background");
     cbm_normalize_path_sep(repo_path);
 
     if (!repo_path) {
@@ -11241,6 +11243,7 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
+    cbm_pipeline_set_background(p, background);
     if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
         cbm_pipeline_free(p);
         mcp_project_mutation_end(srv, mutation_project);
@@ -17626,6 +17629,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
+    cbm_pipeline_set_background(p, true);
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();

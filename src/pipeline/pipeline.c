@@ -72,6 +72,18 @@ static inline void *intptr_to_ptr(intptr_t v) {
 static atomic_int g_pipeline_busy = 0;
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static atomic_int g_last_worker_count = 0;
+
+void cbm_pipeline_worker_count_test_reset(void) {
+    atomic_store(&g_last_worker_count, 0);
+}
+
+int cbm_pipeline_worker_count_test_last(void) {
+    return atomic_load(&g_last_worker_count);
+}
+#endif
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
 static atomic_bool g_persist_test_fail_after_stage_dump = false;
 static atomic_bool g_persist_test_cancel_after_predump = false;
 static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
@@ -192,6 +204,7 @@ struct cbm_pipeline {
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
+    bool background;  /* reserve CPU headroom when no user is waiting */
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -386,6 +399,12 @@ void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation) {
     if (violation) {
         *violation = p ? p->resource_violation : (cbm_index_resource_violation_t){0};
+    }
+}
+
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background) {
+    if (p) {
+        p->background = background;
     }
 }
 
@@ -602,12 +621,18 @@ void cbm_pipeline_set_committed_counts(cbm_pipeline_t *p, int nodes, int edges) 
  * crasher; a parallel re-run would race the marker. Honour that override
  * everywhere the worker count drives the parallel/sequential decision, so the
  * whole extraction phase collapses to the deterministic sequential path. */
-static int effective_worker_count(bool initial) {
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p) {
     const char *st = getenv("CBM_INDEX_SINGLE_THREAD");
+    int workers;
     if (st && st[0] == '1') {
-        return 1;
+        workers = 1;
+    } else {
+        workers = cbm_default_worker_count(!p || !p->background);
     }
-    return cbm_default_worker_count(initial);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    atomic_store(&g_last_worker_count, workers);
+#endif
+    return workers;
 }
 
 /* Resolve the DB path for this pipeline. Caller must free(). */
@@ -2575,7 +2600,7 @@ static int run_githistory(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     gh_compute_arg_t gh_arg = {.repo_path = ctx->repo_path, .result = &gh_result};
 
     if (p->mode != CBM_MODE_FAST) {
-        if (effective_worker_count(true) > SKIP_ONE) {
+        if (cbm_pipeline_worker_count(p) > SKIP_ONE) {
             if (cbm_thread_create(&gh_thread, 0, gh_compute_thread_fn, &gh_arg) == 0) {
                 gh_threaded = true;
             }
@@ -2675,7 +2700,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = effective_worker_count(true);
+    int worker_count = cbm_pipeline_worker_count(p);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
