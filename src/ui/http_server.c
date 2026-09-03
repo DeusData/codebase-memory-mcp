@@ -1557,36 +1557,23 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     /* Capture primary cluster radius before freeing the layout. */
     double primary_radius = layout_radius(layout);
 
-    /* Build JSON: primary layout + linked_projects */
-    char *primary_json = cbm_layout_to_json(layout);
+    /* Build the primary layout directly into ONE yyjson_mut_doc — no
+     * encode-to-string + yyjson_read + yyjson_doc_mut_copy round trip. Every
+     * string field cbm_layout_to_mut_json adds is copied into mdoc's own
+     * arena, so `layout` can be freed immediately: mdoc holds no pointers
+     * into it. missed_graph/linked_projects (below) get attached to this
+     * same doc, and the whole thing is written to bytes exactly once, at
+     * the bottom of this function. */
+    yyjson_mut_doc *mdoc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *mroot = cbm_layout_to_mut_json(layout, mdoc);
     cbm_layout_free(layout);
-    if (!primary_json) {
+    if (!mroot) {
+        yyjson_mut_doc_free(mdoc);
         cbm_store_close(store);
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
         return;
     }
-
-    /* Fast path: no satellites to attach. The missed skeleton only decorates
-     * the CODE graph — a graph=missed request already IS the miss graph. */
-    if (linked_count == 0 && missed_graph) {
-        cbm_store_close(store);
-        cbm_http_replyf(c, 200, g_cors_json, "%s", primary_json);
-        free(primary_json);
-        return;
-    }
-
-    /* Parse primary JSON and append missed_graph + linked_projects */
-    yyjson_doc *pdoc = yyjson_read(primary_json, strlen(primary_json), 0);
-    free(primary_json);
-    if (!pdoc) {
-        cbm_store_close(store);
-        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON parse failed\"}");
-        return;
-    }
-
-    yyjson_mut_doc *mdoc = yyjson_doc_mut_copy(pdoc, NULL);
-    yyjson_doc_free(pdoc);
-    yyjson_mut_val *mroot = yyjson_mut_doc_get_root(mdoc);
+    yyjson_mut_doc_set_root(mdoc, mroot);
 
     if (!missed_graph) {
         (void)attach_missed_graph(mdoc, mroot, store, project, primary_radius);
@@ -1733,14 +1720,29 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     cbm_store_close(store);
     yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
 
+    /* Written exactly once, from the single doc built above — no second
+     * document, no re-parse. ALLOW_INVALID_UNICODE matches
+     * cbm_layout_to_mut_json's contents (identifiers can contain malformed
+     * UTF-8) and is strictly safer here than the old code's flags=0 write,
+     * since this doc's node/edge strings never survived a yyjson_read pass
+     * that could itself have choked on the same bytes. */
     size_t len = 0;
-    char *final_json = yyjson_mut_write(mdoc, 0, &len);
+    yyjson_write_err write_err = {0};
+    char *final_json =
+        yyjson_mut_write_opts(mdoc, YYJSON_WRITE_ALLOW_INVALID_UNICODE, NULL, &len, &write_err);
     yyjson_mut_doc_free(mdoc);
 
     if (final_json) {
-        cbm_http_replyf(c, 200, g_cors_json, "%s", final_json);
+        /* Binary-safe send of the already-built buffer — cbm_http_replyf's
+         * "%s" would vsnprintf-copy the whole (potentially multi-MB) body a
+         * second time just to hand it to the socket. */
+        cbm_http_reply_buf(c, 200, g_cors_json, final_json, len);
         free(final_json);
     } else {
+        char code[32];
+        snprintf(code, sizeof(code), "%u", write_err.code);
+        cbm_log_error("layout.json.fail", "code", code, "msg",
+                      write_err.msg ? write_err.msg : "unknown");
         cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON write failed\"}");
     }
 }

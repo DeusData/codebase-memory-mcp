@@ -5531,23 +5531,22 @@ int cbm_store_search_by_degree(cbm_store_t *s, const char *project, int limit,
         sqlite3_finalize(cnt_stmt);
     }
 
-    const char *sql =
-        "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-        "n.file_path, n.start_line, n.end_line, n.properties, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
-        "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
-        "'IMPLEMENTS')) AS in_deg, "
-        "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
-        "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
-        "'IMPLEMENTS')) AS out_deg "
-        "FROM nodes n "
-        "LEFT JOIN (SELECT source_id AS id, COUNT(*) AS c FROM edges "
-        "  WHERE project = ?1 GROUP BY source_id) od ON od.id = n.id "
-        "LEFT JOIN (SELECT target_id AS id, COUNT(*) AS c FROM edges "
-        "  WHERE project = ?2 GROUP BY target_id) idg ON idg.id = n.id "
-        "WHERE n.project = ?3 "
-        "ORDER BY (IFNULL(od.c, 0) + IFNULL(idg.c, 0)) DESC, n.name, n.id "
-        "LIMIT ?4;";
+    const char *sql = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
+                      "n.file_path, n.start_line, n.end_line, n.properties, "
+                      "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
+                      "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
+                      "'IMPLEMENTS')) AS in_deg, "
+                      "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
+                      "e.type IN ('CALLS', 'USAGE', 'CALL_REFERENCE', 'INHERITS', "
+                      "'IMPLEMENTS')) AS out_deg "
+                      "FROM nodes n "
+                      "LEFT JOIN (SELECT source_id AS id, COUNT(*) AS c FROM edges "
+                      "  WHERE project = ?1 GROUP BY source_id) od ON od.id = n.id "
+                      "LEFT JOIN (SELECT target_id AS id, COUNT(*) AS c FROM edges "
+                      "  WHERE project = ?2 GROUP BY target_id) idg ON idg.id = n.id "
+                      "WHERE n.project = ?3 "
+                      "ORDER BY (IFNULL(od.c, 0) + IFNULL(idg.c, 0)) DESC, n.name, n.id "
+                      "LIMIT ?4;";
 
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {

@@ -21,7 +21,7 @@
  *
  * `depth` must have room for n ints; it is fully overwritten.
  */
-void cbm_layout_compute_call_depth(int n, const int *es, const int *ed, int ne,
-                                    const char **labels, int *depth);
+void cbm_layout_compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
+                                   int *depth);
 
 #endif /* CBM_UI_LAYOUT3D_INTERNAL_H */

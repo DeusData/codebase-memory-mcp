@@ -5,13 +5,24 @@
  *   - Overview: cluster centroids (packages/folders), ~1K-10K nodes
  *   - Detail: individual nodes within a region, up to max_nodes
  *
- * Layout positions are cached in the project's SQLite database.
+ * Layout positions are computed fresh on every request — there is no
+ * position cache. Each cbm_layout_compute() call re-samples the graph and
+ * re-runs the local optimization pass; see cbm_layout_compute's comment for
+ * how the node sample and edge set are scoped to keep that affordable on
+ * large projects.
  */
 #ifndef CBM_UI_LAYOUT3D_H
 #define CBM_UI_LAYOUT3D_H
 
 #include "store/store.h"
 #include <stdbool.h>
+
+/* Forward declarations of yyjson's mutable-document types, matched exactly
+ * against vendored/yyjson/yyjson.h's own typedefs (identical redeclaration
+ * of the same struct tag is legal in C11 — see 6.7p3) so callers that only
+ * need cbm_layout_to_mut_json don't have to pull in the full yyjson.h. */
+typedef struct yyjson_mut_doc yyjson_mut_doc;
+typedef struct yyjson_mut_val yyjson_mut_val;
 
 /* ── Layout node (output) ─────────────────────────────────────── */
 
@@ -70,5 +81,20 @@ void cbm_layout_free(cbm_layout_result_t *result);
 
 /* Serialize layout result to JSON string. Caller must free(). */
 char *cbm_layout_to_json(const cbm_layout_result_t *result);
+
+/* Build a layout result directly as an object — {"nodes":[...],
+ * "edges":[...], "total_nodes":N}, the same shape cbm_layout_to_json's
+ * string encodes — inside a caller-owned yyjson_mut_doc, instead of
+ * encoding to a standalone JSON string. All string fields are copied into
+ * `doc` (not borrowed from `result`), so `result` may be freed as soon as
+ * this call returns. Lets a caller that's assembling a larger document
+ * (e.g. handle_layout attaching missed_graph/linked_projects) skip the
+ * encode -> parse -> deep-copy round trip cbm_layout_to_json + yyjson_read +
+ * yyjson_doc_mut_copy would otherwise require to merge the result in.
+ * Returns the new object (not yet attached to any parent — the caller
+ * decides where it goes, typically yyjson_mut_doc_set_root or
+ * yyjson_mut_obj_add_val), or NULL on allocation failure or a NULL
+ * `result`/`doc`. */
+yyjson_mut_val *cbm_layout_to_mut_json(const cbm_layout_result_t *result, yyjson_mut_doc *doc);
 
 #endif /* CBM_UI_LAYOUT3D_H */

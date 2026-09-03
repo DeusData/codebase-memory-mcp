@@ -1353,10 +1353,8 @@ static cbm_store_t *setup_degree_store(int64_t *hub, int64_t *mid, int64_t leave
         .project = "deg", .label = "Function", .name = "Hub", .qualified_name = "deg.Hub"};
     cbm_node_t nmid = {
         .project = "deg", .label = "Function", .name = "Mid", .qualified_name = "deg.Mid"};
-    cbm_node_t nisland = {.project = "deg",
-                          .label = "Function",
-                          .name = "Island",
-                          .qualified_name = "deg.Island"};
+    cbm_node_t nisland = {
+        .project = "deg", .label = "Function", .name = "Island", .qualified_name = "deg.Island"};
     *hub = cbm_store_upsert_node(s, &nhub);
     *mid = cbm_store_upsert_node(s, &nmid);
     *island = cbm_store_upsert_node(s, &nisland);
@@ -1365,8 +1363,7 @@ static cbm_store_t *setup_degree_store(int64_t *hub, int64_t *mid, int64_t leave
         char name[16], qn[32];
         snprintf(name, sizeof(name), "Leaf%d", i);
         snprintf(qn, sizeof(qn), "deg.Leaf%d", i);
-        cbm_node_t nl = {
-            .project = "deg", .label = "Function", .name = name, .qualified_name = qn};
+        cbm_node_t nl = {.project = "deg", .label = "Function", .name = name, .qualified_name = qn};
         leaves[i] = cbm_store_upsert_node(s, &nl);
     }
 

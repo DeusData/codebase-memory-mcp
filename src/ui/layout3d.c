@@ -423,8 +423,8 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
  * Declared non-static in layout3d_internal.h so tests can drive the BFS
  * directly without a store-backed cbm_layout_compute() call.
  */
-void cbm_layout_compute_call_depth(int n, const int *es, const int *ed, int ne,
-                                   const char **labels, int *depth) {
+void cbm_layout_compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
+                                   int *depth) {
     for (int i = 0; i < n; i++)
         depth[i] = -1;
     if (n <= 0)
@@ -842,13 +842,15 @@ void cbm_layout_free(cbm_layout_result_t *r) {
     free(r);
 }
 
-char *cbm_layout_to_json(const cbm_layout_result_t *r) {
-    if (!r)
+yyjson_mut_val *cbm_layout_to_mut_json(const cbm_layout_result_t *r, yyjson_mut_doc *doc) {
+    if (!r || !doc)
         return NULL;
-    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
-    yyjson_mut_doc_set_root(doc, root);
 
+    /* Every string field is added via the _strcpy variant (copies into doc's
+     * own arena) rather than _str (borrows the pointer): callers that build
+     * straight into a long-lived document (handle_layout) free `r` right
+     * after this call returns, before the document is ever written. */
     yyjson_mut_val *na = yyjson_mut_arr(doc);
     for (int i = 0; i < r->node_count; i++) {
         yyjson_mut_val *nd = yyjson_mut_obj(doc);
@@ -860,13 +862,13 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
         yyjson_mut_obj_add_real(doc, nd, "y", ny);
         yyjson_mut_obj_add_real(doc, nd, "z", nz);
         if (r->nodes[i].label)
-            yyjson_mut_obj_add_str(doc, nd, "label", r->nodes[i].label);
+            yyjson_mut_obj_add_strcpy(doc, nd, "label", r->nodes[i].label);
         if (r->nodes[i].name)
-            yyjson_mut_obj_add_str(doc, nd, "name", r->nodes[i].name);
+            yyjson_mut_obj_add_strcpy(doc, nd, "name", r->nodes[i].name);
         if (r->nodes[i].file_path)
-            yyjson_mut_obj_add_str(doc, nd, "file_path", r->nodes[i].file_path);
+            yyjson_mut_obj_add_strcpy(doc, nd, "file_path", r->nodes[i].file_path);
         if (r->nodes[i].qualified_name)
-            yyjson_mut_obj_add_str(doc, nd, "qualified_name", r->nodes[i].qualified_name);
+            yyjson_mut_obj_add_strcpy(doc, nd, "qualified_name", r->nodes[i].qualified_name);
         if (r->nodes[i].start_line > 0)
             yyjson_mut_obj_add_int(doc, nd, "start_line", r->nodes[i].start_line);
         if (r->nodes[i].end_line > 0)
@@ -878,7 +880,7 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
         yyjson_mut_obj_add_strcpy(doc, nd, "color", hex);
         yyjson_mut_obj_add_int(doc, nd, "in_calls", r->nodes[i].in_calls);
         if (r->nodes[i].status)
-            yyjson_mut_obj_add_str(doc, nd, "status", r->nodes[i].status);
+            yyjson_mut_obj_add_strcpy(doc, nd, "status", r->nodes[i].status);
         yyjson_mut_arr_append(na, nd);
     }
     yyjson_mut_obj_add_val(doc, root, "nodes", na);
@@ -889,11 +891,25 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
         yyjson_mut_obj_add_int(doc, ed, "source", r->edges[i].source);
         yyjson_mut_obj_add_int(doc, ed, "target", r->edges[i].target);
         if (r->edges[i].type)
-            yyjson_mut_obj_add_str(doc, ed, "type", r->edges[i].type);
+            yyjson_mut_obj_add_strcpy(doc, ed, "type", r->edges[i].type);
         yyjson_mut_arr_append(ea, ed);
     }
     yyjson_mut_obj_add_val(doc, root, "edges", ea);
     yyjson_mut_obj_add_int(doc, root, "total_nodes", r->total_nodes);
+
+    return root;
+}
+
+char *cbm_layout_to_json(const cbm_layout_result_t *r) {
+    if (!r)
+        return NULL;
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = cbm_layout_to_mut_json(r, doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
+    yyjson_mut_doc_set_root(doc, root);
 
     size_t len = 0;
     yyjson_write_err write_err = {0};

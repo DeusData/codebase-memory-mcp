@@ -603,7 +603,7 @@ static void tse_cleanup_db(const char *db_path) {
 TEST(store_find_edges_among_readonly_connection) {
     char db_path[512];
     snprintf(db_path, sizeof(db_path), "%s/cbm_test_edges_among_ro_%d.db", cbm_tmpdir(),
-            (int)getpid());
+             (int)getpid());
     tse_cleanup_db(db_path);
 
     cbm_store_t *setup = cbm_store_open_path(db_path);

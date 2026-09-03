@@ -1558,6 +1558,125 @@ TEST(ui_server_delete_project_unlink_failure_keeps_watch) {
     PASS();
 }
 
+/* ── /api/layout end-to-end (#2039) ──────────────────────────────
+ *
+ * handle_layout was refactored to build one yyjson_mut_doc directly (via
+ * cbm_layout_to_mut_json) instead of encoding cbm_layout_to_json's string,
+ * re-parsing it, and deep-copying it into a second mutable doc — then to
+ * send that doc's single write with cbm_http_reply_buf instead of
+ * cbm_http_replyf("%s", ...). These tests exercise the real handler over a
+ * live socket against a real on-disk project store, so a regression in that
+ * refactor (wrong doc, dangling string pointers into a freed
+ * cbm_layout_result_t, a bad content-length from switching reply
+ * functions) shows up as a real HTTP failure, not just a unit test of the
+ * JSON builder in isolation. */
+static int layout_seed_project(const ui_delete_fixture_t *fx, const char *project) {
+    char db_path[1024];
+    ui_delete_db_path(fx, project, db_path, sizeof(db_path));
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    if (!store)
+        return CBM_STORE_ERR;
+    if (cbm_store_upsert_project(store, project, "/tmp/layout-e2e") != CBM_STORE_OK) {
+        cbm_store_close(store);
+        return CBM_STORE_ERR;
+    }
+    cbm_node_t caller = {.project = project,
+                         .label = "Function",
+                         .name = "caller",
+                         .qualified_name = "layout_e2e.caller",
+                         .file_path = "a.py",
+                         .start_line = 1,
+                         .end_line = 2};
+    cbm_node_t callee = {.project = project,
+                         .label = "Function",
+                         .name = "callee",
+                         .qualified_name = "layout_e2e.callee",
+                         .file_path = "b.py",
+                         .start_line = 1,
+                         .end_line = 2};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    int64_t callee_id = cbm_store_upsert_node(store, &callee);
+    int rc = CBM_STORE_ERR;
+    if (caller_id > 0 && callee_id > 0) {
+        cbm_edge_t e = {
+            .project = project, .source_id = caller_id, .target_id = callee_id, .type = "CALLS"};
+        rc = cbm_store_insert_edge(store, &e) > 0 ? CBM_STORE_OK : CBM_STORE_ERR;
+    }
+    cbm_store_close(store);
+    return rc;
+}
+
+TEST(ui_server_layout_returns_nodes_and_edges) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    ASSERT_EQ(layout_seed_project(&fx, "layout-e2e"), CBM_STORE_OK);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/layout?project=layout-e2e HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"nodes\":["));
+    ASSERT_NOT_NULL(strstr(resp, "\"edges\":["));
+    ASSERT_NOT_NULL(strstr(resp, "\"total_nodes\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"caller\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"callee\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"linked_projects\":["));
+    /* No missed_graph key: nothing indexed under the "<project>::missed"
+     * shadow project, so attach_missed_graph is a no-op — same as before
+     * this refactor. */
+    ASSERT_NULL(strstr(resp, "\"missed_graph\""));
+
+    /* Body byte count must match what the server actually declared — proof
+     * cbm_http_reply_buf (len from the single yyjson_mut_write) sent exactly
+     * the buffer it built, not a mismatched or truncated copy. */
+    const char *cl_hdr = strstr(resp, "Content-Length: ");
+    ASSERT_NOT_NULL(cl_hdr);
+    long declared_len = strtol(cl_hdr + strlen("Content-Length: "), NULL, 10);
+    const char *body = strstr(resp, "\r\n\r\n");
+    ASSERT_NOT_NULL(body);
+    body += 4;
+    ASSERT_EQ((long)strlen(body), declared_len);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_server_layout_missing_project_param) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/layout HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 400);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"missing project parameter\"}"));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_layout_unknown_project) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[4096];
+    int n =
+        th_http(cbm_http_server_port(ts.srv),
+                "GET /api/layout?project=layout-e2e-missing HTTP/1.1\r\n\r\n", resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 404);
+    ASSERT_NOT_NULL(strstr(resp, "{\"error\":\"project not found\"}"));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
 TEST(ui_server_ui_config_detects_zh_accept_language) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -2416,6 +2535,9 @@ SUITE(httpd) {
     RUN_TEST(ui_server_delete_project_missing_name_keeps_watch);
     RUN_TEST(ui_server_delete_project_invalid_name_keeps_watch);
     RUN_TEST(ui_server_delete_project_unlink_failure_keeps_watch);
+    RUN_TEST(ui_server_layout_returns_nodes_and_edges);
+    RUN_TEST(ui_server_layout_missing_project_param);
+    RUN_TEST(ui_server_layout_unknown_project);
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_includes_serving_version_issue1820);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);

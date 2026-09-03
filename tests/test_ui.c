@@ -749,8 +749,8 @@ TEST(compute_call_depth_csr_bfs) {
     for (int i = hub; i < n; i++)
         labels[i] = "Function";
 
-    const int ne = 1 /* entry->hub */ + N_CHILDREN /* hub->child[i] */ +
-                   1 /* child[0]->grandchild */;
+    const int ne =
+        1 /* entry->hub */ + N_CHILDREN /* hub->child[i] */ + 1 /* child[0]->grandchild */;
     int *es = malloc((size_t)ne * sizeof(int));
     int *ed = malloc((size_t)ne * sizeof(int));
     ASSERT_NOT_NULL(es);
