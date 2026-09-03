@@ -12,6 +12,7 @@
  */
 #include "foundation/constants.h"
 #include "ui/layout3d.h"
+#include "ui/layout3d_internal.h"
 #include "foundation/log.h"
 
 #include <yyjson/yyjson.h>
@@ -407,12 +408,27 @@ static void local_optimize(body_t *b, int n, const int *es, const int *ed, int n
     }
 }
 
-/* ── Call depth via BFS ───────────────────────────────────────── */
-
-static void compute_call_depth(int n, const int *es, const int *ed, int ne, const char **labels,
-                               int *depth) {
+/* ── Call depth via BFS (CSR adjacency) ──────────────────────────
+ *
+ * Builds a counting-sort CSR (compressed sparse row) index — offsets[n+1]
+ * plus adj[ne], keyed by source node index — so each dequeued node's
+ * outgoing edges are a direct O(degree) slice instead of a full
+ * `for (e=0;e<ne;e++) if (es[e]==c)` rescan of every edge. That rescan made
+ * the BFS O(n*ne); the CSR index makes it O(n+ne), which is the difference
+ * between seconds and minutes once a project graph reaches millions of
+ * edges. Traversal order (and therefore every depth value) is identical to
+ * the previous scan: adj[] preserves each source's edges in their original
+ * es/ed order, so ties resolve exactly as before.
+ *
+ * Declared non-static in layout3d_internal.h so tests can drive the BFS
+ * directly without a store-backed cbm_layout_compute() call.
+ */
+void cbm_layout_compute_call_depth(int n, const int *es, const int *ed, int ne,
+                                   const char **labels, int *depth) {
     for (int i = 0; i < n; i++)
         depth[i] = -1;
+    if (n <= 0)
+        return;
     int *q = malloc((size_t)n * sizeof(int));
     int head = 0, tail = 0;
     if (!q)
@@ -442,17 +458,50 @@ static void compute_call_depth(int n, const int *es, const int *ed, int ne, cons
             free(in_d);
         }
     }
+
+    /* Build CSR: offsets[i]..offsets[i+1] is node i's slice of adj[]. */
+    int *offsets = calloc((size_t)n + 1, sizeof(int));
+    int *adj = ne > 0 ? malloc((size_t)ne * sizeof(int)) : NULL;
+    int *cursor = malloc((size_t)n * sizeof(int));
+    if (!offsets || (ne > 0 && !adj) || !cursor) {
+        /* No index available — every node reachable via the entry-point seed
+         * above already has depth 0; nothing further can be propagated. */
+        free(offsets);
+        free(adj);
+        free(cursor);
+        for (int i = 0; i < n; i++)
+            if (depth[i] == -1)
+                depth[i] = 0;
+        free(q);
+        return;
+    }
+    for (int e = 0; e < ne; e++) {
+        int s = es[e];
+        if (s >= 0 && s < n)
+            offsets[s + 1]++;
+    }
+    for (int i = 0; i < n; i++)
+        offsets[i + 1] += offsets[i];
+    memcpy(cursor, offsets, (size_t)n * sizeof(int));
+    for (int e = 0; e < ne; e++) {
+        int s = es[e];
+        if (s >= 0 && s < n)
+            adj[cursor[s]++] = ed[e];
+    }
+    free(cursor);
+
     while (head < tail) {
         int c = q[head++], cd = depth[c];
-        for (int e = 0; e < ne; e++)
-            if (es[e] == c) {
-                int t = ed[e];
-                if (t >= 0 && t < n && depth[t] == -1) {
-                    depth[t] = cd + SKIP_ONE;
-                    q[tail++] = t;
-                }
+        for (int k = offsets[c]; k < offsets[c + 1]; k++) {
+            int t = adj[k];
+            if (t >= 0 && t < n && depth[t] == -1) {
+                depth[t] = cd + SKIP_ONE;
+                q[tail++] = t;
             }
+        }
     }
+    free(offsets);
+    free(adj);
     for (int i = 0; i < n; i++)
         if (depth[i] == -1)
             depth[i] = 0;
@@ -620,7 +669,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
         for (int i = 0; i < n; i++)
             lbls[i] = search_out.results[i].node.label;
         if (cdepth)
-            compute_call_depth(n, es, ed, mapped, lbls, cdepth);
+            cbm_layout_compute_call_depth(n, es, ed, mapped, lbls, cdepth);
         free(lbls);
     }
 

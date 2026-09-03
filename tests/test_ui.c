@@ -10,6 +10,7 @@
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
+#include "ui/layout3d_internal.h"
 #include "store/store.h"
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
@@ -726,6 +727,68 @@ TEST(layout_dead_code_classification) {
     PASS();
 }
 
+/* ── Call-depth BFS (CSR adjacency) ──────────────────────────────
+ *
+ * Drives cbm_layout_compute_call_depth() directly (see layout3d_internal.h)
+ * rather than through the store-backed cbm_layout_compute(), so the CSR BFS
+ * itself is under test independent of node sampling / query plumbing.
+ */
+TEST(compute_call_depth_csr_bfs) {
+    /* Graph: File entry -> hub -> 20 children (many outgoing edges from one
+     * node) -> one grandchild two hops down, plus a node with no edges at
+     * all (never reached by the BFS). */
+    enum { N_CHILDREN = 20 };
+    const int entry = 0, hub = 1, first_child = 2;
+    const int grandchild = first_child + N_CHILDREN;
+    const int unreachable = grandchild + 1;
+    const int n = unreachable + 1;
+
+    const char **labels = calloc((size_t)n, sizeof(char *));
+    ASSERT_NOT_NULL(labels);
+    labels[entry] = "File"; /* seeds depth 0 as an entry point */
+    for (int i = hub; i < n; i++)
+        labels[i] = "Function";
+
+    const int ne = 1 /* entry->hub */ + N_CHILDREN /* hub->child[i] */ +
+                   1 /* child[0]->grandchild */;
+    int *es = malloc((size_t)ne * sizeof(int));
+    int *ed = malloc((size_t)ne * sizeof(int));
+    ASSERT_NOT_NULL(es);
+    ASSERT_NOT_NULL(ed);
+    int k = 0;
+    es[k] = entry;
+    ed[k] = hub;
+    k++;
+    for (int i = 0; i < N_CHILDREN; i++) {
+        es[k] = hub;
+        ed[k] = first_child + i;
+        k++;
+    }
+    es[k] = first_child;
+    ed[k] = grandchild;
+    k++;
+    ASSERT_EQ(k, ne);
+
+    int *depth = malloc((size_t)n * sizeof(int));
+    ASSERT_NOT_NULL(depth);
+    cbm_layout_compute_call_depth(n, es, ed, ne, labels, depth);
+
+    ASSERT_EQ(depth[entry], 0);
+    ASSERT_EQ(depth[hub], 1);
+    for (int i = 0; i < N_CHILDREN; i++)
+        ASSERT_EQ(depth[first_child + i], 2);
+    ASSERT_EQ(depth[grandchild], 3);
+    /* Never touched by any edge: must fall back to depth 0, not the -1
+     * sentinel and not some stale/garbage value from the CSR arrays. */
+    ASSERT_EQ(depth[unreachable], 0);
+
+    free(labels);
+    free(es);
+    free(ed);
+    free(depth);
+    PASS();
+}
+
 /* ── Octree recursion guard (distilled from PR #821; refs #498/#726/#402) ── */
 
 /* Bodies that share a position made octree_insert subdivide forever — the
@@ -885,5 +948,6 @@ SUITE(ui) {
     RUN_TEST(layout_to_json);
     RUN_TEST(layout_null_inputs);
     RUN_TEST(layout_dead_code_classification);
+    RUN_TEST(compute_call_depth_csr_bfs);
     RUN_TEST(layout_coincident_nodes_bounded);
 }
