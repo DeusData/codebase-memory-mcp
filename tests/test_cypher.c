@@ -2982,6 +2982,90 @@ TEST(cypher_exec_return_star) {
     PASS();
 }
 
+/* Build "MATCH (a0:NoSuchLabelXYZ)-[:CALLS]->(a1)-…->(aN-1)" into buf. The label
+ * matches nothing, so any query built on it is instant and needs no fixture. */
+static void build_node_chain(char *buf, size_t buf_sz, int nodes) {
+    int off = snprintf(buf, buf_sz, "MATCH (a0:NoSuchLabelXYZ)");
+    for (int i = 1; i < nodes; i++) {
+        off += snprintf(buf + off, buf_sz - (size_t)off, "-[:CALLS]->(a%d)", i);
+    }
+}
+
+TEST(cypher_wide_pattern_refused) {
+    /* A binding holds CYP_MAX_VARS (16) node variables, and binding_set drops
+     * the 17th without a word. The query then answers a column of empty strings
+     * for every name it could not bind, which reads as "the graph holds no such
+     * data". Refuse the query instead of answering it wrong. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[2048];
+
+    build_node_chain(query, sizeof(query), 20); /* 20 > CYP_MAX_VARS */
+    strncat(query, " RETURN a0.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    ASSERT_TRUE(strstr(wide.error, "node") != NULL); /* says which limit was passed */
+    cbm_cypher_result_free(&wide);
+
+    /* The width right at the bound still runs, so the guard refuses only what a
+     * binding genuinely cannot hold. */
+    build_node_chain(query, sizeof(query), 16);
+    strncat(query, " RETURN a0.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t ok = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, query, "test", 0, &ok), 0);
+    cbm_cypher_result_free(&ok);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_wide_edge_pattern_refused) {
+    /* Same shape on the edge table, where binding_set_edge stops at
+     * CYP_MAX_EDGE_VARS (8). Only NAMED relationships take a slot. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[2048];
+    int off = snprintf(query, sizeof(query), "MATCH (a0:NoSuchLabelXYZ)");
+    for (int i = 1; i <= 9; i++) { /* 9 > CYP_MAX_EDGE_VARS */
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "-[r%d:CALLS]->(a%d)", i, i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, " RETURN a0.name");
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    ASSERT_TRUE(strstr(wide.error, "edge") != NULL);
+    cbm_cypher_result_free(&wide);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_scope_check_survives_wide_pattern) {
+    /* Regression test for #1995. check_projection_scope models declared names in
+     * a fixed array and used to skip the check entirely when a query declared
+     * more than it held. So the same out-of-scope name was refused on a narrow
+     * query and quietly accepted on a wide one. Both must now be refused. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[4096];
+
+    build_node_chain(query, sizeof(query), 10);
+    strncat(query, " RETURN zzz.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t narrow = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &narrow) != 0);
+    ASSERT_NOT_NULL(narrow.error);
+    ASSERT_TRUE(strstr(narrow.error, "zzz") != NULL);
+    cbm_cypher_result_free(&narrow);
+
+    /* 35 declared names — this one used to answer a zzz.name column of nothing. */
+    build_node_chain(query, sizeof(query), 35);
+    strncat(query, " RETURN zzz.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    cbm_cypher_result_free(&wide);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_parse_neq) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -4290,6 +4374,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_is_null);
     RUN_TEST(cypher_exec_where_is_not_null);
     RUN_TEST(cypher_exec_return_star);
+    RUN_TEST(cypher_wide_pattern_refused);
+    RUN_TEST(cypher_wide_edge_pattern_refused);
+    RUN_TEST(cypher_scope_check_survives_wide_pattern);
     RUN_TEST(cypher_parse_neq);
     RUN_TEST(cypher_parse_in);
     RUN_TEST(cypher_parse_is_null);

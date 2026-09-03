@@ -5043,13 +5043,88 @@ static const char *scope_checkable_var(const cbm_return_item_t *item) {
     return item->variable;
 }
 
+/* Says which limit the query passed and how to get under it. An unnamed node
+ * takes no slot, so dropping a name the query never uses is the cheap way out.
+ * Splitting the MATCH is NOT — every pattern of one query shares one binding,
+ * which is why the caller counts across all of them. Separate queries do work,
+ * because each gets a binding of its own. */
+static char *var_capacity_error(const char *kind, int limit) {
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf),
+             "too many %s variables: a query can name at most %d — "
+             "leave the name off the ones you do not use, or run separate queries",
+             kind, limit);
+    return heap_strdup(buf);
+}
+
+/* A binding holds a fixed number of variables: CYP_MAX_VARS node variables and
+ * CYP_MAX_EDGE_VARS edge variables, both in plain arrays (see binding_t).
+ * binding_set and binding_set_edge drop anything past those without a word, so
+ * a query naming more variables than a binding holds cannot be answered — the
+ * extra names bind to nothing and project as empty strings, which reads as
+ * "the graph holds no such data" rather than "this query is too wide".
+ *
+ * Refuse such a query instead, before any row is touched. Bounding the input
+ * here is also what stops collect_declared_names below overflowing its array:
+ * the patterns contribute at most CYP_MAX_VARS + CYP_MAX_EDGE_VARS names, plus
+ * one UNWIND alias, which is well inside CYP_SCOPE_MAX_NAMES.
+ *
+ * Counts DISTINCT variables across every pattern, because they all land in the
+ * same binding: a multi-MATCH query shares one, and an OPTIONAL MATCH pattern
+ * sits in this same array (q->pattern_optional marks which). A node variable
+ * and an edge variable may share a name and each take a slot, because the
+ * binding keeps the two in separate arrays. */
+static char *check_pattern_var_capacity(const cbm_query_t *q) {
+    /* Initialized because cppcheck cannot see that scope_holds reads only the
+     * node_n / edge_n entries already written, and reports the first call as a
+     * read of an uninitialized array. */
+    const char *node_vars[CYP_MAX_VARS] = {NULL};
+    const char *edge_vars[CYP_MAX_EDGE_VARS] = {NULL};
+    int node_n = 0;
+    int edge_n = 0;
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        const cbm_pattern_t *pat = &q->patterns[pi];
+        for (int ni = 0; ni < pat->node_count; ni++) {
+            const char *var = pat->nodes[ni].variable;
+            if (!var || scope_holds(node_vars, node_n, var)) {
+                continue;
+            }
+            if (node_n >= CYP_MAX_VARS) {
+                return var_capacity_error("node", CYP_MAX_VARS);
+            }
+            node_vars[node_n++] = var;
+        }
+        for (int ri = 0; ri < pat->rel_count; ri++) {
+            const char *var = pat->rels[ri].variable;
+            if (!var || scope_holds(edge_vars, edge_n, var)) {
+                continue;
+            }
+            if (edge_n >= CYP_MAX_EDGE_VARS) {
+                return var_capacity_error("edge", CYP_MAX_EDGE_VARS);
+            }
+            edge_vars[edge_n++] = var;
+        }
+    }
+    return NULL;
+}
+
 /* Answers NULL when the query is fine, or a heap message naming the first
  * variable that is not in scope. Checks one query; the caller walks a UNION. */
 static char *check_projection_scope(const cbm_query_t *q) {
+    /* Runs first, so the rest of this function can trust that the query names
+     * no more variables than the arrays below can model. */
+    char *capacity_err = check_pattern_var_capacity(q);
+    if (capacity_err) {
+        return capacity_err;
+    }
+
     const char *declared[CYP_SCOPE_MAX_NAMES];
     int declared_n = collect_declared_names(q, declared, CYP_SCOPE_MAX_NAMES);
     if (declared_n < 0) {
-        return NULL; /* too many names to model — stay quiet rather than guess */
+        /* Unreachable while the capacity check above holds. Kept so the guard
+         * still stands if either bound ever moves. Skipping the check was the
+         * old behaviour, and it let an out-of-scope name through in silence. */
+        return NULL;
     }
 
     /* A WITH still reads the pattern variables. */
@@ -5073,7 +5148,7 @@ static char *check_projection_scope(const cbm_query_t *q) {
     if (q->with_clause) {
         scope_n = collect_with_names(q->with_clause, after_with, CYP_SCOPE_MAX_NAMES);
         if (scope_n < 0) {
-            return NULL;
+            return NULL; /* unreachable: a WITH holds at most CYP_SCOPE_MAX_NAMES items */
         }
         scope = after_with;
     }
