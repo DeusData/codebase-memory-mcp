@@ -1,6 +1,7 @@
 import { useEffect, useMemo } from "react";
 import * as THREE from "three";
 import type { GraphNode } from "../lib/types";
+import { topKBySize } from "../lib/topK";
 
 interface NodeLabelsProps {
   nodes: GraphNode[];
@@ -138,13 +139,15 @@ export function NodeLabels({
     const hasHighlight = highlightedIds && highlightedIds.size > 0;
 
     if (hasHighlight) {
-      return nodes
-        .filter((n) => highlightedIds.has(n.id))
-        .sort((a, b) => b.size - a.size)
-        .slice(0, maxLabels);
+      return topKBySize(
+        nodes.filter((n) => highlightedIds.has(n.id)),
+        maxLabels,
+      );
     }
 
-    return [...nodes].sort((a, b) => b.size - a.size).slice(0, maxLabels);
+    /* Partial top-k selection instead of cloning + fully sorting every node
+     * (up to hundreds of thousands) just to keep the biggest `maxLabels`. */
+    return topKBySize(nodes, maxLabels);
   }, [nodes, highlightedIds, maxLabels]);
 
   return (

@@ -28,6 +28,7 @@ import { ErrorBoundary } from "./ErrorBoundary";
 import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
 import { colorForStatus } from "../lib/colors";
 import { EDGE_RENDER_LIMIT, sampleEdges } from "../lib/edgeBudget";
+import { buildGraphIndex } from "../lib/graphIndex";
 
 /* Persist panel widths */
 function loadWidth(key: string, fallback: number): number {
@@ -161,33 +162,29 @@ export function GraphTab({ project }: GraphTabProps) {
 
     const nodes = data.nodes.filter(keep).map(paint);
     const nodeIds = new Set(nodes.map((n) => n.id));
-    const filteredEdges = data.edges.filter(
+    /* NOT sampled here — this is the full filtered edge list, used for the
+     * adjacency index (graphIndex below), the highlight-on-click set, the
+     * detail panel's connections, and the HUD edge count. Only the copy
+     * handed to GraphScene/EdgeLines (see `renderData` below) is sampled;
+     * sampling here would silently drop a clicked node's connections
+     * whenever they happened to fall outside the render budget (#2039). */
+    const edges = data.edges.filter(
       (e) =>
         enabledEdgeTypes.has(e.type) &&
         nodeIds.has(e.source) &&
         nodeIds.has(e.target),
     );
-    /* Cap what actually reaches EdgeLines — a deterministic sample so the
-     * geometry buffers built downstream stay bounded on huge graphs (#2039)
-     * regardless of how many edges survived filtering. */
-    const edges = sampleEdges(filteredEdges, EDGE_RENDER_LIMIT);
 
     const linked_projects = data.linked_projects?.map((lp) => {
       const lpNodes = lp.nodes.filter(keep).map(paint);
       const lpIds = new Set(lpNodes.map((n) => n.id));
-      const lpEdges = sampleEdges(
-        lp.edges.filter(
-          (e) =>
-            enabledEdgeTypes.has(e.type) && lpIds.has(e.source) && lpIds.has(e.target),
-        ),
-        EDGE_RENDER_LIMIT,
+      const lpEdges = lp.edges.filter(
+        (e) =>
+          enabledEdgeTypes.has(e.type) && lpIds.has(e.source) && lpIds.has(e.target),
       );
-      const crossEdges = sampleEdges(
-        lp.cross_edges.filter(
-          (e) =>
-            enabledEdgeTypes.has(e.type) && nodeIds.has(e.source) && lpIds.has(e.target),
-        ),
-        EDGE_RENDER_LIMIT,
+      const crossEdges = lp.cross_edges.filter(
+        (e) =>
+          enabledEdgeTypes.has(e.type) && nodeIds.has(e.source) && lpIds.has(e.target),
       );
       return { ...lp, nodes: lpNodes, edges: lpEdges, cross_edges: crossEdges };
     });
@@ -197,7 +194,7 @@ export function GraphTab({ project }: GraphTabProps) {
       edges,
       total_nodes: data.total_nodes,
       linked_projects,
-      edgeFilterTotal: filteredEdges.length,
+      edgeFilterTotal: edges.length,
     };
   }, [
     data,
@@ -208,7 +205,37 @@ export function GraphTab({ project }: GraphTabProps) {
     hideEntryPoints,
     hideTests,
   ]);
-  const edgeLimitNotice = formatEdgeLimitNotice(filteredData);
+
+  /* What actually reaches EdgeLines: filteredData's edges (main, linked-
+   * project, and cross edges), deterministically sampled down to the render
+   * budget so the geometry buffers built downstream stay bounded on huge
+   * graphs (#2039). Everything else (graphIndex, highlights, the detail
+   * panel, the HUD edge count) reads the unsampled filteredData above, so a
+   * clicked node's connections are never silently dropped just because they
+   * fell outside the render sample. */
+  const renderData: FilteredGraphData | null = useMemo(() => {
+    if (!filteredData) return null;
+    return {
+      ...filteredData,
+      edges: sampleEdges(filteredData.edges, EDGE_RENDER_LIMIT),
+      linked_projects: filteredData.linked_projects?.map((lp) => ({
+        ...lp,
+        edges: sampleEdges(lp.edges, EDGE_RENDER_LIMIT),
+        cross_edges: sampleEdges(lp.cross_edges, EDGE_RENDER_LIMIT),
+      })),
+    };
+  }, [filteredData]);
+  const edgeLimitNotice = formatEdgeLimitNotice(renderData);
+
+  /* One id→node map + per-node connection-list index, built once per
+   * filteredData change instead of NodeDetailPanel rebuilding a Map and
+   * scanning every edge on each click. Reused below for the highlight
+   * (connectedIds) computation too. Built from the unsampled filteredData —
+   * see the comment above renderData. */
+  const graphIndex = useMemo(
+    () => buildGraphIndex(filteredData),
+    [filteredData],
+  );
 
   /* Re-read the persisted budget when the project changes… */
   useEffect(() => {
@@ -306,17 +333,18 @@ export function GraphTab({ project }: GraphTabProps) {
 
       setSelectedNode(node);
 
-      /* Highlight the node and its direct connections */
+      /* Highlight the node and its direct connections — using the
+       * precomputed per-node connection list instead of scanning every
+       * edge on each click. */
       const connectedIds = new Set([node.id]);
-      for (const edge of filteredData.edges) {
-        if (edge.source === node.id) connectedIds.add(edge.target);
-        if (edge.target === node.id) connectedIds.add(edge.source);
+      for (const conn of graphIndex.connectionsByNode.get(node.id) ?? []) {
+        connectedIds.add(conn.node.id);
       }
       setHighlightedIds(connectedIds);
       setSelectedPath(node.file_path ?? null);
       setCameraTarget(computeCameraTarget(filteredData.nodes, connectedIds));
     },
-    [filteredData, missedSkeleton],
+    [filteredData, missedSkeleton, graphIndex],
   );
 
   const handleNavigateToNode = useCallback(
@@ -488,7 +516,10 @@ export function GraphTab({ project }: GraphTabProps) {
           <>
             <ErrorBoundary>
               <GraphScene
-                data={filteredData}
+                /* Sampled-for-rendering copy — see the renderData comment
+                 * above. Always in sync with filteredData (same nullity),
+                 * which is guaranteed non-null by the guard above. */
+                data={renderData!}
                 missed={showMissedSkeleton ? missedSkeleton : null}
                 highlightedIds={highlightedIds}
                 cameraTarget={cameraTarget}
@@ -615,8 +646,7 @@ export function GraphTab({ project }: GraphTabProps) {
             ) : (
               <NodeDetailPanel
                 node={selectedNode}
-                allNodes={filteredData.nodes}
-                allEdges={filteredData.edges}
+                graphIndex={graphIndex}
                 project={project}
                 repoInfo={repoInfo}
                 onClose={() => {

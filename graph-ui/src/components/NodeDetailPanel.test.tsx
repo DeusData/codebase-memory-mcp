@@ -3,6 +3,7 @@ import "@testing-library/jest-dom/vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import { NodeDetailPanel } from "./NodeDetailPanel";
+import { buildGraphIndex } from "../lib/graphIndex";
 import type { GraphNode, RepoInfo } from "../lib/types";
 
 /* Mock the RPC layer so "Show code" resolves without a backend. */
@@ -48,8 +49,7 @@ describe("NodeDetailPanel code preview + deep-link", () => {
     const { container } = render(
       <NodeDetailPanel
         node={NODE}
-        allNodes={[NODE]}
-        allEdges={[]}
+        graphIndex={buildGraphIndex({ nodes: [NODE], edges: [] })}
         project="demo"
         repoInfo={REPO}
         onClose={() => {}}
@@ -74,8 +74,7 @@ describe("NodeDetailPanel code preview + deep-link", () => {
     render(
       <NodeDetailPanel
         node={NODE}
-        allNodes={[NODE]}
-        allEdges={[]}
+        graphIndex={buildGraphIndex({ nodes: [NODE], edges: [] })}
         project="demo"
         repoInfo={REPO}
         onClose={() => {}}

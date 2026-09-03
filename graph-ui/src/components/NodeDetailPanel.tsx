@@ -1,19 +1,17 @@
-import { useMemo, useState, useEffect } from "react";
+import { useState, useEffect } from "react";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { colorForLabel } from "../lib/colors";
 import { callTool } from "../api/rpc";
-import type { GraphNode, GraphEdge, RepoInfo } from "../lib/types";
-
-interface Connection {
-  node: GraphNode;
-  edgeType: string;
-  direction: "inbound" | "outbound";
-}
+import type { GraphNode, RepoInfo } from "../lib/types";
+import type { Connection, GraphIndex } from "../lib/graphIndex";
 
 interface NodeDetailPanelProps {
   node: GraphNode;
-  allNodes: GraphNode[];
-  allEdges: GraphEdge[];
+  /* Precomputed per-node connection lists (see lib/graphIndex.ts) — built
+   * once per filteredData change in GraphTab instead of this panel rebuilding
+   * a node Map and scanning every edge on each click (O(nodes + edges) per
+   * click on a multi-million-edge graph). */
+  graphIndex: GraphIndex;
   project: string | null;
   repoInfo: RepoInfo | null;
   onClose: () => void;
@@ -47,8 +45,7 @@ function githubUrl(node: GraphNode, repoInfo: RepoInfo | null): string | null {
 
 export function NodeDetailPanel({
   node,
-  allNodes,
-  allEdges,
+  graphIndex,
   project,
   repoInfo,
   onClose,
@@ -85,22 +82,7 @@ export function NodeDetailPanel({
     }
   };
 
-  const connections = useMemo(() => {
-    const nodeMap = new Map<number, GraphNode>();
-    for (const n of allNodes) nodeMap.set(n.id, n);
-    const conns: Connection[] = [];
-    for (const edge of allEdges) {
-      if (edge.source === node.id) {
-        const t = nodeMap.get(edge.target);
-        if (t) conns.push({ node: t, edgeType: edge.type, direction: "outbound" });
-      }
-      if (edge.target === node.id) {
-        const s = nodeMap.get(edge.source);
-        if (s) conns.push({ node: s, edgeType: edge.type, direction: "inbound" });
-      }
-    }
-    return conns;
-  }, [node, allNodes, allEdges]);
+  const connections: Connection[] = graphIndex.connectionsByNode.get(node.id) ?? [];
 
   const outbound = connections.filter((c) => c.direction === "outbound");
   const inbound = connections.filter((c) => c.direction === "inbound");

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import type { GraphData } from "../lib/types";
+import type { GraphData, GraphEdge, GraphNode, NodeStatus } from "../lib/types";
 
 export interface LoadProgress {
   receivedBytes: number;
@@ -40,6 +40,48 @@ export function clampNodeBudget(value: number): number {
  *  only files the indexer could not fully cover, as their file structure. */
 export type GraphVariant = "code" | "missed";
 
+/** A 4.2M-edge graph has 4.2M freshly-parsed `type` strings (and similarly
+ * many node `label`/`color`/`status` strings) that are almost all one of a
+ * few dozen distinct values, but JSON.parse gives each occurrence its own
+ * string object. Intern them through a shared pool so the whole graph ends
+ * up referencing ~20 string instances instead of millions. Mutates the
+ * parsed objects in place (they are freshly parsed, not shared with
+ * anything else yet). */
+export function internGraphStrings(data: GraphData): GraphData {
+  const pool = new Map<string, string>();
+  const intern = (s: string): string => {
+    const existing = pool.get(s);
+    if (existing !== undefined) return existing;
+    pool.set(s, s);
+    return s;
+  };
+
+  const internNode = (n: GraphNode): GraphNode => {
+    n.label = intern(n.label);
+    n.color = intern(n.color);
+    if (n.status) n.status = intern(n.status) as NodeStatus;
+    return n;
+  };
+  const internEdge = (e: GraphEdge): GraphEdge => {
+    e.type = intern(e.type);
+    return e;
+  };
+
+  data.nodes.forEach(internNode);
+  data.edges.forEach(internEdge);
+  for (const lp of data.linked_projects ?? []) {
+    lp.nodes.forEach(internNode);
+    lp.edges.forEach(internEdge);
+    lp.cross_edges.forEach(internEdge);
+  }
+  if (data.missed_graph) {
+    data.missed_graph.nodes.forEach(internNode);
+    data.missed_graph.edges.forEach(internEdge);
+  }
+
+  return data;
+}
+
 export async function fetchLayout(
   project: string,
   maxNodes = GRAPH_RENDER_NODE_LIMIT,
@@ -58,30 +100,33 @@ export async function fetchLayout(
   /* Stream the body when possible so large budgets show live download
    * progress instead of a silent stall. */
   if (!res.body || !onProgress) {
-    return res.json();
+    return internGraphStrings(await res.json());
   }
 
   const lengthHeader = res.headers.get("content-length");
   const totalBytes = lengthHeader ? parseInt(lengthHeader, 10) || null : null;
   const reader = res.body.getReader();
-  const chunks: Uint8Array[] = [];
+  /* Decode each chunk to text as it arrives instead of buffering every raw
+   * byte chunk and merging them into one big Uint8Array before decoding —
+   * that merge step is a full extra copy of the payload (a 382MB response
+   * meant a 382MB Uint8Array copy, then a 382MB string, then the parsed
+   * object, all transiently live at once). Streaming the decode avoids the
+   * byte-level copy; only the (unavoidable) decoded string pieces + their
+   * join remain. */
+  const decoder = new TextDecoder();
+  const textChunks: string[] = [];
   let receivedBytes = 0;
 
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
     receivedBytes += value.length;
+    textChunks.push(decoder.decode(value, { stream: true }));
     onProgress({ receivedBytes, totalBytes });
   }
+  textChunks.push(decoder.decode());
 
-  const merged = new Uint8Array(receivedBytes);
-  let offset = 0;
-  for (const chunk of chunks) {
-    merged.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return JSON.parse(new TextDecoder().decode(merged));
+  return internGraphStrings(JSON.parse(textChunks.join("")));
 }
 
 const NO_PROGRESS: LoadProgress = { receivedBytes: 0, totalBytes: null };
