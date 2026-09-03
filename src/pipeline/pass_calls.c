@@ -675,7 +675,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * #725 guard, after the service-pattern bypasses above, so no HTTP/route
      * edge can be lost to it. */
     if (cbm_suppress_external_import_shadow(call->callee_name, res.strategy, file_imports, imp_keys,
-                                            imp_count)) {
+                                            imp_count, cbm_pipeline_get_pkgmap())) {
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,

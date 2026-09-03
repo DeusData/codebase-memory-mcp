@@ -5112,6 +5112,116 @@ TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355) {
     PASS();
 }
 
+/* #1355 / #1732: the same tree, but the bare specifier now names a WORKSPACE
+ * package that the repository itself ships. `main` deliberately points at a
+ * build artifact that is not checked in — the shape every real monorepo has,
+ * and the reason an entry-file lookup cannot answer this question. */
+static void write_workspace_shadow_fixture(const char *dir, int pad_files) {
+    /* One directory level only: write_temp_file's mkdir is documented as
+     * "simple version, one level", and a deeper path fails silently — which
+     * makes the fixture look healthy while the file never lands. */
+    write_temp_file(dir, "lib/package.json",
+                    "{\n  \"name\": \"@fixture/lib\",\n  \"main\": \"./dist/index.js\"\n}\n");
+    write_temp_file(dir, "lib/index.ts",
+                    "export function wsEq(a: string, b: string): boolean {\n"
+                    "  return a === b;\n"
+                    "}\n");
+    write_temp_file(dir, "app/package.json", "{\n  \"name\": \"@fixture/app\"\n}\n");
+    /* The lone project symbol named wsSpec — an ordinary local helper that a
+     * project-wide guess would happily bind an external `wsSpec` to. */
+    write_temp_file(dir, "app/spec-helpers.ts",
+                    "export function wsSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    write_temp_file(dir, "app/query.ts",
+                    "import { wsEq } from '@fixture/lib';\n"
+                    "import { wsSpec } from 'vitest';\n"
+                    "export function wsBuild(id: string): unknown {\n"
+                    "  return [wsEq(id, id), wsSpec('case')];\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function wsPad%02d(): number { return %d; }\n", i, i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_workspace_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the workspace sibling: the tree declares @fixture/lib, so the bare
+     * specifier is in-project and the fallback keeps its chance. RED without
+     * the package-map check — this is the 1377-edge class measured on
+     * drizzle-team/drizzle-orm. */
+    if (!cross_file_call_exists(s, project, "wsBuild", "wsEq")) {
+        rc = 4;
+    }
+    /* (2) a genuine third-party package in the very same file is still cut:
+     * the check must not disarm the guard wholesale. */
+    if (rc == 0 && cross_file_call_exists(s, project, "wsBuild", "wsSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ws_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_workspace_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_workspace_shadow_contract(tmp, "ws-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_workspace_shadow_contract(tmp, "ws-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_par_XXXXXX");
@@ -13461,6 +13571,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);

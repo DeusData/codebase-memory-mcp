@@ -528,6 +528,43 @@ static bool specifier_is_relative(const char *module_path) {
     return false;
 }
 
+/* True when the specifier names a package that the indexed tree DECLARES —
+ * a workspace sibling, not a third-party dependency. `indexed_packages` is the
+ * pipeline's package map, keyed by the `name` of every manifest found in the
+ * tree (package.json, go.mod, Cargo.toml, ...), so a pnpm/npm/cargo workspace
+ * registers each of its own packages here.
+ *
+ * The key is the bare package name, so a subpath specifier is walked back one
+ * slash at a time: "drizzle-orm/pg-core" -> "drizzle-orm". Scoped names keep
+ * their leading segment ("@scope/pkg/sub" -> "@scope/pkg" -> "@scope").
+ *
+ * Deliberately a NAME test, not a resolution test. A workspace package usually
+ * points `main`/`module` at a build artifact ("./index.cjs") that is not
+ * checked in, so asking whether the entry file exists in the graph answers
+ * "no" for exactly the monorepos this has to protect. Whether the tree claims
+ * the name is decidable from the manifest alone. */
+static bool specifier_names_indexed_package(const CBMHashTable *indexed_packages,
+                                            const char *module_path) {
+    if (!indexed_packages || !module_path || !module_path[0]) {
+        return false;
+    }
+    if (cbm_ht_has(indexed_packages, module_path)) {
+        return true;
+    }
+    char buf[CBM_SZ_512];
+    if (strlen(module_path) >= sizeof(buf)) {
+        return false;
+    }
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    for (char *slash = strrchr(buf, '/'); slash != NULL; slash = strrchr(buf, '/')) {
+        *slash = '\0';
+        if (cbm_ht_has(indexed_packages, buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool import_map_binds(const char **import_map_keys, int import_map_count,
                              const char *local_name) {
     if (!import_map_keys || import_map_count <= 0) {
@@ -569,10 +606,17 @@ static bool import_map_binds(const char **import_map_keys, int import_map_count,
  * relative and a package specifier keeps the edge — the relative binding wins
  * the tie explicitly, so the outcome does not depend on import order.
  *
+ * `indexed_packages` extends that same reasoning to workspace monorepos, where
+ * a BARE specifier also names in-tree code: `import { eq } from "drizzle-orm"`
+ * inside the drizzle-orm repository is a sibling package, not a dependency. A
+ * specifier the tree's own manifests claim is treated exactly like a relative
+ * one. NULL disables the check and restores the specifier-shape-only contract.
+ *
  * Pure + side-effect-free so the contract is unit-testable without a pipeline. */
 bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
                                          const CBMImportArray *file_imports,
-                                         const char **import_map_keys, int import_map_count) {
+                                         const char **import_map_keys, int import_map_count,
+                                         const CBMHashTable *indexed_packages) {
     if (!callee_name || !callee_name[0] || !strategy || !strategy[0]) {
         return false;
     }
@@ -595,7 +639,8 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
         if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, callee_name) != 0) {
             continue;
         }
-        if (specifier_is_relative(imp->module_path)) {
+        if (specifier_is_relative(imp->module_path) ||
+            specifier_names_indexed_package(indexed_packages, imp->module_path)) {
             return false; /* an in-tree binding for this name — never suppress */
         }
         external_binding = true;
