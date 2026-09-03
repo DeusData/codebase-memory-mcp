@@ -695,6 +695,7 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     options.on_log_line = NULL;
     options.log_ud = NULL;
     options.quiet_timeout_ms = worker_quiet_timeout_ms();
+    options.memory_limit_bytes = memory_budget_bytes;
     options.delete_log_on_exit = false;
     if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
         (void)cbm_unlink(handle->response_path);

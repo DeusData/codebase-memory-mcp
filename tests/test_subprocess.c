@@ -744,6 +744,30 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
 #endif
 }
 
+TEST(subprocess_windows_job_object_enforces_memory_limit) {
+#ifndef _WIN32
+    SKIP_PLATFORM("native Windows Job Object memory-limit probe");
+#else
+    char self_path[32768];
+    DWORD self_length = GetModuleFileNameA(NULL, self_path, (DWORD)sizeof(self_path));
+    ASSERT_TRUE(self_length > 0 && self_length < sizeof(self_path));
+    const char *argv[] = {self_path, "__cbm_windows_memory_limit_probe", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = self_path;
+    opts.argv = argv;
+    opts.memory_limit_bytes = (size_t)512U * 1024U * 1024U;
+    opts.quiet_timeout_ms = 5000;
+
+    cbm_proc_result_t result = {0};
+    ASSERT_EQ(cbm_subprocess_run(&opts, &result), 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_EXIT_NONZERO);
+    ASSERT_EQ(result.exit_code, 73);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    PASS();
+#endif
+}
+
 TEST(subprocess_cancel_grace_is_hard_capped) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX process-group grace cap probe; native Windows coverage pending");
@@ -1228,6 +1252,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree);
+    RUN_TEST(subprocess_windows_job_object_enforces_memory_limit);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
