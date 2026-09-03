@@ -1,0 +1,22 @@
+# A written record of parse_partial_count when this repo indexes itself.
+#
+# NOTHING FAILS ON THIS NUMBER. The gate reports it and moves on.
+#
+# It used to be a ceiling. main could move the count on its own and every open
+# pull request then went red for a reason none of them caused — that is #1972,
+# where main gained src/daemon/runtime.c and the count went 58 -> 59 with no
+# branch involved. The gate now indexes the merge base and compares against
+# that, so the number below does not gate anything.
+#
+# What it is still for: a reader can see how far the count has drifted since
+# anyone last looked, which is the one thing a merge-base comparison cannot
+# show. Update it when you have measured a new number and can say why it moved.
+#
+# It complements the FLOOR asserted in tests/test_index_resilience.c, which
+# stops the coverage signal being switched off by accident. That one IS
+# enforced.
+#
+# 58 -> 59 on 2026-08-31. main gained src/daemon/runtime.c, whose line 47 the
+# tree-sitter C grammar cannot parse. The rise came from main, not from a
+# branch. See the commit for the measurement.
+59

@@ -272,6 +272,9 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
 
+echo "=== Step 0y: parse-coverage gate contract (#963) ==="
+bash "$ROOT/tests/test_coverage_gate_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 

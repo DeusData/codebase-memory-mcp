@@ -388,6 +388,7 @@ scripts/smoke-invariants.sh
 scripts/ci/preflight-docker.sh
 scripts/ci/require-all-green.sh
 scripts/ci/verify-shard-union.sh
+scripts/ci/self-index-coverage-gate.sh
 scripts/ci/generate-sbom.py
 scripts/package-release.sh
 scripts/ci/smoke-artifact.sh
@@ -426,6 +427,7 @@ scripts/lint.sh
 scripts/smoke-local.sh
 scripts/soak-legs.sh
 scripts/ci/preflight-docker.sh
+scripts/ci/self-index-coverage-gate.sh
 test-infrastructure/vm/vm-smoke.sh
 scripts/smoke-invariants.sh
 "

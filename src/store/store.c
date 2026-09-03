@@ -300,9 +300,25 @@ static int init_schema(cbm_store_t *s) {
         "  PRIMARY KEY (project, rel_path)"
         ");"
         /* Best-effort indexing-coverage signal (#963). One row per file the
-         * indexer could not fully cover: kind "parse_partial" (indexed, but the
-         * parse tree had ERROR/MISSING regions — detail = 1-based line ranges)
-         * or a skip phase ("read"/"extract"/"oversized" — detail = reason).
+         * indexer could not fully cover. `kind` says which of three things
+         * happened, and `detail` means something different in each:
+         *
+         *   "parse_partial"   the file WAS indexed, but the parse tree had
+         *                     ERROR/MISSING regions. detail = 1-based line
+         *                     ranges, "start-end,start-end", with an optional
+         *                     trailing "+<N>" saying N more ranges were dropped
+         *                     by the producer's cap. Read those lines.
+         *   "parse_unusable"  the file WAS indexed, but one range covers 80% or
+         *                     more of it, so naming the lines is useless advice.
+         *                     detail = the same range string. Read the source.
+         *   a skip phase      the file was NOT indexed at all: "read",
+         *                     "extract" or "oversized". detail = the reason.
+         *
+         * The first two are easy to confuse with the third, and the difference
+         * matters to a reader: a skipped file is absent from the graph, while
+         * the other two are present but incomplete. Name a new kind so that
+         * distinction stays obvious — "parse_failed" would read as a skip.
+         *
          * Deliberately SEPARATE from the graph tables: coverage is metadata
          * about the graph, not part of it. */
         "CREATE TABLE IF NOT EXISTS index_coverage ("
