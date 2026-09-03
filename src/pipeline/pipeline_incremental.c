@@ -1211,7 +1211,7 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
      * a full build takes, which is what makes its output converge. */
 
 #define MIN_FILES_FOR_PARALLEL_INCR 50
-    int worker_count = cbm_default_worker_count(true);
+    int worker_count = cbm_pipeline_worker_count(ctx->pipeline);
     bool use_parallel =
         closure != NULL || (worker_count > SKIP_ONE && ci > MIN_FILES_FOR_PARALLEL_INCR);
 
@@ -1580,7 +1580,7 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         _Atomic int64_t probe_ids;
         atomic_init(&probe_ids, cbm_gbuf_next_id(probe_gbuf));
         rc = cbm_parallel_extract(&probe_ctx, probe_files, probe_count, cache, &probe_ids,
-                                  cbm_default_worker_count(true));
+                                  cbm_pipeline_worker_count(p));
     }
     if (rc == 0) {
         char **def_modules = (char **)calloc((size_t)probe_count, sizeof(char *));
@@ -2048,7 +2048,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                 elig[elig_count++] = row;
             }
         }
-        int workers = cbm_default_worker_count(true);
+        int workers = cbm_pipeline_worker_count(p);
         if (workers < 1) {
             workers = 1;
         }

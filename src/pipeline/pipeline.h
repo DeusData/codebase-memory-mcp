@@ -53,6 +53,19 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Mark work that runs without a waiting user. Background pipelines reserve
+ * CPU headroom; foreground pipelines retain the initial-index all-core policy. */
+void cbm_pipeline_set_background(cbm_pipeline_t *p, bool background);
+
+/* Resolve the worker policy for this pipeline, including environment and
+ * crash-recovery overrides. */
+int cbm_pipeline_worker_count(const cbm_pipeline_t *p);
+
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+void cbm_pipeline_worker_count_test_reset(void);
+int cbm_pipeline_worker_count_test_last(void);
+#endif
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
