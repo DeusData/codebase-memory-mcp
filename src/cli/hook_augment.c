@@ -20,6 +20,7 @@
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/mem.h"
+#include "foundation/platform.h"
 #include "mcp/mcp.h"
 #include "pipeline/pipeline.h"
 #include "yyjson/yyjson.h"
@@ -70,18 +71,21 @@
  * hook "timeout" remains the outer backstop (and alone governs Windows,
  * where this whole in-process deadline block is compiled out). */
 static int ha_deadline_ms(void) {
-    const char *env = getenv("CBM_HOOK_DEADLINE_MS");
-    if (!env || !env[0]) {
+    /* A value this reader cannot read gets the DEFAULT, never the floor. atoi
+     * used to answer 0 for a typo, 0 is below the minimum, and the clamp then
+     * handed back the shortest deadline the setting allows — the opposite of
+     * what somebody raising CBM_HOOK_DEADLINE_MS is asking for. */
+    long v = 0;
+    if (!cbm_env_long("CBM_HOOK_DEADLINE_MS", &v)) {
         return HA_DEADLINE_DEFAULT_MS;
     }
-    int v = atoi(env);
     if (v < HA_DEADLINE_MIN_MS) {
         return HA_DEADLINE_MIN_MS;
     }
     if (v > HA_DEADLINE_MAX_MS) {
         return HA_DEADLINE_MAX_MS;
     }
-    return v;
+    return (int)v;
 }
 
 static int g_ha_crumb_fd = -1;
@@ -121,6 +125,10 @@ static void ha_open_crumb_log(int deadline_ms) {
                      "CBM_HOOK_DEADLINE_MS)\n",
                      deadline_ms, (long)getpid());
     g_ha_crumb_len = (n > 0 && n < (int)sizeof(g_ha_crumb_msg)) ? (size_t)n : 0;
+}
+
+int cbm_hook_augment_deadline_ms_for_testing(void) {
+    return ha_deadline_ms();
 }
 
 void cbm_hook_augment_arm_deadline(void) {

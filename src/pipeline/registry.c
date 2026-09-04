@@ -925,6 +925,87 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
+ * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
+ * throw away, and throwing it away binds Foundation's URLSession.shared.data to
+ * a project's own PickedFile.data: high confidence, and nothing in the graph
+ * shows it is wrong. Require instead that the candidate's own parent segment
+ * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
+ * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
+ *
+ * Only an upper-case first segment is guarded. A lower-case root names a value
+ * (vm.load, http.Get, os.path.join) whose declared type the chain does not
+ * show, so the chain proves nothing there and the call passes through
+ * unchanged. A callee with no separator passes through as well.
+ *
+ * Language agnostic by design: the registry holds no language, and every
+ * language that writes receiver chains gains the same protection. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+    /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
+     * the same way qualified_suffix_match does. */
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else {
+            dotted[w++] = *s++;
+        }
+    }
+    dotted[w] = '\0';
+
+    const char *last_dot = strrchr(dotted, '.');
+    if (!last_dot) {
+        return true; /* bare name — no receiver chain to judge */
+    }
+    if (dotted[0] < 'A' || dotted[0] > 'Z') {
+        return true; /* lower-case root names a value, not a type */
+    }
+    /* A name written in capitals with underscores is a constant holding a
+     * value, not a type: ISO_4217_URL.lower is a string's own method. JSON and
+     * URL carry no underscore and stay guarded. */
+    int has_underscore = 0;
+    int all_caps = 1;
+    for (const char *c = dotted; c < last_dot && *c != '.'; c++) {
+        if (*c == '_') {
+            has_underscore = 1;
+        } else if (*c >= 'a' && *c <= 'z') {
+            all_caps = 0;
+            break;
+        }
+    }
+    if (all_caps && has_underscore) {
+        return true;
+    }
+
+    /* The candidate's parent segment: the one before its final name. */
+    const char *cand_last = strrchr(candidate_qn, '.');
+    if (!cand_last || cand_last == candidate_qn) {
+        return true; /* top-level candidate — no parent to look for */
+    }
+    const char *parent = cand_last;
+    while (parent > candidate_qn && parent[-1] != '.') {
+        parent--;
+    }
+    size_t parent_len = (size_t)(cand_last - parent);
+
+    /* Walk the chain — every segment before the final callee name. A trailing
+     * "()" is dropped so JSONEncoder().encode reads as JSONEncoder. */
+    for (const char *seg = dotted; seg < last_dot;) {
+        const char *end = strchr(seg, '.');
+        size_t len = (size_t)(end - seg);
+        if (len >= 2 && seg[len - 2] == '(' && seg[len - 1] == ')') {
+            len -= 2; /* an empty "()" — JSONEncoder().encode names JSONEncoder */
+        }
+        if (len == parent_len && strncmp(seg, parent, parent_len) == 0) {
+            return true;
+        }
+        seg = end + SKIP_ONE;
+    }
+    return false;
+}
+
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
@@ -950,6 +1031,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
+        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+            return empty_result();
+        }
         double conf = CONF_UNIQUE_NAME;
         if (import_vals && import_count > 0 &&
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
@@ -964,6 +1048,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
     const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (best) {
+        if (!receiver_chain_admits(callee_name, best)) {
+            return empty_result();
+        }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }

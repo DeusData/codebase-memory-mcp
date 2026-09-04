@@ -68,17 +68,23 @@ def main():
         # coordination-daemon startup latency (#1952) is not misread as a
         # broken CLI index. Reindexing the same cache is idempotent.
         idx_out = ""
+        idx_err = ""
         for attempt in (1, 2):
             idx = run_cli(binary, cache, ["cli", "index_repository",
                                           json.dumps({"repo_path": repo_fwd})])
             idx_out = (idx.stdout or b"").decode("utf-8", "replace")
+            idx_err = (idx.stderr or b"").decode("utf-8", "replace")
             if '"nodes"' in idx_out:
                 break
-            print("SETUP: index attempt %d did not run:\n%s"
-                  % (attempt, idx_out[:300]))
+            # Full stdout AND stderr: the reason lives on stderr (daemon
+            # spawn/handshake diagnostics), and a head slice of stdout only
+            # ever showed the allocator preamble.
+            print("SETUP: index attempt %d did not run (rc=%s):\nstdout:\n%s\nstderr:\n%s"
+                  % (attempt, idx.returncode, idx_out, idx_err))
             time.sleep(2)
         if '"nodes"' not in idx_out:
-            print("SETUP FAIL: index did not run:\n%s" % idx_out[:300])
+            print("SETUP FAIL: index did not run:\nstdout:\n%s\nstderr:\n%s"
+                  % (idx_out, idx_err))
             return 2
 
         # Control: prove the symbol is indexed and queryable.

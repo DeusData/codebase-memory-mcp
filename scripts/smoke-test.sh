@@ -2339,6 +2339,35 @@ if command -v node >/dev/null 2>&1; then
   PI_NODE=$(command -v node)
   PI_PROBE_DIR="$TMPDIR/pi-node-probe"
   mkdir -p "$PI_PROBE_DIR"
+  # The extension is loaded by the Pi host, not by bare Node, so the probe
+  # provides what that host provides: Node's builtins plus the packages Pi
+  # ships to extensions (`typebox` — Pi's schema library for tool
+  # parameters). Every import the generated file makes must come from that
+  # set, otherwise it loads in this probe and fails in a real install with
+  # ERR_MODULE_NOT_FOUND. The typebox stub is a Proxy: any Type.X(...) call
+  # returns a descriptor, so the probe never depends on which helpers the
+  # emitter uses; it only exercises the tool lifecycle.
+  PI_HOST_PACKAGES="typebox"
+  mkdir -p "$PI_PROBE_DIR/node_modules/typebox"
+  cat >"$PI_PROBE_DIR/node_modules/typebox/package.json" <<'PITYPEBOXPKG'
+{ "name": "typebox", "version": "0.0.0-smoke-stub", "type": "module", "exports": "./index.mjs" }
+PITYPEBOXPKG
+  cat >"$PI_PROBE_DIR/node_modules/typebox/index.mjs" <<'PITYPEBOXSTUB'
+export const Type = new Proxy({}, {
+  get: (_target, helper) => (...args) => ({ smokeStubHelper: String(helper), args }),
+});
+export default { Type };
+PITYPEBOXSTUB
+  PI_FOREIGN_IMPORTS=$(grep -oE "^import .* from '[^']+'" "$PI_EXTENSION" |
+    sed -E "s/.* from '([^']+)'/\1/" | grep -vE '^node:' |
+    grep -vxF -f <(
+      # shellcheck disable=SC2086
+      printf '%s\n' $PI_HOST_PACKAGES
+    ) || true)
+  if [ -n "$PI_FOREIGN_IMPORTS" ]; then
+    echo "FAIL 8al-node: generated Pi extension imports packages the Pi host does not provide: $(echo "$PI_FOREIGN_IMPORTS" | tr '\n' ' ')"
+    exit 1
+  fi
   python3 - "$PI_EXTENSION" "$PI_PROBE_DIR/cbmem.mjs" <<'PYPIADAPTER'
 import pathlib
 import sys

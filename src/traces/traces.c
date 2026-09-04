@@ -6,6 +6,8 @@
 #include "foundation/constants.h"
 
 enum { TRACE_PATH_SLASHES = 3, TRACE_NOT_FOUND = -1 };
+#include <ctype.h>
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -63,6 +65,38 @@ const char *cbm_extract_path_from_url(const char *url, char *buf, size_t buf_sz)
 
 /* ── parseDuration ───────────────────────────────────────────────── */
 
+/* Read one nanosecond timestamp. Answers false for text that does not read
+ * cleanly from its first character to its last, the way src/main.c:1104 does
+ * it: an end pointer says where the read stopped, errno catches a number too
+ * large, and *end == '\0' catches anything left over. A leading blank is
+ * refused too, because strtoll would otherwise step over it. */
+static bool trace_read_nano(const char *text, int64_t *out) {
+    if (!text || !text[0] || isspace((unsigned char)text[0])) {
+        return false;
+    }
+    char *end = NULL;
+    errno = 0;
+    long long value = strtoll(text, &end, CBM_DECIMAL_BASE);
+    if (errno != 0 || !end || end == text || *end != '\0') {
+        return false;
+    }
+    *out = (int64_t)value;
+    return true;
+}
+
+int64_t cbm_parse_duration_checked(const char *start_nano, const char *end_nano, bool *ok) {
+    int64_t start = 0;
+    int64_t end = 0;
+    bool read_both = trace_read_nano(start_nano, &start) && trace_read_nano(end_nano, &end);
+    if (ok) {
+        *ok = read_both;
+    }
+    if (!read_both) {
+        return 0;
+    }
+    return (end > start) ? (end - start) : 0;
+}
+
 int64_t cbm_parse_duration(const char *start_nano, const char *end_nano) {
     if (!start_nano || !end_nano) {
         return 0;
@@ -115,7 +149,14 @@ bool cbm_extract_http_info(const cbm_trace_span_t *span, const char *service_nam
         return false;
     }
 
-    out->duration_ns = cbm_parse_duration(span->start_time, span->end_time);
+    /* A timestamp nobody can read is not a measurement. It used to read as 0,
+     * so an unreadable START time reported the whole end time as the duration
+     * -- a made-up number that looks like a real one. The HTTP method and path
+     * on this span are still good, so the span is still returned and only the
+     * duration says it is missing. */
+    bool timed = false;
+    int64_t duration = cbm_parse_duration_checked(span->start_time, span->end_time, &timed);
+    out->duration_ns = timed ? duration : CBM_DURATION_UNKNOWN;
     return true;
 }
 

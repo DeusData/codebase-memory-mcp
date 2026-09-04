@@ -8437,6 +8437,34 @@ cbm_mcp_supervised_result_disposition_t cbm_mcp_supervised_result_disposition(
  *   - a contained-failure response only if even that cannot produce a clean run.
  * A physical CBM host never falls back to its in-process pipeline: an initial
  * start/protocol failure is returned as an explicit error response. */
+/* How many times a failed index worker may be re-run before the server gives
+ * up, as CBM_INDEX_MAX_RESTARTS sets it. Default 100. */
+static int index_restart_cap(void) {
+    enum { INDEX_RESTART_CAP_DEFAULT = 100 };
+    long v = 0;
+    if (!cbm_env_long("CBM_INDEX_MAX_RESTARTS", &v)) {
+        /* Unset is the ordinary case and says nothing. A value that is set but
+         * unreadable is a person's intent being dropped, so name it. */
+        char raw[CBM_SZ_64] = {0};
+        if (cbm_safe_getenv("CBM_INDEX_MAX_RESTARTS", raw, sizeof(raw), NULL) && raw[0]) {
+            cbm_log_warn("index.restart_cap.ignored", "value", raw, "action", "using_default");
+        }
+        return INDEX_RESTART_CAP_DEFAULT;
+    }
+    /* Zero is a real answer meaning no restarts. The old reader kept the
+     * default unless the number was above zero, so the one value somebody sets
+     * to leave the worker alone did the opposite. */
+    if (v < 0 || v > INT_MAX) {
+        cbm_log_warn("index.restart_cap.out_of_range", "action", "using_default");
+        return INDEX_RESTART_CAP_DEFAULT;
+    }
+    return (int)v;
+}
+
+int cbm_index_restart_cap_for_testing(void) {
+    return index_restart_cap();
+}
+
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
     invalidate_cached_store(srv);
 
@@ -8500,14 +8528,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args) {
         (void)fclose(qinit);
     }
 
-    int cap = 100;
-    const char *cap_env = getenv("CBM_INDEX_MAX_RESTARTS");
-    if (cap_env && cap_env[0]) {
-        int v = atoi(cap_env);
-        if (v > 0) {
-            cap = v;
-        }
-    }
+    int cap = index_restart_cap();
 
     char *resp = NULL;
     int quarantined = 0;         /* files pinned + added to the quarantine list so far */
