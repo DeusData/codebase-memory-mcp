@@ -24,6 +24,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
 #include "iris_export_xml.h"
@@ -327,18 +328,12 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
     int64_t node_id = cbm_gbuf_upsert_node(
         ctx->gbuf, def->label ? def->label : "Function", def->name, def->qualified_name,
         def->file_path ? def->file_path : rel, (int)def->start_line, (int)def->end_line, props);
-    /* Register callable symbols + every type-like container (Class/Struct/
-     * Interface/Enum/Type/Trait). Type-like defs must be in the registry so
-     * `class Foo : IBar` (INHERITS), `impl Trait for S` (IMPLEMENTS), and method/
-     * field resolution can reach them — Struct included so Rust/Go/Swift/D structs
-     * resolve as type targets just as a Class did. Variable/Field defs are also
-     * registered so pass_usages.c can resolve READS/WRITES accesses (rw->var_name)
-     * to a Variable/Field node QN.
-     * KEEP IN SYNC with pass_parallel.c and pipeline_incremental.c's seed sets. */
-    if (node_id > 0 && def->label &&
-        (strcmp(def->label, "Function") == 0 || strcmp(def->label, "Method") == 0 ||
-         cbm_label_is_type_like(def->label) || strcmp(def->label, "Variable") == 0 ||
-         strcmp(def->label, "Field") == 0)) {
+    /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
+     * (helpers.c): callables + type-like containers (INHERITS/IMPLEMENTS/method/
+     * field resolution), Variable/Field (READS/WRITES resolution), and Table/View
+     * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
+     * through the same predicate, so the three registries cannot diverge. */
+    if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
@@ -470,9 +465,10 @@ static int create_import_edges_for_file(cbm_pipeline_ctx_t *ctx, const CBMFileRe
         const cbm_gbuf_node_t *target =
             cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
         if (target && target->id != source_node->id) {
+            char esc_ln[CBM_SZ_128];
+            cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
             char imp_props[CBM_SZ_256];
-            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}",
-                     imp->local_name ? imp->local_name : "");
+            snprintf(imp_props, sizeof(imp_props), "{\"local_name\":\"%s\"}", esc_ln);
             cbm_gbuf_insert_edge(ctx->gbuf, source_node->id, target->id, "IMPORTS", imp_props);
             count++;
         }
@@ -727,8 +723,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             if (!phase) {
                 phase = "crash";
             }
-            const char *reason =
-                (strcmp(phase, "hang") == 0) ? "quarantined after hang" : "quarantined after crash";
+            const char *reason = (strcmp(phase, "hang") == 0)    ? "quarantined after hang"
+                                 : (strcmp(phase, "error") == 0) ? "quarantined after error"
+                                                                 : "quarantined after crash";
             cbm_pipeline_add_file_error(ctx->pipeline, rel, reason, phase);
             errors++;
             continue;

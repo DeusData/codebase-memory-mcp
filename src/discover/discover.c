@@ -708,6 +708,10 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     if (dot && strcmp(dot, ".inc") == 0) {
         lang = cbm_disambiguate_inc(abs_path);
     }
+    /* Special: .cfc components may be script-dialect or tag-dialect (<cfcomponent>) */
+    if (dot && strcmp(dot, ".cfc") == 0) {
+        lang = cbm_disambiguate_cfc(abs_path);
+    }
     /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
      * detected by content; otherwise .xml stays XML. */
     if (lang == CBM_LANG_XML) {

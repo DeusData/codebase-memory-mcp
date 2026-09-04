@@ -265,6 +265,82 @@ TEST(traces_parse_duration_large_values) {
     PASS();
 }
 
+/* A timestamp the code cannot read is not a measurement of no time.
+ *
+ * strtoll answers 0 for text it cannot read, and the subtraction guard turns
+ * that into a duration of 0 ns. A span that genuinely took no time and a span
+ * whose timestamps were garbage then look the same, and no later query can
+ * tell them apart. cbm_parse_duration_checked reports which one it read. */
+TEST(traces_parse_duration_checked_reports_unreadable_timestamps) {
+    bool ok = false;
+
+    /* Positive control: a good pair still reads, and still answers the same
+     * number cbm_parse_duration answers. */
+    int64_t d = cbm_parse_duration_checked("1000000000", "1050000000", &ok);
+    ASSERT(ok);
+    ASSERT_EQ(d, 50000000);
+
+    /* A real measurement of no time reads fine. Zero is an answer here. */
+    ok = false;
+    d = cbm_parse_duration_checked("5000000000", "5000000000", &ok);
+    ASSERT(ok);
+    ASSERT_EQ(d, 0);
+
+    /* End before start reads fine too. The clamp to 0 is the caller's rule,
+     * not a reading failure. */
+    ok = false;
+    d = cbm_parse_duration_checked("1000", "500", &ok);
+    ASSERT(ok);
+    ASSERT_EQ(d, 0);
+
+    /* The claim: text that does not read is reported, not folded into 0. */
+    const char *unreadable[] = {"abc", "", " 100", "100ns", "1e9"};
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        ok = true;
+        (void)cbm_parse_duration_checked(unreadable[i], "1050000000", &ok);
+        ASSERT(!ok);
+        ok = true;
+        (void)cbm_parse_duration_checked("1000000000", unreadable[i], &ok);
+        ASSERT(!ok);
+    }
+
+    /* A NULL argument was never a measurement either. */
+    ok = true;
+    (void)cbm_parse_duration_checked(NULL, "1000", &ok);
+    ASSERT(!ok);
+    ok = true;
+    (void)cbm_parse_duration_checked("1000", NULL, &ok);
+    ASSERT(!ok);
+    PASS();
+}
+
+/* A span whose timestamps cannot be read keeps its method and path, and says
+ * the duration was not recorded rather than claiming it was zero. */
+TEST(traces_extract_http_info_marks_unreadable_duration) {
+    cbm_trace_attr_t attrs[] = {
+        {.key = "http.method", .string_value = "GET"},
+        {.key = "http.route", .string_value = "/api/orders"},
+        {.key = "http.status_code", .string_value = "200"},
+    };
+    cbm_trace_span_t span = {
+        .kind = 2,
+        .attributes = attrs,
+        .attr_count = 3,
+        .start_time = "not-a-timestamp",
+        .end_time = "1050000000",
+    };
+
+    cbm_http_span_info_t info;
+    bool ok = cbm_extract_http_info(&span, "svc", &info);
+    /* The HTTP part of the span is still good data, so it is still returned. */
+    ASSERT(ok);
+    ASSERT_STR_EQ(info.method, "GET");
+    ASSERT_STR_EQ(info.path, "/api/orders");
+    /* The claim: not recorded, rather than a duration of zero. */
+    ASSERT_EQ(info.duration_ns, CBM_DURATION_UNKNOWN);
+    PASS();
+}
+
 /* ── TestCalculateP99 — edge cases ────────────────────────────────── */
 
 TEST(traces_calculate_p99_100_values) {
@@ -341,4 +417,6 @@ SUITE(traces) {
     RUN_TEST(traces_parse_duration_both_null);
     RUN_TEST(traces_parse_duration_equal);
     RUN_TEST(traces_parse_duration_large_values);
+    RUN_TEST(traces_parse_duration_checked_reports_unreadable_timestamps);
+    RUN_TEST(traces_extract_http_info_marks_unreadable_duration);
 }

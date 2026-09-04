@@ -64,6 +64,12 @@ CBMLanguage cbm_disambiguate_inc(const char *path);
  * shebang, an embedded NUL in the first line, or an unknown interpreter. */
 CBMLanguage cbm_language_from_shebang(const char *path);
 
+/* Disambiguate .cfc files by reading the head of the content.
+ * Returns CBM_LANG_CFML if the component is tag-based (a "<cfcomponent" tag, or a
+ * leading '<'), otherwise CBM_LANG_CFSCRIPT for script-dialect components.
+ * On read failure, defaults to CBM_LANG_CFSCRIPT. */
+CBMLanguage cbm_disambiguate_cfc(const char *path);
+
 /* ── Gitignore pattern matching ──────────────────────────────────── */
 
 typedef struct cbm_gitignore cbm_gitignore_t;

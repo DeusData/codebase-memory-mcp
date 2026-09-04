@@ -281,8 +281,21 @@ if ($binaryItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
 }
 
 # Prove the downloaded binary runs before touching an existing installation.
+# PS 5.1 wraps redirected native stderr into ErrorRecords, so under the global
+# ErrorActionPreference=Stop a HEALTHY binary that prints one warning while
+# exiting 0 becomes a terminating error here. Relax to Continue for the probe
+# only; failure detection stays on $LASTEXITCODE, and the pre-seed guarantees
+# a binary that fails to START (stale $LASTEXITCODE from an earlier native
+# call) can never read as success.
 try {
-    $candidateVersion = & $DownloadedBinary --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $candidateVersion = & $DownloadedBinary --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "candidate exited with $LASTEXITCODE" }
     Write-Host "Verified candidate: $candidateVersion"
 } catch {
@@ -349,8 +362,18 @@ if (Test-Path -LiteralPath $DownloadedInstaller -PathType Leaf) {
 }
 
 # Verify
+# Same PS 5.1 stderr-wrapping guard as the candidate probe above; the pre-seed
+# matters MOST here, because prior successful native calls leave a stale
+# $LASTEXITCODE=0 that a start-failure would otherwise inherit.
 try {
-    $ver = & $Dest --version 2>&1
+    $ProbeEap = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        $global:LASTEXITCODE = 1
+        $ver = & $Dest --version 2>&1
+    } finally {
+        $ErrorActionPreference = $ProbeEap
+    }
     if ($LASTEXITCODE -ne 0) { throw "installed binary exited with $LASTEXITCODE" }
     Write-Host "Installed: $ver"
 } catch {

@@ -104,6 +104,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_QML:
     case CBM_LANG_CFSCRIPT:
         return strcmp(kind, "property_identifier") == 0 ||
@@ -161,6 +162,7 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_SCHEME:
     case CBM_LANG_FENNEL:
     case CBM_LANG_RACKET:
+    case CBM_LANG_CHIALISP:
     case CBM_LANG_LINKERSCRIPT:
         return strcmp(kind, "symbol") == 0;
     case CBM_LANG_MAKEFILE:
@@ -196,6 +198,8 @@ static bool is_reference_node(TSNode node, CBMLanguage lang) {
     case CBM_LANG_OBJECTSCRIPT_ROUTINE:
         return strcmp(kind, "objectscript_identifier") == 0 ||
                strcmp(kind, "objectscript_identifier_special") == 0;
+    case CBM_LANG_PLSQL:
+        return strcmp(kind, "identifier") == 0;
     default:
         return false;
     }
@@ -374,6 +378,7 @@ typedef enum {
     CBM_OCCURRENCE_VHDL_INTERFACE,
     CBM_OCCURRENCE_PINE_FUNCTION,
     CBM_OCCURRENCE_LLVM_FUNCTION,
+    CBM_OCCURRENCE_PKL_DECLARATION,
 } CBMOccurrencePolicy;
 
 typedef struct {
@@ -461,6 +466,7 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_CLOJURE] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
     [CBM_LANG_SCHEME] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
     [CBM_LANG_RACKET] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
+    [CBM_LANG_CHIALISP] = {NULL, NULL, CBM_OCCURRENCE_LISP_DEF, false},
     [CBM_LANG_COMMONLISP] = {NULL, NULL, CBM_OCCURRENCE_COMMONLISP_DEFUN, false},
     [CBM_LANG_FENNEL] = {NULL, NULL, CBM_OCCURRENCE_FENNEL_FN, false},
     [CBM_LANG_ELIXIR] = {NULL, NULL, CBM_OCCURRENCE_ELIXIR_DEF, false},
@@ -492,6 +498,7 @@ static const CBMOccurrenceSpec occurrence_specs[CBM_LANG_COUNT] = {
     [CBM_LANG_PINE] = {NULL, NULL, CBM_OCCURRENCE_PINE_FUNCTION, false},
     [CBM_LANG_PUPPET] = {NULL, NULL, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_LLVM_IR] = {llvm_binding_nodes, NULL, CBM_OCCURRENCE_LLVM_FUNCTION, false},
+    [CBM_LANG_PKL] = {NULL, NULL, CBM_OCCURRENCE_PKL_DECLARATION, false},
     [CBM_LANG_MESON] = {NULL, meson_write_nodes, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_GN] = {NULL, gn_write_nodes, CBM_OCCURRENCE_STANDARD, true},
     [CBM_LANG_LINKERSCRIPT] = {NULL, linkerscript_write_nodes, CBM_OCCURRENCE_STANDARD, true},
@@ -534,23 +541,39 @@ static bool lisp_def_head(const char *text) {
     return kind_in_exact_set(text, heads);
 }
 
+/* Chialisp heads whose THIRD form is a parameter list, so the symbols in it
+ * bind rather than refer: `(defun NAME (params) body)`. Deliberately not
+ * `defconstant` — its third form is the VALUE expression, whose symbols are
+ * genuine usages — and not `mod`, whose binder is the second form and is
+ * already covered by the shared named_child(1) rule below. */
+static bool chialisp_head_binds_params_at_2(const char *head) {
+    return head && (strcmp(head, "defun") == 0 || strcmp(head, "defun-inline") == 0 ||
+                    strcmp(head, "defmacro") == 0 || strcmp(head, "defmac") == 0);
+}
+
 static bool is_lisp_def_binding(CBMExtractCtx *ctx, TSNode node) {
+    bool chialisp = (ctx->language == CBM_LANG_CHIALISP);
     for (TSNode form = ts_node_parent(node); !ts_node_is_null(form); form = ts_node_parent(form)) {
         const char *kind = ts_node_type(form);
         if ((strcmp(kind, "list") != 0 && strcmp(kind, "list_lit") != 0) ||
             ts_node_named_child_count(form) < 2) {
             continue;
         }
-        TSNode head_node = ts_node_named_child(form, 0);
+        TSNode head_node =
+            chialisp ? cbm_lisp_named_child_skip_comments(form, 0) : ts_node_named_child(form, 0);
+        if (ts_node_is_null(head_node)) {
+            continue;
+        }
         char *head = cbm_node_text(ctx->arena, head_node, ctx->source);
-        if (!lisp_def_head(head)) {
+        if (!(chialisp ? cbm_chialisp_is_def_head(head) : lisp_def_head(head))) {
             continue;
         }
         if (node_contains(head_node, node) || named_child_contains(form, 1, node)) {
             return true;
         }
-        if (ctx->language == CBM_LANG_CLOJURE && ts_node_named_child_count(form) > 2 &&
-            named_child_contains(form, 2, node)) {
+        if ((ctx->language == CBM_LANG_CLOJURE ||
+             (chialisp && chialisp_head_binds_params_at_2(head))) &&
+            ts_node_named_child_count(form) > 2 && named_child_contains(form, 2, node)) {
             return true;
         }
         return false;
@@ -985,6 +1008,30 @@ static bool is_pine_function_binding(TSNode node) {
     return ancestor_field_binds(node, "function_declaration_statement", fields);
 }
 
+/* Pkl declares names positionally: no production labels the declared identifier
+ * with a `name` field, so the generic declared-container rule never binds them
+ * and every method name, parameter name, and property name would be re-emitted
+ * as an ordinary read of itself. Each container below holds its declared name
+ * as named child 0; annotations, defaults, and bodies follow it and stay reads.
+ * Resolve against the NEAREST container so a nested declaration's own name is
+ * the only occurrence its parent can bind. */
+static bool is_pkl_declaration_binding(TSNode node) {
+    static const char *const declaration_kinds[] = {"methodHeader",
+                                                    "typedIdentifier",
+                                                    "classProperty",
+                                                    "objectProperty",
+                                                    "clazz",
+                                                    "typeAlias",
+                                                    NULL};
+    for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
+         parent = ts_node_parent(parent)) {
+        if (kind_in_exact_set(ts_node_type(parent), declaration_kinds)) {
+            return named_child_contains(parent, 0, node);
+        }
+    }
+    return false;
+}
+
 static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
                               const CBMOccurrenceSpec *occurrence) {
     switch (occurrence->policy) {
@@ -1041,6 +1088,8 @@ static bool is_policy_binding(CBMExtractCtx *ctx, TSNode node,
         return is_vhdl_interface_binding(node);
     case CBM_OCCURRENCE_PINE_FUNCTION:
         return is_pine_function_binding(node);
+    case CBM_OCCURRENCE_PKL_DECLARATION:
+        return is_pkl_declaration_binding(node);
     case CBM_OCCURRENCE_LLVM_FUNCTION:
         for (TSNode parent = ts_node_parent(node); !ts_node_is_null(parent);
              parent = ts_node_parent(parent)) {
@@ -1096,6 +1145,14 @@ static bool is_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const CBMLang
         }
 
         const char *kind = ts_node_type(parent);
+        /* PL/SQL: `parameter` is a ref_call ARGUMENT wrapper (upstream grammar
+         * naming), not a declaration; definition-side bindings use the distinct
+         * parameter_declaration kind. Skip it so call arguments stay ordinary
+         * value usages. */
+        if (ctx->language == CBM_LANG_PLSQL && strcmp(kind, "parameter") == 0) {
+            current = parent;
+            continue;
+        }
         if (kind_in_exact_set(kind, common_whole_binding_nodes) ||
             kind_in_exact_set(kind, occurrence->whole_binding_nodes)) {
             return true;
@@ -1367,6 +1424,7 @@ static bool language_may_stamp_exact_callable_value_candidate(CBMLanguage langua
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
     case CBM_LANG_GO:
     case CBM_LANG_PYTHON:
     case CBM_LANG_C:
@@ -1492,7 +1550,7 @@ static TSNode call_reference_candidate_site(CBMExtractCtx *ctx, TSNode node, con
         (void)occurrence_parent(cursor, node, &parent, &parent_field);
     }
     bool ts_family = ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                     ctx->language == CBM_LANG_TSX;
+                     ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS;
     if (ts_family && strcmp(kind, "property_identifier") == 0 && !ts_node_is_null(parent) &&
         strcmp(ts_node_type(parent), "member_expression") == 0) {
         TSNode property = ts_node_child_by_field_name(parent, TS_FIELD("property"));
@@ -1995,7 +2053,8 @@ static bool is_import_binding_occurrence(CBMExtractCtx *ctx, TSNode node, const 
     }
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX: {
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS: {
         if (strcmp(ts_node_type(boundary), "import_statement") != 0) {
             return false;
         }
@@ -2182,7 +2241,7 @@ static void record_lexical_binding(CBMExtractCtx *ctx, WalkState *state, TSNode 
         scope_id = lexical_ancestor_of_kind(state, current_id, true, false);
         whole_scope = true;
     } else if (ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-               ctx->language == CBM_LANG_TSX) {
+               ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) {
         bool is_var = js_var_binding(node);
         scope_id = lexical_ancestor_of_kind(state, current_id, is_var, !is_var);
         if (scope_id == 0) {
@@ -2614,6 +2673,10 @@ void handle_usages(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec, Wal
         usage.ref_name = name;
         usage.enclosing_func_qn = state->enclosing_func_qn;
         usage.lexical_scope_id = usage_lexical_scope_id_for_node(ctx, state, node);
+        /* The member half of a selector is its own reference node
+         * (field_identifier); record that shape — the name alone cannot carry
+         * it, and the Go Field guard keys on it (#1962). */
+        usage.is_member_access = strcmp(ts_node_type(node), "field_identifier") == 0;
         stamp_usage_site(ctx, &usage, node, name, state);
         cbm_usages_push(&ctx->result->usages, ctx->arena, usage);
     }

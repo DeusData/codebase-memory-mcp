@@ -54,6 +54,7 @@
 #include <windows.h>
 #include <process.h>
 #include <psapi.h> /* GetProcessMemoryInfo */
+#include <tlhelp32.h> /* CreateToolhelp32Snapshot, Process32First/Next */
 #else
 #include <sys/stat.h>
 #include <unistd.h>
@@ -62,8 +63,16 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 
 /* ── Constants ────────────────────────────────────────────────── */
+
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
 
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
@@ -142,8 +151,10 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * audit forbids hardcoded external URLs in graph-ui source (external
      * targets must come from an auditable backend response, same pattern as
      * the /api/repo-info deep-links). */
-    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}",
+                    lang_buf, CBM_VERSION,
+                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -560,7 +571,7 @@ static void handle_processes(cbm_http_conn_t *c) {
     int pos = 0;
 
 #ifdef _WIN32
-    /* Windows: GetProcessMemoryInfo + GetProcessTimes */
+    /* Windows: GetProcessMemoryInfo + GetProcessTimes for the current process */
     PROCESS_MEMORY_COUNTERS pmc;
     FILETIME ft_create, ft_exit, ft_kernel, ft_user;
     double user_s = 0, sys_s = 0;
@@ -578,8 +589,81 @@ static void handle_processes(cbm_http_conn_t *c) {
     }
     http_appendf(buf, sizeof(buf), &pos,
                  "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[]}",
+                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
                  (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
+
+    /* Enumerate all codebase-memory-mcp.exe processes via toolhelp snapshot */
+    int proc_count = 0;
+    HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (hSnap != INVALID_HANDLE_VALUE) {
+        PROCESSENTRY32 pe;
+        pe.dwSize = sizeof(pe);
+        for (BOOL ok = Process32First(hSnap, &pe); ok; ok = Process32Next(hSnap, &pe)) {
+            if (_stricmp(pe.szExeFile, "codebase-memory-mcp.exe") == 0) {
+                HANDLE hProc = OpenProcess(
+                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                    FALSE, pe.th32ProcessID);
+                if (hProc) {
+                    PROCESS_MEMORY_COUNTERS ppmc;
+                    FILETIME ftc, fte, ftk, ftu;
+                    double cpu_user = 0, cpu_sys = 0;
+                    size_t proc_rss = 0;
+                    DWORD elapsed_sec = 0;
+
+                    if (GetProcessMemoryInfo(hProc, &ppmc, sizeof(ppmc)))
+                        proc_rss = ppmc.WorkingSetSize;
+
+                    if (GetProcessTimes(hProc, &ftc, &fte, &ftk, &ftu)) {
+                        ULARGE_INTEGER pu, pk;
+                        pu.LowPart = ftu.dwLowDateTime;
+                        pu.HighPart = ftu.dwHighDateTime;
+                        pk.LowPart = ftk.dwLowDateTime;
+                        pk.HighPart = ftk.dwHighDateTime;
+                        cpu_user = (double)pu.QuadPart / 1e7;
+                        cpu_sys = (double)pk.QuadPart / 1e7;
+
+                        /* 进程创建以来的运行时间 */
+                        FILETIME now_ft;
+                        GetSystemTimeAsFileTime(&now_ft);
+                        ULARGE_INTEGER now_uli, start_uli;
+                        now_uli.LowPart = now_ft.dwLowDateTime;
+                        now_uli.HighPart = now_ft.dwHighDateTime;
+                        start_uli.LowPart = ftc.dwLowDateTime;
+                        start_uli.HighPart = ftc.dwHighDateTime;
+                        /* 时钟偏移保护：防止创建时间微偏未来导致 unsigned 下溢 */
+                        if (now_uli.QuadPart > start_uli.QuadPart) {
+                            ULONGLONG elapsed_100ns = now_uli.QuadPart - start_uli.QuadPart;
+                            elapsed_sec = (DWORD)(elapsed_100ns / 10000000ULL);
+                        }
+                    }
+
+                    if (proc_count > 0)
+                        buf[pos++] = ',';
+                    http_appendf(buf, sizeof(buf), &pos,
+                                 "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
+                                 "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
+                                 "\"command\":\"codebase-memory-mcp\","
+                                 "\"is_self\":%s}",
+                                 pe.th32ProcessID, cpu_user + cpu_sys,
+                                 (double)proc_rss / (1024.0 * 1024.0),
+                                 elapsed_sec / 86400,
+                                 (elapsed_sec % 86400) / 3600,
+                                 (elapsed_sec % 3600) / 60,
+                                 elapsed_sec % 60,
+                                 pe.th32ProcessID == (DWORD)_getpid()
+                                     ? "true" : "false");
+                    if (pos >= (int)sizeof(buf)) {
+                        pos = (int)sizeof(buf) - 1;
+                    }
+                    proc_count++;
+                    CloseHandle(hProc);
+                }
+            }
+        }
+        CloseHandle(hSnap);
+    }
+
+    http_appendf(buf, sizeof(buf), &pos, "]}");
 #else
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
@@ -929,6 +1013,15 @@ static bool resolve_self_executable(char *out, size_t outsz) {
         return copy_path(out, outsz, buf);
     }
     return false;
+#elif defined(__FreeBSD__)
+    /* No /proc by default on FreeBSD; ask the kernel for our own path. */
+    char buf[1024];
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t cb = sizeof(buf);
+    if (sysctl(mib, 4, buf, &cb, NULL, 0) == 0 && cb > 0) {
+        return copy_path(out, outsz, buf);
+    }
+    return false;
 #else
     char buf[1024];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -978,15 +1071,50 @@ bool cbm_http_server_resolve_binary_path(const char *argv0, char *out, size_t ou
     }
 #endif
 
+#ifndef _WIN32
+    /* #1204: never hand back a self-resolved path we have not confirmed is
+     * executable. After an installer's atomic rename-over, the resolved image
+     * path no longer exists (Linux readlink reads "<path> (deleted)"), and an
+     * unvalidated return turns into a doomed worker spawn (ENOENT). */
+    if (resolve_self_executable(out, outsz)) {
+        if (is_executable_file(out)) {
+            return true;
+        }
+#if defined(__linux__)
+        /* Deleted image: the /proc/self/exe magic link still executes the
+         * in-memory OLD build — the only spawn that satisfies the worker's
+         * build-fingerprint gate (a rename-over leaves the on-disk path
+         * holding a DIFFERENT build). Hand back the link, not the stale
+         * path. Deliberately NOT the saved launch path: preferring it swaps
+         * an ENOENT for a fingerprint refusal. */
+        return copy_path(out, outsz, "/proc/self/exe");
+#else
+        /* macOS has no magic link. Fail closed: the supervisor logs
+         * index.supervisor.no_self_path and indexing resumes after a daemon
+         * restart, instead of spawning a missing or mismatched binary. */
+        out[0] = '\0';
+        return false;
+#endif
+    }
+#else
     if (resolve_self_executable(out, outsz)) {
         return true;
     }
+#endif
     return copy_path(out, outsz, argv0);
 }
 
 void cbm_http_server_set_binary_path(const char *path) {
     if (path) {
-        if (!cbm_http_server_resolve_binary_path(path, g_binary_path, sizeof(g_binary_path))) {
+        /* Resolve into a local buffer first: `path` may alias g_binary_path
+         * on a repeated call. Resolving in place first hits resolve's leading
+         * out[0]='\0', which zeroes the shared buffer and silently discards
+         * the very path we were asked to re-resolve — and the in-place write
+         * is one reset-reorder away from an overlapping snprintf. */
+        char resolved[sizeof(g_binary_path)];
+        if (cbm_http_server_resolve_binary_path(path, resolved, sizeof(resolved))) {
+            snprintf(g_binary_path, sizeof(g_binary_path), "%s", resolved);
+        } else {
             g_binary_path[0] = '\0';
         }
     }
