@@ -1,0 +1,398 @@
+==================
+Trailing closure component call
+==================
+
+@Component
+struct S {
+  build() {
+    Column() {
+      Text('hi')
+    }
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (arguments)
+              (statement_block
+                (expression_statement
+                  (call_expression
+                    (identifier)
+                    (arguments
+                      (string
+                        (string_fragment)))))))))))))
+
+==================
+Attribute chain after closing brace
+==================
+
+@Component
+struct S {
+  build() {
+    Column() {
+      Text('hi')
+        .fontSize(20)
+    }
+    .width('100%')
+    .height('100%')
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (call_expression
+                  (member_expression
+                    (call_expression
+                      (identifier)
+                      (arguments)
+                      (statement_block
+                        (expression_statement
+                          (call_expression
+                            (member_expression
+                              (call_expression
+                                (identifier)
+                                (arguments
+                                  (string
+                                    (string_fragment))))
+                              (property_identifier))
+                            (arguments
+                              (number))))))
+                    (property_identifier))
+                  (arguments
+                    (string
+                      (string_fragment))))
+                (property_identifier))
+              (arguments
+                (string
+                  (string_fragment))))))))))
+
+==================
+Nested component blocks with arguments
+==================
+
+@Component
+struct S {
+  build() {
+    Row({ space: 8 }) {
+      Button('Go')
+        .onClick(() => {
+          this.go()
+        })
+    }
+    .height(56)
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (call_expression
+                  (identifier)
+                  (arguments
+                    (object
+                      (pair
+                        (property_identifier)
+                        (number))))
+                  (statement_block
+                    (expression_statement
+                      (call_expression
+                        (member_expression
+                          (call_expression
+                            (identifier)
+                            (arguments
+                              (string
+                                (string_fragment))))
+                          (property_identifier))
+                        (arguments
+                          (arrow_function
+                            (formal_parameters)
+                            (statement_block
+                              (expression_statement
+                                (call_expression
+                                  (member_expression
+                                    (this)
+                                    (property_identifier))
+                                  (arguments))))))))))
+                (property_identifier))
+              (arguments
+                (number)))))))))
+
+==================
+Conditional rendering inside build
+==================
+
+@Component
+struct S {
+  build() {
+    Column() {
+      if (this.flag) {
+        Text('on')
+      } else {
+        Text('off')
+      }
+    }
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (arguments)
+              (statement_block
+                (if_statement
+                  (parenthesized_expression
+                    (member_expression
+                      (this)
+                      (property_identifier)))
+                  (statement_block
+                    (expression_statement
+                      (call_expression
+                        (identifier)
+                        (arguments
+                          (string
+                            (string_fragment))))))
+                  (else_clause
+                    (statement_block
+                      (expression_statement
+                        (call_expression
+                          (identifier)
+                          (arguments
+                            (string
+                              (string_fragment))))))))))))))))
+
+==================
+ForEach with item builder
+==================
+
+@Component
+struct S {
+  build() {
+    List() {
+      ForEach(this.items, (item: string) => {
+        ListItem() {
+          Text(item)
+        }
+      }, (item: string) => item)
+    }
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (arguments)
+              (statement_block
+                (expression_statement
+                  (call_expression
+                    (identifier)
+                    (arguments
+                      (member_expression
+                        (this)
+                        (property_identifier))
+                      (arrow_function
+                        (formal_parameters
+                          (required_parameter
+                            (identifier)
+                            (type_annotation
+                              (predefined_type))))
+                        (statement_block
+                          (expression_statement
+                            (call_expression
+                              (identifier)
+                              (arguments)
+                              (statement_block
+                                (expression_statement
+                                  (call_expression
+                                    (identifier)
+                                    (arguments
+                                      (identifier)))))))))
+                      (arrow_function
+                        (formal_parameters
+                          (required_parameter
+                            (identifier)
+                            (type_annotation
+                              (predefined_type))))
+                        (identifier)))))))))))))
+
+==================
+Next-line block splits via ASI, TS-compatible
+==================
+
+@Component
+struct S {
+  build() {
+    Column()
+    {
+      Text('hi')
+    }
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (identifier)
+              (arguments)))
+          (statement_block
+            (expression_statement
+              (call_expression
+                (identifier)
+                (arguments
+                  (string
+                    (string_fragment)))))))))))
+
+==================
+StateStyles anonymous style block
+==================
+
+@Component
+struct S {
+  build() {
+    Button('x')
+      .stateStyles({
+        pressed: pressedStyle,
+        normal: {
+          .borderRadius(20)
+          .borderWidth(1)
+        }
+      })
+  }
+}
+
+---
+
+(program
+  (struct_declaration
+    (decorator
+      (identifier))
+    (type_identifier)
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (statement_block
+          (expression_statement
+            (call_expression
+              (member_expression
+                (call_expression
+                  (identifier)
+                  (arguments
+                    (string
+                      (string_fragment))))
+                (property_identifier))
+              (arguments
+                (object
+                  (pair
+                    (property_identifier)
+                    (identifier))
+                  (pair
+                    (property_identifier)
+                    (style_block
+                      (extend_attribute
+                        (property_identifier)
+                        (arguments
+                          (number)))
+                      (extend_attribute
+                        (property_identifier)
+                        (arguments
+                          (number))))))))))))))
+
+==================
+Mixin extends call keeps its class body
+==================
+
+class Mixin extends withTag(Base) {
+  run(): void {}
+}
+
+---
+
+(program
+  (class_declaration
+    (type_identifier)
+    (class_heritage
+      (extends_clause
+        (call_expression
+          (identifier)
+          (arguments
+            (identifier)))))
+    (class_body
+      (method_definition
+        (property_identifier)
+        (formal_parameters)
+        (type_annotation
+          (predefined_type))
+        (statement_block)))))

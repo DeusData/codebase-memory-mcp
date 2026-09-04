@@ -119,11 +119,196 @@ static uint32_t add_lexical_scope(WalkState *state, TSNode node, CBMLexicalScope
     return scope->id;
 }
 
+/* ── #1912: Python parameter bindings held live by the walk ───────────────────
+ *
+ * A bare Python call `run()` cannot honestly resolve to a project function by
+ * short name when `run` is bound as a parameter of an enclosing def or lambda:
+ * the parameter shadows any module-level `run` for the whole body, so the match
+ * is fabricated by construction.
+ *
+ * Deciding that per call by ASCENDING the tree is the trap this replaces. Both
+ * ts_node_parent() (O(depth) per hop) and a walk-cursor ascent (O(1) per hop,
+ * O(depth) per call) are per-call costs, and every level of f(f(f(...))) is
+ * itself a bare call, so the file-wide cost is quadratic or worse -- exactly
+ * what CBMWalkScope's comment records for the state it replaced. Scanning the
+ * frame stack has the same shape.
+ *
+ * So the walk carries the answer instead: a name -> active-count map, pushed
+ * when a Python function or lambda scope opens and unwound when it closes.
+ * Lookup is O(1), which is what removes the need for a hop cap.
+ *
+ * A COUNT, not a flag: `def outer(run): def inner(run):` binds one name twice,
+ * and leaving the inner scope must not unbind the outer one.
+ *
+ * Every failure path answers "not bound", which can only ever cost a
+ * suppression -- never a true edge. */
+
+static uint32_t py_param_hash(const char *s) {
+    uint32_t h = 2166136261u; /* FNV-1a */
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        h = (h ^ *p) * 16777619u;
+    }
+    return h ? h : 1u; /* 0 marks an empty slot */
+}
+
+static CBMParamSlot *py_param_slot(WalkState *state, const char *name, uint32_t hash) {
+    int mask = state->py_param_slot_capacity - 1;
+    int i = (int)(hash & (uint32_t)mask);
+    for (;;) {
+        CBMParamSlot *slot = &state->py_param_slots[i];
+        if (slot->hash == 0) {
+            return slot; /* free slot -- caller decides whether to claim it */
+        }
+        if (slot->hash == hash && strcmp(slot->name, name) == 0) {
+            return slot;
+        }
+        i = (i + 1) & mask;
+    }
+}
+
+static bool py_param_grow(WalkState *state) {
+    int new_capacity = state->py_param_slot_capacity * PAIR_LEN;
+    if (new_capacity <= state->py_param_slot_capacity) {
+        return false;
+    }
+    CBMParamSlot *grown =
+        (CBMParamSlot *)cbm_arena_alloc(state->arena, (size_t)new_capacity * sizeof(*grown));
+    if (!grown) {
+        return false;
+    }
+    memset(grown, 0, (size_t)new_capacity * sizeof(*grown));
+    CBMParamSlot *old = state->py_param_slots;
+    int old_capacity = state->py_param_slot_capacity;
+    state->py_param_slots = grown;
+    state->py_param_slot_capacity = new_capacity;
+    for (int i = 0; i < old_capacity; i++) {
+        if (old[i].hash != 0) {
+            *py_param_slot(state, old[i].name, old[i].hash) = old[i];
+        }
+    }
+    return true;
+}
+
+static bool py_param_stack_reserve(WalkState *state) {
+    if (state->py_param_stack_count < state->py_param_stack_capacity) {
+        return true;
+    }
+    int new_capacity = state->py_param_stack_capacity * PAIR_LEN;
+    if (new_capacity <= state->py_param_stack_capacity) {
+        return false;
+    }
+    const char **grown =
+        (const char **)cbm_arena_alloc(state->arena, (size_t)new_capacity * sizeof(*grown));
+    if (!grown) {
+        return false;
+    }
+    memcpy(grown, state->py_param_stack, (size_t)state->py_param_stack_count * sizeof(*grown));
+    state->py_param_stack = grown;
+    state->py_param_stack_capacity = new_capacity;
+    return true;
+}
+
+/* Bind one parameter name for the lifetime of the frame currently on top. */
+static void py_param_bind(WalkState *state, const char *name) {
+    if (state->py_param_tracking_failed || !name || !name[0]) {
+        return;
+    }
+    /* Grow before inserting: the probe below must always find a free slot, and
+     * a table above ~70% load degrades toward linear probing. */
+    if ((state->py_param_slot_used + 1) * 10 >= state->py_param_slot_capacity * 7) {
+        if (!py_param_grow(state)) {
+            state->py_param_tracking_failed = true;
+            return;
+        }
+    }
+    if (!py_param_stack_reserve(state)) {
+        state->py_param_tracking_failed = true;
+        return;
+    }
+    uint32_t hash = py_param_hash(name);
+    CBMParamSlot *slot = py_param_slot(state, name, hash);
+    if (slot->hash == 0) {
+        slot->hash = hash;
+        slot->name = name;
+        slot->count = 0;
+        state->py_param_slot_used++;
+    }
+    slot->count++;
+    state->py_param_stack[state->py_param_stack_count++] = name;
+}
+
+/* Unwind to a frame's entry height, undoing exactly what that frame bound. */
+static void py_param_unwind_to(WalkState *state, int base) {
+    if (state->py_param_tracking_failed) {
+        return;
+    }
+    while (state->py_param_stack_count > base) {
+        const char *name = state->py_param_stack[--state->py_param_stack_count];
+        CBMParamSlot *slot = py_param_slot(state, name, py_param_hash(name));
+        if (slot->hash != 0 && slot->count > 0) {
+            slot->count--;
+        }
+    }
+}
+
+bool cbm_walk_python_param_is_bound(const WalkState *state, const char *name) {
+    if (!state || !name || !name[0] || state->py_param_tracking_failed ||
+        state->py_param_slot_used == 0) {
+        return false;
+    }
+    const CBMParamSlot *slot = py_param_slot((WalkState *)state, name, py_param_hash(name));
+    return slot->hash != 0 && slot->count > 0;
+}
+
+/* The identifier a Python parameter node binds. Handles the bare, typed,
+ * defaulted, keyword-only, *args and **kwargs shapes. */
+static const char *py_parameter_name(CBMExtractCtx *ctx, TSNode param) {
+    if (ts_node_is_null(param)) {
+        return NULL;
+    }
+    if (strcmp(ts_node_type(param), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, param, ctx->source);
+    }
+    TSNode name = ts_node_child_by_field_name(param, TS_FIELD("name"));
+    if (!ts_node_is_null(name) && strcmp(ts_node_type(name), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, name, ctx->source);
+    }
+    /* `*args` / `**kwargs`, and any typed shape without a `name` field: the
+     * bound identifier is the first named child. */
+    TSNode first = ts_node_named_child(param, 0);
+    if (!ts_node_is_null(first) && strcmp(ts_node_type(first), "identifier") == 0) {
+        return cbm_node_text(ctx->arena, first, ctx->source);
+    }
+    return NULL;
+}
+
+/* Bind this node's parameters into the frame just pushed for it. Called after
+ * every push in push_boundary_scopes, so the top frame is this node's own and
+ * pop_expired_scopes unwinds them at exactly the right depth. */
+static void py_bind_scope_parameters(CBMExtractCtx *ctx, TSNode node, WalkState *state) {
+    if (ctx->language != CBM_LANG_PYTHON || state->scope_top == 0) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "function_definition") != 0 && strcmp(kind, "lambda") != 0) {
+        return;
+    }
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    if (ts_node_is_null(params)) {
+        return;
+    }
+    uint32_t count = ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < count; i++) {
+        py_param_bind(state, py_parameter_name(ctx, ts_node_named_child(params, i)));
+    }
+}
+
 static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const char *qn) {
     if (!ensure_scope_capacity(state)) {
         return false;
     }
     CBMWalkScope *f = &state->scopes[state->scope_top];
+    f->prev_py_param_stack_count = state->py_param_stack_count;
     f->kind = kind;
     f->depth = depth;
     f->qn = qn;
@@ -260,6 +445,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         state->inside_import = f->prev_inside_import;
         state->loop_depth = f->prev_loop_depth;
         state->branch_depth = f->prev_branch_depth;
+        py_param_unwind_to(state, f->prev_py_param_stack_count);
     }
 }
 
@@ -329,14 +515,48 @@ static bool lisp_head_is_def(const char *t) {
  * forms, ...), so push_boundary_scopes pushes no scope for them. Mirrors
  * extract_lisp_def() in extract_defs.c. */
 static const char *compute_lisp_func_qn(CBMExtractCtx *ctx, TSNode node) {
+    bool chialisp = (ctx->language == CBM_LANG_CHIALISP);
     if (ts_node_named_child_count(node) < 2) {
         return NULL;
     }
-    char *head = cbm_node_text(ctx->arena, ts_node_named_child(node, 0), ctx->source);
-    if (!lisp_head_is_def(head)) {
+    /* Chialisp reads its head and name through the comment-skipping accessor —
+     * the SAME one extract_lisp_def() uses. When these two disagree (one
+     * skipping comments, the other not), a doc comment between a def head and
+     * its name shifts the named-child indices for only one of them, and the
+     * call scope silently stops matching the def it belongs to. */
+    TSNode head_node =
+        chialisp ? cbm_lisp_named_child_skip_comments(node, 0) : ts_node_named_child(node, 0);
+    if (ts_node_is_null(head_node)) {
         return NULL;
     }
-    TSNode target = ts_node_named_child(node, 1);
+    char *head = cbm_node_text(ctx->arena, head_node, ctx->source);
+    if (!(chialisp ? cbm_chialisp_is_def_head(head) : lisp_head_is_def(head))) {
+        return NULL;
+    }
+    if (chialisp && cbm_lisp_node_in_quote(ctx->arena, node, ctx->source)) {
+        return NULL;
+    }
+    if (chialisp && head && strcmp(head, "mod") == 0) {
+        /* `mod`'s second form is the curried-arg list, not a name; the puzzle
+         * entry point is named by its file, so in-body top-level calls
+         * attribute to the entry rather than to a curried argument. Mirrors the
+         * lisp_path_stem() naming in extract_defs.c. */
+        const char *path = ctx->rel_path;
+        const char *slash = path ? strrchr(path, '/') : NULL;
+        const char *base = slash ? slash + 1 : path;
+        if (!base || !base[0]) {
+            return NULL;
+        }
+        const char *dot = strrchr(base, '.');
+        size_t len = (dot && dot != base) ? (size_t)(dot - base) : strlen(base);
+        char *stem = cbm_arena_strndup(ctx->arena, base, len);
+        return cbm_fqn_compute(ctx->arena, ctx->project, ctx->rel_path, stem);
+    }
+    TSNode target =
+        chialisp ? cbm_lisp_named_child_skip_comments(node, 1) : ts_node_named_child(node, 1);
+    if (ts_node_is_null(target)) {
+        return NULL;
+    }
     const char *tk = ts_node_type(target);
     TSNode name_node = target;
     /* (define (foo args) ...) — the name is the head symbol of the nested list. */
@@ -746,7 +966,7 @@ static const char *compute_func_qn(CBMExtractCtx *ctx, TSNode node, const CBMLan
      * lives here (we have ctx->source). Non-def lists return NULL → no scope
      * pushed → the in-body call sources to the enclosing def, not the Module. */
     if (ctx->language == CBM_LANG_CLOJURE || ctx->language == CBM_LANG_SCHEME ||
-        ctx->language == CBM_LANG_RACKET) {
+        ctx->language == CBM_LANG_RACKET || ctx->language == CBM_LANG_CHIALISP) {
         return compute_lisp_func_qn(ctx, node);
     }
 
@@ -1097,6 +1317,227 @@ static void handle_string_refs(CBMExtractCtx *ctx, TSNode node, const WalkState 
         .kind = (CBMStringRefKind)kind_val,
     };
     cbm_stringref_push(&ctx->result->string_refs, ctx->arena, ref);
+}
+
+// --- URL-builder helpers (issue #1009) ---
+
+/* Map-aware template flatten for builder bodies: a ${...} substitution that is
+ * a bare identifier or a call to an already-recorded name (const or an earlier
+ * builder in the same file) inlines that value; anything else becomes "{}".
+ * The query string is not part of a route's identity, so the result is
+ * truncated at the first '?'. Handles the composed-builder shape
+ * `return \`${basePath(id)}?${params}\``. */
+static const char *builder_template_text(CBMExtractCtx *ctx, TSNode node) {
+    enum { BLD_BUF = 512 };
+    char buf[BLD_BUF];
+    size_t pos = 0;
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *k = ts_node_type(c);
+        const char *piece = NULL;
+        if (strcmp(k, "string_fragment") == 0) {
+            piece = cbm_node_text(ctx->arena, c, ctx->source);
+        } else if (strcmp(k, "template_substitution") == 0) {
+            piece = "{}";
+            if (ts_node_named_child_count(c) > 0) {
+                TSNode expr = ts_node_named_child(c, 0);
+                /* `${basePath(id)}` inlines a builder, `${BASE}` a const. A bare
+                 * name never resolves to a builder: that reads the function. */
+                bool want_builder = strcmp(ts_node_type(expr), "call_expression") == 0;
+                TSNode name_node =
+                    want_builder ? ts_node_child_by_field_name(expr, TS_FIELD("function")) : expr;
+                if (!ts_node_is_null(name_node) &&
+                    strcmp(ts_node_type(name_node), "identifier") == 0) {
+                    char *nm = cbm_node_text(ctx->arena, name_node, ctx->source);
+                    if (nm) {
+                        const CBMStringConstantMap *map = &ctx->string_constants;
+                        for (int mi = 0; mi < map->count; mi++) {
+                            if (map->values[mi] && map->is_url_builder[mi] == want_builder &&
+                                strcmp(map->names[mi], nm) == 0) {
+                                piece = map->values[mi];
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            continue;
+        }
+        if (!piece) {
+            continue;
+        }
+        size_t pl = strlen(piece);
+        if (pos + pl >= BLD_BUF) {
+            return NULL;
+        }
+        memcpy(buf + pos, piece, pl);
+        pos += pl;
+    }
+    /* Route identity excludes the query string. */
+    for (size_t qi = 0; qi < pos; qi++) {
+        if (buf[qi] == '?') {
+            pos = qi;
+            break;
+        }
+    }
+    if (pos == 0) {
+        return NULL;
+    }
+    return cbm_arena_strndup(ctx->arena, buf, pos);
+}
+
+/* Flatten a string-ish node (plain string or template literal) to text. */
+static const char *url_builder_literal_text(CBMExtractCtx *ctx, TSNode value_node) {
+    const char *kind = ts_node_type(value_node);
+    if (strcmp(kind, "template_string") == 0) {
+        return builder_template_text(ctx, value_node);
+    }
+    if (!is_string_node(kind)) {
+        return NULL;
+    }
+    char *text = cbm_node_text(ctx->arena, value_node, ctx->source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+    int len = (int)strlen(text);
+    if (len >= CBM_QUOTE_PAIR && (text[0] == '"' || text[0] == '\'')) {
+        text = cbm_arena_strndup(ctx->arena, text + SKIP_ONE, (size_t)(len - PAIR_LEN));
+    }
+    return text;
+}
+
+/* A route-shaped URL literal: an absolute path that classifies as a URL. */
+static const char *builder_route_url(CBMExtractCtx *ctx, TSNode value_node) {
+    const char *url = url_builder_literal_text(ctx, value_node);
+    if (!url || url[0] != '/' || cbm_classify_string(url, (int)strlen(url)) != CBM_STRREF_URL) {
+        return NULL;
+    }
+    return url;
+}
+
+static void record_url_builder(CBMExtractCtx *ctx, const char *name, const char *url) {
+    if (!name || !name[0] || !url) {
+        return;
+    }
+    CBMStringConstantMap *map = &ctx->string_constants;
+    for (int i = 0; i < map->count; i++) {
+        if (strcmp(map->names[i], name) == 0) {
+            if (map->is_url_builder[i] && map->values[i] && strcmp(map->values[i], url) != 0) {
+                map->values[i] = NULL; /* ambiguous builder */
+            }
+            return;
+        }
+    }
+    if (map->count < CBM_MAX_STRING_CONSTANTS) {
+        map->names[map->count] = (char *)name;
+        map->values[map->count] = (char *)url;
+        map->is_url_builder[map->count] = true;
+        map->count++;
+    }
+}
+
+/* Every `return` this function owns yields a route-shaped URL literal. A body
+ * that also returns a computed path (`return computePath(kind)`) would attribute
+ * its one literal to call sites that never produce it, so a mixed builder is
+ * declined rather than guessed. Returns inside a nested function belong to that
+ * function, not to this one. */
+static bool builder_returns_only_urls(CBMExtractCtx *ctx, TSNode func) {
+    TSNode body = ts_node_child_by_field_name(func, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    bool only_urls = true;
+    TSTreeCursor cursor = ts_tree_cursor_new(body);
+    for (;;) {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "return_statement") == 0 &&
+            ts_node_eq(cbm_find_enclosing_func(node, ctx->language), func)) {
+            if (ts_node_named_child_count(node) == 0 ||
+                !builder_route_url(ctx, ts_node_named_child(node, 0))) {
+                only_urls = false;
+                break;
+            }
+        }
+        if (ts_tree_cursor_goto_first_child(&cursor)) {
+            continue;
+        }
+        if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+            continue;
+        }
+        bool found = false;
+        while (ts_tree_cursor_goto_parent(&cursor)) {
+            if (ts_tree_cursor_goto_next_sibling(&cursor)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            break;
+        }
+    }
+    ts_tree_cursor_delete(&cursor);
+    return only_urls;
+}
+
+/* URL-builder helper pattern (issue #1009): a small function whose return value
+ * is a URL-shaped literal, consumed as `client(buildPath(id))`. The literal
+ * never appears as a call argument, so first_string_arg resolution cannot see
+ * it; record `functionName -> url` in the per-file constant map and let the
+ * call-site call_expression branch resolve it. Covers `return`-statement bodies
+ * and arrow-function expression bodies.
+ *
+ * JS/TS only. The predicate accepts any absolute pathname, and `return` plus a
+ * string literal is also the shape of every C or Go helper handing back a
+ * filesystem path (`/etc/...`, `/proc/self/...`); recording those would mint a
+ * Route node and an HTTP_CALLS edge in a language that speaks no HTTP. */
+static void handle_url_builders(CBMExtractCtx *ctx, TSNode node, const WalkState *state) {
+    if (ctx->language != CBM_LANG_JAVASCRIPT && ctx->language != CBM_LANG_TYPESCRIPT &&
+        ctx->language != CBM_LANG_TSX) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+
+    if (strcmp(kind, "arrow_function") == 0) {
+        TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+        if (ts_node_is_null(body) || strcmp(ts_node_type(body), "statement_block") == 0) {
+            return;
+        }
+        const char *url = builder_route_url(ctx, body);
+        if (!url) {
+            return;
+        }
+        TSNode parent = ts_node_parent(node);
+        if (!ts_node_is_null(parent) && strcmp(ts_node_type(parent), "variable_declarator") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(parent, TS_FIELD("name"));
+            if (!ts_node_is_null(name_node)) {
+                record_url_builder(ctx, cbm_node_text(ctx->arena, name_node, ctx->source), url);
+            }
+        }
+        return;
+    }
+
+    if (strcmp(kind, "return_statement") != 0) {
+        return;
+    }
+    if (!state->enclosing_func_qn || state->enclosing_func_qn == ctx->module_qn) {
+        return;
+    }
+    if (ts_node_named_child_count(node) == 0) {
+        return;
+    }
+    const char *url = builder_route_url(ctx, ts_node_named_child(node, 0));
+    if (!url) {
+        return;
+    }
+    TSNode func = cbm_find_enclosing_func(node, ctx->language);
+    if (ts_node_is_null(func) || !builder_returns_only_urls(ctx, func)) {
+        return;
+    }
+    const char *name = strrchr(state->enclosing_func_qn, '.');
+    name = name ? name + 1 : state->enclosing_func_qn;
+    record_url_builder(ctx, name, url);
 }
 
 // --- YAML nested field extraction (D2) ---
@@ -1649,6 +2090,7 @@ static bool is_actual_import_boundary(CBMExtractCtx *ctx, TSNode node, const CBM
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         if (strcmp(kind, "export_statement") == 0) {
             /* An export is an import CONTEXT only in its re-export forms:
              * `export ... from 'mod'` (source field) or a bare specifier list
@@ -2098,6 +2540,7 @@ static void push_boundary_scopes(CBMExtractCtx *ctx, TSNode node, const CBMLangS
     }
 
     push_lexical_boundary(node, state, depth);
+    py_bind_scope_parameters(ctx, node, state);
     push_call_scope(state, depth, invocation);
     if (is_actual_import_boundary(ctx, node, spec) && !is_export_of_declaration(node)) {
         push_scope(state, SCOPE_IMPORT, depth, NULL);
@@ -2131,6 +2574,14 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.scope_capacity = MAX_SCOPES;
     state.lexical_scopes = state.inline_lexical_scopes;
     state.lexical_scope_capacity = INLINE_LEXICAL_SCOPES;
+    state.py_param_slots = state.inline_py_param_slots;
+    state.py_param_slot_capacity = INLINE_PY_PARAM_SLOTS;
+    state.py_param_slot_used = 0;
+    memset(state.inline_py_param_slots, 0, sizeof(state.inline_py_param_slots));
+    state.py_param_stack = state.inline_py_param_stack;
+    state.py_param_stack_capacity = INLINE_PY_PARAM_STACK;
+    state.py_param_stack_count = 0;
+    state.py_param_tracking_failed = false;
     state.usage_start_index = ctx->result->usages.count;
     state.root_lexical_scope_id = add_lexical_scope(&state, ctx->root, CBM_LEXICAL_SCOPE_MODULE);
     /* Base walk-state tuple (previously established by the first
@@ -2160,6 +2611,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
 
             handle_string_constants(ctx, node, &state);
             handle_objectscript_type_map(ctx, node, &state);
+            handle_url_builders(ctx, node, &state);
             CBMInvocationDescriptor invocation = handle_calls(ctx, node, spec, &state);
             handle_usages(ctx, node, spec, &state);
             handle_throws(ctx, node, spec, &state);

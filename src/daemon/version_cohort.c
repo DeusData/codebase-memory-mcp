@@ -463,7 +463,11 @@ cbm_version_cohort_status_t cbm_version_cohort_acquire(cbm_version_cohort_manage
          * which a mismatched client can join. Name it: "was the lifetime lock
          * held?" is exactly what separates a local run (conflict raised) from
          * a CI run (client admitted), and it was not observable in any log. */
-        cbm_log_info("version_cohort.claimed_unheld", "build",
+        /* Key wording matters here: the old name "claimed_unheld" read as a
+         * stale-claim anomaly and derailed the 2026-08-29 zombie diagnosis,
+         * when the record actually marks the HEALTHY fresh-claim path that
+         * every normal start logs. */
+        cbm_log_info("version_cohort.claimed_fresh", "prior_holder", "none", "build",
                      identity->build_fingerprint ? identity->build_fingerprint : "<null>");
         status = version_cohort_claim_new(lease, identity, deadline_ms);
     } else if (status == CBM_VERSION_COHORT_BUSY) {

@@ -908,12 +908,278 @@ TEST(adr_validate_keys_valid) {
     PASS();
 }
 
-TEST(adr_validate_keys_invalid) {
-    const char *keys[] = {"PURPOSE", "STACKS", "CUSTOM"};
+/* Section names are no longer restricted to the canonical six — those are a
+ * convention now, so "STACKS" and "CUSTOM" are ordinary sections. What is
+ * still refused is a name that could not round-trip through a "## NAME" line:
+ * such a name scans back as a different heading or as none, so a second
+ * identical write would append a duplicate instead of being a no-op. */
+TEST(adr_validate_keys_accepts_arbitrary_names) {
+    const char *keys[] = {"PURPOSE", "STACKS", "CUSTOM", "Decisions (2026)"};
     char errbuf[256];
-    ASSERT_TRUE(cbm_adr_validate_section_keys(keys, 3, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
-    ASSERT_TRUE(strstr(errbuf, "STACKS") != NULL);
-    ASSERT_TRUE(strstr(errbuf, "CUSTOM") != NULL);
+    ASSERT_EQ(cbm_adr_validate_section_keys(keys, 4, errbuf, sizeof(errbuf)), CBM_STORE_OK);
+    PASS();
+}
+
+TEST(adr_validate_keys_rejects_unroundtrippable) {
+    char errbuf[256];
+    const char *empty[] = {""};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(empty, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    const char *hashed[] = {"# PURPOSE"};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(hashed, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    const char *newline[] = {"PUR\nPOSE"};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(newline, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    const char *padded[] = {" PURPOSE "};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(padded, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+
+    char toolong[128];
+    memset(toolong, 'X', sizeof(toolong) - 1);
+    toolong[sizeof(toolong) - 1] = '\0';
+    const char *big[] = {toolong};
+    ASSERT_TRUE(cbm_adr_validate_section_keys(big, 1, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+    PASS();
+}
+
+/* ── Splice: bytes outside the target span never change ─────────── */
+
+typedef struct {
+    char buf[512];
+    int n;
+} adr_name_collect_t;
+
+static void adr_collect_names(void *ctx, const cbm_adr_heading_t *h) {
+    adr_name_collect_t *c = (adr_name_collect_t *)ctx;
+    c->n += snprintf(c->buf + c->n, sizeof(c->buf) - (size_t)c->n, "[%.*s]", h->name_len, h->name);
+}
+
+static int adr_check_splice(const char *in, const char *name, const char *body,
+                            const char *expect) {
+    char *out = cbm_adr_splice_section(in, name, body);
+    ASSERT_NOT_NULL(out);
+    if (strcmp(out, expect) != 0) {
+        printf("  %sFAIL%s %s: splice(\"%s\")\n    in     >>>%s<<<\n    got    >>>%s<<<\n"
+               "    expect >>>%s<<<\n",
+               tf_red(), tf_reset(), __FILE__, name, in, out, expect);
+        free(out);
+        return 1;
+    }
+    free(out);
+    return 0;
+}
+
+#define CHECK_SPLICE(in, name, body, expect)                                                       \
+    do {                                                                                           \
+        if (adr_check_splice((in), (name), (body), (expect)) != 0) {                               \
+            return 1;                                                                              \
+        }                                                                                          \
+    } while (0)
+
+/* THE acceptance property. Every document below is a case where rebuilding
+ * from cbm_adr_parse_sections() would have rewritten or destroyed text: a
+ * preamble (dropped), a mis-cased heading (dropped with its whole block), an
+ * unrecognised heading in prose (absorbed), a fenced '##' (absorbed), and
+ * out-of-canonical-order sections (reordered). Splicing touches only the
+ * target span, so each survives byte-for-byte. */
+TEST(adr_splice_preserves_untouched_bytes) {
+    /* Preamble before the first heading. */
+    CHECK_SPLICE("Some preamble.\n\n## PURPOSE\nFoo", "PURPOSE", "New foo",
+                 "Some preamble.\n\n## PURPOSE\nNew foo");
+
+    /* Mis-cased heading: a real section now, and untouched when not targeted. */
+    CHECK_SPLICE("## Purpose\nFoo\n\n## STACK\nBar", "STACK", "New bar",
+                 "## Purpose\nFoo\n\n## STACK\nNew bar");
+
+    /* A heading in prose that the old parser absorbed into the section above. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n## CUSTOM\nStill here\n\n## STACK\nBar", "STACK", "New bar",
+                 "## PURPOSE\nFoo\n## CUSTOM\nStill here\n\n## STACK\nNew bar");
+
+    /* Fenced code containing a '##' line. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n\n```md\n## Example\n```\n\n## STACK\nBar", "STACK", "New bar",
+                 "## PURPOSE\nFoo\n\n```md\n## Example\n```\n\n## STACK\nNew bar");
+
+    /* Sections stored out of canonical order keep the author's order. */
+    CHECK_SPLICE("## STACK\nBar\n\n## PURPOSE\nFoo", "PURPOSE", "New foo",
+                 "## STACK\nBar\n\n## PURPOSE\nNew foo");
+
+    /* The separator run before the next heading is preserved exactly. */
+    CHECK_SPLICE("## A\nx\n\n\n## B\ny", "A", "z", "## A\nz\n\n\n## B\ny");
+
+    /* A trailing newline on the document is preserved. */
+    CHECK_SPLICE("## A\nx\n", "A", "z", "## A\nz\n");
+    PASS();
+}
+
+/* Line endings. Every other ADR fixture in this file uses \n, so nothing
+ * exercised a CRLF-stored document — and CI could not have caught that,
+ * because the fixtures are LF whichever platform runs them.
+ *
+ * The exposure is specific to splicing: the old rebuild normalised everything
+ * on the way out, so ending confusion was invisible. A byte-span replacement
+ * can cut mid-"\r\n" or miscount a separator run, and byte-identity is the
+ * property this design exists to provide.
+ *
+ * Contract: bytes that already exist are never rewritten, so each line keeps
+ * whatever ending it had. Text this code writes itself — the separator before
+ * an appended section and the "## NAME" line — follows the document's majority
+ * ending, LF on a tie. A caller's body is inserted verbatim; rewriting the
+ * bytes a caller supplied would be the same silent modification this whole
+ * change removes. */
+TEST(adr_splice_preserves_line_endings) {
+    /* CRLF throughout: untouched bytes keep their \r\n. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar", "STACK", "New bar",
+                 "## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nNew bar");
+
+    /* The separator run before the next heading survives as CRLF, not as the
+     * two bare newlines a naive walk-back would leave. */
+    CHECK_SPLICE("## A\r\nx\r\n\r\n## B\r\ny", "A", "z", "## A\r\nz\r\n\r\n## B\r\ny");
+
+    /* A trailing CRLF on the document is preserved as CRLF. */
+    CHECK_SPLICE("## A\r\nx\r\n", "A", "z", "## A\r\nz\r\n");
+
+    /* Appending to a CRLF document writes CRLF — a bare \n here would leave a
+     * mixed document that neither the author nor the tool asked for. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* One existing trailing break means one more is added, counting \r\n as a
+     * single break rather than as two characters. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* A document already ending in a CRLF blank line gains no extra break. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\r\n\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* LF documents are unaffected by any of the above. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n", "DECISIONS", "- New.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- New.");
+    PASS();
+}
+
+/* Mixed endings are what real files become through editors and merges. Lines
+ * that already exist keep their own endings; the majority decides only what
+ * this code writes itself. */
+TEST(adr_splice_mixed_line_endings) {
+    /* Majority CRLF (2 of 3) -> the appended block is CRLF, and the one bare
+     * LF line in the middle is left exactly as it was. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\nBar\r\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\nBar\r\n\r\n## DECISIONS\r\n- New.");
+
+    /* Majority LF (2 of 3) -> the appended block is LF, and the lone CRLF line
+     * survives untouched. */
+    CHECK_SPLICE("## PURPOSE\nFoo\r\nBar\n", "DECISIONS", "- New.",
+                 "## PURPOSE\nFoo\r\nBar\n\n## DECISIONS\n- New.");
+
+    /* A tie falls to LF. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\n", "DECISIONS", "- New.",
+                 "## PURPOSE\r\nFoo\n\n## DECISIONS\n- New.");
+
+    /* Replacing a section in a mixed document rewrites nothing around it. */
+    CHECK_SPLICE("## PURPOSE\r\nFoo\n\n## STACK\nBar\r\n", "STACK", "New",
+                 "## PURPOSE\r\nFoo\n\n## STACK\nNew\r\n");
+    PASS();
+}
+
+/* "## PURPOSE\r\n" must locate exactly as "## PURPOSE\n" does. The scanner
+ * trims \r from heading names, but trimming and matching are different claims
+ * and only one of them was pinned. */
+TEST(adr_splice_matches_headings_across_line_endings) {
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n## STACK\r\nBar",
+                                    adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+
+    /* A fenced block with CRLF still hides its heading, and still closes. */
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings("## PURPOSE\r\nFoo\r\n\r\n```md\r\n## Example\r\n```"
+                                    "\r\n\r\n## STACK\r\nBar",
+                                    adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+
+    /* And an unterminated CRLF fence is still refused. */
+    char errbuf[256];
+    ASSERT_TRUE(cbm_adr_check_structure("## PURPOSE\r\nFoo\r\n\r\n```\r\nopen\r\n", errbuf,
+                                        sizeof(errbuf)) != CBM_STORE_OK);
+    PASS();
+}
+
+/* The original use case: add an entry under its own heading. */
+TEST(adr_splice_appends_arbitrary_heading) {
+    CHECK_SPLICE("## PURPOSE\nFoo", "DECISIONS", "- Chose SQLite.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    /* A document already ending in a blank line does not gain another. */
+    CHECK_SPLICE("## PURPOSE\nFoo\n\n", "DECISIONS", "- Chose SQLite.",
+                 "## PURPOSE\nFoo\n\n## DECISIONS\n- Chose SQLite.");
+    /* An empty document becomes a plain create with no leading separator. */
+    CHECK_SPLICE("", "PURPOSE", "Only entry.", "## PURPOSE\nOnly entry.");
+    PASS();
+}
+
+/* Splicing twice must be byte-identical to splicing once — including for a
+ * non-canonical heading, the case that would have corrupted an ADR under the
+ * old rules. Trailing newlines on the body are normalised so the separator run
+ * cannot grow by a blank line on every repeat. */
+TEST(adr_splice_is_idempotent) {
+    const char *doc = "## PURPOSE\nFoo\n\n## STACK\nBar";
+    char *once = cbm_adr_splice_section(doc, "DECISIONS", "- Chose SQLite.\n");
+    ASSERT_NOT_NULL(once);
+    char *twice = cbm_adr_splice_section(once, "DECISIONS", "- Chose SQLite.\n");
+    ASSERT_NOT_NULL(twice);
+    ASSERT_STR_EQ(twice, once);
+    char *thrice = cbm_adr_splice_section(twice, "DECISIONS", "- Chose SQLite.\n");
+    ASSERT_NOT_NULL(thrice);
+    ASSERT_STR_EQ(thrice, once);
+    free(once);
+    free(twice);
+    free(thrice);
+    PASS();
+}
+
+/* Names match exactly, including case: folding them would silently merge two
+ * blocks the author chose to keep apart. */
+TEST(adr_splice_matches_case_exactly) {
+    CHECK_SPLICE("## Purpose\nLower\n\n## PURPOSE\nUpper", "PURPOSE", "New",
+                 "## Purpose\nLower\n\n## PURPOSE\nNew");
+    CHECK_SPLICE("## Purpose\nLower\n\n## PURPOSE\nUpper", "Purpose", "New",
+                 "## Purpose\nNew\n\n## PURPOSE\nUpper");
+    PASS();
+}
+
+/* A '##' line inside a fenced code block is a code sample, not a heading —
+ * and '#' / '###' are not section headings at any position. */
+TEST(adr_splice_ignores_heading_inside_fence) {
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_EQ(cbm_adr_scan_headings(
+                  "## PURPOSE\nFoo\n\n```md\n## Example\n```\n\n### Sub\n# Title\n\n## STACK\nBar",
+                  adr_collect_names, &c),
+              CBM_STORE_OK);
+    ASSERT_STR_EQ(c.buf, "[PURPOSE][STACK]");
+    PASS();
+}
+
+/* An unterminated fence hides every heading after it, so an update would
+ * append a duplicate rather than replace. Refuse instead of guessing. */
+TEST(adr_splice_refuses_unterminated_fence) {
+    const char *doc = "## PURPOSE\nFoo\n\n```\nunclosed sample\n\n## STACK\nBar";
+    char errbuf[256];
+    ASSERT_TRUE(cbm_adr_check_structure(doc, errbuf, sizeof(errbuf)) != CBM_STORE_OK);
+    ASSERT_TRUE(strstr(errbuf, "code fence") != NULL);
+
+    adr_name_collect_t c;
+    memset(&c, 0, sizeof(c));
+    ASSERT_TRUE(cbm_adr_scan_headings(doc, adr_collect_names, &c) != CBM_STORE_OK);
+    ASSERT_EQ(c.n, 0);
+
+    ASSERT_NULL(cbm_adr_splice_section(doc, "STACK", "New bar"));
+
+    /* A closed fence is fine. */
+    ASSERT_EQ(cbm_adr_check_structure("## A\n```\nx\n```\n", errbuf, sizeof(errbuf)), CBM_STORE_OK);
     PASS();
 }
 
@@ -1448,7 +1714,17 @@ SUITE(store_arch) {
     RUN_TEST(adr_validate_missing_sections);
     RUN_TEST(adr_validate_empty);
     RUN_TEST(adr_validate_keys_valid);
-    RUN_TEST(adr_validate_keys_invalid);
+    RUN_TEST(adr_validate_keys_accepts_arbitrary_names);
+    RUN_TEST(adr_validate_keys_rejects_unroundtrippable);
+    RUN_TEST(adr_splice_preserves_untouched_bytes);
+    RUN_TEST(adr_splice_preserves_line_endings);
+    RUN_TEST(adr_splice_mixed_line_endings);
+    RUN_TEST(adr_splice_matches_headings_across_line_endings);
+    RUN_TEST(adr_splice_appends_arbitrary_heading);
+    RUN_TEST(adr_splice_is_idempotent);
+    RUN_TEST(adr_splice_matches_case_exactly);
+    RUN_TEST(adr_splice_ignores_heading_inside_fence);
+    RUN_TEST(adr_splice_refuses_unterminated_fence);
     RUN_TEST(adr_validate_keys_empty);
 
     /* Louvain */

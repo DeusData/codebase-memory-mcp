@@ -17,6 +17,10 @@ enum {
     INIT_FILE_LEN = 8,  /* strlen("__init__") */
     INDEX_FILE_LEN = 5, /* strlen("index") */
     NOT_FOUND = -1,
+    /* Ancestor-walk bound for cbm_lisp_node_in_quote. A quote nest deeper than
+     * this is pathological input, not Chialisp; bounding it keeps the walk O(1)
+     * per node rather than O(depth) on adversarially nested data. */
+    CBM_LISP_QUOTE_ANCESTOR_MAX = 256,
 };
 
 /* Prefix length helper for strncmp with string literals. */
@@ -166,6 +170,102 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
+// True when `label` names a data relation: SQL CREATE TABLE / CREATE VIEW, and
+// a dbt Model (a Jinja-templated .sql file, which materializes as a warehouse
+// table or view). Relations live in the registry so FROM/JOIN and dbt ref()
+// lineage can resolve, and sharing one label class is what lets a dbt model's
+// ref() reach a Table declared in plain DDL elsewhere in the same repository.
+// They are deliberately NOT type-like: they must never satisfy inheritance,
+// impl-receiver, semantic-type, or LSP-registrar lookups, and resolver
+// fallbacks treat them as lineage-only targets (see cbm_label_is_registry_symbol
+// call sites).
+bool cbm_label_is_relation(const char *label) {
+    if (!label) {
+        return false;
+    }
+    return strcmp(label, "Table") == 0 || strcmp(label, "View") == 0 || strcmp(label, "Model") == 0;
+}
+
+// True when `label` belongs in the cross-file name registry (see cbm.h). Single
+// source of truth for every registry-seeding site — full, parallel and
+// incremental pipelines MUST admit the same set or an incremental re-resolve
+// diverges from a clean full reindex.
+bool cbm_label_is_registry_symbol(const char *label) {
+    if (!label) {
+        return false;
+    }
+    /* "Constant" is a named, file-scope-transcending symbol exactly like
+     * Variable: Chialisp's `(defconstant CREATE_COIN 51)` lives in an included
+     * .clib and is referenced by name from every puzzle that includes it. Left
+     * out of the registry it can never be the target of a cross-file resolve,
+     * and the ~half of a Chialisp graph that is constants would be unreachable.
+     * It is deliberately NOT type-like (cbm_label_is_type_like): a constant
+     * must never satisfy an inheritance, impl-receiver or semantic-type
+     * lookup. */
+    return strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0 ||
+           cbm_label_is_type_like(label) || strcmp(label, "Variable") == 0 ||
+           strcmp(label, "Constant") == 0 || strcmp(label, "Field") == 0 ||
+           cbm_label_is_relation(label);
+}
+
+bool cbm_lisp_node_in_quote(CBMArena *a, TSNode node, const char *source) {
+    TSNode cur = ts_node_parent(node);
+    for (int guard = 0; guard < CBM_LISP_QUOTE_ANCESTOR_MAX && !ts_node_is_null(cur); guard++) {
+        const char *ck = ts_node_type(cur);
+        if ((strcmp(ck, "list") == 0 || strcmp(ck, "list_lit") == 0) &&
+            ts_node_named_child_count(cur) > 0) {
+            TSNode h = ts_node_named_child(cur, 0);
+            const char *hk = ts_node_type(h);
+            if (strcmp(hk, "symbol") == 0 || strcmp(hk, "sym_lit") == 0) {
+                char *ht = cbm_node_text(a, h, source);
+                if (ht &&
+                    (strcmp(ht, "q") == 0 || strcmp(ht, "quote") == 0 || strcmp(ht, "qq") == 0)) {
+                    return true;
+                }
+            }
+        }
+        cur = ts_node_parent(cur);
+    }
+    return false;
+}
+
+TSNode cbm_lisp_named_child_skip_comments(TSNode node, uint32_t want) {
+    uint32_t nc = ts_node_named_child_count(node);
+    uint32_t seen = 0;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(c), "comment") == 0) {
+            continue;
+        }
+        if (seen == want) {
+            return c;
+        }
+        seen++;
+    }
+    TSNode null_node = {0};
+    return null_node;
+}
+
+bool cbm_chialisp_is_def_head(const char *t) {
+    if (!t) {
+        return false;
+    }
+    /* `export` and `namespace` are absent ON PURPOSE. `(export foo)` re-exports
+     * a function `(defun foo ...)` already defined in the same file, so
+     * admitting it here mints a SECOND node for the same symbol. They stay in
+     * the not-a-call filter (extract_calls.c) because they are still not calls.
+     */
+    static const char *heads[] = {"mod",          "defun",       "defun-inline", "defmacro",
+                                  "defmac",       "defconstant", "defconst",     "embed-file",
+                                  "compile-file", NULL};
+    for (int i = 0; heads[i]; i++) {
+        if (strcmp(t, heads[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     if (!name || !name[0]) {
         return true;
@@ -182,6 +282,7 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         keywords = js_keywords;
         break;
     case CBM_LANG_RUST:
@@ -315,7 +416,8 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
         return has_prefix(base, "test_") || has_suffix(base, "_test.py");
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
-    case CBM_LANG_TSX: {
+    case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS: {
         char noext[NOEXT_BUF];
         strip_ext(base, noext, sizeof(noext));
         return has_suffix(noext, ".test") || has_suffix(noext, ".spec") ||
@@ -480,7 +582,7 @@ bool cbm_is_namespace_scope_kind(CBMLanguage lang, const char *kind) {
     if (lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA) {
         return strcmp(kind, "namespace_definition") == 0;
     }
-    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX || lang == CBM_LANG_ARKTS) {
         return strcmp(kind, "internal_module") == 0;
     }
     return false;
@@ -549,29 +651,14 @@ int cbm_count_branching(TSNode node, const char **branching_types) {
 
 // Loop node-type names across tree-sitter grammars, for loop-nesting depth.
 bool cbm_is_loop_node_type(const char *kind) {
-    static const char *const loops[] = {"for_statement",
-                                        "while_statement",
-                                        "do_statement",
-                                        "do_while_statement",
-                                        "for_in_statement",
-                                        "for_of_statement",
-                                        "for_each_statement",
-                                        "foreach_statement",
-                                        "enhanced_for_statement",
-                                        "for_range_loop",
-                                        "c_style_for_statement",
-                                        "for_expression",
-                                        "while_expression",
-                                        "loop_expression",
-                                        "while_let_expression",
-                                        "repeat_statement",
-                                        "repeat_while_statement",
-                                        "until",
-                                        "while_modifier",
-                                        "until_modifier",
-                                        "for",
-                                        "while",
-                                        NULL};
+    static const char *const loops[] = {
+        "for_statement", "while_statement", "do_statement", "do_while_statement",
+        "for_in_statement", "for_of_statement", "for_each_statement", "foreach_statement",
+        "enhanced_for_statement", "for_range_loop", "c_style_for_statement", "for_expression",
+        "while_expression", "loop_expression", "while_let_expression", "repeat_statement",
+        "repeat_while_statement",
+        // Pkl: `for (x in xs) { ... }` inside an object body.
+        "forGenerator", "until", "while_modifier", "until_modifier", "for", "while", NULL};
     for (const char *const *l = loops; *l; l++) {
         if (strcmp(kind, *l) == 0) {
             return true;
@@ -722,6 +809,7 @@ static const char **func_kinds_for_lang(CBMLanguage lang) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         return func_kinds_js;
     case CBM_LANG_RUST:
         return func_kinds_rust;
@@ -1312,7 +1400,8 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang) {
     if (lang == CBM_LANG_PYTHON) {
         return check_script_module_level(parent, pk, "module", "expression_statement");
     }
-    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
+    if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
+        lang == CBM_LANG_ARKTS) {
         return check_script_module_level(parent, pk, "program", "export_statement");
     }
     if (lang == CBM_LANG_LUA) {

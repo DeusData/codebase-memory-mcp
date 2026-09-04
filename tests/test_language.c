@@ -89,6 +89,20 @@ TEST(lang_ext_csharp) {
     ASSERT_EQ(cbm_language_for_extension(".cs"), CBM_LANG_CSHARP);
     PASS();
 }
+/* Blazor components were unmapped, so a .razor file was never discovered at
+ * all: indexing a Blazor app produced no nodes for any component, and reaching
+ * them required an undocumented extra_extensions entry in a per-project
+ * .codebase-memory.json. */
+TEST(lang_ext_razor) {
+    ASSERT_EQ(cbm_language_for_extension(".razor"), CBM_LANG_CSHARP);
+    PASS();
+}
+/* Razor Pages / MVC views were unmapped for the same reason .razor was, so an
+ * ASP.NET Core app's entire view layer was invisible to discovery. */
+TEST(lang_ext_cshtml) {
+    ASSERT_EQ(cbm_language_for_extension(".cshtml"), CBM_LANG_CSHARP);
+    PASS();
+}
 TEST(lang_ext_php) {
     ASSERT_EQ(cbm_language_for_extension(".php"), CBM_LANG_PHP);
     PASS();
@@ -609,6 +623,92 @@ TEST(lang_m_default_on_read_fail) {
     PASS();
 }
 
+/* ── .cfc disambiguation (tag vs script dialect) ───────────────── */
+
+/* Helper: write content to a temp .cfc and return its disambiguated language. */
+static CBMLanguage disambiguate_cfc_content(const char *name, const char *content) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/%s", cbm_tmpdir(), name);
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return CBM_LANG_COUNT;
+    }
+    fputs(content, f);
+    fclose(f);
+    CBMLanguage lang = cbm_disambiguate_cfc(path);
+    remove(path);
+    return lang;
+}
+
+TEST(lang_cfc_tag_component) {
+    /* <cfcomponent> wrapper ⇒ tag dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_tag.cfc",
+                                       "<cfcomponent>\n<cffunction name=\"f\"></cffunction>\n"
+                                       "</cfcomponent>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_bare_cffunction) {
+    /* A component that omits <cfcomponent> but uses <cffunction> is still tag. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_bare.cfc",
+                                       "<cffunction name=\"f\" output=\"false\">\n"
+                                       "<cfreturn 1>\n</cffunction>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_script_component) {
+    /* Plain "component { ... }" ⇒ script dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_script.cfc",
+                                       "component {\n    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_script_bare_keyword) {
+    /* "component" on its own line (brace on the next) ⇒ script dialect. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_kw.cfc",
+                                       "component\n{\n    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_cfscript_wrapped_script) {
+    /* A script component wrapped in a leading <cfscript> is still script — the
+     * leading '<' must NOT route it to the tag grammar. */
+    ASSERT_EQ(
+        disambiguate_cfc_content("test_cfc_wrapped.cfc",
+                                 "<cfscript>\ncomponent {\n    function f() { return 1; }\n}\n"
+                                 "</cfscript>\n"),
+        CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_tag_after_license_comment) {
+    /* A leading <!--- ---> license comment before <cfcomponent> ⇒ tag. */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_licensed.cfc",
+                                       "<!---\n  Copyright\n--->\n<cfcomponent>\n</cfcomponent>\n"),
+              CBM_LANG_CFML);
+    PASS();
+}
+
+TEST(lang_cfc_script_after_license_comment) {
+    /* A leading <!--- ---> comment before a script component ⇒ script (the
+     * comment's '<' must be skipped, not treated as a tag opener). */
+    ASSERT_EQ(disambiguate_cfc_content("test_cfc_lic_script.cfc",
+                                       "<!--- header ---> \ncomponent {\n"
+                                       "    function f() { return 1; }\n}\n"),
+              CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
+TEST(lang_cfc_default_on_read_fail) {
+    /* Non-existent file defaults to script dialect. */
+    ASSERT_EQ(cbm_disambiguate_cfc("/tmp/nonexistent_file_98765.cfc"), CBM_LANG_CFSCRIPT);
+    PASS();
+}
+
 /* --- New languages (auto-generated) --- */
 TEST(lang_ext_solidity) {
     ASSERT_EQ(cbm_language_for_extension(".sol"), CBM_LANG_SOLIDITY);
@@ -659,6 +759,15 @@ TEST(lang_ext_nim) {
 TEST(lang_ext_scheme) {
     ASSERT_EQ(cbm_language_for_extension(".scm"), CBM_LANG_SCHEME);
     ASSERT_EQ(cbm_language_for_extension(".ss"), CBM_LANG_SCHEME);
+    PASS();
+}
+
+TEST(lang_ext_chialisp) {
+    ASSERT_EQ(cbm_language_for_extension(".clsp"), CBM_LANG_CHIALISP);
+    ASSERT_EQ(cbm_language_for_extension(".clib"), CBM_LANG_CHIALISP);
+    ASSERT_EQ(cbm_language_for_extension(".clinc"), CBM_LANG_CHIALISP);
+    /* .clj stays Clojure — the Chialisp extensions must not widen it. */
+    ASSERT_EQ(cbm_language_for_extension(".clj"), CBM_LANG_CLOJURE);
     PASS();
 }
 
@@ -961,6 +1070,29 @@ TEST(lang_ext_mojo) {
     PASS();
 }
 
+TEST(lang_ext_arkts) {
+    ASSERT_EQ(cbm_language_for_extension(".ets"), CBM_LANG_ARKTS);
+    PASS();
+}
+
+TEST(lang_ext_plsql) {
+    ASSERT_EQ(cbm_language_for_extension(".pks"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pkb"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pck"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".pls"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".plb"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".plsql"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".fnc"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".trg"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".bdy"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".tps"), CBM_LANG_PLSQL);
+    ASSERT_EQ(cbm_language_for_extension(".tpb"), CBM_LANG_PLSQL);
+    /* .sql stays generic SQL; .prc stays FORM */
+    ASSERT_EQ(cbm_language_for_extension(".sql"), CBM_LANG_SQL);
+    ASSERT_EQ(cbm_language_for_extension(".prc"), CBM_LANG_FORM);
+    PASS();
+}
+
 TEST(lang_ext_squirrel) {
     ASSERT_EQ(cbm_language_for_extension(".nut"), CBM_LANG_SQUIRREL);
     PASS();
@@ -1079,6 +1211,8 @@ SUITE(language) {
     RUN_TEST(lang_ext_h);
     RUN_TEST(lang_ext_ixx);
     RUN_TEST(lang_ext_csharp);
+    RUN_TEST(lang_ext_razor);
+    RUN_TEST(lang_ext_cshtml);
     RUN_TEST(lang_ext_php);
     RUN_TEST(lang_ext_lua);
     RUN_TEST(lang_ext_scala);
@@ -1209,6 +1343,14 @@ SUITE(language) {
     RUN_TEST(lang_m_magma);
     RUN_TEST(lang_m_matlab);
     RUN_TEST(lang_m_default_on_read_fail);
+    RUN_TEST(lang_cfc_tag_component);
+    RUN_TEST(lang_cfc_bare_cffunction);
+    RUN_TEST(lang_cfc_script_component);
+    RUN_TEST(lang_cfc_script_bare_keyword);
+    RUN_TEST(lang_cfc_cfscript_wrapped_script);
+    RUN_TEST(lang_cfc_tag_after_license_comment);
+    RUN_TEST(lang_cfc_script_after_license_comment);
+    RUN_TEST(lang_cfc_default_on_read_fail);
 
     /* Go test ports */
     /* New languages */
@@ -1221,6 +1363,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_d);
     RUN_TEST(lang_ext_nim);
     RUN_TEST(lang_ext_scheme);
+    RUN_TEST(lang_ext_chialisp);
     RUN_TEST(lang_ext_fennel);
     RUN_TEST(lang_ext_fish);
     RUN_TEST(lang_ext_awk);
@@ -1277,6 +1420,8 @@ SUITE(language) {
     RUN_TEST(lang_ext_cairo);
     RUN_TEST(lang_ext_move);
     RUN_TEST(lang_ext_mojo);
+    RUN_TEST(lang_ext_arkts);
+    RUN_TEST(lang_ext_plsql);
     RUN_TEST(lang_ext_squirrel);
     RUN_TEST(lang_ext_func);
     RUN_TEST(lang_ext_rst);

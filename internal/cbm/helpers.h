@@ -122,6 +122,36 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+/* --- Lisp-family shared gates ---------------------------------------------
+ * The defs, calls and unified extractors each walk the same generic `list`
+ * node and must agree on what it means. The predicates below therefore live
+ * here rather than being copied per translation unit: a private copy in each
+ * drifts, and the drift is silent — defs and call-scope simply stop describing
+ * the same tree.
+ */
+
+/* True when any ancestor list of `node` is headed by a quote symbol
+ * (`q` / `quote` / `qq`) — its contents are DATA, not code, so no def and no
+ * call may be minted from them. Bounded ancestor walk; the arena is used only
+ * for the head-text reads. */
+bool cbm_lisp_node_in_quote(CBMArena *a, TSNode node, const char *source);
+
+/* The `want`-th named child of `node`, skipping `comment` nodes. Comments are
+ * named in the s-expression grammars and so occupy named-child indices: a
+ * comment between a def head and its name shifts every later index by one.
+ * Definition extraction and call-scope attribution MUST use this same skipping
+ * rule or they desynchronise on exactly the files that carry doc comments. */
+TSNode cbm_lisp_named_child_skip_comments(TSNode node, uint32_t want);
+
+/* True for a Chialisp definition-form head. Deliberately separate from the
+ * Clojure/Scheme def-head set: Chialisp shares the generic `list` kind, and
+ * treating `mod`/`defconstant` as defs must not leak into the other lisps (in
+ * Scheme `(mod x y)` is a call). Excludes the expression-local binding forms
+ * (`let`, `assign`, `lambda`), which would fragment call attribution, and
+ * excludes `export`/`namespace`, which NAME an already-defined function rather
+ * than defining one. */
+bool cbm_chialisp_is_def_head(const char *t);
+
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
 

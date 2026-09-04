@@ -21,8 +21,6 @@
 enum { LEAN_MAX_PARENT_DEPTH = 20 };
 /* Max positional args to scan for URL/string. */
 enum { MAX_POSITIONAL_SCAN = 3 };
-/* Max positional args to scan for handler ref. */
-enum { MAX_HANDLER_SCAN = 4 };
 /* Max string arg length before rejection. */
 enum { MAX_STRING_ARG_LEN = CBM_SZ_512 };
 /* Min printable ASCII (space). */
@@ -30,14 +28,29 @@ enum { MIN_PRINTABLE = 0x20 };
 /* Handler arg scan start index (skip first positional). */
 enum { HANDLER_START_IDX = 1 };
 
-/* Look up a module-level string constant by name. */
+/* Look up a module-level string constant by name. URL-builder entries share the
+ * map but are not constants: a bare `thingPath` reference is the function, not
+ * the URL it would build (issue #1009). */
 static const char *lookup_string_constant(const CBMExtractCtx *ctx, const char *name) {
     if (!name || !name[0]) {
         return NULL;
     }
     const CBMStringConstantMap *map = &ctx->string_constants;
     for (int i = 0; i < map->count; i++) {
-        if (strcmp(map->names[i], name) == 0) {
+        if (!map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
+            return map->values[i];
+        }
+    }
+    return NULL;
+}
+
+static const char *lookup_url_builder(const CBMExtractCtx *ctx, const char *name) {
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    const CBMStringConstantMap *map = &ctx->string_constants;
+    for (int i = 0; i < map->count; i++) {
+        if (map->is_url_builder[i] && strcmp(map->names[i], name) == 0) {
             return map->values[i];
         }
     }
@@ -48,7 +61,8 @@ static const char *lookup_string_constant(const CBMExtractCtx *ctx, const char *
 static int is_string_like(const char *kind) {
     return (strcmp(kind, "string") == 0 || strcmp(kind, "string_literal") == 0 ||
             strcmp(kind, "interpreted_string_literal") == 0 ||
-            strcmp(kind, "raw_string_literal") == 0 || strcmp(kind, "string_content") == 0);
+            strcmp(kind, "raw_string_literal") == 0 || strcmp(kind, "string_content") == 0 ||
+            strcmp(kind, "line_string_literal") == 0);
 }
 
 /* Strip surrounding quotes from a string, return arena-allocated copy */
@@ -720,7 +734,94 @@ static bool call_node_is_definition_container(CBMLanguage lang, TSNode node, con
 // Lisp dialects: a call is a list (`list` / `list_lit`) whose head (first named
 // child) is the function symbol (`symbol` / `sym_lit`). Generic field/first-child
 // extraction misses it because the head is not an `identifier` node.
-static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+/* Chialisp: a head atom that is a CLVM primitive/opcode, or a Chialisp
+ * syntax/binding/def keyword, is NOT a call — emit no CALLS edge. Sourced from
+ * the clvm_tools_rs keyword set and the clvm_rs operator set. The def and
+ * include heads are here too so `(defun ...)`/`(include ...)` never mint a
+ * phantom call to their own keyword. `export` and `namespace` are in THIS set
+ * even though they are deliberately NOT definition heads: `(export foo)` names
+ * a function already defined in the same file, so it is neither a call nor a
+ * second definition of it. Real helpers that merely look primitive —
+ * sha256tree, the curry helpers — are deliberately absent, so they pass through
+ * and resolve normally. */
+static bool chialisp_head_is_not_call(const char *t) {
+    if (!t) {
+        return true;
+    }
+    static const char *filtered[] = {
+        /* --- CLVM primitives (VM ops) --- */
+        "q", "a", "i", "c", "f", "r", "l", "x", "=", ">s", "sha256", "substr", "strlen", "concat",
+        "+", "-", "*", "/", "divmod", ">", "ash", "lsh", "logand", "logior", "logxor", "lognot",
+        "point_add", "pubkey_for_exp", "not", "any", "all", "softfork", "coinid", "g1_subtract",
+        "g1_multiply", "g1_negate", "g2_add", "g2_subtract", "g2_multiply", "g2_negate", "g1_map",
+        "g2_map", "bls_pairing_identity", "bls_verify", "modpow", "%", "secp256k1_verify",
+        "secp256r1_verify", "keccak256",
+        /* --- Chialisp syntax / binding / intrinsics (not calls or defs) --- */
+        "quote", "qq", "unquote", "&rest", "let", "let*", "assign", "assign-inline",
+        "assign-lambda", "lambda", "mod", "if", "list", "com", "opt", "@", "@*env*", "print",
+        /* --- def / export / include heads (never a call) --- */
+        "defun", "defun-inline", "defmacro", "defmac", "defconstant", "defconst", "namespace",
+        "export", "embed-file", "compile-file", "include", NULL};
+    for (int i = 0; filtered[i]; i++) {
+        if (strcmp(t, filtered[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when `node` (a `list`) sits in a BINDER position rather than an
+ * application position: a `(defun NAME (params) ...)` parameter list, a
+ * `(mod (ARGS) ...)` curried-argument list, a `(lambda (x) ...)` parameter
+ * list, or a `let` binding container / one of its binding pairs.
+ *
+ * A binder NAMES things; it is not an invocation. Without this every function's
+ * parameter list would mint a CALLS edge to its own first parameter — on
+ * `(defun check_conditions (HEIGHTLOCK conditions) ...)` that is a phantom call
+ * to HEIGHTLOCK, and real Chialisp is mostly such definitions.
+ *
+ * Cost note: this compares `node` against the parent's first three forms rather
+ * than computing `node`'s own index. Searching for the index would scan all of
+ * the parent's children, and since this runs once per child, a single list of N
+ * forms would cost O(N^2) — `condition_codes.clib` is one list of forty, and a
+ * generated table is one list of thousands. Reading forms 1 and 2 is O(1). */
+static bool chialisp_node_is_binder_list(CBMArena *a, TSNode node, const char *source) {
+    /* At most two levels: the binder itself, and one binding pair inside a
+     * `let` binding container. Bounded on purpose — never an ancestor walk. */
+    for (int level = 0; level < 2; level++) {
+        TSNode parent = ts_node_parent(node);
+        if (ts_node_is_null(parent) || strcmp(ts_node_type(parent), "list") != 0) {
+            return false;
+        }
+        TSNode head = cbm_lisp_named_child_skip_comments(parent, 0);
+        if (!ts_node_is_null(head) && strcmp(ts_node_type(head), "symbol") == 0) {
+            char *ht = cbm_node_text(a, head, source);
+            if (!ht) {
+                return false;
+            }
+            /* `(defun NAME (params) ...)` — the params are the third form. */
+            if (strcmp(ht, "defun") == 0 || strcmp(ht, "defun-inline") == 0 ||
+                strcmp(ht, "defmacro") == 0 || strcmp(ht, "defmac") == 0) {
+                TSNode params = cbm_lisp_named_child_skip_comments(parent, 2);
+                return !ts_node_is_null(params) && ts_node_eq(params, node);
+            }
+            /* `(mod (ARGS) ...)`, `(lambda (x) ...)`, `(let ((a 1)) ...)`. */
+            if (strcmp(ht, "mod") == 0 || strcmp(ht, "lambda") == 0 || strcmp(ht, "let") == 0 ||
+                strcmp(ht, "let*") == 0) {
+                TSNode binder = cbm_lisp_named_child_skip_comments(parent, 1);
+                return !ts_node_is_null(binder) && ts_node_eq(binder, node);
+            }
+            return false;
+        }
+        /* The head is not a symbol, so `parent` may itself be a let-binding
+         * container and `node` one of its pairs — retry one level up. */
+        node = parent;
+    }
+    return false;
+}
+
+static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, const char *nk,
+                                 CBMLanguage lang) {
     if (strcmp(nk, "list") != 0 && strcmp(nk, "list_lit") != 0) {
         return NULL;
     }
@@ -729,7 +830,16 @@ static char *extract_lisp_callee(CBMArena *a, TSNode node, const char *source, c
         const char *hk = ts_node_type(head);
         if (strcmp(hk, "symbol") == 0 || strcmp(hk, "sym_lit") == 0 ||
             strcmp(hk, "identifier") == 0) {
-            return cbm_node_text(a, head, source);
+            char *ht = cbm_node_text(a, head, source);
+            /* Drop CLVM ops / syntax / def heads, binder positions, and
+             * anything inside quoted data — a quoted form is a value, not an
+             * invocation. */
+            if (lang == CBM_LANG_CHIALISP &&
+                (chialisp_head_is_not_call(ht) || chialisp_node_is_binder_list(a, node, source) ||
+                 cbm_lisp_node_in_quote(a, node, source))) {
+                return NULL;
+            }
+            return ht;
         }
     }
     return NULL;
@@ -809,6 +919,32 @@ static char *extract_ada_callee(CBMArena *a, TSNode node, const char *source, co
         }
     }
     return NULL;
+}
+
+/* PL/SQL: ref_call → referenced_element. Package-qualified calls use
+ * ref_name_parent.ref_name (e.g. UTIL_PKG.CALC_SALARY); bare calls use
+ * ref_name alone. */
+static char *extract_plsql_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "ref_call") != 0) {
+        return NULL;
+    }
+    TSNode ref = cbm_find_child_by_kind(node, "referenced_element");
+    if (ts_node_is_null(ref)) {
+        return NULL;
+    }
+    TSNode parent = ts_node_child_by_field_name(ref, TS_FIELD("ref_name_parent"));
+    TSNode name = ts_node_child_by_field_name(ref, TS_FIELD("ref_name"));
+    if (!ts_node_is_null(parent) && !ts_node_is_null(name)) {
+        char *p = cbm_node_text(a, parent, source);
+        char *n = cbm_node_text(a, name, source);
+        if (p && n && p[0] && n[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", p, n);
+        }
+    }
+    if (!ts_node_is_null(name)) {
+        return cbm_node_text(a, name, source);
+    }
+    return cbm_node_text(a, ref, source);
 }
 
 // Solidity: a call_expression's callee is on the `function` field, wrapped in an
@@ -1022,6 +1158,65 @@ static char *extract_nickel_callee(CBMArena *a, TSNode node, const char *source,
         cur = next;
     }
     return NULL;
+}
+
+// Pkl: `unqualifiedAccessExpr` / `qualifiedAccessExpr` are the same node whether
+// they are a call (`helper(a)`) or a bare property read (`host`) — the only
+// discriminator is an `argumentList` child, so both are gated on it. For a
+// qualified call the method name is the `identifier` child that is not the
+// `receiver`; the receiver is prefixed only when it is itself a plain name
+// (`utils.fallback(a)` -> "utils.fallback", module-qualified, which cbm.c
+// shortens to the last dotted segment when resolving). A receiver that is itself
+// a call must NOT be prefixed: `s.trim().toLowerCase()` -> "toLowerCase", since
+// the receiver's text carries parens and would never resolve.
+// `newExpr` resolves to its `declaredType` so `new Server {}` links to the class.
+static char *extract_pkl_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    if (strcmp(nk, "newExpr") == 0) {
+        // `new { ... }` with an inferred type has no declaredType child.
+        TSNode dt = cbm_find_child_by_kind(node, "declaredType");
+        return ts_node_is_null(dt) ? NULL : cbm_node_text(a, dt, source);
+    }
+
+    bool qualified = strcmp(nk, "qualifiedAccessExpr") == 0;
+    if (!qualified && strcmp(nk, "unqualifiedAccessExpr") != 0) {
+        return NULL;
+    }
+    // No argument list -> property read, not a call.
+    if (ts_node_is_null(cbm_find_child_by_kind(node, "argumentList"))) {
+        return NULL;
+    }
+
+    TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
+    TSNode name = (TSNode){0};
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode child = ts_node_named_child(node, i);
+        if (!ts_node_is_null(recv) && ts_node_eq(child, recv)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(child), "identifier") == 0) {
+            name = child;
+            break;
+        }
+    }
+    if (ts_node_is_null(name)) {
+        return NULL;
+    }
+    char *mn = cbm_node_text(a, name, source);
+    if (!mn || !mn[0]) {
+        return NULL;
+    }
+    if (!qualified || ts_node_is_null(recv)) {
+        return mn;
+    }
+    if (strcmp(ts_node_type(recv), "unqualifiedAccessExpr") == 0 &&
+        ts_node_is_null(cbm_find_child_by_kind(recv, "argumentList"))) {
+        char *rt = cbm_node_text(a, recv, source);
+        if (rt && rt[0]) {
+            return cbm_arena_sprintf(a, "%s.%s", rt, mn);
+        }
+    }
+    return mn;
 }
 
 // Typst: a `call` node's callee is its `item` field (an ident), matching the
@@ -1342,8 +1537,9 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
 
     if (lang == CBM_LANG_CLOJURE || lang == CBM_LANG_COMMONLISP || lang == CBM_LANG_SCHEME ||
-        lang == CBM_LANG_FENNEL || lang == CBM_LANG_RACKET || lang == CBM_LANG_EMACSLISP) {
-        return extract_lisp_callee(a, node, source, nk);
+        lang == CBM_LANG_FENNEL || lang == CBM_LANG_RACKET || lang == CBM_LANG_EMACSLISP ||
+        lang == CBM_LANG_CHIALISP) {
+        return extract_lisp_callee(a, node, source, nk, lang);
     }
     if (lang == CBM_LANG_FSHARP) {
         return extract_fsharp_callee(a, node, source, nk);
@@ -1353,6 +1549,9 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
     }
     if (lang == CBM_LANG_ADA) {
         return extract_ada_callee(a, node, source, nk);
+    }
+    if (lang == CBM_LANG_PLSQL) {
+        return extract_plsql_callee(a, node, source, nk);
     }
     if (lang == CBM_LANG_SOLIDITY) {
         return extract_solidity_callee(a, node, source, nk);
@@ -1648,6 +1847,15 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         }
     }
 
+    /* Pkl: resolve here and return unconditionally — the access-expr call node
+     * types double as plain property reads, so falling through to field-based or
+     * generic first-identifier resolution would mint a CALLS edge for every
+     * property read (a bare `host` has an `identifier` first child, which the
+     * generic fallback would happily emit). NULL here means "not a call". */
+    if (lang == CBM_LANG_PKL) {
+        return extract_pkl_callee(a, node, source, ts_node_type(node));
+    }
+
     // Helm / Go templates: resolve `include "x"` / `template "x"` to the
     // referenced named template so it links to the define'd Function (#338).
     if (lang == CBM_LANG_GOTEMPLATE) {
@@ -1855,8 +2063,22 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
             ca->index = positional_idx++;
             if (is_string_like(ak) && ca->expr) {
                 ca->value = strip_quotes(ctx->arena, ca->expr);
+            } else if (strcmp(ak, "template_string") == 0) {
+                /* Flattened {} form so downstream url-arg detection joins the
+                 * canonical server route shape (issue #1006/#1009). */
+                ca->value = cbm_template_string_text(ctx->arena, arg_node, ctx->source);
             } else if (strcmp(ak, "identifier") == 0 && ca->expr) {
                 ca->value = lookup_string_constant(ctx, ca->expr);
+            } else if (strcmp(ak, "call_expression") == 0) {
+                /* URL-builder helper call (issue #1009): resolve
+                 * client(buildPath(id)) through the per-file builder map. */
+                TSNode fn = ts_node_child_by_field_name(arg_node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                    if (fname) {
+                        ca->value = lookup_url_builder(ctx, fname);
+                    }
+                }
             }
             call->arg_count++;
         }
@@ -2065,6 +2287,18 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
         if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
             arg = ts_node_named_child(arg, 0);
         }
+        /* Swift wraps each argument in a value_argument that may lead with its
+         * label, so `data(from: url)` would otherwise yield the label `from`
+         * rather than the value. Step past a leading value_argument_label. */
+        if (strcmp(ts_node_type(arg), "value_argument") == 0 &&
+            ts_node_named_child_count(arg) > 0) {
+            TSNode val = ts_node_named_child(arg, 0);
+            if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
+                ts_node_named_child_count(arg) > 1) {
+                val = ts_node_named_child(arg, 1);
+            }
+            arg = val;
+        }
         const char *ak = ts_node_type(arg);
 
         if (strcmp(ak, "keyword_argument") == 0 || strcmp(ak, "pair") == 0) {
@@ -2082,6 +2316,19 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
             const char *val = extract_composite_queue_field(ctx, arg);
             if (val) {
                 return val;
+            }
+        }
+
+        /* URL-builder helper call (issue #1009): `client(buildPath(id))` — the
+         * builder's returned URL was recorded in the per-file constant map. */
+        if (strcmp(ak, "call_expression") == 0) {
+            TSNode fn = ts_node_child_by_field_name(arg, TS_FIELD("function"));
+            if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                char *fname = cbm_node_text(ctx->arena, fn, ctx->source);
+                const char *val = fname ? lookup_url_builder(ctx, fname) : NULL;
+                if (val) {
+                    return val;
+                }
             }
         }
 
@@ -2113,8 +2360,17 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
 }
 
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
+    /* The LAST eligible argument wins, and every argument is examined.
+     * Express, Fastify, gin and Laravel all put middleware between the route
+     * path and the handler, so the first function-shaped argument is usually a
+     * middleware. Taking the first one pointed the HANDLES edge at the
+     * middleware; stopping the scan early missed the handler outright when the
+     * middleware was written inline, because an arrow function matches none of
+     * the kinds below. Nothing that follows a handler matches them either — an
+     * options argument is an object node — so the last match is the handler. */
+    const char *handler = NULL;
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
+    for (uint32_t ai = HANDLER_START_IDX; ai < nc; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
         if (strcmp(ts_node_type(arg2), "argument") == 0 && ts_node_named_child_count(arg2) > 0) {
@@ -2126,17 +2382,18 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
-            return cbm_node_text(ctx->arena, arg2, ctx->source);
+            handler = cbm_node_text(ctx->arena, arg2, ctx->source);
+            continue;
         }
         if (is_string_like(ak2)) {
             const char *h =
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
-                return h;
+                handler = h;
             }
         }
     }
-    return NULL;
+    return handler;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.
@@ -2669,6 +2926,101 @@ static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const 
     return NULL;
 }
 
+/* True when a Python attribute-call receiver is EXEMPT from the weak-member
+ * guard (#1276). Three exemptions, each because the receiver is in fact known:
+ *   - `self.x()` / `cls.x()`  — a direct self/cls receiver keeps class-local
+ *     semantics; the enclosing class is the right namespace for a weak match.
+ *   - `super().x()`           — same, via the base class.
+ *   - `helper.compute()`      — an identifier bound by one of THIS file's
+ *     imports, including the root of an attribute chain (`pkg.sub.fn()`).
+ *     module.function() is Python's canonical cross-file call shape and the
+ *     import map resolves it; flagging it would kill the true edge.
+ * Everything else — a parameter, a local, an attribute of self — has no
+ * statically-known type here, so the call must not bind by short name alone.
+ * Note `self.client.send()` is NOT exempt: the receiver is `self.client`, an
+ * attribute of unknown type, not `self` itself. */
+static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
+    if (ts_node_is_null(receiver)) {
+        return false;
+    }
+
+    /* super().m() — the receiver is a call node whose function is `super`. */
+    if (strcmp(ts_node_type(receiver), "call") == 0) {
+        TSNode fn = ts_node_child_by_field_name(receiver, TS_FIELD("function"));
+        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+            char *name = cbm_node_text(ctx->arena, fn, ctx->source);
+            return name && strcmp(name, "super") == 0;
+        }
+        return false;
+    }
+
+    /* Walk an attribute chain down to its root identifier: for `pkg.sub.fn()`
+     * the receiver is `pkg.sub`, whose root is `pkg` — the name an import binds. */
+    bool direct_identifier = strcmp(ts_node_type(receiver), "identifier") == 0;
+    TSNode root = receiver;
+    while (!ts_node_is_null(root) && strcmp(ts_node_type(root), "attribute") == 0) {
+        root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) {
+        return false;
+    }
+
+    char *name = cbm_node_text(ctx->arena, root, ctx->source);
+    if (!name) {
+        return false;
+    }
+    /* self/cls only as a DIRECT receiver: `self.m()` is class-local, but
+     * `self.client.m()` has receiver `self.client` of unknown type. */
+    if (direct_identifier && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0)) {
+        return true;
+    }
+    /* Import-bound root, incl. aliases (`import tools as toolkit` binds
+     * local_name "toolkit"). Per-file scan: imports.count is a file-local
+     * number (tens), never the corpus, so this stays O(file), not O(corpus). */
+    for (int i = 0; i < ctx->result->imports.count; i++) {
+        const char *local_name = ctx->result->imports.items[i].local_name;
+        if (local_name && strcmp(local_name, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Name bound by one Python parameter node, or NULL when the shape binds none.
+ * Covers every binding form a `parameters` / `lambda_parameters` list produces:
+ * a bare `identifier`, the `name` field of default/typed parameters, and the
+ * identifier under a `*args` / `**kwargs` splat. A shape with no identifier (the
+ * bare `*` keyword separator) yields NULL and simply matches nothing. */
+/* True when the callee of a BARE Python call `foo()` is bound as a parameter of
+ * an enclosing function or lambda -- the bare-call counterpart of
+ * python_receiver_is_exempt above.
+ *
+ * A parameter binding shadows any module-level `foo` for the whole body, so
+ * resolving such a call to a project Function/Method by short name alone
+ * fabricates the edge BY CONSTRUCTION: `def _run_with_heavy_slot(run): run()`
+ * must not bind an unrelated `SatoriLive.run`. Unlike a receiver type this is
+ * decidable from the AST outright, with no flow analysis and no list of
+ * "generic-looking" callee names -- Python forbids `global` on a parameter, and
+ * a parameter is in scope for the entire body regardless of position.
+ *
+ * The answer is CARRIED BY THE WALK rather than recomputed here. The unified
+ * walk binds a def's or lambda's parameters when it opens that scope and
+ * unwinds them when it closes it, so this is an O(1) map lookup. Deciding it
+ * by ascending the tree instead -- with ts_node_parent() or with a copied walk
+ * cursor -- costs O(depth) per call, and since every level of f(f(f(...))) is
+ * itself a bare call, that is quadratic across the file: the 30,000-deep
+ * fixture in tests/test_stack_overflow.c turned it into a hang rather than a
+ * slowdown. An O(1) lookup needs no hop cap, so unlike a capped walk this can
+ * no longer fail open on deep-but-ordinary code.
+ *
+ * It still answers false if the walk's own tracking hit an allocation failure,
+ * which costs a suppression and never a true edge. */
+static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, WalkState *state,
+                                             TSNode callee_ident) {
+    const char *callee_name = cbm_node_text(ctx->arena, callee_ident, ctx->source);
+    return cbm_walk_python_param_is_bound(state, callee_name);
+}
+
 static bool is_objectscript_language(CBMLanguage language) {
     return language == CBM_LANG_OBJECTSCRIPT_UDL || language == CBM_LANG_OBJECTSCRIPT_ROUTINE;
 }
@@ -2739,6 +3091,19 @@ static TSNode objectscript_call_args(TSNode node) {
     TSNode macro_function = cbm_find_child_by_kind(node, "macro_function");
     return ts_node_is_null(macro_function) ? (TSNode){0}
                                            : cbm_find_child_by_kind(macro_function, "method_args");
+}
+
+/* Swift models a call as a target expression plus a call_suffix, and its grammar
+ * declares no "arguments" field at all, so the generic field lookup finds
+ * nothing for every Swift call. Reach the argument list through the suffix
+ * instead. A trailing closure has a call_suffix with no value_arguments, which
+ * returns a null node and leaves the call without a string argument, as before. */
+static TSNode swift_call_args(TSNode node) {
+    TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+    if (ts_node_is_null(suffix)) {
+        return (TSNode){0};
+    }
+    return cbm_find_child_by_kind(suffix, "value_arguments");
 }
 
 static bool node_has_token(TSNode node, const char *token) {
@@ -3286,6 +3651,27 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 strcmp(ts_node_type(node), "method_call_expression") == 0) {
                 call.is_method = true;
             }
+            // Python receiver-aware guard (#1276; same intent as the Perl and
+            // TS/JS flags). Flag an attribute call x.foo() whose receiver is not
+            // self/cls/super() and is not rooted in an imported name, so the
+            // call-resolution pass can suppress weak short-name matches for it
+            // (`accelerator.print()` must not bind MockAccelerator.print).
+            // Imported receivers stay unflagged: module.function() is Python's
+            // canonical cross-file call and the import map resolves it.
+            // A BARE Python call foo() whose callee is bound as a parameter of an
+            // enclosing scope cannot be the module-level foo, so short-name
+            // resolution would fabricate the edge (`def f(run): run()` must not
+            // bind SatoriLive.run). Distinct from is_method: there is no receiver
+            // here, so the weak-member guard cannot see this class at all.
+            if (ctx->language == CBM_LANG_PYTHON && strcmp(ts_node_type(node), "call") == 0) {
+                TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+                if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
+                    TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+                    call.is_method = !python_receiver_is_exempt(ctx, obj);
+                } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, state, fn);
+                }
+            }
             // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent
             // as the Perl flag above). Flag a member call x.foo() whose receiver
             // is NOT `this`/`super`. When the TS-LSP cannot resolve the receiver
@@ -3296,7 +3682,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // right. Bare calls (helper()) and new_expression have no member
             // receiver, so they keep is_method=false (struct is zero-init).
             if ((ctx->language == CBM_LANG_JAVASCRIPT || ctx->language == CBM_LANG_TYPESCRIPT ||
-                 ctx->language == CBM_LANG_TSX) &&
+                 ctx->language == CBM_LANG_TSX || ctx->language == CBM_LANG_ARKTS) &&
                 strcmp(ts_node_type(node), "call_expression") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "member_expression") == 0) {
@@ -3315,6 +3701,10 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // generic "arguments" field; macro arguments add one wrapper.
             if (ts_node_is_null(args) && is_objectscript_language(ctx->language)) {
                 args = objectscript_call_args(node);
+            }
+            // Swift has no "arguments" field either; its args hang off call_suffix.
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_SWIFT) {
+                args = swift_call_args(node);
             }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);

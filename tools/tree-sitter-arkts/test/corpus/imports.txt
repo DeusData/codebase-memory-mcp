@@ -1,0 +1,74 @@
+==================
+Lazy named import
+==================
+
+import lazy { HeavyModule, Other } from './heavy'
+
+---
+
+(program
+  (import_statement
+    (import_clause
+      (import_lazy)
+      (named_imports
+        (import_specifier
+          (identifier))
+        (import_specifier
+          (identifier))))
+    (string
+      (string_fragment))))
+
+==================
+Default import named lazy still works
+==================
+
+import lazy from './lazymod'
+
+---
+
+(program
+  (import_statement
+    (import_clause
+      (identifier))
+    (string
+      (string_fragment))))
+
+==================
+Type-only import unaffected
+==================
+
+import type { Props } from './types'
+
+---
+
+(program
+  (import_statement
+    (import_clause
+      (named_imports
+        (import_specifier
+          (identifier))))
+    (string
+      (string_fragment))))
+
+==================
+Kit and default imports
+==================
+
+import { router } from '@kit.ArkUI'
+import curves from '@ohos.curves'
+
+---
+
+(program
+  (import_statement
+    (import_clause
+      (named_imports
+        (import_specifier
+          (identifier))))
+    (string
+      (string_fragment)))
+  (import_statement
+    (import_clause
+      (identifier))
+    (string
+      (string_fragment))))
