@@ -564,6 +564,79 @@ TEST(perllsp_repeated_inherited_method_calls_join_by_exact_site) {
                                            "$child->greet()");
 }
 
+/* ── Invocant binding: signatures (5.36+) and classic list unpack ── */
+
+TEST(perllsp_signature_self_dispatch) {
+    /* `sub render ($self, $depth)` must bind $self to the enclosing package so
+     * $self->draw() dispatches — signatures are stable since Perl 5.36 and the
+     * dominant modern method form. */
+    const char *src = "use feature 'signatures';\n"
+                      "package Widget;\n"
+                      "sub draw ($self, $d) { return $d; }\n"
+                      "sub render ($self, $depth) {\n"
+                      "    $self->draw($depth);\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.render", "main.draw") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_list_unpack_self_dispatch) {
+    /* The dominant classic form `my ($self, $x) = @_;` must bind $self exactly
+     * like `my $self = shift;` does. */
+    const char *src = "package Widget;\n"
+                      "sub draw { return 1; }\n"
+                      "sub render {\n"
+                      "    my ($self, $x) = @_;\n"
+                      "    $self->draw($x);\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.render", "main.draw") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_plain_first_param_not_invocant) {
+    /* Name gate: a first parameter NOT named $self/$class must stay untyped —
+     * $cfg's package is unknown, so $cfg->go() must emit no edge (zero-edge
+     * guarantee). */
+    const char *src = "use feature 'signatures';\n"
+                      "package Widget;\n"
+                      "sub go { return 1; }\n"
+                      "sub util ($cfg, $n) {\n"
+                      "    $cfg->go($n);\n"
+                      "}\n"
+                      "sub grab {\n"
+                      "    my ($cfg, $n) = @_;\n"
+                      "    $cfg->go($n);\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "main.util", "main.go") < 0);
+    ASSERT(find_resolved(r, "main.grab", "main.go") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_signature_class_dispatch) {
+    /* $class as leading signature parameter binds to the package so
+     * $class->method() (constructor-style) dispatches. */
+    const char *src = "use feature 'signatures';\n"
+                      "package Widget;\n"
+                      "sub fresh { return bless {}, 'Widget'; }\n"
+                      "sub make ($class, %args) {\n"
+                      "    return $class->fresh();\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.make", "main.fresh") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -584,4 +657,8 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_repeated_target_calls_join_by_exact_site);
     RUN_TEST(perllsp_repeated_static_function_calls_join_by_exact_site);
     RUN_TEST(perllsp_repeated_inherited_method_calls_join_by_exact_site);
+    RUN_TEST(perllsp_signature_self_dispatch);
+    RUN_TEST(perllsp_list_unpack_self_dispatch);
+    RUN_TEST(perllsp_plain_first_param_not_invocant);
+    RUN_TEST(perllsp_signature_class_dispatch);
 }

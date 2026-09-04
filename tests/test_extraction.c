@@ -5002,6 +5002,35 @@ TEST(extract_perl_method_call_flags_is_method) {
     PASS();
 }
 
+/* CPAN test layout: .t files under t/ must index as Perl AND carry the is_test flag
+ * (file-level and def-level), so the whole suite of a conventional Perl distro
+ * becomes visible to TESTS-edge detection. xt/ (author tests) likewise; lib/
+ * modules must stay non-test. */
+TEST(extract_perl_t_file_is_test) {
+    CBMFileResult *r = extract("use Test::More;\n"
+                               "use MyLib;\n"
+                               "ok(MyLib::add(1, 1) == 2, 'adds');\n"
+                               "done_testing();\n",
+                               CBM_LANG_PERL, "proj", "t/basic.t");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->is_test_file);
+    cbm_free_result(r);
+
+    r = extract("use Test::More;\nok(1);\ndone_testing();\n", CBM_LANG_PERL, "proj",
+                "xt/author-pod.t");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->is_test_file);
+    cbm_free_result(r);
+
+    r = extract("package MyLib;\nsub add { return $_[0] + $_[1]; }\n1;\n", CBM_LANG_PERL, "proj",
+                "lib/MyLib.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->is_test_file);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Languages OUTSIDE the is_method flag set (only Perl and TS/JS/TSX set it) must
  * be unaffected: a Go method call never sets is_method. */
 TEST(extract_flag_exempt_method_call_not_flagged_is_method) {
@@ -6937,6 +6966,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
+    RUN_TEST(extract_perl_t_file_is_test);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);

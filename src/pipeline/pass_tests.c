@@ -108,6 +108,17 @@ bool cbm_is_test_path(const char *path) {
         return true;
     }
 
+    /* Perl CPAN layout: .t harness scripts, t/ and xt/ (author tests) dirs.
+     * Only Perl maps .t, and the dir rules are segment-anchored; keep in
+     * lockstep with cbm_is_test_file's CBM_LANG_PERL case (#1294). */
+    if (str_ends_with(path, len, ".t")) {
+        return true;
+    }
+    if (strncmp(path, "t/", SLEN("t/")) == 0 || strncmp(path, "xt/", SLEN("xt/")) == 0 ||
+        strstr(path, "/t/") || strstr(path, "/xt/")) {
+        return true;
+    }
+
     return false;
 }
 
@@ -239,7 +250,13 @@ static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
         }
 
         if (!cbm_is_test_func_name(src->name)) {
-            continue;
+            /* Perl .t files assert at file scope, so the caller is the
+             * module-level def whose name never looks like a test function —
+             * for them the .t path suffix is the gate instead. */
+            size_t src_len = src->file_path ? strlen(src->file_path) : 0;
+            if (!(src_len && str_ends_with(src->file_path, src_len, ".t"))) {
+                continue;
+            }
         }
 
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, "TESTS", "{}");

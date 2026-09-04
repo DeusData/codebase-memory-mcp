@@ -61,7 +61,7 @@ Scope: The grammar already parses `class Foo :isa(Base) { field $x :param; metho
 
 Test plan: tests/test_perl_lsp.c: TEST(perllsp_corinna_method_dispatch) with source "use v5.38;\nuse experimental 'class';\nclass Animal { method speak { return 1 } }\nclass Dog :isa(Animal) { method fetch { $self->speak() } }" asserting fetch→speak (inherited) edge; TEST for `my $d = Dog->new; $d->fetch;` from a main sub. tests/test_extraction.c: assert class Dog produces a Class def with base_classes[0]=="Animal", a Method def fetch, and field $tricks a Property def.
 
-### perl-invocant-signatures  (P0/S, wave 1)
+### perl-invocant-signatures  (P0/S, wave 1) ✅ done
 
 **Bind the invocant from sub signatures and `my ($self, ...) = @_;` list assignment**
 
@@ -109,7 +109,7 @@ Scope: Perl route registrations never mint Route nodes: `$r->get('/users' => sub
 
 Test plan: tests/test_extraction.c (or the pass-level route test home): index "use Dancer2;\nget '/users' => sub { return 'u' };\npost '/users/:id' => sub { 1 };" as app.pl and assert two Route nodes GET /users, POST /users/:id with HANDLES edges; a Mojolicious::Lite twin ("use Mojolicious::Lite;\nget '/hello' => sub { my $c = shift; };\napp->start;"); negative: "sub get { 1 } get('/tmp/file');" — resolved local sub wins, no Route (the matcher runs only on the empty-resolution path).
 
-### perl-test-ecosystem  (P1/S, wave 1)
+### perl-test-ecosystem  (P1/S, wave 1) ✅ done
 
 **Recognize the Perl test ecosystem: .t/.psgi/.cgi files, t//xt/ dirs, Test::More subtests**
 

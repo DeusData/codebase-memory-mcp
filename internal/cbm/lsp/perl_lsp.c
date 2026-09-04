@@ -1022,9 +1022,40 @@ static bool perl_rhs_is_invocant(const char *rtxt) {
     return false;
 }
 
+/* True when the text names a conventional invocant variable. The signature and
+ * list-unpack forms are name-gated to $self/$class so a plain function's first
+ * parameter never gains a spurious package type (zero-edge guarantee). */
+static bool perl_is_invocant_name(const char *txt) {
+    return txt && (strcmp(txt, "$self") == 0 || strcmp(txt, "$class") == 0);
+}
+
+/* First scalar descendant, caps on depth and per-level breadth: unwraps the
+ * paren list in `my ($self, $x)` and the parameter wrapper in a signature. The
+ * invocant is always leftmost, so the leftmost-first search returns after O(1)
+ * nodes on real code; the caps bound pathological LHS shapes. */
+static TSNode perl_first_scalar_desc(TSNode node, int depth) {
+    TSNode null_node;
+    memset(&null_node, 0, sizeof(null_node));
+    if (ts_node_is_null(node) || depth > 3)
+        return null_node;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "scalar") == 0 || strcmp(k, "scalar_variable") == 0)
+        return node;
+    uint32_t nc = ts_node_named_child_count(node);
+    if (nc > 8)
+        nc = 8;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode r = perl_first_scalar_desc(ts_node_named_child(node, i), depth + 1);
+        if (!ts_node_is_null(r))
+            return r;
+    }
+    return null_node;
+}
+
 /* Bind the invocant: in a method sub belonging to package P, the first
  * statement is typically `my $self = shift;` or `my $class = shift;`. Bind the
- * first such scalar to type P so $self->method() / $class->method() dispatch. */
+ * first such scalar to type P so $self->method() / $class->method() dispatch.
+ * Also handles the classic list unpack `my ($self, $x) = @_;` (name-gated). */
 static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
     const char *pkg =
         ctx->enclosing_package_qn ? ctx->enclosing_package_qn : ctx->current_package_qn;
@@ -1063,8 +1094,25 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
             continue;
         TSNode lhs_var = perl_decl_target(left);
         const char *lvk = ts_node_type(lhs_var);
-        if (strcmp(lvk, "scalar") != 0 && strcmp(lvk, "scalar_variable") != 0)
+        if (strcmp(lvk, "scalar") != 0 && strcmp(lvk, "scalar_variable") != 0) {
+            /* Classic list unpack `my ($self, $x) = @_;`: the invocant is the
+             * FIRST scalar of the paren list when the whole RHS is @_. */
+            char *lrtxt = perl_node_text(ctx, right);
+            if (lrtxt && strcmp(lrtxt, "@_") == 0) {
+                TSNode sc = perl_first_scalar_desc(lhs_var, 0);
+                char *vtxt = ts_node_is_null(sc) ? NULL : perl_node_text(ctx, sc);
+                if (perl_is_invocant_name(vtxt)) {
+                    const char *lbare = perl_strip_sigil(vtxt);
+                    if (lbare && lbare[0]) {
+                        cbm_scope_bind(ctx->current_scope, lbare,
+                                       cbm_type_named(ctx->arena, pkg));
+                        free(kids);
+                        return; /* only the first invocant binding */
+                    }
+                }
+            }
             continue;
+        }
 
         /* RHS must reference the invocant idiom (`shift` / `shift @_` / `$_[0]`). */
         char *rtxt = perl_node_text(ctx, right);
@@ -1083,6 +1131,37 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
     free(kids);
 }
 
+/* Modern signature form (`sub render ($self, $x) {...}`, stable since 5.36):
+ * bind a leading $self/$class parameter to the enclosing package so the method
+ * body dispatches. Other first parameters stay untyped (name gate). */
+static void perl_bind_signature_invocant(PerlLSPContext *ctx, TSNode sub_node) {
+    const char *pkg =
+        ctx->enclosing_package_qn && ctx->enclosing_package_qn[0] ? ctx->enclosing_package_qn
+                                                                  : ctx->current_package_qn;
+    if (!pkg || !pkg[0])
+        return;
+    TSNode sig = perl_first_child_of_type(sub_node, "signature");
+    if (ts_node_is_null(sig))
+        return;
+    TSNode first = ts_node_named_child(sig, 0);
+    if (ts_node_is_null(first))
+        return;
+    /* Optional parameters carry defaults (`$x = 1`) whose scalar would pass the
+     * name compare below; an optional invocant is nonsense, so gate on the
+     * mandatory/bare forms only. */
+    const char *fk = ts_node_type(first);
+    if (strcmp(fk, "mandatory_parameter") != 0 && strcmp(fk, "scalar") != 0 &&
+        strcmp(fk, "scalar_variable") != 0)
+        return;
+    TSNode sc = perl_first_scalar_desc(first, 0);
+    char *ptxt = ts_node_is_null(sc) ? NULL : perl_node_text(ctx, sc);
+    if (!perl_is_invocant_name(ptxt))
+        return;
+    const char *bare = perl_strip_sigil(ptxt);
+    if (bare && bare[0])
+        cbm_scope_bind(ctx->current_scope, bare, cbm_type_named(ctx->arena, pkg));
+}
+
 static void process_subroutine(PerlLSPContext *ctx, TSNode node) {
     CBMScope *saved_scope = ctx->current_scope;
     const char *saved_func = ctx->enclosing_func_qn;
@@ -1097,6 +1176,8 @@ static void process_subroutine(PerlLSPContext *ctx, TSNode node) {
         else
             ctx->enclosing_func_qn = cbm_arena_strdup(ctx->arena, sname);
     }
+
+    perl_bind_signature_invocant(ctx, node);
 
     /* Locate the body block. */
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
