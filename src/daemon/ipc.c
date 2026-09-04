@@ -3386,8 +3386,6 @@ typedef DWORD(WINAPI *get_security_info_fn)(HANDLE, SE_OBJECT_TYPE, SECURITY_INF
                                             PSID *, PACL *, PACL *, PSECURITY_DESCRIPTOR *);
 typedef DWORD(WINAPI *set_security_info_fn)(HANDLE, SE_OBJECT_TYPE, SECURITY_INFORMATION, PSID,
                                             PSID, PACL, PACL);
-typedef BOOL(WINAPI *get_security_descriptor_control_fn)(PSECURITY_DESCRIPTOR,
-                                                         PSECURITY_DESCRIPTOR_CONTROL, LPDWORD);
 typedef BOOL(WINAPI *impersonate_named_pipe_client_fn)(HANDLE);
 typedef BOOL(WINAPI *revert_to_self_fn)(void);
 typedef BOOL(WINAPI *get_named_pipe_client_process_id_fn)(HANDLE, PULONG);
@@ -3415,7 +3413,6 @@ typedef struct {
     get_ace_fn get_ace;
     get_security_info_fn get_security_info;
     set_security_info_fn set_security_info;
-    get_security_descriptor_control_fn get_security_descriptor_control;
     impersonate_named_pipe_client_fn impersonate_named_pipe_client;
     revert_to_self_fn revert_to_self;
     PSID user_sid;
@@ -3704,8 +3701,6 @@ static bool win_security_init(win_security_t *security) {
     RESOLVE_ADVAPI_MEMBER(security, get_ace, get_ace_fn, "GetAce");
     RESOLVE_ADVAPI_MEMBER(security, get_security_info, get_security_info_fn, "GetSecurityInfo");
     RESOLVE_ADVAPI_MEMBER(security, set_security_info, set_security_info_fn, "SetSecurityInfo");
-    RESOLVE_ADVAPI_MEMBER(security, get_security_descriptor_control,
-                          get_security_descriptor_control_fn, "GetSecurityDescriptorControl");
     RESOLVE_ADVAPI_MEMBER(security, impersonate_named_pipe_client, impersonate_named_pipe_client_fn,
                           "ImpersonateNamedPipeClient");
     RESOLVE_ADVAPI_MEMBER(security, revert_to_self, revert_to_self_fn, "RevertToSelf");
@@ -4540,12 +4535,11 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
          * so rename-replace works again without manual icacls. */
         secure_result = ERROR_SUCCESS;
         if (!owner_exact && can_write_owner) {
-            secure_result = security.set_security_info(directory, SE_FILE_OBJECT,
-                                                       OWNER_SECURITY_INFORMATION,
-                                                       security.user_sid, NULL, NULL, NULL);
+            secure_result =
+                security.set_security_info(directory, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                           security.user_sid, NULL, NULL, NULL);
         }
-        if (secure_result == ERROR_SUCCESS &&
-            win_directory_dacl_protected(&security, directory)) {
+        if (secure_result == ERROR_SUCCESS && win_directory_dacl_protected(&security, directory)) {
             /* Restore the inherited DACL shape: copy the parent's DACL
              * (the ACEs a freshly created directory inherits) and clear
              * SE_DACL_PROTECTED. A NULL pDacl with
@@ -4554,10 +4548,10 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
             PACL inherited = NULL;
             PSECURITY_DESCRIPTOR parent_descriptor = NULL;
             if (win_directory_parent_dacl(&security, runtime_dir, &inherited, &parent_descriptor)) {
-                secure_result = security.set_security_info(
-                    directory, SE_FILE_OBJECT,
-                    UNPROTECTED_DACL_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, NULL, NULL,
-                    inherited, NULL);
+                secure_result = security.set_security_info(directory, SE_FILE_OBJECT,
+                                                           UNPROTECTED_DACL_SECURITY_INFORMATION |
+                                                               DACL_SECURITY_INFORMATION,
+                                                           NULL, NULL, inherited, NULL);
             } else {
                 secure_result = ERROR_ACCESS_DENIED;
             }
