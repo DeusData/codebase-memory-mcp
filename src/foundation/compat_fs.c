@@ -837,14 +837,32 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
+/* Symlink policy for the parent-chain walk. Every component is opened with
+ * O_NOFOLLOW; a symlink is followed only when its OWNER is trusted, never by
+ * default. Trusted owners are root (distro /home indirection, macOS /tmp:
+ * only root can create those, so they are outside the attacker model) and the
+ * invoking account itself: a link the caller owns is the caller's own
+ * arrangement, not something planted on them. That second case is how dotfile
+ * managers and configs kept on another volume look (~/.config/opencode ->
+ * /mnt/...), and refusing it made every agent-config write under such a root
+ * fail with an opaque agent_config error. It is the same rule the Linux
+ * kernel's fs.protected_symlinks applies, and the ancestor policy the
+ * activation transaction already uses. A link owned by any OTHER account
+ * (planted in a group- or world-writable ancestor) stays refused, and a
+ * privileged install (euid 0) still refuses user-owned links. */
 static int cbm_open_directory_component(int parent, const char *component, int flags) {
     int descriptor = openat(parent, component, flags);
 #if defined(O_NOFOLLOW) && defined(AT_SYMLINK_NOFOLLOW)
     if (descriptor < 0) {
+        /* The caller decides on errno from the FIRST open (ENOENT means
+         * "create it"); a refused link must not leak fstatat's errno instead. */
+        int open_errno = errno;
         struct stat state;
         if (fstatat(parent, component, &state, AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISLNK(state.st_mode) && state.st_uid == 0U) {
+            S_ISLNK(state.st_mode) && (state.st_uid == 0U || state.st_uid == geteuid())) {
             descriptor = openat(parent, component, flags & ~O_NOFOLLOW);
+        } else {
+            errno = open_errno;
         }
     }
 #endif

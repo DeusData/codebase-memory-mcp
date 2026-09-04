@@ -77,6 +77,58 @@ TEST(platform_file_apis_survive_max_path_overflow) {
     PASS();
 }
 
+/* A directory reached through a symlink the invoking account owns is that
+ * account's own arrangement (a dotfile manager, a config tree kept on another
+ * volume: ~/.config/opencode -> /mnt/...), not a planted link, so the
+ * parent-chain walk follows it and creates the missing tail INSIDE the target
+ * -- the trust fs.protected_symlinks applies. A dangling link of the same
+ * owner still fails closed: nothing is created on either side of it. */
+TEST(platform_mkdir_p_follows_symlink_owned_by_caller) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-ownlink-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char target[CBM_SZ_1K];
+    char link[CBM_SZ_1K];
+    char through_link[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+    (void)snprintf(target, sizeof(target), "%s/target", base);
+    (void)snprintf(link, sizeof(link), "%s/link", base);
+    (void)snprintf(through_link, sizeof(through_link), "%s/child/grandchild", link);
+    (void)snprintf(created, sizeof(created), "%s/child/grandchild", target);
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_EQ(symlink(target, link), 0);
+
+    ASSERT_TRUE(cbm_mkdir_p(through_link, 0700));
+    ASSERT_TRUE(cbm_is_dir(created));
+
+    char dangling[CBM_SZ_1K];
+    char through_dangling[CBM_SZ_1K];
+    char dangling_target[CBM_SZ_1K];
+    (void)snprintf(dangling, sizeof(dangling), "%s/dangling", base);
+    (void)snprintf(through_dangling, sizeof(through_dangling), "%s/child", dangling);
+    (void)snprintf(dangling_target, sizeof(dangling_target), "%s/missing", base);
+    ASSERT_EQ(symlink("missing", dangling), 0);
+    ASSERT_FALSE(cbm_mkdir_p(through_dangling, 0700));
+    ASSERT_FALSE(cbm_is_dir(dangling_target));
+
+    ASSERT_EQ(cbm_unlink(dangling), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    char *slash = strrchr(created, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
 TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
     char base[CBM_SZ_256];
     int written = snprintf(base, sizeof(base), "/tmp/cbm-utf8-Ã©Ã¨-XXXXXX");
@@ -758,6 +810,7 @@ TEST(cgroup_no_mem_files) {
 
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
+    RUN_TEST(platform_mkdir_p_follows_symlink_owned_by_caller);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
     RUN_TEST(platform_mkdtemp_is_thread_safe);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);

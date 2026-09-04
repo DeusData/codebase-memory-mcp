@@ -9832,32 +9832,33 @@ TEST(cli_mcp_installers_preserve_foreign_same_name_entries) {
     PASS();
 }
 
-TEST(cli_installer_rejects_symlinked_agent_roots) {
+/* Agent roots reached through a symlink. A link the invoking account owns is
+ * that account's own arrangement -- a dotfile manager, or a config tree kept
+ * on another volume (~/.config/opencode -> /mnt/...) -- and the installer
+ * follows it; refusing it failed every write under such a root with an opaque
+ * agent_config error. Root-owned links are trusted as infrastructure (distro
+ * /home indirection, macOS /tmp): only root can create them, so they are
+ * outside the attacker model. A link owned by ANY OTHER account is the
+ * planted-link case the O_NOFOLLOW parent-chain walk exists for, and stays
+ * refused. Only root can create a foreign-owned link, so the refusal leg is
+ * exercised when the suite runs as root (containers); the follow leg runs
+ * everywhere. */
+TEST(cli_installer_follows_symlinked_agent_roots_only_for_trusted_owners) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX symlink parent-chain contract");
 #else
     char tmpdir[256];
-    char qoder_target[256];
-    char junie_target[256];
+    char own_target[256];
+    char foreign_target[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-linked-roots-XXXXXX");
-    snprintf(qoder_target, sizeof(qoder_target), "/tmp/cli-linked-qoder-XXXXXX");
-    snprintf(junie_target, sizeof(junie_target), "/tmp/cli-linked-junie-XXXXXX");
-    if (!cbm_mkdtemp(tmpdir) || !cbm_mkdtemp(qoder_target) || !cbm_mkdtemp(junie_target))
+    snprintf(own_target, sizeof(own_target), "/tmp/cli-linked-own-XXXXXX");
+    snprintf(foreign_target, sizeof(foreign_target), "/tmp/cli-linked-foreign-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir) || !cbm_mkdtemp(own_target) || !cbm_mkdtemp(foreign_target))
         FAIL("cbm_mkdtemp failed");
     char qoder_link[512];
-    char junie_link[512];
     snprintf(qoder_link, sizeof(qoder_link), "%s/.qoder", tmpdir);
-    snprintf(junie_link, sizeof(junie_link), "%s/.junie", tmpdir);
-    if (symlink(qoder_target, qoder_link) != 0 || symlink(junie_target, junie_link) != 0)
+    if (symlink(own_target, qoder_link) != 0)
         FAIL("symlink failed");
-    /* Root-owned symlinks are deliberately trusted as infrastructure (distro
-     * /home indirection, macOS /tmp) — only root can create them, so they are
-     * outside the attacker model. The contract under test is refusal of
-     * USER-planted links; a root test run (containers) must demote its links
-     * to an unprivileged owner or it would assert against the wrong model. */
-    if (geteuid() == 0 &&
-        (lchown(qoder_link, 65534, 65534) != 0 || lchown(junie_link, 65534, 65534) != 0))
-        FAIL("lchown to unprivileged owner failed");
 
     char qoder_executable[512];
     snprintf(qoder_executable, sizeof(qoder_executable), "%s/qodercli", tmpdir);
@@ -9869,33 +9870,49 @@ TEST(cli_installer_rejects_symlinked_agent_roots) {
     char *saved_path = save_test_env("PATH");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
-    (void)cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int own_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
-    char outside_qoder_settings[512];
-    char outside_qoder_skill[512];
-    char outside_junie_mcp[512];
-    char outside_junie_agent[512];
-    snprintf(outside_qoder_settings, sizeof(outside_qoder_settings), "%s/settings.json",
-             qoder_target);
-    snprintf(outside_qoder_skill, sizeof(outside_qoder_skill), "%s/skills/codebase-memory/SKILL.md",
-             qoder_target);
-    snprintf(outside_junie_mcp, sizeof(outside_junie_mcp), "%s/mcp/mcp.json", junie_target);
-    snprintf(outside_junie_agent, sizeof(outside_junie_agent), "%s/agents/codebase-memory.md",
-             junie_target);
+    char own_settings[512];
+    char own_skill[512];
+    snprintf(own_settings, sizeof(own_settings), "%s/settings.json", own_target);
+    snprintf(own_skill, sizeof(own_skill), "%s/skills/codebase-memory/SKILL.md", own_target);
     struct stat state;
-    bool refused = stat(outside_qoder_settings, &state) != 0 &&
-                   stat(outside_qoder_skill, &state) != 0 && stat(outside_junie_mcp, &state) != 0 &&
-                   stat(outside_junie_agent, &state) != 0;
+    bool followed = stat(own_settings, &state) == 0 && S_ISREG(state.st_mode) &&
+                    stat(own_skill, &state) == 0 && S_ISREG(state.st_mode);
+
+    /* Refusal leg: the same root, now a link some other account planted. */
+    bool foreign_refused = true;
+    bool foreign_setup_ok = true;
+    if (geteuid() == 0) {
+        foreign_setup_ok = cbm_unlink(qoder_link) == 0 &&
+                           symlink(foreign_target, qoder_link) == 0 &&
+                           lchown(qoder_link, 65534, 65534) == 0;
+        if (foreign_setup_ok) {
+            int foreign_rc =
+                cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+            char foreign_settings[512];
+            char foreign_skill[512];
+            snprintf(foreign_settings, sizeof(foreign_settings), "%s/settings.json",
+                     foreign_target);
+            snprintf(foreign_skill, sizeof(foreign_skill), "%s/skills/codebase-memory/SKILL.md",
+                     foreign_target);
+            foreign_refused = foreign_rc != 0 && stat(foreign_settings, &state) != 0 &&
+                              stat(foreign_skill, &state) != 0;
+        }
+    }
 
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     cbm_unlink(qoder_link);
-    cbm_unlink(junie_link);
     test_rmdir_r(tmpdir);
-    test_rmdir_r(qoder_target);
-    test_rmdir_r(junie_target);
-    if (!refused)
-        FAIL("installer must not follow symlinked agent roots outside the selected home");
+    test_rmdir_r(own_target);
+    test_rmdir_r(foreign_target);
+    if (!foreign_setup_ok)
+        FAIL("could not plant a foreign-owned link while running as root");
+    if (own_rc != 0 || !followed)
+        FAIL("installer must follow an agent root symlinked by the invoking account");
+    if (!foreign_refused)
+        FAIL("installer must not follow an agent root symlinked by another account");
     PASS();
 #endif
 }
@@ -14028,7 +14045,7 @@ SUITE(cli) {
     RUN_TEST(cli_read_only_agents_do_not_receive_mutating_mcp_server);
     RUN_TEST(cli_junie_foreign_analysis_alias_falls_back_to_parent_handoff);
     RUN_TEST(cli_mcp_installers_preserve_foreign_same_name_entries);
-    RUN_TEST(cli_installer_rejects_symlinked_agent_roots);
+    RUN_TEST(cli_installer_follows_symlinked_agent_roots_only_for_trusted_owners);
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
