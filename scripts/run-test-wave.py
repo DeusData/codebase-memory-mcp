@@ -27,6 +27,14 @@ FAILED = re.compile(r"(?:^|, )(?P<failed>[0-9]+) failed")
 SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
 SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime"))
 POLL_SECONDS = 0.05
+# Floor for how long an external Windows helper (taskkill.exe, powershell.exe)
+# may take to answer. This is deliberately NOT --kill-grace: that flag budgets
+# how long a doomed process may take to die, while this budgets process spawn
+# plus CIM startup on a loaded runner, which routinely exceeds a second. Wiring
+# the two together made a small kill grace flake the whole wave -- taskkill
+# timing out is reported as "could not prove cleanup", and the descendant probe
+# that runs afterwards fails closed on its own timeout.
+WINDOWS_HELPER_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -123,6 +131,10 @@ def start_suite(
     )
 
 
+def windows_helper_timeout(kill_grace: int) -> int:
+    return max(kill_grace, WINDOWS_HELPER_TIMEOUT_SECONDS)
+
+
 def windows_descendants(pid: int, timeout: int) -> bool:
     """True if any live process still claims `pid` as its parent.
 
@@ -167,7 +179,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
             # how a deliberately-hanging fixture suite reddened a release run.
             # taskkill /T cannot walk a tree from a dead PID, so prove cleanup
             # the only way still available -- nothing is parented to it.
-            if windows_descendants(process.pid, kill_grace):
+            if windows_descendants(process.pid, windows_helper_timeout(kill_grace)):
                 raise RuntimeError(
                     f"suite {active.name!r} leader exited leaving live descendants"
                 )
@@ -185,7 +197,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=kill_grace,
+                timeout=windows_helper_timeout(kill_grace),
             )
         except (OSError, subprocess.TimeoutExpired):
             completed = None

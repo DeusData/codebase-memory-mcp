@@ -256,6 +256,7 @@ python3 - "$scheduler" "$fixture" "$(command -v python3)" <<'PY'
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import os
 import pathlib
 import signal
@@ -273,6 +274,29 @@ ready = barrier / "timeout_exit_race.ready"
 leader_exited = barrier / "timeout_exit_race.leader-exited"
 release = barrier / "timeout_exit_race.release"
 descendant_path = fixture / "descendant.pid"
+
+
+def scheduler_wait_budget() -> int:
+    """Seconds to allow the scheduler to finish refusing.
+
+    On POSIX the refusal is signal-driven and lands well inside --kill-grace.
+    On Windows it costs external helper spawns (taskkill.exe, and powershell.exe
+    for the descendant probe), which the scheduler deliberately budgets with its
+    own floor rather than --kill-grace. Read that floor from the scheduler
+    instead of restating it: hard-coding a budget here silently turns a slow
+    runner into a harness failure the moment the two numbers drift apart. The
+    refusal path can spend the floor twice -- once proving descendants, once in
+    the cleanup re-entry -- so allow both plus interpreter startup.
+    """
+    if os.name != "nt":
+        return 8
+    spec = importlib.util.spec_from_file_location("cbm_run_test_wave", scheduler)
+    module = importlib.util.module_from_spec(spec)
+    # Register before exec: @dataclass resolves annotations through
+    # sys.modules[cls.__module__], which is None for an unregistered module.
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module.WINDOWS_HELPER_TIMEOUT_SECONDS * 2 + 10
 
 
 def process_state(pid: int) -> str:
@@ -370,7 +394,7 @@ try:
             raise SystemExit("FAIL: scheduler did not observe the forced leader exit")
         time.sleep(0.02)
     release.write_text("release\n", encoding="utf-8")
-    stdout, stderr = process.communicate(timeout=8)
+    stdout, stderr = process.communicate(timeout=scheduler_wait_budget())
 
     if os.name == "nt":
         # Assert the PROPERTY, not the wording. This used to require the phrase
