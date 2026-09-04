@@ -50,6 +50,19 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* C# */
     {".cs", CBM_LANG_CSHARP},
+    /* Blazor components. The C# grammar recovers the @code block; the
+     * surrounding markup parses as ERROR regions and is reported via
+     * parse_partial, which is why this is a best-effort mapping rather
+     * than a dedicated grammar. */
+    {".razor", CBM_LANG_CSHARP},
+    /* Razor Pages / MVC views. Same Razor syntax and the same C# host as
+     * .razor, and equally unmapped before this: an ASP.NET Core app's views
+     * produced no nodes at all. The `@page` directive that defines a Razor
+     * Page lives in this file type, so the route extraction below matters
+     * more here than it does for components. Best-effort on the same terms:
+     * the C# grammar recovers the @{ } / @functions blocks, the surrounding
+     * markup lands in ERROR regions and is reported via parse_partial. */
+    {".cshtml", CBM_LANG_CSHARP},
 
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},

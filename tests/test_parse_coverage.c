@@ -470,6 +470,77 @@ TEST(perl_malformed_source_remains_partial_issue1838) {
     PASS();
 }
 
+/* ── #1746: trailing blanks before EOF are still just an absent newline ───────
+ *
+ * #1610 suppressed the zero-width MISSING terminator but tested for it with
+ * `end == source_len`. Trailing blanks are extras owned by no node, so
+ * `ENTRYPOINT ["a"] ` + EOF parks it at [29,29) while source_len is 30.
+ *
+ * The reporter's byte-exact controls pin the trigger to the PAIR: `] ` + EOF
+ * flags, `] ` + newline is clean, `]` + EOF is clean. */
+TEST(dockerfile_trailing_blank_at_eof_not_flagged_issue1746) {
+    const char *cases[] = {
+        "FROM scratch\nENTRYPOINT [\"a\"] ",     /* space + EOF — the report */
+        "FROM scratch\nENTRYPOINT [\"a\"]\t",    /* tab + EOF */
+        "FROM scratch\nENTRYPOINT [\"a\"]\v",    /* vertical tab + EOF */
+        "FROM scratch\nENTRYPOINT [\"a\"]\f",    /* form feed + EOF */
+        "FROM scratch\nENTRYPOINT [\"a\"]  \t ", /* run of blanks + EOF */
+        "FROM scratch\nENTRYPOINT [\"a\"] \r",   /* CRLF file truncated to CR */
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        CBMFileResult *r = do_extract(cases[i], CBM_LANG_DOCKERFILE, "Dockerfile");
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        if (flagged) {
+            fprintf(stderr, "  case %zu flagged: ranges=%s\n", i,
+                    r->error_ranges ? r->error_ranges : "(none)");
+        }
+        cbm_free_result(r);
+        if (flagged) {
+            FAIL("trailing blanks must not turn an absent final newline into parse_partial");
+        }
+    }
+    PASS();
+}
+
+/* GUARD: widening the tail must not swallow a genuine mid-file failure just
+ * because the file happens to end in blanks. */
+TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746) {
+    size_t n = strlen(C_IFDEF_SPLIT);
+    char *buf = (char *)malloc(n + 1);
+    ASSERT_NOT_NULL(buf);
+    memcpy(buf, C_IFDEF_SPLIT, n + 1);
+    buf[n - 1] = ' '; /* final newline becomes a blank */
+
+    CBMFileResult *r = do_extract(buf, CBM_LANG_C, "split.c");
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    bool has_ranges = r->error_ranges != NULL;
+    cbm_free_result(r);
+    if (!flagged) {
+        FAIL("a real mid-file parse failure must still be reported when the file ends in blanks");
+    }
+    if (!has_ranges) {
+        FAIL("a reported failure must still name its line range");
+    }
+    PASS();
+}
+
+/* GUARD: a WIDTH-BEARING loss at EOF stays honest with a blank tail too — the
+ * Makefile recipe really is dropped, and only zero-width nodes are excused. */
+TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746) {
+    const char *src = "all:\n\techo hi ";
+    CBMFileResult *r = do_extract(src, CBM_LANG_MAKEFILE, "Makefile");
+    ASSERT_NOT_NULL(r);
+    bool flagged = r->parse_incomplete;
+    cbm_free_result(r);
+    if (!flagged) {
+        FAIL("a width-bearing parse failure at EOF must still be reported when the file ends in blanks");
+    }
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -491,4 +562,7 @@ SUITE(parse_coverage) {
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
     RUN_TEST(perl_format_followed_by_named_sub_is_complete_issue1838);
     RUN_TEST(perl_malformed_source_remains_partial_issue1838);
+    RUN_TEST(dockerfile_trailing_blank_at_eof_not_flagged_issue1746);
+    RUN_TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746);
+    RUN_TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
 }

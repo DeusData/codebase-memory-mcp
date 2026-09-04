@@ -290,4 +290,8 @@ void cbm_mcp_server_request_scope_end(cbm_mcp_server_t *srv);
  * On Windows, strips leading / from /C:/path. */
 bool cbm_parse_file_uri(const char *uri, char *out_path, int out_size);
 
+/* How many restarts a failed index worker gets, as CBM_INDEX_MAX_RESTARTS sets
+ * it. Exposed so a test can check what the setting resolves to. */
+int cbm_index_restart_cap_for_testing(void);
+
 #endif /* CBM_MCP_H */

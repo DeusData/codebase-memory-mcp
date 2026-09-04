@@ -2445,7 +2445,13 @@ static int collect_bases_from_field(CBMArena *a, TSNode field_node, const char *
              * dotted base like `mod.Base`). Without these the raw-text fallback
              * below captured the whole "(Base)" field text, which never
              * resolved -> zero INHERITS edges for Python subclasses. */
-            strcmp(ck, "identifier") == 0 || strcmp(ck, "attribute") == 0) {
+            strcmp(ck, "identifier") == 0 || strcmp(ck, "attribute") == 0 ||
+            /* Ruby `class C < Base` wraps the base in a `superclass` node whose
+             * child is a `constant` (or `scope_resolution` for `A::B`). Without
+             * these the raw-text fallback captured "< Base" (operator included),
+             * which never resolves — breaking INHERITS and the Ruby LSP's
+             * superclass chain. */
+            strcmp(ck, "constant") == 0 || strcmp(ck, "scope_resolution") == 0) {
             char *t = cbm_node_text(a, child, source);
             if (t) {
                 char *angle = strchr(t, '<');
@@ -5316,8 +5322,8 @@ static TSNode emit_elixir_module_class(CBMExtractCtx *ctx, TSNode cur) {
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     (void)spec;
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_64);
-    ts_nstack_push(&stack, ctx->arena, node);
+    ts_nstack_init(&stack, ctx, CBM_SZ_64);
+    ts_nstack_push(&stack, node);
 
     while (stack.count > 0) {
         TSNode cur = ts_nstack_pop(&stack);
@@ -5345,7 +5351,7 @@ static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSp
                 for (int di = (int)dbc - SKIP_CHAR; di >= 0; di--) {
                     TSNode dchild = ts_node_child(do_block, (uint32_t)di);
                     if (!ts_node_is_null(dchild) && strcmp(ts_node_type(dchild), "call") == 0) {
-                        ts_nstack_push(&stack, ctx->arena, dchild);
+                        ts_nstack_push(&stack, dchild);
                     }
                 }
             }
@@ -6285,8 +6291,8 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 // Used by YAML, TOML, INI, JSON.
 static void walk_variables_iter(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_256);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_256);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -6310,7 +6316,7 @@ static void walk_variables_iter(CBMExtractCtx *ctx, TSNode root, const CBMLangSp
                 strcmp(ck, "section") == 0 || strcmp(ck, "object") == 0 ||
                 strcmp(ck, "array") == 0 || strcmp(ck, "pair") == 0 || strcmp(ck, "element") == 0 ||
                 strcmp(ck, "content") == 0) {
-                ts_nstack_push(&stack, ctx->arena, child);
+                ts_nstack_push(&stack, child);
             }
         }
     }
@@ -7144,10 +7150,10 @@ static void wd_push_children_reverse(wd_stack_t *s, TSNode node, const char *enc
 // Push nested class nodes from a class body container onto the defs stack.
 // Iteratively walks into wrapper nodes (field_declaration, template_declaration).
 static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_stack_t *s,
-                                    const char *enclosing_qn, CBMArena *arena) {
+                                    const char *enclosing_qn, const CBMExtractCtx *ctx) {
     TSNodeStack nc_stack;
-    ts_nstack_init(&nc_stack, arena, NESTED_CLASS_STACK_CAP);
-    ts_nstack_push(&nc_stack, arena, body);
+    ts_nstack_init(&nc_stack, ctx, NESTED_CLASS_STACK_CAP);
+    ts_nstack_push(&nc_stack, body);
 
     while (nc_stack.count > 0) {
         TSNode cur = ts_nstack_pop(&nc_stack);
@@ -7162,7 +7168,7 @@ static void push_nested_class_nodes(TSNode body, const CBMLangSpec *spec, wd_sta
                 const char *ck = ts_node_type(child);
                 if (strcmp(ck, "field_declaration") == 0 ||
                     strcmp(ck, "template_declaration") == 0 || strcmp(ck, "declaration") == 0) {
-                    ts_nstack_push(&nc_stack, arena, child);
+                    ts_nstack_push(&nc_stack, child);
                 }
             }
         }
@@ -7278,7 +7284,7 @@ static void extract_typescript_namespace_def(CBMExtractCtx *ctx, TSNode node,
 
 // Push nested class children from a class body container onto the walk stack.
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
-                                     const char *new_enclosing, CBMArena *arena) {
+                                     const char *new_enclosing, const CBMExtractCtx *ctx) {
     /* Use the same language-aware body selection as method extraction.  The old
      * independent spelling list omitted valid containers such as Scala's
      * `template_body` and Solidity's contract body.  Methods were extracted
@@ -7294,7 +7300,7 @@ static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_st
         body = find_class_member_body(node, spec->language);
     }
     if (!ts_node_is_null(body)) {
-        push_nested_class_nodes(body, spec, s, new_enclosing, arena);
+        push_nested_class_nodes(body, spec, s, new_enclosing, ctx);
         return;
     }
 
@@ -7880,7 +7886,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
         if (cbm_kind_in_set(node, spec->class_node_types)) {
             extract_class_def(ctx, node, spec);
             const char *new_enclosing = compute_class_qn(ctx, node, frame.enclosing_class_qn);
-            push_class_body_children(node, spec, &s, new_enclosing, ctx->arena);
+            push_class_body_children(node, spec, &s, new_enclosing, ctx);
             continue;
         }
 
@@ -7906,6 +7912,99 @@ void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {
     extract_variables(ctx, ctx->root, spec);
 }
 
+/* True when rel_path names a Blazor component file. */
+static bool cbm_path_is_razor(const char *rel_path) {
+    /* Both Razor file types, not just components. `@page` is what DEFINES a
+     * Razor Page, so a .cshtml route is at least as worth extracting as a
+     * .razor one. Deliberately not .aspx/.ascx: Web Forms is a different
+     * templating syntax (`<%@ %>`, `runat="server"`) with no `@page`
+     * directive, so neither the C# recovery nor the scan below applies. */
+    if (!rel_path) {
+        return false;
+    }
+    static const char *const suffixes[] = {".razor", ".cshtml"};
+    size_t len = strlen(rel_path);
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        size_t slen = strlen(suffixes[i]);
+        if (len > slen && strcmp(rel_path + (len - slen), suffixes[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Match `@page "/route"` on ONE line; returns the route text or NULL.
+ *
+ * Deliberately strict: the directive must be the first token on the line and be
+ * followed by whitespace and a double-quoted path beginning with '/', so
+ * neither `@pageSize` nor a `@page` mentioned in markup prose can match.
+ *
+ * A blank line is rejected up front rather than falling through the length
+ * check, which keeps every later comparison reachable on some path — the
+ * all-whitespace case would otherwise leave `line_end - p` provably zero. */
+static const char *razor_page_route_on_line(CBMArena *a, const char *line, const char *line_end) {
+    static const char directive[] = "@page";
+    const size_t dlen = sizeof(directive) - 1U;
+
+    const char *p = line;
+    while (p < line_end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p == line_end) {
+        return NULL; /* blank line — nothing can follow */
+    }
+    if ((size_t)(line_end - p) <= dlen || strncmp(p, directive, dlen) != 0) {
+        return NULL;
+    }
+    p += dlen;
+    if (*p != ' ' && *p != '\t') {
+        return NULL; /* `@pageSize` and friends */
+    }
+    while (p < line_end && (*p == ' ' || *p == '\t')) {
+        p++;
+    }
+    if (p == line_end || *p != '"') {
+        return NULL;
+    }
+    p++;
+    const char *route = p;
+    while (p < line_end && *p != '"') {
+        p++;
+    }
+    if (p == line_end || p == route || *route != '/') {
+        return NULL; /* unterminated, empty, or not a rooted path */
+    }
+    return cbm_arena_strndup(a, route, (size_t)(p - route));
+}
+
+/* Blazor route directive: `@page "/counter"` lives in MARKUP above the `@code`
+ * block. Tree-sitter's C# grammar recovers `@code` but never parses the
+ * directive, so there is no AST node to read it from — this scans the raw
+ * source instead. That is why routes need no Razor grammar.
+ *
+ * A component may declare several routes; the first is taken, because
+ * CBMDefinition carries a single route_path. */
+static const char *cbm_razor_page_route(CBMArena *a, const char *source, int source_len) {
+    if (!source || source_len <= 0) {
+        return NULL;
+    }
+    const char *end = source + source_len;
+    const char *line = source;
+
+    while (line < end) {
+        const char *nl = memchr(line, '\n', (size_t)(end - line));
+        const char *route = razor_page_route_on_line(a, line, nl ? nl : end);
+        if (route) {
+            return route;
+        }
+        if (!nl) {
+            break;
+        }
+        line = nl + 1;
+    }
+    return NULL;
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -7927,6 +8026,17 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     mod.is_test = ctx->result->is_test_file;
     // #519: index what a config file declares itself to be, not only its path.
     mod.docstring = extract_config_module_description(ctx);
+    /* A routable Blazor component carries its route on the module def: the
+     * component's class is implicit in a .razor file, so there is no class node
+     * to hang it on, and the module QN already is the component's identity.
+     * insert_def_into_gbuf creates Route+HANDLES for any def with route_path. */
+    if (ctx->language == CBM_LANG_CSHARP && cbm_path_is_razor(ctx->rel_path)) {
+        const char *route = cbm_razor_page_route(a, ctx->source, ctx->source_len);
+        if (route) {
+            mod.route_path = route;
+            mod.route_method = "GET"; /* a routable page is reached by navigation */
+        }
+    }
     cbm_defs_push(&ctx->result->defs, a, mod);
 
     cbm_extract_definitions_without_module(ctx);

@@ -448,20 +448,57 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * per-language decision made at the call sites in pass_calls.c and
  * pass_parallel.c, which MUST stay in lockstep — a gate added to only one of
  * them diverges the sequential and parallel resolvers. */
-bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
-    if (!enabled || !is_method || !strategy || !strategy[0]) {
+/* The weak short-name strategies that actually reach the call-resolution
+ * guards: the registry's suffix_match / unique_name and the parallel
+ * field_type_hint. "fuzzy" is listed as defensive insurance only —
+ * cbm_registry_fuzzy_resolve is not wired into the sequential/parallel resolvers
+ * today, so it never reaches these helpers, but naming it keeps a future wiring
+ * from silently reintroducing the noise. Everything else — same_module /
+ * import_map / import_map_suffix / qualified_suffix / callee_suffix /
+ * service_pattern / lsp_* — is a receiver- or import-aware match and is KEPT.
+ *
+ * Shared by BOTH weak-call guards below so the drop-list exists exactly once: a
+ * list that drifted between the member guard and the local-binding guard would
+ * make the two disagree about what "weak" means. */
+static bool weak_short_name_strategy(const char *strategy) {
+    if (!strategy || !strategy[0]) {
         return false;
     }
-    /* Weak short-name strategies that actually reach the call-resolution guards:
-     * the registry's suffix_match / unique_name and the parallel field_type_hint.
-     * "fuzzy" is listed as defensive insurance only — cbm_registry_fuzzy_resolve
-     * is not wired into the sequential/parallel resolvers today, so it never
-     * reaches this helper, but naming it keeps a future wiring from silently
-     * reintroducing the noise. Everything else — same_module / import_map /
-     * import_map_suffix / qualified_suffix / callee_suffix / service_pattern /
-     * lsp_* — is a receiver- or import-aware match and is KEPT. */
     return strcmp(strategy, "suffix_match") == 0 || strcmp(strategy, "unique_name") == 0 ||
            strcmp(strategy, "field_type_hint") == 0 || strcmp(strategy, "fuzzy") == 0;
+}
+
+bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy) {
+    if (!enabled || !is_method) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
+/* Bare-call counterpart of the member guard above. A Python call `foo()` whose
+ * callee identifier is bound as a parameter of an enclosing scope cannot be the
+ * module-level `foo`: the parameter shadows it for the whole body. Binding such
+ * a call to a project Function/Method by a weak short-name strategy fabricates
+ * the edge by construction (`def _run_with_heavy_slot(run): run()` ->
+ * SatoriLive.run).
+ *
+ * This is deliberately NOT keyed on the callee's spelling. A list of
+ * "generic-looking" names (get / run / execute) asserts that certain spellings
+ * are usually noise, which is a claim about corpus fashion rather than about
+ * what the resolver knew — and it ages invisibly, because nothing fails when the
+ * distribution shifts, the graph just quietly loses different edges. A parameter
+ * binding is a fact about THIS file's scope, decidable outright.
+ *
+ * `enabled` is the caller's per-language gate, kept out of the helper for the
+ * same reason as the member guard: the two call sites in pass_calls.c and
+ * pass_parallel.c MUST enumerate the identical language set, or the sequential
+ * and parallel resolvers diverge. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
+                                          const char *strategy) {
+    if (!enabled || !callee_is_locally_bound) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
 }
 
 static bool js_ts_family(CBMLanguage lang) {
@@ -546,22 +583,21 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
     return true;
 }
 
-bool cbm_go_suppress_bare_field_ref(bool is_go, const char *ref_name, const char *target_label) {
-    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
-     * field access is always a selector expression (x.f), and selector
-     * references resolve through the LSP join, never through the bare-name
-     * registry fallback. Every Field-targeted reference edge in the field
-     * census carried dot-less text, so dropping the bind loses nothing real.
-     * Go-gated: a C#/Java/C++/Python method body legitimately references its
-     * own members bare (cp_reads_writes_cs_static_field pins that shape as
-     * required), so a global veto would break those languages. */
-    if (!is_go || !ref_name || !ref_name[0] || !target_label) {
+bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label) {
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression (x.f). The extractor
+     * strips the receiver before the resolver runs (resolve_lhs_write_name
+     * records the trailing field name; is_reference_node records the inner
+     * field_identifier), so the reference TEXT is always dot-less and cannot
+     * carry the distinction — the recorded is_member_access shape can. Only a
+     * reference that was never the member half of a selector is refused a
+     * Field bind. Go-gated: a C#/Java/C++/Python method body legitimately
+     * references its own members bare (cp_reads_writes_cs_static_field pins
+     * that shape as required), so a global veto would break those languages. */
+    if (!is_go || is_member_access || !target_label) {
         return false;
     }
-    if (strcmp(target_label, "Field") != 0) {
-        return false;
-    }
-    return strchr(ref_name, '.') == NULL;
+    return strcmp(target_label, "Field") == 0;
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -889,6 +925,87 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
+ * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
+ * throw away, and throwing it away binds Foundation's URLSession.shared.data to
+ * a project's own PickedFile.data: high confidence, and nothing in the graph
+ * shows it is wrong. Require instead that the candidate's own parent segment
+ * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
+ * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
+ *
+ * Only an upper-case first segment is guarded. A lower-case root names a value
+ * (vm.load, http.Get, os.path.join) whose declared type the chain does not
+ * show, so the chain proves nothing there and the call passes through
+ * unchanged. A callee with no separator passes through as well.
+ *
+ * Language agnostic by design: the registry holds no language, and every
+ * language that writes receiver chains gains the same protection. */
+static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
+    /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
+     * the same way qualified_suffix_match does. */
+    char dotted[CBM_SZ_512];
+    size_t w = 0;
+    for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
+        if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else {
+            dotted[w++] = *s++;
+        }
+    }
+    dotted[w] = '\0';
+
+    const char *last_dot = strrchr(dotted, '.');
+    if (!last_dot) {
+        return true; /* bare name — no receiver chain to judge */
+    }
+    if (dotted[0] < 'A' || dotted[0] > 'Z') {
+        return true; /* lower-case root names a value, not a type */
+    }
+    /* A name written in capitals with underscores is a constant holding a
+     * value, not a type: ISO_4217_URL.lower is a string's own method. JSON and
+     * URL carry no underscore and stay guarded. */
+    int has_underscore = 0;
+    int all_caps = 1;
+    for (const char *c = dotted; c < last_dot && *c != '.'; c++) {
+        if (*c == '_') {
+            has_underscore = 1;
+        } else if (*c >= 'a' && *c <= 'z') {
+            all_caps = 0;
+            break;
+        }
+    }
+    if (all_caps && has_underscore) {
+        return true;
+    }
+
+    /* The candidate's parent segment: the one before its final name. */
+    const char *cand_last = strrchr(candidate_qn, '.');
+    if (!cand_last || cand_last == candidate_qn) {
+        return true; /* top-level candidate — no parent to look for */
+    }
+    const char *parent = cand_last;
+    while (parent > candidate_qn && parent[-1] != '.') {
+        parent--;
+    }
+    size_t parent_len = (size_t)(cand_last - parent);
+
+    /* Walk the chain — every segment before the final callee name. A trailing
+     * "()" is dropped so JSONEncoder().encode reads as JSONEncoder. */
+    for (const char *seg = dotted; seg < last_dot;) {
+        const char *end = strchr(seg, '.');
+        size_t len = (size_t)(end - seg);
+        if (len >= 2 && seg[len - 2] == '(' && seg[len - 1] == ')') {
+            len -= 2; /* an empty "()" — JSONEncoder().encode names JSONEncoder */
+        }
+        if (len == parent_len && strncmp(seg, parent, parent_len) == 0) {
+            return true;
+        }
+        seg = end + SKIP_ONE;
+    }
+    return false;
+}
+
 /* Strategy 3+4: Name lookup + suffix match */
 static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char *callee_name,
                                             const char *module_qn, const char **import_vals,
@@ -914,6 +1031,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
 
     /* Strategy 3: unique name */
     if (arr->count == SKIP_ONE) {
+        if (!receiver_chain_admits(callee_name, arr->items[0])) {
+            return empty_result();
+        }
         double conf = CONF_UNIQUE_NAME;
         if (import_vals && import_count > 0 &&
             !is_import_reachable(arr->items[0], import_vals, import_count)) {
@@ -928,6 +1048,9 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     }
     const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
     if (best) {
+        if (!receiver_chain_admits(callee_name, best)) {
+            return empty_result();
+        }
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
     }

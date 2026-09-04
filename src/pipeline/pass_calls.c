@@ -627,8 +627,16 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     bool suppress_weak_member = lang == CBM_LANG_PYTHON || lang == CBM_LANG_JAVASCRIPT ||
                                 lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
                                 lang == CBM_LANG_ARKTS;
+    /* Bare-call local-binding suppression. A member call has a receiver the
+     * guard above can reason about; a bare `run()` has none, so that guard
+     * cannot see this class at all. Python-only today because the extraction
+     * flag is set only for Python — this gate MUST match pass_parallel.c's
+     * exactly, for the same divergence reason noted above. */
+    bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
     bool drop_plain_call =
-        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy);
+        cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
+        cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
+                                             call->callee_is_locally_bound, res.strategy);
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
