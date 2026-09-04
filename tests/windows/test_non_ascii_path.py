@@ -358,9 +358,9 @@ def no_project_error(index_txt, repo, cache):
 
 
 def index_and_count(binary, repo, cache):
-    """Index `repo` into an isolated cache and return label-resolved counts."""
+    """Start in and index `repo`, then return label-resolved counts."""
     os.makedirs(cache, exist_ok=True)
-    with McpServer(binary, cache_dir=cache) as s:
+    with McpServer(binary, cache_dir=cache, cwd=repo) as s:
         s.initialize()
         resp = s.call_tool("index_repository", {"repo_path": repo}, timeout=180)
         index_txt, err = s.tool_text(resp)

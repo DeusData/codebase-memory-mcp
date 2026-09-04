@@ -367,6 +367,83 @@ static void restore_test_env(const char *name, char *saved) {
     }
 }
 
+/* An unreadable CBM_HOOK_DEADLINE_MS must fall back to the DEFAULT budget, not
+ * to the shortest one the setting allows.
+ *
+ * atoi answers 0 for text it cannot read, and 0 is below HA_DEADLINE_MIN_MS, so
+ * the clamp used to hand back 50 ms -- the worst possible answer for a setting
+ * whose whole purpose is to give the hook more room. The comment above
+ * ha_deadline_ms records a hunt for hook runs that never finished (0 of 24 real
+ * sessions), which is exactly the symptom a silently-shortened deadline makes.
+ *
+ * POSIX only: the Windows path arms a fixed timer and reads no environment. */
+#ifndef _WIN32
+TEST(cli_hook_deadline_ignores_an_unreadable_value) {
+    enum { HOOK_DEADLINE_DEFAULT = 2000, HOOK_DEADLINE_MIN = 50, HOOK_DEADLINE_MAX = 10000 };
+    char *saved = save_test_env("CBM_HOOK_DEADLINE_MS");
+
+    /* Positive control: a good value is still used, so a failure below is about
+     * the unreadable case and not about the reader being broken outright. */
+    cbm_setenv("CBM_HOOK_DEADLINE_MS", "1234", 1);
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), 1234);
+
+    /* Unset falls back to the default. */
+    cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_DEFAULT);
+
+    /* The claim: text the reader cannot read gets the default, never the floor. */
+    const char *unreadable[] = {"abc", "2000ms", " 2000", "2000 ", "", "1e3"};
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        cbm_setenv("CBM_HOOK_DEADLINE_MS", unreadable[i], 1);
+        int ms = cbm_hook_augment_deadline_ms_for_testing();
+        if (ms != HOOK_DEADLINE_DEFAULT) {
+            printf("  unreadable value \"%s\" gave %d ms\n", unreadable[i], ms);
+        }
+        ASSERT_EQ(ms, HOOK_DEADLINE_DEFAULT);
+    }
+
+    /* Both clamps still hold for values that DO read. */
+    cbm_setenv("CBM_HOOK_DEADLINE_MS", "1", 1);
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_MIN);
+    cbm_setenv("CBM_HOOK_DEADLINE_MS", "999999", 1);
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_MAX);
+
+    restore_test_env("CBM_HOOK_DEADLINE_MS", saved);
+    PASS();
+}
+#endif
+
+/* CBM_INDEX_MAX_RESTARTS=0 means no restarts. It used to mean 100 of them.
+ *
+ * The old reader kept the default unless atoi answered greater than zero, so
+ * the one value a person sets when they want the worker left alone did the
+ * opposite. A typo did the same thing, with nothing on screen either way. */
+TEST(cli_index_restart_cap_honours_zero_and_refuses_junk) {
+    enum { INDEX_RESTART_CAP_DEFAULT = 100 };
+    char *saved = save_test_env("CBM_INDEX_MAX_RESTARTS");
+
+    /* Positive control: a good value is still used. */
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "7", 1);
+    ASSERT_EQ(cbm_index_restart_cap_for_testing(), 7);
+
+    cbm_unsetenv("CBM_INDEX_MAX_RESTARTS");
+    ASSERT_EQ(cbm_index_restart_cap_for_testing(), INDEX_RESTART_CAP_DEFAULT);
+
+    /* The claim: zero is a real answer meaning no restarts. */
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "0", 1);
+    ASSERT_EQ(cbm_index_restart_cap_for_testing(), 0);
+
+    /* Text the reader cannot read keeps the default. */
+    const char *unreadable[] = {"abc", "5x", " 5", "5 ", ""};
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", unreadable[i], 1);
+        ASSERT_EQ(cbm_index_restart_cap_for_testing(), INDEX_RESTART_CAP_DEFAULT);
+    }
+
+    restore_test_env("CBM_INDEX_MAX_RESTARTS", saved);
+    PASS();
+}
+
 /* Helper: mkdirp */
 static int test_mkdirp(const char *path) {
     char tmp[1024];
@@ -6561,8 +6638,19 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    /* Neither of these agents has a plugin directory, so a planned path under
+     * one would be invented. Name the two directories rather than searching the
+     * whole plan for "/plugins/": OpenCode does ship a real plugin file, and
+     * agent detection finds a command in /usr/local/bin or /opt/homebrew/bin
+     * whatever HOME and PATH say, so a blanket search passes or fails according
+     * to what the developer happens to have installed. */
+    char qoder_plugins[700];
+    char pi_plugins[700];
+    snprintf(qoder_plugins, sizeof(qoder_plugins), "%s/plugins/", qoder_dir);
+    snprintf(pi_plugins, sizeof(pi_plugins), "%s/plugins/", pi_dir);
     bool plan_ok =
-        plan && !strstr(plan, "/plugins/") && !strstr(plan, "plugin_files") &&
+        plan && !strstr(plan, qoder_plugins) && !strstr(plan, pi_plugins) &&
+        !strstr(plan, "plugin_files") &&
         test_json_string_array_contains(plan_root, "config_files_planned", qoder_settings) &&
         test_json_string_array_contains(plan_root, "config_files_planned", amazon_config) &&
         test_json_string_array_contains(plan_root, "config_files_planned", roo_config) &&
@@ -13481,8 +13569,16 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
     ASSERT_NULL(
         cbm_cli_external_manager_name_for_testing("/Users/x/.local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/cbm/codebase-memory-mcp"));
-    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("build/c/test-runner"));
+#ifdef __FreeBSD__
+    /* On FreeBSD the port/pkg owns ${LOCALBASE}/bin, so a binary there IS
+     * externally managed; elsewhere the same path is unremarkable. */
+    ASSERT_NOT_NULL(
+        cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/local/bin/codebase-memory-mcp"));
+#else
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+#endif
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(""));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(NULL));
     PASS();
@@ -13492,7 +13588,7 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
  * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
  * install silently recreated them. The selector restricts it.
  *
- * The vocabulary is the part that makes it usable: 26 clients ship, with tokens
+ * The vocabulary is the part that makes it usable: clients ship with tokens
  * nobody would guess (factory-droid, mistral-vibe, copilot-cli). A selector
  * whose accepted values can only be learned by reading our source is not a
  * usable selector, so this pins that every client is listed and that an unknown
@@ -13521,6 +13617,12 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     cbm_detected_agents_t typo = all;
     ASSERT_FALSE(cbm_cli_clients_apply_selection_for_testing("claude,codx", &typo));
 
+    /* Registry-backed clients share the public selector vocabulary. */
+    cbm_detected_agents_t registry = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("qoder", &registry));
+    ASSERT_FALSE(registry.claude_code);
+    ASSERT_FALSE(registry.cursor);
+
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
     for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
@@ -13529,6 +13631,34 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
         cbm_detected_agents_t one = all;
         ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing(token, &one));
     }
+    PASS();
+}
+
+TEST(cli_clients_selector_filters_registry_installs_issue1798) {
+    char *tmpdir = th_mktempdir("cbm_cli_clients_registry");
+    ASSERT_NOT_NULL(tmpdir);
+
+    char qoder_dir[512];
+    char settings_path[512];
+    ASSERT(snprintf(qoder_dir, sizeof(qoder_dir), "%s/.qoder", tmpdir) > 0);
+    ASSERT(snprintf(settings_path, sizeof(settings_path), "%s/settings.json", qoder_dir) > 0);
+    ASSERT_EQ(test_mkdirp(qoder_dir), 0);
+
+    cbm_cli_set_client_selection_for_testing("cursor");
+    int excluded_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    struct stat settings_state;
+    bool excluded = stat(settings_path, &settings_state) != 0;
+
+    cbm_cli_set_client_selection_for_testing("qoder");
+    int included_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool included = stat(settings_path, &settings_state) == 0;
+    cbm_cli_set_client_selection_for_testing(NULL);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(excluded_rc, 0);
+    ASSERT_TRUE(excluded);
+    ASSERT_EQ(included_rc, 0);
+    ASSERT_TRUE(included);
     PASS();
 }
 
@@ -13644,6 +13774,10 @@ TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
 
 SUITE(cli) {
     RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
+#ifndef _WIN32
+    RUN_TEST(cli_hook_deadline_ignores_an_unreadable_value);
+#endif
+    RUN_TEST(cli_index_restart_cap_honours_zero_and_refuses_junk);
     RUN_TEST(cli_progress_visibility_policy);
     RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);
     RUN_TEST(cli_maintenance_cancellation_forces_failure_status);
@@ -13679,6 +13813,7 @@ SUITE(cli) {
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
+    RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);

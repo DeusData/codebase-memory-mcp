@@ -365,6 +365,96 @@ TEST(ei_typescript_named_relative_import) {
     PASS();
 }
 
+/* #1682: extensionless dotted basenames are part of the module name.  The
+ * resolver used to strip `.engine`, miss the module, and bind both imports to
+ * the same-named fixture Function in the sibling spec file. */
+TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682) {
+    static const char *engine_path = "packages/api/src/modules/featureX/featureX.engine.ts";
+    static const char *consumer_path = "packages/api/src/modules/consumer/consumer.service.ts";
+    static const EILangFile f[] = {
+        {"packages/api/src/modules/featureX/featureX.engine.ts",
+         "export interface SomeType { id: string; qty: number; }\n"
+         "export interface Evaluation { rateByItem: Record<string, number>; }\n"
+         "export function helperB(configs: SomeType[], lines: SomeType[]): Evaluation {\n"
+         "  return { rateByItem: { [lines[0].id]: lines[0].qty + configs.length } };\n"
+         "}\n"},
+        {"packages/api/src/modules/featureX/featureX.service.ts",
+         "import { SomeType, Evaluation, helperB } from './featureX.engine';\n"
+         "export class FeatureXService {\n"
+         "  evaluate(configs: SomeType[], lines: SomeType[]): Evaluation {\n"
+         "    return helperB(configs, lines);\n"
+         "  }\n"
+         "}\n"},
+        {"packages/api/src/modules/featureX/featureX.service.spec.ts",
+         "import { SomeType, helperB } from './featureX.engine';\n"
+         "function featureX(overrides: Partial<SomeType>): SomeType {\n"
+         "  return { id: 'x', qty: 1, ...overrides };\n"
+         "}\n"
+         "export function exerciseFixture(): number {\n"
+         "  return helperB([featureX({})], [featureX({ qty: 2 })]).rateByItem.x;\n"
+         "}\n"},
+        {"packages/api/src/modules/consumer/consumer.service.ts",
+         "import { helperB, type SomeType } from '../featureX/featureX.engine';\n"
+         "export class ConsumerService {\n"
+         "  callerMethod(items: SomeType[]): number {\n"
+         "    return helperB(items, [{ id: 'p1', qty: 1 }]).rateByItem.p1;\n"
+         "  }\n"
+         "}\n"},
+        {"packages/mobile/src/api.ts",
+         "export function helperB(token: string): Promise<unknown> {\n"
+         "  return fetch('/api/x', { method: 'POST', body: token });\n"
+         "}\n"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t consumer_id = ei_node_id_for_file_label(store, lp.project, consumer_path, "File");
+    ASSERT_GT(consumer_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, consumer_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+
+    bool saw_helper = false;
+    bool saw_type = false;
+    bool helper_target_ok = false;
+    bool type_target_ok = false;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        bool is_helper = strstr(props, "\"local_name\":\"helperB\"") != NULL;
+        bool is_type = strstr(props, "\"local_name\":\"SomeType\"") != NULL;
+        if (!is_helper && !is_type) {
+            continue;
+        }
+
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        bool target_ok = target->file_path && strcmp(target->file_path, engine_path) == 0;
+        if (is_helper) {
+            saw_helper = true;
+            helper_target_ok = target_ok;
+        }
+        if (is_type) {
+            saw_type = true;
+            type_target_ok = target_ok;
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+
+    ASSERT_TRUE(saw_helper);
+    ASSERT_TRUE(saw_type);
+    ASSERT_TRUE(helper_target_ok);
+    ASSERT_TRUE(type_target_ok);
+    PASS();
+}
+
 /* TypeScript: default import `import helper from './util'`. */
 TEST(ei_typescript_default_import) {
     static const EILangFile f[] = {
@@ -1063,6 +1153,7 @@ SUITE(edge_imports) {
 
     /* ── GREEN GUARDS — TypeScript (must stay passing) ── */
     RUN_TEST(ei_typescript_named_relative_import);
+    RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);
