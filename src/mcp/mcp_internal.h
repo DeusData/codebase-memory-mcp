@@ -67,6 +67,7 @@ bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *
  * PowerShell -like contract. Exposed for
  * direct boundary tests only. */
 bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern);
+bool cbm_search_code_windows_path_matches_prefilter(const char *path, const char *file_pattern);
 
 /* Internal command builder exposed so tests can pin the PowerShell pipeline
  * ordering without
