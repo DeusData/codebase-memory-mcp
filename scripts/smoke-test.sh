@@ -838,15 +838,16 @@ else
   echo; echo "-- B3 first bytes (od) --"; echo "$IM_ARR" | od -c | head -6; exit 1
 fi
 
-# B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
-IM_STDIN=$(echo "{\"project\":\"$PROJECT\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
-if ! echo "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
-  echo "FAIL B4: stdin get_graph_schema did not resolve"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
+# B4: STDIN + --json is the generated-client transport. It must return the
+# complete MCP result envelope and must NOT emit a deprecation warning.
+IM_STDIN=$(printf '%s' "{\"project\":\"$PROJECT\"}" | "$BINARY" cli --json get_graph_schema 2>"$CLI_STDERR")
+if ! printf '%s' "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); c=d.get('content'); p=json.loads(c[0].get('text','')) if isinstance(c,list) and c and c[0].get('type') == 'text' else None; sys.exit(0 if d.get('isError') is not True and isinstance(p,dict) and isinstance(p.get('node_labels'),list) else 1)" 2>/dev/null; then
+  echo "FAIL B4: compact stdin + --json did not return a successful get_graph_schema MCP payload"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
 fi
 if grep -qi 'deprecated' "$CLI_STDERR"; then
   echo "FAIL B4: stdin path wrongly emitted a deprecation warning"; cat "$CLI_STDERR"; exit 1
 fi
-echo "OK B4: STDIN input resolves, no deprecation warning"
+echo "OK B4: compact STDIN + --json returns a successful schema MCP envelope, no deprecation warning"
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
 IM_ARGS_FILE=$(smoke_mktemp_file)
@@ -890,7 +891,8 @@ else
   echo "FAIL B6c: 'notatool --help' did not report 'unknown tool'"; cat "$CLI_STDERR"; exit 1
 fi
 
-# B7: DEPRECATION guard — one raw-JSON call MUST warn on stderr; flag form must NOT.
+# B7: DEPRECATION control — positional raw JSON MUST warn on stderr; this is
+# retained only to prove B4 is exercising the non-deprecated stdin transport.
 cli search_graph "{\"project\":\"$PROJECT\",\"name_pattern\":\"compute\"}" >/dev/null || true
 if grep -qi 'deprecated' "$CLI_STDERR"; then
   echo "OK B7a: raw-JSON cli emits deprecation warning on stderr"
@@ -1314,6 +1316,7 @@ echo "=== Phase 8: agent config install E2E ==="
 FAKE_HOME=$(smoke_mktemp_dir)
 mkdir -p "$FAKE_HOME/.claude"
 mkdir -p "$FAKE_HOME/.codex"
+mkdir -p "$FAKE_HOME/.grok"
 mkdir -p "$FAKE_HOME/.gemini/antigravity-cli"
 mkdir -p "$FAKE_HOME/.junie"
 mkdir -p "$FAKE_HOME/.cursor"
@@ -1635,7 +1638,7 @@ fi
 echo "OK 8c-i: Claude exact-tool graph subagent"
 
 # 8d: Claude Code hooks keep search augmentation and read-coverage reporting
-# separate: PreToolUse matches exactly Grep|Glob, while PostToolUse matches
+# separate: PreToolUse matches exactly Grep|Glob|Bash, while PostToolUse matches
 # exactly Read. Neither hook may grow a Search or catch-all matcher.
 if ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
@@ -1643,7 +1646,7 @@ d = json.load(sys.stdin)
 all_hooks = d.get('hooks', {})
 pre = all_hooks.get('PreToolUse', [])
 post = all_hooks.get('PostToolUse', [])
-ok = (any(h.get('matcher') == 'Grep|Glob' for h in pre) and
+ok = (any(h.get('matcher') == 'Grep|Glob|Bash' for h in pre) and
       any(h.get('matcher') == 'Read' for h in post))
 bad = any('Search' in str(h.get('matcher', '')) for h in pre + post)
 sys.exit(0 if (ok and not bad) else 1)
@@ -1651,7 +1654,7 @@ sys.exit(0 if (ok and not bad) else 1)
   echo "FAIL 8d: Claude search/read hook matchers are not exact"
   exit 1
 fi
-echo "OK 8d: Claude Code PreToolUse Grep|Glob + PostToolUse Read"
+echo "OK 8d: Claude Code PreToolUse Grep|Glob|Bash + PostToolUse Read"
 
 # 8e: Claude Code shim script — must be non-blocking augmenter, not a gate.
 # #929: Windows installs a .cmd script (extensionless bash shims triggered the
@@ -2302,16 +2305,125 @@ if ! path_match "$CMD" "$SELF_PATH" ||
 fi
 echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hook"
 
-# 8al: Pi has documented instructions and skill, but no invented MCP config.
+# 8al: Pi has documented instructions and skill, no invented MCP config, and
+# an installed generated extension that uses the non-deprecated stdin bridge.
 PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
 PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
+PI_EXTENSION="$FAKE_HOME/.pi/agent/extensions/cbmem.ts"
 if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
+   ! grep -Fq "spawn(BIN, ['cli', '--json', tool], {" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq "stdio: ['pipe', 'pipe', 'pipe']" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq "child.stdin.on('error'" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq 'child.stdin.end(JSON.stringify(args ?? {}));' "$PI_EXTENSION" 2>/dev/null ||
+   grep -Fq 'tool, JSON.stringify(args ?? {})]' "$PI_EXTENSION" 2>/dev/null ||
+   grep -Fq "stdio: ['ignore', 'pipe', 'pipe']" "$PI_EXTENSION" 2>/dev/null ||
    [ -e "$FAKE_HOME/.pi/agent/mcp.json" ]; then
-  echo "FAIL 8al: Pi durable context missing or unsupported MCP config created"
+  echo "FAIL 8al: Pi durable context or stdin client bridge missing, or unsupported MCP config created"
   exit 1
 fi
-echo "OK 8al: Pi durable context only (no MCP config)"
+echo "OK 8al: Pi durable context + stdin client bridge (no MCP config)"
+
+# 8al-node: execute the generated extension against a child that exits without
+# consuming a deliberately over-pipe-capacity payload. This is the lifecycle
+# Node implements: without an stdin error listener, the late EPIPE is an
+# unhandled EventEmitter error and crashes the Pi host. A second call emits a
+# valid MCP envelope before the same early exit, proving parsed JSON remains
+# authoritative over a retained stdin transport error.
+#
+# SKIP_WHITELIST: the minimal C-only Linux image intentionally has no Node.
+# What was tried: making Node a universal core-suite prerequisite would widen
+# the product's C build dependencies. The exact generated-source assertions
+# above still run there; this live probe gates every Node-equipped smoke venue.
+if command -v node >/dev/null 2>&1; then
+  PI_NODE=$(command -v node)
+  PI_PROBE_DIR="$TMPDIR/pi-node-probe"
+  mkdir -p "$PI_PROBE_DIR"
+  # The extension is loaded by the Pi host, not by bare Node, so the probe
+  # provides what that host provides: Node's builtins plus the packages Pi
+  # ships to extensions (`typebox` — Pi's schema library for tool
+  # parameters). Every import the generated file makes must come from that
+  # set, otherwise it loads in this probe and fails in a real install with
+  # ERR_MODULE_NOT_FOUND. The typebox stub is a Proxy: any Type.X(...) call
+  # returns a descriptor, so the probe never depends on which helpers the
+  # emitter uses; it only exercises the tool lifecycle.
+  PI_HOST_PACKAGES="typebox"
+  mkdir -p "$PI_PROBE_DIR/node_modules/typebox"
+  cat >"$PI_PROBE_DIR/node_modules/typebox/package.json" <<'PITYPEBOXPKG'
+{ "name": "typebox", "version": "0.0.0-smoke-stub", "type": "module", "exports": "./index.mjs" }
+PITYPEBOXPKG
+  cat >"$PI_PROBE_DIR/node_modules/typebox/index.mjs" <<'PITYPEBOXSTUB'
+export const Type = new Proxy({}, {
+  get: (_target, helper) => (...args) => ({ smokeStubHelper: String(helper), args }),
+});
+export default { Type };
+PITYPEBOXSTUB
+  PI_FOREIGN_IMPORTS=$(grep -oE "^import .* from '[^']+'" "$PI_EXTENSION" |
+    sed -E "s/.* from '([^']+)'/\1/" | grep -vE '^node:' |
+    grep -vxF -f <(
+      # shellcheck disable=SC2086
+      printf '%s\n' $PI_HOST_PACKAGES
+    ) || true)
+  if [ -n "$PI_FOREIGN_IMPORTS" ]; then
+    echo "FAIL 8al-node: generated Pi extension imports packages the Pi host does not provide: $(echo "$PI_FOREIGN_IMPORTS" | tr '\n' ' ')"
+    exit 1
+  fi
+  python3 - "$PI_EXTENSION" "$PI_PROBE_DIR/cbmem.mjs" <<'PYPIADAPTER'
+import pathlib
+import sys
+
+source, destination = map(pathlib.Path, sys.argv[1:])
+text = source.read_text(encoding="utf-8")
+lines = text.splitlines()
+matches = [i for i, line in enumerate(lines) if line.startswith("const BIN = ")]
+if len(matches) != 1:
+    raise SystemExit("generated Pi extension has no unique BIN declaration")
+lines[matches[0]] = "const BIN = process.execPath;"
+destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PYPIADAPTER
+  cat >"$PI_PROBE_DIR/cli" <<'PICHILD'
+const fs = require('node:fs');
+if (process.argv[3] === 'get_graph_schema') {
+  fs.writeSync(1, JSON.stringify({ content: [{ type: 'text', text: 'schema-ok' }] }) + '\n');
+}
+process.exit(0);
+PICHILD
+  if ! grep -Fxq 'const BIN = process.execPath;' "$PI_PROBE_DIR/cbmem.mjs" ||
+     ! grep -Fxq "const fs = require('node:fs');" "$PI_PROBE_DIR/cli"; then
+    echo "FAIL 8al-node: generated lifecycle probe is not portable across Node launch environments"
+    exit 1
+  fi
+  cat >"$PI_PROBE_DIR/probe.mjs" <<'PIPROBE'
+import extension from './cbmem.mjs';
+
+const tools = [];
+extension({ registerTool: (definition) => tools.push(definition) });
+const byName = (name) => tools.find((tool) => tool.name === name);
+const args = { padding: 'x'.repeat(16 * 1024 * 1024) };
+
+const successful = await byName('get_graph_schema').execute('probe-ok', args);
+if (successful?.content?.[0]?.text !== 'schema-ok') {
+  throw new Error('valid child JSON was not authoritative over stdin EPIPE');
+}
+
+let transportError = '';
+try {
+  await byName('search_graph').execute('probe-error', args);
+} catch (error) {
+  transportError = String(error?.message ?? error);
+}
+if (!/(EPIPE|broken pipe|write)/i.test(transportError)) {
+  throw new Error(`missing surfaced stdin transport error: ${transportError || '<none>'}`);
+}
+PIPROBE
+  if ! (cd "$PI_PROBE_DIR" && "$PI_NODE" probe.mjs); then
+    echo "FAIL 8al-node: generated Pi extension did not contain early-exit stdin errors"
+    exit 1
+  fi
+  echo "OK 8al-node: generated Pi extension contains EPIPE and keeps valid JSON authoritative"
+else
+  echo "SKIP 8al-node: Node unavailable in this C-only smoke venue (whitelisted above)"
+fi
 
 # 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
 WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
@@ -2558,7 +2670,40 @@ assert_tier_profile_set "Qoder" "$FAKE_HOME/.qoder/agents" ".md" "direct"
 assert_tier_profile_set "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md" "direct"
 assert_tier_profile_set "Pochi" "$FAKE_HOME/.pochi/agents" ".md" "handoff"
 assert_tier_profile_set "Rovo" "$FAKE_HOME/.rovodev/subagents" ".md" "handoff"
+assert_tier_profile_set "Grok" "$FAKE_HOME/.grok/agents" ".md" "direct"
 echo "OK 8aw: all supported Scout/Verify/Auditor profile sets"
+
+# 8ax: Grok Build config.toml MCP table (exactly one header), owned rules file,
+# skill, named-server subagent inheritance with dispatcher tool ids, and NO
+# hook: Grok's passive hook events discard stdout, so context hooks are withheld.
+GROK_CONFIG="$FAKE_HOME/.grok/config.toml"
+GROK_CMD=$(sed -n 's/^command *= *//p' "$GROK_CONFIG" 2>/dev/null | head -1)
+if ! grep -q '^\[mcp_servers\.codebase-memory-mcp\]$' "$GROK_CONFIG" 2>/dev/null ||
+   [ "$(grep -c '^\[mcp_servers\.codebase-memory-mcp\]$' "$GROK_CONFIG" 2>/dev/null)" != "1" ] ||
+   ! grep -q '^args = \[\]$' "$GROK_CONFIG" 2>/dev/null ||
+   ! quoted_path_value_matches "$GROK_CMD" "$SELF_PATH"; then
+  echo "FAIL 8ax: Grok Build MCP table missing or malformed"
+  exit 1
+fi
+if ! grep -q 'search_graph' "$FAKE_HOME/.grok/rules/codebase-memory.md" 2>/dev/null ||
+   ! grep -q 'search_graph' "$FAKE_HOME/.grok/skills/codebase-memory/SKILL.md" 2>/dev/null; then
+  echo "FAIL 8ax: Grok Build rules file or skill missing"
+  exit 1
+fi
+GROK_AGENT="$FAKE_HOME/.grok/agents/codebase-memory.md"
+if ! grep -Fq 'tools: read_file, grep, list_dir, search_tool, use_tool' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq '    - codebase-memory-mcp' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq 'codebase-memory-mcp__search_graph' "$GROK_AGENT" 2>/dev/null ||
+   ! grep -Fq 'codebase-memory-mcp__check_index_coverage' "$GROK_AGENT" 2>/dev/null ||
+   grep -Fq 'codebase-memory-mcp__*' "$GROK_AGENT" 2>/dev/null; then
+  echo "FAIL 8ax: Grok Build graph agent lacks named inheritance or dispatcher tool ids"
+  exit 1
+fi
+if [ -e "$FAKE_HOME/.grok/hooks" ]; then
+  echo "FAIL 8ax: Grok Build must not receive hooks"
+  exit 1
+fi
+echo "OK 8ax: Grok Build MCP + rules + skill + named-inheritance agents; hooks withheld"
 
 echo ""
 echo "=== Phase 9: agent config uninstall E2E ==="
@@ -2813,6 +2958,7 @@ echo "OK 9l: JSON agents, lifecycle hooks, and Kilo cleaned; foreign settings pr
 if grep -q '^  codebase-memory-mcp:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
    grep -q '^  pre_llm_call:' "$FAKE_HOME/.hermes/config.yaml" 2>/dev/null ||
    grep -q '^  codebase-memory-mcp:' "$GOOSE_CFG" 2>/dev/null ||
+   grep -q 'codebase-memory-mcp' "$FAKE_HOME/.grok/config.toml" 2>/dev/null ||
    grep -q '^name = "codebase-memory-mcp"' "$FAKE_HOME/.vibe/config.toml" 2>/dev/null; then
   echo "FAIL 9m: YAML/TOML MCP entry remains"
   exit 1
@@ -2834,6 +2980,7 @@ for CONTEXT_FILE in \
   "$KILO_RULE" \
   "$CLINE_RULE" \
   "$FAKE_HOME/.vibe/AGENTS.md" \
+  "$FAKE_HOME/.grok/rules/codebase-memory.md" \
   "$FAKE_HOME/.codeium/windsurf/memories/global_rules.md" \
   "$DEVIN_INSTRUCTIONS" \
   "$CODEBUDDY_INSTRUCTIONS" \
@@ -2872,6 +3019,7 @@ if [ -d "$FAKE_HOME/.claude/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.rovodev/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.copilot/skills/codebase-memory" ] ||
    [ -d "$FAKE_HOME/.vibe/skills/codebase-memory" ] ||
+   [ -d "$FAKE_HOME/.grok/skills/codebase-memory" ] ||
    [ -e "$DEVIN_SKILL" ] ||
    [ -e "$CODEBUDDY_SKILL" ] ||
    [ -e "$BOB_SKILL" ] ||
@@ -2909,6 +3057,7 @@ assert_tier_profile_set_removed "Qwen" "$FAKE_HOME/.qwen/agents" ".md"
 assert_tier_profile_set_removed "Factory" "$FAKE_HOME/.factory/droids" ".md"
 assert_tier_profile_set_removed "Vibe" "$FAKE_HOME/.vibe/agents" ".toml"
 assert_tier_profile_set_removed "Vibe prompt" "$FAKE_HOME/.vibe/prompts" ".md"
+assert_tier_profile_set_removed "Grok" "$FAKE_HOME/.grok/agents" ".md"
 assert_tier_profile_set_removed "Copilot" "$FAKE_HOME/.copilot/agents" ".agent.md"
 assert_tier_profile_set_removed "Qoder" "$FAKE_HOME/.qoder/agents" ".md"
 assert_tier_profile_set_removed "CodeBuddy" "$FAKE_HOME/.codebuddy/agents" ".md"

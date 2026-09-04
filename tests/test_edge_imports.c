@@ -241,6 +241,20 @@ static void ei_cleanup(EILangProj *lp, cbm_store_t *store) {
 
 /* Index `files`, check IMPORTS count >= `floor`.  Dumps a diagnostic on
  * failure so failures are self-diagnosable without re-running manually. */
+/* Exact-count variant of ei_edge_present: a fabricated EXTRA edge must fail
+ * the probe, so a floor is not enough (#1932's negative-assertion gap). */
+static int ei_edge_count_is(const EILangFile *files, int nfiles, const char *edge_type,
+                            int expected) {
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, files, nfiles);
+    int got = store ? cbm_store_count_edges_by_type(store, lp.project, edge_type) : -1;
+    if (got != expected) {
+        fprintf(stderr, "  [%s] FAIL count=%d expected==%d\n", edge_type, got, expected);
+    }
+    ei_cleanup(&lp, store);
+    return got == expected;
+}
+
 static int ei_edge_present(const EILangFile *files, int nfiles, const char *edge_type, int floor) {
     EILangProj lp;
     cbm_store_t *store = ei_index_files(&lp, files, nfiles);
@@ -348,6 +362,96 @@ TEST(ei_typescript_named_relative_import) {
         {"main.ts", "import { helper } from './util';\n\n"
                     "export function run(y: number): number { return helper(y); }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 2, "IMPORTS", 1));
+    PASS();
+}
+
+/* #1682: extensionless dotted basenames are part of the module name.  The
+ * resolver used to strip `.engine`, miss the module, and bind both imports to
+ * the same-named fixture Function in the sibling spec file. */
+TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682) {
+    static const char *engine_path = "packages/api/src/modules/featureX/featureX.engine.ts";
+    static const char *consumer_path = "packages/api/src/modules/consumer/consumer.service.ts";
+    static const EILangFile f[] = {
+        {"packages/api/src/modules/featureX/featureX.engine.ts",
+         "export interface SomeType { id: string; qty: number; }\n"
+         "export interface Evaluation { rateByItem: Record<string, number>; }\n"
+         "export function helperB(configs: SomeType[], lines: SomeType[]): Evaluation {\n"
+         "  return { rateByItem: { [lines[0].id]: lines[0].qty + configs.length } };\n"
+         "}\n"},
+        {"packages/api/src/modules/featureX/featureX.service.ts",
+         "import { SomeType, Evaluation, helperB } from './featureX.engine';\n"
+         "export class FeatureXService {\n"
+         "  evaluate(configs: SomeType[], lines: SomeType[]): Evaluation {\n"
+         "    return helperB(configs, lines);\n"
+         "  }\n"
+         "}\n"},
+        {"packages/api/src/modules/featureX/featureX.service.spec.ts",
+         "import { SomeType, helperB } from './featureX.engine';\n"
+         "function featureX(overrides: Partial<SomeType>): SomeType {\n"
+         "  return { id: 'x', qty: 1, ...overrides };\n"
+         "}\n"
+         "export function exerciseFixture(): number {\n"
+         "  return helperB([featureX({})], [featureX({ qty: 2 })]).rateByItem.x;\n"
+         "}\n"},
+        {"packages/api/src/modules/consumer/consumer.service.ts",
+         "import { helperB, type SomeType } from '../featureX/featureX.engine';\n"
+         "export class ConsumerService {\n"
+         "  callerMethod(items: SomeType[]): number {\n"
+         "    return helperB(items, [{ id: 'p1', qty: 1 }]).rateByItem.p1;\n"
+         "  }\n"
+         "}\n"},
+        {"packages/mobile/src/api.ts",
+         "export function helperB(token: string): Promise<unknown> {\n"
+         "  return fetch('/api/x', { method: 'POST', body: token });\n"
+         "}\n"},
+    };
+
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, (int)(sizeof(f) / sizeof(f[0])));
+    ASSERT_NOT_NULL(store);
+
+    int64_t consumer_id = ei_node_id_for_file_label(store, lp.project, consumer_path, "File");
+    ASSERT_GT(consumer_id, 0);
+
+    cbm_edge_t *edges = NULL;
+    int edge_count = 0;
+    ASSERT_EQ(
+        cbm_store_find_edges_by_source_type(store, consumer_id, "IMPORTS", &edges, &edge_count),
+        CBM_STORE_OK);
+
+    bool saw_helper = false;
+    bool saw_type = false;
+    bool helper_target_ok = false;
+    bool type_target_ok = false;
+    for (int i = 0; i < edge_count; i++) {
+        const char *props = edges[i].properties_json ? edges[i].properties_json : "";
+        bool is_helper = strstr(props, "\"local_name\":\"helperB\"") != NULL;
+        bool is_type = strstr(props, "\"local_name\":\"SomeType\"") != NULL;
+        if (!is_helper && !is_type) {
+            continue;
+        }
+
+        cbm_node_t *target = (cbm_node_t *)calloc(1, sizeof(cbm_node_t));
+        ASSERT_NOT_NULL(target);
+        ASSERT_EQ(cbm_store_find_node_by_id(store, edges[i].target_id, target), CBM_STORE_OK);
+        bool target_ok = target->file_path && strcmp(target->file_path, engine_path) == 0;
+        if (is_helper) {
+            saw_helper = true;
+            helper_target_ok = target_ok;
+        }
+        if (is_type) {
+            saw_type = true;
+            type_target_ok = target_ok;
+        }
+        cbm_store_free_nodes(target, 1);
+    }
+    cbm_store_free_edges(edges, edge_count);
+    ei_cleanup(&lp, store);
+
+    ASSERT_TRUE(saw_helper);
+    ASSERT_TRUE(saw_type);
+    ASSERT_TRUE(helper_target_ok);
+    ASSERT_TRUE(type_target_ok);
     PASS();
 }
 
@@ -510,6 +614,34 @@ TEST(ei_go_two_consumers_same_package) {
         {"b/b.go", "package b\n\nimport \"example.com/two/util\"\n\n"
                    "func Run() int { return util.Helper(2) }\n"}};
     ASSERT_TRUE(ei_edge_present(f, 4, "IMPORTS", 2));
+    PASS();
+}
+
+TEST(ei_go_import_never_binds_symbol) {
+    /* #1934: a Go import path names a package, never a symbol. `os/exec` is
+     * external (not in the graph), so the ONLY correct outcome is no edge —
+     * but Strategy 3's symbol-name fallback matched the path's last segment
+     * against any project definition named `exec` and bound the import to a
+     * test harness's method. Exact count: the internal `util` import (edge 1,
+     * via Strategy 1 → the package Folder) must be the whole IMPORTS
+     * relation; the fallback edge onto harness.exec (reproduce-first RED:
+     * count 2) must not exist. */
+    static const EILangFile f[] = {
+        {"go.mod", "module example.com/fxi\n\ngo 1.22\n"},
+        {"util/util.go", "package util\n\nfunc Tag() string { return \"t\" }\n"},
+        {"helper/harness.go", "package helper\n\ntype harness struct{ n int }\n\n"
+                              "func (h *harness) exec(cmd string) error { return nil }\n"},
+        /* Same-package decoy: the field-measured survivor bound os/exec to a
+         * method in the IMPORTER'S OWN package (Strategy 1b's sibling-file
+         * resolution accepts symbol labels too), so the fixture needs the
+         * collision both cross-package and same-package. */
+        {"app/aux.go", "package app\n\ntype runner struct{ n int }\n\n"
+                       "func (r *runner) exec(cmd string) error { return nil }\n"},
+        {"app/run.go", "package app\n\nimport (\n\t\"os/exec\"\n\n"
+                       "\t\"example.com/fxi/util\"\n)\n\n"
+                       "func Run() error {\n\t_ = util.Tag()\n"
+                       "\treturn exec.Command(\"true\").Run()\n}\n"}};
+    ASSERT_TRUE(ei_edge_count_is(f, 5, "IMPORTS", 1));
     PASS();
 }
 
@@ -1021,6 +1153,7 @@ SUITE(edge_imports) {
 
     /* ── GREEN GUARDS — TypeScript (must stay passing) ── */
     RUN_TEST(ei_typescript_named_relative_import);
+    RUN_TEST(ei_typescript_dotted_relative_import_targets_source_module_issue1682);
     RUN_TEST(ei_typescript_default_import);
     RUN_TEST(ei_typescript_namespace_import);
     RUN_TEST(ei_typescript_aliased_import);
@@ -1037,6 +1170,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_subpackage_import);
     RUN_TEST(ei_go_blank_import);
     RUN_TEST(ei_go_two_consumers_same_package);
+    RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */

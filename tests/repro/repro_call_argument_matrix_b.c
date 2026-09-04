@@ -1,5 +1,5 @@
 /*
- * Exhaustive call-argument reproduction matrix, CBMLanguage 80..162.
+ * Exhaustive call-argument reproduction matrix, CBMLanguage 80..164.
  *
  * Every language in this numeric range whose live spec has call-node metadata
  * owns one TEST row below. Semantic applications are exercised twice: once as
@@ -752,6 +752,12 @@ static const char TLAPLUS_BOUNDED_QUANTIFICATION[] =
     "Guard(values) == \\A item \\in values : item = item\n"
     "====\n";
 
+/* Pkl access expressions double as plain property reads, so the bare fixture
+ * also proves the un-applied reference is not promoted to a call. */
+static const char PKL_INSIDE[] = "function accept(value: Int): Int = value\n"
+                                 "function run(watched: Int): Int = accept(watched)\n";
+static const char PKL_BARE[] = "function run(watched: Int): Int = watched\n";
+
 static const char APEX_INSIDE[] = "public class Sample {\n"
                                   "  private static Integer accept(Integer value) {\n"
                                   "    return value;\n"
@@ -843,6 +849,36 @@ static const char OBJECTSCRIPT_ROUTINE_BARE[] = "SAMPLE\n"
                                                 "    Quit\n"
                                                 "Run(watched)\n"
                                                 "    Quit watched\n";
+
+/* Chialisp: a .clib wraps its definitions in one enclosing list; a call is a
+ * `list` whose head symbol is the callee, and a parameter list is a `list`
+ * too — so `total_calls` here also pins that a binder is not an invocation. */
+static const char CHIALISP_INSIDE[] = "(\n"
+                                      "  (defun accept (value) value)\n"
+                                      "  (defun run (watched) (accept watched))\n"
+                                      ")\n";
+static const char CHIALISP_BARE[] = "(\n"
+                                    "  (defun run (watched) watched)\n"
+                                    ")\n";
+
+static const char PLSQL_INSIDE[] = "CREATE OR REPLACE PACKAGE BODY sample_pkg AS\n"
+                                   "  FUNCTION accept(value NUMBER) RETURN NUMBER IS\n"
+                                   "  BEGIN\n"
+                                   "    RETURN value;\n"
+                                   "  END;\n"
+                                   "  FUNCTION run(watched NUMBER) RETURN NUMBER IS\n"
+                                   "  BEGIN\n"
+                                   "    RETURN accept(watched);\n"
+                                   "  END;\n"
+                                   "END sample_pkg;\n"
+                                   "/\n";
+static const char PLSQL_BARE[] = "CREATE OR REPLACE PACKAGE BODY sample_pkg AS\n"
+                                 "  FUNCTION run(watched NUMBER) RETURN NUMBER IS\n"
+                                 "  BEGIN\n"
+                                 "    RETURN watched;\n"
+                                 "  END;\n"
+                                 "END sample_pkg;\n"
+                                 "/\n";
 
 #define ROUTINE_ARGUMENT_CASE(tag_value, language_value, filename_value, inside_value, bare_value, \
                               kind_value, caller_value, callee_value, argument_value, defs_value,  \
@@ -958,6 +994,9 @@ static const RoutineArgumentCase LLVM_IR_CASE = ROUTINE_ARGUMENT_CASE(
 static const RoutineArgumentCase TLAPLUS_CASE = ROUTINE_ARGUMENT_CASE(
     "TLAPLUS", CBM_LANG_TLAPLUS, "Sample.tla", TLAPLUS_INSIDE, TLAPLUS_BARE, "bound_op", "Guard",
     "Accept", "values", 1, 1, 0, "TLA+ operator application with a value argument");
+static const RoutineArgumentCase PKL_CASE = ROUTINE_ARGUMENT_CASE(
+    "PKL", CBM_LANG_PKL, "sample.pkl", PKL_INSIDE, PKL_BARE, "unqualifiedAccessExpr", "run",
+    "accept", "watched", 1, 1, 0, "native Pkl method application and property-read vocabulary");
 static const RoutineArgumentCase APEX_CASE = ROUTINE_ARGUMENT_CASE(
     "APEX", CBM_LANG_APEX, "Sample.cls", APEX_INSIDE, APEX_BARE, "method_invocation", "run",
     "accept", "watched", 1, 1, 0, "native method application");
@@ -984,6 +1023,13 @@ static const RoutineArgumentCase OBJECTSCRIPT_ROUTINE_CASE = ROUTINE_ARGUMENT_CA
     "OBJECTSCRIPT_ROUTINE", CBM_LANG_OBJECTSCRIPT_ROUTINE, "Sample.mac",
     OBJECTSCRIPT_ROUTINE_INSIDE, OBJECTSCRIPT_ROUTINE_BARE, "extrinsic_function", "Run", "Accept",
     "watched", 1, 1, 0, "ObjectScript routine extrinsic application with a value argument");
+static const RoutineArgumentCase PLSQL_CASE = ROUTINE_ARGUMENT_CASE(
+    "PLSQL", CBM_LANG_PLSQL, "sample_pkg.pkb", PLSQL_INSIDE, PLSQL_BARE, "ref_call", "run",
+    "accept", "watched", 1, 1, 0, "native PL/SQL package-body routine application");
+
+static const RoutineArgumentCase CHIALISP_CASE = ROUTINE_ARGUMENT_CASE(
+    "CHIALISP", CBM_LANG_CHIALISP, "sample.clib", CHIALISP_INSIDE, CHIALISP_BARE, "list", "run",
+    "accept", "watched", 1, 1, 0, "Chialisp list application and symbol-reference vocabulary");
 
 static const ModuleArgumentCase JUST_CASE = MODULE_ARGUMENT_CASE(
     "JUST", CBM_LANG_JUST, "justfile", JUST_INSIDE, JUST_BARE, "function_call", "uppercase",
@@ -1166,6 +1212,7 @@ DEFINE_ROUTINE_ARGUMENT_TEST(func, FUNC_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(puppet, PUPPET_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(slang, SLANG_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(llvm_ir, LLVM_IR_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(pkl, PKL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(apex, APEX_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(pine, PINE_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(qml, QML_CASE)
@@ -1174,6 +1221,8 @@ DEFINE_ROUTINE_ARGUMENT_TEST(cfml, CFML_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(mojo, MOJO_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_udl, OBJECTSCRIPT_UDL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_routine, OBJECTSCRIPT_ROUTINE_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(plsql, PLSQL_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(chialisp, CHIALISP_CASE)
 
 #undef DEFINE_ROUTINE_ARGUMENT_TEST
 
@@ -1243,15 +1292,15 @@ TEST(repro_call_argument_matrix_b_domain_bitbake) {
 }
 
 enum {
-    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 36,
+    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 39,
     MODULE_ARGUMENT_LANGUAGE_COUNT = 4,
     DOMAIN_CONTROL_LANGUAGE_COUNT = 6,
     MATRIX_LANGUAGE_COUNT = ROUTINE_ARGUMENT_LANGUAGE_COUNT + MODULE_ARGUMENT_LANGUAGE_COUNT +
                             DOMAIN_CONTROL_LANGUAGE_COUNT,
 };
 
-_Static_assert(MATRIX_LANGUAGE_COUNT == 46,
-               "RACKET..OBJECTSCRIPT_ROUTINE call-capable matrix must contain exactly 46 "
+_Static_assert(MATRIX_LANGUAGE_COUNT == 49,
+               "RACKET..CHIALISP call-capable matrix must contain exactly 49 "
                "language rows");
 
 #define MATRIX_B_LANGUAGE_ROWS(X)                                                               \
@@ -1283,6 +1332,7 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 46,
     X(repro_call_argument_matrix_b_routine_slang, SLANG_CASE.identity.language)                 \
     X(repro_call_argument_matrix_b_routine_llvm_ir, LLVM_IR_CASE.identity.language)             \
     X(repro_call_argument_matrix_b_routine_tlaplus, TLAPLUS_CASE.identity.language)             \
+    X(repro_call_argument_matrix_b_routine_pkl, PKL_CASE.identity.language)                     \
     X(repro_call_argument_matrix_b_routine_apex, APEX_CASE.identity.language)                   \
     X(repro_call_argument_matrix_b_routine_pine, PINE_CASE.identity.language)                   \
     X(repro_call_argument_matrix_b_routine_qml, QML_CASE.identity.language)                     \
@@ -1293,6 +1343,8 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 46,
       OBJECTSCRIPT_UDL_CASE.identity.language)                                                  \
     X(repro_call_argument_matrix_b_routine_objectscript_routine,                                \
       OBJECTSCRIPT_ROUTINE_CASE.identity.language)                                              \
+    X(repro_call_argument_matrix_b_routine_plsql, PLSQL_CASE.identity.language)                 \
+    X(repro_call_argument_matrix_b_routine_chialisp, CHIALISP_CASE.identity.language)           \
     X(repro_call_argument_matrix_b_module_just, JUST_CASE.identity.language)                    \
     X(repro_call_argument_matrix_b_module_gotemplate, GOTEMPLATE_CASE.identity.language)        \
     X(repro_call_argument_matrix_b_module_linkerscript, LINKERSCRIPT_CASE.identity.language)    \

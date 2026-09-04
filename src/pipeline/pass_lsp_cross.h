@@ -54,10 +54,19 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * receives per-file prefix offsets: file i's defs occupy
  * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
  * needs the per-file slices, which the flat array does not otherwise
- * record. */
-CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
-                                    int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts);
+ * record.
+ *
+ * `ctx` (nullable) enables cross-file base-class resolution: for the
+ * languages whose cross registrars read embedded_types as qualified names
+ * (Python, JS/TS/TSX), every CBMDefinition.base_classes spelling is resolved
+ * to a project QN through ctx->registry plus the file's import map — the same
+ * inputs pass_semantic uses to draw its INHERITS edge, so the LSP's
+ * inheritance view and the graph's cannot diverge. Pass NULL to keep the raw
+ * source spelling (surface-probe paths that build no registry). */
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                    const cbm_file_info_t *files, int file_count,
+                                    const char *project_name, char **def_modules, int *out_count,
+                                    int *out_def_starts);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -143,8 +152,9 @@ void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint
 
 static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegistries *r,
                                                          CBMLanguage lang) {
-    if (!r)
+    if (!r) {
         return NULL;
+    }
     switch (lang) {
     case CBM_LANG_GO:
         return r->go;
@@ -169,25 +179,29 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
-/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
- * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
- * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
+/* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
+ * The manifest owns strings in manifest_arena; callers keep that arena alive
+ * until every resolver worker has joined.  Each worker must install the shared
+ * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
 struct CBMCargoManifest;
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
+                                 struct CBMCargoManifest *out_manifest);
+void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends
  * resolved CALLS into r->resolved_calls (lives in r->arena). Caller
- * owns source, module_qn, all_defs, imp_keys, imp_vals.
- * NOTE: all_defs is read-only in practice but typed non-const to match
+ * owns source, module_qn, defs, imp_names, imp_qns.
+ * NOTE: defs is read-only in practice but typed non-const to match
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
-                     const char *module_qn, CBMLSPDef *all_defs, int def_count,
-                     const char **imp_keys, const char **imp_vals, int imp_count);
+                     const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
+                     const char **imp_qns, int imp_count);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
-                        CBMLSPDef *all_defs, int def_count, const char **imp_keys,
-                        const char **imp_vals, int imp_count, bool js_mode, bool jsx_mode,
+                        CBMLSPDef *defs, int def_count, const char **imp_names,
+                        const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode);
 
 /* Per-file cross-LSP dispatch shared by the parallel resolve worker AND the

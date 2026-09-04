@@ -171,6 +171,21 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
     {"racket", CBM_LANG_RACKET, "a.rkt", "(define (foo) 1)\n(define (bar) 2)\n", 1, {NULL}},
     {"rescript", CBM_LANG_RESCRIPT, "a.res", "let foo = () => 1\nlet bar = () => 2\n", 1, {NULL}},
     {"scheme", CBM_LANG_SCHEME, "a.scm", "(define (foo) 1)\n(define (bar) 2)\n", 1, {NULL}},
+    /* Chialisp: every def is a head symbol of a generic `list`, and they are
+     * NESTED inside the top-level `(mod ...)` — the fixture must exercise that
+     * nesting, or the walk could stop at `mod` and still look green. */
+    {"chialisp",
+     CBM_LANG_CHIALISP,
+     "a.clsp",
+     "(mod (ARG)\n"
+     "  (include condition_codes.clib)\n"
+     "  (defconstant TWO 2)\n"
+     "  (defun-inline square (x) (* x x))\n"
+     "  (defmacro twice (v) (qq (+ (unquote v) (unquote v))))\n"
+     "  (square ARG)\n"
+     ")\n",
+     3,
+     {"square", "TWO", "twice", NULL}},
     {"slang", CBM_LANG_SLANG, "a.slang", "void foo() {}\nvoid bar() {}\n", 1, {NULL}},
     {"squirrel", CBM_LANG_SQUIRREL, "a.nut", "function foo() {}\nfunction bar() {}\n", 1, {NULL}},
     {"starlark",
@@ -199,9 +214,30 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
     {"mojo",
      CBM_LANG_MOJO,
      "a.mojo",
-     "fn foo() -> Int:\n    return 1\n\nstruct A:\n    fn bar(self) -> Int:\n        return foo()\n",
+     "fn foo() -> Int:\n    return 1\n\nstruct A:\n    fn bar(self) -> Int:\n        return "
+     "foo()\n",
      2,
      {"foo", "A", NULL}},
+    {"arkts",
+     CBM_LANG_ARKTS,
+     "a.ets",
+     "@Component\nstruct Card {\n  @State title: string = ''\n\n  build() {\n    Column() {\n"
+     "      Text(this.title).fontSize(20)\n    }\n  }\n}\n\n@Builder\nfunction rowCard() {\n"
+     "  Row() {}\n}\n",
+     2,
+     {"Card", "build", "rowCard"}},
+    {"plsql",
+     CBM_LANG_PLSQL,
+     "emp_pkg.pkb",
+     "CREATE OR REPLACE PACKAGE BODY emp_pkg AS\n"
+     "  FUNCTION hire(p_name VARCHAR2) RETURN NUMBER IS\n"
+     "  BEGIN\n"
+     "    RETURN util_pkg.calc_salary(p_name);\n"
+     "  END;\n"
+     "END emp_pkg;\n"
+     "/\n",
+     2,
+     {"emp_pkg", "hire", NULL}},
     {"smali",
      CBM_LANG_SMALI,
      "A.smali",

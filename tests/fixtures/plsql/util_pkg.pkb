@@ -1,0 +1,12 @@
+CREATE OR REPLACE PACKAGE util_pkg AS
+  FUNCTION calc_salary(p_name VARCHAR2) RETURN NUMBER;
+END util_pkg;
+/
+
+CREATE OR REPLACE PACKAGE BODY util_pkg AS
+  FUNCTION calc_salary(p_name VARCHAR2) RETURN NUMBER IS
+  BEGIN
+    RETURN 1000;
+  END;
+END util_pkg;
+/

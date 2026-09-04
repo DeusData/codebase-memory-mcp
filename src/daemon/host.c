@@ -583,9 +583,22 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
         cbm_log_error("daemon.runtime_config_open_failed", "reason", "config_db_unavailable");
         return false;
     }
-    host->watch_store = cbm_store_open_memory();
     host->project_locks = cbm_project_lock_manager_new(endpoint);
-    host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
+    /* #335: watcher_enabled (default true) is the master switch for the
+     * background watcher. When false the daemon never builds the watcher or the
+     * in-memory store backing it, so the poll thread never starts
+     * (host_background_start has nothing to run) and no project ever registers
+     * (register_watcher_if_enabled early-returns on a NULL watcher). The daemon
+     * still starts and still owns everything else: IPC, HTTP/UI, project locks,
+     * and manual index_repository. Read once here at daemon startup, so a change
+     * takes effect when the daemon next starts — see docs/CONFIGURATION.md. */
+    bool watcher_enabled = cbm_config_watcher_enabled(host->runtime_config);
+    if (watcher_enabled) {
+        host->watch_store = cbm_store_open_memory();
+        host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
+    } else {
+        cbm_log_info("watcher.disabled", "reason", "config");
+    }
     cbm_daemon_application_config_t application_config = {
         .watcher = host->watcher,
         .config = host->runtime_config,
@@ -598,7 +611,12 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
     if (host->application && host->permanent) {
         cbm_daemon_application_set_permanent(host->application, true);
     }
-    if (!host->watch_store || !host->watcher || !host->project_locks || !host->application) {
+    if (!host->project_locks || !host->application) {
+        return false;
+    }
+    /* A watcher deliberately left unbuilt by watcher_enabled=false is not a
+     * startup failure; an allocation failure while it is enabled still is. */
+    if (watcher_enabled && (!host->watch_store || !host->watcher)) {
         return false;
     }
     return true;
@@ -824,10 +842,14 @@ bool cbm_daemon_host_http_thread_create_failure_lifecycle_for_test(void) {
 }
 
 static bool host_background_start(host_state_t *host) {
-    if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
-        return false;
+    /* No watcher object when watcher_enabled=false (#335) — nothing to run, and
+     * the daemon must still come up with its remaining subsystems. */
+    if (host->watcher) {
+        if (cbm_thread_create(&host->watcher_thread, 0, host_watcher_thread, host->watcher) != 0) {
+            return false;
+        }
+        host->watcher_started = true;
     }
-    host->watcher_started = true;
 
     host_http_reconcile_at(host, cbm_now_ms(), true);
     return true;
