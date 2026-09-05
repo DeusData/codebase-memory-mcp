@@ -3384,6 +3384,63 @@ TEST(tool_index_status_keeps_authoritative_ignored_total_when_rows_are_sampled) 
     PASS();
 }
 
+/* #2012: a COUNT(*) that cannot be read must not be reported as an empty
+ * project. The store now returns CBM_STORE_ERR for a failed step, and
+ * index_status has to say the read failed rather than answering "empty" with
+ * a bare -1 as the count. Dropping the tables after the first call makes the
+ * step (not the prepare) fail deterministically, because the statements are
+ * cached by then. */
+TEST(tool_index_status_reports_an_unreadable_count_as_an_error) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    /* First call: a healthy project, and it caches the count statements. */
+    char *response = cbm_mcp_handle_tool(srv, "index_status",
+                                         "{\"project\":\"test-project\",\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "status")), "ready");
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    ASSERT_EQ(cbm_store_exec(store, "DROP TABLE nodes;"), 0);
+    ASSERT_EQ(cbm_store_exec(store, "DROP TABLE edges;"), 0);
+
+    response = cbm_mcp_handle_tool(srv, "index_status",
+                                   "{\"project\":\"test-project\",\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    doc = yyjson_read(inner, strlen(inner), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+
+    /* Not "empty": that is the false all-clear the issue is about. */
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(root, "status")), "error");
+
+    /* A failed read is not a count, so no negative number reaches the caller. */
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(root, "nodes")) >= 0);
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(root, "edges")) >= 0);
+
+    /* The hint names the unreadable table instead of telling the user to
+     * re-index an "empty" project. */
+    const char *hint = yyjson_get_str(yyjson_obj_get(root, "hint"));
+    ASSERT_NOT_NULL(hint);
+    ASSERT_TRUE(strstr(hint, "could not be read") != NULL);
+    ASSERT_TRUE(strstr(hint, "Project is empty") == NULL);
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_output_byte_budgets) {
     /* GUARD: absolute byte ceilings on default tool outputs. Re-bloat (e.g.
      * a property blob sneaking back into row emission — the fp field alone
@@ -19827,6 +19884,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_toon_never_leaks_internal_fields);
     RUN_TEST(tool_lean_defaults_schema_and_status);
     RUN_TEST(tool_index_status_keeps_authoritative_ignored_total_when_rows_are_sampled);
+    RUN_TEST(tool_index_status_reports_an_unreadable_count_as_an_error);
     RUN_TEST(tool_output_regression_gate);
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
