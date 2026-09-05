@@ -1,0 +1,283 @@
+{
+  "llmOffByDefault": true,
+  "zeroLlmRequestsWhileOff": true,
+  "notRunningHonest": true,
+  "statusReady": true,
+  "modelShown": "Qwen3.5-2B",
+  "chipShown": true,
+  "stopFallsBackHonestly": true,
+  "policyBlocks": true,
+  "switchIneffective": true,
+  "port": 4301,
+  "leftoverProcesses": 0,
+  "sidecarPort": 4141,
+  "project": "codeatlasweb-w5a",
+  "policyProject": "codeatlasweb-w5a-policy",
+  "fixture": "fixtures/atlas-sample (nur gelesen; die Policy liegt in einer Kopie)",
+  "model": {
+    "choice": "class-a",
+    "expected": "Qwen3.5-2B"
+  },
+  "timings": {
+    "buildMs": 10800,
+    "readyMs": 2997,
+    "totalMs": 60911
+  },
+  "generatedAt": "2026-08-30T18:44:57.299Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [
+      "Failed to load resource: net::ERR_CONNECTION_REFUSED",
+      "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+    ],
+    "pageErrors": [],
+    "sidecarRequests": [
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 42230
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 45221
+      },
+      {
+        "url": "http://127.0.0.1:4141/props",
+        "atMs": 45224
+      },
+      {
+        "url": "http://127.0.0.1:4141/v1/models",
+        "atMs": 45226
+      },
+      {
+        "url": "http://127.0.0.1:4141/health",
+        "atMs": 48219
+      }
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "indexedPolicy": {
+      "nodes": 80,
+      "edges": 182
+    },
+    "serverPort": 4300,
+    "sidecarListenersBefore": 0,
+    "off": {
+      "seam": {
+        "state": "off",
+        "preferenceOn": false,
+        "policyVerdict": "absent",
+        "policyPath": ".codeatlas/policy.json",
+        "policyDetail": "",
+        "model": "",
+        "chip": "off",
+        "probes": 0
+      },
+      "dom": {
+        "panelPresent": true,
+        "panelState": "off",
+        "panelText": "LOCAL LLMoffoffoff. Nothing is started and nothing is probed: while this is off, this page sends no request to 127.0.0.1:4141.Turn it on here or in the [a]tlas menu. Everything else on this surface keeps showing the same deterministic text either way.",
+        "message": "off. Nothing is started and nothing is probed: while this is off, this page sends no request to 127.0.0.1:4141.",
+        "command": "",
+        "hint": "Turn it on here or in the [a]tlas menu. Everything else on this surface keeps showing the same deterministic text either way.",
+        "model": "",
+        "rows": [],
+        "chipPresent": true,
+        "chipText": "local llm off",
+        "toggleLabel": "off",
+        "toggleDisabled": false,
+        "menuLabel": "[l]ocal llm off"
+      }
+    },
+    "notRunning": {
+      "seam": {
+        "state": "not-running",
+        "preferenceOn": true,
+        "policyVerdict": "absent",
+        "policyPath": ".codeatlas/policy.json",
+        "policyDetail": "",
+        "model": "",
+        "chip": "not running",
+        "probes": 1
+      },
+      "dom": {
+        "panelPresent": true,
+        "panelState": "not-running",
+        "panelText": "LOCAL LLMnot-runningonon, but nothing is listening on 127.0.0.1:4141. This page has no backend and cannot start a process, so the sidecar is started from a shell:llm/start.sh class-aOther models: class-a | class-a-lfm | class-a-minicpm | class-a-coder | class-b | class-b-gemma. class-a is Qwen3.5-2B at 3072 tokens of context, class-b is gemma-4-E4B at 8192. The class is the context window, not a parameter count. Stop it again with llm/stop.sh.",
+        "message": "on, but nothing is listening on 127.0.0.1:4141. This page has no backend and cannot start a process, so the sidecar is started from a shell:",
+        "command": "llm/start.sh class-a",
+        "hint": "Other models: class-a | class-a-lfm | class-a-minicpm | class-a-coder | class-b | class-b-gemma. class-a is Qwen3.5-2B at 3072 tokens of context, class-b is gemma-4-E4B at 8192. The class is the context window, not a parameter count. Stop it again with llm/stop.sh.",
+        "model": "",
+        "rows": [],
+        "chipPresent": true,
+        "chipText": "local llm not running",
+        "toggleLabel": "on",
+        "toggleDisabled": false,
+        "menuLabel": "[l]ocal llm on"
+      }
+    },
+    "startScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar gestartet: pid 58889, Qwen3.5-2B-Q4_K_M.gguf (Reproduktionsgriff class-a), Kontext 3072, http://127.0.0.1:4141",
+        "Bereitschaft: curl -s http://127.0.0.1:4141/health  ->  {\"status\":\"ok\"}",
+        "Log: /Users/bernhard/Desktop/CodeAtlasWeb/llm/llama-server.log",
+        "Beenden: /Users/bernhard/Desktop/CodeAtlasWeb/llm/stop.sh"
+      ]
+    },
+    "ready": {
+      "seam": {
+        "state": "ready",
+        "preferenceOn": true,
+        "policyVerdict": "absent",
+        "policyPath": ".codeatlas/policy.json",
+        "policyDetail": "",
+        "model": "Qwen3.5-2B",
+        "chip": "ready: Qwen3.5-2B",
+        "probes": 2
+      },
+      "dom": {
+        "panelPresent": true,
+        "panelState": "ready",
+        "panelText": "LOCAL LLMreadyonready on 127.0.0.1:4141. Qwen3.5-2Bmodelmodels/Qwen3.5-2B-Q4_K_M.gguf (Q4_K - Medium)context3072 of 262144 trained tokensweights1.18 GB for 1.88B parametersslots4 on 127.0.0.1:4141",
+        "message": "ready on 127.0.0.1:4141. Qwen3.5-2B",
+        "command": "",
+        "hint": "",
+        "model": "Qwen3.5-2B",
+        "rows": [
+          {
+            "key": "model",
+            "value": "models/Qwen3.5-2B-Q4_K_M.gguf (Q4_K - Medium)"
+          },
+          {
+            "key": "context",
+            "value": "3072 of 262144 trained tokens"
+          },
+          {
+            "key": "weights",
+            "value": "1.18 GB for 1.88B parameters"
+          },
+          {
+            "key": "slots",
+            "value": "4 on 127.0.0.1:4141"
+          }
+        ],
+        "chipPresent": true,
+        "chipText": "local llm ready: Qwen3.5-2B",
+        "toggleLabel": "on",
+        "toggleDisabled": false,
+        "menuLabel": "[l]ocal llm on"
+      }
+    },
+    "stopScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar beendet (pid 58889)."
+      ]
+    },
+    "afterStop": {
+      "panelPresent": true,
+      "panelState": "not-running",
+      "panelText": "LOCAL LLMnot-runningonon, but nothing is listening on 127.0.0.1:4141. This page has no backend and cannot start a process, so the sidecar is started from a shell:llm/start.sh class-aOther models: class-a | class-a-lfm | class-a-minicpm | class-a-coder | class-b | class-b-gemma. class-a is Qwen3.5-2B at 3072 tokens of context, class-b is gemma-4-E4B at 8192. The class is the context window, not a parameter count. Stop it again with llm/stop.sh.",
+      "message": "on, but nothing is listening on 127.0.0.1:4141. This page has no backend and cannot start a process, so the sidecar is started from a shell:",
+      "command": "llm/start.sh class-a",
+      "hint": "Other models: class-a | class-a-lfm | class-a-minicpm | class-a-coder | class-b | class-b-gemma. class-a is Qwen3.5-2B at 3072 tokens of context, class-b is gemma-4-E4B at 8192. The class is the context window, not a parameter count. Stop it again with llm/stop.sh.",
+      "model": "",
+      "rows": [],
+      "chipPresent": true,
+      "chipText": "local llm not running",
+      "toggleLabel": "on",
+      "toggleDisabled": false,
+      "menuLabel": "[l]ocal llm on"
+    },
+    "apiRoutes": {
+      "/api/layout": 1,
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 2,
+      "check_index_coverage": 1
+    },
+    "policy": {
+      "seam": {
+        "state": "disabled-by-policy",
+        "preferenceOn": true,
+        "policyVerdict": "deny",
+        "policyPath": ".codeatlas/policy.json",
+        "policyDetail": "",
+        "model": "",
+        "chip": "off by policy",
+        "probes": 0
+      },
+      "dom": {
+        "panelPresent": true,
+        "panelState": "disabled-by-policy",
+        "panelText": "LOCAL LLMdisabled-by-policyoffoff by policy. The committed .codeatlas/policy.json of the indexed project \"codeatlasweb-w5a-policy\" says \"llm\": \"deny\", and a committed policy beats any preference of this browser.",
+        "message": "off by policy. The committed .codeatlas/policy.json of the indexed project \"codeatlasweb-w5a-policy\" says \"llm\": \"deny\", and a committed policy beats any preference of this browser.",
+        "command": "",
+        "hint": "",
+        "model": "",
+        "rows": [],
+        "chipPresent": true,
+        "chipText": "local llm off by policy",
+        "toggleLabel": "off",
+        "toggleDisabled": true,
+        "menuLabel": "[l]ocal llm off"
+      }
+    },
+    "policyAfterClick": {
+      "seam": {
+        "state": "disabled-by-policy",
+        "preferenceOn": true,
+        "policyVerdict": "deny",
+        "policyPath": ".codeatlas/policy.json",
+        "policyDetail": "",
+        "model": "",
+        "chip": "off by policy",
+        "probes": 0
+      },
+      "dom": {
+        "panelPresent": true,
+        "panelState": "disabled-by-policy",
+        "panelText": "LOCAL LLMdisabled-by-policyoffoff by policy. The committed .codeatlas/policy.json of the indexed project \"codeatlasweb-w5a-policy\" says \"llm\": \"deny\", and a committed policy beats any preference of this browser.",
+        "message": "off by policy. The committed .codeatlas/policy.json of the indexed project \"codeatlasweb-w5a-policy\" says \"llm\": \"deny\", and a committed policy beats any preference of this browser.",
+        "command": "",
+        "hint": "",
+        "model": "",
+        "rows": [],
+        "chipPresent": true,
+        "chipText": "local llm off by policy",
+        "toggleLabel": "off",
+        "toggleDisabled": true,
+        "menuLabel": "[l]ocal llm off"
+      }
+    },
+    "policyRequestsDelta": 0,
+    "policyReadPath": {
+      "tool": "get_code_snippet",
+      "via": "Modul-Knoten der Datei, wie in src/reader/file-source.ts",
+      "moduleQuery": "rows: 1  (cols: n.qualified_name n.start_line n.end_line)\n  codeatlasweb-w5a-policy.codeatlas.policy \"1\" \"4\"\ntotal: 1\n",
+      "snippet": "{\"name\":\".codeatlas/policy.json\",\"qualified_name\":\"codeatlasweb-w5a-policy.codeatlas.policy\",\"label\":\"Module\",\"file_path\":\"/private/tmp/codeatlasweb-w5a-policy-pPTUpm/.codeatlas/policy.json\",\"start_line\":1,\"end_line\":4,\"source\":\"{\\n  \\\"llm\\\": \\\"deny\\\"\\n}\\n\",\"callers\":0,\"callees\":0}"
+    },
+    "leftovers": [
+      {
+        "port": 4300,
+        "listeners": 0,
+        "waitedMs": 102
+      },
+      {
+        "port": 4301,
+        "listeners": 0,
+        "waitedMs": 95
+      },
+      {
+        "port": 4141,
+        "listeners": 0,
+        "waitedMs": 96
+      }
+    ]
+  }
+}

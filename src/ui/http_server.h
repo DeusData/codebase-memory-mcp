@@ -16,6 +16,24 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+/* Content-Security-Policy directives for the served UI (the value only; the
+ * server prepends the header name). No external host appears anywhere, which
+ * enforces the airgap against a future dependency or injected content.
+ * connect-src admits the server itself plus the two loopback services the UI
+ * may talk to when the reader starts them: the local-model sidecar on
+ * 127.0.0.1:4141 (graph-ui/llm/start.sh) and the agent-event bridge on
+ * 127.0.0.1:4142 (graph-ui/tools/agent-bridge.mjs). A bridge on any other
+ * port (?agents=<port>) stays blocked by this policy on purpose. The other
+ * allowances cover the bundled app's own needs (inline styles, three.js
+ * textures, Monaco workers, WASM). */
+#define CBM_UI_CSP_VALUE                                                 \
+    "default-src 'self'; "                                               \
+    "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142; "   \
+    "img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; " \
+    "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
+    "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; "      \
+    "frame-ancestors 'none'"
+
 typedef struct cbm_http_server cbm_http_server_t;
 struct cbm_watcher;
 

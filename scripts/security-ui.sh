@@ -51,7 +51,7 @@ else
             if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.css' \) -exec grep -lE 'https?://' {} \; 2>/dev/null | head -20 > "$SEC_TMPDIR/urls"; then
                 while IFS= read -r file; do
                     relfile="${file#"$ROOT/"}"
-                    grep -onE 'https?://[^\s"'"'"')]+' "$file" 2>/dev/null | while IFS=: read -r lineno url; do
+                    grep -onE 'https?://[^[:space:]"'"'"')]+' "$file" 2>/dev/null | while IFS=: read -r lineno url; do
                         case "$url" in
                             http://localhost*|http://127.0.0.1*|https://localhost*|https://127.0.0.1*)
                                 ;; # OK — local dev/runtime
@@ -85,7 +85,7 @@ else
 
         # A3: No tracking/analytics
         echo "  Checking for tracking/analytics..."
-        TRACKING='google-analytics|gtag|mixpanel|segment\.com|hotjar|sentry\.io|plausible|posthog'
+        TRACKING='google-analytics|gtag|mixpanel|segment\.com|hotjar|sentry\.io|plausible\.io|posthog'
         if find "$UI_DIR" -type f \( -name '*.js' -o -name '*.ts' -o -name '*.tsx' -o -name '*.html' \) \
             -exec grep -lE "$TRACKING" {} \; 2>/dev/null > "$SEC_TMPDIR/track"; then
             while IFS= read -r file; do

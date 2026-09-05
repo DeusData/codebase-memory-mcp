@@ -1,0 +1,593 @@
+{
+  "findingFirst": true,
+  "headSaysWhatTheFindingIs": true,
+  "noLengthThreshold": true,
+  "stepTargetsClickable": true,
+  "stepClickOpensReader": true,
+  "stepsWithoutTargetExplained": true,
+  "enrichmentAvailable": {
+    "usable": [
+      {
+        "kind": "raises",
+        "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+        "symbols": 2
+      },
+      {
+        "kind": "calls-on",
+        "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+        "symbols": 3
+      }
+    ],
+    "silent": [
+      {
+        "kind": "reads-env",
+        "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+      }
+    ],
+    "missing": [
+      {
+        "kind": "what the callee reads or writes",
+        "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+      },
+      {
+        "kind": "the callee's own steps, in order",
+        "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+      },
+      {
+        "kind": "whether a raised error escapes through this call",
+        "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+      },
+      {
+        "kind": "the callee's signature and return type",
+        "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+      },
+      {
+        "kind": "anything at all about an unresolved callee",
+        "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+      }
+    ]
+  },
+  "enrichedSteps": 3,
+  "noExtraServerRequest": true,
+  "importFindingProminent": true,
+  "importHonestyWordsKept": true,
+  "metaCharsBefore": 347,
+  "metaCharsAfter": 58,
+  "modelRequestsWhileOff": 0,
+  "refineStillGated": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "screenshotsAtRest": true,
+  "port": 4561,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w8c",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "shortCase": {
+    "name": "getOrder",
+    "file": "src/services/orderService.ts"
+  },
+  "longCase": {
+    "name": "createUser",
+    "file": "src/services/userService.ts"
+  },
+  "metaMethod": "metaCharsAfter ist der sichtbare Text ueber den Block selbst, aus dem gerenderten Kasten gelesen und ohne das Fragezeichen. metaCharsBefore ist derselbe Kasten plus die Saetze, die W8c dahinter geraeumt hat (Deckung, ungenannte Symbole, Herkunftsnotiz), gelesen am Griff des laufenden Panels. Diese drei Zeichenketten sind unveraendert; ihre Laenge ist damit der Zustand vor diesem Zyklus, gemessen an dem, was das Produkt heute haelt.",
+  "enrichmentMethod": "Gemessen wird, was OHNE zusaetzliche Anfrage vorlag: die Layout-Antwort, die die Galaxie ohnehin geladen hat, verbunden ueber den qualifizierten Namen des aufgerufenen Symbols (nie ueber den blossen Namen, denn dieses Projekt hat zwei Symbole namens `create`). `usable` sind die Sorten, die an den zwei gemessenen Bloecken wirklich etwas ergeben haben; `silent` sind die, die dieser Block liest und die hier nichts zu melden hatten; `missing` ist die stehende Liste dessen, was kein geladenes Datum hergibt, samt Grund (src/pseudocode/step-insights.ts).",
+  "timings": {
+    "buildMs": 10771,
+    "totalMs": 38677
+  },
+  "generatedAt": "2026-08-30T18:34:50.369Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "getOrder, Block offen",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 156,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 156,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "createUser, Block offen",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 170,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 177,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "blocks": {
+      "short": {
+        "lead": {
+          "text": "You cannot see this in the code: 1 of the 4 names this file pulls in is not used by getOrder as far as the index shows.",
+          "kind": "unused-imports",
+          "top": 398
+        },
+        "imports": {
+          "heading": "What this file pulls in: 1 name not used by this symbol as far as the index shows",
+          "top": 474,
+          "entries": [
+            {
+              "usage": "unused",
+              "finding": true,
+              "text": "insert from ../repo/db: imported here, not used by this symbol as far as the index showsnot used here",
+              "accent": "2px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses query from ../repo/dbused here",
+              "accent": "0px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses Order from ../typesused here",
+              "accent": "0px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses validateId from ../util/validateused here",
+              "accent": "0px"
+            }
+          ],
+          "tally": "3 used by this symbol, 1 not used by it, 0 that CodeAtlas cannot check."
+        },
+        "stepsHead": {
+          "text": "Steps, and where each one goes",
+          "top": 689
+        },
+        "firstLineTop": 710,
+        "lines": [
+          {
+            "kind": "step",
+            "order": 1,
+            "text": "1. call validateId",
+            "target": "validate.ts:33",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": [
+              {
+                "kind": "raises",
+                "text": "may raise ValidationError"
+              },
+              {
+                "kind": "calls-on",
+                "text": "makes 1 call of its own"
+              }
+            ]
+          },
+          {
+            "kind": "step",
+            "order": 2,
+            "text": "2. call query",
+            "target": "db.ts:17",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": []
+          }
+        ],
+        "honest": {
+          "text": "Only what the index reported, in the order it reported it.?",
+          "chars": 58,
+          "provenanceHint": "1 of 1 symbol in scope contributed steps. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. What stands beside a step comes from the relations the index recorded for the symbol that step calls, in the graph this window already loaded: what it can raise, what it calls in turn, and what it reads from the environment. It is not a reading of that symbol's body. A step with nothing beside it is a step whose callee the loaded graph records none of those three for, not a callee that does none of them.",
+          "moved": 289
+        },
+        "seam": {
+          "lead": "You cannot see this in the code: 1 of the 4 names this file pulls in is not used by getOrder as far as the index shows.",
+          "leadKind": "unused-imports",
+          "lines": 2,
+          "steps": 2,
+          "stepsWithTarget": 2,
+          "stepsWithoutTarget": 0,
+          "enrichedSteps": 1,
+          "enrichment": {
+            "usable": [
+              {
+                "kind": "raises",
+                "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                "symbols": 1
+              },
+              {
+                "kind": "calls-on",
+                "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                "symbols": 1
+              }
+            ],
+            "silent": [
+              {
+                "kind": "reads-env",
+                "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+              }
+            ],
+            "missing": [
+              {
+                "kind": "what the callee reads or writes",
+                "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+              },
+              {
+                "kind": "the callee's own steps, in order",
+                "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+              },
+              {
+                "kind": "whether a raised error escapes through this call",
+                "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+              },
+              {
+                "kind": "the callee's signature and return type",
+                "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+              },
+              {
+                "kind": "anything at all about an unresolved callee",
+                "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+              }
+            ]
+          },
+          "imports": 4,
+          "importFindings": 1,
+          "metaVisibleChars": 58,
+          "metaMovedChars": 289
+        }
+      },
+      "long": {
+        "lead": {
+          "text": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+          "kind": "unused-imports",
+          "top": 398
+        },
+        "imports": {
+          "heading": "What this file pulls in: 2 names not used by this symbol as far as the index shows",
+          "top": 474,
+          "entries": [
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses insert from ../repo/dbused here",
+              "accent": "0px"
+            },
+            {
+              "usage": "unused",
+              "finding": true,
+              "text": "query from ../repo/db: imported here, not used by this symbol as far as the index showsnot used here",
+              "accent": "2px"
+            },
+            {
+              "usage": "unused",
+              "finding": true,
+              "text": "Row from ../repo/db: imported here, not used by this symbol as far as the index showsnot used here",
+              "accent": "2px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses UserEntity from ../typesused here",
+              "accent": "0px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses User from ../typesused here",
+              "accent": "0px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses ValidationError from ../util/validateused here",
+              "accent": "0px"
+            },
+            {
+              "usage": "used",
+              "finding": false,
+              "text": "uses validateUser from ../util/validateused here",
+              "accent": "0px"
+            }
+          ],
+          "tally": "5 used by this symbol, 2 not used by it, 0 that CodeAtlas cannot check."
+        },
+        "stepsHead": {
+          "text": "Steps, and where each one goes",
+          "top": 783
+        },
+        "firstLineTop": 805,
+        "lines": [
+          {
+            "kind": "step",
+            "order": 1,
+            "text": "1. call validateUser",
+            "target": "validate.ts:19",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": [
+              {
+                "kind": "raises",
+                "text": "may raise ValidationError"
+              },
+              {
+                "kind": "calls-on",
+                "text": "makes 1 call of its own"
+              }
+            ]
+          },
+          {
+            "kind": "step",
+            "order": 2,
+            "text": "2. construct ValidationError",
+            "target": "validate.ts:4",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": []
+          },
+          {
+            "kind": "step",
+            "order": 3,
+            "text": "3. construct UserEntity",
+            "target": "types.ts:37",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": []
+          },
+          {
+            "kind": "step",
+            "order": 4,
+            "text": "4. call listUsers",
+            "target": "userService.ts:18",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": [
+              {
+                "kind": "calls-on",
+                "text": "makes 1 call of its own"
+              }
+            ]
+          },
+          {
+            "kind": "step",
+            "order": 5,
+            "text": "5. call insert",
+            "target": "db.ts:31",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": []
+          },
+          {
+            "kind": "step",
+            "order": 6,
+            "text": "6. call toUser",
+            "target": "userService.ts:9",
+            "targetKnown": true,
+            "targetClickable": true,
+            "behind": []
+          },
+          {
+            "kind": "raise",
+            "order": 7,
+            "text": "7. may raise ValidationError",
+            "target": "validate.ts:23",
+            "targetKnown": true,
+            "targetClickable": false,
+            "behind": []
+          },
+          {
+            "kind": "env",
+            "order": 8,
+            "text": "8. read DB_URL from the environment",
+            "target": "userService.ts",
+            "targetKnown": true,
+            "targetClickable": false,
+            "behind": []
+          }
+        ],
+        "honest": {
+          "text": "Only what the index reported, in the order it reported it.?",
+          "chars": 58,
+          "provenanceHint": "1 of 1 symbol in scope contributed steps. Derived from the index and nothing else: every line is a call, a raised error or an environment read that the analysis reported, in the order it reported them. Anything the index did not resolve is absent from this block, not absent from the code. What stands beside a step comes from the relations the index recorded for the symbol that step calls, in the graph this window already loaded: what it can raise, what it calls in turn, and what it reads from the environment. It is not a reading of that symbol's body. A step with nothing beside it is a step whose callee the loaded graph records none of those three for, not a callee that does none of them.",
+          "moved": 289
+        },
+        "seam": {
+          "lead": "You cannot see this in the code: 2 of the 7 names this file pulls in are not used by createUser as far as the index shows.",
+          "leadKind": "unused-imports",
+          "lines": 8,
+          "steps": 6,
+          "stepsWithTarget": 6,
+          "stepsWithoutTarget": 0,
+          "enrichedSteps": 2,
+          "enrichment": {
+            "usable": [
+              {
+                "kind": "raises",
+                "source": "RAISES edges of the layout this window already loaded (/api/layout)",
+                "symbols": 1
+              },
+              {
+                "kind": "calls-on",
+                "source": "CALLS edges of the layout this window already loaded (/api/layout)",
+                "symbols": 2
+              }
+            ],
+            "silent": [
+              {
+                "kind": "reads-env",
+                "source": "CONFIGURES edges to an environment node of the layout this window already loaded"
+              }
+            ],
+            "missing": [
+              {
+                "kind": "what the callee reads or writes",
+                "reason": "The layout carries USAGE edges without a direction and without a kind, so \"query goes to the database\" cannot be read off them: a USAGE edge to `rows` says the two are related, not that the symbol reads it. The `reads` and `writes` families of the callee would answer it, and those come from a facts request per callee, which is a second server way this block does not take."
+              },
+              {
+                "kind": "the callee's own steps, in order",
+                "reason": "The graph says that the callee calls something, not in which order or under which condition. The walk behind the flow explainer has the order; reading it here would mean running that walk for every step of every block."
+              },
+              {
+                "kind": "whether a raised error escapes through this call",
+                "reason": "RAISES records where an error is constructed and thrown, never which caller lets it through. The note therefore says what the callee can raise and never what this symbol propagates."
+              },
+              {
+                "kind": "the callee's signature and return type",
+                "reason": "The layout nodes carry a name, a place, a kind and two call counts. Parameters and return types are in neither the layout nor the twin's IR of the calling symbol."
+              },
+              {
+                "kind": "anything at all about an unresolved callee",
+                "reason": "A call site the index did not resolve carries no qualified name, and this module joins on the qualified name alone (two functions named `create` in two files are the reason). Such a step says at its own line that the index records no place for it."
+              }
+            ]
+          },
+          "imports": 7,
+          "importFindings": 2,
+          "metaVisibleChars": 58,
+          "metaMovedChars": 289
+        }
+      }
+    },
+    "shots": [
+      {
+        "name": "pseudocode-short.png",
+        "atRest": true,
+        "regions": []
+      },
+      {
+        "name": "pseudocode-long.png",
+        "atRest": true,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 149
+          }
+        ]
+      }
+    ],
+    "requestsAroundTab": {
+      "before": {
+        "api": {
+          "/api/layout": 1,
+          "/api/tree": 7
+        },
+        "rpc": {
+          "index_status": 2,
+          "query_graph": 31,
+          "check_index_coverage": 2,
+          "search_graph": 2,
+          "get_code_snippet": 2
+        }
+      },
+      "after": {
+        "api": {
+          "/api/layout": 1,
+          "/api/tree": 7
+        },
+        "rpc": {
+          "index_status": 2,
+          "query_graph": 31,
+          "check_index_coverage": 2,
+          "search_graph": 2,
+          "get_code_snippet": 2
+        }
+      },
+      "newApi": [],
+      "newRpc": []
+    },
+    "refineProbe": {
+      "buttonPresent": false,
+      "validation": {
+        "asSent": {
+          "applied": true,
+          "reason": ""
+        },
+        "renumbered": {
+          "applied": false,
+          "reason": "a line came back with a different number than it was sent with (line 1: expected 1 and got 99)"
+        },
+        "shorter": {
+          "applied": false,
+          "reason": "the answer holds a different number of lines than were sent (1 instead of 8)"
+        }
+      },
+      "appliesPositionally": true,
+      "readerTriggered": true
+    },
+    "llm": {
+      "state": "off",
+      "preferenceOn": false,
+      "policyVerdict": "absent",
+      "policyPath": ".codeatlas/policy.json",
+      "policyDetail": "",
+      "model": "",
+      "chip": "off",
+      "probes": 0
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4560,
+    "galaxyCollapsed": "open",
+    "stepClick": {
+      "beforeClick": {
+        "path": "src/services/orderService.ts",
+        "line": 8
+      },
+      "afterClick": {
+        "path": "src/util/validate.ts",
+        "line": 33
+      },
+      "wanted": "validate.ts:33"
+    },
+    "behind": {
+      "short": [
+        "1. call validateId: may raise ValidationError",
+        "1. call validateId: makes 1 call of its own"
+      ],
+      "long": [
+        "1. call validateUser: may raise ValidationError",
+        "1. call validateUser: makes 1 call of its own",
+        "4. call listUsers: makes 1 call of its own"
+      ]
+    },
+    "provenanceKept": {
+      "short": true,
+      "long": true
+    },
+    "apiRoutes": {
+      "/api/layout": 1,
+      "/api/tree": 7
+    },
+    "rpcTools": {
+      "index_status": 2,
+      "query_graph": 107,
+      "check_index_coverage": 4,
+      "search_graph": 4,
+      "get_code_snippet": 6
+    },
+    "leftovers": [
+      {
+        "port": 4560,
+        "listeners": 0
+      },
+      {
+        "port": 4561,
+        "listeners": 0
+      }
+    ]
+  }
+}

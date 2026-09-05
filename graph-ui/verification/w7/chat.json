@@ -1,0 +1,583 @@
+{
+  "lowercaseMentionResolves": true,
+  "lowercaseMentionCitations": 7,
+  "mentionCandidateListShown": true,
+  "mentionCandidateCount": 2,
+  "mentionCandidatePickAnswers": true,
+  "focusFallbackAnswered": true,
+  "focusFallbackExplained": true,
+  "noCardStillHonest": true,
+  "chatResizeWorks": true,
+  "chatResizePersists": true,
+  "chatResizeByKeyboard": true,
+  "chatHeaderStaysVisible": true,
+  "chatClosesByEscape": true,
+  "chatClosesByButton": true,
+  "historySurvivesClose": true,
+  "clearStillClears": true,
+  "llmMenuLabel": "local llm on",
+  "llmStatusChip": "local llm ready: Qwen3.5-2B",
+  "llmPanelHeading": "LOCAL LLM",
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "port": 4421,
+  "leftoverProcesses": 0,
+  "llmMenuLabelRaw": "[l]ocal llm on",
+  "sidecarPort": 4422,
+  "productSidecarPort": 4141,
+  "productPortRequests": 0,
+  "project": "codeatlasweb-w7c",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "questions": {
+    "lowercaseMention": "@createuser explain this function",
+    "noCard": "Was macht @nichtsDergleichenImIndex?",
+    "ambiguous": "Was macht @create?",
+    "focusFallback": "@nichtsDergleichenImIndex explain this function"
+  },
+  "timings": {
+    "buildMs": 10469,
+    "llamaReadyMs": 1208,
+    "answerMs": 3449,
+    "totalMs": 49157
+  },
+  "generatedAt": "2026-08-29T15:41:21.681Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "sidecarRequests": [
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 30199
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 30242
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 30244
+      },
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 33301
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 33308
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 33310
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/chat/completions",
+        "atMs": 33744
+      },
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 36189
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 36191
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 36193
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/chat/completions",
+        "atMs": 38369
+      },
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 39190
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 39192
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 39194
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/chat/completions",
+        "atMs": 40699
+      },
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 42190
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 42192
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 42194
+      },
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 45190
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 45192
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 45193
+      },
+      {
+        "url": "http://127.0.0.1:4422/health",
+        "atMs": 46888
+      },
+      {
+        "url": "http://127.0.0.1:4422/props",
+        "atMs": 46891
+      },
+      {
+        "url": "http://127.0.0.1:4422/v1/models",
+        "atMs": 46893
+      }
+    ],
+    "productPortRequests": [],
+    "readability": [
+      {
+        "name": "chat mit Verlauf",
+        "scrolledRegions": 2,
+        "top": {
+          "candidates": 189,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 172,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "chat gezogen",
+        "scrolledRegions": 2,
+        "top": {
+          "candidates": 203,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 180,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "nach clear",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 172,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 149,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "model": {
+      "winner": "Qwen3.5-2B",
+      "file": "Qwen3.5-2B-Q4_K_M.gguf",
+      "ctx": 3072
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4420,
+    "llama": {
+      "port": 4422,
+      "props": {
+        "modelPath": "/Users/bernhard/Desktop/CodeAtlasWeb/models/Qwen3.5-2B-Q4_K_M.gguf",
+        "quantization": "Q4_K - Medium",
+        "contextTokens": 3072,
+        "slots": 4
+      },
+      "readyMs": 1208
+    },
+    "noCard": {
+      "turn": {
+        "id": 1,
+        "question": "Was macht @nichtsDergleichenImIndex?",
+        "status": "no-cards",
+        "klass": "what-is",
+        "rule": "what-is-words",
+        "depth": 1,
+        "cards": 0,
+        "cardIds": [],
+        "sources": 2,
+        "citations": [],
+        "unknownCitations": [],
+        "uncitedLines": 0,
+        "answer": "No card covers this. Fetch it with @name.",
+        "refusal": "",
+        "tokens": 0,
+        "budget": 2300,
+        "tokensPerSecond": 0,
+        "candidates": [],
+        "askedName": "",
+        "focusFallbackUsed": ""
+      },
+      "view": {
+        "question": "> Was macht @nichtsDergleichenImIndex?",
+        "status": "no-cards",
+        "citations": [],
+        "unknownCitations": 0,
+        "fallback": "",
+        "choiceHead": "",
+        "candidates": []
+      },
+      "messages": [
+        "The index holds nothing this question could be answered from, so the model was not asked. Name a symbol with @name to fetch its facts."
+      ],
+      "completionsBefore": 0,
+      "completionsAfter": 0
+    },
+    "focusSymbol": "codeatlasweb-w7c.src.services.userService.createUser",
+    "lowercase": {
+      "turn": {
+        "id": 2,
+        "question": "@createuser explain this function",
+        "status": "answered",
+        "klass": "what-is",
+        "rule": "what-is-words",
+        "depth": 1,
+        "cards": 11,
+        "cardIds": [
+          "K1",
+          "K2",
+          "K3",
+          "K4",
+          "K5",
+          "K6",
+          "K7",
+          "K8",
+          "K9",
+          "K10",
+          "K11"
+        ],
+        "sources": 2,
+        "citations": [],
+        "unknownCitations": [],
+        "uncitedLines": 0,
+        "answer": "<one short sentence taken from a card> [K2] createUser calls validateUser at line 24 in body order. [K11] createUser calls listUsers at line 18 and toUser at line 9. [K6] createUser constructs UserEntity at line 37. [K5] create calls createUser at line 41. [K3] createUser reads environment value DB_URL. [K2] createUser raises ValidationError at line 27. [K10] createUser constructs ValidationError at line 4. [K8] createUser calls toUser at line 9 and listUsers at line 18. [K5] create calls createUser at line 41. [K6] createUser calls insert at line 30. [K2] createUser calls validateUser at line 24 in body order. [K11] createUser calls listUsers at line 18 and toUser at line 9. [K6] createUser constructs UserEntity at line 37. [K5] create calls createUser at",
+        "refusal": "",
+        "tokens": 283,
+        "budget": 2300,
+        "tokensPerSecond": 90.9090909090909,
+        "candidates": [],
+        "askedName": "",
+        "focusFallbackUsed": ""
+      },
+      "view": {
+        "question": "> @createuser explain this function",
+        "status": "answered",
+        "citations": [
+          "K2",
+          "K11",
+          "K6",
+          "K5",
+          "K3",
+          "K10",
+          "K8"
+        ],
+        "unknownCitations": 0,
+        "fallback": "",
+        "choiceHead": "",
+        "candidates": []
+      },
+      "citationsInSeam": 0,
+      "answerLines": [
+        "No card covers this. Fetch it with @name.",
+        "<one short sentence taken from a card> [K2] createUser calls validateUser at line 24 in body order. [K11] createUser calls listUsers at line 18 and toUser at line 9. [K6] createUser constructs UserEntity at line 37. [K5] create calls createUser at line 41. [K3] createUser reads environment value DB_URL. [K2] createUser raises ValidationError at line 27. [K10] createUser constructs ValidationError at line 4. [K8] createUser calls toUser at line 9 and listUsers at line 18. [K5] create calls createUser at line 41. [K6] createUser calls insert at line 30. [K2] createUser calls validateUser at line 24 in body order. [K11] createUser calls listUsers at line 18 and toUser at line 9. [K6] createUser constructs UserEntity at line 37. [K5] create calls createUser at"
+      ]
+    },
+    "choice": {
+      "turn": {
+        "id": 3,
+        "question": "Was macht @create?",
+        "status": "needs-choice",
+        "klass": "what-is",
+        "rule": "what-is-words",
+        "depth": 1,
+        "cards": 0,
+        "cardIds": [],
+        "sources": 2,
+        "citations": [],
+        "unknownCitations": [],
+        "uncitedLines": 0,
+        "answer": "",
+        "refusal": "",
+        "tokens": 0,
+        "budget": 2300,
+        "tokensPerSecond": 0,
+        "candidates": [
+          {
+            "name": "create",
+            "qualifiedName": "codeatlasweb-w7c.src.services.orderService.create",
+            "filePath": "src/services/orderService.ts",
+            "line": 30
+          },
+          {
+            "name": "create",
+            "qualifiedName": "codeatlasweb-w7c.src.services.userService.create",
+            "filePath": "src/services/userService.ts",
+            "line": 40
+          }
+        ],
+        "askedName": "create",
+        "focusFallbackUsed": ""
+      },
+      "shown": [
+        {
+          "label": "create (src/services/orderService.ts:30)",
+          "qualified": "codeatlasweb-w7c.src.services.orderService.create",
+          "visible": true
+        },
+        {
+          "label": "create (src/services/userService.ts:40)",
+          "qualified": "codeatlasweb-w7c.src.services.userService.create",
+          "visible": true
+        }
+      ],
+      "head": "\"create\" names 2 symbols in this index. Pick the one you meant and the same question is asked again about it; nothing was sent to the model in the meantime."
+    },
+    "picked": {
+      "qualified": "codeatlasweb-w7c.src.services.userService.create",
+      "turn": {
+        "id": 4,
+        "question": "Was macht @create?",
+        "status": "answered",
+        "klass": "what-is",
+        "rule": "what-is-words",
+        "depth": 1,
+        "cards": 4,
+        "cardIds": [
+          "K1",
+          "K2",
+          "K3",
+          "K4"
+        ],
+        "sources": 2,
+        "citations": [
+          "K4",
+          "K1",
+          "K2"
+        ],
+        "unknownCitations": [],
+        "uncitedLines": 0,
+        "answer": "<one short sentence taken from a card> [K4] create calls createUser (src/services/userService.ts:23).\n[K1] The index records no test that reaches it.\n[K2] create, in body order: calls createUser [line 41].",
+        "refusal": "",
+        "tokens": 102,
+        "budget": 2300,
+        "tokensPerSecond": 81.80535966149506,
+        "candidates": [],
+        "askedName": "",
+        "focusFallbackUsed": ""
+      }
+    },
+    "focusFallback": {
+      "turn": {
+        "id": 5,
+        "question": "@nichtsDergleichenImIndex explain this function",
+        "status": "answered",
+        "klass": "what-is",
+        "rule": "what-is-words",
+        "depth": 1,
+        "cards": 11,
+        "cardIds": [
+          "K1",
+          "K2",
+          "K3",
+          "K4",
+          "K5",
+          "K6",
+          "K7",
+          "K8",
+          "K9",
+          "K10",
+          "K11"
+        ],
+        "sources": 2,
+        "citations": [
+          "K2",
+          "K4",
+          "K11",
+          "K9",
+          "K3"
+        ],
+        "unknownCitations": [],
+        "uncitedLines": 0,
+        "answer": "<one short sentence taken from a card> [K2] createUser is called by registerUserRoutes at line 15 in src/routes/users.ts. [K4]\n<one short sentence taken from a card> createUser calls validateUser at line 19 in src/util/validate.ts. [K11]\n<one short sentence taken from a card> createUser constructs UserEntity at line 37 in src/types.ts. [K9]\n<one short sentence taken from a card> createUser raises ValidationError at line 23 in src/util/validate.ts. [K3]",
+        "refusal": "",
+        "tokens": 283,
+        "budget": 2300,
+        "tokensPerSecond": 94.44021325209444,
+        "candidates": [],
+        "askedName": "nichtsDergleichenImIndex",
+        "focusFallbackUsed": "codeatlasweb-w7c.src.services.userService.createUser"
+      },
+      "view": {
+        "question": "> @nichtsDergleichenImIndex explain this function",
+        "status": "answered",
+        "citations": [
+          "K2",
+          "K4",
+          "K11",
+          "K9",
+          "K3"
+        ],
+        "unknownCitations": 0,
+        "fallback": "\"@nichtsDergleichenImIndex\" was not found in the index; answered about the symbol in focus instead: codeatlasweb-w7c.src.services.userService.createUser.",
+        "choiceHead": "",
+        "candidates": []
+      },
+      "line": "\"@nichtsDergleichenImIndex\" was not found in the index; answered about the symbol in focus instead: codeatlasweb-w7c.src.services.userService.createUser."
+    },
+    "header": [
+      {
+        "label": "bei Vorgabehoehe",
+        "chips": {
+          "top": 688,
+          "bottom": 710,
+          "left": 924,
+          "height": 22,
+          "width": 231
+        },
+        "panel": {
+          "top": 681,
+          "bottom": 988,
+          "left": 266,
+          "height": 306,
+          "width": 968
+        },
+        "scrollTop": 903
+      },
+      {
+        "label": "bei kleiner Hoehe",
+        "chips": {
+          "top": 736,
+          "bottom": 758,
+          "left": 924,
+          "height": 22,
+          "width": 231
+        },
+        "panel": {
+          "top": 729,
+          "bottom": 988,
+          "left": 266,
+          "height": 258,
+          "width": 968
+        },
+        "scrollTop": 951
+      }
+    ],
+    "keyboardResize": {
+      "handleFocused": true,
+      "heightBeforeKeys": 340,
+      "heightAfterDown": 244,
+      "heightAfterUp": 292
+    },
+    "drag": {
+      "before": {
+        "height": 292,
+        "box": {
+          "top": 729,
+          "bottom": 988,
+          "left": 266,
+          "height": 258,
+          "width": 968
+        }
+      },
+      "after": {
+        "height": 472,
+        "box": {
+          "top": 549,
+          "bottom": 988,
+          "left": 266,
+          "height": 438,
+          "width": 968
+        }
+      },
+      "cursor": "row-resize"
+    },
+    "close": {
+      "turnsBeforeClose": 5,
+      "afterEscape": {
+        "open": false,
+        "turns": 5
+      },
+      "afterReopen": {
+        "open": true,
+        "questions": 5
+      },
+      "collapsedNote": "5 questions in this session",
+      "closeLabel": "[esc] fold",
+      "closeTitle": "fold this area away. Nothing in it is lost: the chat keeps its history, the walk its step and the flow its place. Only \"clear\" in the chat deletes anything.",
+      "clearLabel": "clear",
+      "clearTitle": "forget this session: every question and every answer in this panel is deleted. The history is in memory and nowhere else, so this cannot be undone. Folding the explain area away costs nothing; only this button deletes."
+    },
+    "cleared": {
+      "present": false,
+      "turns": 0
+    },
+    "naming": {
+      "menuRaw": "[l]ocal llm on",
+      "menuTitle": "atlas: turn the local model off (no request goes to the sidecar afterwards)",
+      "chip": "local llm ready: Qwen3.5-2B",
+      "chipLabel": "local llm",
+      "heading": "LOCAL LLM"
+    },
+    "persistence": {
+      "draggedHeight": 472,
+      "afterReload": 472
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14
+    },
+    "rpcTools": {
+      "index_status": 4,
+      "query_graph": 46,
+      "check_index_coverage": 3,
+      "search_graph": 24,
+      "get_code_snippet": 5
+    },
+    "completions": 3,
+    "leftovers": [
+      {
+        "port": 4420,
+        "listeners": 0
+      },
+      {
+        "port": 4421,
+        "listeners": 0
+      },
+      {
+        "port": 4422,
+        "listeners": 0
+      }
+    ],
+    "productPort": {
+      "port": 4141,
+      "sockets": 1,
+      "usedByThisRun": false,
+      "requestsFromThisRun": 0,
+      "note": "Der Produktport. Dieser Lauf startet dort nichts, beendet dort nichts und schickt nichts dorthin: die Anfragen der Anwendung werden an der fetch-Naht auf den eigenen Sidecar umgeleitet. Die Zahl beschreibt den Rechner, nicht diesen Lauf."
+    }
+  }
+}

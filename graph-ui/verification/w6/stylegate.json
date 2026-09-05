@@ -1,0 +1,153 @@
+{
+  "dashHitsOutsideDocumentedQuotes": 0,
+  "dashHits": [],
+  "documentedQuoteExceptions": [
+    {
+      "file": "verification/w4/coverage.json",
+      "line": 63,
+      "text": "\"note\": \"Purposely not indexed — excluded BY DESIGN via gitignore/.cbmignore/skip-lists (see each file's reason). Not an error: change the ignore rules and re-i",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    }
+  ],
+  "attributionHits": 0,
+  "attributionMatches": [],
+  "attributionPatternHits": 0,
+  "attributionPatternMatches": [],
+  "documentedAttributionExceptions": [
+    {
+      "file": "CLAUDE.md",
+      "line": 46,
+      "text": "keine Claude/AI-Attribution in Repo, Commits oder Dateien.",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "PLAN.md",
+      "line": 304,
+      "text": "- Deutsch antworten, keine em/en-Dashes, keine Claude/AI-Attribution im",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "PLAN.md",
+      "line": 305,
+      "text": "Repo, Anthropic-Key existiert in diesem Projekt NICHT (es gibt keinen",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "PLAN.md",
+      "line": 341,
+      "text": "W0 starten: Lies zuerst diese Datei und CLAUDE.md komplett, dann PR-Branch",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "README.md",
+      "line": 6,
+      "text": "Projektregeln in `CLAUDE.md`, der aufgenommene Fremdcode in `THIRD_PARTY.md`.",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "fixtures/agent-events/HERKUNFT.md",
+      "line": 50,
+      "text": "(PLAN.md, CLAUDE.md), und die Ansicht ist erst dann messbar, wenn mehr als",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "tests/scaffold/w6a.test.mjs",
+      "line": 70,
+      "text": "assert.equal(s.attributionHits, 0, 'keine Claude/Anthropic-Treffer im Repo');",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.json",
+      "line": 19,
+      "text": "\"reason\": \"Der Prozessstaat (Contracts, Red-Proofs, Gates) lebt konstruktionsbedingt ausserhalb des Repos unter ~/.claude/red-proof/; der Ledger im selben Verze",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.json",
+      "line": 54,
+      "text": "\"detail\": \"Haengt an Upstream-Ask 3/5 (offizieller Platz fuer Zusatz-Frontends); der C-Server ist Martins Hoheit, eigenmaechtige graph-ui-Aenderungen sind per C",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.json",
+      "line": 62,
+      "text": "\"item\": \"Abwesenheit nie als Wissen: CALLERS_EMPTY (CLAUDE.md Regel 7)\",",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.md",
+      "line": 23,
+      "text": "| 17 | §5 llama-server als einziger Inferenzprozess, kein Cloud-Fallback, kein API-Key | 1e7998e | `llm/start.sh`, `src/chat/chat-client.ts` | eigener Grep: kei",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.md",
+      "line": 40,
+      "text": "| 34 | §9 Keine Claude/AI-Attribution, keine em/en-Dashes | 2c3562f | `tools/style-gate.mjs`, `tools/lib/forbidden-names.mjs` | eigener repoweiter Scan: 2 lange",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.md",
+      "line": 47,
+      "text": "| 41 | CLAUDE.md Regel 7: Abwesenheit nie als Wissen verkaufen | 41afa62 | `src/twin/strings.ts:165-171` | drei von vier Leer-Saetzen nennen den Index als Quell",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/w6/audit.md",
+      "line": 121,
+      "text": "1. **Schwere mittel.** Anforderung: CLAUDE.md Regel 7, Abwesenheit nie als Wissen. `src/twin/strings.ts:166` `CALLERS_EMPTY = 'Nothing in the indexed workspace ",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    }
+  ],
+  "namesWatched": [
+    "claude",
+    "anthropic"
+  ],
+  "selfReportExcluded": "verification/w6/stylegate.json",
+  "ruleFileNames": [
+    "CLAUDE.md"
+  ],
+  "hardcodedChromeStrings": 0,
+  "hardcodedChromeMatches": [],
+  "chromeFilesScanned": [
+    "src/App.tsx",
+    "src/app/AtlasChrome.tsx",
+    "src/app/AtlasTree.tsx",
+    "src/help/HelpOverlay.tsx",
+    "src/settings/SettingsPanel.tsx",
+    "src/why/WhyPanel.tsx",
+    "src/tours/TourCard.tsx",
+    "src/search/SearchOverlay.tsx",
+    "src/entry/EntryPointDialog.tsx",
+    "src/llm/SidecarPanel.tsx",
+    "src/chat/AtlasChatPanel.tsx",
+    "src/traces/BugWizard.tsx",
+    "src/impact/ImpactPanel.tsx"
+  ],
+  "chromeScanWhitelist": [
+    {
+      "rule": "no-letter",
+      "reason": "Literale ohne ASCII-Buchstaben sind Zeichen und keine Saetze: der Prompt \">\", die Baumpfeile, das Trennzeichen des Breadcrumbs, der Ordnerpunkt, Ziffern und Leerraum."
+    },
+    {
+      "rule": "single-letter",
+      "reason": "Ein einzelner Buchstabe ist ein Zeichen: das \"x\" am Tab-Schliesser."
+    },
+    {
+      "rule": "structural-attribute",
+      "reason": "className, data-*, role, key, id, htmlFor, type, href und name stehen nie auf dem Bildschirm und werden gar nicht erst gelesen."
+    },
+    {
+      "rule": "single-token-state",
+      "reason": "Regel 5 (Zustandssetzer) verlangt Leerraum im Literal: setTwinStatus(\"ready\") setzt einen Zustand, keine Beschriftung."
+    },
+    {
+      "rule": "comment",
+      "reason": "Docblocks und Zeilenkommentare sind kein Bildschirmtext. Der Parser sieht den Unterschied, ein regulaerer Ausdruck koennte ihn nicht sehen."
+    }
+  ],
+  "filesConsidered": 586,
+  "textFiles": 462,
+  "binaryFiles": 124,
+  "generatedAt": "2026-08-30T18:51:16.137Z"
+}

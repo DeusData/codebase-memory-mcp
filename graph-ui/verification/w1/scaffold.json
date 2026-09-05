@@ -1,0 +1,10 @@
+{
+  "buildExit": 0,
+  "unitExit": 0,
+  "unitTests": 1521,
+  "distFiles": 85,
+  "netDenySamples": 7,
+  "netDenyOutboundViolations": 0,
+  "gateExit": 0,
+  "generatedAt": "2026-08-29T11:42:34.444Z"
+}
