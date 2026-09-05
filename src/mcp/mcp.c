@@ -6668,10 +6668,17 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
     if (project) {
         int nodes = cbm_store_count_nodes(store, project);
         int edges = cbm_store_count_edges(store, project);
+        /* A negative count is a failed read (CBM_STORE_ERR), not a small
+         * project. Reporting it as a count would put a bare -1 in the output,
+         * and `nodes > 0 ? "ready" : "empty"` would answer "empty" for an
+         * unreadable table — the false all-clear #2012 is about. Say the read
+         * failed, and name the table that could not be read. */
+        const bool counts_unreadable = nodes < 0 || edges < 0;
         yyjson_mut_obj_add_str(doc, root, "project", project);
-        yyjson_mut_obj_add_int(doc, root, "nodes", nodes);
-        yyjson_mut_obj_add_int(doc, root, "edges", edges);
-        yyjson_mut_obj_add_str(doc, root, "status", nodes > 0 ? "ready" : "empty");
+        yyjson_mut_obj_add_int(doc, root, "nodes", counts_unreadable ? 0 : nodes);
+        yyjson_mut_obj_add_int(doc, root, "edges", counts_unreadable ? 0 : edges);
+        yyjson_mut_obj_add_str(doc, root, "status",
+                               counts_unreadable ? "error" : (nodes > 0 ? "ready" : "empty"));
         cbm_project_t proj_info = {0};
         bool have_proj_info = cbm_store_get_project(store, project, &proj_info) == CBM_STORE_OK;
         if (have_proj_info) {
@@ -6688,7 +6695,20 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         safe_str_free(&proj_info.name);
         safe_str_free(&proj_info.indexed_at);
         safe_str_free(&proj_info.root_path);
-        if (nodes == 0) {
+        if (counts_unreadable) {
+            yyjson_mut_obj_add_str(
+                doc, root, "hint",
+                nodes < 0 && edges < 0
+                    ? "The nodes and edges tables could not be read; the database may be "
+                      "corrupt. Re-run index_repository(repo_path=...) or remove the project "
+                      "cache and re-index."
+                    : (nodes < 0 ? "The nodes table could not be read; the database may be "
+                                   "corrupt. Re-run index_repository(repo_path=...) or remove "
+                                   "the project cache and re-index."
+                                 : "The edges table could not be read; the database may be "
+                                   "corrupt. Re-run index_repository(repo_path=...) or remove "
+                                   "the project cache and re-index."));
+        } else if (nodes == 0) {
             yyjson_mut_obj_add_str(
                 doc, root, "hint",
                 "Project is empty. Re-run index_repository(repo_path=...) to populate.");
