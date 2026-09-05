@@ -2550,7 +2550,19 @@ ok = ok and owned_total == 2
 sys.exit(0 if ok else 1)
 " 2>/dev/null ||
    ! grep -q 'SessionStart' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
-   ! grep -q 'cbm-code-discovery-gate' "$FAKE_HOME/.claude/settings.json" 2>/dev/null; then
+   ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | SELF_PATH="$SELF_PATH" python3 -c "
+# Claude's gate is registered shell-free (#1733): the binary itself as the
+# command with 'hook-augment' as its argument, so no shim name can be grepped.
+import json, os, sys
+d = json.load(sys.stdin)
+self_path = os.environ['SELF_PATH']
+hooks = [h for entry in d.get('hooks', {}).get('PreToolUse', []) for h in entry.get('hooks', [])]
+ok = any(h.get('args') == ['hook-augment'] and
+         (h.get('command') == self_path or
+          os.path.basename(str(h.get('command', ''))) == os.path.basename(self_path))
+         for h in hooks)
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
   echo "FAIL 8aq: Devin hooks are not deduplicated against Claude SessionStart"
   exit 1
 else
@@ -2755,9 +2767,14 @@ if cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 hooks = d.get('hooks', {})
+# Shim names cover legacy shell registrations; the exec form (#1733) carries
+# no shim name, so its 'hook-augment' argument is the owned marker there.
 found = any('cbm-code-discovery-gate' in str(h) or
             'cbm-session-reminder' in str(h) or
-            'cbm-subagent-reminder' in str(h)
+            'cbm-subagent-reminder' in str(h) or
+            any('hook-augment' in str(x.get('args', [])) or
+                'hook-augment' in str(x.get('command', ''))
+                for x in h.get('hooks', []))
             for entries in hooks.values() for h in entries)
 sys.exit(1 if found else 0)
 " 2>/dev/null; then

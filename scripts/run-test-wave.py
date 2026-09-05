@@ -28,6 +28,20 @@ SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
 SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime"))
 POLL_SECONDS = 0.05
 
+# WHY: the Windows descendant probe below is a cold `powershell.exe` + CIM
+# start. On a GitHub Windows runner that routinely costs seconds -- interpreter
+# start-up, module autoload, CIM service warm-up -- and that cost is unrelated
+# to the state of the tree being proven. --kill-grace bounds how long a
+# *process* may resist termination and CI passes 1s, so timing the probe with
+# it made the proof a function of interpreter latency instead of the tree: a
+# cold start blew the 1s budget, TimeoutExpired became "assume the worst", and
+# an already-clean shard exited 2. This is a stable-state budget, not a race
+# tune -- the answer does not change with waiting, the budget only has to cover
+# a cold start, and a probe that still cannot finish is reported as an
+# unfinished probe rather than as a leaked tree.
+WINDOWS_DESCENDANT_PROBE_SECONDS = 15
+WINDOWS_DESCENDANT_PROBE_ATTEMPTS = 2
+
 
 @dataclass
 class ActiveSuite:
@@ -123,8 +137,8 @@ def start_suite(
     )
 
 
-def windows_descendants(pid: int, timeout: int) -> bool:
-    """True if any live process still claims `pid` as its parent.
+def windows_tree_cleanup_blocker(pid: int) -> str | None:
+    """Why `pid`'s tree cannot be called clean, or None when it provably is.
 
     Used only when the suite leader has already exited: `taskkill /T` cannot
     walk a tree from a dead PID, so cleanup is proven by asking whether anything
@@ -132,28 +146,45 @@ def windows_descendants(pid: int, timeout: int) -> bool:
     reparent orphans, so a grandchild keeps pointing at its own (dead) parent
     and would not be found here. That is a weaker proof than taskkill /T, which
     is why it is reserved for the case where the strong proof is impossible.
+
+    Fail-closed: a probe that times out, cannot start, or reports failure is
+    never read as absence. The reason names WHICH of the two happened -- a probe
+    that did not finish, or a counted set of live descendants -- because those
+    are different defects and used to be reported with the same sentence.
     """
-    try:
-        completed = subprocess.run(
-            [
-                "powershell.exe",
-                "-NoProfile",
-                "-NonInteractive",
-                "-Command",
-                "@(Get-CimInstance Win32_Process -Filter "
-                f"'ParentProcessId={pid}').Count",
-            ],
-            check=False,
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return True  # cannot prove absence -> assume the worst
-    if completed.returncode != 0:
-        return True
-    return (completed.stdout or "").strip() not in ("0", "")
+    unproven = "descendant probe did not run"
+    for _ in range(WINDOWS_DESCENDANT_PROBE_ATTEMPTS):
+        try:
+            completed = subprocess.run(
+                [
+                    "powershell.exe",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "@(Get-CimInstance Win32_Process -Filter "
+                    f"'ParentProcessId={pid}').Count",
+                ],
+                check=False,
+                stdin=subprocess.DEVNULL,
+                capture_output=True,
+                text=True,
+                timeout=WINDOWS_DESCENDANT_PROBE_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            unproven = (
+                "descendant probe could not complete in "
+                f"{WINDOWS_DESCENDANT_PROBE_SECONDS}s"
+            )
+            continue
+        except OSError as exc:
+            return f"descendant probe could not run: {exc}"
+        if completed.returncode != 0:
+            return f"descendant probe failed (rc={completed.returncode})"
+        count = (completed.stdout or "").strip()
+        if count in ("0", ""):
+            return None
+        return f"{count} live descendant(s)"
+    return unproven
 
 
 def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
@@ -167,9 +198,11 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
             # how a deliberately-hanging fixture suite reddened a release run.
             # taskkill /T cannot walk a tree from a dead PID, so prove cleanup
             # the only way still available -- nothing is parented to it.
-            if windows_descendants(process.pid, kill_grace):
+            blocker = windows_tree_cleanup_blocker(process.pid)
+            if blocker is not None:
                 raise RuntimeError(
-                    f"suite {active.name!r} leader exited leaving live descendants"
+                    f"suite {active.name!r} leader exited and tree cleanup "
+                    f"could not be proven: {blocker}"
                 )
             return
         try:

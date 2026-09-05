@@ -15,9 +15,11 @@ augmenter now fires for a drive-letter cwd.
 
 This test indexes a repo with a known symbol, confirms `search_graph` finds it
 (control — proves the index and project name are fine), then invokes
-`hook-augment` exactly as the installed PreToolUse hook does and asserts a
-`hookSpecificOutput` payload is produced. It fails (red) if that fix regresses.
-Also passes on Linux/macOS (`cwd` starts with `/`).
+`hook-augment` exactly as Claude's shell-free hook registration does: the
+executable is a literal argv element, including a forward-slash Windows path,
+and the hook payload is forwarded directly on stdin. It asserts a
+`hookSpecificOutput` payload is produced and fails (red) if either product
+contract regresses. Also passes on Linux/macOS (`cwd` starts with `/`).
 
 Exit code: 0 == augmenter fired (green), 1 == no-op (regression), 2 == setup error.
 
@@ -40,6 +42,7 @@ SRC = "export function %s(a: number): number { return a + 1; }\n" % SYMBOL
 def run_cli(binary, cache, args, stdin=None, timeout=120):
     env = dict(os.environ)
     env["CBM_CACHE_DIR"] = cache
+    env["CBM_RUNTIME_DIR"] = os.path.join(cache, "runtime")
     return subprocess.run([binary] + args, capture_output=True, timeout=timeout,
                           env=env, input=stdin)
 
@@ -48,12 +51,20 @@ def main():
     if len(sys.argv) < 2:
         print("usage: python test_hook_augment.py <binary>")
         return 2
-    binary = os.path.abspath(sys.argv[1])
+    # Claude's exec-form hook preserves this string exactly. On Windows, keep
+    # the forward-slash spelling that previously crossed Git Bash incorrectly.
+    binary = os.path.abspath(sys.argv[1]).replace("\\", "/")
     if not os.path.exists(binary):
         print("FAIL: binary not found: %s" % binary)
         return 2
 
-    work = tempfile.mkdtemp(prefix="cbm_win_hook_")
+    # macOS resolves /tmp through a symlink; the daemon's secure path walk
+    # accepts the canonical root-owned sticky parent at /private/tmp.
+    temp_parent = "/private/tmp" if sys.platform == "darwin" else None
+    work = tempfile.mkdtemp(prefix="cbm_win_hook_", dir=temp_parent)
+    cache = None
+    daemon_pid = 0
+    daemon_started = False
     try:
         repo = os.path.join(work, "repo")
         os.makedirs(os.path.join(repo, "src"), exist_ok=True)
@@ -61,6 +72,31 @@ def main():
             f.write(SRC.encode("utf-8"))
         cache = os.path.join(work, "cache")
         os.makedirs(cache, exist_ok=True)
+        os.makedirs(os.path.join(cache, "runtime"), mode=0o700, exist_ok=True)
+
+        # The CLI and hooks share the mandatory daemon. Start the supported
+        # permanent mode before indexing so every product-surface command uses
+        # the same isolated cache and daemon cohort.
+        # Retry once: a cold runner's daemon startup latency (#1952) is setup
+        # noise, not the surface under test.
+        start_out = ""
+        rc = 1
+        for attempt in (1, 2):
+            start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
+            start_out = (start.stdout or b"").decode("utf-8", "replace")
+            start_err = (start.stderr or b"").decode("utf-8", "replace")
+            rc = start.returncode
+            print("daemon start attempt %d rc=%d stdout=%r stderr=%r" %
+                  (attempt, rc, start_out[:120], start_err[:500]))
+            if rc == 0:
+                break
+            time.sleep(2)
+        if rc != 0:
+            print("SETUP FAIL: permanent daemon did not start")
+            return 2
+        daemon_started = True
+        pid_match = re.search(r"pid (\d+)", start_out)
+        daemon_pid = int(pid_match.group(1)) if pid_match else 0
 
         # repo_path / cwd in the forward-slash drive form Claude Code passes.
         repo_fwd = repo.replace("\\", "/")
@@ -100,27 +136,6 @@ def main():
             return 2
         print("control: search_graph finds %s in project %s" % (SYMBOL, name))
 
-        # Hooks are connect-only under the mandatory daemon: they never spawn
-        # one and fail open when none is active. Bring up a permanent daemon
-        # first — the supported way to keep hooks armed outside MCP sessions —
-        # and retire it afterwards (with a kill-by-pid backstop so a stuck stop
-        # can never hang CI).
-        start_out = ""
-        rc = 1
-        for attempt in (1, 2):
-            start = run_cli(binary, cache, ["daemon", "start"], timeout=60)
-            start_out = (start.stdout or b"").decode("utf-8", "replace")
-            rc = start.returncode
-            print("daemon start attempt %d rc=%d %r" % (attempt, rc, start_out[:120]))
-            if rc == 0:
-                break
-            time.sleep(2)
-        if rc != 0:
-            print("SETUP FAIL: permanent daemon did not start")
-            return 2
-        pid_match = re.search(r"pid (\d+)", start_out)
-        daemon_pid = int(pid_match.group(1)) if pid_match else 0
-
         # Invoke hook-augment exactly as the installed PreToolUse hook does.
         payload = json.dumps({
             "hook_event_name": "PreToolUse",
@@ -128,21 +143,7 @@ def main():
             "cwd": repo_fwd,
             "tool_input": {"pattern": SYMBOL},
         }).encode("utf-8")
-        try:
-            ha = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60)
-        finally:
-            stopped = False
-            try:
-                stop = run_cli(binary, cache, ["daemon", "stop"], timeout=30)
-                stopped = stop.returncode == 0
-            except subprocess.TimeoutExpired:
-                pass
-            if not stopped and daemon_pid:
-                subprocess.run(["taskkill" if os.name == "nt" else "kill",
-                                "/F" if os.name == "nt" else "-9",
-                                "/PID" if os.name == "nt" else str(daemon_pid)] +
-                               ([str(daemon_pid)] if os.name == "nt" else []),
-                               capture_output=True, timeout=30)
+        ha = run_cli(binary, cache, ["hook-augment"], stdin=payload, timeout=60)
         out = (ha.stdout or b"").decode("utf-8", "replace").strip()
         print("hook-augment rc=%d stdout=%r" % (ha.returncode, out[:200]))
 
@@ -155,6 +156,19 @@ def main():
               "cbm_is_walkable_abs_path handling in hook_augment.c regressed?).")
         return 1
     finally:
+        if daemon_started and cache:
+            stopped = False
+            try:
+                stop = run_cli(binary, cache, ["daemon", "stop"], timeout=30)
+                stopped = stop.returncode == 0
+            except subprocess.TimeoutExpired:
+                pass
+            if not stopped and daemon_pid:
+                subprocess.run(["taskkill" if os.name == "nt" else "kill",
+                                "/F" if os.name == "nt" else "-9",
+                               "/PID" if os.name == "nt" else str(daemon_pid)] +
+                               ([str(daemon_pid)] if os.name == "nt" else []),
+                               capture_output=True, timeout=30)
         shutil.rmtree(work, ignore_errors=True)
 
 

@@ -30,6 +30,99 @@ if ! grep -Fq 'run-test-wave.py' "$driver"; then
     exit 1
 fi
 
+# The Windows descendant proof must not be timed by --kill-grace. That argument
+# bounds how long a *process* may resist termination (this file runs the
+# scheduler with 1s); the probe is a cold PowerShell + CIM start that routinely
+# costs seconds on a runner. Binding one to the other made the verdict a
+# function of interpreter latency: a slow start became "assume the worst" and
+# reddened an already-clean shard. Asserted structurally -- no sleeps, no timing
+# thresholds -- so the contract stays deterministic on every platform.
+# (Command substitution, not `| grep -q`: under pipefail an early-exiting
+# reader can hand the writer EPIPE and turn a satisfied match into status 141.)
+probe_sites=$(grep -n 'windows_tree_cleanup_blocker(' "$scheduler" || true)
+if [[ "$probe_sites" == *kill_grace* ]]; then
+    echo "FAIL: the Windows descendant probe is still timed by --kill-grace" >&2
+    exit 1
+fi
+
+python3 - "$scheduler" <<'PROBE'
+from __future__ import annotations
+
+import importlib.util
+import subprocess
+import sys
+
+
+spec = importlib.util.spec_from_file_location("cbm_run_test_wave", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+# @dataclass resolves its own module out of sys.modules; register before exec.
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+
+budget = getattr(module, "WINDOWS_DESCENDANT_PROBE_SECONDS", None)
+if not isinstance(budget, int) or budget < 15:
+    raise SystemExit(
+        "FAIL: the descendant probe has no independent budget "
+        f"(WINDOWS_DESCENDANT_PROBE_SECONDS={budget!r})"
+    )
+
+probe = module.windows_tree_cleanup_blocker
+original_run = subprocess.run
+observed: list[object] = []
+
+
+def timing_out(*args: object, **kwargs: object) -> object:
+    observed.append(kwargs.get("timeout"))
+    raise subprocess.TimeoutExpired(cmd="probe", timeout=kwargs.get("timeout"))
+
+
+class _Completed:
+    def __init__(self, stdout: str) -> None:
+        self.returncode = 0
+        self.stdout = stdout
+
+
+try:
+    subprocess.run = timing_out
+    timed_out_reason = probe(4321)
+    subprocess.run = lambda *a, **k: _Completed("3\n")
+    live_reason = probe(4321)
+    subprocess.run = lambda *a, **k: _Completed("0\n")
+    clean_reason = probe(4321)
+finally:
+    subprocess.run = original_run
+
+if observed != [budget] * len(observed):
+    raise SystemExit(
+        "FAIL: the descendant probe is not bounded by its own budget "
+        f"(timeouts={observed})"
+    )
+if len(observed) < 2:
+    raise SystemExit(
+        "FAIL: the descendant probe does not retry a timed-out probe "
+        f"(attempts={len(observed)})"
+    )
+if timed_out_reason is None or live_reason is None:
+    raise SystemExit(
+        "FAIL: the descendant probe stopped failing closed "
+        f"(timed_out={timed_out_reason!r}, live={live_reason!r})"
+    )
+if clean_reason is not None:
+    raise SystemExit(f"FAIL: a clean tree was not proven clean ({clean_reason!r})")
+if "could not complete" not in timed_out_reason:
+    raise SystemExit(
+        f"FAIL: an unfinished probe is not named as one ({timed_out_reason!r})"
+    )
+if "3 live descendant" not in live_reason:
+    raise SystemExit(
+        f"FAIL: proven descendants are not reported with their count ({live_reason!r})"
+    )
+if timed_out_reason == live_reason:
+    raise SystemExit(
+        "FAIL: an unfinished probe and a leaked tree are reported identically"
+    )
+PROBE
+
 cat >"$fixture/fake_runner.py" <<'PY'
 from __future__ import annotations
 
@@ -370,7 +463,11 @@ try:
             raise SystemExit("FAIL: scheduler did not observe the forced leader exit")
         time.sleep(0.02)
     release.write_text("release\n", encoding="utf-8")
-    stdout, stderr = process.communicate(timeout=8)
+    # Generous on purpose: the scheduler's refusal is the asserted state, and
+    # on Windows it now spends up to the descendant-probe budget (twice --
+    # once in the wave loop, once in the cleanup pass) before refusing. This
+    # bound only has to exceed that worst case; it never decides the verdict.
+    stdout, stderr = process.communicate(timeout=120)
 
     if os.name == "nt":
         # Assert the PROPERTY, not the wording. This used to require the phrase
