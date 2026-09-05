@@ -17,11 +17,14 @@ bool cbm_dump_verify_is_degraded(int committed_nodes, int persisted_nodes, doubl
     if (committed_nodes < 0) {
         return false;
     }
-    if (committed_nodes <= min_floor) {
-        return false;
-    }
     if (persisted_nodes < 0) {
         return true;
+    }
+    if (committed_nodes > 0 && persisted_nodes == 0) {
+        return true;
+    }
+    if (committed_nodes <= min_floor) {
+        return false;
     }
     return (double)persisted_nodes < (double)committed_nodes * ratio;
 }

@@ -8,6 +8,7 @@
 
 // for ISO timestamp
 
+#include <limits.h>
 #include <stdint.h>
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -2174,13 +2175,214 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
+static int rollback_savepoint_preserving_error(cbm_store_t *s, const char *rollback_sql,
+                                               const char *release_sql) {
+    char saved_error[sizeof(s->errbuf)];
+    snprintf(saved_error, sizeof(saved_error), "%s", s->errbuf);
+    (void)sqlite3_exec(s->db, rollback_sql, NULL, NULL, NULL);
+    (void)sqlite3_exec(s->db, release_sql, NULL, NULL, NULL);
+    snprintf(s->errbuf, sizeof(s->errbuf), "%s", saved_error);
+    return CBM_STORE_ERR;
+}
+
+static bool generation_uid_is_canonical(const char *uid) {
+    if (!uid || strlen(uid) != 16) {
+        return false;
+    }
+    for (size_t i = 0; i < 16; i++) {
+        if (!((uid[i] >= '0' && uid[i] <= '9') || (uid[i] >= 'a' && uid[i] <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool generation_counter_parse(const char *text, uint64_t *out) {
+    if (!text || !text[0] || (text[0] == '0' && text[1] != '\0')) {
+        return false;
+    }
+    uint64_t value = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+        uint64_t digit = (uint64_t)(*p - '0');
+        if (value > (UINT64_MAX - digit) / 10) {
+            return false;
+        }
+        value = value * 10 + digit;
+    }
+    *out = value;
+    return true;
+}
+
+/* Read and validate the two generation keys. Extra store_meta keys belong to
+ * other store features and are deliberately ignored. */
+static int generation_metadata_read(cbm_store_t *s, bool *absent, char uid[17], char counter[21],
+                                    uint64_t *counter_value) {
+    *absent = false;
+    sqlite3_stmt *object = NULL;
+    int rc = sqlite3_prepare_v2(s->db,
+                                "SELECT type FROM sqlite_schema WHERE name='store_meta' "
+                                "AND type IN ('table','view') LIMIT 1;",
+                                CBM_NOT_FOUND, &object, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "store generation schema probe prepare");
+        return CBM_STORE_ERR;
+    }
+    rc = sqlite3_step(object);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(object);
+        *absent = true;
+        return CBM_STORE_OK;
+    }
+    if (rc != SQLITE_ROW) {
+        store_set_error_sqlite(s, "store generation schema probe");
+        sqlite3_finalize(object);
+        return CBM_STORE_ERR;
+    }
+    const char *object_type = (const char *)sqlite3_column_text(object, 0);
+    bool is_table = object_type && strcmp(object_type, "table") == 0;
+    sqlite3_finalize(object);
+    if (!is_table) {
+        store_set_error(s, "store generation metadata is not a table");
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt = NULL;
+    rc = sqlite3_prepare_v2(s->db,
+                            "SELECT k, v, typeof(v) FROM store_meta "
+                            "WHERE k IN ('db_uid','mutation_gen') ORDER BY k;",
+                            CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        store_set_error_sqlite(s, "store generation metadata prepare");
+        return CBM_STORE_ERR;
+    }
+    bool have_uid = false;
+    bool have_counter = false;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *key = (const char *)sqlite3_column_text(stmt, 0);
+        const char *value = (const char *)sqlite3_column_text(stmt, 1);
+        const char *value_type = (const char *)sqlite3_column_text(stmt, 2);
+        if (!key || !value || !value_type || strcmp(value_type, "text") != 0) {
+            store_set_error(s, "store generation metadata has a non-text value");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        if ((size_t)sqlite3_column_bytes(stmt, 0) != strlen(key) ||
+            (size_t)sqlite3_column_bytes(stmt, 1) != strlen(value) ||
+            (size_t)sqlite3_column_bytes(stmt, 2) != strlen(value_type)) {
+            store_set_error(s, "store generation metadata contains an embedded NUL");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+        if (strcmp(key, "db_uid") == 0 && !have_uid && generation_uid_is_canonical(value)) {
+            snprintf(uid, 17, "%s", value);
+            have_uid = true;
+        } else if (strcmp(key, "mutation_gen") == 0 && !have_counter &&
+                   generation_counter_parse(value, counter_value)) {
+            snprintf(counter, 21, "%s", value);
+            have_counter = true;
+        } else {
+            store_set_error(s, "store generation metadata is malformed");
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+    }
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "store generation metadata scan");
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    sqlite3_finalize(stmt);
+    if (!have_uid || !have_counter) {
+        store_set_error(s, "store generation metadata is incomplete");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_generation_advance(cbm_store_t *s) {
+    static const char savepoint[] = "SAVEPOINT cbm_generation_advance;";
+    static const char rollback[] = "ROLLBACK TO cbm_generation_advance;";
+    static const char release[] = "RELEASE cbm_generation_advance;";
+    if (!s || !s->db) {
+        return CBM_STORE_ERR;
+    }
+    int rc = SQLITE_OK;
+    if (exec_sql(s, savepoint) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    bool absent = false;
+    char uid[17] = {0};
+    char counter[21] = {0};
+    uint64_t counter_value = 0;
+    if (generation_metadata_read(s, &absent, uid, counter, &counter_value) != CBM_STORE_OK) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    if (absent) {
+        if (sqlite3_exec(s->db,
+                         "CREATE TABLE store_meta (k TEXT PRIMARY KEY, v TEXT NOT NULL);"
+                         "INSERT INTO store_meta VALUES"
+                         "('db_uid', lower(hex(randomblob(8))));"
+                         "INSERT INTO store_meta VALUES('mutation_gen','0');",
+                         NULL, NULL, NULL) != SQLITE_OK) {
+            store_set_error_sqlite(s, "store generation metadata create");
+            return rollback_savepoint_preserving_error(s, rollback, release);
+        }
+        if (generation_metadata_read(s, &absent, uid, counter, &counter_value) != CBM_STORE_OK ||
+            absent) {
+            if (absent) {
+                store_set_error(s, "store generation metadata create did not persist");
+            }
+            return rollback_savepoint_preserving_error(s, rollback, release);
+        }
+    }
+    if (counter_value == UINT64_MAX) {
+        store_set_error(s, "store generation mutation counter overflow");
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+
+    char next_counter[21];
+    snprintf(next_counter, sizeof(next_counter), "%llu", (unsigned long long)(counter_value + 1));
+    sqlite3_stmt *update = NULL;
+    if (sqlite3_prepare_v2(s->db, "UPDATE store_meta SET v=?1 WHERE k='mutation_gen' AND v=?2;",
+                           CBM_NOT_FOUND, &update, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "store generation advance prepare");
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    bind_text(update, SKIP_ONE, next_counter);
+    bind_text(update, ST_COL_2, counter);
+    rc = sqlite3_step(update);
+    sqlite3_finalize(update);
+    if (rc != SQLITE_DONE || sqlite3_changes(s->db) != 1) {
+        if (rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "store generation advance");
+        } else {
+            store_set_error(s, "store generation advance changed an unexpected row count");
+        }
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    if (exec_sql(s, release) != CBM_STORE_OK) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
+    static const char savepoint[] = "SAVEPOINT cbm_upsert_project;";
+    static const char rollback[] = "ROLLBACK TO cbm_upsert_project;";
+    static const char release[] = "RELEASE cbm_upsert_project;";
+    if (!s || !s->db || exec_sql(s, savepoint) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_project,
                        "INSERT INTO projects (name, indexed_at, root_path) VALUES (?1, ?2, ?3) "
                        "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3;");
     if (!stmt) {
-        return CBM_STORE_ERR;
+        return rollback_savepoint_preserving_error(s, rollback, release);
     }
 
     char ts[CBM_SZ_64];
@@ -2193,53 +2395,42 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     int rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
         store_set_error_sqlite(s, "upsert_project");
-        return CBM_STORE_ERR;
+        sqlite3_reset(stmt);
+        return rollback_savepoint_preserving_error(s, rollback, release);
     }
+    sqlite3_reset(stmt);
 
-    /* Store generation for cursor staleness (pagination): db_uid is a random
-     * identity minted once per DB FILE (a full reindex publishes a fresh file
-     * via the writer, which carries no store_meta — the first upsert_project
-     * on the opened store seeds a NEW uid, so cursors minted against the old
-     * file can never validate against the rebuilt one, whose node ids all
-     * differ). mutation_gen increments on every project upsert — the choke
-     * point every index run (full, incremental, watcher) passes through.
-     * Created here rather than in the byte-level writer: adding a table to
-     * its hand-built sqlite_master is rootpage surgery for zero benefit. */
-    (void)sqlite3_exec(s->db,
-                       "CREATE TABLE IF NOT EXISTS store_meta (k TEXT PRIMARY KEY, v TEXT);"
-                       "INSERT OR IGNORE INTO store_meta VALUES"
-                       "('db_uid', lower(hex(randomblob(8))));"
-                       "INSERT OR IGNORE INTO store_meta VALUES('mutation_gen','0');"
-                       "UPDATE store_meta SET v = CAST(CAST(v AS INTEGER)+1 AS TEXT) "
-                       "WHERE k='mutation_gen';",
-                       NULL, NULL, NULL);
+    if (cbm_store_generation_advance(s) != CBM_STORE_OK) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    if (exec_sql(s, release) != CBM_STORE_OK) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
     return CBM_STORE_OK;
 }
 
 /* Opaque store generation for pagination cursors: "u<db_uid>g<mutation_gen>",
- * or "legacy" when the DB predates store_meta (read-only opens never create
- * it). A cursor whose embedded generation mismatches the store's current one
- * is stale — the graph may have changed under it. */
+ * or "legacy" only when the DB genuinely predates store_meta. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz) {
     if (!s || !s->db || !buf || bufsz == 0) {
         return CBM_STORE_ERR;
     }
-    snprintf(buf, bufsz, "legacy");
-    sqlite3_stmt *stmt = NULL;
-    if (sqlite3_prepare_v2(s->db,
-                           "SELECT (SELECT v FROM store_meta WHERE k='db_uid'),"
-                           "       (SELECT v FROM store_meta WHERE k='mutation_gen');",
-                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
-        return CBM_STORE_OK; /* pre-migration DB: stable "legacy" generation */
+    bool absent = false;
+    char uid[17] = {0};
+    char counter[21] = {0};
+    uint64_t counter_value = 0;
+    if (generation_metadata_read(s, &absent, uid, counter, &counter_value) != CBM_STORE_OK) {
+        buf[0] = '\0';
+        return CBM_STORE_ERR;
     }
-    if (sqlite3_step(stmt) == SQLITE_ROW) {
-        const char *uid = (const char *)sqlite3_column_text(stmt, 0);
-        const char *gen = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
-        if (uid && gen) {
-            snprintf(buf, bufsz, "u%sg%s", uid, gen);
-        }
+    (void)counter_value;
+    int written =
+        absent ? snprintf(buf, bufsz, "legacy") : snprintf(buf, bufsz, "u%sg%s", uid, counter);
+    if (written < 0 || (size_t)written >= bufsz) {
+        buf[0] = '\0';
+        store_set_error(s, "store generation output buffer is too small");
+        return CBM_STORE_ERR;
     }
-    sqlite3_finalize(stmt);
     return CBM_STORE_OK;
 }
 
@@ -4274,8 +4465,18 @@ int cbm_store_list_files(cbm_store_t *s, const char *project, char ***out, int *
         return CBM_STORE_ERR;
     }
 
+    /* A node path can name a graph-only identity such as a Folder,
+     * <python-builtins>, or another synthetic source. Published indexes have
+     * one canonical File node per scannable path, so prefer that exact set.
+     * Legacy/manual stores without File nodes retain their previous node-path
+     * fallback (minus Folder directories). Missing canonical paths stay in
+     * the list so search_code still fails closed on a stale snapshot. */
     const char *sql = "SELECT DISTINCT file_path FROM nodes "
-                      "WHERE project = ?1 AND file_path IS NOT NULL AND file_path != ''";
+                      "WHERE project = ?1 AND label != 'Folder' "
+                      "AND file_path IS NOT NULL AND file_path != '' "
+                      "AND (label = 'File' OR NOT EXISTS ("
+                      "SELECT 1 FROM nodes WHERE project = ?1 AND label = 'File')) "
+                      "ORDER BY file_path";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
         return CBM_STORE_ERR;
@@ -5393,10 +5594,14 @@ void cbm_store_search_free(cbm_search_output_t *out) {
 
 static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_hop_t *visited,
                              int visited_count, const char *types_clause, const char **edge_types,
-                             int edge_type_count, cbm_edge_info_t **out_edges,
-                             int *out_edge_count) {
+                             int edge_type_count, int max_edges, cbm_edge_info_t **out_edges,
+                             int *out_edge_count, bool *out_truncated) {
     *out_edges = NULL;
     *out_edge_count = 0;
+    *out_truncated = false;
+    if (max_edges == 0) {
+        return CBM_STORE_OK;
+    }
 
     /* Visited-ID set via a per-connection TEMP table. The previous approach
      * interpolated the ids into a fixed 4KB SQL string: past ~1000 visited
@@ -5408,22 +5613,37 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
                      "CREATE TEMP TABLE IF NOT EXISTS bfs_ids (id INTEGER PRIMARY KEY);"
                      "DELETE FROM bfs_ids;",
                      NULL, NULL, NULL) != SQLITE_OK) {
-        return CBM_STORE_OK; /* best-effort: nodes without edges beat an error */
+        store_set_error_sqlite(s, "bfs edge ids");
+        return CBM_STORE_ERR;
     }
     sqlite3_stmt *ins = NULL;
     if (sqlite3_prepare_v2(s->db, "INSERT OR IGNORE INTO bfs_ids(id) VALUES (?1)", CBM_NOT_FOUND,
                            &ins, NULL) != SQLITE_OK) {
-        return CBM_STORE_OK;
+        store_set_error_sqlite(s, "bfs edge ids prepare");
+        return CBM_STORE_ERR;
     }
     sqlite3_bind_int64(ins, SKIP_ONE, start_id);
-    (void)sqlite3_step(ins);
+    if (sqlite3_step(ins) != SQLITE_DONE) {
+        store_set_error_sqlite(s, "bfs edge root id");
+        sqlite3_finalize(ins);
+        return CBM_STORE_ERR;
+    }
     for (int i = 0; i < visited_count; i++) {
         sqlite3_reset(ins);
         sqlite3_bind_int64(ins, SKIP_ONE, visited[i].node.id);
-        (void)sqlite3_step(ins);
+        if (sqlite3_step(ins) != SQLITE_DONE) {
+            store_set_error_sqlite(s, "bfs edge visited id");
+            sqlite3_finalize(ins);
+            return CBM_STORE_ERR;
+        }
     }
     sqlite3_finalize(ins);
 
+    char limit_clause[ST_BUF_64] = "";
+    if (max_edges > 0) {
+        snprintf(limit_clause, sizeof(limit_clause), " LIMIT %d",
+                 max_edges < INT_MAX ? max_edges + SKIP_ONE : max_edges);
+    }
     char edge_sql[ST_SQL_BUF];
     snprintf(edge_sql, sizeof(edge_sql),
              "SELECT n1.name, n2.name, e.type, e.source_id, e.target_id, e.properties "
@@ -5432,15 +5652,15 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
              "JOIN nodes n2 ON n2.id = e.target_id "
              "WHERE e.source_id IN (SELECT id FROM bfs_ids) "
              "AND e.target_id IN (SELECT id FROM bfs_ids) "
-             "AND e.type IN (%s)",
-             types_clause);
+             "AND e.type IN (%s) "
+             "ORDER BY e.source_id, e.target_id, e.type%s",
+             types_clause, limit_clause);
 
     sqlite3_stmt *estmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, edge_sql, CBM_NOT_FOUND, &estmt, NULL);
     if (rc != SQLITE_OK) {
-        *out_edges = NULL;
-        *out_edge_count = 0;
-        return CBM_STORE_OK;
+        store_set_error_sqlite(s, "bfs edges prepare");
+        return CBM_STORE_ERR;
     }
 
     if (edge_type_count > 0) {
@@ -5478,6 +5698,15 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
         return CBM_STORE_ERR;
     }
     sqlite3_finalize(estmt);
+
+    if (max_edges > 0 && en > max_edges) {
+        en = max_edges;
+        safe_str_free(&edges[en].from_name);
+        safe_str_free(&edges[en].to_name);
+        safe_str_free(&edges[en].type);
+        safe_str_free(&edges[en].properties_json);
+        *out_truncated = true;
+    }
 
     *out_edges = edges;
     *out_edge_count = en;
@@ -5533,8 +5762,11 @@ static int bfs_cte_row_limit_for_depth(int max_results, int max_depth) {
 
 static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                      const char **edge_types, int edge_type_count, int max_depth, int max_results,
-                     bool trail, cbm_traverse_result_t *out) {
+                     bool trail, int max_edges, cbm_traverse_result_t *out) {
     memset(out, 0, sizeof(*out));
+    if (max_results < 0) {
+        max_results = 0;
+    }
 
     cbm_node_t root = {0};
     int rc = cbm_store_find_node_by_id(s, start_id, &root);
@@ -5560,6 +5792,8 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
         next_id = "e.target_id";
     }
 
+    /* One extra row makes max_results saturation observable on both branches. */
+    int probe_limit = max_results < INT_MAX ? max_results + SKIP_ONE : max_results;
     int cte_row_limit = 0;
     if (trail) {
         cte_row_limit = bfs_cte_row_limit_for_depth(max_results, max_depth);
@@ -5588,7 +5822,7 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "FROM bfs JOIN nodes n ON n.id = bfs.node_id "
                  "WHERE bfs.hop > 0 ORDER BY bfs.hop, n.id LIMIT %d;",
                  (long long)start_id, next_id, join_cond, types_clause, max_depth,
-                 cte_row_limit + SKIP_ONE, max_results);
+                 cte_row_limit + SKIP_ONE, probe_limit);
     } else {
         snprintf(sql, sizeof(sql),
                  /* SHORTEST-PATH semantics: the UNION dedupes (node, hop) pairs.
@@ -5611,7 +5845,7 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
                  "GROUP BY n.id "
                  "ORDER BY hop, n.id "
                  "LIMIT %d;",
-                 (long long)start_id, next_id, join_cond, types_clause, max_depth, max_results);
+                 (long long)start_id, next_id, join_cond, types_clause, max_depth, probe_limit);
     }
 
     sqlite3_stmt *stmt = NULL;
@@ -5664,14 +5898,26 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
         snprintf(limit_buf, sizeof(limit_buf), "%d", cte_row_limit);
         cbm_log_warn("cypher.trail_truncated", "cte_rows", limit_buf, "result", "partial");
     }
+    if (n > max_results) {
+        /* The extra probe row fired: drop it and report the ceiling honestly. */
+        n = max_results;
+        cbm_node_free_fields(&visited[n].node);
+        out->truncated = true;
+    }
 
     out->visited = visited;
     out->visited_count = n;
 
-    /* Collect edges between visited nodes (including root) */
-    if (n > 0) {
-        bfs_collect_edges(s, start_id, out->visited, n, types_clause, edge_types, edge_type_count,
-                          &out->edges, &out->edge_count);
+    /* Edge properties are a secondary, potentially dense all-pairs lookup.
+     * Lean callers pass max_edges=0 and avoid it entirely; diagnostics callers
+     * pass an explicit ceiling and receive an honest saturation bit. */
+    if (n > 0 && max_edges != 0) {
+        rc = bfs_collect_edges(s, start_id, out->visited, n, types_clause, edge_types,
+                               edge_type_count, max_edges, &out->edges, &out->edge_count,
+                               &out->edges_truncated);
+        if (rc != CBM_STORE_OK) {
+            return rc;
+        }
     } else {
         out->edges = NULL;
         out->edge_count = 0;
@@ -5683,14 +5929,23 @@ static int store_bfs(cbm_store_t *s, int64_t start_id, const char *direction,
 int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const char **edge_types,
                   int edge_type_count, int max_depth, int max_results, cbm_traverse_result_t *out) {
     return store_bfs(s, start_id, direction, edge_types, edge_type_count, max_depth, max_results,
-                     false, out);
+                     false, -1, out);
 }
 
 int cbm_store_bfs_trail(cbm_store_t *s, int64_t start_id, const char *direction,
                         const char **edge_types, int edge_type_count, int max_depth,
                         int max_results, cbm_traverse_result_t *out) {
     return store_bfs(s, start_id, direction, edge_types, edge_type_count, max_depth, max_results,
-                     true, out);
+                     true, -1, out);
+}
+
+int cbm_store_bfs_with_edge_limit(cbm_store_t *s, int64_t start_id, const char *direction,
+                                  const char **edge_types, int edge_type_count, int max_depth,
+                                  int max_results, int max_edges, cbm_traverse_result_t *out) {
+    /* Bounded edge-data variant for lean callers: node traversal is the plain
+     * shortest-path BFS; max_edges=0 skips the all-pairs edge lookup entirely. */
+    return store_bfs(s, start_id, direction, edge_types, edge_type_count, max_depth, max_results,
+                     false, max_edges, out);
 }
 
 /* Multi-source BFS: one recursive CTE anchored on ALL seeds (via a temp
@@ -9821,6 +10076,18 @@ static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *
     return results;
 }
 
+static int vs_ranked_result_cmp(const void *lhs, const void *rhs) {
+    const cbm_vector_result_t *a = lhs;
+    const cbm_vector_result_t *b = rhs;
+    if (a->score > b->score) {
+        return -1;
+    }
+    if (a->score < b->score) {
+        return 1;
+    }
+    return (a->node_id > b->node_id) - (a->node_id < b->node_id);
+}
+
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count) {
@@ -9836,16 +10103,15 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_OK;
     }
 
-    /* Scan all node vectors, compute per-keyword cosine, take min.
-     * We use the FIRST keyword as the SQL sort (for top-K pre-filter),
-     * then re-score with min across all keywords in the append helper. */
+    /* Use the first keyword for a cheap candidate ordering, then score each
+     * materialized candidate by min-cosine across every keyword. */
     const char *sql = "SELECT n.id, n.name, n.qualified_name, n.file_path, n.label,"
                       "       cbm_cosine_i8(v.vector, ?1) as score, v.vector"
                       " FROM node_vectors v"
                       " INNER JOIN nodes n ON n.id = v.node_id"
                       " WHERE v.project = ?2"
                       " AND n.label IN (" CBM_SQL_CALLABLE_OR_TYPE_LABELS ")"
-                      " ORDER BY score DESC"
+                      " ORDER BY score DESC, n.id ASC"
                       " LIMIT ?3";
 
     sqlite3_stmt *stmt = NULL;
@@ -9855,59 +10121,74 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
-    /* Use first keyword for SQL pre-filter, fetch more candidates for re-ranking */
-    int fetch_limit = (limit > 0 ? limit : CBM_SZ_16) * ST_COL_5;
+    /* A fixed 5x prefilter is normally ample, but it is not a proof: a later
+     * candidate can have a lower first-keyword score and a much higher
+     * all-keyword min-score. Expand until either the scan is exhausted or the
+     * Kth final score is strictly above the best possible omitted score. This
+     * makes top-K prefixes identical for every requested K, which semantic
+     * offset pagination requires. */
+    int requested_limit = limit > 0 ? limit : CBM_SZ_16;
+    int fetch_limit = requested_limit > INT_MAX / ST_COL_5 ? INT_MAX : requested_limit * ST_COL_5;
     sqlite3_bind_blob(stmt, SKIP_ONE, kw_vecs[0], VS_VEC_DIM, SQLITE_STATIC);
     sqlite3_bind_text(stmt, ST_COL_2, project, SQLITE_AUTO_LEN, SQLITE_STATIC);
-    sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
+
+    cbm_vector_result_t *results = NULL;
+    int count = 0;
+    for (;;) {
+        int cap = 0;
+        int step_rc;
+        double omitted_score_ceiling = 0.0;
+        sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+            omitted_score_ceiling = sqlite3_column_double(stmt, ST_COL_5);
+            cbm_vector_result_t *grown =
+                vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
+            if (!grown) {
+                step_rc = SQLITE_NOMEM;
+                break;
+            }
+            results = grown;
+        }
+        if (step_rc != SQLITE_DONE) {
+            char rc_buf[VS_STR_BUF];
+            snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
+            cbm_log_warn("vector_search.step_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
+            cbm_store_free_vector_results(results, count);
+            sqlite3_finalize(stmt);
+            return CBM_STORE_ERR;
+        }
+
+        if (count > 1) {
+            qsort(results, (size_t)count, sizeof(*results), vs_ranked_result_cmp);
+        }
+        bool scan_exhausted = count < fetch_limit;
+        bool top_k_certified = scan_exhausted || count < requested_limit ||
+                               results[requested_limit - 1].score > omitted_score_ceiling;
+        if (top_k_certified || fetch_limit == INT_MAX) {
+            break;
+        }
+
+        cbm_store_free_vector_results(results, count);
+        results = NULL;
+        count = 0;
+        fetch_limit = fetch_limit > INT_MAX / ST_COL_2 ? INT_MAX : fetch_limit * ST_COL_2;
+        sqlite3_reset(stmt);
+    }
 
     {
         char kw_buf[VS_STR_BUF];
         char fl_buf[VS_STR_BUF];
+        char cnt_buf[VS_STR_BUF];
         snprintf(kw_buf, sizeof(kw_buf), "%d", actual_kw);
         snprintf(fl_buf, sizeof(fl_buf), "%d", fetch_limit);
-        cbm_log_info("vector_search.exec", "kw_count", kw_buf, "fetch_limit", fl_buf, "project",
-                     project);
-    }
-
-    cbm_vector_result_t *results = NULL;
-    int count = 0;
-    int cap = 0;
-    int step_rc = 0;
-    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        cbm_vector_result_t *grown =
-            vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
-        if (!grown) {
-            break;
-        }
-        results = grown;
-    }
-
-    if (step_rc != SQLITE_DONE) {
-        char rc_buf[VS_STR_BUF];
-        snprintf(rc_buf, sizeof(rc_buf), "%d", step_rc);
-        cbm_log_warn("vector_search.step_error", "rc", rc_buf, "msg", sqlite3_errmsg(s->db));
-    }
-    {
-        char cnt_buf[VS_STR_BUF];
         snprintf(cnt_buf, sizeof(cnt_buf), "%d", count);
-        cbm_log_info("vector_search.done", "candidates", cnt_buf);
+        cbm_log_info("vector_search.done", "kw_count", kw_buf, "fetch_limit", fl_buf, "candidates",
+                     cnt_buf);
     }
     sqlite3_finalize(stmt);
 
-    /* Re-sort by min-score (SQL sorted by first keyword only) */
-    for (int i = 0; i < count - SKIP_ONE; i++) {
-        for (int j = i + SKIP_ONE; j < count; j++) {
-            if (results[j].score > results[i].score) {
-                cbm_vector_result_t tmp = results[i];
-                results[i] = results[j];
-                results[j] = tmp;
-            }
-        }
-    }
-
     /* Trim to requested limit */
-    int final_limit = limit > 0 ? limit : CBM_SZ_16;
+    int final_limit = requested_limit;
     if (count > final_limit) {
         for (int i = final_limit; i < count; i++) {
             free(results[i].name);

@@ -181,10 +181,35 @@ endif
 # ~259 MB of tree-sitter parse tables was mapped executable at runtime while the
 # amd64 build of the same source mapped them R only. That is a large ROP gadget
 # surface for data that is never executed, and it is invisible to section flags.
+#
+# -z relro + -z now finish the same job on the OTHER writable-but-shouldn't-be
+# region: the GOT. Both are free at runtime here (a static binary resolves
+# everything at link time, so there is no lazy binding left to pay for), and
+# they are added because the SHIPPED artifact measurably lacked the property --
+# not because the linker accepts the flags. Measured on this binary, built the
+# way .github/workflows/_build.yml builds the Linux release (STATIC=1, gcc 13.3
+# / GNU ld 2.42, Ubuntu 24.04 aarch64); PT_GNU_RELRO ends at 0x11DA0000 in both:
+#
+#   without -z now:  .got 0x11d9ec20+0x13c8, .got.plt 0x11d9ffe8+0x40
+#                    -> .got.plt ends at 0x11DA0028, i.e. 40 bytes PAST the
+#                       window: those GOT slots stayed writable for the whole
+#                       process lifetime, in every Linux binary we have shipped
+#   with    -z now:  .got.plt folded into .got (0x11d9ec20+0x13c8, ends
+#                    0x11D9FFE8) -> the whole GOT is inside the window and is
+#                    re-mapped read-only after startup
+#
+# -z relro is already this toolchain's default and changes nothing here; it is
+# named anyway so the property stops depending on one distro's spec file (the
+# musl/portable and glibc-floor images are different toolchains, and a default
+# is not a guarantee). A1c/A1d in scripts/ci/check-binary-composition.sh assert
+# the OUTCOME on the produced binary, because a flag the compiler accepts is
+# not evidence that the artifact gained anything -- the same reason A1 exists
+# next to the .note.GNU-stack annotation.
 ELF_HARDENING_FLAGS :=
 ifeq ($(IS_LINUX),yes)
 ifneq ($(IS_MINGW),yes)
-ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code
+ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code \
+                       -Wl,-z,relro -Wl,-z,now
 endif
 endif
 

@@ -714,6 +714,45 @@ TEST(daemon_application_requires_immutable_explicit_context) {
     PASS();
 }
 
+TEST(daemon_application_accepts_utf8_session_context_root) {
+    char root[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-context-caf\xC3\xA9-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&callbacks, 311);
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    bool context_ok = root_ok && app_test_context_request(root, root, &context, &context_length);
+    cbm_daemon_runtime_application_status_t status =
+        context_ok ? app_test_request(&callbacks, session, context, context_length, &response,
+                                      &response_length)
+                   : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+
+    free(context);
+    free(response);
+    if (session) {
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    if (root_ok) {
+        (void)cbm_rmdir(root);
+    }
+
+    ASSERT_TRUE(root_ok);
+    ASSERT_NOT_NULL(application);
+    ASSERT_NOT_NULL(session);
+    ASSERT_TRUE(context_ok);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_EQ(response_length, 0);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
 TEST(daemon_application_mcp_notification_has_no_response) {
     cbm_daemon_application_t *application = cbm_daemon_application_new(NULL);
     cbm_daemon_runtime_application_callbacks_t callbacks =
@@ -5348,6 +5387,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
     RUN_TEST(daemon_application_request_cancel_is_scoped_to_exact_token);
     RUN_TEST(daemon_application_requires_immutable_explicit_context);
+    RUN_TEST(daemon_application_accepts_utf8_session_context_root);
     RUN_TEST(daemon_application_ui_config_updates_are_masked_and_serialized);
     RUN_TEST(daemon_application_ui_config_rejects_noncanonical_frames);
     RUN_TEST(daemon_application_ui_readiness_proof_is_generation_bound_before_context);

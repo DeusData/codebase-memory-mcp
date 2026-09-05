@@ -21,6 +21,7 @@
 #include <daemon/runtime.h>
 #include <daemon/version_cohort.h>
 #include <foundation/constants.h>
+#include <foundation/log.h>
 #include <foundation/platform.h>
 #include <mcp/mcp.h>
 #include <pipeline/pipeline.h>
@@ -57,10 +58,138 @@ int cbm_cli_build_yaml_stdio_mcp_block_for_test(const char *binary_path, bool go
                                                 char *block, size_t block_size);
 bool cbm_cli_stdin_allowed_for_schema_for_test(const char *schema_str);
 
+/* CLI config lifecycle tests exercise the real activation guard on POSIX. Keep
+ * that protocol coverage, but bind it to this suite's private endpoint so an
+ * editor using the developer's installed CBM cannot make an unrelated cleanup
+ * assertion fail. One focused activation-order test temporarily overrides this
+ * parent and restores it before the remaining suite continues. */
+static char g_cli_suite_runtime_parent[512];
+
+TEST(cli_suite_uses_private_activation_runtime) {
+    const char *runtime_parent = cbm_cli_activation_runtime_parent_for_test();
+    ASSERT_NOT_NULL(runtime_parent);
+    ASSERT_STR_EQ(runtime_parent, g_cli_suite_runtime_parent);
+    PASS();
+}
+
 TEST(cli_progress_visibility_policy) {
-    ASSERT_TRUE(cbm_cli_progress_enabled(true, false));
-    ASSERT_TRUE(cbm_cli_progress_enabled(false, true));
-    ASSERT_FALSE(cbm_cli_progress_enabled(false, false));
+    ASSERT_TRUE(cbm_cli_progress_enabled(true, false, false));
+    ASSERT_TRUE(cbm_cli_progress_enabled(false, false, true));
+    ASSERT_FALSE(cbm_cli_progress_enabled(false, false, false));
+    ASSERT_FALSE(cbm_cli_progress_enabled(false, true, true));
+    ASSERT_FALSE(cbm_cli_progress_enabled(true, true, true));
+    PASS();
+}
+
+TEST(cli_quiet_is_stripped_before_tool_argument_forwarding) {
+    char *argv[] = {"search_graph", "--project", "demo", "--quiet"};
+    int argc = (int)(sizeof(argv) / sizeof(argv[0]));
+    cbm_cli_output_flags_t flags;
+    char error[256] = {0};
+
+    ASSERT_TRUE(cbm_cli_output_flags_parse(&argc, argv, &flags, error, sizeof(error)));
+    ASSERT_TRUE(flags.quiet_requested);
+    ASSERT_FALSE(flags.progress_requested);
+    ASSERT_FALSE(flags.verbose_requested);
+    ASSERT_EQ(argc, 3);
+    ASSERT_STR_EQ(argv[0], "search_graph");
+    ASSERT_STR_EQ(argv[1], "--project");
+    ASSERT_STR_EQ(argv[2], "demo");
+
+    char *build_error = NULL;
+    char *json = cbm_cli_build_args_json(argv[0], argc - 1, argv + 1, &build_error);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(build_error);
+    ASSERT_NOT_NULL(strstr(json, "\"project\":\"demo\""));
+    ASSERT_NULL(strstr(json, "quiet"));
+    free(json);
+    PASS();
+}
+
+TEST(cli_quiet_rejects_other_outer_output_modes_with_guidance) {
+    char *progress_argv[] = {"--quiet", "--progress", "search_graph"};
+    int progress_argc = (int)(sizeof(progress_argv) / sizeof(progress_argv[0]));
+    cbm_cli_output_flags_t progress_flags;
+    char progress_error[256] = {0};
+    ASSERT_FALSE(cbm_cli_output_flags_parse(&progress_argc, progress_argv, &progress_flags,
+                                            progress_error, sizeof(progress_error)));
+    ASSERT_NOT_NULL(strstr(progress_error, "--quiet"));
+    ASSERT_NOT_NULL(strstr(progress_error, "--progress"));
+    ASSERT_NOT_NULL(strstr(progress_error, "errors-only"));
+
+    char *verbose_argv[] = {"--quiet", "--verbose", "index_status"};
+    int verbose_argc = (int)(sizeof(verbose_argv) / sizeof(verbose_argv[0]));
+    cbm_cli_output_flags_t verbose_flags;
+    char verbose_error[256] = {0};
+    ASSERT_FALSE(cbm_cli_output_flags_parse(&verbose_argc, verbose_argv, &verbose_flags,
+                                            verbose_error, sizeof(verbose_error)));
+    ASSERT_NOT_NULL(strstr(verbose_error, "--verbose"));
+    ASSERT_NOT_NULL(strstr(verbose_error, "informational diagnostics"));
+
+    /* Existing progress plus verbose behavior remains valid; only quiet is
+     * exclusive with the two output-expanding controls. */
+    char *compatible_argv[] = {"--progress", "--verbose", "search_graph"};
+    int compatible_argc = (int)(sizeof(compatible_argv) / sizeof(compatible_argv[0]));
+    cbm_cli_output_flags_t compatible_flags;
+    char compatible_error[256] = {0};
+    ASSERT_TRUE(cbm_cli_output_flags_parse(&compatible_argc, compatible_argv, &compatible_flags,
+                                           compatible_error, sizeof(compatible_error)));
+    ASSERT_TRUE(compatible_flags.progress_requested);
+    ASSERT_TRUE(compatible_flags.verbose_requested);
+    ASSERT_FALSE(compatible_flags.quiet_requested);
+    ASSERT_EQ(compatible_argc, 1);
+    ASSERT_STR_EQ(compatible_argv[0], "search_graph");
+    PASS();
+}
+
+TEST(cli_quiet_preserves_tool_level_verbose_argument) {
+    char *argv[] = {"--quiet", "index_status", "--verbose"};
+    int argc = (int)(sizeof(argv) / sizeof(argv[0]));
+    cbm_cli_output_flags_t flags;
+    char error[256] = {0};
+
+    ASSERT_TRUE(cbm_cli_output_flags_parse(&argc, argv, &flags, error, sizeof(error)));
+    ASSERT_TRUE(flags.quiet_requested);
+    ASSERT_FALSE(flags.verbose_requested);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(argv[0], "index_status");
+    ASSERT_STR_EQ(argv[1], "--verbose");
+    PASS();
+}
+
+static FILE *s_cli_quiet_log_capture;
+
+static void cli_quiet_log_capture(const char *line) {
+    if (s_cli_quiet_log_capture && line) {
+        (void)fprintf(s_cli_quiet_log_capture, "%s\n", line);
+    }
+}
+
+TEST(cli_quiet_suppresses_ordinary_diagnostics_but_preserves_errors) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    CBMLogLevel previous_level = cbm_log_get_level();
+    CBMLogFormat previous_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    s_cli_quiet_log_capture = out;
+    cbm_log_set_sink(cli_quiet_log_capture);
+
+    cbm_cli_diagnostics_configure(true, false);
+    cbm_log_info("quiet.info", "detail", "drop");
+    cbm_log_warn("quiet.warning", "detail", "drop");
+    cbm_log_error("quiet.error", "detail", "keep");
+
+    cbm_log_set_sink(NULL);
+    s_cli_quiet_log_capture = NULL;
+    cbm_log_set_level(previous_level);
+    cbm_log_set_format(previous_format);
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[512] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_STR_EQ(rendered, "level=error msg=quiet.error detail=keep\n");
     PASS();
 }
 
@@ -100,6 +229,82 @@ TEST(cli_progress_sink_accepts_worker_json_logs) {
     ASSERT_TRUE(rendered_size > 0);
     ASSERT_NOT_NULL(strstr(rendered, "Discovering files (3 found)"));
     ASSERT_NOT_NULL(strstr(rendered, "[1/9] Building file structure"));
+    PASS();
+}
+
+TEST(cli_progress_sink_enables_lifecycle_info_then_restores_quiet_default) {
+    CBMLogLevel saved = cbm_log_get_level();
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    cbm_log_set_level(CBM_LOG_WARN);
+
+    cbm_progress_sink_init(out);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+    cbm_log_info("pipeline.discover", "files", "3");
+    cbm_progress_sink_fini();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[256] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_NOT_NULL(strstr(rendered, "Discovering files (3 found)"));
+    cbm_log_set_level(saved);
+    PASS();
+}
+
+TEST(cli_progress_sink_suppresses_noise_and_preserves_failures) {
+    /* The quiet frontend default is a process policy; pin it for this test
+     * and hand back whatever the process had. */
+    CBMLogLevel saved = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_WARN);
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+
+    cbm_progress_sink_init(out);
+    cbm_progress_sink_fn("level=info msg=parallel.extract.progress done=1 total=2");
+    cbm_progress_sink_fn("level=debug msg=worker.detail value=drop-debug");
+    cbm_progress_sink_fn(
+        "{\"level\":\"info\",\"event\":\"worker.detail\",\"value\":\"drop-info\"}");
+    cbm_progress_sink_fn("level=warn msg=worker.warning detail=keep-text");
+    cbm_progress_sink_fn(
+        "{\"level\":\"error\",\"event\":\"worker.failure\",\"detail\":\"keep-json\"}");
+    cbm_progress_sink_fini();
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[1024] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_STR_EQ(rendered,
+                  "\r  Extracting: 1/2 files (50%)\n"
+                  "level=warn msg=worker.warning detail=keep-text\n"
+                  "{\"level\":\"error\",\"event\":\"worker.failure\",\"detail\":\"keep-json\"}\n");
+    cbm_log_set_level(saved);
+    PASS();
+}
+
+TEST(cli_progress_sink_preserves_explicit_verbose_diagnostics) {
+    FILE *out = tmpfile();
+    ASSERT_NOT_NULL(out);
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+
+    cbm_progress_sink_init(out);
+    cbm_log_info("cli.daemon.spawned", "hint", "keep-info");
+    cbm_log_debug("cli.detail", "value", "keep-debug");
+    cbm_progress_sink_fini();
+    cbm_log_set_level(previous_level);
+
+    ASSERT_EQ(fseek(out, 0, SEEK_SET), 0);
+    char rendered[1024] = {0};
+    size_t rendered_size = fread(rendered, 1, sizeof(rendered) - 1, out);
+    (void)fclose(out);
+    ASSERT_TRUE(rendered_size > 0);
+    ASSERT_NOT_NULL(strstr(rendered, "msg=cli.daemon.spawned"));
+    ASSERT_NOT_NULL(strstr(rendered, "msg=cli.detail"));
     PASS();
 }
 
@@ -316,6 +521,50 @@ static size_t test_count_substring(const char *text, const char *needle) {
     return count;
 }
 
+static size_t test_count_exec_hook(yyjson_val *root, const char *event_name,
+                                   const char *matcher_value, const char *expected_command,
+                                   const char *expected_arg) {
+    yyjson_val *hooks = root ? yyjson_obj_get(root, "hooks") : NULL;
+    yyjson_val *entries = hooks && yyjson_is_obj(hooks) ? yyjson_obj_get(hooks, event_name) : NULL;
+    if (!entries || !yyjson_is_arr(entries)) {
+        return 0U;
+    }
+    size_t matches = 0U;
+    size_t entry_index;
+    size_t entry_count;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, entry_index, entry_count, entry) {
+        yyjson_val *matcher = yyjson_is_obj(entry) ? yyjson_obj_get(entry, "matcher") : NULL;
+        if ((matcher_value && (!matcher || !yyjson_is_str(matcher) ||
+                               strcmp(yyjson_get_str(matcher), matcher_value) != 0)) ||
+            (!matcher_value && matcher)) {
+            continue;
+        }
+        yyjson_val *entry_hooks = yyjson_obj_get(entry, "hooks");
+        if (!entry_hooks || !yyjson_is_arr(entry_hooks)) {
+            continue;
+        }
+        size_t hook_index;
+        size_t hook_count;
+        yyjson_val *hook;
+        yyjson_arr_foreach(entry_hooks, hook_index, hook_count, hook) {
+            yyjson_val *type = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "type") : NULL;
+            yyjson_val *command = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "command") : NULL;
+            yyjson_val *args = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "args") : NULL;
+            yyjson_val *first_arg = args && yyjson_is_arr(args) ? yyjson_arr_get(args, 0U) : NULL;
+            if (type && yyjson_is_str(type) && strcmp(yyjson_get_str(type), "command") == 0 &&
+                command && yyjson_is_str(command) &&
+                strcmp(yyjson_get_str(command), expected_command) == 0 && args &&
+                yyjson_is_arr(args) && yyjson_arr_size(args) == 1U && first_arg &&
+                yyjson_is_str(first_arg) && strcmp(yyjson_get_str(first_arg), expected_arg) == 0 &&
+                !yyjson_obj_get(hook, "shell") && !yyjson_obj_get(hook, "command_windows")) {
+                matches++;
+            }
+        }
+    }
+    return matches;
+}
+
 #ifdef _WIN32
 static bool test_append_command_hook(yyjson_mut_doc *doc, yyjson_mut_val *event_entries,
                                      const char *matcher, const char *command) {
@@ -373,6 +622,83 @@ static void restore_test_env(const char *name, char *saved) {
     } else {
         cbm_unsetenv(name);
     }
+}
+
+/* An unreadable CBM_HOOK_DEADLINE_MS must fall back to the DEFAULT budget, not
+ * to the shortest one the setting allows.
+ *
+ * atoi answers 0 for text it cannot read, and 0 is below HA_DEADLINE_MIN_MS, so
+ * the clamp used to hand back 50 ms -- the worst possible answer for a setting
+ * whose whole purpose is to give the hook more room. The comment above
+ * ha_deadline_ms records a hunt for hook runs that never finished (0 of 24 real
+ * sessions), which is exactly the symptom a silently-shortened deadline makes.
+ *
+ * POSIX only: the Windows path arms a fixed timer and reads no environment. */
+#ifndef _WIN32
+TEST(cli_hook_deadline_ignores_an_unreadable_value) {
+    enum { HOOK_DEADLINE_DEFAULT = 2000, HOOK_DEADLINE_MIN = 50, HOOK_DEADLINE_MAX = 10000 };
+    char *saved = save_test_env("CBM_HOOK_DEADLINE_MS");
+
+    /* Positive control: a good value is still used, so a failure below is about
+     * the unreadable case and not about the reader being broken outright. */
+    cbm_setenv("CBM_HOOK_DEADLINE_MS", "1234", 1);
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), 1234);
+
+    /* Unset falls back to the default. */
+    cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_DEFAULT);
+
+    /* The claim: text the reader cannot read gets the default, never the floor. */
+    const char *unreadable[] = {"abc", "2000ms", " 2000", "2000 ", "", "1e3"};
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        cbm_setenv("CBM_HOOK_DEADLINE_MS", unreadable[i], 1);
+        int ms = cbm_hook_augment_deadline_ms_for_testing();
+        if (ms != HOOK_DEADLINE_DEFAULT) {
+            printf("  unreadable value \"%s\" gave %d ms\n", unreadable[i], ms);
+        }
+        ASSERT_EQ(ms, HOOK_DEADLINE_DEFAULT);
+    }
+
+    /* Both clamps still hold for values that DO read. */
+    cbm_setenv("CBM_HOOK_DEADLINE_MS", "1", 1);
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_MIN);
+    cbm_setenv("CBM_HOOK_DEADLINE_MS", "999999", 1);
+    ASSERT_EQ(cbm_hook_augment_deadline_ms_for_testing(), HOOK_DEADLINE_MAX);
+
+    restore_test_env("CBM_HOOK_DEADLINE_MS", saved);
+    PASS();
+}
+#endif
+
+/* CBM_INDEX_MAX_RESTARTS=0 means no restarts. It used to mean 100 of them.
+ *
+ * The old reader kept the default unless atoi answered greater than zero, so
+ * the one value a person sets when they want the worker left alone did the
+ * opposite. A typo did the same thing, with nothing on screen either way. */
+TEST(cli_index_restart_cap_honours_zero_and_refuses_junk) {
+    enum { INDEX_RESTART_CAP_DEFAULT = 100 };
+    char *saved = save_test_env("CBM_INDEX_MAX_RESTARTS");
+
+    /* Positive control: a good value is still used. */
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "7", 1);
+    ASSERT_EQ(cbm_index_restart_cap_for_testing(), 7);
+
+    cbm_unsetenv("CBM_INDEX_MAX_RESTARTS");
+    ASSERT_EQ(cbm_index_restart_cap_for_testing(), INDEX_RESTART_CAP_DEFAULT);
+
+    /* The claim: zero is a real answer meaning no restarts. */
+    cbm_setenv("CBM_INDEX_MAX_RESTARTS", "0", 1);
+    ASSERT_EQ(cbm_index_restart_cap_for_testing(), 0);
+
+    /* Text the reader cannot read keeps the default. */
+    const char *unreadable[] = {"abc", "5x", " 5", "5 ", ""};
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        cbm_setenv("CBM_INDEX_MAX_RESTARTS", unreadable[i], 1);
+        ASSERT_EQ(cbm_index_restart_cap_for_testing(), INDEX_RESTART_CAP_DEFAULT);
+    }
+
+    restore_test_env("CBM_INDEX_MAX_RESTARTS", saved);
+    PASS();
 }
 
 /* Helper: mkdirp */
@@ -989,7 +1315,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
     char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
     int install_rc = child_ready ? cli_test_cmd_install(4, install_argv) : -1;
-    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
     cbm_set_auto_answer_for_test(0);
 
     int child_status = 0;
@@ -6570,8 +6896,19 @@ TEST(cli_agent_client_registry_routes_plan_install_and_uninstall) {
     char *plan = cbm_build_install_plan_json(tmpdir, binary_path);
     yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    /* Neither of these agents has a plugin directory, so a planned path under
+     * one would be invented. Name the two directories rather than searching the
+     * whole plan for "/plugins/": OpenCode does ship a real plugin file, and
+     * agent detection finds a command in /usr/local/bin or /opt/homebrew/bin
+     * whatever HOME and PATH say, so a blanket search passes or fails according
+     * to what the developer happens to have installed. */
+    char qoder_plugins[700];
+    char pi_plugins[700];
+    snprintf(qoder_plugins, sizeof(qoder_plugins), "%s/plugins/", qoder_dir);
+    snprintf(pi_plugins, sizeof(pi_plugins), "%s/plugins/", pi_dir);
     bool plan_ok =
-        plan && !strstr(plan, "/plugins/") && !strstr(plan, "plugin_files") &&
+        plan && !strstr(plan, qoder_plugins) && !strstr(plan, pi_plugins) &&
+        !strstr(plan, "plugin_files") &&
         test_json_string_array_contains(plan_root, "config_files_planned", qoder_settings) &&
         test_json_string_array_contains(plan_root, "config_files_planned", amazon_config) &&
         test_json_string_array_contains(plan_root, "config_files_planned", roo_config) &&
@@ -6962,8 +7299,7 @@ TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
         FAIL("cbm_mkdtemp failed");
 
     const char *const env_names[] = {
-        "HOME",           "PATH",     "OMP_PROFILE",    "PI_CODING_AGENT_DIR",
-        "XDG_CONFIG_HOME", "APPDATA",
+        "HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "APPDATA",
     };
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
@@ -7048,8 +7384,7 @@ TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
         relocated_plan && strstr(relocated_plan, "\"omp\"") &&
         test_json_string_array_contains(relocated_root, "config_files_planned",
                                         omp_relocated_mcp) &&
-        test_json_string_array_contains(relocated_root, "agent_files_planned",
-                                        omp_relocated_agent);
+        test_json_string_array_contains(relocated_root, "agent_files_planned", omp_relocated_agent);
     yyjson_doc_free(relocated_doc);
     free(relocated_plan);
     cbm_unsetenv("PI_CODING_AGENT_DIR");
@@ -7072,12 +7407,9 @@ TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
     /* None of the plan-only invocations may have written OMP-owned content. */
     struct stat state;
     bool plan_did_not_mutate =
-        (stat(omp_default_mcp, &state) != 0) &&
-        (stat(omp_default_agent, &state) != 0) &&
-        (stat(omp_profile_mcp, &state) != 0) &&
-        (stat(omp_profile_agent, &state) != 0) &&
-        (stat(omp_relocated_mcp, &state) != 0) &&
-        (stat(omp_relocated_agent, &state) != 0);
+        (stat(omp_default_mcp, &state) != 0) && (stat(omp_default_agent, &state) != 0) &&
+        (stat(omp_profile_mcp, &state) != 0) && (stat(omp_profile_agent, &state) != 0) &&
+        (stat(omp_relocated_mcp, &state) != 0) && (stat(omp_relocated_agent, &state) != 0);
 
     for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         restore_test_env(env_names[i], saved_env[i]);
@@ -7085,8 +7417,7 @@ TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
     test_rmdir_r(tmpdir);
     if (!default_plan_ok || !profile_plan_ok || !relocated_plan_ok || !fallback_plan_ok ||
         !plan_did_not_mutate) {
-        fprintf(stderr,
-                "omp diag default=%d profile=%d relocated=%d fallback=%d plan_clean=%d\n",
+        fprintf(stderr, "omp diag default=%d profile=%d relocated=%d fallback=%d plan_clean=%d\n",
                 default_plan_ok, profile_plan_ok, relocated_plan_ok, fallback_plan_ok,
                 plan_did_not_mutate);
         FAIL("OMP must resolve ~/.omp/agent under the documented fallback, honor OMP_PROFILE "
@@ -7096,15 +7427,14 @@ TEST(cli_registry_routes_omp_via_profile_and_pi_coding_agent_dir) {
     PASS();
 }
 
-
 TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-registry-omp-lifecycle-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    const char *const env_names[] = {"HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR",
-                                     "XDG_CONFIG_HOME", "APPDATA"};
+    const char *const env_names[] = {
+        "HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "APPDATA"};
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         saved_env[i] = save_test_env(env_names[i]);
@@ -7145,22 +7475,22 @@ TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content)
         install_rc == 0 && installed_mcp && strstr(installed_mcp, "codebase-memory-mcp") &&
         strstr(installed_mcp, binary_path) && installed_instructions &&
         strcmp(installed_instructions, user_instructions) == 0 &&
-        test_file_contains_all(skill_path,
-                               (const char *const[]){"search_graph", "trace_path",
-                                                   "Sessions and Subagents"},
-                               3U) &&
+        test_file_contains_all(
+            skill_path,
+            (const char *const[]){"search_graph", "trace_path", "Sessions and Subagents"}, 3U) &&
         test_file_contains_all(scout_path,
                                (const char *const[]){"autoloadSkills: [codebase-memory]",
-                                                   "mcp__codebase_memory_mcp_search_graph"},
+                                                     "mcp__codebase_memory_mcp_search_graph"},
                                2U) &&
-        test_file_contains_all(verify_path,
-                               (const char *const[]){"read-summarize: false",
-                                                   "mcp__codebase_memory_mcp_trace_path"},
-                               2U) &&
-        test_file_contains_all(auditor_path,
-                               (const char *const[]){"autoloadSkills: [codebase-memory]",
-                                                   "mcp__codebase_memory_mcp_check_index_coverage"},
-                               2U);
+        test_file_contains_all(
+            verify_path,
+            (const char *const[]){"read-summarize: false", "mcp__codebase_memory_mcp_trace_path"},
+            2U) &&
+        test_file_contains_all(
+            auditor_path,
+            (const char *const[]){"autoloadSkills: [codebase-memory]",
+                                  "mcp__codebase_memory_mcp_check_index_coverage"},
+            2U);
     free(installed_mcp);
     free(installed_instructions);
 
@@ -7173,12 +7503,12 @@ TEST(cli_registry_omp_named_profile_install_and_uninstall_preserve_user_content)
     char *preserved_instructions = read_test_file_alloc(instructions_path);
     char *preserved_verify = read_test_file_alloc(verify_path);
     char *mcp_after = read_test_file_alloc(mcp_path);
-    bool uninstalled =
-        uninstall_rc == 0 && preserved_instructions &&
-        strcmp(preserved_instructions, user_instructions) == 0 && preserved_verify &&
-        strcmp(preserved_verify, modified_verify) == 0 && stat(skill_path, &state) != 0 &&
-        stat(scout_path, &state) != 0 && stat(auditor_path, &state) != 0 &&
-        (!mcp_after || !strstr(mcp_after, "codebase-memory-mcp"));
+    bool uninstalled = uninstall_rc == 0 && preserved_instructions &&
+                       strcmp(preserved_instructions, user_instructions) == 0 && preserved_verify &&
+                       strcmp(preserved_verify, modified_verify) == 0 &&
+                       stat(skill_path, &state) != 0 && stat(scout_path, &state) != 0 &&
+                       stat(auditor_path, &state) != 0 &&
+                       (!mcp_after || !strstr(mcp_after, "codebase-memory-mcp"));
     free(preserved_instructions);
     free(preserved_verify);
     free(mcp_after);
@@ -7201,8 +7531,8 @@ TEST(cli_registry_omp_relocated_dry_run_is_non_mutating) {
     if (!cbm_mkdtemp(tmpdir))
         FAIL("cbm_mkdtemp failed");
 
-    const char *const env_names[] = {"HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR",
-                                     "XDG_CONFIG_HOME", "APPDATA"};
+    const char *const env_names[] = {
+        "HOME", "PATH", "OMP_PROFILE", "PI_CODING_AGENT_DIR", "XDG_CONFIG_HOME", "APPDATA"};
     char *saved_env[sizeof(env_names) / sizeof(env_names[0])];
     for (size_t i = 0U; i < sizeof(env_names) / sizeof(env_names[0]); i++) {
         saved_env[i] = save_test_env(env_names[i]);
@@ -8833,6 +9163,57 @@ TEST(cli_hook_session_resolves_custom_named_index_by_root_path) {
     PASS();
 }
 
+TEST(cli_hook_session_exhausts_project_registry_pages) {
+    enum { DECOY_DATABASES = 500 };
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-project-pages-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char cache[512];
+    char decoy_root[512];
+    char target_root[512];
+    char decoy_db[640];
+    char target_db[640];
+    snprintf(cache, sizeof(cache), "%s/cache", tmpdir);
+    snprintf(decoy_root, sizeof(decoy_root), "%s/decoy", tmpdir);
+    snprintf(target_root, sizeof(target_root), "%s/target", tmpdir);
+    snprintf(decoy_db, sizeof(decoy_db), "%s/decoy-000.db", cache);
+    snprintf(target_db, sizeof(target_db), "%s/target.db", cache);
+    test_mkdirp(cache);
+    test_mkdirp(decoy_root);
+    test_mkdirp(target_root);
+
+    cbm_store_t *store = cbm_store_open_path(decoy_db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "aaa-decoy", decoy_root), CBM_STORE_OK);
+    cbm_store_close(store);
+    for (int i = 1; i < DECOY_DATABASES; i++) {
+        char copy[640];
+        snprintf(copy, sizeof(copy), "%s/decoy-%03d.db", cache, i);
+        ASSERT_EQ(cbm_copy_file(decoy_db, copy), 0);
+    }
+
+    store = cbm_store_open_path(target_db);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "zzz-custom-project", target_root), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    char input[1024];
+    snprintf(input, sizeof(input), "{\"hook_event_name\":\"SessionStart\",\"cwd\":\"%s\"}",
+             target_root);
+    char *output = cbm_hook_augment_lifecycle_json(input);
+    bool matched = output && strstr(output, "zzz-custom-project") && strstr(output, "is indexed");
+
+    free(output);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+    if (!matched)
+        FAIL("SessionStart must exhaust list_projects pages before resolving root_path");
+    PASS();
+}
+
 TEST(cli_hook_session_sanitizes_untrusted_project_metadata) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-untrusted-project-XXXXXX");
@@ -9354,8 +9735,13 @@ TEST(cli_claude_session_hook_preserves_user_entry) {
     cbm_install_agent_configs(tmpdir, "/usr/local/bin/codebase-memory-mcp", false, false);
 
     char *installed = read_test_file_alloc(settings_path);
-    bool preserved = installed && strstr(installed, "echo user-session-hook") &&
-                     strstr(installed, "cbm-session-reminder");
+    yyjson_doc *installed_doc = installed ? yyjson_read(installed, strlen(installed), 0) : NULL;
+    yyjson_val *installed_root = installed_doc ? yyjson_doc_get_root(installed_doc) : NULL;
+    bool preserved =
+        installed && strstr(installed, "echo user-session-hook") &&
+        test_count_exec_hook(installed_root, "SessionStart", "startup",
+                             "/usr/local/bin/codebase-memory-mcp", "hook-augment") == 1U;
+    yyjson_doc_free(installed_doc);
     free(installed);
     restore_test_env("PATH", saved_path);
     restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
@@ -10038,7 +10424,7 @@ TEST(cli_claude_hook_scripts_shell_quote_binary_path) {
     PASS();
 }
 
-TEST(cli_claude_hook_commands_shell_quote_custom_config_dir) {
+TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX shell quoting contract");
 #endif
@@ -10056,23 +10442,33 @@ TEST(cli_claude_hook_commands_shell_quote_custom_config_dir) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
 
-    cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    const char *binary = "/opt/codebase-memory-mcp";
+    cbm_install_agent_configs(tmpdir, binary, false, false);
     char settings_path[768];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     char *settings = read_test_file_alloc(settings_path);
-    char quoted_prefix[704];
-    snprintf(quoted_prefix, sizeof(quoted_prefix), "'%s/hooks/", config_dir);
-    bool quoted = settings && strstr(settings, quoted_prefix) &&
-                  strstr(settings, "cbm-code-discovery-gate'") &&
-                  strstr(settings, "cbm-session-reminder'") &&
-                  strstr(settings, "cbm-subagent-reminder'");
+    yyjson_doc *document = settings ? yyjson_read(settings, strlen(settings), 0) : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    static const char *const matchers[] = {"startup", "resume", "clear", "compact"};
+    size_t owned =
+        test_count_exec_hook(root, "PreToolUse", "Grep|Glob|Bash", binary, "hook-augment") +
+        test_count_exec_hook(root, "PostToolUse", "Read", binary, "hook-augment") +
+        test_count_exec_hook(root, "SubagentStart", "*", binary, "hook-augment");
+    for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
+        owned += test_count_exec_hook(root, "SessionStart", matchers[i], binary, "hook-augment");
+    }
+    bool exec_form = settings && owned == 7U && !strstr(settings, config_dir) &&
+                     !strstr(settings, "cbm-code-discovery-gate") &&
+                     !strstr(settings, "cbm-session-reminder") &&
+                     !strstr(settings, "cbm-subagent-reminder");
+    yyjson_doc_free(document);
     free(settings);
 
     restore_test_env("PATH", saved_path);
     restore_test_env("CLAUDE_CONFIG_DIR", saved_claude);
     test_rmdir_r(tmpdir);
-    if (!quoted)
-        FAIL("Claude settings must shell-quote the complete custom hook script path");
+    if (!exec_form)
+        FAIL("Claude settings must keep custom config paths out of shell-free hook commands");
     PASS();
 }
 
@@ -10504,6 +10900,55 @@ TEST(cli_hook_augment_bash_pattern_extractor) {
                                                                 out, sizeof(out)));
     ASSERT_STR_EQ(out, "CreateStripeCheckout");
 
+    PASS();
+}
+TEST(cli_hook_augment_coverage_requests_machine_json) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-coverage-json-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char repo[512];
+    char source[640];
+    char db_path[640];
+    snprintf(repo, sizeof(repo), "%s/repo", tmpdir);
+    snprintf(source, sizeof(source), "%s/src/partial.c", repo);
+    snprintf(db_path, sizeof(db_path), "%s/hook.db", tmpdir);
+    test_mkdirp(repo);
+    char source_dir[640];
+    snprintf(source_dir, sizeof(source_dir), "%s/src", repo);
+    test_mkdirp(source_dir);
+    write_test_file(source, "int partial(void) { return 1; }\n");
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "repo", repo), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "repo", "src/partial.c", "fixture", 1, 32),
+              CBM_STORE_OK);
+    const cbm_coverage_row_t row = {
+        .rel_path = "src/partial.c", .kind = "parse_partial", .detail = "12-14"};
+    ASSERT_EQ(cbm_store_coverage_replace(store, "repo", &row, 1), CBM_STORE_OK);
+    cbm_store_close(store);
+
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("CBM_CACHE_DIR", tmpdir, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, "repo");
+
+    char input[2048];
+    snprintf(input, sizeof(input),
+             "{\"hook_event_name\":\"PostToolUse\",\"tool_name\":\"Read\","
+             "\"tool_input\":{\"file_path\":\"%s\"},\"cwd\":\"%s\"}",
+             source, repo);
+    char *output = cbm_hook_augment_process(srv, input);
+    bool matched = output && strstr(output, "PARTIALLY indexed") && strstr(output, "12-14");
+
+    free(output);
+    cbm_mcp_server_free(srv);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    test_rmdir_r(tmpdir);
+    if (!matched)
+        FAIL("Post-read hook must parse check_index_coverage's explicit JSON response");
     PASS();
 }
 
@@ -11011,18 +11456,32 @@ TEST(cli_upgrade_migrates_released_claude_hook_scripts) {
     cbm_setenv("PATH", tmpdir, 1);
     cbm_unsetenv("CLAUDE_CONFIG_DIR");
     cbm_unsetenv("CODEX_HOME");
-    int rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    const char *binary = "/opt/codebase-memory-mcp";
+    int rc = cbm_install_agent_configs(tmpdir, binary, false, false);
 
     char *gate = read_test_file_alloc(gate_path);
     char *session = read_test_file_alloc(session_path);
     char *subagent = read_test_file_alloc(subagent_path);
     char *settings = read_test_file_alloc(settings_path);
+    yyjson_doc *settings_doc = settings ? yyjson_read(settings, strlen(settings), 0) : NULL;
+    yyjson_val *settings_root = settings_doc ? yyjson_doc_get_root(settings_doc) : NULL;
+    static const char *const matchers[] = {"startup", "resume", "clear", "compact"};
+    size_t registered =
+        test_count_exec_hook(settings_root, "PreToolUse", "Grep|Glob|Bash", binary,
+                             "hook-augment") +
+        test_count_exec_hook(settings_root, "PostToolUse", "Read", binary, "hook-augment") +
+        test_count_exec_hook(settings_root, "SubagentStart", "*", binary, "hook-augment");
+    for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
+        registered += test_count_exec_hook(settings_root, "SessionStart", matchers[i], binary,
+                                           "hook-augment");
+    }
     bool migrated = rc == 0 && gate && strcmp(gate, legacy_gate) != 0 && session &&
                     strcmp(session, legacy_session) != 0 && subagent &&
-                    strcmp(subagent, legacy_subagent) != 0 && settings &&
-                    strstr(settings, "cbm-code-discovery-gate") &&
-                    strstr(settings, "cbm-session-reminder") &&
-                    strstr(settings, "cbm-subagent-reminder");
+                    strcmp(subagent, legacy_subagent) != 0 && settings && registered == 7U &&
+                    !strstr(settings, "cbm-code-discovery-gate") &&
+                    !strstr(settings, "cbm-session-reminder") &&
+                    !strstr(settings, "cbm-subagent-reminder");
+    yyjson_doc_free(settings_doc);
     free(gate);
     free(session);
     free(subagent);
@@ -12219,8 +12678,13 @@ TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     snprintf(appdata, sizeof(appdata), "%s/AppData/Roaming", tmpdir);
     snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+    /* cbm_mkdtemp hands back a native '\\' temp root; the product normalizes
+     * the install directory before any registration (cbm_cmd_install), so the
+     * exact-owned exec command is the '/'-spelled path uninstall derives. */
+    cbm_normalize_path_sep(binary_path);
     test_mkdirp(hooks_dir);
 
+    static const char *const matchers[] = {"startup", "resume", "clear", "compact"};
     const char *const script_names[] = {
         "cbm-code-discovery-gate",
         "cbm-session-reminder",
@@ -12294,13 +12758,21 @@ TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
     yyjson_doc *installed_doc =
         installed_settings ? yyjson_read(installed_settings, strlen(installed_settings), 0) : NULL;
     yyjson_val *installed_root = installed_doc ? yyjson_doc_get_root(installed_doc) : NULL;
+    /* Every owned shell spelling (current .cmd, previous, released) converges
+     * on one exec-form registration per matcher; foreign hooks are untouched. */
+    size_t installed_exec =
+        test_count_exec_hook(installed_root, "SubagentStart", "*", binary_path, "hook-augment");
+    for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
+        installed_exec += test_count_exec_hook(installed_root, "SessionStart", matchers[i],
+                                               binary_path, "hook-augment");
+    }
     bool commands_migrated =
-        install_rc == 0 &&
-        test_count_hook_command(installed_root, "SessionStart", session_current) == 4U &&
+        install_rc == 0 && installed_exec == 5U &&
+        test_count_hook_command(installed_root, "SessionStart", session_current) == 0U &&
         test_count_hook_command(installed_root, "SessionStart", session_previous) == 0U &&
         test_count_hook_command(installed_root, "SessionStart", session_released) == 0U &&
         test_count_hook_command(installed_root, "SessionStart", foreign_command) == 1U &&
-        test_count_hook_command(installed_root, "SubagentStart", subagent_current) == 1U &&
+        test_count_hook_command(installed_root, "SubagentStart", subagent_current) == 0U &&
         test_count_hook_command(installed_root, "SubagentStart", subagent_previous) == 0U &&
         test_count_hook_command(installed_root, "SubagentStart", subagent_released) == 0U &&
         test_count_hook_command(installed_root, "SubagentStart", foreign_command) == 1U;
@@ -12324,8 +12796,14 @@ TEST(cli_windows_claude_lifecycle_migrates_only_exact_owned_legacy_state) {
         uninstalled_settings ? yyjson_read(uninstalled_settings, strlen(uninstalled_settings), 0)
                              : NULL;
     yyjson_val *uninstalled_root = uninstalled_doc ? yyjson_doc_get_root(uninstalled_doc) : NULL;
+    size_t uninstalled_exec =
+        test_count_exec_hook(uninstalled_root, "SubagentStart", "*", binary_path, "hook-augment");
+    for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
+        uninstalled_exec += test_count_exec_hook(uninstalled_root, "SessionStart", matchers[i],
+                                                 binary_path, "hook-augment");
+    }
     bool commands_clean =
-        uninstall_rc == 0 &&
+        uninstall_rc == 0 && uninstalled_exec == 0U &&
         test_count_hook_command(uninstalled_root, "SessionStart", session_current) == 0U &&
         test_count_hook_command(uninstalled_root, "SessionStart", session_previous) == 0U &&
         test_count_hook_command(uninstalled_root, "SessionStart", session_released) == 0U &&
@@ -12499,6 +12977,152 @@ TEST(cli_windows_claude_hook_command_is_shell_portable) {
               -1);
 
     restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
+    PASS();
+}
+
+/* #1733: shell-form Windows hooks cross two incompatible parsers. Git Bash
+ * rewrites cmd.exe's slash switches as paths, while PowerShell has different
+ * quoting and invocation rules. Claude's exec form avoids both shells: the
+ * executable path is one literal field, hook-augment is one literal argv
+ * element, and the hook payload is forwarded directly on stdin. */
+TEST(cli_claude_hooks_use_exec_form_across_shells_issue1733) {
+    char *saved_path = save_test_env("PATH");
+    char *saved_config = save_test_env("CLAUDE_CONFIG_DIR");
+    const char *const matchers[] = {"startup", "resume", "clear", "compact"};
+    const char *binary_path = "C:/Program Files/CBM & Tools/codebase-memory-mcp.exe";
+    bool all_valid = true;
+
+    for (int custom = 0; custom < 2; custom++) {
+        char tmpdir[256];
+        snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-exec-XXXXXX");
+        if (!cbm_mkdtemp(tmpdir)) {
+            all_valid = false;
+            break;
+        }
+        char config_dir[640];
+        if (custom) {
+            snprintf(config_dir, sizeof(config_dir), "%s/custom Claude & $(inert)!100%%", tmpdir);
+            cbm_setenv("CLAUDE_CONFIG_DIR", config_dir, 1);
+        } else {
+            snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
+            cbm_unsetenv("CLAUDE_CONFIG_DIR");
+        }
+        test_mkdirp(config_dir);
+        cbm_setenv("PATH", tmpdir, 1);
+
+        char settings_path[768];
+        snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+        const char *foreign =
+            "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"resume\",\"hooks\":[{"
+            "\"type\":\"command\",\"command\":\"foreign-hook\",\"args\":[\"keep\"]}]}]}}";
+        if (write_test_file(settings_path, foreign) != 0 ||
+            cbm_install_agent_configs(tmpdir, binary_path, false, false) != 0) {
+            all_valid = false;
+            test_rmdir_r(tmpdir);
+            break;
+        }
+
+        char *settings = read_test_file_alloc(settings_path);
+        yyjson_doc *doc = settings ? yyjson_read(settings, strlen(settings), 0) : NULL;
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        size_t owned =
+            test_count_exec_hook(root, "PreToolUse", "Grep|Glob|Bash", binary_path,
+                                 "hook-augment") +
+            test_count_exec_hook(root, "PostToolUse", "Read", binary_path, "hook-augment") +
+            test_count_exec_hook(root, "SubagentStart", "*", binary_path, "hook-augment");
+        for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
+            owned += test_count_exec_hook(root, "SessionStart", matchers[i], binary_path,
+                                          "hook-augment");
+        }
+        size_t foreign_count =
+            test_count_exec_hook(root, "SessionStart", "resume", "foreign-hook", "keep");
+        all_valid = all_valid && owned == 7U && foreign_count == 1U && settings &&
+                    strstr(settings, "cmd.exe") == NULL &&
+                    strstr(settings, "cbm-session-reminder.cmd") == NULL &&
+                    strstr(settings, "cbm-subagent-reminder.cmd") == NULL &&
+                    strstr(settings, "cbm-code-discovery-gate.cmd") == NULL;
+        yyjson_doc_free(doc);
+        free(settings);
+        test_rmdir_r(tmpdir);
+    }
+
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
+    if (!all_valid)
+        FAIL("Claude hooks must use shell-free exec form and preserve foreign hooks");
+    PASS();
+}
+
+TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733) {
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_config = save_test_env("CLAUDE_CONFIG_DIR");
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-hook-uninstall-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char config_dir[512];
+    char settings_path[640];
+    char install_dir[512];
+    char binary_path[640];
+    snprintf(config_dir, sizeof(config_dir), "%s/.claude", tmpdir);
+    snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    snprintf(install_dir, sizeof(install_dir), "%s/custom CBM & bin", tmpdir);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp.exe", install_dir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", install_dir);
+#endif
+    test_mkdirp(config_dir);
+    test_mkdirp(install_dir);
+    const char *foreign =
+        "{\"hooks\":{\"SessionStart\":[{\"matcher\":\"resume\",\"hooks\":[{"
+        "\"type\":\"command\",\"command\":\"foreign-hook\",\"args\":[\"keep\"]}]}]}}";
+    write_test_file(settings_path, foreign);
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
+    int install_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *installed = read_test_file_alloc(settings_path);
+    yyjson_doc *installed_doc = installed ? yyjson_read(installed, strlen(installed), 0) : NULL;
+    yyjson_val *installed_root = installed_doc ? yyjson_doc_get_root(installed_doc) : NULL;
+    const char *const matchers[] = {"startup", "resume", "clear", "compact"};
+    size_t before_owned =
+        test_count_exec_hook(installed_root, "PreToolUse", "Grep|Glob|Bash", binary_path,
+                             "hook-augment") +
+        test_count_exec_hook(installed_root, "PostToolUse", "Read", binary_path, "hook-augment") +
+        test_count_exec_hook(installed_root, "SubagentStart", "*", binary_path, "hook-augment");
+    for (size_t i = 0U; i < sizeof(matchers) / sizeof(matchers[0]); i++) {
+        before_owned += test_count_exec_hook(installed_root, "SessionStart", matchers[i],
+                                             binary_path, "hook-augment");
+    }
+    yyjson_doc_free(installed_doc);
+    free(installed);
+
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
+    char *argv[] = {"uninstall", "--yes", dir_arg};
+    int uninstall_rc = cli_test_cmd_uninstall(3, argv);
+    char *uninstalled = read_test_file_alloc(settings_path);
+    yyjson_doc *uninstalled_doc =
+        uninstalled ? yyjson_read(uninstalled, strlen(uninstalled), 0) : NULL;
+    yyjson_val *uninstalled_root = uninstalled_doc ? yyjson_doc_get_root(uninstalled_doc) : NULL;
+    size_t after_owned = test_count_substring(uninstalled ? uninstalled : "", "\"hook-augment\"");
+    size_t foreign_count =
+        test_count_exec_hook(uninstalled_root, "SessionStart", "resume", "foreign-hook", "keep");
+    yyjson_doc_free(uninstalled_doc);
+    free(uninstalled);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_config);
+    test_rmdir_r(tmpdir);
+    if (install_rc != 0 || before_owned != 7U || uninstall_rc != 0 || after_owned != 0U ||
+        foreign_count != 1U)
+        FAIL("custom --dir uninstall must remove seven exact-owned exec hooks and keep foreign "
+             "hooks");
     PASS();
 }
 
@@ -13421,10 +14045,49 @@ TEST(cli_build_args_json_bad_positional_errors_issue680) {
     PASS();
 }
 
-/* Per-tool --help returns 0 for a known tool, -1 for an unknown one. */
+/* Capture per-tool help using the same tmpfile+dup2 idiom as config-command
+ * output above. This stays portable to the MinGW test leg. */
+static int cli_tool_help_capture(const char *tool_name, char *out, size_t cap) {
+    out[0] = '\0';
+    FILE *capture = tmpfile();
+    int saved = capture ? dup(fileno(stdout)) : -1;
+    if (!capture || saved < 0) {
+        if (capture)
+            fclose(capture);
+        if (saved >= 0)
+            close(saved);
+        return -1000;
+    }
+    fflush(stdout);
+    if (dup2(fileno(capture), fileno(stdout)) < 0) {
+        fclose(capture);
+        close(saved);
+        return -1000;
+    }
+    int rc = cbm_cli_print_tool_help(tool_name);
+    fflush(stdout);
+    (void)dup2(saved, fileno(stdout));
+    close(saved);
+    rewind(capture);
+    size_t got = fread(out, 1, cap - 1, capture);
+    out[got] = '\0';
+    fclose(capture);
+    return rc;
+}
+
+/* Per-tool --help returns 0 for a known tool, -1 for an unknown one, and
+ * surfaces schema choices/defaults rather than flattening every flag to its
+ * primitive JSON type. */
 TEST(cli_print_tool_help_issue680) {
-    ASSERT_EQ(cbm_cli_print_tool_help("index_repository"), 0);
-    ASSERT_EQ(cbm_cli_print_tool_help("nope_not_a_tool"), -1);
+    char out[16 * 1024];
+    ASSERT_EQ(cli_tool_help_capture("search_graph", out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "--format <tree|json> [default: tree]"));
+    ASSERT_NOT_NULL(strstr(out, "--detail <ids|default> [default: default]"));
+    ASSERT_EQ(cli_tool_help_capture("index_repository", out, sizeof(out)), 0);
+    ASSERT_NOT_NULL(strstr(out, "--mode <full|moderate|fast|cross-repo-intelligence> [default: "
+                                "full]"));
+    ASSERT_EQ(cli_tool_help_capture("nope_not_a_tool", out, sizeof(out)), -1);
+    ASSERT_STR_EQ(out, "");
     PASS();
 }
 
@@ -13735,8 +14398,16 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
     ASSERT_NULL(
         cbm_cli_external_manager_name_for_testing("/Users/x/.local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/cbm/codebase-memory-mcp"));
-    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing("build/c/test-runner"));
+#ifdef __FreeBSD__
+    /* On FreeBSD the port/pkg owns ${LOCALBASE}/bin, so a binary there IS
+     * externally managed; elsewhere the same path is unremarkable. */
+    ASSERT_NOT_NULL(
+        cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/opt/local/bin/codebase-memory-mcp"));
+#else
+    ASSERT_NULL(cbm_cli_external_manager_name_for_testing("/usr/local/bin/codebase-memory-mcp"));
+#endif
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(""));
     ASSERT_NULL(cbm_cli_external_manager_name_for_testing(NULL));
     PASS();
@@ -13746,7 +14417,7 @@ TEST(cli_external_manager_detection_needs_positive_evidence_issue1566) {
  * Claude and Codex had to revert OpenCode and Cursor by hand — and the next
  * install silently recreated them. The selector restricts it.
  *
- * The vocabulary is the part that makes it usable: 26 clients ship, with tokens
+ * The vocabulary is the part that makes it usable: clients ship with tokens
  * nobody would guess (factory-droid, mistral-vibe, copilot-cli). A selector
  * whose accepted values can only be learned by reading our source is not a
  * usable selector, so this pins that every client is listed and that an unknown
@@ -13775,6 +14446,12 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
     cbm_detected_agents_t typo = all;
     ASSERT_FALSE(cbm_cli_clients_apply_selection_for_testing("claude,codx", &typo));
 
+    /* Registry-backed clients share the public selector vocabulary. */
+    cbm_detected_agents_t registry = all;
+    ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing("qoder", &registry));
+    ASSERT_FALSE(registry.claude_code);
+    ASSERT_FALSE(registry.cursor);
+
     /* Every token in the table must resolve — a client added to detection but
      * forgotten here is invisible to the selector. */
     for (size_t i = 0; i < cbm_cli_clients_count_for_testing(); i++) {
@@ -13783,6 +14460,34 @@ TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558) {
         cbm_detected_agents_t one = all;
         ASSERT_TRUE(cbm_cli_clients_apply_selection_for_testing(token, &one));
     }
+    PASS();
+}
+
+TEST(cli_clients_selector_filters_registry_installs_issue1798) {
+    char *tmpdir = th_mktempdir("cbm_cli_clients_registry");
+    ASSERT_NOT_NULL(tmpdir);
+
+    char qoder_dir[512];
+    char settings_path[512];
+    ASSERT(snprintf(qoder_dir, sizeof(qoder_dir), "%s/.qoder", tmpdir) > 0);
+    ASSERT(snprintf(settings_path, sizeof(settings_path), "%s/settings.json", qoder_dir) > 0);
+    ASSERT_EQ(test_mkdirp(qoder_dir), 0);
+
+    cbm_cli_set_client_selection_for_testing("cursor");
+    int excluded_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    struct stat settings_state;
+    bool excluded = stat(settings_path, &settings_state) != 0;
+
+    cbm_cli_set_client_selection_for_testing("qoder");
+    int included_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    bool included = stat(settings_path, &settings_state) == 0;
+    cbm_cli_set_client_selection_for_testing(NULL);
+
+    test_rmdir_r(tmpdir);
+    ASSERT_EQ(excluded_rc, 0);
+    ASSERT_TRUE(excluded);
+    ASSERT_EQ(included_rc, 0);
+    ASSERT_TRUE(included);
     PASS();
 }
 
@@ -13897,11 +14602,32 @@ TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
 }
 
 SUITE(cli) {
+    if (!th_secure_runtime_parent_new(g_cli_suite_runtime_parent,
+                                      sizeof(g_cli_suite_runtime_parent), "cli-suite")) {
+        printf("  %sFAIL%s: could not create private CLI activation runtime\n", tf_red(),
+               tf_reset());
+        tf_fail_count++;
+        return;
+    }
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
+
+    RUN_TEST(cli_suite_uses_private_activation_runtime);
     RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
+#ifndef _WIN32
+    RUN_TEST(cli_hook_deadline_ignores_an_unreadable_value);
+#endif
+    RUN_TEST(cli_index_restart_cap_honours_zero_and_refuses_junk);
     RUN_TEST(cli_progress_visibility_policy);
+    RUN_TEST(cli_quiet_is_stripped_before_tool_argument_forwarding);
+    RUN_TEST(cli_quiet_rejects_other_outer_output_modes_with_guidance);
+    RUN_TEST(cli_quiet_preserves_tool_level_verbose_argument);
+    RUN_TEST(cli_quiet_suppresses_ordinary_diagnostics_but_preserves_errors);
     RUN_TEST(cli_raw_mcp_result_preserves_tool_error_status);
     RUN_TEST(cli_maintenance_cancellation_forces_failure_status);
     RUN_TEST(cli_progress_sink_accepts_worker_json_logs);
+    RUN_TEST(cli_progress_sink_enables_lifecycle_info_then_restores_quiet_default);
+    RUN_TEST(cli_progress_sink_suppresses_noise_and_preserves_failures);
+    RUN_TEST(cli_progress_sink_preserves_explicit_verbose_diagnostics);
     RUN_TEST(cli_progress_sink_serializes_concurrent_callbacks);
     RUN_TEST(cli_sha256_file_matches_known_vector);
     RUN_TEST(cli_checksum_manifest_requires_exact_filename_and_accepts_star);
@@ -13933,6 +14659,7 @@ SUITE(cli) {
     RUN_TEST(cli_skill_frontmatter_scalars_with_colons_are_quoted_issue1554);
     RUN_TEST(cli_external_manager_detection_needs_positive_evidence_issue1566);
     RUN_TEST(cli_clients_selector_vocabulary_is_complete_and_strict_issue1558);
+    RUN_TEST(cli_clients_selector_filters_registry_installs_issue1798);
     RUN_TEST(cli_update_accepts_retired_variant_flags_issue1544);
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
@@ -14127,6 +14854,7 @@ SUITE(cli) {
     RUN_TEST(cli_augment_installs_session_context_and_subagent);
     RUN_TEST(cli_augment_session_uses_workspace_roots);
     RUN_TEST(cli_hook_session_resolves_custom_named_index_by_root_path);
+    RUN_TEST(cli_hook_session_exhausts_project_registry_pages);
     RUN_TEST(cli_hook_session_sanitizes_untrusted_project_metadata);
     RUN_TEST(cli_hook_ownership_requires_exact_command_identity);
     RUN_TEST(cli_gemini_hook_upgrade_migrates_released_exact_commands);
@@ -14150,7 +14878,7 @@ SUITE(cli) {
     RUN_TEST(cli_mcp_installers_preserve_foreign_same_name_entries);
     RUN_TEST(cli_installer_rejects_symlinked_agent_roots);
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
-    RUN_TEST(cli_claude_hook_commands_shell_quote_custom_config_dir);
+    RUN_TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
     RUN_TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689);
 #ifndef _WIN32
@@ -14159,6 +14887,7 @@ SUITE(cli) {
     RUN_TEST(cli_hook_augment_context_tracks_search_json_shape);
     RUN_TEST(cli_hook_augment_bash_pretooluse_reaches_augmenter);
     RUN_TEST(cli_hook_augment_bash_pattern_extractor);
+    RUN_TEST(cli_hook_augment_coverage_requests_machine_json);
     RUN_TEST(cli_hook_augment_lifecycle_output_contract);
     RUN_TEST(cli_hook_augment_subagent_tier_router_contract);
     RUN_TEST(cli_hook_augment_subagent_no_project_guidance_is_read_only);
@@ -14237,6 +14966,8 @@ SUITE(cli) {
     RUN_TEST(cli_windows_claude_hook_scripts_migrate_and_uninstall_all_owned_shapes);
 #endif
     RUN_TEST(cli_windows_claude_hook_command_is_shell_portable);
+    RUN_TEST(cli_claude_hooks_use_exec_form_across_shells_issue1733);
+    RUN_TEST(cli_claude_exec_hooks_custom_dir_uninstall_issue1733);
     RUN_TEST(cli_hook_augment_path_is_abs);
     RUN_TEST(cli_hook_augment_deadline_breadcrumb_issue858);
     RUN_TEST(cli_upsert_claude_hook_fresh);
@@ -14286,4 +15017,7 @@ SUITE(cli) {
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
     RUN_TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359);
+    cbm_cli_set_activation_runtime_parent_for_test(NULL);
+    test_rmdir_r(g_cli_suite_runtime_parent);
+    g_cli_suite_runtime_parent[0] = '\0';
 }

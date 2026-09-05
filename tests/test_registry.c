@@ -840,22 +840,23 @@ TEST(cross_language_ref_drops_go_vs_c) {
 }
 
 TEST(go_bare_ref_never_binds_field) {
-    /* #1942: a bare (dot-less) Go reference can never denote a struct field —
-     * field access is always a selector expression. */
-    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "err", "Field"));
-    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, "config", "Field"));
-    /* A selector-shaped reference may bind a field. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "t.err", "Field"));
+    /* #1942/#1962: a bare Go identifier can never denote a struct field —
+     * field access is always a selector expression. The extractor strips the
+     * receiver before the resolver runs (resolve_lhs_write_name writes the
+     * trailing name; is_reference_node records the inner field_identifier),
+     * so the selector-vs-bare distinction arrives as the recorded
+     * is_member_access signal, never as a dot in the reference text. */
+    ASSERT_TRUE(cbm_go_suppress_bare_field_ref(true, false, "Field"));
+    /* The member half of a selector may bind a field. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, true, "Field"));
     /* Bare references to non-fields are untouched. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Variable"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", "Function"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Variable"));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, "Function"));
     /* Other languages reference their own members bare inside methods —
      * never suppressed (cp_reads_writes_cs_static_field pins the C# shape). */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, "_count", "Field"));
-    /* Degenerate inputs → nothing to judge. */
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, NULL, "Field"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "", "Field"));
-    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, "err", NULL));
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(false, false, "Field"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_go_suppress_bare_field_ref(true, false, NULL));
     PASS();
 }
 
@@ -898,6 +899,77 @@ TEST(dynamic_suppress_keeps_high_confidence_and_non_methods) {
     /* No match (NULL/empty strategy) → nothing to suppress. */
     ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, NULL));
     ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, ""));
+    PASS();
+}
+
+TEST(local_binding_suppress_drops_weak_shadowed_bare_calls) {
+    /* A bare `run()` whose callee is a parameter of an enclosing scope cannot be
+     * the module-level `run`, so a weak short-name match fabricates the edge. */
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "field_type_hint"));
+    ASSERT_TRUE(cbm_suppress_weak_local_binding_call(true, true, "fuzzy"));
+    PASS();
+}
+
+TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies) {
+    /* THE RECALL PIN. A bare call to a genuine module-level function is NOT
+     * locally bound, so it is never suppressed — whatever the callee is spelled.
+     * This is the assertion a name-keyed guard (get/run/execute) would fail: it
+     * would drop these purely because of how the callee reads. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "field_type_hint"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, false, "fuzzy"));
+    /* Every receiver-/import-aware strategy is kept even when shadowed. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "import_map_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "qualified_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "callee_suffix"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "service_pattern"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_cross"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_py_method"));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, "lsp_direct"));
+    /* Languages outside the caller's gate are never affected. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(false, true, "suffix_match"));
+    /* No match (NULL/empty strategy) → nothing to suppress. */
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, NULL));
+    ASSERT_FALSE(cbm_suppress_weak_local_binding_call(true, true, ""));
+    PASS();
+}
+
+TEST(weak_call_guards_share_one_drop_list) {
+    /* The member guard and the local-binding guard must agree on what "weak"
+     * means. They share a single static predicate for exactly this reason; if
+     * someone re-inlines one of the lists and edits only that copy, the two
+     * guards start disagreeing and this test catches it at the contract level
+     * rather than in a corpus months later. */
+    static const char *const strategies[] = {"suffix_match",
+                                             "unique_name",
+                                             "field_type_hint",
+                                             "fuzzy",
+                                             "same_module",
+                                             "import_map",
+                                             "import_map_suffix",
+                                             "qualified_suffix",
+                                             "callee_suffix",
+                                             "service_pattern",
+                                             "lsp_cross",
+                                             "lsp_ts_method",
+                                             "lsp_py_method",
+                                             "lsp_direct",
+                                             "",
+                                             NULL};
+    for (int i = 0; strategies[i] != NULL; i++) {
+        bool member = cbm_suppress_weak_member_match(true, true, strategies[i]);
+        bool binding = cbm_suppress_weak_local_binding_call(true, true, strategies[i]);
+        if (member != binding) {
+            printf("  drop-list divergence on strategy \"%s\": member=%d binding=%d\n",
+                   strategies[i], member, binding);
+        }
+        ASSERT_EQ(member, binding);
+    }
     PASS();
 }
 
@@ -997,4 +1069,7 @@ SUITE(registry) {
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(local_binding_suppress_drops_weak_shadowed_bare_calls);
+    RUN_TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies);
+    RUN_TEST(weak_call_guards_share_one_drop_list);
 }
