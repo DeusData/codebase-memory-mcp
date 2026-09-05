@@ -1,0 +1,49 @@
+/*
+ * Die Farben und der Schriftstapel des CODEATLAS-Terminals, an einer Stelle.
+ *
+ * Vorlage ist design/design.png und PLAN.md Abschnitt 4. Die Werte stehen hier
+ * als Tokens und nicht in den Komponenten, weil das Design in W2b (Twin) und
+ * W3 (Galaxy) weitere Flaechen bekommt und eine zweite Farbtabelle die erste
+ * still falsch machen wuerde.
+ *
+ * Die Namen sind Rollen, keine Farben: --atlas-phosphor ist "der eine Akzent,
+ * den das Auge sucht", nicht "gruen". Wer eine Flaeche neu baut, greift die
+ * Rolle und nicht den Hexwert.
+ *
+ * ALLES monospace. Das ist keine Laune: die Oberflaeche zeigt Quelltext,
+ * Pfade, Zeilennummern und Tabellen, und eine Proportionalschrift wuerde in
+ * jeder dieser vier Lagen luegen, wo etwas ausgerichtet aussieht, das es
+ * nicht ist.
+ */
+
+:root {
+    /* Grundflaechen: fast schwarz, die Panels nur eine Spur abgesetzt. */
+    --atlas-bg: #0a0e0d;
+    --atlas-panel: #0f1513;
+    --atlas-panel-raised: #131b18;
+    --atlas-line: #1d2926;
+
+    /* Der eine Akzent. Marke, aktiver Tab, Primaeraktionen, Schritt-Badges. */
+    --atlas-phosphor: #33ff99;
+    --atlas-phosphor-mute: #1f7f4c;
+
+    /* Gedaempftes Gruen-Grau: alles, was da ist, aber nicht ruft. */
+    --atlas-dim: #7d9a8e;
+    --atlas-fg: #c3d4cd;
+
+    /* Sekundaerakzent: Symbolnamen, Bezeichner, Verweise. */
+    --atlas-cyan: #66d9e8;
+
+    /* Sparsam: Fehlerpfade, "may raise", verweigerte Faehigkeiten. */
+    --atlas-alarm: #ff5f8f;
+
+    /* Aktive Zeile im Baum und im Editor: dunkelgruener Balken. */
+    --atlas-select: #12251d;
+
+    --atlas-font: ui-monospace, SFMono-Regular, "SF Mono", "JetBrains Mono",
+        Menlo, Consolas, "Liberation Mono", monospace;
+    --atlas-font-size: 13px;
+    --atlas-line-height: 1.6;
+
+    color-scheme: dark;
+}

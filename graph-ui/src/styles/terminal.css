@@ -1,0 +1,6582 @@
+/*
+ * Das Chrome der Lese-IDE: Kopfzeile, Tabs, Explorer, Reader, Kommandozeile,
+ * Statusleiste. Die Farben kommen aus tokens.css, hier steht nur Anordnung.
+ *
+ * Der Aufbau folgt design/design.png: eine Spalte fuer den Baum, daneben der
+ * Editor, rechts das SEMANTIC_TWIN-Panel, oben zwei Zeilen (Marke plus Menue,
+ * dann Tabs), unten zwei Zeilen (Kommandozeile, Statusleiste).
+ *
+ * Die dritte Spalte gibt es nur, wenn ein Panel hereingereicht wurde
+ * (`[data-twin='true']`). Eine leere Spalte zu reservieren waere die
+ * Behauptung, es gaebe dort etwas, das gerade nichts sagt.
+ */
+
+* {
+    box-sizing: border-box;
+}
+
+html,
+body {
+    height: 100%;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background: var(--atlas-bg);
+    color: var(--atlas-fg);
+    font-family: var(--atlas-font);
+    font-size: var(--atlas-font-size);
+    line-height: var(--atlas-line-height);
+    -webkit-font-smoothing: antialiased;
+    overflow: hidden;
+}
+
+#root {
+    height: 100vh;
+}
+
+/* ------------------------------------------------------------- Geruest --- */
+
+.atlas-shell {
+    display: grid;
+    grid-template-rows: auto auto minmax(0, 1fr) auto auto;
+    height: 100vh;
+    background: var(--atlas-bg);
+}
+
+/* ------------------------------------------------------------ Kopfzeile -- */
+
+/*
+ * Die Kopfzeile bricht um, statt ihren rechten Rand abzuschneiden.
+ *
+ * Befund vom 2026-08-30 (`npm run smoke:w6`, vier Beschneidungen an drei
+ * Halten): der Chip mit der Kantenzahl ragte 41.77px aus der Zeile heraus,
+ * waagerecht abgeschnitten und ohne jeden Hinweis darauf, dass dort etwas
+ * fehlt. Gemessen an derselben Zeile vor dem Befund: sie passte mit einem
+ * Projektnamen von fuenfzehn Zeichen auf 1680 Pixel GENAU, mit null Pixeln
+ * Rest. Jeder laengere Projektname und jeder neue Eintrag (W10 hat
+ * `[s]ettings` dazugestellt) muss also herausragen. Das war keine knappe
+ * Sache, das war eine Reihe ohne Reserve.
+ *
+ * Der Umbruch ist die Antwort und nicht das Kuerzen: was hier steht, sind
+ * Namen und Zahlen ohne Fuellwort, und ein gekuerzter Projektname beantwortet
+ * die Frage nicht mehr, fuer die er dasteht. Umgebrochen bleibt jedes Zeichen
+ * lesbar, bei jeder Fensterbreite; `overflow: hidden` bleibt als Sperre stehen,
+ * fuer den Fall, dass doch einmal etwas nicht umbrechen kann.
+ *
+ * `white-space: nowrap` bleibt ebenfalls: es haelt die BESCHRIFTUNGEN
+ * zusammen ("[w]hy am I here" gehoert in eine Zeile), waehrend `flex-wrap`
+ * die Eintraege untereinander verteilt. Die Zeilenluecke ist kleiner als die
+ * Spaltenluecke, damit zwei Zeilen wie eine Kopfzeile aussehen und nicht wie
+ * zwei Leisten.
+ */
+.atlas-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 18px;
+    row-gap: 4px;
+    padding: 8px 16px;
+    border-bottom: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.atlas-brand {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 700;
+    letter-spacing: 0.22em;
+    color: var(--atlas-phosphor);
+}
+
+.atlas-version {
+    color: var(--atlas-dim);
+    letter-spacing: 0.06em;
+}
+
+/*
+ * Der Zustand des Arbeitsbaums, neben der Fassung und leiser als sie.
+ *
+ * Kleiner und gedimmt, weil er eine Randbemerkung ist: wer die Fassung sucht,
+ * liest den Chip, und wer wissen will, ob ein Bild zu einem Commit gehoert,
+ * findet daneben die Antwort.
+ */
+.atlas-version-suffix {
+    color: var(--atlas-dim);
+    opacity: 0.7;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+}
+
+/*
+ * Die Menuezeile: sechs Knoepfe, die auch wie sechs Knoepfe aussehen.
+ *
+ * Nutzerbefund vom 2026-08-29 (Screenshot): `[a]tlas` und `[?]help` trugen
+ * einen Rahmen, die vier Eintraege dazwischen einen gepunkteten Unterstrich in
+ * kleinerer Schrift. Wer die Zeile ansah, las vier Beschriftungen zwischen zwei
+ * Bedienelementen. Alle sechs tun aber dasselbe: einen Buchstaben, eine
+ * Flaeche, ein Klick oder eine Taste. Also tragen sie seit W7b eine Klasse und
+ * eine Gestalt, und die Zeile teilt ihre Abstaende mit den Gruppen darin,
+ * damit zwischen `[a]tlas` und `[w]hy` derselbe Abstand steht wie zwischen
+ * `[l]lm off` und `[?]help`: ein engerer Abstand innerhalb der Gruppe wuerde
+ * die Zeile wieder in zwei Sorten zerlegen.
+ */
+/*
+ * Sie bricht mit der Kopfzeile um, und zwar zwischen den Eintraegen.
+ *
+ * Ohne das waere die Zeile nur bis zur Breite der Menueleiste gerettet: sie ist
+ * mit acht Eintraegen der breiteste Brocken der Kopfzeile (gemessen 1045px),
+ * und ein Brocken, der selbst nicht umbrechen kann, ragt bei einem schmalen
+ * Fenster genauso heraus wie vorher der Chip. Umgebrochen wird zwischen den
+ * Knoepfen; die Beschriftung eines Knopfes bleibt in einer Zeile
+ * (`white-space: nowrap` an `.atlas-menu-item`).
+ */
+.atlas-menu {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: 10px;
+    row-gap: 4px;
+    margin-left: 6px;
+    align-items: center;
+}
+
+.atlas-menu-item {
+    appearance: none;
+    /*
+     * Der Rahmen ist sichtbar, auch im Ruhezustand. Ein durchsichtiger Rahmen
+     * haelt zwar den Platz, sagt dem Auge aber nichts, und genau daran hat der
+     * Nutzer die vier Eintraege fuer Text gehalten.
+     */
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    padding: 1px 6px;
+    cursor: pointer;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.atlas-menu-item:hover {
+    color: var(--atlas-phosphor);
+    border-color: var(--atlas-phosphor-mute);
+}
+
+/*
+ * Der Fokus ist ein Ring und keine Randfarbe.
+ *
+ * Vorher setzte `:focus-visible` `outline: none` und faerbte den Rahmen. Das
+ * war in dem Moment unsichtbar, in dem der Punkt ohnehin einen gefaerbten
+ * Rahmen trug (`data-state="on"`), also genau dort, wo jemand mit der Tastatur
+ * wissen will, wo er steht. Ein eigener Ring ausserhalb des Rahmens kann mit
+ * keinem Zustand kollidieren.
+ */
+.atlas-menu-item:focus-visible {
+    outline: 2px solid var(--atlas-phosphor);
+    outline-offset: 1px;
+    color: var(--atlas-phosphor);
+}
+
+.atlas-menu-key {
+    color: var(--atlas-phosphor);
+}
+
+/*
+ * Die Legende der Menuezeile: was die Klammer verlangt.
+ *
+ * Gedaempft und klein, weil sie einmal gelesen und danach uebersehen wird. Sie
+ * steht trotzdem da: ein `[a]`, das ohne Alt nichts tut, waere sonst genau die
+ * Sorte Versprechen, die dieser Zyklus aus der Zeile entfernt hat.
+ */
+.atlas-menu-legend {
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    align-self: center;
+}
+
+/*
+ * Ein eingeschalteter Menuepunkt sieht anders aus als ein ausgeschalteter, und
+ * das sind seit W7a alle Zustaende, die es gibt: einen dritten fuer "tut
+ * nichts" braucht die Zeile nicht mehr, weil sie nichts mehr traegt, was nichts
+ * tut.
+ */
+.atlas-menu-item[data-state='off'] {
+    color: var(--atlas-fg);
+}
+
+.atlas-menu-item[data-state='on'] {
+    color: var(--atlas-phosphor);
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-select);
+}
+
+/*
+ * Die Angaben am rechten Rand, und sie bleiben rechts, auch wenn sie in die
+ * naechste Zeile rutschen. `margin-left: auto` schiebt den Block an den Rand,
+ * `justify-content: flex-end` haelt die einzelnen Chips dort, sobald der Block
+ * selbst umbricht.
+ */
+.atlas-chips {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    column-gap: 14px;
+    row-gap: 4px;
+    margin-left: auto;
+    color: var(--atlas-dim);
+}
+
+.atlas-chip {
+    letter-spacing: 0.04em;
+}
+
+.atlas-chip b {
+    color: var(--atlas-fg);
+    font-weight: 500;
+}
+
+.atlas-chip[data-state='absent'] {
+    color: var(--atlas-alarm);
+}
+
+/* ----------------------------------------------------------------- Tabs -- */
+
+/*
+ * Die Tab-Leiste scrollt waagerecht, statt in die Nachbarn zu wachsen.
+ *
+ * Befund vom 2026-08-29: bei vielen offenen Dateien schrumpften die Tabs (das
+ * ist die Vorgabe eines Flex-Kindes), ihre Beschriftungen liefen aus ihnen
+ * heraus und ueberlagerten sich. `flex: 0 0 auto` je Tab plus `overflow-x` an
+ * der Leiste heisst: ein Tab behaelt seine Breite, die Leiste scrollt, und
+ * nichts umbricht. Die zwei Verlaufsstreifen an den Raendern sagen, dass es
+ * weitergeht; der aktive Tab wird beim Oeffnen in Sicht gescrollt.
+ */
+.atlas-tabs-bar {
+    position: relative;
+    min-width: 0;
+    border-bottom: 1px solid var(--atlas-line);
+    background: var(--atlas-bg);
+}
+
+.atlas-tabs {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: stretch;
+    min-height: 30px;
+    background: var(--atlas-bg);
+    overflow-x: auto;
+    overflow-y: hidden;
+    scrollbar-width: none;
+    overscroll-behavior-x: contain;
+}
+
+.atlas-tabs::-webkit-scrollbar {
+    display: none;
+}
+
+/* Der Zeiger sagt, dass man die Leiste ziehen kann, sobald es etwas zu ziehen gibt. */
+.atlas-tabs-bar[data-overflowing='true'] .atlas-tabs {
+    cursor: grab;
+}
+
+.atlas-tabs-bar[data-dragging='true'] .atlas-tabs {
+    cursor: grabbing;
+    user-select: none;
+}
+
+.atlas-tabs-overflow {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    width: 22px;
+    pointer-events: none;
+    opacity: 0;
+    transition: opacity 120ms linear;
+}
+
+.atlas-tabs-overflow[data-on='true'] {
+    opacity: 1;
+}
+
+.atlas-tabs-overflow[data-side='left'] {
+    left: 0;
+    background: linear-gradient(to right, var(--atlas-bg), transparent);
+    box-shadow: inset 1px 0 0 0 var(--atlas-phosphor-mute);
+}
+
+.atlas-tabs-overflow[data-side='right'] {
+    right: 0;
+    background: linear-gradient(to left, var(--atlas-bg), transparent);
+    box-shadow: inset -1px 0 0 0 var(--atlas-phosphor-mute);
+}
+
+.atlas-tab {
+    display: flex;
+    flex: 0 0 auto;
+    max-width: 240px;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 12px;
+    border: none;
+    border-right: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.atlas-tab[data-active='true'] {
+    color: var(--atlas-phosphor);
+    background: var(--atlas-panel-raised);
+    box-shadow: inset 0 1px 0 0 var(--atlas-phosphor);
+}
+
+.atlas-tab-label {
+    appearance: none;
+    display: block;
+    max-width: 170px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    padding: 0;
+    cursor: pointer;
+    /* Ein langer Dateiname kuerzt sich, statt aus seinem Tab herauszulaufen. */
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.atlas-tab-dot {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-tab-close {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    cursor: pointer;
+    padding: 0 2px;
+}
+
+.atlas-tab-close:hover {
+    color: var(--atlas-alarm);
+}
+
+.atlas-tabs-empty {
+    padding: 4px 12px;
+    color: var(--atlas-dim);
+}
+
+/* ----------------------------------------------------------------- Rumpf - */
+
+/*
+ * Drei Spalten mit einem Griff dazwischen, und die Breiten kommen vom Leser.
+ *
+ * Bis W8 standen 260 und 440 fest im Raster. Seit W8 stehen sie als
+ * CSS-Variable da, die AtlasChrome setzt, und der Rueckfallwert ist genau die
+ * alte Zahl: ein Fenster ohne Layout-Zustand (jsdom, ein Bild vor dem ersten
+ * Lesen aus localStorage) sieht aus wie vorher, statt auf null zusammenzufallen.
+ *
+ * Die 10 Pixel zwischen den Spalten sind die Griffe. Sie stehen im Raster und
+ * nicht als Rahmen an den Zonen, weil sie eine eigene Flaeche brauchen, die man
+ * treffen kann: ein Rahmen ist einen Pixel breit, und einen Pixel trifft
+ * niemand. Bis W8b waren es sechs; warum daraus zehn geworden sind, steht im
+ * Abschnitt "Griffe" weiter unten, und der Grund ist ein Nutzerbefund.
+ */
+.atlas-body {
+    display: grid;
+    grid-template-columns: var(--atlas-left-w, 260px) 10px minmax(0, 1fr);
+    min-height: 0;
+}
+
+.atlas-body[data-twin='true'] {
+    grid-template-columns:
+        var(--atlas-left-w, 260px) 10px minmax(0, 1fr) 10px var(--atlas-right-w, 440px);
+}
+
+/*
+ * Die rechte Spalte ist ein festes Zwei-Regionen-Layout, und das ist seit W5c
+ * eine Zusicherung und keine Anordnung.
+ *
+ * Oben die Twin-Region, die INTERN scrollt; unten das Graph-Panel mit einer
+ * Mindesthoehe, das nie weggeschoben werden kann. Der Befund vom 2026-08-29 war
+ * genau das: bei langem Twin-Inhalt (und waehrend einer Fuehrung) wanderte die
+ * Galaxie aus dem sichtbaren Bereich, weil die Spalte ihren Inhalt einfach
+ * ueberlaufen liess. `overflow: hidden` hier plus `min-height: 0` am Twin
+ * heisst: was zu lang ist, scrollt im Twin und nicht in der Spalte, und das
+ * Panel darunter behaelt seinen Platz.
+ *
+ * Der Rahmen wandert dabei von den Panels auf die Spalte, damit zwischen ihnen
+ * genau eine Linie steht und nicht zwei.
+ *
+ * Seit W8 ist die Grenze zwischen den beiden Regionen ziehbar. Der Twin hat
+ * darum eine feste Hoehe statt `flex: 1`, und der Graph nimmt, was bleibt. Die
+ * `max-height` ist die zweite Haelfte der Zusage aus AC2: die Zahl selbst ist in
+ * src/layout/layout-model.ts schon begrenzt, und diese Zeile haelt die Grenze
+ * auch dann, wenn das Fenster zwischen zwei Bildern kleiner wird und die Zahl
+ * noch die alte ist.
+ */
+.atlas-side {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+    overflow: hidden;
+    border-left: 1px solid var(--atlas-line);
+}
+
+.atlas-side .atlas-twin {
+    /*
+     * Nachgeben darf er, wachsen nicht.
+     *
+     * `flex: 0 1 auto` mit `min-height: 0` ist genau die Rolle, die er bis W8
+     * hatte, nur andersherum aufgeschrieben: bis dahin war der Graph der feste
+     * Kasten und der Twin nahm den Rest, jetzt traegt der Twin die gezogene Zahl
+     * und der Graph nimmt den Rest. Was gleich bleibt, ist, WER nachgibt, wenn
+     * das Fenster zu klein fuer beide ist, und das muss der Twin bleiben: der
+     * Graph hat seit W5c eine Mindesthoehe, die eine Zusicherung ist.
+     */
+    flex: 0 1 auto;
+    height: var(--atlas-twin-h, 360px);
+    min-height: 0;
+    max-height: calc(100% - 300px);
+    overflow: hidden;
+    border-left: none;
+}
+
+/*
+ * Ist der Graph zugeklappt, gibt es keine Grenze mehr zu ziehen, und der Twin
+ * nimmt die Spalte.
+ *
+ * Ohne diese Regel bliebe unter dem eingeklappten Graphen der Platz leer
+ * stehen, den er offen gehabt haette: ein Loch, das aussieht wie ein
+ * Layoutfehler. Der Griff selbst wird in App.tsx gar nicht erst gezeichnet,
+ * denn ein Griff zwischen zwei Flaechen, von denen eine weg ist, ist ein Griff,
+ * der nichts tut, und ein Bedienelement ohne Wirkung gibt es hier nicht.
+ */
+.atlas-side:has(.atlas-galaxy[data-visible='false']) .atlas-twin {
+    flex: 1 1 auto;
+    height: auto;
+    max-height: none;
+}
+
+/* ------------------------------------------------------------- Griffe ---- */
+
+/*
+ * Vier gleiche Griffe zwischen den Zonen.
+ *
+ * Zehn Pixel breit, und die Zahl kommt aus einem Nutzerbefund und nicht aus
+ * einem Geschmack. Bis W8b waren es sechs, der Strich darin war die einzige
+ * Farbe, und die kam erst bei Hover. Der Nutzer hat daraufhin am 2026-08-29
+ * gefragt, ob man die Hoehe des Chats verstellen koenne: sie war seit W7c
+ * verstellbar, und er hatte den Griff nicht gefunden. Gemessen war der Grund
+ * eindeutig: ein Griff, der ohne Hover wie eine Trennlinie aussieht, IST fuer
+ * einen Leser eine Trennlinie, und niemand faehrt mit der Maus auf eine
+ * Trennlinie.
+ *
+ * Also zweierlei, und beides ohne Hover:
+ *
+ *  - **Zehn Pixel Trefferflaeche.** Der Strich (`::before`) bleibt duenn; was
+ *    waechst, ist das, was man treffen kann. Sichtbar duenn, greifbar breit,
+ *    wie schon beim Griff des Antwort-Panels aus W7c, nur mit einer
+ *    Trefferflaeche, die eine Maus auch bei schneller Bewegung erwischt.
+ *  - **Eine Marke in der Mitte** (`::after`): ein kurzer Balken in Phosphor,
+ *    quer zur Linie. Er ist das Zeichen, das aus einer Trennlinie einen Griff
+ *    macht, und er ist DA, bevor jemand hinfaehrt. Alle vier Griffe tragen
+ *    dieselbe Marke: ein Produkt, in dem vier Grenzen ziehbar sind, die
+ *    niemand sieht, hat vier Grenzen weniger als es glaubt.
+ *
+ * `touch-action: none` gehoert dazu und ist keine Vorsichtsmassnahme: ohne die
+ * Angabe nimmt ein Trackpad den Zug als Bildlauf und der Griff bekommt nie ein
+ * zweites Zeigerereignis.
+ */
+.atlas-splitter {
+    position: relative;
+    background: transparent;
+    border: none;
+    padding: 0;
+    outline: none;
+    touch-action: none;
+}
+
+.atlas-splitter::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: var(--atlas-line);
+}
+
+/*
+ * Die Marke. Absolut in der Mitte, ohne Zeigerereignisse: sie zeigt den Griff
+ * an, sie ist nicht der Griff.
+ */
+.atlas-splitter::after {
+    content: '';
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background: var(--atlas-phosphor-mute);
+    border-radius: 1px;
+    pointer-events: none;
+}
+
+.atlas-splitter[data-orientation='vertical'] {
+    cursor: col-resize;
+}
+
+.atlas-splitter[data-orientation='vertical']::before {
+    left: 4px;
+    right: 4px;
+}
+
+.atlas-splitter[data-orientation='vertical']::after {
+    width: 2px;
+    height: 26px;
+}
+
+.atlas-splitter[data-orientation='horizontal'] {
+    flex: 0 0 10px;
+    cursor: row-resize;
+}
+
+.atlas-splitter[data-orientation='horizontal']::before {
+    top: 4px;
+    bottom: 4px;
+}
+
+.atlas-splitter[data-orientation='horizontal']::after {
+    width: 26px;
+    height: 2px;
+}
+
+.atlas-splitter:hover::before,
+.atlas-splitter:focus-visible::before {
+    background: var(--atlas-phosphor);
+}
+
+.atlas-splitter:hover::after,
+.atlas-splitter:focus-visible::after {
+    background: var(--atlas-phosphor);
+}
+
+/* Der Fokusring liegt auf dem Strich und nicht um den ganzen Griff. */
+.atlas-splitter:focus-visible {
+    outline: none;
+}
+
+/* ------------------------------------------------- Erklaeren-Bereich ----- */
+
+/*
+ * Der eine Platz unter dem Reader, an dem erklaert wird.
+ *
+ * Die Hoehe kommt als Inline-Stil von der Zone selbst, weil sie eine Zahl ist,
+ * die der Leser gezogen hat, und keine Regel. `max-height` daneben ist die
+ * zweite Haelfte der Zusage aus AC2: was auch immer in der Zahl steht, dem
+ * Reader bleiben seine 180 Pixel plus Breadcrumb. Zwei Grenzen fuer dieselbe
+ * Sache, und das ist Absicht: die eine spricht (der Griff meldet sie als
+ * `aria-valuemax`), die andere zeichnet.
+ */
+.atlas-explain {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    max-height: calc(100% - 230px);
+    overflow: hidden;
+    border-top: 1px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel);
+}
+
+/* Eingeklappt ist er genau seine Reiterleiste. Kein Rest, keine Leere. */
+.atlas-explain[data-open='false'] {
+    height: auto;
+    max-height: none;
+}
+
+.atlas-explain-tabs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    padding: 4px 12px;
+    border-bottom: 1px solid var(--atlas-line);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.atlas-explain[data-open='false'] .atlas-explain-tabs {
+    border-bottom: none;
+}
+
+.atlas-explain-tab {
+    flex: 0 0 auto;
+    border: 1px solid transparent;
+    border-radius: 2px;
+    padding: 2px 10px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+}
+
+.atlas-explain-tab:hover {
+    color: var(--atlas-fg);
+    border-color: var(--atlas-line);
+}
+
+.atlas-explain-tab[data-on='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-phosphor);
+}
+
+/*
+ * Ein Reiter ohne Inhalt ist gedimmt und bleibt anklickbar.
+ *
+ * Anklickbar, weil er sonst nur eine Farbe waere: wer ihn drueckt, bekommt den
+ * Grund im Feld darunter zu lesen. `disabled` waere die bequeme Loesung und die
+ * stumme: ein Knopf, der nicht reagiert, sagt nicht, warum.
+ */
+.atlas-explain-tab[data-enabled='false'] {
+    color: var(--atlas-line);
+}
+
+.atlas-explain-tab[data-enabled='false'][data-on='true'] {
+    border-color: var(--atlas-line);
+    color: var(--atlas-dim);
+}
+
+.atlas-explain-note {
+    flex: 1 1 auto;
+    min-width: 0;
+    text-align: right;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-explain-fold {
+    flex: 0 0 auto;
+    margin-left: auto;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    padding: 1px 8px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-explain-fold:hover,
+.atlas-explain-fold:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+/*
+ * Das Feld selbst scrollt NICHT, seine Inhalte tun es.
+ *
+ * Zwei ineinanderliegende Bildlaeufe sind ein Bedienfehler mit Ansage: das Rad
+ * trifft mal den einen und mal den anderen, je nachdem, wo der Zeiger steht.
+ * Also ist dieses Feld ein Rahmen mit `overflow: hidden`, und jeder Reiter
+ * bringt seinen eigenen Bildlauf mit, den er schon vorher hatte.
+ */
+.atlas-explain-body {
+    flex: 1 1 auto;
+    display: flex;
+    min-height: 0;
+    overflow: hidden;
+}
+
+.atlas-explain-body > * {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 0;
+}
+
+/*
+ * Die vier Flaechen, die bis W8 ueber dem Editor lagen, liegen jetzt in diesem
+ * Feld. Sie behalten ihr Aussehen und verlieren ihre Ebene: ein Kasten mit
+ * `position: absolute` in einem Bereich, der ihm ohnehin gehoert, waere eine
+ * Ebene ohne Gegenueber.
+ */
+.atlas-explain-body > .atlas-flow-overlay,
+.atlas-explain-body > .atlas-bugwizard,
+.atlas-explain-body > .atlas-impact {
+    position: static;
+    inset: auto;
+    z-index: auto;
+}
+
+.atlas-explain-body > .atlas-chat {
+    border-top: none;
+    background: transparent;
+}
+
+.atlas-explain-body > .atlas-tour {
+    border-top: none;
+    overflow-y: auto;
+}
+
+.atlas-explain-empty {
+    margin: 0;
+    padding: 14px 16px;
+    max-width: 88ch;
+    color: var(--atlas-dim);
+    line-height: 1.6;
+    overflow-y: auto;
+}
+
+/* -------------------------------------------------------------- Explorer - */
+
+.atlas-tree {
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-right: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-tree-title {
+    padding: 8px 12px 6px;
+    margin: 0;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.2em;
+    color: var(--atlas-dim);
+}
+
+.atlas-tree-list {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    margin: 0;
+    padding: 0 0 8px;
+    list-style: none;
+    outline: none;
+}
+
+.atlas-tree-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 1px 8px 1px 4px;
+    border: none;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-tree-row[data-kind='dir'] {
+    color: var(--atlas-dim);
+}
+
+.atlas-tree-row[data-active='true'] {
+    background: var(--atlas-select);
+    color: var(--atlas-phosphor);
+    box-shadow: inset 2px 0 0 0 var(--atlas-phosphor);
+}
+
+.atlas-tree-list:focus-visible .atlas-tree-row[data-cursor='true'] {
+    outline: 1px solid var(--atlas-phosphor-mute);
+    outline-offset: -1px;
+}
+
+.atlas-tree-twisty {
+    width: 10px;
+    flex: 0 0 10px;
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-tree-symbols {
+    margin-left: auto;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+}
+
+.atlas-tree-note {
+    padding: 6px 12px;
+    border-top: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    white-space: normal;
+}
+
+.atlas-tree-note[data-state='absent'] {
+    color: var(--atlas-alarm);
+}
+
+/*
+ * Die Coverage-Stufen im Baum.
+ *
+ * Gedimmt wird, was keinen Inhalt hat: `skipped`, `not-indexed` und `ignored`
+ * sind Zeilen, hinter denen dieses Produkt nichts zeigen kann. Die Warnfarbe
+ * ist --atlas-alarm und kein eigener Ton: ein sechstes Token allein fuer einen
+ * Marker waere eine Farbe mehr in einer Palette, die absichtlich klein ist.
+ */
+
+/*
+ * Gedimmt werden Dateien, nicht Ordner.
+ *
+ * Ein Ordner traegt die schlechteste Stufe seines Inhalts, und die kann von
+ * einer einzigen Datei unter zwanzig kommen. Ihn deswegen auszugrauen hiesse,
+ * neunzehn indizierte Dateien mit auszugrauen. Der Ordner bekommt seinen Punkt,
+ * und der sagt genau so viel, wie er weiss.
+ */
+.atlas-tree-row[data-kind='file'][data-coverage='skipped'],
+.atlas-tree-row[data-kind='file'][data-coverage='not-indexed'],
+.atlas-tree-row[data-kind='file'][data-coverage='ignored'] {
+    color: var(--atlas-dim);
+    opacity: 0.55;
+}
+
+/*
+ * Der Status-Punkt, den jede Datei traegt.
+ *
+ * Drei Toene und nicht fuenf: der Punkt beantwortet "steht dahinter etwas im
+ * Graphen". Der gedimmte Phosphor ist der Gutfall und ausdruecklich nicht der
+ * volle Akzent: ein Baum voller heller Punkte waere ein Baum, in dem nichts
+ * mehr ruft. Die Warnfarbe ist --atlas-alarm, dieselbe wie beim Zeichen
+ * daneben, und Grau heisst "hierzu ist nichts im Graphen".
+ */
+.atlas-tree-dot {
+    display: inline-block;
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--atlas-phosphor-mute);
+}
+
+.atlas-tree-dot[data-tone='partial'] {
+    background: var(--atlas-alarm);
+}
+
+.atlas-tree-dot[data-tone='absent'] {
+    background: transparent;
+    box-shadow: inset 0 0 0 1px var(--atlas-dim);
+}
+
+.atlas-tree-legend .atlas-tree-dot {
+    margin-right: 5px;
+    vertical-align: middle;
+}
+
+.atlas-tree-mark {
+    flex: 0 0 auto;
+    margin-left: 6px;
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+.atlas-tree-mark[data-coverage='partial'] {
+    color: var(--atlas-alarm);
+    font-weight: 700;
+}
+
+.atlas-tree-mark[data-coverage='skipped'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-tree-mark[data-coverage='folder'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-tree-row[data-kind='dir'] .atlas-tree-mark {
+    color: var(--atlas-alarm);
+}
+
+.atlas-tree-legend {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 6px 12px 8px;
+    border-top: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+/*
+ * Eine Zeile je Stufe, als Fliesstext und nicht als Flex-Spalten: mit
+ * Flex-Kindern bricht jedes Stueck in seiner eigenen Spalte um, und aus
+ * "partially parsed" wird ein Wort pro Zeile.
+ */
+.atlas-tree-legend-entry {
+    display: block;
+    white-space: normal;
+    text-indent: -14px;
+    padding-left: 14px;
+}
+
+.atlas-tree-legend-entry b {
+    color: var(--atlas-fg);
+    font-weight: 500;
+}
+
+.atlas-tree-legend .atlas-tree-mark {
+    display: inline-block;
+    margin-left: 0;
+    margin-right: 4px;
+    width: 10px;
+    text-align: center;
+}
+
+.atlas-tree-legend-source {
+    margin-top: 4px;
+    padding-top: 4px;
+    border-top: 1px dotted var(--atlas-line);
+    color: var(--atlas-phosphor-mute);
+    white-space: normal;
+}
+
+/* Die Notiz UEBER dem Editor: was gleich zu lesen ist, ist im Graphen luecken-
+ * haft. Sie steht vor dem Text und nicht dahinter, weil sie ihn qualifiziert. */
+
+.atlas-coverage-note {
+    margin: 0;
+    padding: 6px 14px;
+    border-bottom: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    white-space: normal;
+}
+
+.atlas-coverage-note b {
+    color: var(--atlas-alarm);
+    font-weight: 500;
+}
+
+/* ------------------------------------------------------- Mitte: Reader --- */
+
+.atlas-main {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--atlas-bg);
+}
+
+.atlas-breadcrumb {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 16px;
+    border-bottom: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-breadcrumb-leaf {
+    color: var(--atlas-cyan);
+}
+
+.atlas-breadcrumb-empty {
+    color: var(--atlas-dim);
+}
+
+/*
+ * Der Reader gibt Hoehe her, aber nicht die letzte.
+ *
+ * Seit W7c kann der Leser die Flaeche darunter groesser ziehen, und ohne eine
+ * Untergrenze hier waere der Editor die Flaeche, die dabei verschwindet. Die
+ * Zahl ist die kleinere Haelfte des Vertrages; die groessere steht seit W8 in
+ * src/layout/layout-model.ts, wo der Deckel des Erklaeren-Bereichs an der
+ * Fensterhoehe haengt, und noch einmal als `max-height` an `.atlas-explain`.
+ * Zwei Grenzen, weil zwei Flaechen um denselben Platz streiten.
+ */
+.atlas-reader {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 180px;
+    /*
+     * Der Editor bleibt in seinem Kasten, auch fuer den Wimpernschlag, in dem er
+     * es noch nicht weiss.
+     *
+     * Monaco kennt seine Groesse als ZAHL und misst sie mit `automaticLayout`
+     * selbst nach; zwischen dem Bild, in dem der Erklaeren-Bereich aufgeht, und
+     * dem, in dem Monaco es bemerkt hat, steht sein altes, hoeheres Rechteck
+     * ueber der neuen Zone. Gemessen im Beweislauf von W5c (Halt 6e): vier
+     * Punkte im Erklaerer trafen `DIV.view-lines` statt des Erklaerers, obwohl
+     * das Rechteck des Readers laengst kuerzer war. Ein Bildlauf ist das nicht,
+     * also darf hier auch nichts scrollen; `hidden` schneidet genau den einen
+     * Ueberstand weg, und was der Editor in sich zeigt, verantwortet er weiter
+     * selbst.
+     */
+    overflow: hidden;
+}
+
+.atlas-reader-editor {
+    position: absolute;
+    inset: 0;
+}
+
+/*
+ * Der Platzhalter liegt UEBER dem Editor statt an seiner Stelle. Ein Editor,
+ * der nur manchmal im Layout haengt, misst sich beim Auftauchen auf null und
+ * rendert eine leere Flaeche, bis irgendetwas ihn anstoesst.
+ */
+.atlas-reader-placeholder {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    padding: 24px;
+    background: var(--atlas-bg);
+    color: var(--atlas-dim);
+    text-align: center;
+    white-space: pre-wrap;
+}
+
+.atlas-reader-placeholder[data-state='failed'] {
+    color: var(--atlas-alarm);
+}
+
+/*
+ * `unavailable` bleibt gedimmt und wird ausdruecklich nicht rot: eine Datei,
+ * die der Index nach seinen eigenen Regeln ausgelassen hat, ist kein Ausfall
+ * dieser Oberflaeche, sondern eine Grenze der heutigen Server-Flaeche. Der
+ * Text bekommt trotzdem Platz zum Atmen, denn er ist eine Erklaerung und kein
+ * Statuswort.
+ */
+.atlas-reader-placeholder[data-state='unavailable'] {
+    color: var(--atlas-fg);
+    max-width: 62ch;
+    margin: 0 auto;
+    text-align: left;
+    align-items: center;
+}
+
+.atlas-truncation {
+    padding: 5px 16px;
+    border-top: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-alarm);
+    font-size: 12px;
+}
+
+.atlas-truncation b {
+    font-weight: 500;
+}
+
+.atlas-truncation-why {
+    color: var(--atlas-dim);
+}
+
+/* ------------------------------------------- Rechts: der Semantic Twin --- */
+
+.atlas-twin {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    border-left: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+/*
+ * Die Marke an der Kante des Twin-Koerpers (W8b).
+ *
+ * Dieselbe Gestalt wie die Marke der Legende, aus demselben Grund: zwei
+ * Formulierungen fuer dieselbe Auskunft waeren zwei Idiome. Sie liegt absolut
+ * im Panel und nicht im scrollenden Kasten, faengt keine Klicks ab und deckt
+ * keinen Text zu.
+ *
+ * Der Anlass ist der Screenshot des Nutzers vom 2026-08-29: die Zeile "Order
+ * exact 1 citation" endete halb hinter dem GALAXY-Kopf. Der mitrollende
+ * Verlauf, den dieser Kasten schon trug, zaehlt der Lesbarkeitsregel als
+ * Hinweis, und einem Leser hat er nicht gereicht.
+ */
+.atlas-twin-more {
+    position: absolute;
+    right: 10px;
+    bottom: 4px;
+    z-index: 1;
+    padding: 0 4px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: var(--atlas-panel);
+    color: var(--atlas-phosphor-mute);
+    font-size: 10px;
+    line-height: 1.4;
+    pointer-events: none;
+}
+
+.atlas-twin-more[data-edge='top'] {
+    top: 4px;
+    bottom: auto;
+}
+
+.atlas-twin-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding: 8px 14px 6px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-twin-title {
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--atlas-dim);
+}
+
+.atlas-twin-subject {
+    font-size: 15px;
+    color: var(--atlas-fg);
+}
+
+.atlas-twin-subject-name {
+    color: var(--atlas-cyan);
+}
+
+.atlas-twin-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-twin-depth {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+.atlas-twin-depth input {
+    flex: 1 1 auto;
+    min-width: 0;
+    accent-color: var(--atlas-phosphor);
+}
+
+.atlas-twin-depth-name {
+    color: var(--atlas-phosphor);
+    min-width: 68px;
+    text-align: right;
+}
+
+.atlas-twin-facets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 5px;
+}
+
+.atlas-twin-facet {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 6px;
+    cursor: pointer;
+}
+
+.atlas-twin-facet[data-on='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+    background: var(--atlas-select);
+}
+
+/*
+ * Der Koerper des Twin ist die Flaeche, die scrollt.
+ *
+ * `min-height: 0` und nicht mehr `min-height: 180px`: die Untergrenze stammt
+ * aus der Zeit, in der der Flow-Kasten in derselben Spalte sass und den Koerper
+ * auf null druecken konnte. Der Kasten ist seit W5c ein Overlay, und eine
+ * Untergrenze hier waere jetzt genau das Gegenteil ihrer alten Absicht: sie
+ * liesse die Spalte wachsen und schoebe das Graph-Panel aus dem Bild.
+ */
+.atlas-twin-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 8px 14px 16px;
+}
+
+.atlas-twin-empty {
+    color: var(--atlas-dim);
+}
+
+.atlas-twin-empty-message[data-state='failed'],
+.atlas-twin-empty-message[data-state='not-indexed'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-twin-empty-hint {
+    color: var(--atlas-dim);
+    font-size: 12px;
+}
+
+/* --- Sektionen ----------------------------------------------------------- */
+
+.atlas-twin-section {
+    margin: 0 0 14px;
+}
+
+.atlas-twin-block-label {
+    font-size: 10px;
+    letter-spacing: 0.24em;
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-twin-section-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.atlas-twin-section-title {
+    margin: 0;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.16em;
+    text-transform: uppercase;
+    color: var(--atlas-dim);
+}
+
+.atlas-twin-section[data-alarm='true'] .atlas-twin-section-title {
+    color: var(--atlas-alarm);
+}
+
+.atlas-twin-section-count,
+.atlas-twin-state {
+    font-size: 11px;
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-twin-state[data-state='unsupported'],
+.atlas-twin-state[data-state='notIndexed'],
+.atlas-twin-state[data-state='unknown'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-twin-section-text,
+.atlas-twin-section-empty,
+.atlas-twin-section-note,
+.atlas-twin-note,
+.atlas-twin-paragraph {
+    margin: 4px 0;
+    font-size: 12px;
+    color: var(--atlas-fg);
+}
+
+/*
+ * Die Ehrlichkeitszeilen. Gedaempft, aber nie versteckt: sie sagen, was der
+ * Index NICHT sieht, und ein Leser, der sie ueberliest, zieht aus einer leeren
+ * Liste den falschen Schluss.
+ */
+.atlas-twin-section-empty,
+.atlas-twin-section-note,
+.atlas-twin-note {
+    color: var(--atlas-dim);
+}
+
+.atlas-twin-section[data-alarm='true'] .atlas-twin-section-note {
+    color: var(--atlas-alarm);
+}
+
+/* --- Zeilen -------------------------------------------------------------- */
+
+.atlas-twin-rows {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-twin-rows-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 8px;
+}
+
+.atlas-twin-group {
+    width: 100%;
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    color: var(--atlas-phosphor-mute);
+    margin-top: 4px;
+}
+
+.atlas-twin-row,
+.atlas-twin-row-chip {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.atlas-twin-row-chip {
+    border: 1px solid var(--atlas-line);
+    padding: 0 6px;
+}
+
+.atlas-twin-row-activate {
+    appearance: none;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    padding: 0;
+    text-align: left;
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: 2px 6px;
+}
+
+button.atlas-twin-row-activate {
+    cursor: pointer;
+}
+
+button.atlas-twin-row-activate:hover .atlas-twin-row-label,
+button.atlas-twin-row-activate:focus-visible .atlas-twin-row-label {
+    color: var(--atlas-phosphor);
+    text-decoration: underline;
+}
+
+.atlas-twin-row-line {
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+    min-width: 22px;
+    text-align: right;
+}
+
+.atlas-twin-row-label {
+    color: var(--atlas-cyan);
+}
+
+.atlas-twin-section[data-alarm='true'] .atlas-twin-row-label {
+    color: var(--atlas-alarm);
+}
+
+.atlas-twin-row-inert .atlas-twin-row-label {
+    color: var(--atlas-fg);
+}
+
+/*
+ * Die Anhaengsel der dichten Tiefe brechen als GANZE um und nie mitten im
+ * Wort: "via direct-" auf der einen und "call" auf der naechsten Zeile ist
+ * keine Angabe mehr, sondern ein Raetsel.
+ */
+.atlas-twin-row-detail,
+.atlas-twin-row-extra,
+.atlas-twin-row-confidence {
+    font-size: 11px;
+    color: var(--atlas-dim);
+    white-space: nowrap;
+}
+
+.atlas-twin-badge {
+    font-size: 10px;
+    border: 1px solid var(--atlas-line);
+    padding: 0 4px;
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-twin-row-current {
+    background: var(--atlas-select);
+    box-shadow: inset 2px 0 0 0 var(--atlas-phosphor);
+}
+
+/* --- Prosa und gefuehrte Tiefe ------------------------------------------- */
+
+.atlas-twin-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 6px 0;
+}
+
+.atlas-twin-chip {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-cyan);
+    font: inherit;
+    font-size: 12px;
+    padding: 0 6px;
+    cursor: pointer;
+}
+
+.atlas-twin-chip:disabled {
+    color: var(--atlas-dim);
+    cursor: default;
+}
+
+.atlas-twin-facts {
+    margin: 4px 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-twin-fact {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 12px;
+}
+
+.atlas-twin-fact-label {
+    color: var(--atlas-dim);
+    min-width: 132px;
+}
+
+.atlas-twin-fact-name {
+    appearance: none;
+    border: none;
+    background: transparent;
+    font: inherit;
+    padding: 0;
+    color: var(--atlas-cyan);
+    cursor: pointer;
+    text-align: left;
+}
+
+/* --- Die fuenf Leser (W13) ----------------------------------------------- */
+
+/*
+ * Die Frage der Stufe, ueber allem anderen.
+ *
+ * Sie ist die erste Zeile jeder Stufe und traegt darum als einzige Zeile des
+ * Koerpers die Phosphorfarbe: sie beantwortet nichts, sie sagt, welche Frage
+ * gleich beantwortet wird, und ein Leser, der den Regler bewegt hat, soll sie
+ * ohne Suchen finden.
+ */
+.atlas-twin-question {
+    margin: 0 0 10px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--atlas-line);
+    font-size: 12px;
+    color: var(--atlas-phosphor);
+}
+
+/* Die Schritte der Junior-Stufe: die Ordnungszahl traegt die Reihenfolge. */
+.atlas-twin-steps {
+    margin: 6px 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-twin-step {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    font-size: 12px;
+    margin: 3px 0;
+}
+
+.atlas-twin-step-order {
+    color: var(--atlas-phosphor-mute);
+    min-width: 18px;
+    text-align: right;
+    flex: 0 0 auto;
+}
+
+.atlas-twin-step-text {
+    appearance: none;
+    border: none;
+    background: transparent;
+    font: inherit;
+    padding: 0;
+    color: var(--atlas-fg);
+    text-align: left;
+}
+
+button.atlas-twin-step-text {
+    color: var(--atlas-cyan);
+    cursor: pointer;
+}
+
+/* Die erklaerten Woerter. Eine Definitionsliste, weil es eine ist. */
+.atlas-twin-terms {
+    margin: 4px 0 10px;
+}
+
+.atlas-twin-term {
+    margin: 0 0 4px;
+    font-size: 12px;
+}
+
+.atlas-twin-term-word {
+    color: var(--atlas-phosphor-mute);
+    letter-spacing: 0.06em;
+}
+
+.atlas-twin-term-text {
+    margin: 0;
+    color: var(--atlas-dim);
+}
+
+/* Die Bloecke der Senior- und der Architekten-Stufe. */
+.atlas-twin-block {
+    margin: 0 0 16px;
+}
+
+.atlas-twin-block-lead {
+    margin: 4px 0;
+    font-size: 12px;
+    color: var(--atlas-dim);
+}
+
+.atlas-twin-limits {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-twin-limit-row {
+    margin: 0 0 4px;
+    padding-left: 10px;
+    border-left: 1px solid var(--atlas-line);
+}
+
+/*
+ * Die drei Sorten Grenze, an der Farbe zu unterscheiden.
+ *
+ * Was dieser Bau nicht beantwortet hat, ist eine Luecke, die jemand schliessen
+ * koennte, und steht darum in der Warnfarbe; was diese Maschine fuer niemanden
+ * aufzeichnet, ist keine Luecke, sondern eine Grenze, und steht gedaempft. Die
+ * Farbe ist nie der einzige Traeger: der Satz daneben sagt beides in Worten.
+ */
+.atlas-twin-limit-row[data-kind='state'] {
+    border-left-color: var(--atlas-alarm);
+}
+
+.atlas-twin-limit {
+    margin: 0;
+    font-size: 12px;
+    color: var(--atlas-dim);
+}
+
+/* Die Umformulierung durch das lokale Modell, und ihr Herkunftsvermerk. */
+.atlas-twin-voice {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--atlas-line);
+}
+
+.atlas-twin-voice-btn {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-cyan);
+    font: inherit;
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+}
+
+.atlas-twin-voice-btn:disabled {
+    color: var(--atlas-dim);
+    cursor: default;
+}
+
+.atlas-twin-voice-note {
+    margin: 0;
+    flex: 1 1 100%;
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+/*
+ * Eine verworfene Umformulierung ist ein Befund und keine Panne: der Waechter
+ * hat gearbeitet. Sie steht in der Warnfarbe, damit ein Leser sie nicht
+ * ueberliest und die gebauten Saetze fuer die des Modells haelt.
+ */
+.atlas-twin-voice-note[data-refused='true'] {
+    color: var(--atlas-alarm);
+}
+
+/*
+ * Der Vermerk am formulierten Satz, im Idiom der Zustandsmarker: ein kurzes
+ * Zeichen, dessen ganzer Satz im Tooltip steht. Dieselbe Bauform wie
+ * `PURPOSE inferred [?]`, damit ein Leser das Zeichen nicht neu lernen muss.
+ */
+.atlas-twin-voiced {
+    margin-left: 6px;
+    font-size: 11px;
+    color: var(--atlas-phosphor-mute);
+}
+
+/* --- Belege -------------------------------------------------------------- */
+
+/*
+ * `display: contents` macht Knopf und Liste zu direkten Kindern der Zeile.
+ * Damit bleibt der Knopf neben der Beschriftung stehen und der aufgeklappte
+ * Block bekommt mit `flex-basis: 100%` eine eigene Zeile, statt sich neben den
+ * Ort zu quetschen.
+ */
+.atlas-evidence {
+    display: contents;
+}
+
+.atlas-evidence-btn {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1.2;
+    padding: 0 4px;
+    cursor: pointer;
+}
+
+.atlas-evidence-btn[aria-expanded='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-evidence-list {
+    display: block;
+    flex-basis: 100%;
+    margin: 4px 0 4px 22px;
+    padding: 4px 8px;
+    border-left: 2px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel-raised);
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+.atlas-evidence-entry {
+    display: block;
+    padding: 2px 0;
+}
+
+.atlas-evidence-entry + .atlas-evidence-entry {
+    border-top: 1px solid var(--atlas-line);
+}
+
+.atlas-evidence-relation {
+    display: block;
+    color: var(--atlas-fg);
+}
+
+.atlas-evidence-runtime {
+    margin-left: 6px;
+    color: var(--atlas-cyan);
+}
+
+.atlas-evidence-loc {
+    display: block;
+    color: var(--atlas-cyan);
+}
+
+.atlas-evidence-strategy,
+.atlas-evidence-observations,
+.atlas-evidence-attribution,
+.atlas-evidence-empty {
+    display: block;
+}
+
+/* ------------------------------------------------- Rand: Schritt-Badges --- */
+
+/*
+ * Herkunft: uebernommen am 2026-08-28 aus CodeAtlasIDE,
+ * theia-extensions/codeatlas-core/src/browser/style/index.css, Zeilen 26-70.
+ * Gleicher Urheber (Bernhard Jackiewicz). Die Regeln sind semantisch
+ * unveraendert: relative Position, absolut gesetztes ::after mit der Ziffer als
+ * `content`, neun numerierte Klassen, und die Puls-Klasse als volle Deckkraft
+ * plus Ring statt einer Animation.
+ *
+ * Aenderungen: die Farben kommen aus tokens.css statt aus den Theia-Themen
+ * (`--theia-codeatlas-accent` und Freunde gibt es hier nicht), und die Schrift
+ * ist --atlas-font statt --theia-code-font-family.
+ *
+ * Warum kein Blinken: der Twin umrandet im selben Moment die passende
+ * Schritt-Zeile, es aendern sich also zwei Dinge gleichzeitig, und ein Leser,
+ * der den Caret verloren hat, findet beide. Eine Animation muesste ausserdem
+ * fuer die Bild-Abnahme und fuer jeden, der reduzierte Bewegung eingestellt
+ * hat, wieder abgeschaltet werden, und sie saegte nichts, was das hier nicht
+ * sagt.
+ */
+
+.codeatlas-step-badge {
+    position: relative;
+}
+
+.codeatlas-step-badge::after {
+    position: absolute;
+    top: 0;
+    right: 2px;
+    min-width: 12px;
+    height: 12px;
+    line-height: 12px;
+    border-radius: 6px;
+    text-align: center;
+    font-size: 9px;
+    font-weight: 600;
+    font-family: var(--atlas-font);
+    color: var(--atlas-bg);
+    background-color: var(--atlas-phosphor);
+    opacity: 0.85;
+}
+
+.codeatlas-step-badge-1::after { content: '1'; }
+.codeatlas-step-badge-2::after { content: '2'; }
+.codeatlas-step-badge-3::after { content: '3'; }
+.codeatlas-step-badge-4::after { content: '4'; }
+.codeatlas-step-badge-5::after { content: '5'; }
+.codeatlas-step-badge-6::after { content: '6'; }
+.codeatlas-step-badge-7::after { content: '7'; }
+.codeatlas-step-badge-8::after { content: '8'; }
+.codeatlas-step-badge-9::after { content: '9'; }
+
+.codeatlas-step-badge-pulse::after {
+    opacity: 1;
+    box-shadow: 0 0 0 2px var(--atlas-select);
+}
+
+/* Die Zeile, auf die die Schrittliste gerade zeigt. */
+.codeatlas-step-line {
+    background: var(--atlas-select);
+}
+
+/* -------------------------------------------------------- Kommandozeile -- */
+
+.atlas-command {
+    position: relative;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 16px;
+    border-top: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+/*
+ * Der Fokus ist zu sehen, und zwar an der Zeile selbst.
+ *
+ * Nutzerbefund vom 2026-08-29: ohne Fokus kam kein Zeichen an, und der Zeile
+ * war das nicht anzusehen. Zwei Zeichen dafuer: der Prompt leuchtet, und die
+ * Zeile bekommt eine Kante in der Akzentfarbe. Beides zusammen, weil ein
+ * einzelner farbiger Punkt in einer Zeile aus gruenen Zeichen untergeht.
+ */
+.atlas-command[data-focused='true'] {
+    border-top-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-panel-raised);
+}
+
+.atlas-command-prompt {
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-command[data-focused='true'] .atlas-command-prompt {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-command-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    outline: none;
+}
+
+.atlas-command-input::placeholder {
+    color: var(--atlas-dim);
+}
+
+.atlas-command-hint {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+/* --------------------------------------------------------- Statusleiste -- */
+
+/*
+ * Sie bricht um wie die Kopfzeile, und aus demselben Grund.
+ *
+ * Sie ist dieselbe Bauart (`nowrap` plus `overflow: hidden`) und traegt mehr
+ * Angaben als jene: sieben Chips, darunter zwei, deren Laenge von aussen kommt
+ * (der Projektname und der Name des laufenden Modells). Gemessen passt sie
+ * heute in 1680 Pixel; ohne Umbruch waere das eine Zusage darueber, wie lang
+ * ein Modellname sein darf, und die kann diese Zeile nicht geben. Wo alles
+ * hineinpasst, aendert der Umbruch nichts.
+ */
+.atlas-statusbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 20px;
+    row-gap: 3px;
+    padding: 4px 16px;
+    border-top: 1px solid var(--atlas-line);
+    background: var(--atlas-bg);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.atlas-statusbar b {
+    color: var(--atlas-fg);
+    font-weight: 500;
+}
+
+.atlas-statusbar [data-state='ok'] b {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-statusbar [data-state='absent'] b {
+    color: var(--atlas-alarm);
+}
+
+/* ------------------------------------------------- Rechts unten: Galaxie - */
+
+/*
+ * Die Galaxie ist ein Panel mit fester Hoehe und keine Flaeche, die sich den
+ * Rest nimmt: der Twin darueber ist der Text, den man liest, und ein Panel,
+ * das ihn beim Wachsen zusammendrueckt, waere ein Bild, das die Erklaerung
+ * verdraengt.
+ *
+ * Zugeklappt bleibt sie im Baum stehen und faellt nur auf Hoehe null. Das ist
+ * kein Trick, sondern die Bedingung dafuer, dass der WebGL-Kontext ueberlebt:
+ * ein `display: none` haengt den Canvas aus, und der naechste Aufklapper
+ * zahlte mit einem schwarzen Kasten und einer Sekunde Wartezeit.
+ */
+.atlas-galaxy {
+    display: flex;
+    flex-direction: column;
+    /*
+     * Seit W8 nimmt der Graph, was der Twin uebrig laesst, statt 420 Pixel zu
+     * fordern. Die Zusicherung darunter ist unveraendert: `min-height: 280px`
+     * gilt weiter, und weil er nicht mehr schrumpfen kann, ohne sie zu
+     * verletzen, gibt bei zu kleinem Fenster der Twin nach und nicht er.
+     */
+    flex: 1 1 0;
+    height: auto;
+    /*
+     * Die Untergrenze ist die Zusicherung aus W5c: dieses Panel ist immer da,
+     * und "da" heisst mindestens 280 Pixel hoch. Der Beweislauf liest genau
+     * diesen Wert und misst danach mit getBoundingClientRect, dass das Panel
+     * waehrend einer Fuehrung und im Entry-Walk vollstaendig im Bild steht.
+     */
+    min-height: 280px;
+    border-top: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    overflow: hidden;
+}
+
+/*
+ * Zugeklappt bleibt der KOPF stehen, und das ist seit W5c der Unterschied.
+ *
+ * Vorher fiel das ganze Panel auf Hoehe null und war damit ein Zustand ohne
+ * Griff: wer es zugeklappt hatte, fand nichts mehr, woran er es wieder
+ * aufmachen konnte, ausser dem Menuepunkt, den er suchen musste. Jetzt faellt
+ * nur die Szene weg; der Kopf mit seinem Schalter bleibt sichtbar. Die Szene
+ * bleibt dabei im Baum und faellt auf Hoehe null statt auf `display: none`:
+ * ein Aushaengen wuerde den WebGL-Kontext wegwerfen, und der naechste
+ * Aufklapper zahlte dafuer mit einem schwarzen Kasten.
+ */
+.atlas-galaxy[data-visible='false'] {
+    flex: 0 0 auto;
+    height: auto;
+    min-height: 0;
+}
+
+.atlas-galaxy[data-visible='false'] .atlas-galaxy-scene,
+.atlas-galaxy[data-visible='false'] .atlas-galaxy-legend-frame,
+.atlas-galaxy[data-visible='false'] .atlas-galaxy-legend {
+    height: 0;
+    min-height: 0;
+    flex: 0 0 0;
+    visibility: hidden;
+    border: none;
+    padding: 0;
+}
+
+/*
+ * Der Kopf traegt zwei Zeilen: oben die Marke, der Ansichts-Schalter und die
+ * Legende, darunter der Satz ueber das Bild. Alles in einer Zeile hiesse in
+ * einer 440 Pixel breiten Spalte, dass der Satz nach zwei Woertern in einem
+ * Auslassungszeichen endet, und genau dieser Satz nennt in der Hierarchie das
+ * Symbol, die Zahl der Knoten und die Tiefe.
+ */
+.atlas-galaxy-head {
+    display: flex;
+    flex-direction: column;
+    /*
+     * Der Kopf gibt nicht nach, die Szene tut es.
+     *
+     * Ohne diese Angabe ist der Kopf ein schrumpfbares Flex-Element: wird das
+     * Panel eng, quetscht er seine eigenen Zeilen und ist danach je nach Lage
+     * ein paar Pixel hoeher oder niedriger. Fuer Text waere das haesslich, hier
+     * ist es ausserdem falsch messbar: unter dem Kopf liegt ein Canvas, dessen
+     * Hoehe der Rest ist, und der Beweislauf von W9 vergleicht zwei Aufnahmen
+     * genau dieser Flaeche. Ein Kopf, der zwischen zwei Aufnahmen um vier Pixel
+     * waechst, macht aus zwei Bildern derselben Szene zwei verschiedene Bilder
+     * und meldet eine Kamerabewegung, die es nie gab.
+     *
+     * Also: der Kopf ist so hoch wie sein Text, immer, und was die Zone uebrig
+     * laesst, gehoert der Szene. Sie hat eine Untergrenze am Panel selbst
+     * (min-height: 280px), also kann sie dabei nicht verschwinden.
+     */
+    flex: 0 0 auto;
+    gap: 3px;
+    padding: 8px 10px 6px;
+    border-bottom: 1px solid var(--atlas-line);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+/*
+ * Die Kopfzeile bleibt EINE Zeile, und die Woerter darin wurden dafuer kuerzer.
+ *
+ * Bis W8b trug sie vier Zeichen (`[-]`, `[+]`, zwei Pfeile) und passte immer.
+ * Seit W8b tragen ihre Schalter Woerter, weil der Nutzer die Zeichen beim
+ * Testen am 2026-08-29 nicht verstanden hat. Der Contract sagt zu dem Fall
+ * woertlich: "Passt das Wort in einer engen Spalte nicht, wird die Spalte
+ * breiter oder das Wort kuerzer, nicht das Zeichen wieder eingesetzt."
+ *
+ * Beides ist hier passiert, und zwar in dieser Reihenfolge: erst wurde die
+ * Zeile umbrechend gemacht, und das war falsch. Der Beweislauf von W9 misst die
+ * gezeichnete Szene und verlangt, dass die Kamera zwischen zwei Aufnahmen
+ * stillsteht; eine Kopfzeile, die ihre Zeilenzahl aendern kann, aendert die
+ * HOEHE der Zeichenflaeche darunter, und dann vergleicht der Lauf zwei Bilder
+ * verschiedener Groesse. Eine Kopfzeile ueber einem Canvas ist damit kein Ort
+ * fuer eine Hoehe, die vom Text abhaengt.
+ *
+ * Also eine Zeile, und der Platz kommt aus drei kleinen Stellen: der Schalter
+ * der Legende heisst "hide"/"show" statt "collapse"/"open" (vier Zeichen
+ * kuerzer, derselbe Zustand im Wort), die Chips sind zwei Pixel schmaler
+ * gepolstert, und der Kopf hat vier Pixel weniger Rand. Der Schalter des
+ * Graphen behaelt seinen vollen Wortlaut: den nennt der Contract woertlich.
+ */
+.atlas-galaxy-head-row {
+    display: flex;
+    flex-wrap: nowrap;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+
+.atlas-galaxy-title {
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--atlas-dim);
+}
+
+.atlas-galaxy-headline {
+    font-size: 11px;
+    color: var(--atlas-dim);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+.atlas-galaxy-headline[data-state='failed'] {
+    color: var(--atlas-alarm);
+}
+
+/*
+ * Die zweite Kopfzeile (W9): woraus die Linien bestehen und was der Filter
+ * gerade wegnimmt.
+ *
+ * Sie darf umbrechen, und das ist der Unterschied zur Zeile darueber. Der Satz
+ * dort ist eine Zusammenfassung, von der man das Ende zur Not verschmerzt; hier
+ * steht eine Zahl, die genau dann gebraucht wird, wenn sie da ist ("3 of 12
+ * edge kinds hidden"). Eine Zahl in drei Punkten enden zu lassen hiesse, die
+ * Meldung ueber ein Ausblenden auszublenden. Sie steht nur da, wenn es etwas zu
+ * sagen gibt, kostet also im Regelfall keine Zeile.
+ */
+.atlas-galaxy-edgenote {
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--atlas-dim);
+    white-space: normal;
+}
+
+/*
+ * Der Ansichts-Schalter: zwei Chips, von denen genau einer gedrueckt ist.
+ * Deaktiviert heisst hier "es gibt noch keinen Walk", und der Tooltip sagt, was
+ * fehlt; ausgeblendet waere ein Schalter, den man erst findet, wenn man ihn
+ * nicht mehr sucht.
+ *
+ * Der RAHMEN um die beiden ist neu in W8b, und er ist die Antwort auf den
+ * Nutzerbefund "galaxy Knopf macht nichts". Ohne Rahmen standen dort vier
+ * Knoepfe nebeneinander: zwei Ansichten, ein Legenden-Schalter und ein
+ * Zuklapper, alle in derselben Gestalt. Zwei davon sind ein PAAR, aus dem genau
+ * einer aktiv sein kann; das war nur an der Faerbung des aktiven zu ahnen. Der
+ * Rahmen macht aus dem Ahnen ein Sehen, und `role="group"` sagt dasselbe fuer
+ * eine Vorlesehilfe.
+ */
+
+.atlas-graph-mode {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 2px;
+    margin-left: auto;
+    padding: 1px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 3px;
+}
+
+.atlas-graph-mode-chip {
+    padding: 1px 5px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-graph-mode-chip:hover:not([aria-disabled='true']) {
+    color: var(--atlas-phosphor);
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-graph-mode-chip[data-active='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-select);
+    color: var(--atlas-phosphor);
+}
+
+/*
+ * Grau heisst hier "es gibt nichts zu zeigen", und der Knopf sagt es auch.
+ *
+ * Seit W10b traegt er `aria-disabled` statt `disabled` (AC3): ein vom Browser
+ * gesperrter Knopf bekommt keine Zeigerereignisse, also oeffnet sein Tooltip
+ * nicht und er ist stumm. So bleibt er beruehrbar und erklaert sich, und der
+ * Zeiger sagt trotzdem, dass hier nichts umzuschalten ist.
+ */
+.atlas-graph-mode-chip[aria-disabled='true'] {
+    opacity: 0.45;
+    cursor: default;
+}
+
+/*
+ * Der Ring um den Schritt, auf dem der Leser steht.
+ *
+ * Ein DOM-Element ueber dem Canvas und kein Objekt der Szene: eine Animation
+ * aus Geometrie waere ein Neubau der Puffer in jedem Bild. Er zeigt nichts an,
+ * was nicht auch im Text steht, und faengt keine Klicks ab.
+ */
+
+.atlas-hierarchy-pulse {
+    display: block;
+    width: 26px;
+    height: 26px;
+    border: 1px solid var(--atlas-phosphor);
+    border-radius: 50%;
+    box-shadow: 0 0 8px var(--atlas-phosphor-mute);
+    animation: atlas-hierarchy-pulse 1.6s ease-out infinite;
+}
+
+@keyframes atlas-hierarchy-pulse {
+    0% {
+        transform: scale(0.7);
+        opacity: 0.95;
+    }
+
+    70% {
+        transform: scale(1.35);
+        opacity: 0.25;
+    }
+
+    100% {
+        transform: scale(0.7);
+        opacity: 0.95;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .atlas-hierarchy-pulse {
+        animation: none;
+        opacity: 0.9;
+    }
+}
+
+/*
+ * Die Legende unter dem Kopf: dim als Grundton, monospace wie alles hier, und
+ * die Kantenfarben als echte Punkte in genau den Werten, die die Szene malt.
+ */
+
+.atlas-galaxy-legend-toggle {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 4px;
+    padding: 0 2px;
+    border: none;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.atlas-galaxy-legend-toggle:hover,
+.atlas-galaxy-legend-toggle[aria-expanded='true'] {
+    color: var(--atlas-phosphor);
+}
+
+/* Der Zuklapp-Schalter im Kopf: derselbe Ton wie der Legenden-Schalter daneben. */
+.atlas-galaxy-collapse {
+    padding: 0 2px;
+    border: none;
+    background: transparent;
+    color: var(--atlas-phosphor-mute);
+    font: inherit;
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.atlas-galaxy-collapse:hover,
+.atlas-galaxy-collapse:focus-visible {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-galaxy[data-visible='false'] .atlas-galaxy-note {
+    display: none;
+}
+
+/*
+ * Die Legende nimmt hoechstens einen Bruchteil des Panels und scrollt intern.
+ *
+ * Der Befund vom 2026-08-29: aufgeklappt nahm sie 190 Pixel von 420 und der
+ * Graph war der schmale Rest. Die Zusicherung ist jetzt umgekehrt formuliert:
+ * die Legende bleibt unter 40 Prozent der Panelhoehe und der Graph behaelt
+ * mindestens 60 Prozent. Der Wert hier ist kleiner als die Zusicherung, weil
+ * Kopf und Notizzeile auch noch Platz brauchen und die 60 Prozent fuer den
+ * Graphen gemessen werden, nicht gerechnet.
+ *
+ * Seit W9-1 stehen hier 20 statt 18 Prozent, und die zwei Punkte sind
+ * abgezaehlt und nicht geschaetzt: die zwoelf Kantenarten dieses Fixtures
+ * brauchen mit ihren Zahlen vier Zeilen, ihre Ueberschrift eine fuenfte, und
+ * bei 18 Prozent stand die vierte Zeile halb im Bild. Gemessen bleibt der
+ * Graphenanteil damit bei rund 62 Prozent und die Zusicherung von W5c steht.
+ * Der Zeilendurchschuss faellt aus demselben Grund von 1.5 auf 1.4: eine
+ * Legende ist eine Liste und kein Fliesstext.
+ */
+.atlas-galaxy-legend-frame {
+    position: relative;
+    display: flex;
+    flex: 0 1 auto;
+    min-height: 0;
+    max-height: 20%;
+    border-bottom: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-galaxy-legend {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 5px 14px 6px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+/*
+ * Die Kante der Legende: der Verlauf und die Marke.
+ *
+ * Der Befund aus dem Beweisbild von W9 (Bernhard, 2026-08-29): der Kasten ist
+ * niedriger als sein Inhalt, die Bildlaufleiste dieser Plattform liegt
+ * ueberlagernd und ist im Ruhezustand unsichtbar, und der letzte sichtbare Satz
+ * endete darum an einer harten Kante mitten im Wort. Zwei Mittel dagegen, und
+ * sie tun Verschiedenes:
+ *
+ *  - Der VERLAUF (die Maske) loest die angeschnittene Zeile auf, statt sie zu
+ *    kappen. Ein Wort, das ausblendet, liest sich als Fortsetzung; eines, das
+ *    an einer Linie endet, liest sich als Darstellungsfehler.
+ *  - Die MARKE sagt die Richtung und ist die Einladung zum Scrollen. Sie liegt
+ *    im Rahmen und nicht im Kasten: was im Kasten liegt, scrollt mit und waere
+ *    genau dann verschwunden, wenn es gebraucht wird.
+ *
+ * Beide erscheinen nur, wenn wirklich etwas ausserhalb steht; das Panel misst
+ * das an `scrollTop`, `clientHeight` und `scrollHeight` (GalaxyPanel,
+ * Entscheidung 12). Eine fest verdrahtete Kante waere bei kurzer Legende eine
+ * Behauptung ueber Inhalt, den es nicht gibt.
+ */
+.atlas-galaxy-legend[data-more-below='true'] {
+    mask-image: linear-gradient(to bottom, #000 calc(100% - 14px), transparent 100%);
+}
+
+.atlas-galaxy-legend[data-more-above='true'] {
+    mask-image: linear-gradient(to bottom, transparent 0, #000 14px);
+}
+
+.atlas-galaxy-legend[data-more-above='true'][data-more-below='true'] {
+    mask-image: linear-gradient(
+        to bottom,
+        transparent 0,
+        #000 14px,
+        #000 calc(100% - 14px),
+        transparent 100%
+    );
+}
+
+.atlas-galaxy-legend-more {
+    position: absolute;
+    right: 8px;
+    z-index: 1;
+    padding: 0 4px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: var(--atlas-panel);
+    color: var(--atlas-phosphor-mute);
+    font-size: 10px;
+    line-height: 1.4;
+    pointer-events: none;
+}
+
+.atlas-galaxy-legend-more[data-edge='bottom'] {
+    bottom: 2px;
+}
+
+.atlas-galaxy-legend-more[data-edge='top'] {
+    top: 2px;
+}
+
+.atlas-galaxy-legend-entry {
+    margin: 0 0 4px;
+    white-space: normal;
+}
+
+.atlas-galaxy-legend-entry b {
+    color: var(--atlas-fg);
+    font-weight: 500;
+}
+
+/*
+ * Die Arten laufen im Text weiter und stehen nicht in einem eigenen Kasten.
+ *
+ * Vorher war das hier ein `inline-flex`, und ein solcher Kasten ist unteilbar:
+ * er ist so breit wie sein Inhalt es zulaesst, passt darum neben die
+ * Ueberschrift nicht mehr hin und faengt eine eigene Zeile an. Bei zwoelf Arten
+ * kostete das genau die Zeile, die der Legende zum Ruhezustand fehlte. Als
+ * normaler Textfluss teilen sich Ueberschrift und die ersten Arten eine Zeile,
+ * und der Umbruch faellt dorthin, wo die Zeile wirklich voll ist. Jede Art
+ * bleibt dabei fuer sich zusammen (`nowrap`): ein Name, den ein Umbruch von
+ * seiner Zahl trennt, waere zwei Angaben statt einer.
+ */
+.atlas-galaxy-legend-swatches {
+    display: inline;
+    margin-left: 8px;
+}
+
+/*
+ * Eine Kantenart in der Legende (seit W9 ein Schalter).
+ *
+ * Die Regel gilt fuer beide Formen, den Knopf und den blossen Punkt: eine
+ * Zeile, die sich klicken laesst, soll genauso aussehen wie eine, die es nicht
+ * tut, solange man sie nicht anfasst. Der Unterschied ist der Zeiger und der
+ * Rahmen bei Tastaturfokus, nicht die Farbe.
+ */
+.atlas-galaxy-legend-swatch {
+    display: inline-block;
+    margin: 0 10px 0 0;
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    text-align: left;
+    white-space: nowrap;
+}
+
+button.atlas-galaxy-legend-swatch {
+    cursor: pointer;
+}
+
+button.atlas-galaxy-legend-swatch:hover {
+    color: var(--atlas-fg);
+}
+
+/*
+ * Ausgeblendet heisst gedimmt und durchgestrichen, nicht weg.
+ *
+ * Der ganze Zweck des Filters: wer eine Art aus dem Bild nimmt, soll in der
+ * Legende sehen, DASS sie fehlt. Eine Zeile, die beim Abschalten verschwindet,
+ * macht aus einem Ausblenden ein Fehlen, und der Leser sucht danach einen
+ * Fehler im Index statt einen Schalter in der Legende. 0.42 ist dunkel genug,
+ * um sofort als "aus" zu lesen, und hell genug, dass der Name und die Zahl
+ * lesbar bleiben.
+ */
+.atlas-galaxy-legend-swatch[data-hidden='true'] {
+    opacity: 0.42;
+    text-decoration: line-through;
+}
+
+.atlas-galaxy-legend-dot {
+    display: inline-block;
+    width: 7px;
+    height: 7px;
+    margin-right: 4px;
+    border-radius: 50%;
+    vertical-align: middle;
+}
+
+.atlas-galaxy-legend-detail {
+    display: block;
+    color: var(--atlas-dim);
+}
+
+.atlas-galaxy-scene {
+    position: relative;
+    flex: 1 1 auto;
+    min-height: 0;
+    background: #0d0f12;
+}
+
+.atlas-galaxy-scene canvas {
+    display: block;
+}
+
+/*
+ * Der Weg zurueck zur eingepassten Ansicht (W10b, AC5).
+ *
+ * Oben rechts in der Szene, halbtransparent, in derselben Schrift wie alles
+ * hier. Er liegt bewusst IM Bild und nicht im Kopf: die Kopfzeile ist bei 440
+ * Pixeln Breite voll (siehe .atlas-galaxy-head-row), und ein Wort mehr darin
+ * haette den Zuklapper abgeschnitten. Die andere Ecke gehoert dem Instrument
+ * der Agentenebene, also stehen sich die beiden nie im Weg.
+ */
+.atlas-galaxy-fit {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    z-index: 3;
+    padding: 1px 6px;
+    border: 1px solid var(--atlas-line);
+    background: rgb(10 14 13 / 82%);
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.atlas-galaxy-fit:hover,
+.atlas-galaxy-fit:focus-visible {
+    color: var(--atlas-phosphor);
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-galaxy-placeholder {
+    position: absolute;
+    inset: 0;
+    z-index: 2;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    margin: 0;
+    padding: 18px;
+    background: #0d0f12;
+    color: var(--atlas-dim);
+    text-align: center;
+}
+
+.atlas-galaxy-placeholder[data-state='failed'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-galaxy-note {
+    margin: 0;
+    padding: 5px 14px;
+    border-top: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* Die Hover-Karte der Szene, in den Tokens dieses Projekts. */
+
+.atlas-galaxy-card {
+    min-width: 160px;
+    max-width: 320px;
+    padding: 6px 9px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-fg);
+    font-family: var(--atlas-font);
+    font-size: 11px;
+    line-height: 1.5;
+    text-align: left;
+    white-space: nowrap;
+}
+
+.atlas-galaxy-card-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.atlas-galaxy-card-dot {
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    flex: 0 0 auto;
+}
+
+.atlas-galaxy-card-name {
+    color: var(--atlas-cyan);
+}
+
+.atlas-galaxy-card-label,
+.atlas-galaxy-card-path,
+.atlas-galaxy-card-status,
+.atlas-galaxy-card-action {
+    color: var(--atlas-dim);
+}
+
+.atlas-galaxy-card-path {
+    margin: 2px 0 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-galaxy-card-rows {
+    margin: 3px 0 0;
+}
+
+.atlas-galaxy-card-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 18px;
+}
+
+.atlas-galaxy-card-row dt {
+    color: var(--atlas-dim);
+}
+
+.atlas-galaxy-card-row dd {
+    margin: 0;
+    color: var(--atlas-fg);
+}
+
+.atlas-galaxy-card-status,
+.atlas-galaxy-card-action {
+    margin: 3px 0 0;
+}
+
+/* ------------------------------------------------------- Bedeutungssuche - */
+
+/*
+ * Das Suchfenster steht ueber der Kommandozeile und ueber allem anderen: es
+ * gehoert zu der Zeile, in die getippt wird, und muss den Editor darunter
+ * verdecken duerfen, ohne das Layout zu verschieben.
+ */
+.atlas-search-results {
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: 100%;
+    z-index: 30;
+    display: flex;
+    flex-direction: column;
+    border-top: 1px solid var(--atlas-line);
+    border-bottom: 1px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel-raised);
+}
+
+/*
+ * Die Trefferliste hat eine feste Hoehe, und zwar genau MAX_SEARCH_ROWS Zeilen
+ * (search/overlay-model.ts).
+ *
+ * Warum, steht in search/SearchOverlay.tsx an der Stelle, an der der Kasten
+ * gezeichnet wird: das Fenster waechst nach oben, also verschiebt jede
+ * hinzukommende Zeile die oberste, und die oberste ist der beste Treffer. Mit
+ * fester Hoehe werden die vorlaeufigen Vorschlaege an Ort und Stelle durch die
+ * Antwort des Index ersetzt, ohne dass etwas springt.
+ *
+ * Die Zeilenhoehe wird aus den Tokens gerechnet und nicht als Pixelzahl
+ * hingeschrieben: sie muss die der Zeilen darin sein, sonst zeigt der Kasten
+ * neuneinhalb Zeilen.
+ */
+.atlas-search-list {
+    --atlas-search-rows: 10;
+    --atlas-search-row-height: calc(var(--atlas-font-size) * var(--atlas-line-height) + 6px);
+    display: flex;
+    flex-direction: column;
+    height: calc(var(--atlas-search-rows) * var(--atlas-search-row-height));
+    overflow-y: auto;
+}
+
+.atlas-search-headline {
+    padding: 5px 16px;
+    border-bottom: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+}
+
+.atlas-search-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    width: 100%;
+    /*
+     * Eine Zeile gibt keine Hoehe her. Ohne das verteilte der Flexbox die feste
+     * Hoehe des Kastens auf wenige Zeilen, und drei Treffer stuenden als drei
+     * hohe Streifen da.
+     */
+    flex: 0 0 auto;
+    padding: 3px 16px;
+    border: none;
+    border-left: 2px solid transparent;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.atlas-search-row[data-selected='true'] {
+    background: var(--atlas-select);
+    border-left-color: var(--atlas-phosphor);
+}
+
+.atlas-search-name {
+    color: var(--atlas-cyan);
+    flex: 0 0 auto;
+}
+
+.atlas-search-path {
+    color: var(--atlas-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-search-line {
+    color: var(--atlas-dim);
+    flex: 0 0 auto;
+}
+
+.atlas-search-matched {
+    margin-left: auto;
+    padding-left: 12px;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+    flex: 0 0 auto;
+}
+
+/*
+ * Die Marke an einer vorlaeufigen Zeile.
+ *
+ * Gedaempft und in eckigen Klammern, wie alles in dieser Oberflaeche, was eine
+ * Herkunft nennt statt eine Handlung anzubieten. Sie steht LINKS von der
+ * Wortangabe, damit sie beim Ersetzen durch die Antwort des Index einfach
+ * verschwindet, ohne dass sich der rechte Rand der Zeile bewegt.
+ */
+.atlas-search-provisional {
+    margin-left: auto;
+    padding-left: 12px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    flex: 0 0 auto;
+}
+
+.atlas-search-provisional::before {
+    content: '[';
+}
+
+.atlas-search-provisional::after {
+    content: ']';
+}
+
+/* Steht die Marke da, traegt sie den automatischen Rand und nicht die Wortangabe. */
+.atlas-search-provisional + .atlas-search-matched {
+    margin-left: 0;
+}
+
+.atlas-search-message {
+    margin: 0;
+    padding: 5px 16px;
+    border-top: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-search-message[data-status='failed'] {
+    color: var(--atlas-alarm);
+}
+
+/* ------------------------------------------------- Menue: zweiter Eintrag - */
+
+/*
+ * Der Atlas-Punkt hat seit W4a weitere Eintraege neben sich statt unter sich.
+ * Warum kein Aufklappmenue, steht an MenuWiring.extras in
+ * app/AtlasChrome.tsx: der Buchstabe selbst ist schon ein Verb.
+ *
+ * Die Gruppe ist seit W7b nur noch eine Klammer um zusammengehoerige Eintraege
+ * und keine eigene Gestalt mehr: derselbe Abstand wie in der Zeile, dieselben
+ * Knoepfe darin. `align-items: center` statt `baseline`, weil die Eintraege
+ * jetzt Rahmen haben und eine gemeinsame Schriftlinie sie unterschiedlich hoch
+ * haengen liesse.
+ */
+/* Die Gruppe umbricht mit; sonst waere sie der Brocken, den die Leiste darum
+ * herum gerade umbrechen gelernt hat (die Atlas-Zeile allein traegt sechs
+ * Eintraege). */
+.atlas-menu-group {
+    display: inline-flex;
+    flex-wrap: wrap;
+    align-items: center;
+    column-gap: 10px;
+    row-gap: 4px;
+}
+
+/* ----------------------------------------------------- Why are you here? - */
+
+/*
+ * Die Frage fuellt den leeren Editorbereich und liegt ueber ihm, aus demselben
+ * Grund wie der Platzhalter des Readers: ein Editor, der nur manchmal im
+ * Layout haengt, misst sich beim Auftauchen auf null.
+ */
+.atlas-why {
+    position: absolute;
+    inset: 0;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    overflow-y: auto;
+    background: var(--atlas-bg);
+}
+
+.atlas-why-inner {
+    width: 100%;
+    max-width: 760px;
+}
+
+.atlas-why-headline {
+    margin: 0;
+    color: var(--atlas-phosphor);
+    font-size: 18px;
+    font-weight: 500;
+    letter-spacing: 0.04em;
+}
+
+.atlas-why-subline {
+    margin: 6px 0 18px;
+    color: var(--atlas-dim);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.atlas-why-cards {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px;
+}
+
+.atlas-why-card {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    grid-template-areas:
+        'index label'
+        '.     detail'
+        '.     stub';
+    gap: 2px 10px;
+    padding: 12px 14px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.atlas-why-card:hover,
+.atlas-why-card:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-panel-raised);
+    outline: none;
+}
+
+.atlas-why-card-index {
+    grid-area: index;
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-why-card-label {
+    grid-area: label;
+    color: var(--atlas-phosphor);
+}
+
+.atlas-why-card-detail {
+    grid-area: detail;
+    color: var(--atlas-dim);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.atlas-why-card-stub {
+    grid-area: stub;
+    margin-top: 6px;
+    color: var(--atlas-alarm);
+    font-size: 11px;
+}
+
+.atlas-why-foot {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    margin-top: 16px;
+}
+
+.atlas-why-decline {
+    border: 1px solid var(--atlas-line);
+    padding: 5px 12px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    cursor: pointer;
+}
+
+.atlas-why-decline:hover {
+    color: var(--atlas-fg);
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-why-project {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+/* -------------------------------------------------- Einstiegspunkt-Dialog - */
+
+.atlas-entry {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 24px;
+    overflow-y: auto;
+    background: var(--atlas-bg);
+}
+
+.atlas-entry-inner {
+    width: 100%;
+    max-width: 760px;
+}
+
+.atlas-entry-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.atlas-entry-title {
+    margin: 0;
+    color: var(--atlas-phosphor);
+    font-size: 16px;
+    font-weight: 500;
+}
+
+.atlas-entry-close {
+    border: none;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-entry-subline {
+    margin: 6px 0 14px;
+    color: var(--atlas-dim);
+    font-size: 12px;
+}
+
+.atlas-entry-search {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel);
+}
+
+.atlas-entry-prompt {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-entry-input {
+    flex: 1 1 auto;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    outline: none;
+}
+
+.atlas-entry-input::placeholder {
+    color: var(--atlas-dim);
+}
+
+.atlas-entry-status {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-entry-headline {
+    padding: 12px 0 5px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+}
+
+.atlas-entry-list {
+    display: flex;
+    flex-direction: column;
+    max-height: 320px;
+    overflow-y: auto;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-entry-row {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    width: 100%;
+    padding: 3px 12px;
+    border: none;
+    border-left: 2px solid transparent;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+.atlas-entry-row:hover:not(:disabled) {
+    background: var(--atlas-select);
+    border-left-color: var(--atlas-phosphor);
+}
+
+.atlas-entry-row:disabled {
+    color: var(--atlas-dim);
+    cursor: default;
+}
+
+.atlas-entry-name {
+    color: var(--atlas-cyan);
+    flex: 0 0 auto;
+}
+
+.atlas-entry-row:disabled .atlas-entry-name {
+    color: var(--atlas-dim);
+}
+
+.atlas-entry-where {
+    color: var(--atlas-dim);
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-entry-origin {
+    margin-left: auto;
+    padding-left: 12px;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+    flex: 0 0 auto;
+}
+
+.atlas-entry-message {
+    margin: 8px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-entry-message[data-status='failed'] {
+    color: var(--atlas-alarm);
+}
+
+/* ---------------------------------------------------------- Schrittkarte - */
+
+/*
+ * Die Karte sitzt in der Editorspalte unter dem Reader und schiebt ihn hoch,
+ * statt ihn zu verdecken: sie erklaert den Schritt, und der Quelltext daneben
+ * ist das, was sie erklaert. Vorlage ist design/design.png.
+ */
+.atlas-tour {
+    flex: 0 0 auto;
+    padding: 10px 16px 12px;
+    border-top: 1px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel);
+}
+
+.atlas-tour-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+}
+
+.atlas-tour-progress {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-tour-bar {
+    color: var(--atlas-phosphor-mute);
+    letter-spacing: 0;
+}
+
+.atlas-tour-name {
+    margin-left: auto;
+    color: var(--atlas-dim);
+}
+
+.atlas-tour-title {
+    margin: 6px 0 4px;
+    color: var(--atlas-fg);
+    font-size: 13px;
+    font-weight: 500;
+}
+
+.atlas-tour-chevron {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-tour-description {
+    margin: 0;
+    max-width: 88ch;
+    color: var(--atlas-dim);
+    line-height: 1.6;
+}
+
+.atlas-tour-cap {
+    margin: 6px 0 0;
+    color: var(--atlas-alarm);
+    font-size: 12px;
+}
+
+.atlas-tour-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.atlas-tour-action {
+    border: 1px solid var(--atlas-line);
+    padding: 4px 12px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    cursor: pointer;
+}
+
+.atlas-tour-action[data-primary='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-tour-action:disabled {
+    color: var(--atlas-line);
+    cursor: default;
+}
+
+.atlas-tour-action:hover:not(:disabled) {
+    border-color: var(--atlas-phosphor);
+    color: var(--atlas-fg);
+}
+
+.atlas-entry-note {
+    margin: 8px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+/* ------------------------------------------------- BUG-Assistent ---------- */
+
+/*
+ * Vier Schritte untereinander, ueber dem Editor, mit derselben Grundform wie
+ * der Einstiegsdialog: eine Flaeche, die den leeren Platz fuellt, statt eines
+ * Modals, das die Oberflaeche blockiert. Die Nummer am Kopf jedes Schrittes
+ * steht da, weil die Reihenfolge Teil der Aussage ist und nicht Dekoration.
+ */
+.atlas-bugwizard,
+.atlas-impact {
+    position: absolute;
+    inset: 0;
+    z-index: 4;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: 24px;
+    overflow-y: auto;
+    background: var(--atlas-bg);
+}
+
+.atlas-bugwizard-inner,
+.atlas-impact-inner {
+    width: 100%;
+    max-width: 900px;
+}
+
+.atlas-bugwizard-head,
+.atlas-impact-head {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.atlas-bugwizard-title,
+.atlas-impact-title {
+    margin: 0;
+    color: var(--atlas-phosphor);
+    font-size: 16px;
+    font-weight: 500;
+}
+
+.atlas-bugwizard-close,
+.atlas-impact-close {
+    border: none;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-bugwizard-subline,
+.atlas-impact-subline {
+    margin: 6px 0 14px;
+    max-width: 88ch;
+    color: var(--atlas-dim);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.atlas-bugwizard-step {
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-bugwizard-step-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.atlas-bugwizard-step-number {
+    display: inline-block;
+    min-width: 18px;
+    color: var(--atlas-phosphor);
+    text-align: center;
+}
+
+.atlas-bugwizard-eyebrow,
+.atlas-impact-eyebrow {
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.atlas-bugwizard-note,
+.atlas-bugwizard-hint,
+.atlas-impact-note {
+    margin: 4px 0;
+    max-width: 92ch;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.6;
+}
+
+.atlas-bugwizard-origin {
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-bugwizard-empty,
+.atlas-impact-empty {
+    margin: 4px 0;
+    max-width: 92ch;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.atlas-bugwizard-alarm,
+.atlas-impact-alarm {
+    margin: 4px 0;
+    color: var(--atlas-alarm);
+    font-size: 12px;
+}
+
+.atlas-bugwizard-busy,
+.atlas-impact-busy {
+    margin: 4px 0;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+}
+
+.atlas-bugwizard-target {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.atlas-bugwizard-target-name {
+    margin: 0;
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.atlas-bugwizard-symbol {
+    color: var(--atlas-cyan);
+    font-size: 13px;
+}
+
+.atlas-bugwizard-qualified {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-bugwizard-button {
+    border: 1px solid var(--atlas-line);
+    padding: 3px 10px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-bugwizard-button:hover {
+    border-color: var(--atlas-phosphor);
+    color: var(--atlas-fg);
+}
+
+/* Eine Kette: Hops nebeneinander, mit einem Pfeil dazwischen, der aus dem
+   Listenmarker kommt und nicht aus einem zusaetzlichen Element. */
+.atlas-bugwizard-chain {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+    margin: 6px 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-bugwizard-hop {
+    display: flex;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.atlas-bugwizard-hop + .atlas-bugwizard-hop::before {
+    content: '->';
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-bugwizard-link {
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: var(--atlas-cyan);
+    font: inherit;
+    cursor: pointer;
+}
+
+.atlas-bugwizard-link:hover {
+    color: var(--atlas-phosphor);
+    text-decoration: underline;
+}
+
+.atlas-bugwizard-badge {
+    padding: 0 4px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor-mute);
+    font-size: 10px;
+}
+
+.atlas-bugwizard-observed {
+    color: var(--atlas-phosphor);
+    font-size: 11px;
+}
+
+.atlas-bugwizard-command {
+    margin: 6px 0;
+    padding: 8px 10px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-fg);
+    font: inherit;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-all;
+}
+
+.atlas-bugwizard-edges {
+    margin: 8px 0;
+}
+
+.atlas-bugwizard-edges ul {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-bugwizard-edge {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+    padding: 2px 0;
+}
+
+.atlas-bugwizard-edge-verb {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-bugwizard-verdict {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-bugwizard-runtime-only .atlas-bugwizard-observed {
+    color: var(--atlas-alarm);
+}
+
+/* ------------------------------------------- Aenderung und Blast-Radius --- */
+
+.atlas-impact-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    padding: 8px 0;
+    border-top: 1px solid var(--atlas-line);
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-impact-toolbar-label {
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.atlas-impact-mode {
+    border: 1px solid var(--atlas-line);
+    padding: 3px 10px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-impact-mode[data-active='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-impact-ref {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.atlas-impact-ref-label {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-impact-ref-input {
+    width: 22ch;
+    border: 1px solid var(--atlas-line);
+    padding: 2px 6px;
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-fg);
+    font: inherit;
+    font-size: 11px;
+}
+
+.atlas-impact-ref-input:focus {
+    border-color: var(--atlas-phosphor-mute);
+    outline: none;
+}
+
+.atlas-impact-ref-go {
+    border: 1px solid var(--atlas-line);
+    padding: 2px 10px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-impact-ref-error {
+    margin: 8px 0 0;
+    padding: 6px 8px;
+    border-left: 2px solid var(--atlas-alarm);
+    color: var(--atlas-alarm);
+    font-size: 12px;
+}
+
+.atlas-impact-tiles {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 12px 0;
+}
+
+.atlas-impact-tile {
+    display: flex;
+    flex-direction: column;
+    min-width: 96px;
+    padding: 6px 10px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-impact-tile-value {
+    color: var(--atlas-phosphor);
+    font-size: 18px;
+    font-weight: 500;
+}
+
+.atlas-impact-tile-label {
+    color: var(--atlas-dim);
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.atlas-impact-badge-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    margin: 12px 0;
+    padding: 10px 12px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-impact-badge {
+    flex: 0 0 auto;
+    padding: 4px 10px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+    font-size: 13px;
+    letter-spacing: 0.1em;
+}
+
+.atlas-impact-badge[data-level='high'],
+.atlas-impact-chip[data-level='high'] {
+    border-color: var(--atlas-alarm);
+    color: var(--atlas-alarm);
+}
+
+.atlas-impact-badge[data-level='low'],
+.atlas-impact-chip[data-level='low'] {
+    border-color: var(--atlas-line);
+    color: var(--atlas-dim);
+}
+
+.atlas-impact-badge-why {
+    flex: 1 1 auto;
+}
+
+.atlas-impact-rule {
+    margin: 3px 0;
+    max-width: 92ch;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.atlas-impact-narrative {
+    margin: 12px 0;
+}
+
+.atlas-impact-narrative-text {
+    margin: 0 0 8px;
+    max-width: 92ch;
+    color: var(--atlas-fg);
+    line-height: 1.6;
+}
+
+.atlas-impact-evidence {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-impact-evidence-row {
+    display: flex;
+    flex-direction: column;
+    padding: 3px 0 3px 8px;
+    border-left: 1px solid var(--atlas-line);
+}
+
+.atlas-impact-evidence-claim {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-impact-evidence-value {
+    color: var(--atlas-phosphor-mute);
+    font-size: 10px;
+}
+
+.atlas-impact-section {
+    margin: 12px 0;
+}
+
+.atlas-impact-list {
+    margin: 4px 0 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-impact-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    padding: 2px 0;
+}
+
+.atlas-impact-link {
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: var(--atlas-cyan);
+    font: inherit;
+    cursor: pointer;
+}
+
+.atlas-impact-link:disabled {
+    color: var(--atlas-dim);
+    cursor: default;
+}
+
+.atlas-impact-link:hover:not(:disabled) {
+    color: var(--atlas-phosphor);
+    text-decoration: underline;
+}
+
+.atlas-impact-where,
+.atlas-impact-via {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-impact-chip {
+    padding: 0 6px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+    font-size: 10px;
+}
+
+.atlas-impact-band {
+    margin: 6px 0;
+}
+
+.atlas-impact-band-label {
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+}
+
+/* ------------------------- Flow-Erklaerer und Pseudocode (W4c) ----------- */
+
+/*
+ * Der flow()-Kopf ist ein Knopf und sieht auch so aus.
+ *
+ * Nutzerfeedback 2026-08-28: er sah anklickbar aus und war es nicht. Also
+ * traegt er jetzt einen Zeiger, eine Hover-Farbe und im offenen Zustand die
+ * Phosphor-Klammer. Alles aus tokens.css, nichts hier ausgerechnet.
+ */
+button.atlas-twin-subject {
+    appearance: none;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    font-size: 15px;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+button.atlas-twin-subject:hover,
+button.atlas-twin-subject:focus-visible {
+    color: var(--atlas-phosphor);
+}
+
+button.atlas-twin-subject:hover .atlas-twin-subject-name,
+button.atlas-twin-subject:focus-visible .atlas-twin-subject-name {
+    text-decoration: underline;
+}
+
+/*
+ * Das Wort am Ende des flow-Kopfes.
+ *
+ * Bis W8b stand dort `[-]` beziehungsweise `[+]` (.atlas-twin-subject-caret).
+ * Der Nutzer hat die Zeichen beim Testen am 2026-08-29 nicht verstanden, und
+ * die Erklaerung dazu stand in einem nativen Tooltip: also genau in der Sache,
+ * die dieser Zyklus abgeschafft hat. Das Wort ist etwas laenger und kostet
+ * keine Erklaerung.
+ */
+.atlas-twin-subject-fold {
+    margin-left: 6px;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+button.atlas-twin-subject[aria-expanded='true'] .atlas-twin-subject-fold {
+    color: var(--atlas-phosphor);
+}
+
+/*
+ * Der Flow-Erklaerer als Overlay ueber der Editorflaeche.
+ *
+ * Bis W5c war das ein Kasten in der rechten Spalte, zwischen Kopfzeile und
+ * Detailstufen-Regler eingezwaengt und mit 260 Pixeln gedeckelt. Der Befund vom
+ * 2026-08-29 war deutlich: er verschwand hinter der Zeile darunter, sobald das
+ * Bild breiter wurde als die 440 Pixel der Spalte. Jetzt liegt er ueber dem
+ * Editor, in dessen ganzer Breite, mit einem eigenen Grund davor, und nichts
+ * liegt vor ihm: `z-index: 12` steht ueber dem Platzhalter des Readers (2), der
+ * Frage (3) und den Dialogen (4), und unter dem Suchfenster (30), das zur
+ * Kommandozeile gehoert und diese Flaeche gar nicht schneidet.
+ */
+.atlas-flow-overlay {
+    position: absolute;
+    inset: 0;
+    z-index: 12;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 12px 16px 14px;
+    background: var(--atlas-bg);
+    overflow-y: auto;
+}
+
+.atlas-flow-overlay:focus {
+    outline: none;
+}
+
+.atlas-flow-overlay-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-flow-overlay-title {
+    color: var(--atlas-fg);
+    font-size: 14px;
+    letter-spacing: 0.04em;
+}
+
+.atlas-flow-overlay-title::first-letter {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-flow-overlay-close {
+    margin-left: auto;
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 8px;
+    cursor: pointer;
+}
+
+.atlas-flow-overlay-close:hover,
+.atlas-flow-overlay-close:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-flow-overlay-esc {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+/*
+ * Zwei Haelften nebeneinander: das Bild links, die Liste rechts. Das Bild
+ * bekommt die groessere Spalte, weil es waechst, wenn eine Datei mehr im Walk
+ * steht, und die Liste scrollt intern.
+ */
+.atlas-flow-overlay-split {
+    display: grid;
+    grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+    min-height: 0;
+    /*
+     * Nicht schrumpfen. Gemessen am 2026-08-29 an dem Halt, den der
+     * Audit-Befund 13 neu in die Strecke gebracht hat: waehrend einer Fuehrung
+     * steht die Schrittkarte unter dem Editor, die Reader-Flaeche ist um deren
+     * Hoehe kuerzer, und dieses Overlay liegt mit `inset: 0` darin. Als
+     * Flex-Kind mit der Vorgabe `flex-shrink: 1` wurde das Raster dann auf die
+     * verbleibende Hoehe gedrueckt, waehrend die Liste darin ihre eigenen
+     * 52vh behielt: sie hing unten aus ihrer Zelle heraus und lag ueber den
+     * Ehrlichkeits-Saetzen darunter, zehn Ueberlagerungen im Lesbarkeits-Gate
+     * und im Bild sofort zu sehen.
+     *
+     * Der Kasten sagt mit `overflow-y: auto` schon, was in diesem Fall passieren
+     * soll: ER scrollt. Diese Zeile laesst ihn das auch tun, statt seinen
+     * Inhalt uebereinanderzuschieben. Eine gedrueckte Zeile ist kein Layout,
+     * sondern zwei Saetze am selben Ort.
+     */
+    flex-shrink: 0;
+}
+
+.atlas-flow {
+    min-width: 0;
+}
+
+/*
+ * Der Kasten selbst. Fast-schwarz und ausdruecklich NICHT der helle Stil des
+ * Referenz-Overlays: der Beweislauf misst die Luminanz dieser Flaeche.
+ */
+.atlas-flow-box {
+    background: var(--atlas-panel-raised);
+    border: 1px solid var(--atlas-line);
+    padding: 8px 10px;
+    overflow-x: auto;
+}
+
+.atlas-flow-legend {
+    color: var(--atlas-dim);
+    font-size: 10px;
+    letter-spacing: 0.14em;
+    margin: 2px 0 4px;
+}
+
+/* --- Das Sequenzdiagramm ------------------------------------------------- */
+
+/*
+ * Ein SVG und keine Bibliothek: diese Oberflaeche ist air-gapped. Jede Zahl
+ * darin kommt aus src/pseudocode/flow-diagram.ts, jede Farbe aus tokens.css.
+ * Der helle Stil der Vorlage kommt ausdruecklich nicht mit; der Beweislauf
+ * misst die Luminanz des Grundes, auf dem das hier steht.
+ */
+/*
+ * Die Hoehe kommt aus dem Seitenverhaeltnis und nicht aus dem Attribut.
+ *
+ * Mit fester Hoehe und `meet` skaliert das Bild auf die Breite und laesst
+ * darunter genau so viel Leerraum stehen, wie die Skalierung eingespart hat.
+ * `height: auto` ueber der Attributangabe heisst: die Flaeche ist so hoch, wie
+ * das Bild nach der Skalierung wirklich ist.
+ */
+.atlas-flow-svg {
+    display: block;
+    width: 100%;
+    height: auto;
+    font-family: var(--atlas-font);
+}
+
+.atlas-flow-lifeline-line {
+    stroke: var(--atlas-line);
+    stroke-width: 1;
+}
+
+.atlas-flow-lifeline-box {
+    fill: var(--atlas-panel);
+    stroke: var(--atlas-phosphor-mute);
+    stroke-width: 1;
+}
+
+.atlas-flow-lifeline-label {
+    fill: var(--atlas-cyan);
+    font-size: 11px;
+}
+
+.atlas-flow-arrow-line {
+    stroke: var(--atlas-dim);
+    stroke-width: 1;
+    fill: none;
+}
+
+.atlas-flow-arrow-head {
+    fill: var(--atlas-dim);
+}
+
+.atlas-flow-arrow-label {
+    fill: var(--atlas-fg);
+    font-size: 11px;
+}
+
+/* Eine Kante, die eine Kette schliesst, wird gestrichelt und nicht versteckt. */
+.atlas-flow-arrow[data-cycle='true'] .atlas-flow-arrow-line {
+    stroke-dasharray: 4 3;
+}
+
+.atlas-flow-arrow[data-current='true'] .atlas-flow-arrow-line {
+    stroke: var(--atlas-phosphor);
+    stroke-width: 2;
+}
+
+.atlas-flow-arrow[data-current='true'] .atlas-flow-arrow-head {
+    fill: var(--atlas-phosphor);
+}
+
+.atlas-flow-arrow[data-current='true'] .atlas-flow-arrow-label {
+    fill: var(--atlas-phosphor);
+}
+
+/* "may raise" ist die eine Aussage, deren Farbe vor dem Satz ankommen darf. */
+.atlas-flow-raise-line {
+    stroke: var(--atlas-alarm);
+    stroke-width: 1;
+    fill: none;
+}
+
+.atlas-flow-raise-head {
+    fill: var(--atlas-alarm);
+}
+
+.atlas-flow-raise-label {
+    fill: var(--atlas-alarm);
+    font-size: 11px;
+}
+
+.atlas-flow-raise[data-current='true'] .atlas-flow-raise-line {
+    stroke-width: 2;
+}
+
+.atlas-flow-raise[data-current='true'] .atlas-flow-raise-label {
+    text-decoration: underline;
+}
+
+/* --- Die Schritt-Liste --------------------------------------------------- */
+
+.atlas-flow-steps {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.atlas-flow-steps-title {
+    margin: 0 0 4px;
+    font-size: 11px;
+    font-weight: 500;
+    letter-spacing: 0.2em;
+    color: var(--atlas-dim);
+}
+
+.atlas-flow-step-list {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    max-height: 52vh;
+    overflow-y: auto;
+}
+
+.atlas-flow-step-group {
+    margin-top: 8px;
+    color: var(--atlas-cyan);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+}
+
+/*
+ * Ein Symbol, fuer das der Index nichts hat, sagt es hier: gedimmt und kursiv,
+ * weil es kein Schritt ist, den man anlaufen koennte, und trotzdem eine Aussage.
+ */
+.atlas-flow-step-absence {
+    padding: 1px 0 1px 14px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    font-style: italic;
+    line-height: 1.5;
+}
+
+.atlas-flow-step {
+    padding-left: 14px;
+}
+
+.atlas-flow-step[data-active='true'] {
+    background: var(--atlas-select);
+    box-shadow: inset 2px 0 0 0 var(--atlas-phosphor);
+}
+
+button.atlas-flow-step-line {
+    appearance: none;
+    border: none;
+    padding: 1px 0;
+    background: transparent;
+    color: var(--atlas-fg);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.atlas-flow-step[data-alarm='true'] button.atlas-flow-step-line {
+    color: var(--atlas-alarm);
+}
+
+.atlas-flow-step[data-active='true'] button.atlas-flow-step-line {
+    color: var(--atlas-phosphor);
+}
+
+button.atlas-flow-step-line:hover,
+button.atlas-flow-step-line:focus-visible {
+    text-decoration: underline;
+}
+
+/* --- Der Stepper und die Ehrlichkeit ------------------------------------- */
+
+.atlas-flow-stepper {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 6px 0 2px;
+    border-top: 1px solid var(--atlas-line);
+}
+
+.atlas-flow-step-btn {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-phosphor);
+    font: inherit;
+    font-size: 11px;
+    padding: 1px 8px;
+    cursor: pointer;
+}
+
+.atlas-flow-step-btn:hover:not(:disabled) {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-select);
+}
+
+.atlas-flow-step-btn:disabled {
+    color: var(--atlas-dim);
+    cursor: default;
+}
+
+.atlas-flow-position {
+    color: var(--atlas-fg);
+    font-size: 11px;
+    min-width: 84px;
+    text-align: center;
+}
+
+.atlas-flow-current {
+    margin: 0;
+    color: var(--atlas-fg);
+    font-size: 12px;
+}
+
+.atlas-flow-current[data-alarm='true'] {
+    color: var(--atlas-alarm);
+}
+
+button.atlas-flow-current-line {
+    appearance: none;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+button.atlas-flow-current-line:hover,
+button.atlas-flow-current-line:focus-visible {
+    text-decoration: underline;
+}
+
+.atlas-flow-honesty {
+    max-width: 108ch;
+}
+
+.atlas-flow-note {
+    margin: 2px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+/* --- Der Umschalter zwischen den beiden Ansichten ------------------------ */
+
+.atlas-twin-tabs {
+    display: flex;
+    gap: 5px;
+}
+
+.atlas-twin-tab {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 6px;
+    cursor: pointer;
+}
+
+.atlas-twin-tab[data-on='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+    background: var(--atlas-select);
+}
+
+/* --- Die Pseudocode-Ansicht --------------------------------------------- */
+
+.atlas-pseudocode-title {
+    margin: 0 0 8px;
+    color: var(--atlas-fg);
+    font-size: 13px;
+    font-weight: normal;
+}
+
+.atlas-pseudocode-imports {
+    margin: 0 0 12px;
+    padding: 0 0 8px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-pseudocode-group {
+    margin: 0 0 4px;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+    font-weight: normal;
+    letter-spacing: 0.08em;
+}
+
+.atlas-pseudocode-import-list,
+.atlas-pseudocode-lines {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-pseudocode-import,
+.atlas-pseudocode-line {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 1px 0;
+    color: var(--atlas-fg);
+    font-size: 12px;
+}
+
+.atlas-pseudocode-line[data-alarm='true'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-pseudocode-import[data-usage='unused'],
+.atlas-pseudocode-import[data-usage='unknown'] {
+    color: var(--atlas-dim);
+}
+
+.atlas-pseudocode-import-mark {
+    color: var(--atlas-phosphor-mute);
+    font-size: 10px;
+}
+
+.atlas-pseudocode-import[data-usage='unused'] .atlas-pseudocode-import-mark,
+.atlas-pseudocode-import[data-usage='unknown'] .atlas-pseudocode-import-mark {
+    color: var(--atlas-dim);
+}
+
+button.atlas-pseudocode-line-btn {
+    appearance: none;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+button.atlas-pseudocode-line-btn:hover,
+button.atlas-pseudocode-line-btn:focus-visible {
+    color: var(--atlas-phosphor);
+    text-decoration: underline;
+}
+
+.atlas-pseudocode-line[data-alarm='true'] button.atlas-pseudocode-line-btn:hover {
+    color: var(--atlas-alarm);
+}
+
+.atlas-pseudocode-tally {
+    margin: 4px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-pseudocode-note {
+    margin: 2px 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-pseudocode-honest {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 12px;
+    padding-top: 8px;
+    border-top: 1px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-pseudocode-honest p {
+    margin: 2px 0;
+}
+
+/*
+ * --- W8c: der Fund zuerst, das Ziel an jeder Zeile ----------------------
+ *
+ * Die Typografie traegt hier eine Reihenfolge und keine Verzierung. Der Satz
+ * ueber dem Block ist so hell wie der Text der Zeilen, weil er die Aussage des
+ * Blocks ist; der Ort neben einem Schritt und das, was hinter ihm liegt, sind
+ * gedimmt, weil sie zu der Zeile gehoeren, neben der sie stehen. Was sie NICHT
+ * sind, ist kleiner als lesbar: 11px ist dieselbe Groesse, die die Bilanz und
+ * die Marker der Importgruppe schon tragen.
+ */
+
+.atlas-pseudocode-lead {
+    margin: 0 0 10px;
+    padding: 6px 8px;
+    border-left: 2px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+/* Ein Eintrag, der der Fund ist, und nicht eine Zeile unter anderen. */
+.atlas-pseudocode-import[data-finding='true'] {
+    border-left: 2px solid var(--atlas-phosphor-mute);
+    padding-left: 6px;
+    margin-left: -8px;
+}
+
+.atlas-pseudocode-import[data-finding='true'] .atlas-pseudocode-import-mark {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-pseudocode-steps-head {
+    margin: 12px 0 4px;
+    color: var(--atlas-phosphor-mute);
+    font-size: 11px;
+    font-weight: normal;
+    letter-spacing: 0.08em;
+}
+
+/*
+ * Wohin ein Schritt fuehrt.
+ *
+ * Als Knopf sieht er aus wie der Text der Zeile, wenn man ihn beruehrt: es ist
+ * dieselbe Handlung (eine Stelle oeffnen) an einer anderen Stelle. Ohne Ziel
+ * ist er kein Knopf und sieht auch nicht so aus.
+ */
+.atlas-pseudocode-target {
+    appearance: none;
+    border: none;
+    padding: 0;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    text-align: left;
+}
+
+button.atlas-pseudocode-target {
+    cursor: pointer;
+}
+
+button.atlas-pseudocode-target:hover,
+button.atlas-pseudocode-target:focus-visible {
+    color: var(--atlas-phosphor);
+    text-decoration: underline;
+}
+
+.atlas-pseudocode-target[data-known='false'] {
+    font-style: italic;
+}
+
+/* Was hinter dem Aufruf liegt: eine Marke je aufgezeichneter Beziehung. */
+.atlas-pseudocode-behind {
+    padding: 0 4px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    color: var(--atlas-dim);
+    font-size: 10px;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+
+.atlas-pseudocode-behind[data-kind='raises'] {
+    border-color: var(--atlas-alarm);
+    color: var(--atlas-alarm);
+}
+
+/*
+ * Das Fragezeichen unter dem Block, wortgleich mit dem am Diagramm (W8b).
+ *
+ * Hinter ihm stehen die Saetze, die bis W8c als Absaetze unter dem Block
+ * standen: die Deckung, die ungenannten Symbole und die Herkunftsnotiz. Sie
+ * sind nicht gekuerzt, sie sind nur nicht mehr die letzte Textwand einer
+ * Flaeche, die davor drei Zeilen Inhalt hatte.
+ */
+.atlas-pseudocode-provenance {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-phosphor-mute);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    /*
+     * `pointer` und nicht mehr `help`: seit W10-1 haelt ein Klick den Satz fest
+     * (src/ui/tooltip/Hint.tsx). Ein Zeiger, der Hilfe ankuendigt, wo eine
+     * Handlung wartet, sagt die Haelfte.
+     */
+    cursor: pointer;
+}
+
+.atlas-pseudocode-provenance:hover,
+.atlas-pseudocode-provenance:focus-visible,
+.atlas-pseudocode-provenance[aria-expanded="true"] {
+    color: var(--atlas-phosphor);
+    border-color: var(--atlas-phosphor-mute);
+}
+
+/* Festgehalten sieht anders aus als beruehrt, sonst wuesste niemand, dass der
+ * Klick etwas getan hat. */
+.atlas-pseudocode-provenance[aria-expanded="true"] {
+    background: var(--atlas-panel-raised);
+}
+
+/*
+ * Eine Schrittzeile darf umbrechen.
+ *
+ * Sie traegt seit W8c bis zu drei Dinge (Text, Ort, was dahinter liegt), und in
+ * einer 440 Pixel breiten Spalte passen die nicht immer nebeneinander. Ohne
+ * Umbruch waere der Ort das Erste, was aus dem Kasten laeuft, und genau das ist
+ * die Sorte Schnitt, die die Lesbarkeitsmessung dieses Projekts zaehlt.
+ */
+.atlas-pseudocode-line {
+    flex-wrap: wrap;
+}
+
+/* ------------------------------------------------------- Lokales Modell -- */
+
+/*
+ * Die Karte oben in der rechten Spalte. Sie waechst nicht mit: `flex: 0 0 auto`
+ * ist der ganze Unterschied zwischen "eine Zeile ueber dem Twin" und "ein
+ * drittes Panel, das dem Twin die Haelfte nimmt". Was sie zeigt, ist im Zustand
+ * aus zwei Zeilen lang, und dafuer soll das Layout nichts reservieren.
+ */
+.atlas-llm {
+    flex: 0 0 auto;
+    /*
+     * Gedeckelt, weil diese Karte sich die rechte Spalte mit dem Twin und dem
+     * Graph-Panel teilt und was sie an Hoehe nimmt, dort fehlt. Zwei
+     * Modellnamen, die umbrechen, duerfen die Fakten daneben nicht auf eine
+     * halbe Zeile druecken.
+     */
+    max-height: 200px;
+    overflow-y: auto;
+    padding: 8px 14px 10px;
+    border-bottom: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-llm-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+}
+
+.atlas-llm-title {
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--atlas-dim);
+}
+
+.atlas-llm-state {
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+.atlas-llm-state[data-state='ready'] {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-llm-state[data-state='disabled-by-policy'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-llm-toggle {
+    margin-left: auto;
+    padding: 1px 10px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-llm-toggle[data-on='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-llm-toggle:disabled {
+    cursor: not-allowed;
+    color: var(--atlas-alarm);
+    border-color: var(--atlas-line);
+}
+
+.atlas-llm-toggle:hover:not(:disabled) {
+    border-color: var(--atlas-phosphor);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-llm-message {
+    margin: 6px 0 0;
+    color: var(--atlas-fg);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-llm-message[data-state='disabled-by-policy'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-llm-message b {
+    color: var(--atlas-cyan);
+}
+
+.atlas-llm-command {
+    margin: 6px 0 0;
+}
+
+.atlas-llm-command code {
+    display: inline-block;
+    padding: 2px 8px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    border-radius: 2px;
+    background: var(--atlas-select);
+    color: var(--atlas-phosphor);
+    font: inherit;
+    font-size: 11px;
+}
+
+.atlas-llm-hint {
+    margin: 6px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-llm-rows {
+    margin: 8px 0 0;
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 2px 12px;
+    font-size: 11px;
+}
+
+.atlas-llm-row {
+    display: contents;
+}
+
+.atlas-llm-row-label {
+    color: var(--atlas-dim);
+}
+
+.atlas-llm-row-value {
+    margin: 0;
+    color: var(--atlas-fg);
+    overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------- Atlas-Chat -- */
+
+/*
+ * Das Antwort-Panel ist seit W8 der Reiter `chat` des Erklaeren-Bereichs. Es
+ * liegt damit weiter zwischen Editor und Kommandozeile, teilt sich seinen Platz
+ * aber mit den vier anderen Flaechen, die dieselbe Frage anders beantworten.
+ *
+ * Was W7c hier gebaut hatte und wo es jetzt steht:
+ *
+ * 1. **Das Panel ist eine Spalte aus zwei Teilen**: Kopf und Verlauf. Nur der
+ *    Verlauf scrollt. Der Kopf mit der Kontext-Auswahl bleibt darum beim
+ *    Scrollen stehen, ohne dass er dafuer `position: sticky` braucht: er liegt
+ *    gar nicht erst im scrollenden Kasten. Unveraendert, und weiterhin
+ *    dieselbe Zusicherung mit einem Mechanismus weniger, der schiefgehen kann.
+ * 2. **`overflow: hidden` am Panel**, damit eine zu klein gezogene Flaeche
+ *    ihren Inhalt nicht in die Kommandozeile schiebt. Unveraendert.
+ * 3. **Der Griff an der oberen Kante** ist der Griff der Zone geworden
+ *    (`.atlas-splitter`, data-testid atlas-split-explain). Er tut dasselbe,
+ *    kann dasselbe (Maus, Tastatur, Doppelklick, Gedaechtnis ueber den Reload)
+ *    und tut es fuer alle fuenf Reiter statt nur fuer diesen einen.
+ * 4. **Eingeklappt bleibt eine Zeile stehen**, die sagt, was noch da ist. Das
+ *    macht jetzt der eingeklappte Streifen der Zone, und er macht es fuer jeden
+ *    Reiter (`.atlas-explain-note`).
+ */
+.atlas-chat {
+    position: relative;
+    flex: 1 1 auto;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow: hidden;
+    border-top: 1px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel);
+}
+
+.atlas-chat-head {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    padding: 7px 16px 5px;
+    background: var(--atlas-panel);
+}
+
+.atlas-chat-scroll {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 0 16px 10px;
+}
+
+.atlas-chat-title {
+    font-size: 11px;
+    letter-spacing: 0.2em;
+    color: var(--atlas-dim);
+}
+
+.atlas-chat-depth {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    margin-left: auto;
+}
+
+.atlas-chat-depth-label {
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+.atlas-chat-depth-option,
+.atlas-chat-clear {
+    padding: 1px 8px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-chat-depth-option[data-on='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+    background: var(--atlas-select);
+}
+
+.atlas-chat-depth-option:hover,
+.atlas-chat-clear:hover {
+    border-color: var(--atlas-phosphor);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-chat-depth-note {
+    margin: 4px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-chat-turns {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 8px;
+}
+
+.atlas-chat-turn {
+    border-left: 2px solid var(--atlas-line);
+    padding-left: 10px;
+}
+
+.atlas-chat-turn[data-status='answered'] {
+    border-left-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-chat-turn[data-status='refused'],
+.atlas-chat-turn[data-status='failed'] {
+    border-left-color: var(--atlas-alarm);
+}
+
+.atlas-chat-question {
+    margin: 0;
+    color: var(--atlas-fg);
+    font-size: 12px;
+}
+
+.atlas-chat-prompt {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-chat-answer {
+    margin: 6px 0 0;
+}
+
+.atlas-chat-line {
+    margin: 0 0 2px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.atlas-chat-citation {
+    padding: 0 3px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-phosphor);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-chat-citation:hover {
+    background: var(--atlas-select);
+    border-color: var(--atlas-phosphor);
+}
+
+.atlas-chat-citation-unknown {
+    padding: 0 3px;
+    color: var(--atlas-alarm);
+    text-decoration: line-through;
+}
+
+.atlas-chat-message {
+    margin: 6px 0 0;
+    color: var(--atlas-fg);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-chat-message[data-status='refused'],
+.atlas-chat-message[data-status='failed'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-chat-warning {
+    margin: 4px 0 0;
+    color: var(--atlas-alarm);
+    font-size: 11px;
+}
+
+/* The optional model wording occupies the same reading place as the built text. */
+.atlas-chat-ai {
+    margin: 6px 0 0;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 7px;
+}
+
+.atlas-chat-ai > p {
+    margin: 0;
+    font-size: 11px;
+    color: var(--atlas-dim);
+}
+
+.atlas-chat-ai > [data-testid='atlas-chat-ai-provenance'] {
+    flex-basis: 100%;
+    color: var(--atlas-phosphor-mute);
+}
+
+.atlas-flow-ai-version {
+    margin: 10px 0;
+    padding: 8px 10px;
+    border-left: 2px solid var(--atlas-phosphor-mute);
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.6;
+}
+
+.atlas-flow-ai-version p {
+    margin: 0 0 3px;
+}
+
+.atlas-chat-cards {
+    margin-top: 6px;
+}
+
+.atlas-chat-cards-toggle {
+    padding: 0;
+    border: none;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-chat-cards-toggle:hover {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-chat-card-list {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.atlas-chat-card {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--atlas-fg);
+}
+
+.atlas-chat-card-id {
+    flex: 0 0 auto;
+    color: var(--atlas-phosphor);
+}
+
+.atlas-chat-card-lines {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.atlas-chat-card-line {
+    overflow-wrap: anywhere;
+}
+
+.atlas-chat-card-open {
+    margin-left: auto;
+    padding: 0 4px;
+    border: none;
+    background: transparent;
+    color: var(--atlas-cyan);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+.atlas-chat-provenance {
+    margin: 6px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-chat-gaps {
+    list-style: none;
+    margin: 4px 0 0;
+    padding: 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+/*
+ * Die Zeile, die sagt, dass die Antwort von einem anderen Symbol handelt.
+ *
+ * Sie steht ueber der Antwort und nicht unter ihr, und sie ist gefaerbt wie eine
+ * Warnung und nicht wie eine Fussnote: eine Ersetzung, die man erst nach dem
+ * Lesen bemerkt, hat man beim Lesen geglaubt.
+ */
+.atlas-chat-fallback {
+    margin: 4px 0 0;
+    padding-left: 8px;
+    border-left: 2px solid var(--atlas-alarm);
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.atlas-chat-choice {
+    margin: 6px 0 0;
+}
+
+.atlas-chat-choice-head {
+    margin: 0;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+.atlas-chat-candidates {
+    list-style: none;
+    margin: 6px 0 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.atlas-chat-candidate-row {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.atlas-chat-candidate {
+    padding: 1px 8px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-cyan);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.atlas-chat-candidate:hover {
+    border-color: var(--atlas-phosphor);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-chat-candidate-mark {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+/* ------------------------------------- Umformulierung des Pseudocode-Blocks */
+
+.atlas-pseudocode-refine {
+    display: flex;
+    gap: 8px;
+    margin: 4px 0 0;
+}
+
+.atlas-pseudocode-refine-btn {
+    padding: 1px 10px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-pseudocode-refine-btn:hover:not(:disabled) {
+    border-color: var(--atlas-phosphor);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-pseudocode-refine-btn:disabled {
+    cursor: progress;
+    color: var(--atlas-dim);
+}
+
+.atlas-pseudocode-refine-note {
+    margin: 4px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+.atlas-pseudocode-refine-note[data-state='refused'] {
+    color: var(--atlas-alarm);
+}
+
+.atlas-pseudocode-refine-note[data-state='applied'] {
+    color: var(--atlas-phosphor-mute);
+}
+
+/*
+ * ------------------------------------------------------------------ Hilfe ---
+ *
+ * Die Hilfeseite liegt ueber der Editorflaeche, nach demselben Muster wie der
+ * Flow-Erklaerer und aus denselben Gruenden: eine eigene Ebene ueber allem, was
+ * in dieser Flaeche steht, ein eigener Grund davor, und der Kasten scrollt
+ * selbst, statt seinen Inhalt an den Rand zu druecken.
+ *
+ * `z-index: 14` liegt ueber dem Erklaerer (12) und damit ueber allem in dieser
+ * Flaeche. Die Hilfe ist die eine Seite, die jemand aufschlaegt, WEIL er nicht
+ * weiterweiss; sie hinter das zu legen, was ihn ratlos gemacht hat, waere die
+ * falsche Reihenfolge.
+ *
+ * Die Breite ist gedeckelt und der Kasten zentriert: eine Textspalte ueber 1680
+ * Pixel ist eine Zeile, deren Anfang man beim Lesen verliert. Der Deckel ist
+ * eine Zahl in `ch`, also in Zeichen der Monospace-Schrift, weil genau das die
+ * Groesse ist, um die es geht.
+ */
+.atlas-help {
+    position: absolute;
+    inset: 0;
+    z-index: 14;
+    padding: 14px 20px 20px;
+    background: var(--atlas-bg);
+    overflow-y: auto;
+}
+
+.atlas-help:focus {
+    outline: none;
+}
+
+.atlas-help > * {
+    max-width: 108ch;
+}
+
+.atlas-help-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-help-title {
+    color: var(--atlas-phosphor);
+    font-size: 14px;
+    letter-spacing: 0.08em;
+}
+
+.atlas-help-subtitle {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-help-close {
+    margin-left: auto;
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 8px;
+    cursor: pointer;
+}
+
+.atlas-help-close:hover,
+.atlas-help-close:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-help-section {
+    margin-top: 18px;
+}
+
+.atlas-help-section-title {
+    margin: 0 0 6px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    font-weight: normal;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.atlas-help-text {
+    margin: 0 0 6px;
+    color: var(--atlas-dim);
+    line-height: var(--atlas-line-height);
+}
+
+.atlas-help-list {
+    margin: 0 0 8px;
+    padding-left: 18px;
+}
+
+.atlas-help-item {
+    color: var(--atlas-dim);
+    line-height: var(--atlas-line-height);
+    margin-bottom: 3px;
+}
+
+/* Die Grenzen tragen die Farbe, die in diesem Produkt "hier hoert es auf" heisst. */
+.atlas-help-item[data-alarm='true']::marker {
+    color: var(--atlas-alarm);
+}
+
+.atlas-help-item[data-alarm='true'] {
+    color: var(--atlas-fg);
+}
+
+/*
+ * Begriff und Erklaerung als zwei Spalten, ohne dass ein Trennzeichen im Text
+ * stehen muss: ein Doppelpunkt waere ein sichtbarer String, der in den Katalog
+ * gehoerte, und ein Layout ist kein Satz.
+ */
+.atlas-help-defs {
+    margin: 0;
+}
+
+.atlas-help-def {
+    display: grid;
+    grid-template-columns: minmax(0, 22ch) minmax(0, 1fr);
+    gap: 4px 14px;
+    align-items: baseline;
+    margin-bottom: 4px;
+}
+
+.atlas-help-term {
+    color: var(--atlas-cyan);
+    overflow-wrap: anywhere;
+}
+
+.atlas-help-path {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-help-desc {
+    margin: 0;
+    color: var(--atlas-dim);
+    line-height: var(--atlas-line-height);
+}
+
+.atlas-help-keys {
+    border-collapse: collapse;
+    width: 100%;
+    margin-bottom: 6px;
+}
+
+.atlas-help-keys th {
+    text-align: left;
+    font-weight: normal;
+    color: var(--atlas-dim);
+    border-bottom: 1px solid var(--atlas-line);
+    padding: 2px 10px 3px 0;
+    font-size: 11px;
+    letter-spacing: 0.04em;
+}
+
+.atlas-help-keys td {
+    padding: 2px 10px 2px 0;
+    color: var(--atlas-dim);
+    vertical-align: baseline;
+    line-height: var(--atlas-line-height);
+}
+
+.atlas-help-keys tr:not(:last-child) td {
+    border-bottom: 1px solid var(--atlas-panel-raised);
+}
+
+.atlas-help-key {
+    color: var(--atlas-phosphor);
+    white-space: nowrap;
+    width: 8ch;
+}
+
+.atlas-help-scope {
+    white-space: nowrap;
+    color: var(--atlas-fg);
+}
+
+.atlas-help-note {
+    margin: 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: 1.5;
+}
+
+/*
+ * Der Tastentest, abgesetzt vom Rest des Abschnitts.
+ *
+ * Er beantwortet dieselbe Frage wie die Tabelle darueber und tut es anders,
+ * naemlich am Geraet des Lesers. Ein Rahmen und ein eigener Grund sagen das,
+ * ohne dass ein Satz es behaupten muss; die Zeilen darin benutzen dieselben
+ * Klassen wie die Begriffslisten der Seite, damit hier kein zweites Layout
+ * entsteht, das der Lesbarkeitsmessung unbekannt waere.
+ */
+.atlas-help-keyprobe {
+    margin-top: 12px;
+    padding: 10px 12px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: var(--atlas-panel-raised);
+}
+
+.atlas-help-keyprobe-title {
+    margin: 0 0 6px;
+    color: var(--atlas-fg);
+    font-size: 11px;
+    font-weight: normal;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+/* Was gerade angekommen ist, in Phosphor: das ist die Antwort, nicht der Rahmen. */
+.atlas-help-keyprobe[data-pressed='true'] .atlas-help-desc {
+    color: var(--atlas-phosphor);
+}
+
+/* -------------------------------------------- Die Kante eines Bildlaufs --- */
+
+/*
+ * Jeder Kasten, der mehr traegt als er zeigt, sagt es an seiner Kante.
+ *
+ * Der Befund kam von den Beweisbildern der Legende (Bernhard, 2026-08-29), aber
+ * er gehoert nicht der Legende allein: die Bildlaufleiste dieser Plattform
+ * liegt ueberlagernd und ist im Ruhezustand unsichtbar. Ein Panel, dessen
+ * Inhalt unten weitergeht, sieht darum aus wie eines, dessen letzte Zeile
+ * mitten im Wort endet. Das Lesbarkeits-Gate misst diesen Fall seit W9-1
+ * (tools/lib/readability.mjs, Regel c) und hat ihn in vier weiteren Flaechen
+ * gefunden: im Twin, im Fluss-Overlay und im BUG-Assistenten.
+ *
+ * Die Antwort ist eine Regel und keine vier: ein Schimmer an der Kante, hinter
+ * der es weitergeht. Er kommt ohne eine Zeile TypeScript aus und ist trotzdem
+ * bedingt, und dieser Kunstgriff ist der Grund fuer die vier Ebenen:
+ *
+ *  - Die beiden UNTEREN Ebenen sind der Schimmer selbst, am Kasten befestigt
+ *    (`scroll`): sie liegen immer an seiner Ober- und Unterkante.
+ *  - Die beiden OBEREN Ebenen sind Deckel in der Farbe des Grundes, am INHALT
+ *    befestigt (`local`): sie wandern mit ihm. Steht der Inhalt oben an, liegt
+ *    der obere Deckel genau ueber dem oberen Schimmer und loescht ihn; ist
+ *    unten nichts mehr, deckt der untere Deckel den unteren.
+ *
+ * Uebrig bleibt genau die Aussage, um die es geht: ein Schimmer steht dort, wo
+ * wirklich noch etwas ist. Alle vier Ebenen sind Hintergrund, liegen also
+ * hinter dem Text und verdecken kein Zeichen.
+ *
+ * Die Legende der Galaxie ist nicht dabei: sie traegt seit W9-1 ihren eigenen
+ * Verlauf und dazu eine Marke, die die Richtung nennt (GalaxyPanel,
+ * Entscheidung 12). Zwei Kanten uebereinander waeren eine zu viel.
+ */
+.atlas-tree-list,
+.atlas-twin-body,
+.atlas-llm,
+.atlas-entry-list,
+.atlas-chat-scroll,
+.atlas-search-list,
+.atlas-why,
+.atlas-entry,
+.atlas-help,
+.atlas-settings,
+.atlas-bugwizard,
+.atlas-impact,
+.atlas-flow-overlay,
+.atlas-flow-overlay-split,
+.atlas-flow-step-list,
+/*
+ * Zwei neue Kaesten aus W8, und sie stehen genau aus dem Grund hier, den der
+ * Kopf dieses Abschnitts nennt: ein Umbau, der Flaechen kleiner macht, ist der
+ * Anlass, an dem Saetze anfangen, an Kanten zu enden. Die Schrittkarte war bis
+ * W8 so hoch wie ihr Text und scrollte nie; als Reiter erbt sie die Hoehe der
+ * Zone, und eine kurz gezogene Zone schneidet ihren letzten Satz an. Der Grund
+ * eines leeren Reiters ist derselbe Fall.
+ */
+.atlas-tour,
+.atlas-explain-empty {
+    --atlas-scroll-ground: var(--atlas-panel);
+
+    background-image:
+        linear-gradient(to bottom, var(--atlas-scroll-ground) 40%, transparent),
+        linear-gradient(to top, var(--atlas-scroll-ground) 40%, transparent),
+        linear-gradient(to bottom, rgba(51, 255, 153, 0.22), transparent),
+        linear-gradient(to top, rgba(51, 255, 153, 0.22), transparent);
+    background-position: center top, center bottom, center top, center bottom;
+    background-size: 100% 14px, 100% 14px, 100% 6px, 100% 6px;
+    background-repeat: no-repeat;
+    background-attachment: local, local, scroll, scroll;
+}
+
+/* Wo der Grund ein anderer ist, ist es auch der Deckel. */
+.atlas-why,
+.atlas-entry,
+.atlas-help,
+.atlas-settings,
+.atlas-bugwizard,
+.atlas-impact,
+.atlas-flow-overlay,
+.atlas-flow-overlay-split,
+.atlas-flow-step-list {
+    --atlas-scroll-ground: var(--atlas-bg);
+}
+
+.atlas-search-list {
+    --atlas-scroll-ground: var(--atlas-panel-raised);
+}
+
+/* ------------------------------------------- Einstellungen (W10) --------- */
+
+/*
+ * Dieselbe Bauform wie die Hilfe, und das ist der Punkt: es ist dieselbe Sorte
+ * Flaeche. Eine Ebene ueber dem Editor, der Kasten scrollt selbst, die Breite
+ * ist in Zeichen gedeckelt, weil eine Textspalte ueber 1680 Pixel eine Zeile
+ * ist, deren Anfang man beim Lesen verliert.
+ *
+ * `z-index: 14` ist der der Hilfe. Beide koennen nicht gleichzeitig offen sein
+ * (jede ist ein eigener Zustand, und ein Menuepunkt schaltet sie), also
+ * entscheidet bei Gleichstand die Reihenfolge im DOM, und dort steht dieses
+ * Panel hinter der Hilfe.
+ */
+.atlas-settings {
+    position: absolute;
+    inset: 0;
+    z-index: 14;
+    padding: 14px 20px 20px;
+    background-color: var(--atlas-bg);
+    overflow-y: auto;
+}
+
+.atlas-settings:focus {
+    outline: none;
+}
+
+.atlas-settings > * {
+    max-width: 108ch;
+}
+
+.atlas-settings-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-settings-title {
+    color: var(--atlas-phosphor);
+    font-size: 14px;
+    letter-spacing: 0.08em;
+}
+
+.atlas-settings-subtitle {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-close {
+    margin-left: auto;
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 8px;
+    cursor: pointer;
+}
+
+.atlas-settings-close:hover,
+.atlas-settings-close:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-settings-section {
+    margin-top: 18px;
+}
+
+.atlas-settings-section-title {
+    margin: 0 0 6px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    font-weight: normal;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.atlas-settings-subtitle-inline {
+    margin: 14px 0 4px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    font-weight: normal;
+}
+
+.atlas-settings-text {
+    margin: 0 0 6px;
+    color: var(--atlas-dim);
+    line-height: var(--atlas-line-height);
+}
+
+/*
+ * Der Ehrlichkeitssatz traegt einen Rand in der Akzentfarbe.
+ *
+ * Nicht als Schmuck: er ist der eine Satz dieser Seite, der von einem
+ * Netzzugriff handelt, in einer Oberflaeche, die sonst keinen macht. Wer die
+ * Seite ueberfliegt, soll genau an ihm haengenbleiben.
+ */
+.atlas-settings-honesty {
+    margin: 0 0 8px;
+    padding: 8px 10px;
+    border-left: 2px solid var(--atlas-phosphor-mute);
+    background: var(--atlas-panel);
+    color: var(--atlas-fg);
+    line-height: var(--atlas-line-height);
+}
+
+.atlas-settings-note {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    border-left: 2px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-settings-note .atlas-settings-text:last-child {
+    margin-bottom: 0;
+}
+
+.atlas-settings-note-line {
+    margin: 4px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-command {
+    margin: 6px 0 0;
+}
+
+.atlas-settings-command code,
+.atlas-settings-command-text {
+    display: inline-block;
+    padding: 2px 8px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-phosphor);
+    user-select: all;
+}
+
+/* Die vier Zahlen des laufenden Modells. */
+.atlas-settings-facts {
+    margin: 4px 0 0;
+    display: grid;
+    grid-template-columns: 14ch minmax(0, 1fr);
+    gap: 2px 12px;
+}
+
+.atlas-settings-fact {
+    display: contents;
+}
+
+.atlas-settings-fact-label {
+    color: var(--atlas-dim);
+}
+
+.atlas-settings-fact-value {
+    margin: 0;
+    color: var(--atlas-fg);
+    overflow-wrap: anywhere;
+}
+
+/* Die Liste der Modelle im Cache. */
+.atlas-settings-count {
+    margin: 0 0 4px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-models {
+    margin: 0 0 8px;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.atlas-settings-model-pick {
+    display: flex;
+    width: 100%;
+    align-items: baseline;
+    gap: 12px;
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-fg);
+    font: inherit;
+    text-align: left;
+    padding: 4px 8px;
+}
+
+button.atlas-settings-model-pick {
+    cursor: pointer;
+}
+
+button.atlas-settings-model-pick:hover,
+button.atlas-settings-model-pick:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-settings-model[data-active='true'] .atlas-settings-model-pick {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-select);
+}
+
+.atlas-settings-model-id {
+    color: var(--atlas-cyan);
+    overflow-wrap: anywhere;
+}
+
+.atlas-settings-model-state {
+    margin-left: auto;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.atlas-settings-refresh,
+.atlas-settings-copy,
+.atlas-settings-profile,
+.atlas-settings-option {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.atlas-settings-refresh:hover,
+.atlas-settings-refresh:focus-visible,
+.atlas-settings-copy:hover,
+.atlas-settings-copy:focus-visible,
+.atlas-settings-profile:hover,
+.atlas-settings-profile:focus-visible,
+.atlas-settings-option:hover,
+.atlas-settings-option:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-settings-option[data-active='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-select);
+    color: var(--atlas-phosphor);
+}
+
+/* Die sechs Vorschlaege. */
+.atlas-settings-suggestions {
+    margin: 0 0 8px;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.atlas-settings-suggestion {
+    padding: 8px 10px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-settings-suggestion-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.atlas-settings-suggestion-name {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-settings-suggestion-repo {
+    color: var(--atlas-dim);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
+.atlas-settings-numbers {
+    margin: 4px 0 6px;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 18px;
+}
+
+.atlas-settings-number {
+    display: flex;
+    flex-direction: column;
+}
+
+.atlas-settings-number dt {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-number dd {
+    margin: 0;
+    color: var(--atlas-fg);
+}
+
+/*
+ * Die nicht gemessenen Antworten stehen unter der Zitattreue und nicht daneben.
+ *
+ * Unter ihr, weil sie zu ihr gehoert: eine Quote ohne die Zahl der Faelle, die
+ * aus ihr herausfallen, ist eine Quote ueber eine Stichprobe, die niemand
+ * kennt. Nebeneinander sahen beide aus wie zwei gleichrangige Zahlen.
+ */
+.atlas-settings-unmeasured {
+    display: block;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-command-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.atlas-settings-free {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    align-items: flex-start;
+}
+
+.atlas-settings-free-input {
+    width: min(48ch, 100%);
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-fg);
+    font: inherit;
+    padding: 3px 8px;
+}
+
+.atlas-settings-free-input:focus {
+    outline: none;
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-settings-free-state {
+    margin: 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-free-state[data-valid='true'] {
+    color: var(--atlas-phosphor-mute);
+}
+
+/* Darstellung und Leistung. */
+.atlas-settings-live {
+    margin: 0 0 10px;
+    padding: 6px 10px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-fg);
+}
+
+.atlas-settings-live[data-running='false'] {
+    color: var(--atlas-dim);
+}
+
+.atlas-settings-live-scene,
+.atlas-settings-measure-scene {
+    display: block;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-settings-choice {
+    padding: 8px 10px;
+    margin-bottom: 6px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-settings-choice-head {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+    flex-wrap: wrap;
+}
+
+.atlas-settings-choice-label {
+    color: var(--atlas-fg);
+}
+
+.atlas-settings-choice-options {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+    flex-wrap: wrap;
+}
+
+.atlas-settings-choice-detail {
+    margin: 4px 0 0;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: var(--atlas-line-height);
+}
+
+/*
+ * Die Messzeile.
+ *
+ * Sie steht IM Kasten der Einstellung und nicht darunter, weil sie eine Angabe
+ * ueber genau diesen Schalter ist. Der Rand links faerbt sich nach dem Urteil:
+ * ein gemessener Unterschied traegt den Akzent, ein Unterschied innerhalb des
+ * Rauschens die gedaempfte Linie. Die Farbe ist die Wiederholung des Textes und
+ * nicht seine Ersetzung; was gemessen wurde, steht in Worten daneben.
+ */
+.atlas-settings-measure {
+    margin: 6px 0 0;
+    padding: 4px 8px;
+    border-left: 2px solid var(--atlas-line);
+    color: var(--atlas-dim);
+    font-size: 11px;
+    line-height: var(--atlas-line-height);
+}
+
+.atlas-settings-measure[data-verdict='higher'],
+.atlas-settings-measure[data-verdict='lower'] {
+    border-left-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-fg);
+}
+
+.atlas-settings-measure[data-verdict='measuring'] {
+    border-left-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-settings-profiles {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    flex-wrap: wrap;
+    padding: 8px 10px;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+}
+
+.atlas-settings-profiles .atlas-settings-measure {
+    flex-basis: 100%;
+}
+
+.atlas-settings-profile-state {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+/* ------------------------------------------------------- Tooltips -------- */
+
+/*
+ * Der eigene Tooltip dieser Oberflaeche.
+ *
+ * Er ersetzt seit W8b das `title`-Attribut, und der Unterschied ist nicht
+ * kosmetisch: ein nativer Tooltip liegt ausserhalb des Dokuments, unter dem
+ * Mauszeiger, ohne Rechteck. Er kann sich damit ueber alles legen, und keine
+ * Ueberlagerungsmessung dieses Projekts kann ihn sehen. Dieser hier liegt im
+ * Dokument, rechnet seine Lage (src/ui/tooltip/tooltip-model.ts) und traegt
+ * eine Testmarke.
+ *
+ * `position: fixed` und die Koordinaten kommen als Inline-Stil, weil sie
+ * gerechnet sind und keine Regel: eine Zahl, die jedes Mal eine andere ist,
+ * gehoert nicht in eine Datei, die einmal gelesen wird. Was hier steht, ist
+ * die Gestalt.
+ *
+ * `pointer-events: none` ist die eine Angabe, ohne die er sich selbst im Weg
+ * staende: ein Kasten, der unter dem Zeiger auftaucht und Ereignisse faengt,
+ * nimmt dem Ausloeser sein `mouseleave` und bleibt danach stehen.
+ */
+.atlas-hint {
+    z-index: 40;
+    display: block;
+    padding: 4px 8px;
+    background: var(--atlas-panel-raised);
+    border: 1px solid var(--atlas-phosphor-mute);
+    color: var(--atlas-fg);
+    font-family: var(--atlas-font);
+    font-size: 12px;
+    line-height: 1.45;
+    text-align: left;
+    white-space: normal;
+    pointer-events: none;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.55);
+}
+
+/*
+ * Das Angebot an der letzten Antwort (W8b, AC6b).
+ *
+ * Nutzerbefund vom 2026-08-29: "wenn ich 1 hop, 2 hop, 3 hop klicke, kein
+ * anderer Text, wieso?" Die Tiefe gilt absichtlich erst fuer die naechste
+ * Frage, weil eine Antwort, die sich unter der Hand aendert, ihre Zitate
+ * entwertet. Dieser Satz stand im Kopf des Panels und wurde ueberlesen. Ein
+ * Knopf an der Antwort, um die es geht, wird nicht ueberlesen.
+ *
+ * Er sieht aus wie ein Kandidaten-Knopf aus W7c, und das ist Absicht: es ist
+ * dasselbe Muster (dieselbe Frage noch einmal, als eigener Zug).
+ */
+.atlas-chat-rerun {
+    margin-top: 6px;
+    padding: 1px 7px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-phosphor);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-chat-rerun:hover,
+.atlas-chat-rerun:focus-visible {
+    background: var(--atlas-select);
+}
+
+/*
+ * Der gekuerzte Ehrlichkeitsblock des Flow-Erklaerers (W8b).
+ *
+ * Ein Satz und ein Fragezeichen, in einer Zeile. Das Fragezeichen ist dasselbe
+ * Idiom wie der Beleg-Knopf am Twin (.atlas-evidence-btn): dieses Produkt hat
+ * eine Geste fuer "woher kommt das", und eine zweite waere eine zu viel.
+ */
+.atlas-flow-honesty {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.atlas-flow-provenance {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    border: 1px solid var(--atlas-line);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-phosphor-mute);
+    font: inherit;
+    font-size: 10px;
+    line-height: 1.4;
+    /* Wie am Pseudocode-Block: der Klick haelt den Satz fest (W10-1). */
+    cursor: pointer;
+}
+
+.atlas-flow-provenance:hover,
+.atlas-flow-provenance:focus-visible,
+.atlas-flow-provenance[aria-expanded="true"] {
+    color: var(--atlas-phosphor);
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-flow-provenance[aria-expanded="true"] {
+    background: var(--atlas-panel-raised);
+}
+
+/* Die Grenze des Walks, als Beschriftung am unteren Rand des Bildes. */
+.atlas-flow-bound {
+    fill: var(--atlas-dim);
+    font-family: var(--atlas-font);
+    font-size: 9px;
+}
+
+/*
+ * Die Beispiele ueber der leeren Kommandozeile (W8b, AC6c).
+ *
+ * Nutzerbefund vom 2026-08-29: "anstelle von 'type a command or ask the atlas'
+ * explizite Beispiele, wie man den Chat nutzt, sonst weiss niemand, wie man es
+ * nutzt." Sie liegen wie das Suchfenster ueber der Fusszeile und nicht in der
+ * Mitte des Bildschirms: sie gehoeren zu der Zeile, in die getippt wird.
+ *
+ * Beide koennen nie zugleich dastehen: die Beispiele erscheinen nur bei LEERER
+ * Zeile, das Suchfenster nur, wenn etwas darin steht.
+ */
+.atlas-command-examples {
+    /* Die Beispiele bleiben positionsstabil ueber der Kommandozeile. Zwischen
+     * ihnen und ihr liegt aber immer die ganze eingeklappte Erklaeren-Leiste:
+     * deren Reiterleiste misst bei fester Schrift rund 35px; 40px lassen ihre
+     * Kante und den Ausklapper auch bei Rundung sichtbar. Die Box nimmt
+     * damit keinen sichtbaren Knopf mehr ein, ohne beim Blur unter dem Zeiger
+     * wegzuspringen. */
+    position: absolute;
+    left: 0;
+    right: 0;
+    bottom: calc(100% + 40px);
+    z-index: 12;
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px 10px;
+    padding: 6px 12px;
+    border: 1px solid var(--atlas-line);
+    border-bottom: none;
+    background: var(--atlas-panel-raised);
+}
+
+.atlas-command-examples-label {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-command-example {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 6px;
+    padding: 1px 7px;
+    border: 1px solid var(--atlas-phosphor-mute);
+    border-radius: 2px;
+    background: transparent;
+    color: var(--atlas-phosphor);
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+}
+
+.atlas-command-example:hover,
+.atlas-command-example:focus-visible {
+    background: var(--atlas-select);
+}
+
+.atlas-command-example-note {
+    color: var(--atlas-dim);
+}
+
+/* ==========================================================================
+ * Die Agentenebene und ihr Instrument (W11a)
+ *
+ * Zwei Regeln halten diesen ganzen Abschnitt zusammen:
+ *
+ * 1. **Die Farbe kommt von aussen.** Jeder Koerper, jeder Ping und jeder
+ *    Balken faerbt sich mit `--atlas-agent-color`, und die setzt die Ebene aus
+ *    der Kennung des Akteurs (src/agents/agent-colors.ts). Eine Farbe hier
+ *    waere eine zweite Tabelle neben der, die die Zuordnung entscheidet.
+ * 2. **Nichts hiervon faerbt den Graphen um.** Es sind Ebenen DARUEBER: die
+ *    Knotenfarben der Szene und die zwoelf Kantenfarben aus W9 werden an keiner
+ *    Stelle angefasst.
+ * ========================================================================== */
+
+/*
+ * Der Koerper: ein leuchtender Punkt mit seinem Buchstaben daneben.
+ *
+ * Der Kern ist 10 Pixel gross und damit in der Mitte des Bereichs, den der
+ * Contract nennt (8 bis 12). Der Buchstabe steht NEBEN ihm und nicht darin: in
+ * einem Kreis von zehn Pixeln waere er zwei Pixel hoch und damit kein
+ * Unterscheidungsmerkmal, sondern ein Fleck.
+ */
+.atlas-agent {
+    display: flex;
+    align-items: center;
+    gap: 3px;
+    pointer-events: none;
+    white-space: nowrap;
+    transform: translateZ(0);
+}
+
+.atlas-agent-core {
+    display: block;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--atlas-agent-color, #ffffff);
+    box-shadow:
+        0 0 4px var(--atlas-agent-color, #ffffff),
+        0 0 12px var(--atlas-agent-color, #ffffff);
+}
+
+.atlas-agent-letter {
+    font-family: var(--atlas-font);
+    font-size: 9px;
+    line-height: 1;
+    letter-spacing: 0.06em;
+    color: var(--atlas-agent-color, #ffffff);
+    text-shadow: 0 0 4px rgb(0 0 0 / 90%);
+}
+
+/* Schreiben ist enger und schneller; der Koerper ist dabei etwas kleiner, damit
+ * die Bahn eng aussieht und nicht nur eng gerechnet ist. */
+.atlas-agent[data-kind='write'] .atlas-agent-core {
+    width: 8px;
+    height: 8px;
+}
+
+/*
+ * Der Puls (W11b AC3b) steht NICHT hier.
+ *
+ * Bis W11a lief an dieser Stelle eine CSS-Animation fuer die Art "testen". Sie
+ * ist gestrichen, und zwar aus einem inhaltlichen Grund: eine Animation mit
+ * fester Dauer laeuft weiter, wenn nichts mehr passiert, und ein Herzschlag im
+ * Leerlauf ist die Behauptung einer Arbeit, die nicht stattfindet (AC6). Der
+ * Puls wird jetzt in jedem Bild aus der gezaehlten Zahl der Ereignisse
+ * gerechnet und als `transform: scale(...)` auf den Kern geschrieben
+ * (src/galaxy/AgentLayer.tsx). Ein Akteur ohne Ereignisse bekommt dabei GAR
+ * KEINE Aenderung, und das ist der Unterschied zwischen "Ausschlag null" und
+ * "kein Puls": das eine kann man messen, das andere nur behaupten.
+ *
+ * Der Uebergang traegt eine kurze Weichzeichnung, damit ein einzelnes
+ * ausgefallenes Bild nicht als Ruck zu sehen ist; sie ist keine Animation, sie
+ * hat kein eigenes Leben und steht still, sobald der Wert steht.
+ */
+.atlas-agent-core {
+    transition: transform 60ms linear;
+}
+
+/*
+ * Ruhe: blass und still.
+ *
+ * Ein Akteur ohne Ereignis seit einer Minute haelt an (der Orbit friert dort
+ * ein, wo er war), atmet nicht mehr und wird blass. Er verschwindet nicht: sein
+ * Lauf laeuft, und ein Koerper, der bei der ersten Pause weg waere, hiesse
+ * "fertig", was niemand hier weiss.
+ */
+.atlas-agent[data-idle='true'] {
+    opacity: 0.45;
+}
+
+.atlas-agent[data-idle='true'] .atlas-agent-core {
+    box-shadow: none;
+    transition: none;
+}
+
+/*
+ * Die Welle eines Schreib-Bruchs.
+ *
+ * GENAU EINE je Bruch. Sie laeuft einmal und ist dann weg (`forwards` haelt sie
+ * am Ende, das Element selbst verschwindet mit dem Bruch aus der Ansicht); eine
+ * endlos laufende Welle waere wieder eine Bewegung ohne Ereignis dahinter.
+ */
+.atlas-agent-wave {
+    display: block;
+    width: 22px;
+    height: 22px;
+    border: 2px solid var(--atlas-agent-color, #ffffff);
+    border-radius: 50%;
+    pointer-events: none;
+    animation: atlas-agent-wave 1.6s ease-out 1 forwards;
+}
+
+@keyframes atlas-agent-wave {
+    0% {
+        transform: scale(0.5);
+        opacity: 0.9;
+    }
+
+    100% {
+        transform: scale(4);
+        opacity: 0;
+    }
+}
+
+/* Der Leser traegt einen Ring statt eines vollen Kerns: er ist ein Akteur, aber
+ * kein Agent, und der Unterschied soll auch ohne den Buchstaben zu sehen sein. */
+.atlas-agent[data-you='true'] .atlas-agent-core {
+    background: transparent;
+    border: 2px solid var(--atlas-agent-color, #ffffff);
+}
+
+/*
+ * Ghost-Pings der Suche: kurze Ringe an den Knoten, deren NAME das Suchmuster
+ * traegt. Sie sind schwach und schnell, weil sie eine Namensuebereinstimmung
+ * zeigen und keine gemessene Beruehrung.
+ */
+.atlas-agent-ghost {
+    display: block;
+    width: 16px;
+    height: 16px;
+    border: 1px solid var(--atlas-agent-color, #ffffff);
+    border-radius: 50%;
+    opacity: 0.7;
+    pointer-events: none;
+    animation: atlas-agent-ping 1.8s ease-out infinite;
+}
+
+@keyframes atlas-agent-ping {
+    0% {
+        transform: scale(0.4);
+        opacity: 0.8;
+    }
+
+    80% {
+        transform: scale(1.5);
+        opacity: 0;
+    }
+
+    100% {
+        transform: scale(0.4);
+        opacity: 0;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .atlas-agent-ghost,
+    .atlas-agent-wave {
+        animation: none;
+    }
+
+    .atlas-agent-core {
+        transition: none;
+    }
+}
+
+/*
+ * Das Instrument unten rechts.
+ *
+ * Halbtransparent ueber dem Graphen, in derselben Schrift und mit denselben
+ * duennen Raendern wie der Rest der Oberflaeche. Kein Glassmorphism: keine
+ * Weichzeichnung, kein Verlauf, kein runder Kasten. Was hier "fancy" ist, kommt
+ * aus dem Licht der Koerper daneben und nicht aus der Flaeche.
+ */
+.atlas-agents {
+    position: absolute;
+    right: 8px;
+    bottom: 8px;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    width: 320px;
+    max-width: calc(100% - 16px);
+    max-height: calc(100% - 16px);
+    border: 1px solid var(--atlas-line);
+    background: rgb(10 14 13 / 88%);
+    color: var(--atlas-fg);
+    font-family: var(--atlas-font);
+    font-size: 11px;
+    /*
+     * Enger als der Rest der Oberflaeche, und das ist der Preis des Richtwerts:
+     * 320 mal 150 Pixel tragen bei 11 Pixel Schrift und einem Zeilenabstand von
+     * 1.45 genau acht Zeilen, und je Akteur braucht es eine. Die Zahlen bleiben
+     * lesbar, weil hier nichts umbricht: was zu lang ist, kuerzt sich und steht
+     * im Tooltip und in der grossen Lage vollstaendig da.
+     */
+    line-height: 1.25;
+}
+
+.atlas-agents[data-size='collapsed'] {
+    width: auto;
+}
+
+.atlas-agents-head {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 3px 6px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+/*
+ * Zwei Zeilen im Kopf, und beide bleiben EINE Zeile.
+ *
+ * Der Richtwert des Contracts ist 320 mal 150 Pixel. In einem Kasten dieser
+ * Breite ist jede umbrechende Zeile eine Zeile mehr, und drei davon sind der
+ * Unterschied zwischen einem Instrument und einem Panel. Was nicht hineinpasst,
+ * kuerzt sich darum mit einem Auslassungszeichen; der ganze Wortlaut steht im
+ * Tooltip und in der grossen Lage.
+ */
+.atlas-agents-head-row {
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+}
+
+.atlas-agents[data-size='collapsed'] .atlas-agents-head {
+    border-bottom: none;
+}
+
+.atlas-agents-title {
+    flex: 0 0 auto;
+    color: var(--atlas-phosphor);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+}
+
+.atlas-agents-count,
+.atlas-agents-rate,
+.atlas-agents-order,
+.atlas-agents-line {
+    color: var(--atlas-dim);
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+/*
+ * Die ersten beiden Messwerte sind kurz und bleiben voll sichtbar. Der
+ * Verlustzaehler kann dagegen auch nach einer langen Unterbrechung sechsstellig
+ * werden. Er ist deshalb der einzige flexible Kopfwert: `min-width: 0` erlaubt
+ * ihm, in der 320px-Zeile wirklich zu schrumpfen, und sein vorhandener Hint
+ * behaelt den vollstaendigen Wortlaut erreichbar.
+ */
+.atlas-agents-count,
+.atlas-agents-rate {
+    flex: 0 0 auto;
+}
+
+.atlas-agents-order {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-agents-line {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.atlas-agents-order[data-missed='0'] {
+    color: var(--atlas-dim);
+}
+
+.atlas-agents-order:not([data-missed='0']) {
+    color: var(--atlas-alarm);
+}
+
+.atlas-agents-head-buttons {
+    display: inline-flex;
+    flex: 0 0 auto;
+    gap: 6px;
+    margin-left: auto;
+}
+
+.atlas-agents-button,
+.atlas-agents-option {
+    padding: 0 4px;
+    border: 1px solid transparent;
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 10px;
+    cursor: pointer;
+}
+
+.atlas-agents-button:hover,
+.atlas-agents-option:hover,
+.atlas-agents-button:focus-visible,
+.atlas-agents-option:focus-visible {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-agents-option[data-active='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-agents-body {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    min-height: 0;
+    padding: 3px 6px 4px;
+    overflow-y: auto;
+}
+
+.atlas-agents-source {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.atlas-agents-source-head {
+    min-width: 0;
+    flex: 1 1 auto;
+    color: var(--atlas-fg);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents[data-source='no-source'] .atlas-agents-source-head,
+.atlas-agents[data-source='off'] .atlas-agents-source-head {
+    color: var(--atlas-alarm);
+}
+
+.atlas-agents-source-detail,
+.atlas-agents-note,
+.atlas-agents-unmapped-intro {
+    margin: 0;
+    color: var(--atlas-dim);
+    font-size: 10px;
+}
+
+.atlas-agents-command {
+    display: block;
+    padding: 2px 4px;
+    border: 1px solid var(--atlas-line);
+    color: var(--atlas-phosphor);
+    font-size: 10px;
+    /* Ein langer Befehl bricht nicht die Breite des Instruments: er darf
+     * umbrechen. Ein Auslassungszeichen waere hier ein Befehl, den man nicht
+     * abtippen kann. */
+    overflow-wrap: anywhere;
+}
+
+.atlas-agents-filter,
+.atlas-agents-switches {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 4px;
+}
+
+.atlas-agents-window-option {
+    margin-left: 2px;
+}
+
+.atlas-agents-filter-label {
+    color: var(--atlas-dim);
+    font-size: 10px;
+}
+
+.atlas-agents-rows {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 0;
+    padding: 0;
+    list-style: none;
+}
+
+.atlas-agents[data-size='expanded'] .atlas-agents-rows {
+    gap: 6px;
+}
+
+.atlas-agents-row {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    min-width: 0;
+}
+
+/*
+ * Kompakt ist eine Zeile: Punkt, Name, Buchstabe der Art, Ort, Streifen, Dauer.
+ * Der Ort ist der einzige Teil, der nachgibt; alles andere ist kurz genug, um
+ * ganz dazustehen.
+ */
+.atlas-agents-row-head {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    min-width: 0;
+}
+
+.atlas-agents-dot {
+    display: block;
+    width: 8px;
+    height: 8px;
+    flex: 0 0 8px;
+    border-radius: 50%;
+}
+
+.atlas-agents-name {
+    flex: 0 1 auto;
+    max-width: 88px;
+    color: var(--atlas-fg);
+    /* Ein sehr langer Name kuerzt sich selbst; sein ganzer Wortlaut steht in
+     * der grossen Lage. */
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-kind {
+    flex: 0 0 auto;
+    padding: 0 3px;
+    border: 1px solid var(--atlas-line);
+    color: var(--atlas-cyan);
+    font-size: 9px;
+}
+
+.atlas-agents-since {
+    flex: 0 0 auto;
+    color: var(--atlas-dim);
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.atlas-agents-place,
+.atlas-agents-tested,
+.atlas-agents-path {
+    display: block;
+    color: var(--atlas-dim);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-place {
+    flex: 1 1 auto;
+    min-width: 0;
+    color: var(--atlas-cyan);
+}
+
+.atlas-agents-place-full {
+    flex: none;
+    padding-left: 12px;
+}
+
+.atlas-agents-row[data-uncertain='true'] .atlas-agents-place,
+.atlas-agents-row[data-placement='none'] .atlas-agents-place {
+    color: var(--atlas-dim);
+    font-style: italic;
+}
+
+/*
+ * Die Absichtszeile traegt eine EIGENE Schriftfarbe.
+ *
+ * Sie ist die einzige Zeile dieser Flaeche, die nicht gemessen ist, sondern
+ * gemeldet, und der Unterschied muss ohne Tooltip zu sehen sein.
+ */
+.atlas-agents-intent {
+    display: block;
+    padding-left: 12px;
+    color: #d8b4fe;
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-intent-prefix {
+    color: var(--atlas-dim);
+}
+
+.atlas-agents-strip {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: flex-end;
+    gap: 1px;
+    height: 10px;
+    padding: 0;
+}
+
+.atlas-agents-bar {
+    display: block;
+    width: 2px;
+    min-height: 1px;
+    background: var(--atlas-line);
+}
+
+.atlas-agents[data-size='expanded'] .atlas-agents-strip {
+    height: 14px;
+}
+
+.atlas-agents[data-size='expanded'] .atlas-agents-bar {
+    width: 3px;
+}
+
+.atlas-agents-card {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding-left: 13px;
+    border-left: 1px solid var(--atlas-line);
+}
+
+.atlas-agents-card-line {
+    color: var(--atlas-dim);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-unmapped {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding-top: 3px;
+    border-top: 1px solid var(--atlas-line);
+}
+
+.atlas-agents-unmapped-head {
+    display: block;
+    color: var(--atlas-alarm);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-unmapped-row {
+    display: block;
+    color: var(--atlas-dim);
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-more {
+    position: absolute;
+    right: 8px;
+    bottom: 2px;
+    color: var(--atlas-dim);
+    font-size: 9px;
+    pointer-events: none;
+}
+
+/*
+ * Der Deckel und der Ticker (W11b).
+ */
+.atlas-agents-cap {
+    margin: 0;
+    padding-top: 2px;
+    border-top: 1px solid var(--atlas-line);
+    color: var(--atlas-alarm);
+    font-size: 10px;
+}
+
+.atlas-agents-ticker {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding-top: 3px;
+    border-top: 1px solid var(--atlas-line);
+}
+
+.atlas-agents-ticker-head {
+    display: block;
+    color: var(--atlas-phosphor);
+    font-size: 10px;
+    letter-spacing: 0.12em;
+}
+
+.atlas-agents-ticker-row {
+    display: block;
+    color: var(--atlas-agent-color, var(--atlas-dim));
+    font-size: 10px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/*
+ * Der Streifen unten: erst die Ereigniszeile des FOLLOW-Modus, darunter der
+ * Zeitstrahl.
+ *
+ * Ein Stapel und nicht zwei absolut gesetzte Kaesten: beide stehen unten, ihre
+ * Hoehen haengen an der Zahl der Akteure, und zwei feste Abstaende, die sich
+ * beim neunten Agenten ineinander schieben, waeren eine Ueberlagerung, die erst
+ * dann auffaellt. Er endet VOR dem Instrument (336 Pixel im Panel, 320 im
+ * Vollbild), damit auch dort nichts uebereinander liegt.
+ */
+.atlas-galaxy-bottom {
+    position: absolute;
+    right: 336px;
+    bottom: 0;
+    left: 0;
+    z-index: 3;
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 3px;
+    pointer-events: none;
+}
+
+.atlas-agents-followline {
+    align-self: center;
+    max-width: 92%;
+    margin: 0 0 2px;
+    padding: 2px 8px;
+    border: 1px solid var(--atlas-line);
+    background: rgb(10 14 13 / 88%);
+    color: var(--atlas-agent-color, var(--atlas-fg));
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ==========================================================================
+ * Der Zeitstrahl unten (W11b AC4)
+ *
+ * Ein Strich je Ereignis, eine Spur je Akteur. Die Namen stehen in einer
+ * eigenen Spalte links und nicht ueber den Spuren: ein Name ueber einer Spur
+ * waere Text ueber Text, und die Lesbarkeitsmessung dieses Projekts zaehlt das
+ * als Ueberlagerung, zu Recht.
+ * ========================================================================== */
+
+.atlas-agents-timeline {
+    display: flex;
+    pointer-events: auto;
+    flex-direction: column;
+    gap: 2px;
+    padding: 3px 8px 4px;
+    border-top: 1px solid var(--atlas-line);
+    background: rgb(10 14 13 / 92%);
+    font-family: var(--atlas-font);
+    font-size: 10px;
+}
+
+.atlas-agents-timeline-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+}
+
+.atlas-agents-timeline-label {
+    color: var(--atlas-phosphor);
+    letter-spacing: 0.12em;
+}
+
+.atlas-agents-timeline-mode {
+    padding: 0 4px;
+    border: 1px solid var(--atlas-line);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-agents-timeline-mode[data-mode='paused'] {
+    color: var(--atlas-dim);
+}
+
+.atlas-agents-timeline-mode[data-mode='replay'] {
+    border-color: var(--atlas-alarm);
+    color: var(--atlas-alarm);
+}
+
+.atlas-agents-timeline-replay {
+    color: var(--atlas-alarm);
+}
+
+.atlas-agents-timeline-windows {
+    display: inline-flex;
+    gap: 4px;
+    margin-left: auto;
+}
+
+.atlas-agents-timeline-body {
+    display: flex;
+    gap: 8px;
+    min-width: 0;
+}
+
+.atlas-agents-timeline-names {
+    display: flex;
+    flex: 0 0 96px;
+    flex-direction: column;
+    gap: 2px;
+    width: 96px;
+}
+
+.atlas-agents-timeline-name {
+    display: block;
+    height: 11px;
+    line-height: 11px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.atlas-agents-timeline-name[data-idle='true'] {
+    opacity: 0.5;
+}
+
+.atlas-agents-timeline-lanes {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    cursor: pointer;
+}
+
+.atlas-agents-timeline-track {
+    position: relative;
+    height: 11px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-agents-timeline-track[data-idle='true'] {
+    opacity: 0.5;
+}
+
+.atlas-agents-timeline-tick {
+    position: absolute;
+    top: 1px;
+    width: 2px;
+    height: 8px;
+    margin-left: -1px;
+}
+
+/* ==========================================================================
+ * FULLSCREEN: derselbe Graph, das ganze Fenster (W11b AC5)
+ *
+ * Er hiess bis W11b "cinema". Der Nutzer hat ihn am 2026-08-30 benutzt und
+ * gesagt: "bin jetzt im cinema mode, sollte fullscreen heissen." Er heisst
+ * jetzt so, hier und ueberall sonst.
+ *
+ * Er ist der RAHMEN und keine Fuehrung: die Kamera geht weiter dorthin, wo der
+ * Leser sie hinschickt, und sie steht nach dem Verlassen noch genau so.
+ * ========================================================================== */
+
+.atlas-galaxy[data-fullscreen='true'] {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    border: none;
+}
+
+/*
+ * Das Instrument wandert an den Rand und wird zur Spalte.
+ *
+ * 320 Pixel breit, ueber die ganze Hoehe, und der Zeitstrahl bleibt darunter
+ * frei: die beiden duerfen sich nicht ueberlagern, und "duerfen nicht" heisst
+ * hier "wird gemessen".
+ */
+.atlas-galaxy[data-fullscreen='true'] .atlas-agents {
+    top: 0;
+    right: 0;
+    bottom: 0;
+    width: 320px;
+    max-height: none;
+    border-top: none;
+    border-right: none;
+    border-bottom: none;
+    font-size: 12px;
+}
+
+.atlas-galaxy[data-fullscreen='true'] .atlas-agents[data-size='collapsed'] {
+    top: auto;
+    width: auto;
+}
+
+/* Groessere Koerper und Beschriftungen. Der Schirm hat den Platz. */
+.atlas-galaxy[data-fullscreen='true'] .atlas-agent-core {
+    width: 14px;
+    height: 14px;
+}
+
+.atlas-galaxy[data-fullscreen='true'] .atlas-agent[data-kind='write'] .atlas-agent-core {
+    width: 11px;
+    height: 11px;
+}
+
+.atlas-galaxy[data-fullscreen='true'] .atlas-agent-letter {
+    font-size: 12px;
+}
+
+/* Der Weg zurueck zur eingepassten Ansicht weicht der Spalte aus. */
+.atlas-galaxy[data-fullscreen='true'] .atlas-galaxy-fit {
+    right: 332px;
+}
+
+/*
+ * Der Streifen unten endet vor der Spalte.
+ *
+ * Die Spalte reicht im Vollbild ueber die ganze Hoehe; der Streifen belegt den
+ * Rest der Breite. Damit koennen sich die beiden nicht ueberlagern, gleich wie
+ * hoch die eine und wie lang der andere wird, und das ist keine Abstimmung von
+ * Zahlen, sondern eine Aufteilung der Flaeche.
+ */
+.atlas-galaxy[data-fullscreen='true'] .atlas-galaxy-bottom {
+    right: 320px;
+}
+
+/*
+ * Zwei Zeilen je Akteur in der Spalte.
+ *
+ * Der Befund am Beweisbild von W11a: in einer Spalte dieser Breite schrumpfen
+ * die Namen auf vier Zeichen ("expl...", "chec..."). Sauber gekuerzt ist immer
+ * noch gekuerzt, und "chec..." sagt niemandem, wer da arbeitet. Zwei Zeilen
+ * kosten Hoehe, und Hoehe ist genau das, was eine Spalte hat.
+ */
+.atlas-agents[data-column='true'] .atlas-agents-name {
+    max-width: none;
+    flex: 0 1 auto;
+}
+
+.atlas-agents[data-column='true'] .atlas-agents-since {
+    margin-left: auto;
+}
+
+.atlas-agents-row-second {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+    padding-left: 12px;
+}
+
+.atlas-agents[data-column='true'] .atlas-agents-rows {
+    gap: 5px;
+}
+
+.atlas-agents[data-column='true'] .atlas-agents-row {
+    padding-bottom: 3px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+/* Ein ruhiger Akteur wird auch im Instrument blass. */
+.atlas-agents-row[data-idle='true'] {
+    opacity: 0.6;
+}
+
+/* Und die Ansicht sagt es, wenn sie einen alten Zustand zeigt. */
+.atlas-galaxy[data-replay='true'] .atlas-galaxy-scene {
+    outline: 1px solid var(--atlas-alarm);
+    outline-offset: -1px;
+}

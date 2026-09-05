@@ -1,0 +1,49 @@
+.DS_Store
+cbm/
+node_modules/
+dist/
+*.log
+.vite/
+*.tsbuildinfo
+
+# Die lokalen Modelle und die gebaute Inferenz-Runtime: zusammen ueber 11 GB
+# und beide reproduzierbar aus Pruefsummen und Baubefehl. Was committet wird,
+# ist die Herkunft und nicht das Gewicht.
+#
+# Die vier Zeilen je Verzeichnis sind kein Umweg, sondern das, was git
+# verlangt: ein ausgeschlossenes VERZEICHNIS wird gar nicht erst betreten, also
+# koennte eine Ausnahme darin nie greifen (git-scm, gitignore(5): "It is not
+# possible to re-include a file if a parent directory of that file is
+# excluded"). Die Verzeichnisregel steht trotzdem zuerst, weil sie die Absicht
+# nennt; die naechste hebt sie fuer das Verzeichnis selbst wieder auf, die
+# dritte schliesst seinen Inhalt aus, und erst die vierte holt die eine Datei
+# zurueck, die committet gehoert.
+models/
+!models/
+models/*
+!models/SHA256SUMS
+
+vendor/
+!vendor/
+vendor/*
+!vendor/llama/
+vendor/llama/*
+!vendor/llama/HERKUNFT.md
+
+# Die Laufspuren des Sidecars. Die PID-Datei gehoert dem laufenden Prozess,
+# das Log ist ohnehin schon durch *.log erfasst.
+llm/.pid
+
+# Der Node-Bau des Context-Compilers fuer die Eval. Er wird bei jedem Lauf neu
+# erzeugt (tools/lib/compiler-bundle.mjs); ein committetes Bundle waere eine
+# zweite, alternde Fassung der Dateien daneben.
+.eval-build/
+
+# Die Ereignisdatei der Agenten (W11a). Sie enthaelt keine Dateiinhalte, aber
+# sie verraet, an welchen Dateien jemand gearbeitet und welche Befehle er
+# gefahren hat. Das ist die Arbeitsspur einer Person und gehoert nicht in ein
+# Repository; was committet ist, ist die AUFZEICHNUNG des Beweislaufs unter
+# fixtures/agent-events/, und deren Herkunft steht dort daneben.
+.atlas-trace/
+events.jsonl
+events.jsonl.seq
