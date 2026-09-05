@@ -16,6 +16,17 @@ enum {
     GIT_OUTPUT_MAX = 4096,
 };
 
+/* Bounded worktree-status stream constants.
+ * STATUS_FIELD_MAX is the largest single NUL-delimited record field we
+ * buffer; a field at/over the bound is treated as a malformed stream and the
+ * whole snapshot fails closed. PATH components of real repos are far below
+ * this even with long paths. */
+enum {
+    STATUS_HEADER_LEN = 3, /* porcelain-v1 record prefix "XY " */
+    STATUS_CHUNK_MAX = CBM_SZ_4K,
+    STATUS_FIELD_MAX = CBM_SZ_16K,
+};
+
 static char *git_strdup(const char *s) {
     if (!s) {
         s = "";
@@ -408,4 +419,211 @@ int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_
         return 0;
     }
     return off;
+}
+
+/* ── Bounded worktree status ──────────────────────────────────────────────
+ * git status --porcelain=v1 -z --untracked-files=all is parsed record by
+ * record, NUL-delimited, over a bounded chunk buffer. The full stream is
+ * counted but only max_samples paths per class (tracked / untracked) are
+ * ever retained, so a huge dirty tree cannot grow memory. Rename/copy
+ * records carry a second NUL-terminated path (the source); it is consumed
+ * without being counted so one rename counts once. */
+
+typedef struct {
+    cbm_worktree_status_t *out;
+    int max_samples;
+    bool expecting_source; /* next field is the source path of an R/C record */
+    bool parse_ok;
+    char partial[STATUS_FIELD_MAX];
+    size_t partial_len;
+} status_parser_t;
+
+/* porcelain-v1 status columns (X/Y): documented codes plus the lowercase
+ * submodule variants and type-change 'T'. Anything else is not a record
+ * header, so a malformed stream fails closed instead of being misread. */
+static bool status_code_ok(char c) {
+    switch (c) {
+        case ' ':
+        case 'M':
+        case 'A':
+        case 'D':
+        case 'R':
+        case 'C':
+        case 'U':
+        case '?':
+        case '!':
+        case 'T':
+        case 'm':
+        case 'a':
+        case 'd':
+        case 'r':
+        case 'c':
+        case 'u':
+        case 't':
+            return true;
+        default:
+            return false;
+    }
+}
+
+/* Retain one bounded sample; the running total always advances so the caller
+ * sees the true stream count even when samples are capped or OOM. */
+static void status_add_sample(int *total, char ***samples, int *sample_count,
+                              bool *truncated, int max_samples, const char *path,
+                              size_t path_len) {
+    (*total)++;
+    if (*sample_count >= max_samples) {
+        *truncated = true;
+        return;
+    }
+    char *copy = (char *)malloc(path_len + 1);
+    if (!copy) {
+        *truncated = true;
+        return;
+    }
+    memcpy(copy, path, path_len);
+    copy[path_len] = '\0';
+    char **grown = (char **)realloc(*samples, (size_t)(*sample_count + 1) * sizeof(char *));
+    if (!grown) {
+        free(copy);
+        *truncated = true;
+        return;
+    }
+    *samples = grown;
+    (*samples)[*sample_count] = copy;
+    (*sample_count)++;
+}
+
+/* Parse one complete NUL-delimited field. Returns false on malformed input,
+ * which fails the whole snapshot closed. */
+static bool status_parse_record(cbm_worktree_status_t *out, status_parser_t *parser,
+                                const char *field, size_t field_len) {
+    if (parser->expecting_source) {
+        parser->expecting_source = false;
+        return true; /* second path of a rename/copy record — not counted */
+    }
+    if (field_len < STATUS_HEADER_LEN || field[2] != ' ' ||
+        !status_code_ok(field[0]) || !status_code_ok(field[1])) {
+        return false;
+    }
+    const char *path = field + STATUS_HEADER_LEN;
+    size_t path_len = field_len - STATUS_HEADER_LEN;
+    if (field[0] == '?' && field[1] == '?') {
+        status_add_sample(&out->untracked_count, &out->untracked_paths,
+                          &out->untracked_sample_count, &out->untracked_truncated,
+                          parser->max_samples, path, path_len);
+        return true;
+    }
+    if (field[0] == 'R' || field[0] == 'C' || field[1] == 'R' || field[1] == 'C') {
+        parser->expecting_source = true;
+    }
+    status_add_sample(&out->tracked_count, &out->tracked_paths,
+                      &out->tracked_sample_count, &out->tracked_truncated,
+                      parser->max_samples, path, path_len);
+    return true;
+}
+
+/* Feed a chunk of the NUL-delimited stream through the bounded record parser. */
+static void status_feed(status_parser_t *parser, const char *data, size_t data_len) {
+    size_t i = 0;
+    while (i < data_len) {
+        if (parser->partial_len >= STATUS_FIELD_MAX) {
+            parser->parse_ok = false; /* field exceeded the bound: malformed */
+            return;
+        }
+        size_t j = i;
+        while (j < data_len && data[j] != '\0' &&
+               parser->partial_len + (j - i) < STATUS_FIELD_MAX) {
+            j++;
+        }
+        size_t take = j - i;
+        memcpy(parser->partial + parser->partial_len, data + i, take);
+        parser->partial_len += take;
+        i += take;
+        if (i < data_len && data[i] == '\0') {
+            if (!status_parse_record(parser->out, parser, parser->partial,
+                                     parser->partial_len)) {
+                parser->parse_ok = false;
+                return;
+            }
+            parser->partial_len = 0;
+            i++; /* consume the record terminator */
+        } else if (i >= data_len) {
+            return; /* chunk exhausted mid-record */
+        }
+    }
+}
+
+int cbm_git_worktree_status(const char *validated_root, int max_samples,
+                            cbm_worktree_status_t *out) {
+    if (!out) {
+        return CBM_NOT_FOUND;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!validated_root || !validated_root[0] || max_samples < 0) {
+        return CBM_NOT_FOUND;
+    }
+    if (!git_validate_repo_path(validated_root)) {
+        return CBM_NOT_FOUND;
+    }
+
+    char cmd[GIT_CMD_MAX];
+#ifdef _WIN32
+    const char *null_dev = "NUL";
+#else
+    const char *null_dev = "/dev/null";
+#endif
+    int n = snprintf(cmd, sizeof(cmd),
+                     "git -C \"%s\" status --porcelain=v1 -z --untracked-files=all 2>%s",
+                     validated_root, null_dev);
+    if (n < 0 || n >= (int)sizeof(cmd)) {
+        return CBM_NOT_FOUND;
+    }
+
+    FILE *fp = cbm_popen(cmd, "r");
+    if (!fp) {
+        return 0; /* out is zeroed: available=false */
+    }
+
+    status_parser_t parser;
+    memset(&parser, 0, sizeof(parser));
+    parser.out = out;
+    parser.max_samples = max_samples;
+    parser.parse_ok = true;
+
+    char chunk[STATUS_CHUNK_MAX];
+    size_t got;
+    bool io_error = false;
+    while (parser.parse_ok && (got = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        status_feed(&parser, chunk, got);
+    }
+    if (ferror(fp)) {
+        io_error = true;
+    }
+    int rc = cbm_pclose(fp);
+
+    if (rc != 0 || !parser.parse_ok || io_error || parser.partial_len > 0) {
+        /* Fail closed: any deviation from a clean, complete status stream is a
+         * machine-readable "unavailable", never a clean worktree. */
+        cbm_git_worktree_status_free(out);
+        return 0;
+    }
+
+    out->available = true;
+    return 0;
+}
+
+void cbm_git_worktree_status_free(cbm_worktree_status_t *st) {
+    if (!st) {
+        return;
+    }
+    for (int i = 0; i < st->tracked_sample_count; i++) {
+        free(st->tracked_paths[i]);
+    }
+    free(st->tracked_paths);
+    for (int i = 0; i < st->untracked_sample_count; i++) {
+        free(st->untracked_paths[i]);
+    }
+    free(st->untracked_paths);
+    memset(st, 0, sizeof(*st));
 }
