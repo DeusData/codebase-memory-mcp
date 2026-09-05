@@ -491,7 +491,7 @@ overwrite user-modified agents.
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
 | Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
-| Codex CLI | Detected | `$CODEX_HOME/config.toml` | `AGENTS.md`, skill, three read-only agents; `SessionStart` + `SubagentStart` |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, skill, three read-only agents; `SessionStart` + `SubagentStart` |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
 | OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
@@ -535,6 +535,11 @@ overwrite user-modified agents.
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Oh My Pi (omp) | Detected | Effective agent directory (`OMP_PROFILE` / `PI_CODING_AGENT_DIR`; default `~/.omp/agent/mcp.json`) | Skill and three direct-MCP graph-tool subagents (Scout/Verify/Auditor); preserves user `AGENTS.md` |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
+
+For Codex, install keeps only a tiny managed activation pointer in global
+`$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory` skill.
+Fresh installs create the pointer, upgrades replace the legacy full managed block while preserving
+all user-owned bytes, and uninstall removes only the managed pointer.
 
 ### Sessions, compaction, and subagents
 

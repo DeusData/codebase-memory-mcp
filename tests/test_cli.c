@@ -499,6 +499,14 @@ static bool test_plan_has_hook_for_agent(yyjson_val *root, const char *agent) {
     return false;
 }
 
+static const char test_codex_activation_pointer[] =
+    "For structural codebase exploration, use the installed `codebase-memory` skill.\n";
+
+static const char test_codex_activation_block[] =
+    "<!-- codebase-memory-mcp:start -->\n"
+    "For structural codebase exploration, use the installed `codebase-memory` skill.\n"
+    "<!-- codebase-memory-mcp:end -->\n";
+
 static size_t test_count_substring(const char *text, const char *needle) {
     size_t count = 0U;
     size_t needle_len = strlen(needle);
@@ -2728,11 +2736,11 @@ TEST(cli_skill_files_content) {
 }
 
 TEST(cli_codex_instructions) {
-    /* Port of TestCodexInstructionsCreation */
     const char *instr = cbm_get_codex_instructions();
     ASSERT_NOT_NULL(instr);
-    ASSERT(strstr(instr, "Codebase Knowledge Graph") != NULL);
-    ASSERT(strstr(instr, "trace_path") != NULL);
+    ASSERT_STR_EQ(instr, test_codex_activation_pointer);
+    ASSERT_NULL(strstr(instr, "search_graph"));
+    ASSERT_NULL(strstr(instr, "trace_path"));
     PASS();
 }
 
@@ -4822,6 +4830,7 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
             }
         }
     }
+
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
@@ -8195,23 +8204,169 @@ TEST(cli_codex_respects_codex_home) {
     char *saved = save_test_env("CODEX_HOME");
     cbm_setenv("CODEX_HOME", codex_home, 1);
 
+    char expected_instructions[640];
+    snprintf(expected_instructions, sizeof(expected_instructions), "%s/AGENTS.md", codex_home);
+    const char *user_instructions = "# Personal Codex guidance\n";
+    ASSERT_EQ(write_test_file(expected_instructions, user_instructions), 0);
+
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     char expected_config[640];
-    char expected_instructions[640];
     snprintf(expected_config, sizeof(expected_config), "%s/config.toml", codex_home);
-    snprintf(expected_instructions, sizeof(expected_instructions), "%s/AGENTS.md", codex_home);
-    bool plans_config = json && strstr(json, expected_config) != NULL;
-    bool plans_instructions = json && strstr(json, expected_instructions) != NULL;
+    yyjson_doc *plan_doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    bool plans_config = test_json_string_array_contains(plan_root, "config_files_planned",
+                                                        expected_config);
+    bool plans_instructions = test_json_string_array_contains(
+        plan_root, "instruction_files_planned", expected_instructions);
+    bool plans_cleanup = json && strstr(json, "remove_managed_block_if_present") != NULL;
+    char *instructions_after = read_test_file_alloc(expected_instructions);
+    bool plan_preserved_user_file =
+        instructions_after && strcmp(instructions_after, user_instructions) == 0;
 
+    free(instructions_after);
+    yyjson_doc_free(plan_doc);
     free(json);
     restore_test_env("CODEX_HOME", saved);
     test_rmdir_r(tmpdir);
 
     if (!agents.codex)
         FAIL("Codex detection must honor CODEX_HOME");
-    if (!plans_config || !plans_instructions)
-        FAIL("Codex install plan must place config and AGENTS.md under CODEX_HOME");
+    if (!plans_config || !plans_instructions || plans_cleanup || !plan_preserved_user_file)
+        FAIL("Codex plan must include the managed activation pointer under CODEX_HOME without "
+             "mutating existing user content");
+    PASS();
+}
+
+TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-agents-pointer-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char agents_path[640];
+    char config_path[640];
+    char skill_path[768];
+    char profile_path[768];
+    char binary_path[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_home);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_home);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_home);
+    snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_home);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    ASSERT_EQ(test_mkdirp(codex_home), 0);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    struct stat state;
+    int fresh_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *fresh_agents = read_test_file_alloc(agents_path);
+    bool fresh_pointer_installed = fresh_rc == 0 && fresh_agents &&
+                                   strcmp(fresh_agents, test_codex_activation_block) == 0;
+    char *config = read_test_file_alloc(config_path);
+    bool other_surfaces_installed =
+        fresh_rc == 0 && config && strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+        strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
+        stat(profile_path, &state) == 0;
+    free(fresh_agents);
+    free(config);
+
+    const char *user_only = "# Personal Codex guidance\nKeep this byte-for-byte.\n";
+    ASSERT_EQ(write_test_file(agents_path, user_only), 0);
+    int dry_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_dry = read_test_file_alloc(agents_path);
+    int unowned_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_unowned = read_test_file_alloc(agents_path);
+    char expected_user_pointer[1024];
+    int user_pointer_written = snprintf(expected_user_pointer, sizeof(expected_user_pointer),
+                                        "%s%s", user_only, test_codex_activation_block);
+    bool unowned_preserved =
+        user_pointer_written > 0 && (size_t)user_pointer_written < sizeof(expected_user_pointer) &&
+        dry_rc == 0 && unowned_rc == 0 && after_dry && after_unowned &&
+        strcmp(after_dry, user_only) == 0 &&
+        strcmp(after_unowned, expected_user_pointer) == 0;
+    free(after_dry);
+    free(after_unowned);
+
+    const char *legacy = "# Before\n<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                         "<!-- codebase-memory-mcp:end -->\n# After\n";
+    char expected_migration[1024];
+    int migration_written = snprintf(expected_migration, sizeof(expected_migration),
+                                     "# Before\n%s# After\n", test_codex_activation_block);
+    ASSERT_EQ(write_test_file(agents_path, legacy), 0);
+    int managed_dry_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_managed_dry = read_test_file_alloc(agents_path);
+    int managed_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_managed = read_test_file_alloc(agents_path);
+    int repeat_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_repeat = read_test_file_alloc(agents_path);
+    bool managed_migrated_once =
+        migration_written > 0 && (size_t)migration_written < sizeof(expected_migration) &&
+        managed_dry_rc == 0 && after_managed_dry && strcmp(after_managed_dry, legacy) == 0 &&
+        managed_rc == 0 && repeat_rc == 0 && after_managed && after_repeat &&
+        strcmp(after_managed, expected_migration) == 0 &&
+        strcmp(after_repeat, expected_migration) == 0 &&
+        test_count_substring(after_repeat, "<!-- codebase-memory-mcp:start -->") == 1U;
+    free(after_managed_dry);
+    free(after_managed);
+    free(after_repeat);
+
+    const char *managed_only = "<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                               "<!-- codebase-memory-mcp:end -->\n";
+    ASSERT_EQ(write_test_file(agents_path, managed_only), 0);
+    int managed_only_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_managed_only = read_test_file_alloc(agents_path);
+    bool marker_only_migrated = managed_only_rc == 0 && after_managed_only &&
+                                strcmp(after_managed_only, test_codex_activation_block) == 0 &&
+                                stat(agents_path, &state) == 0;
+    free(after_managed_only);
+
+    const char *malformed = "# Keep\n<!-- codebase-memory-mcp:start -->\nunterminated\n";
+    ASSERT_EQ(write_test_file(agents_path, malformed), 0);
+    ASSERT_EQ(remove(config_path), 0);
+    ASSERT_EQ(remove(skill_path), 0);
+    ASSERT_EQ(remove(profile_path), 0);
+    int malformed_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_malformed = read_test_file_alloc(agents_path);
+    config = read_test_file_alloc(config_path);
+    bool malformed_preserved = malformed_rc != 0 && after_malformed &&
+                               strcmp(after_malformed, malformed) == 0 && config &&
+                               strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+                               strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
+                               stat(profile_path, &state) == 0;
+    free(config);
+    free(after_malformed);
+
+    ASSERT_EQ(write_test_file(agents_path, expected_user_pointer), 0);
+    char *uninstall_argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, uninstall_argv);
+    char *after_uninstall = read_test_file_alloc(agents_path);
+    bool uninstall_preserved_foreign = uninstall_rc == 0 && after_uninstall &&
+                                       strcmp(after_uninstall, user_only) == 0;
+    free(after_uninstall);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+
+    if (!fresh_pointer_installed || !other_surfaces_installed || !unowned_preserved ||
+        !managed_migrated_once || !marker_only_migrated || !malformed_preserved ||
+        !uninstall_preserved_foreign)
+        FAIL("Codex install must keep only a tiny managed activation pointer, preserve foreign "
+             "bytes, migrate legacy blocks, fail closed on malformed markers, and remove the "
+             "pointer on uninstall");
     PASS();
 }
 
@@ -10346,8 +10501,10 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
 
     char hooks_path[640];
     char config_path[640];
+    char agents_path[640];
     snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_dir);
     int first_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
     char *first = read_test_file_alloc(config_path);
     int repeat_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
@@ -10387,14 +10544,17 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.toml", codex_dir);
     struct stat state;
     hooks = read_test_file_alloc(hooks_path);
+    char *agents_after_uninstall = read_test_file_alloc(agents_path);
     bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) == 0 &&
                                stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0 &&
-                               hooks && !strstr(hooks, "hook-augment");
+                               hooks && !strstr(hooks, "hook-augment") && agents_after_uninstall &&
+                               agents_after_uninstall[0] == '\0';
     free(hooks);
+    free(agents_after_uninstall);
 
     char bad_home[256];
     snprintf(bad_home, sizeof(bad_home), "/tmp/cli-codex-preflight-XXXXXX");
-    bool no_partial = false;
+    bool pointer_only_on_preflight_failure = false;
     if (cbm_mkdtemp(bad_home)) {
         char bad_codex[512];
         char bad_config[640];
@@ -10408,18 +10568,110 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
         cbm_setenv("PATH", bad_home, 1);
         int bad_rc = cbm_install_agent_configs(bad_home, binary_path, false, false);
         char *bad_after = read_test_file_alloc(bad_config);
-        no_partial = bad_rc != 0 && bad_after && strcmp(bad_after, ambiguous) == 0 &&
-                     stat(bad_agents, &state) != 0;
+        char *bad_agents_after = read_test_file_alloc(bad_agents);
+        pointer_only_on_preflight_failure =
+            bad_rc != 0 && bad_after && strcmp(bad_after, ambiguous) == 0 && bad_agents_after &&
+            strcmp(bad_agents_after, test_codex_activation_block) == 0;
         free(bad_after);
+        free(bad_agents_after);
         test_rmdir_r(bad_home);
     }
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!lifecycle_ok || !migrated || !independent_cleanup || !no_partial)
-        FAIL("Codex lifecycle preflight must be idempotent, transactional, and independently "
-             "clean owned side files");
+    if (!lifecycle_ok || !migrated || !independent_cleanup ||
+        !pointer_only_on_preflight_failure)
+        FAIL("Codex lifecycle preflight must be idempotent, preserve the activation pointer "
+             "contract, and independently clean owned side files");
+    PASS();
+}
+
+TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-cleanup-preflight-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char config_path[640];
+    char agents_path[640];
+    char skill_path[768];
+    char profile_path[768];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_dir);
+    snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_dir);
+    if (test_mkdirp(codex_dir) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to create Codex cleanup preflight fixture directory");
+    }
+
+    const char *ambiguous =
+        "[hooks]\nSessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = ["
+        "{ type = 'command', command = 'codebase-memory-mcp hook-augment' }, "
+        "{ type = 'command', command = 'foreign' }] }]\n";
+    const char *legacy = "# Before\n<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                         "<!-- codebase-memory-mcp:end -->\n# After\n";
+    char legacy_migrated[1024];
+    int migrated_written = snprintf(legacy_migrated, sizeof(legacy_migrated),
+                                    "# Before\n%s# After\n", test_codex_activation_block);
+    if (migrated_written <= 0 || (size_t)migrated_written >= sizeof(legacy_migrated)) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to build expected Codex pointer migration");
+    }
+    if (write_test_file(config_path, ambiguous) != 0 ||
+        write_test_file(agents_path, legacy) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to write Codex cleanup preflight fixture");
+    }
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
+    yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    bool plans_pointer =
+        test_json_string_array_contains(plan_root, "instruction_files_planned", agents_path);
+    char *config_after_plan = read_test_file_alloc(config_path);
+    char *agents_after_plan = read_test_file_alloc(agents_path);
+    bool plan_preserved_files = config_after_plan && agents_after_plan &&
+                                strcmp(config_after_plan, ambiguous) == 0 &&
+                                strcmp(agents_after_plan, legacy) == 0;
+
+    int install_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *config_after_install = read_test_file_alloc(config_path);
+    char *agents_after_install = read_test_file_alloc(agents_path);
+    struct stat state;
+    bool preflight_failed_closed =
+        install_rc != 0 && config_after_install && strcmp(config_after_install, ambiguous) == 0 &&
+        stat(skill_path, &state) != 0 && stat(profile_path, &state) != 0;
+    bool pointer_migrated =
+        agents_after_install && strcmp(agents_after_install, legacy_migrated) == 0;
+
+    free(config_after_plan);
+    free(agents_after_plan);
+    free(config_after_install);
+    free(agents_after_install);
+    if (plan_doc) {
+        yyjson_doc_free(plan_doc);
+    }
+    free(plan);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+
+    if (!plans_pointer || !plan_preserved_files || !preflight_failed_closed || !pointer_migrated)
+        FAIL("Codex legacy instructions must migrate to the activation pointer independently of "
+             "hook preflight while other config surfaces fail closed");
     PASS();
 }
 
@@ -10488,13 +10740,15 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
         fclose(capture);
     }
     char *after = read_test_file_alloc(config_path);
-    struct stat state;
-    bool unchanged = after && strcmp(after, ambiguous) == 0 && stat(agents_path, &state) != 0;
+    char *agents_after = read_test_file_alloc(agents_path);
+    bool unchanged = after && strcmp(after, ambiguous) == 0 && agents_after &&
+                     strcmp(agents_after, test_codex_activation_block) == 0;
     bool diagnostic =
         strstr(output, "Codex CLI:\nerror: agent_config agent=Codex CLI op=hook_preflight path=") !=
             NULL &&
         strstr(output, "reason=ambiguous_hook_ownership") != NULL;
     free(after);
+    free(agents_after);
 
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
@@ -14580,6 +14834,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_user_scope_avoids_nested_mcp_json);
     RUN_TEST(cli_codex_respects_codex_home);
     RUN_TEST(cli_grok_respects_grok_home);
+    RUN_TEST(cli_codex_install_uses_global_activation_pointer_issue1689);
     RUN_TEST(cli_gemini_session_hook_uses_json_for_all_sources);
     RUN_TEST(cli_gemini_installs_dedicated_graph_subagent);
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
@@ -14625,6 +14880,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
+    RUN_TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689);
 #ifndef _WIN32
     RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
 #endif
