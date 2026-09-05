@@ -70,6 +70,45 @@ TEST(ws_posix_top_level_trees_are_too_shallow) {
     PASS();
 }
 
+/* PATH_ALLOW_BROAD is deliberately not part of the grant store's overridability:
+ * cbm_workspace_classify_root and cbm_workspace_verdict_is_overridable must stay
+ * exactly as strict as the test above already checked. Only the top-level
+ * decision, cbm_workspace_root_allowed, knows about it, and only as an exact
+ * match. */
+TEST(ws_allow_broad_root_lifts_too_shallow_for_an_exact_match_only) {
+    char cache[256];
+    char *created = th_mktempdir("cbm_ws_allow_broad");
+    ASSERT_NOT_NULL(created);
+    snprintf(cache, sizeof(cache), "%s", created);
+
+    char err[1024];
+    ASSERT_FALSE(cbm_workspace_root_allowed("/srv", "/home/dev", cache, NULL, NULL, err,
+                                            sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "PATH_ALLOW_BROAD"));
+
+    ASSERT_TRUE(
+        cbm_workspace_root_allowed("/srv", "/home/dev", cache, NULL, "/srv", err, sizeof(err)));
+
+    /* A grant for the root does not extend to a sibling: PATH_ALLOW_BROAD names
+     * one path, not a prefix. */
+    ASSERT_FALSE(cbm_workspace_root_allowed("/opt", "/home/dev", cache, NULL, "/srv", err,
+                                            sizeof(err)));
+
+    /* Sensitive and absolute refusals are a different verdict and stay refused
+     * even when PATH_ALLOW_BROAD happens to name that exact path. */
+    ASSERT_FALSE(cbm_workspace_root_allowed("/home/dev", "/home/dev", cache, NULL, "/home/dev",
+                                            err, sizeof(err)));
+    ASSERT_FALSE(
+        cbm_workspace_root_allowed("/", "/home/dev", cache, NULL, "/", err, sizeof(err)));
+
+    /* Environment, not a grant: it never shows up in the recorded list. */
+    char listed[64];
+    ASSERT_FALSE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+
+    th_cleanup(cache);
+    PASS();
+}
+
 /* Legitimately shallow project roots must survive: these are the false positives
  * a blanket depth rule would cause, which is why Windows counts drive-relative. */
 TEST(ws_legitimate_shallow_roots_are_allowed) {
@@ -170,10 +209,10 @@ TEST(ws_sensitive_root_explicit_approval_is_preserved) {
     snprintf(cache, sizeof(cache), "%s", created);
 
     char err[1024];
-    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
     ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
     ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
-    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
 
     th_cleanup(root);
     th_cleanup(cache);
@@ -193,10 +232,10 @@ TEST(ws_sensitive_approval_upgrades_existing_ordinary_exact_grant) {
 
     char err[1024];
     ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, root, false, err, sizeof(err)));
-    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
 
     ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
-    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, NULL, err, sizeof(err)));
     /* A repeated explicit approval must recognize the marked exact grant rather
      * than append another exception. */
     ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
@@ -228,11 +267,11 @@ TEST(ws_sensitive_approval_adds_exact_exception_under_ordinary_ancestor) {
     ASSERT_EQ(cbm_mkdir(sensitive), 0);
     char err[1024];
     ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, ancestor, false, err, sizeof(err)));
-    ASSERT_FALSE(cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, NULL, err, sizeof(err)));
 
     ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
     ASSERT_TRUE(
-        cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
+        cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, NULL, err, sizeof(err)));
     ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
 
     char listed[4096];
@@ -385,6 +424,7 @@ SUITE(workspace) {
     RUN_TEST(ws_volume_roots_are_absolutely_denied);
     RUN_TEST(ws_non_absolute_paths_are_denied);
     RUN_TEST(ws_posix_top_level_trees_are_too_shallow);
+    RUN_TEST(ws_allow_broad_root_lifts_too_shallow_for_an_exact_match_only);
     RUN_TEST(ws_legitimate_shallow_roots_are_allowed);
     RUN_TEST(ws_home_itself_is_sensitive_but_subdirs_are_fine);
     RUN_TEST(ws_credential_directories_are_sensitive_at_any_depth);
