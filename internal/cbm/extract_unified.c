@@ -1137,9 +1137,11 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
      * the type here. Without a class scope, an impl method's QN drops the type
      * (proj.file.method) and no longer matches the class-qualified def-side Method
      * node, so in-body calls fall back to the Module. */
+    bool rust_impl_type = false;
     if (ts_node_is_null(name_node) && ctx->language == CBM_LANG_RUST &&
         strcmp(ts_node_type(node), "impl_item") == 0) {
         name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
+        rust_impl_type = true;
     }
     if (ts_node_is_null(name_node)) {
         return NULL;
@@ -1148,6 +1150,18 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
     char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
     if (!name || !name[0]) {
         return NULL;
+    }
+
+    /* Rust impl scope: strip generic args (`Stack<T>` → `Stack`) to match the
+     * def side, which strips them for Method QNs (extract_defs.c). Otherwise a
+     * call inside a generic impl carries enclosing_func_qn Stack<T>.push,
+     * pass_calls finds no such caller node, and the call attributes to the
+     * File node. */
+    if (rust_impl_type) {
+        char *lt = strchr(name, '<');
+        if (lt) {
+            *lt = '\0';
+        }
     }
 
     /* Nested class: prefix with the enclosing class QN (Outer.Inner) so this

@@ -3481,6 +3481,8 @@ static void py_resolve_calls_in_inner(PyLSPContext *ctx, TSNode node) {
 static const CBMType *py_parse_type_text(CBMArena *arena, const char *ann);
 static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
                                             const char *module_qn);
+static const char *py_qualify_template_base(CBMArena *arena, const char *btrim,
+                                            const char *module_qn);
 
 /* Trim ASCII whitespace from both ends of an arena-allocated copy. */
 static char *py_trim_ws(CBMArena *arena, const char *start, size_t len) {
@@ -3546,6 +3548,45 @@ static const char **py_split_subscript_args(CBMArena *arena, const char *s, int 
     out[n] = NULL;
     *out_n = n;
     return out;
+}
+
+/* Container-base names that are stdlib generics, not user classes: their
+ * element/receiver logic keys on the BARE name (builtins.list, typing.Mapping,
+ * ...), so they must NOT be qualified to the consumer's module. Everything
+ * else subscripted (Box[T], Repository[User]) is a user class whose methods
+ * live at <module_qn>.<base>. Mirrors the bare-name qualify convention in
+ * py_parse_type_text_qn's non-subscripted tail. */
+static bool py_container_base_is_stdlib_generic(const char *base) {
+    if (!base || !base[0])
+        return true; /* nothing to qualify */
+    if (strchr(base, '.'))
+        return true; /* already qualified (typing.X / mod.X): leave as-is */
+    static const char *names[] = {
+        "list",        "dict",          "set",          "tuple",         "frozenset",
+        "deque",       "defaultdict",   "OrderedDict",  "Counter",       "ChainMap",
+        "List",        "Dict",          "Set",          "Tuple",         "FrozenSet",
+        "Deque",       "Type",          "type",         "Sequence",      "MutableSequence",
+        "Mapping",     "MutableMapping", "Collection",  "Container",     "Iterable",
+        "Iterator",    "Generator",     "AsyncIterator", "AsyncIterable", "Awaitable",
+        "Coroutine",   "Reversible",    "Optional",     "Union",         "Callable",
+        "ClassVar",    "Final",         "Annotated",    "Required",      "NotRequired",
+        "ReadOnly",    "InitVar",       "Any",          NULL};
+    for (int i = 0; names[i]; i++) {
+        if (strcmp(base, names[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* Qualify a subscripted container base to <module_qn>.<base> when it is a user
+ * class, so TEMPLATE receiver probes (py_lookup_attribute on the tname) hit
+ * the registered class and `b: Box[T]; b.get()` resolves. Returns btrim
+ * unchanged for stdlib generics. */
+static const char *py_qualify_template_base(CBMArena *arena, const char *btrim,
+                                            const char *module_qn) {
+    if (!module_qn || !module_qn[0] || py_container_base_is_stdlib_generic(btrim))
+        return btrim;
+    return cbm_arena_sprintf(arena, "%s.%s", module_qn, btrim);
 }
 
 static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
@@ -3653,7 +3694,9 @@ static const CBMType *py_parse_type_text_qn(CBMArena *arena, const char *ann,
                     }
                 }
                 if (arg_types && arg_n > 0) {
-                    return cbm_type_template(arena, btrim, arg_types, arg_n);
+                    return cbm_type_template(
+                        arena, py_qualify_template_base(arena, btrim, module_qn), arg_types,
+                        arg_n);
                 }
                 return py_parse_type_text_qn(arena, btrim, module_qn);
             }
@@ -3873,9 +3916,12 @@ static const CBMType *py_resolve_annotation(PyLSPContext *ctx, const char *ann) 
                         }
                     }
                 }
-                // Generic containers -> TEMPLATE
+                // Generic containers -> TEMPLATE (user-class bases qualified so
+                // the receiver probe hits the registered class)
                 if (arg_types && arg_n > 0) {
-                    return cbm_type_template(ctx->arena, btrim, arg_types, arg_n);
+                    return cbm_type_template(
+                        ctx->arena, py_qualify_template_base(ctx->arena, btrim, ctx->module_qn),
+                        arg_types, arg_n);
                 }
                 return py_resolve_annotation(ctx, btrim);
             }

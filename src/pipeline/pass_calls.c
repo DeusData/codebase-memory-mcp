@@ -209,18 +209,30 @@ static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *ca
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
                                       const char **imp_keys, const char **imp_vals, int imp_count) {
     const char *method = cbm_service_pattern_route_method(call->callee_name);
+    const char *route_path = call->first_string_arg;
+    if (!route_path || !route_path[0]) {
+        return;
+    }
+    /* Go 1.22 ServeMux "METHOD /path" literals: split and let the embedded
+     * method outrank the callee-suffix ANY of .Handle/.HandleFunc. */
+    const char *mux_method = NULL;
+    const char *mux_path = cbm_go_split_mux_pattern(route_path, &mux_method);
+    if (mux_path) {
+        route_path = mux_path;
+        method = mux_method;
+    }
     char route_qn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(route_qn, sizeof(route_qn), "__route__%s__%s", method ? method : "ANY",
-             cbm_route_canon_path(call->first_string_arg, cpath, sizeof(cpath)));
+             cbm_route_canon_path(route_path, cpath, sizeof(cpath)));
     char route_props[CBM_SZ_256];
     snprintf(route_props, sizeof(route_props), "{\"method\":\"%s\"}", method ? method : "ANY");
-    int64_t route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", call->first_string_arg, route_qn,
-                                            "", 0, 0, route_props);
+    int64_t route_id =
+        cbm_gbuf_upsert_node(ctx->gbuf, "Route", route_path, route_qn, "", 0, 0, route_props);
     char esc_cn[CBM_SZ_256]; /* sliced source text: escape quotes/newlines */
     char esc_fa[CBM_SZ_256];
     cbm_json_escape(esc_cn, sizeof(esc_cn), call->callee_name);
-    cbm_json_escape(esc_fa, sizeof(esc_fa), call->first_string_arg);
+    cbm_json_escape(esc_fa, sizeof(esc_fa), route_path);
     char props[CBM_SZ_512];
     snprintf(props, sizeof(props),
              "{\"callee\":\"%s\",\"url_path\":\"%s\",\"via\":\"route_registration\"}", esc_cn,
@@ -424,6 +436,18 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
         handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
         return;
     }
+    /* Go 1.22 ServeMux "METHOD /path" literals: the method+path live in the
+     * literal (first char is the method, not '/'), so the '/'-prefixed guard
+     * above misses them, and the QN classifies net/http as an HTTP *client*.
+     * A mux registration callee (.Handle/.HandleFunc) carrying a
+     * method-qualified pattern is unambiguously a server route. */
+    if (call->first_string_arg && cbm_service_pattern_route_method(call->callee_name) != NULL) {
+        const char *mux_probe = NULL;
+        if (cbm_go_split_mux_pattern(call->first_string_arg, &mux_probe)) {
+            handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+            return;
+        }
+    }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
         emit_http_async_edge(ctx, call, source, target, res, svc, suppress_plain_calls);
         return;
@@ -567,7 +591,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
          * like the parallel path's callee_suffix fallback; without this the
          * sequential path minted zero Route nodes for such files. */
         if (cbm_service_pattern_route_method(call->callee_name) != NULL && call->first_string_arg &&
-            call->first_string_arg[0] == '/') {
+            (call->first_string_arg[0] == '/' ||
+             cbm_go_split_mux_pattern(call->first_string_arg, NULL) != NULL)) {
+            /* Go 1.22 mux literals ("GET /users/{id}") start with the method,
+             * not '/', and mux.HandleFunc always lands here (net/http is
+             * external, so resolution is empty) — the split probe keeps them
+             * from falling through to the client-pattern checks. */
             handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
                                       imp_count);
             return SKIP_ONE;

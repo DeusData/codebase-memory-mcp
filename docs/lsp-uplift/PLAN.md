@@ -196,7 +196,7 @@ Test coverage: Suite name `go_lsp` (SUITE(go_lsp), tests/test_go_lsp.c, ~50 test
 | go-interface-scan-memo | P2 | S | confirm | confirm | 4 |
 | gomod-replace-directives | P2 | S | refute | confirm | parked |
 
-### go122-servemux-route-patterns  (P0/S, wave 1)
+### go122-servemux-route-patterns  (P0/S, wave 1) ✅ done
 
 **Parse Go 1.22 method+pattern ServeMux route literals into Route nodes**
 
@@ -218,7 +218,7 @@ Scope: The generated table's 34-package allowlist predates Go 1.21 and its gener
 
 Test plan: tests/test_go_lsp.c: golsp_stdlib_slices (`us := slices.Clone(users); us[0].Name()` resolves Name via inferred []User), golsp_stdlib_maps_keys (`for k := range maps.Keys(m)`), golsp_stdlib_randv2 (`r := rand.New(...); r.IntN(10)`), asserting lsp_direct/lsp_type_dispatch with confidence > 0.
 
-### go-crossfile-interface-method-names  (P0/S, wave 1)
+### go-crossfile-interface-method-names  (P0/S, wave 1) ✅ done
 
 **Populate interface method_names_str in production cross-file defs (sole-implementer resolve today only works in tests)**
 
@@ -274,7 +274,7 @@ Scope: Detect calls whose callee leaf matches Register<Service>Server (protoc-ge
 
 Test plan: tests/test_pipeline.c: two-file Go case — generated-style pb file with RegisterCartServiceServer + CartServiceClient iface, server file with `type server struct{}; func (s *server) GetCart(...)` and `pb.RegisterCartServiceServer(g, &server{})`, client file calling `pb.NewCartServiceClient(conn).GetCart(...)`; assert one Route __grpc__CartService/GetCart with both GRPC_CALLS (client fn) and HANDLES (server.GetCart).
 
-### go-fuzz-and-subtests  (P1/S, wave 1)
+### go-fuzz-and-subtests  (P1/S, wave 1) ✅ Fuzz half done (subtests JSON deferred)
 
 **Recognize Fuzz* test functions and t.Run subtest names**
 
@@ -366,7 +366,7 @@ Test coverage: tests/test_rust_lsp.c (7385 lines, 523 RUN_TESTs) registered as s
 | rust-enum-variant-registration | P2 | S | modify | modify | 4 |
 | rust-from-into-conversion-edges | P2 | S | confirm | confirm | 4 |
 
-### rust-generic-impl-qn-alignment  (P0/S, wave 1)
+### rust-generic-impl-qn-alignment  (P0/S, wave 1) ✅ done
 
 **Strip generic args from impl-block scope QNs so calls inside generic impls attribute to their Method node**
 
@@ -414,7 +414,7 @@ Scope: (1) In Phase B1/B2 AST harvest, detect `async` on function_item (a functi
 
 Test plan: tests/test_rust_lsp.c: TEST(rustlsp_async_await_result_typed) fixture "struct D; impl D{ fn ok(&self)->bool{true} }\nasync fn fetch()->Result<D,String>{ todo!() }\nasync fn run(){ let r = fetch().await; if let Ok(d)=r { d.ok(); } }" asserting require_resolved(r,"run","D.ok"); TEST(rustlsp_rpitit_output_binding) with fn make()->impl std::future::Future<Output=D> then make().await receiver dispatch; unsafe-block value fixture "let x = unsafe { helper() }; x.method()".
 
-### rust-trait-default-bodies-and-nested-scopes  (P1/S, wave 1)
+### rust-trait-default-bodies-and-nested-scopes  (P1/S, wave 1) ✅ done (B/B1 mod-recursion follow-up logged)
 
 **Walk trait default-method bodies, nested inline modules, and impl-level bounds**
 
@@ -575,7 +575,7 @@ Scope: The grammar already parses py2 cleanly (probe-verified), so this is purel
 
 Test plan: tests/test_py_lsp.c: (1) `import urllib2\ndef fetch(u):\n    return urllib2.urlopen(u)` — require_resolved(fetch, urlopen) with confidence >= 0.9; (2) `def f(n):\n    for i in xrange(n):\n        pass\n    return unicode(n).upper()` — require_resolved(f, xrange) and require_resolved(f, upper) (str receiver via unicode alias); (3) `def g(d):\n    for k, v in d.iteritems():\n        k.upper()` with `d: dict[str, int]` annotation — require_resolved(g, upper); (4) py2 mega-fixture (print stmt, chevron, except-comma, exec, backticks, 0777) asserting extraction still yields the function/class defs and HAS no crash (extend pylsp_no_crash_on_syntax_error pattern).
 
-### py-generic-annotation-receiver  (P0/S, wave 1)
+### py-generic-annotation-receiver  (P0/S, wave 1) ✅ done
 
 **Resolve method calls on parameterized user-class annotations (Box[T], Repository[User])**
 
@@ -661,7 +661,7 @@ Scope: Add to ALLOWED_MODULES: tomllib, zoneinfo, configparser, csv, sqlite3, ha
 
 Test plan: tests/test_py_lsp.c: `import tomllib\ndef load(p):\n    with open(p,'rb') as f:\n        return tomllib.load(f)` — require_resolved(load, load) targeting tomllib.load; `import configparser\ndef r():\n    c = configparser.ConfigParser()\n    return c.read('x.ini')` — resolved ConfigParser (constructor) and read (method). Bench guard: extend tests/test_py_lsp_bench.c with a registration-time assertion (existing bench harness pattern) so table growth that regresses per-file registration beyond budget fails the perf suite.
 
-### py-match-branch-complexity  (P2/S, wave 1)
+### py-match-branch-complexity  (P2/S, wave 1) ✅ done
 
 **Count match/case in Python cyclomatic complexity**
 
@@ -791,7 +791,7 @@ Scope: The 1329-line hand-written table (~175 types / 699 methods, biggest singl
 
 Test plan: tests/test_java_lsp_coverage.c new block: cov_std_bigdecimal_add (`a.add(b).setScale(2)` → BigDecimal.add/setScale), cov_std_httpclient (`HttpClient.newHttpClient().send(req, HttpResponse.BodyHandlers.ofString())`), cov_std_virtual_thread (`Thread.ofVirtual().name("w").start(r)` → Thread.Builder.OfVirtual.start), cov_std_countdown_latch (`latch.await(); latch.countDown();`), cov_std_blocking_queue (`q.take().length()` with BlockingQueue<String>), cov_std_enum_name (user enum `e.name().isEmpty()` — composes with java-enum-semantics), cov_std_collectors_tomap.
 
-### java-multi-parent-inheritance-bfs  (P1/S, wave 1)
+### java-multi-parent-inheritance-bfs  (P1/S, wave 1) ✅ done
 
 **Walk ALL embedded_types (frontier BFS) in method/field inheritance lookup**
 

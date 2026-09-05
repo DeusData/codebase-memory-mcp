@@ -100,6 +100,7 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
         add_str_or_null(doc, o, "tq", d->trait_qn);
         yyjson_mut_obj_add_bool(doc, o, "ir", d->is_rust_impl_relation);
         yyjson_mut_obj_add_bool(doc, o, "ab", d->is_abstract);
+        yyjson_mut_obj_add_bool(doc, o, "tf", d->from_test_file);
         add_str_array_or_null(doc, o, "dec", d->decorators, -1);
         yyjson_mut_arr_add_val(lsp, o);
     }
@@ -256,6 +257,8 @@ int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLS
         d->trait_qn = arena_str_or_null(arena, yyjson_obj_get(o, "tq"));
         d->is_rust_impl_relation = yyjson_get_bool(yyjson_obj_get(o, "ir"));
         d->is_abstract = yyjson_get_bool(yyjson_obj_get(o, "ab"));
+        /* Absent on pre-"tf" surfaces → false, matching the old behavior. */
+        d->from_test_file = yyjson_get_bool(yyjson_obj_get(o, "tf"));
         int dec_count = 0;
         d->decorators = arena_str_array(arena, yyjson_obj_get(o, "dec"), true, &dec_count);
         if (!d->qualified_name || !d->short_name || !d->label) {

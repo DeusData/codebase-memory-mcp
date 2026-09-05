@@ -895,16 +895,69 @@ static const CBMType *eval_field_access(JavaLSPContext *ctx, TSNode node) {
     return cbm_type_unknown();
 }
 
-/* Lookup a field's type on a class, walking the parent chain. */
+/* Bounded BFS frontier over ALL supertypes (JLS 8.4.8: member lookup searches
+ * the superclass AND every superinterface — the old single-path walk followed
+ * embedded_types[0] only, so `class Impl extends B implements Greeter, Closer`
+ * never reached Greeter's defaults or Closer's members). Level order keeps the
+ * class chain (embedded_types[0] = extends clause when present) ahead of
+ * interfaces at equal depth, so class-chain hits stay most-specific-first.
+ * Mirrors the C# frontier walk (cs_lsp.c) and the Kotlin queue. */
+typedef struct {
+    const char *frontier[JAVA_LSP_MAX_INHERIT_HOPS];
+    const char *visited[JAVA_LSP_MAX_INHERIT_HOPS];
+    int head;
+    int tail;
+    int visited_count;
+} JavaParentWalk;
+
+static void java_walk_init(JavaParentWalk *w, const char *start_qn) {
+    w->head = 0;
+    w->tail = 0;
+    w->visited_count = 0;
+    if (start_qn)
+        w->frontier[w->tail++] = start_qn;
+}
+
+/* Pop the next unvisited QN, or NULL when the frontier is exhausted. */
+static const char *java_walk_next(JavaParentWalk *w) {
+    while (w->head < w->tail) {
+        const char *cur = w->frontier[w->head++];
+        bool seen = false;
+        for (int v = 0; v < w->visited_count; v++) {
+            if (strcmp(w->visited[v], cur) == 0) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen)
+            continue;
+        if (w->visited_count >= JAVA_LSP_MAX_INHERIT_HOPS)
+            return NULL;
+        w->visited[w->visited_count++] = cur;
+        return cur;
+    }
+    return NULL;
+}
+
+static void java_walk_push_parents(JavaParentWalk *w, const CBMRegisteredType *rt) {
+    if (!rt || !rt->embedded_types)
+        return;
+    for (int i = 0; rt->embedded_types[i] && w->tail < JAVA_LSP_MAX_INHERIT_HOPS; i++) {
+        w->frontier[w->tail++] = rt->embedded_types[i];
+    }
+}
+
+/* Lookup a field's type on a class, walking ALL supertypes breadth-first. */
 const CBMType *java_lookup_field_type(JavaLSPContext *ctx, const char *class_qn,
                                       const char *field_name) {
     if (!class_qn || !field_name)
         return cbm_type_unknown();
-    const char *cur = class_qn;
-    for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
+    JavaParentWalk w;
+    java_walk_init(&w, class_qn);
+    for (const char *cur = java_walk_next(&w); cur; cur = java_walk_next(&w)) {
         const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
         if (!rt)
-            break;
+            continue;
         if (rt->field_names && rt->field_types) {
             for (int i = 0; rt->field_names[i]; i++) {
                 if (strcmp(rt->field_names[i], field_name) == 0) {
@@ -912,11 +965,7 @@ const CBMType *java_lookup_field_type(JavaLSPContext *ctx, const char *class_qn,
                 }
             }
         }
-        if (rt->embedded_types && rt->embedded_types[0]) {
-            cur = rt->embedded_types[0];
-        } else {
-            cur = NULL;
-        }
+        java_walk_push_parents(&w, rt);
     }
     return cbm_type_unknown();
 }
@@ -945,26 +994,20 @@ const CBMRegisteredFunc *java_lookup_method(JavaLSPContext *ctx, const char *cla
                                             const char *method_name, int arg_count) {
     if (!class_qn || !method_name)
         return NULL;
-    const char *cur = class_qn;
+    JavaParentWalk w;
+    java_walk_init(&w, class_qn);
     const CBMRegisteredFunc *fallback = NULL;
-    for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur; hops++) {
+    for (const char *cur = java_walk_next(&w); cur; cur = java_walk_next(&w)) {
         /* Try arg-count-aware lookup first. */
         const CBMRegisteredFunc *m =
             cbm_registry_lookup_method_by_args(ctx->registry, cur, method_name, arg_count);
         if (m)
             return m;
-        /* Otherwise capture any name match as fallback. */
+        /* Otherwise capture the nearest name match as fallback. */
         if (!fallback) {
             fallback = cbm_registry_lookup_method(ctx->registry, cur, method_name);
         }
-        const CBMRegisteredType *rt = cbm_registry_lookup_type(ctx->registry, cur);
-        if (!rt)
-            break;
-        if (rt->embedded_types && rt->embedded_types[0]) {
-            cur = rt->embedded_types[0];
-        } else {
-            cur = NULL;
-        }
+        java_walk_push_parents(&w, cbm_registry_lookup_type(ctx->registry, cur));
     }
     return fallback;
 }
@@ -1915,25 +1958,30 @@ static const char *java_find_sole_impl(JavaLSPContext *ctx, const char *iface_qn
          * `embedded_types` list a supertype sometimes by short name ("Shape")
          * and sometimes by full QN ("proj.Shape"); a full-QN-only comparison
          * silently misses the short-name form, so compare both. */
-        const char *cur = cand->qualified_name;
         bool subtype = false;
-        for (int hops = 0; hops < JAVA_LSP_MAX_INHERIT_HOPS && cur && !subtype; hops++) {
-            const CBMRegisteredType *ct = cbm_registry_lookup_type(ctx->registry, cur);
-            if (!ct || !ct->embedded_types)
-                break;
-            const char *next = NULL;
-            for (int pi = 0; ct->embedded_types[pi]; pi++) {
-                const char *e = ct->embedded_types[pi];
-                const char *edot = strrchr(e, '.');
-                const char *ebare = edot ? edot + 1 : e;
-                if (strcmp(e, iface_qn) == 0 || strcmp(ebare, iface_bare) == 0) {
-                    subtype = true;
-                    break;
+        {
+            /* Frontier over ALL supertypes: the old walk followed only the
+             * FIRST supertype per hop, missing `class C extends B implements
+             * Target` when Target is a later entry on some ancestor. */
+            JavaParentWalk w;
+            java_walk_init(&w, cand->qualified_name);
+            for (const char *cur = java_walk_next(&w); cur && !subtype;
+                 cur = java_walk_next(&w)) {
+                const CBMRegisteredType *ct = cbm_registry_lookup_type(ctx->registry, cur);
+                if (!ct || !ct->embedded_types)
+                    continue;
+                for (int pi = 0; ct->embedded_types[pi]; pi++) {
+                    const char *e = ct->embedded_types[pi];
+                    const char *edot = strrchr(e, '.');
+                    const char *ebare = edot ? edot + 1 : e;
+                    if (strcmp(e, iface_qn) == 0 || strcmp(ebare, iface_bare) == 0) {
+                        subtype = true;
+                        break;
+                    }
                 }
-                if (!next)
-                    next = e; /* first supertype → continue the walk upward */
+                if (!subtype)
+                    java_walk_push_parents(&w, ct);
             }
-            cur = next;
         }
         if (!subtype)
             continue;

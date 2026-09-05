@@ -133,6 +133,11 @@ bool cbm_is_test_func_name(const char *name) {
         (name[PT_TEST_LEN] == '\0' || (name[PT_TEST_LEN] >= 'A' && name[PT_TEST_LEN] <= 'Z'))) {
         return true;
     }
+    /* Go native fuzzing (1.18+): FuzzXxx, same shape rule as Test. */
+    if (strncmp(name, "Fuzz", SLEN("Fuzz")) == 0 &&
+        (name[PT_TEST_LEN] == '\0' || (name[PT_TEST_LEN] >= 'A' && name[PT_TEST_LEN] <= 'Z'))) {
+        return true;
+    }
     if (strncmp(name, "Benchmark", SLEN("Benchmark")) == 0 &&
         (name[PT_DESCRIBE_LEN] == '\0' ||
          (name[PT_DESCRIBE_LEN] >= 'A' && name[PT_DESCRIBE_LEN] <= 'Z'))) {

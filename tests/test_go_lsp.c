@@ -1433,6 +1433,79 @@ TEST(golsp_crossfile_local_interface_single_impl) {
     PASS();
 }
 
+TEST(golsp_crossfile_interface_skips_test_file_impls) {
+    /* A _test.go fake implementer must not ambiguate away the sole PRODUCTION
+     * implementer: with FakeStore carrying from_test_file, s.Get() still
+     * resolves to RedisStore.Get at sole-implementer confidence. The interface
+     * needs {Get, Put} like the sibling test above: a single-method {Get} set
+     * is also satisfied by stdlib types (net/http.Header, net/url.Values),
+     * which would ambiguate the scan regardless of the test-file gate. */
+    const char *source = "package main\n\n"
+                         "import \"myapp/svc\"\n\n"
+                         "func process(s svc.Store) {\n\ts.Get(\"key\")\n}\n";
+
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.process",
+         .short_name = "process",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "myapp/svc.Store",
+         .short_name = "Store",
+         .label = "Interface",
+         .def_module_qn = "myapp/svc",
+         .is_interface = true,
+         .method_names_str = "Get|Put"},
+        {.qualified_name = "myapp/svc.RedisStore",
+         .short_name = "RedisStore",
+         .label = "Class",
+         .def_module_qn = "myapp/svc"},
+        {.qualified_name = "myapp/svc.RedisStore.Get",
+         .short_name = "Get",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.RedisStore"},
+        {.qualified_name = "myapp/svc.RedisStore.Put",
+         .short_name = "Put",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.RedisStore"},
+        {.qualified_name = "myapp/svc.FakeStore",
+         .short_name = "FakeStore",
+         .label = "Class",
+         .def_module_qn = "myapp/svc",
+         .from_test_file = true},
+        {.qualified_name = "myapp/svc.FakeStore.Get",
+         .short_name = "Get",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.FakeStore",
+         .from_test_file = true},
+        {.qualified_name = "myapp/svc.FakeStore.Put",
+         .short_name = "Put",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.FakeStore",
+         .from_test_file = true},
+    };
+    const char *imp_names[] = {"svc"};
+    const char *imp_qns[] = {"myapp/svc"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 8, imp_names,
+                         imp_qns, 1, NULL, &out);
+
+    int idxGet = find_resolved_arr_confident(&out, "process", "Get");
+    ASSERT_GTE(idxGet, 0);
+    ASSERT_STR_EQ(out.items[idxGet].strategy, "lsp_interface_resolve");
+    ASSERT_STR_EQ(out.items[idxGet].callee_qn, "myapp/svc.RedisStore.Get");
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(go_lsp) {
@@ -1545,4 +1618,5 @@ SUITE(go_lsp) {
     RUN_TEST(golsp_crossfile_map_index);
     RUN_TEST(golsp_crossfile_stdlib_interface);
     RUN_TEST(golsp_crossfile_local_interface_single_impl);
+    RUN_TEST(golsp_crossfile_interface_skips_test_file_impls);
 }

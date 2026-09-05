@@ -207,7 +207,8 @@ static const char *py_import_from_types[] = {"import_from_statement", "future_im
                                              NULL};
 static const char *py_branch_types[] = {
     "if_statement",  "for_statement",  "while_statement", "try_statement",
-    "except_clause", "with_statement", "elif_clause",     NULL};
+    "except_clause", "with_statement", "elif_clause",     "match_statement",
+    "case_clause",   NULL};
 static const char *py_var_types[] = {"assignment", "augmented_assignment", NULL};
 static const char *py_throw_types[] = {"raise_statement", NULL};
 static const char *py_decorator_types[] = {"decorator", NULL};
@@ -1654,6 +1655,7 @@ static const char *mojo_import_types[] = {"import_statement", "import_from_state
                                           "future_import_statement", NULL};
 static const char *mojo_branch_types[] = {"if_statement",
                                           "match_statement",
+                                          "case_clause",
                                           "for_statement",
                                           "while_statement",
                                           "try_statement",

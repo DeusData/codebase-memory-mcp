@@ -55,6 +55,15 @@ typedef struct {
     const char **type_param_names; // NULL-terminated, e.g., ["T", "K", NULL] for template classes
     bool is_interface;
     bool is_object; // Kotlin `object`/`companion object` singleton (member calls are static)
+    /* Type is defined in a test file. Go's sole-implementer interface scan
+     * skips such candidates for production interfaces so test doubles never
+     * shadow the real implementer. */
+    bool from_test_file;
+    /* Type came from a generated stdlib table (cbm_<lang>_stdlib_register).
+     * Go's sole-implementer scan uses it to keep stdlib types (e.g. sync.Pool,
+     * which happens to have Get+Put) from ambiguating project interfaces —
+     * QN-shape heuristics ('/' in the QN) break for repos without a go.mod. */
+    bool is_stdlib;
 
     // --- TS-specific fields (NULL/empty for non-TS types — backward compatible) ---
     // TS interfaces / object types may be callable: `interface F { (x:number): string }`.

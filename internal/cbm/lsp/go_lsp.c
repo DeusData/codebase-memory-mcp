@@ -26,6 +26,19 @@ static void emit_resolved_call(GoLSPContext *ctx, const char *callee_qn, const c
                                float confidence, TSNode site);
 static const char *go_exact_callable_target(GoLSPContext *ctx, TSNode node);
 static const CBMType* go_lookup_field(GoLSPContext* ctx, const char* type_qn, const char* field_name, int depth);
+static const CBMRegisteredFunc* go_iface_sole_impl_method(const CBMTypeRegistry* reg,
+                                                          const char* iface_qn,
+                                                          const char* method_name);
+
+/* Stamp every type registered so far as stdlib. Called immediately after each
+ * cbm_go_stdlib_register() — project defs register afterwards and stay
+ * unmarked, giving the sole-implementer scan a real stdlib signal instead of
+ * the old '/'-in-QN heuristic (which broke for repos without a go.mod). */
+static void go_mark_stdlib_types(CBMTypeRegistry* reg) {
+    for (int i = 0; i < reg->type_count; i++) {
+        reg->types[i].is_stdlib = true;
+    }
+}
 static void extract_type_params_from_ast(CBMArena* arena, CBMTypeRegistry* reg,
     TSNode root, const char* source, const char* module_qn);
 
@@ -1538,58 +1551,20 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                                 }
                             }
                             if (is_iface) {
-                                // Try interface satisfaction: find concrete types implementing this interface
-                                const CBMRegisteredType* iface_rt = iface_qn ?
-                                    cbm_registry_lookup_type(ctx->registry, iface_qn) : NULL;
-                                if (iface_rt && iface_rt->method_names && iface_rt->method_names[0]) {
-                                    // Count interface methods
-                                    int iface_mcount = 0;
-                                    while (iface_rt->method_names[iface_mcount]) iface_mcount++;
-
-                                    // Scan all registered types for satisfaction
-                                    const char* sole_impl_qn = NULL;
-                                    int impl_count = 0;
-                                    // Skip stdlib types when interface is from a project package
-                                    bool iface_is_project = iface_qn && strchr(iface_qn, '/') != NULL;
-                                    for (int ti = 0; ti < ctx->registry->type_count && impl_count < 2; ti++) {
-                                        const CBMRegisteredType* cand = &ctx->registry->types[ti];
-                                        if (cand->is_interface) continue;
-                                        if (!cand->qualified_name) continue;
-                                        if (cand->alias_of) continue;
-                                        // For project interfaces, skip stdlib candidates (no '/' in QN)
-                                        if (iface_is_project && !strchr(cand->qualified_name, '/')) continue;
-
-                                        // Check if candidate has all interface methods
-                                        bool satisfies = true;
-                                        for (int mi = 0; mi < iface_mcount; mi++) {
-                                            if (!cbm_registry_lookup_method(ctx->registry,
-                                                    cand->qualified_name, iface_rt->method_names[mi])) {
-                                                satisfies = false;
-                                                break;
-                                            }
-                                        }
-                                        if (satisfies) {
-                                            sole_impl_qn = cand->qualified_name;
-                                            impl_count++;
-                                        }
-                                    }
-
-                                    if (impl_count == 1 && sole_impl_qn) {
-                                        // Single implementer: resolve to concrete method
-                                        const CBMRegisteredFunc* concrete_method =
-                                            cbm_registry_lookup_method(ctx->registry, sole_impl_qn, field_name);
-                                        if (concrete_method) {
-                                            // Sole-implementer interface dispatch is an unambiguous
-                                            // resolution (exactly one concrete method); rank it at least
-                                            // as high as a direct type dispatch (0.95) so the concrete
-                                            // `Type.method` wins over the interface-method type_dispatch
-                                            // for the same call site.
-                                            emit_resolved_call(ctx, concrete_method->qualified_name,
-                                                               "lsp_interface_resolve", 0.95f,
-                                                               node);
-                                            goto recurse;
-                                        }
-                                    }
+                                // Try interface satisfaction via the shared sole-implementer
+                                // scan (go_iface_sole_impl_method — also used by the Tier-3
+                                // fast resolver so the two paths stay in sync).
+                                const CBMRegisteredFunc* concrete_method =
+                                    go_iface_sole_impl_method(ctx->registry, iface_qn, field_name);
+                                if (concrete_method) {
+                                    // Sole-implementer interface dispatch is an unambiguous
+                                    // resolution (exactly one concrete method); rank it at least
+                                    // as high as a direct type dispatch (0.95) so the concrete
+                                    // `Type.method` wins over the interface-method type_dispatch
+                                    // for the same call site.
+                                    emit_resolved_call(ctx, concrete_method->qualified_name,
+                                                       "lsp_interface_resolve", 0.95f, node);
+                                    goto recurse;
                                 }
 
                                 // Fallback: generic interface dispatch
@@ -2067,6 +2042,7 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
 
     // Register Go stdlib types/functions
     cbm_go_stdlib_register(&reg, arena);
+    go_mark_stdlib_types(&reg);
 
     const char* module_qn = result->module_qn;
 
@@ -2192,6 +2168,11 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                     memset(&auto_type, 0, sizeof(auto_type));
                     auto_type.qualified_name = rf.receiver_type;
                     auto_type.short_name = dot ? dot + 1 : rf.receiver_type;
+                    /* Inherit the def's test origin: an auto-created entry can
+                     * PRECEDE (and thus shadow) the explicit type def's entry,
+                     * so an unflagged auto-create would let a _test.go double
+                     * ambiguate the sole-implementer scan. */
+                    auto_type.from_test_file = d->is_test;
                     cbm_registry_add_type(&reg, auto_type);
                 }
             }
@@ -2966,6 +2947,7 @@ void cbm_run_go_lsp_cross(
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_go_stdlib_register(&reg, arena);
+    go_mark_stdlib_types(&reg);
 
     // Register all defs (file-local + cross-file).
     // Perf: borrow strings from defs[] directly — they live in the
@@ -2986,6 +2968,7 @@ void cbm_run_go_lsp_cross(
             rt.qualified_name = d->qualified_name;  // borrowed
             rt.short_name = d->short_name;          // borrowed
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
+            rt.from_test_file = d->from_test_file;
             rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
 
             // Set method_names for interfaces from "|"-separated string
@@ -3026,6 +3009,9 @@ void cbm_run_go_lsp_cross(
                     auto_type.qualified_name = rf.receiver_type;
                     const char* dot = strrchr(d->receiver_type, '.');
                     auto_type.short_name = dot ? dot + 1 : rf.receiver_type;  // borrowed substring
+                    // Inherit test origin — an unflagged auto-create can shadow
+                    // the flagged explicit def and break the sole-impl gate.
+                    auto_type.from_test_file = d->from_test_file;
                     cbm_registry_add_type(&reg, auto_type);
                 }
             }
@@ -3224,6 +3210,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
     if (!reg) return NULL;
     cbm_registry_init(reg, arena);
     cbm_go_stdlib_register(reg, arena);
+    go_mark_stdlib_types(reg);
 
     for (int i = 0; i < def_count; i++) {
         CBMLSPDef* d = &defs[i];
@@ -3243,6 +3230,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
             rt.qualified_name = d->qualified_name; /* borrowed */
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
+            rt.from_test_file = d->from_test_file;
             rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = split_pipe_strings(arena, d->method_names_str);
@@ -3273,6 +3261,9 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
                     auto_type.qualified_name = rf.receiver_type;
                     const char* dot = strrchr(d->receiver_type, '.');
                     auto_type.short_name = dot ? dot + 1 : rf.receiver_type;
+                    // Inherit test origin — an unflagged auto-create can shadow
+                    // the flagged explicit def and break the sole-impl gate.
+                    auto_type.from_test_file = d->from_test_file;
                     cbm_registry_add_type(reg, auto_type);
                 }
             }
@@ -3324,6 +3315,63 @@ void cbm_run_go_lsp_cross_with_registry(
         ts_tree_delete(tree);
         if (parser) ts_parser_delete(parser);
     }
+}
+
+/* When (iface_qn, method_name) names an interface's own method, return the
+ * method on the interface's SOLE concrete implementer, or NULL when no
+ * unambiguous upgrade exists. Skips alias entries, stdlib candidates for
+ * project interfaces, and test-file candidates for non-test interfaces (test
+ * doubles must not shadow or ambiguate the production implementer). Shared by
+ * the per-file interface-dispatch branch and the Tier-3 fast resolver so the
+ * two paths cannot drift apart again. */
+static const CBMRegisteredFunc* go_iface_sole_impl_method(
+    const CBMTypeRegistry* reg, const char* iface_qn, const char* method_name) {
+    const CBMRegisteredType* iface_rt =
+        iface_qn ? cbm_registry_lookup_type(reg, iface_qn) : NULL;
+    if (!iface_rt || !iface_rt->is_interface || !iface_rt->method_names ||
+        !iface_rt->method_names[0] || !method_name)
+        return NULL;
+    int iface_mcount = 0;
+    while (iface_rt->method_names[iface_mcount]) iface_mcount++;
+
+    /* Single-method interfaces are structurally satisfied by ANY type carrying
+     * a same-named method (a `Client{Ping}` alias is "implemented" by an
+     * unrelated Svc.Ping), so a sole-implementer upgrade on them routinely
+     * hijacks calls to the wrong concrete type. Require a >=2-method signature
+     * before claiming an unambiguous implementer; io.Reader-alikes keep the
+     * interface-dispatch fallback. */
+    if (iface_mcount < 2)
+        return NULL;
+
+    const char* sole_impl_qn = NULL;
+    int impl_count = 0;
+    /* For project interfaces, skip stdlib candidates: sync.Pool (Get+Put) and
+     * friends must never ambiguate a project interface. The is_stdlib marker
+     * replaces the old '/'-in-QN heuristic, which broke for repos without a
+     * go.mod (their QNs carry no '/' either). */
+    bool iface_is_project = !iface_rt->is_stdlib;
+    for (int ti = 0; ti < reg->type_count && impl_count < 2; ti++) {
+        const CBMRegisteredType* cand = &reg->types[ti];
+        if (cand->is_interface) continue;
+        if (!cand->qualified_name) continue;
+        if (cand->alias_of) continue;
+        if (iface_is_project && cand->is_stdlib) continue;
+        if (cand->from_test_file && !iface_rt->from_test_file) continue;
+        bool satisfies = true;
+        for (int mi = 0; mi < iface_mcount; mi++) {
+            if (!cbm_registry_lookup_method(reg, cand->qualified_name,
+                                            iface_rt->method_names[mi])) {
+                satisfies = false;
+                break;
+            }
+        }
+        if (satisfies) {
+            sole_impl_qn = cand->qualified_name;
+            impl_count++;
+        }
+    }
+    if (impl_count != 1 || !sole_impl_qn) return NULL;
+    return cbm_registry_lookup_method(reg, sole_impl_qn, method_name);
 }
 
 /* ── Tier 3: AST-walk-free metadata-driven cross-file resolver ────
@@ -3412,6 +3460,20 @@ int cbm_go_fast_resolve_qualified_calls(
         }
 
         if (!f) continue;
+
+        /* Interface-method hit: without this the graph edge stops at the
+         * interface's own method node. Upgrade to the sole concrete
+         * implementer when the registry (interface method sets folded from
+         * cross defs) proves the dispatch unambiguous — the Tier-3 twin of
+         * the per-file lsp_interface_resolve branch. */
+        if (f->receiver_type) {
+            const CBMRegisteredType* frt = cbm_registry_lookup_type(reg, f->receiver_type);
+            if (frt && frt->is_interface) {
+                const CBMRegisteredFunc* up =
+                    go_iface_sole_impl_method(reg, frt->qualified_name, f->short_name);
+                if (up) f = up;
+            }
+        }
 
         /* Emit a resolved entry. cbm_pipeline_find_lsp_resolution
          * picks the highest-confidence match, so the unresolved entry

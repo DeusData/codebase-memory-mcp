@@ -377,6 +377,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     if (!label || !src->qualified_name || !src->name)
         return -1;
     memset(dst, 0, sizeof(*dst));
+    /* Def-level is_test flows from cbm_is_test_file at extraction, so every
+     * def in a _test.go (or other test file) carries it. Go's interface
+     * satisfaction scan consumes the bit to keep test doubles from shadowing
+     * production implementers. */
+    dst->from_test_file = src->is_test;
     if (pxc_is_jvm_lang(lang) && namespace_name && namespace_name[0]) {
         dst->qualified_name = pxc_jvm_def_qn(arena, src, namespace_name, label);
         dst->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src->parent_class);
@@ -480,6 +485,70 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
     }
 }
 
+/* Go: fold interface Method defs into their owning interface's
+ * method_names_str ("Get|Put"). Interface methods exist as flat Method defs
+ * (method_elem is in go_func_types) with parent_class = the interface QN and
+ * always live in the interface's own file, so the file-local scan mirrors
+ * pxc_fold_go_struct_fields above. Without this fold, cross-file registries
+ * see interfaces with an empty method set and the sole-implementer branch
+ * (go_lsp.c lsp_interface_resolve, 0.95) never fires on the production
+ * Tier-2/per-file cross paths — only the 0.85 lsp_interface_dispatch
+ * fallback. */
+static void pxc_fold_go_interface_methods(CBMArena *arena, const CBMFileResult *result,
+                                          CBMLSPDef *defs, int start, int end) {
+    if (!arena || !result || !defs || start >= end) {
+        return;
+    }
+    for (int si = start; si < end; si++) {
+        CBMLSPDef *dst = &defs[si];
+        if (!dst->label || strcmp(dst->label, "Interface") != 0 || !dst->qualified_name) {
+            continue;
+        }
+        if (dst->method_names_str && dst->method_names_str[0]) {
+            continue; /* already carried (e.g. surface round-trip) */
+        }
+        int count = 0;
+        size_t total = 0; /* name bytes; separators and NUL added below */
+        for (int di = 0; di < result->defs.count; di++) {
+            const CBMDefinition *md = &result->defs.items[di];
+            if (!md->label || !md->parent_class || !md->name || !md->name[0] ||
+                strcmp(md->label, "Method") != 0 ||
+                strcmp(md->parent_class, dst->qualified_name) != 0) {
+                continue;
+            }
+            total += strlen(md->name);
+            count++;
+        }
+        if (count == 0) {
+            continue;
+        }
+        size_t bufsz = total + (size_t)(count - 1) + 1;
+        char *buf = (char *)cbm_arena_alloc(arena, bufsz);
+        if (!buf) {
+            continue;
+        }
+        char *p = buf;
+        int written = 0;
+        for (int di = 0; di < result->defs.count; di++) {
+            const CBMDefinition *md = &result->defs.items[di];
+            if (!md->label || !md->parent_class || !md->name || !md->name[0] ||
+                strcmp(md->label, "Method") != 0 ||
+                strcmp(md->parent_class, dst->qualified_name) != 0) {
+                continue;
+            }
+            size_t n = strlen(md->name);
+            memcpy(p, md->name, n);
+            p += n;
+            if (written + 1 < count) {
+                *p++ = '|';
+            }
+            written++;
+        }
+        *p = '\0';
+        dst->method_names_str = buf;
+    }
+}
+
 /* Carry one Rust type-level impl independently of any method definition.
  * `impl Trait for Type {}` is semantically meaningful even when the block is
  * empty (the trait may provide defaults), so attaching the relation only to
@@ -580,6 +649,7 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
             pxc_fold_go_struct_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx);
+            pxc_fold_go_interface_methods(&cache[fi]->arena, cache[fi], defs, file_start, idx);
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < cache[fi]->impl_traits.count; ii++) {

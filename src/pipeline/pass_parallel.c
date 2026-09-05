@@ -1548,12 +1548,23 @@ static bool is_path_keyword(const char *keyword) {
     return false;
 }
 
-static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
+static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler,
+                                           const char **out_method) {
     *out_handler = NULL;
+    *out_method = NULL;
     /* 1. First string arg starting with / */
-    if (call->first_string_arg && call->first_string_arg[0] == '/') {
-        *out_handler = call->second_arg_name;
-        return call->first_string_arg;
+    if (call->first_string_arg) {
+        if (call->first_string_arg[0] == '/') {
+            *out_handler = call->second_arg_name;
+            return call->first_string_arg;
+        }
+        /* Go 1.22 ServeMux "METHOD /path" literals: the literal-embedded
+         * method outranks the callee-suffix ANY of .Handle/.HandleFunc. */
+        const char *mux_path = cbm_go_split_mux_pattern(call->first_string_arg, out_method);
+        if (mux_path) {
+            *out_handler = call->second_arg_name;
+            return mux_path;
+        }
     }
     /* 2. Keyword args (prefix=, path=, route=, etc.) */
     const char *found = NULL;
@@ -1701,10 +1712,12 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
 /* Create Route node + CALLS + HANDLES edges for a route registration call. */
 static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                     const CBMCall *call, const char *route_path,
-                                    const char *handler_ref, const char *module_qn,
-                                    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                                    const char **ik, const char **iv, int ic) {
-    const char *method = cbm_service_pattern_route_method(call->callee_name);
+                                    const char *handler_ref, const char *method_lit,
+                                    const char *module_qn, const cbm_registry_t *registry,
+                                    const cbm_gbuf_t *main_gbuf, const char **ik, const char **iv,
+                                    int ic) {
+    const char *method =
+        method_lit ? method_lit : cbm_service_pattern_route_method(call->callee_name);
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(rqn, sizeof(rqn), "__route__%s__%s", method ? method : "ANY",
@@ -2025,6 +2038,19 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         svc = CBM_SVC_ROUTE_REG;
     }
 
+    /* Go 1.22 ServeMux "METHOD /path" literals: the resolved QN classifies
+     * net/http surfaces as an HTTP *client* library, but a method-qualified
+     * mux pattern is unambiguously a server-side registration — no HTTP
+     * client passes "GET /x" as its URL. Reclassify before the client branch
+     * would swallow (and then drop) it. */
+    if (svc == CBM_SVC_HTTP && cbm_service_pattern_route_method(call->callee_name) != NULL &&
+        call->first_string_arg) {
+        const char *mux_method_probe = NULL;
+        if (cbm_go_split_mux_pattern(call->first_string_arg, &mux_method_probe)) {
+            svc = CBM_SVC_ROUTE_REG;
+        }
+    }
+
     /* Detect gRPC stub method calls by resolved QN.
      * Go pattern: pb.NewCartServiceClient(conn).GetCart(ctx, req)
      * Tree-sitter extracts GetCart as the callee, which resolves to the
@@ -2039,10 +2065,11 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
-        const char *route_path = find_route_path_in_args(call, &handler_ref);
+        const char *route_method = NULL;
+        const char *route_path = find_route_path_in_args(call, &handler_ref, &route_method);
         if (route_path) {
-            emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
-                                    registry, main_gbuf, imp_keys, imp_vals, imp_count);
+            emit_route_registration(gbuf, source, call, route_path, handler_ref, route_method,
+                                    module_qn, registry, main_gbuf, imp_keys, imp_vals, imp_count);
             return;
         }
         /* No path found — fall through to normal CALLS edge */
