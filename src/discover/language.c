@@ -214,9 +214,14 @@ static const ext_entry_t EXT_TABLE[] = {
     {".ml", CBM_LANG_OCAML},
     {".mli", CBM_LANG_OCAML},
 
-    /* Perl */
+    /* Perl. .t is the CPAN test-harness suffix and .psgi the PSGI app entry —
+     * both usually lack shebangs, so the shebang fallback never catches them
+     * (GitHub-linguist maps both to Perl). .cgi is intentionally NOT mapped:
+     * runnable CGI scripts require a shebang, which already routes them. */
     {".pl", CBM_LANG_PERL},
     {".pm", CBM_LANG_PERL},
+    {".t", CBM_LANG_PERL},
+    {".psgi", CBM_LANG_PERL},
 
     /* PHP */
     {".php", CBM_LANG_PHP},

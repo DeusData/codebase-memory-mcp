@@ -858,6 +858,48 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
     return NULL;
 }
 
+const char *cbm_go_split_mux_pattern(const char *literal, const char **out_method) {
+    if (out_method) {
+        *out_method = NULL;
+    }
+    if (!literal || !literal[0]) {
+        return NULL;
+    }
+    /* Methods net/http accepts in a pattern; returned strings are static so
+     * callers may hold them past this call. */
+    static const char *const mux_methods[] = {"GET",     "POST",    "PUT",   "DELETE", "PATCH",
+                                              "HEAD",    "OPTIONS", "CONNECT", "TRACE", NULL};
+    for (int i = 0; mux_methods[i] != NULL; i++) {
+        size_t mlen = strlen(mux_methods[i]);
+        if (strncmp(literal, mux_methods[i], mlen) != 0 || literal[mlen] != ' ') {
+            continue;
+        }
+        const char *rest = literal + mlen;
+        while (*rest == ' ') {
+            rest++;
+        }
+        if (*rest == '\0') {
+            return NULL;
+        }
+        const char *slash = strchr(rest, '/');
+        if (!slash) {
+            return NULL;
+        }
+        /* A host prefix must be one token — any space before the '/' means
+         * this is prose, not a mux pattern. */
+        for (const char *p = rest; p < slash; p++) {
+            if (*p == ' ') {
+                return NULL;
+            }
+        }
+        if (out_method) {
+            *out_method = mux_methods[i];
+        }
+        return slash;
+    }
+    return NULL;
+}
+
 const char *cbm_service_pattern_broker(const char *resolved_qn) {
     if (!resolved_qn) {
         return NULL;

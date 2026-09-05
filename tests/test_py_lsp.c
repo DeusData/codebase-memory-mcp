@@ -2159,6 +2159,43 @@ TEST(pylsp_eval_steps_budget_degrades_gracefully) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* ── Parameterized user-class annotations (Box[T] / Repository[User]) ── */
+
+TEST(pylsp_generic_user_class_receiver) {
+    /* A parameterized USER class annotation must qualify its base so the
+     * method call on the receiver resolves — the dominant typed-repo idiom
+     * (repository/service generics). */
+    const char *src = "class Box:\n"
+                      "    def get(self):\n"
+                      "        return 1\n"
+                      "\n"
+                      "def use(b: Box[int]):\n"
+                      "    return b.get()\n";
+    CBMFileResult *r = extract_py(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "use", "Box.get") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pylsp_generic_builtin_base_not_qualified) {
+    /* Stdlib generic bases must stay bare: list[Box].append still resolves on
+     * builtins.list, never on a module-qualified 'list' class. */
+    const char *src = "class Box:\n"
+                      "    def get(self):\n"
+                      "        return 1\n"
+                      "\n"
+                      "def n(x: list[Box]):\n"
+                      "    x.append(1)\n";
+    CBMFileResult *r = extract_py(src);
+    ASSERT(r);
+    int idx = require_resolved(r, "n", "append");
+    ASSERT(idx >= 0);
+    ASSERT(strstr(r->resolved_calls.items[idx].callee_qn, "list") != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(py_lsp) {
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
@@ -2252,4 +2289,7 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_issue710_deep_call_chain_resolves);
     RUN_TEST(pylsp_issue710_heterogeneous_receiver_chain);
     RUN_TEST(pylsp_eval_steps_budget_degrades_gracefully);
+    /* Parameterized user-class annotations */
+    RUN_TEST(pylsp_generic_user_class_receiver);
+    RUN_TEST(pylsp_generic_builtin_base_not_qualified);
 }

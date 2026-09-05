@@ -94,6 +94,10 @@ typedef struct {
     const char *trait_qn;
     bool is_rust_impl_relation; // independent type-level impl record (empty impls survive)
     bool is_abstract;           // Rust required trait method; false for defaults
+    /* Def originates in a test file (def-level is_test flows from
+     * cbm_is_test_file at extraction). Go's sole-implementer interface scan
+     * uses it so test doubles never shadow the production implementer. */
+    bool from_test_file;
     /* Python-only raw decorator syntax, borrowed from CBMDefinition.  The
      * resolver must retain it across fused/cross-file registry construction:
      * a decorator rebinds the function name, so the undecorated definition is

@@ -4617,6 +4617,37 @@ TEST(complexity_loop_with_branch) {
     PASS();
 }
 
+/* Python 3.10 match/case must count toward cyclomatic complexity (both the
+ * match_statement and each case_clause, mirroring the JS switch convention) —
+ * previously match-heavy code under-reported. */
+TEST(complexity_python_match_counts) {
+    CBMFileResult *r = extract("def route(x):\n"
+                               "    match x:\n"
+                               "        case 1:\n"
+                               "            return 'one'\n"
+                               "        case 2:\n"
+                               "            return 'two'\n"
+                               "        case _:\n"
+                               "            return 'other'\n"
+                               "\n"
+                               "def flat(x):\n"
+                               "    return x\n",
+                               CBM_LANG_PYTHON, "t", "m.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *d = find_def(r, "route");
+    ASSERT_NOT_NULL(d);
+    /* base 1 + match_statement + 3 case clauses = 5; assert > 3 to stay robust
+     * to whether the wildcard arm counts. */
+    ASSERT_GT(d->complexity, 3);
+    const CBMDefinition *f = find_def(r, "flat");
+    ASSERT_NOT_NULL(f);
+    /* This engine counts branches only (no +1 cyclomatic base). */
+    ASSERT_EQ(f->complexity, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(complexity_flat_no_loops) {
     CBMFileResult *r = extract("package p\n"
                                "func flat() {\n"
@@ -4998,6 +5029,157 @@ TEST(extract_perl_method_call_flags_is_method) {
     ASSERT_TRUE(commit_calls >= 1);
     /* (d) genuine intra-file function call still extracted. */
     ASSERT_TRUE(count_calls_exact(r, "helper") >= 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* CPAN test layout: .t files under t/ must index as Perl AND carry the is_test flag
+ * (file-level and def-level), so the whole suite of a conventional Perl distro
+ * becomes visible to TESTS-edge detection. xt/ (author tests) likewise; lib/
+ * modules must stay non-test. */
+TEST(extract_perl_t_file_is_test) {
+    CBMFileResult *r = extract("use Test::More;\n"
+                               "use MyLib;\n"
+                               "ok(MyLib::add(1, 1) == 2, 'adds');\n"
+                               "done_testing();\n",
+                               CBM_LANG_PERL, "proj", "t/basic.t");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->is_test_file);
+    cbm_free_result(r);
+
+    r = extract("use Test::More;\nok(1);\ndone_testing();\n", CBM_LANG_PERL, "proj",
+                "xt/author-pod.t");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->is_test_file);
+    cbm_free_result(r);
+
+    r = extract("package MyLib;\nsub add { return $_[0] + $_[1]; }\n1;\n", CBM_LANG_PERL, "proj",
+                "lib/MyLib.pm");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->is_test_file);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Calls inside a generic impl must attribute to the STRIPPED receiver QN
+ * (Stack.push, matching the def side which strips `<T>`), not Stack<T>.push —
+ * otherwise pass_calls finds no caller node and attributes them to the File. */
+TEST(extract_rust_generic_impl_caller_qn) {
+    CBMFileResult *r = extract("struct Stack<T> { v: Vec<T> }\n"
+                               "fn helper() {}\n"
+                               "impl<T> Stack<T> {\n"
+                               "    fn push(&mut self, x: T) { helper(); }\n"
+                               "}\n",
+                               CBM_LANG_RUST, "t", "src/stack.rs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool caller_ok = false;
+    const char *seen = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || strcmp(c->callee_name, "helper") != 0)
+            continue;
+        seen = c->enclosing_func_qn;
+        if (c->enclosing_func_qn && strstr(c->enclosing_func_qn, "Stack.push") &&
+            !strchr(c->enclosing_func_qn, '<'))
+            caller_ok = true;
+    }
+    if (!caller_ok) {
+        printf("  helper() call enclosing_func_qn=%s (want ...Stack.push, no '<')\n",
+               seen ? seen : "(none)");
+    }
+    ASSERT_TRUE(caller_ok);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Go 1.22 mux-route ingredients contract: the pipeline's route gates key on
+ * callee_name carrying the ".HandleFunc" suffix, first_string_arg holding the
+ * UNQUOTED "METHOD /path" literal, and second_arg_name naming the handler.
+ * If any shape drifts, every route gate silently stops firing — pin it. */
+TEST(extract_go_mux_call_ingredients) {
+    CBMFileResult *r = extract("package main\n\n"
+                               "import \"net/http\"\n\n"
+                               "func getUser(w http.ResponseWriter, r *http.Request) {}\n\n"
+                               "func main() {\n"
+                               "\tmux := http.NewServeMux()\n"
+                               "\tmux.HandleFunc(\"GET /users/{id}\", getUser)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "main.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *hit = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strstr(c->callee_name, "HandleFunc")) {
+            hit = c;
+            break;
+        }
+    }
+    if (!hit || !hit->first_string_arg || strcmp(hit->first_string_arg, "GET /users/{id}") != 0 ||
+        !hit->second_arg_name || strcmp(hit->second_arg_name, "getUser") != 0 ||
+        strcmp(hit->callee_name, "mux.HandleFunc") != 0) {
+        printf("  mux call shapes:\n");
+        for (int i = 0; i < r->calls.count; i++) {
+            const CBMCall *c = &r->calls.items[i];
+            printf("    callee=%s fsa=%s second=%s\n", c->callee_name ? c->callee_name : "-",
+                   c->first_string_arg ? c->first_string_arg : "-",
+                   c->second_arg_name ? c->second_arg_name : "-");
+        }
+    }
+    ASSERT_NOT_NULL(hit);
+    ASSERT_STR_EQ(hit->callee_name, "mux.HandleFunc");
+    ASSERT_NOT_NULL(hit->first_string_arg);
+    ASSERT_STR_EQ(hit->first_string_arg, "GET /users/{id}");
+    ASSERT_NOT_NULL(hit->second_arg_name);
+    ASSERT_STR_EQ(hit->second_arg_name, "getUser");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Go interface members: `type Store interface { Get(...) }` must yield a def
+ * labeled Interface for Store and Method defs for its members whose
+ * parent_class is the interface's QN — the contract pxc_fold_go_interface_
+ * methods (pass_lsp_cross.c) builds interface method sets from. */
+TEST(extract_go_interface_method_parent) {
+    CBMFileResult *r = extract("package main\n\n"
+                               "type Store interface {\n"
+                               "\tGet(id string) string\n"
+                               "\tPut(id string, v string)\n"
+                               "}\n",
+                               CBM_LANG_GO, "t", "store.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    bool iface_ok = false;
+    bool get_ok = false;
+    const char *get_parent = NULL;
+    const char *get_label = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "Store") == 0 && d->label &&
+            strcmp(d->label, "Interface") == 0)
+            iface_ok = true;
+        if (d->name && strcmp(d->name, "Get") == 0) {
+            get_label = d->label;
+            get_parent = d->parent_class;
+            if (d->label && strcmp(d->label, "Method") == 0 && d->parent_class &&
+                strstr(d->parent_class, "Store"))
+                get_ok = true;
+        }
+    }
+    if (!iface_ok || !get_ok) {
+        printf("  iface_ok=%d get_ok=%d get_label=%s get_parent=%s; defs:\n", iface_ok, get_ok,
+               get_label ? get_label : "(none)", get_parent ? get_parent : "(none)");
+        for (int i = 0; i < r->defs.count; i++) {
+            const CBMDefinition *d = &r->defs.items[i];
+            printf("    %s label=%s qn=%s parent=%s\n", d->name ? d->name : "?",
+                   d->label ? d->label : "?", d->qualified_name ? d->qualified_name : "?",
+                   d->parent_class ? d->parent_class : "-");
+        }
+    }
+    ASSERT_TRUE(iface_ok);
+    ASSERT_TRUE(get_ok);
     cbm_free_result(r);
     PASS();
 }
@@ -6937,6 +7119,10 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_config_string_not_a_callee);
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
+    RUN_TEST(extract_perl_t_file_is_test);
+    RUN_TEST(extract_go_interface_method_parent);
+    RUN_TEST(extract_go_mux_call_ingredients);
+    RUN_TEST(extract_rust_generic_impl_caller_qn);
     RUN_TEST(extract_flag_exempt_method_call_not_flagged_is_method);
     RUN_TEST(extract_python_member_call_flags_is_method);
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
@@ -7275,6 +7461,7 @@ SUITE(extraction) {
     RUN_TEST(complexity_nested_loops_depth);
     RUN_TEST(complexity_loop_with_branch);
     RUN_TEST(complexity_flat_no_loops);
+    RUN_TEST(complexity_python_match_counts);
     RUN_TEST(complexity_linear_scan_in_loop);
     RUN_TEST(complexity_recursion_in_loop_unguarded);
     RUN_TEST(complexity_guarded_recursion);

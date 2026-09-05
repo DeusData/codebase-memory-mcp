@@ -5246,6 +5246,18 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     if (!type_text)
         return;
 
+    /* Strip generic args (`Stack<T>` → `Stack`) to match the def side
+     * (extract_defs strips them for Method QNs) and the registry (Phase A
+     * registers the stripped receiver). Without this, caller_qn from a
+     * generic impl reads Stack<T>.push while the graph node is Stack.push,
+     * so every call from such a method attributes to the File node. Blanket
+     * impls are unaffected: their type_text is a bare parameter like `T`. */
+    {
+        char *lt = strchr(type_text, '<');
+        if (lt)
+            *lt = '\0';
+    }
+
     /* Detect blanket impl: `impl<T: Trait> ForeignTrait for T { ... }`
      * where type_text is a name that appears in the impl's type
      * parameters. In that case the receiver isn't a concrete type — it's
@@ -5258,8 +5270,12 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     if (is_blanket) {
         char *tt = rust_node_text(ctx, trait_node);
-        if (tt)
+        if (tt) {
+            char *lt = strchr(tt, '<');
+            if (lt)
+                *lt = '\0'; /* `ForeignTrait<F>` → `ForeignTrait` */
             effective_recv = rust_resolve_path_expr(ctx, tt);
+        }
     } else {
         effective_recv = rust_resolve_path_expr(ctx, type_text);
     }
@@ -5273,8 +5289,32 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     if (!ts_node_is_null(trait_node) && !is_blanket) {
         char *tt = rust_node_text(ctx, trait_node);
-        if (tt)
+        if (tt) {
+            char *lt = strchr(tt, '<');
+            if (lt)
+                *lt = '\0'; /* `From<Foo>` → `From` so the trait QN is real */
             ctx->self_trait_qn = rust_resolve_path_expr(ctx, tt);
+        }
+    }
+
+    /* Chalk-lite: impl-level bounds (`impl<T: Display> Wrapper<T>` and the
+     * impl's where-clause) join the bound env exactly as fn-level bounds do in
+     * rust_process_function, so `t.to_string()` in any method of the impl
+     * dispatches through the bound trait. Restored on exit. */
+    int saved_impl_bound_count = ctx->type_param_bound_count;
+    {
+        TSNode tp_list = ts_node_child_by_field_name(impl_node, "type_parameters", 15);
+        if (!ts_node_is_null(tp_list)) {
+            char *tp_text = rust_node_text(ctx, tp_list);
+            if (tp_text)
+                rust_collect_bounds_from_text(ctx, tp_text);
+        }
+        TSNode where_clause = ts_node_child_by_field_name(impl_node, "where_clause", 12);
+        if (!ts_node_is_null(where_clause)) {
+            char *wt = rust_node_text(ctx, where_clause);
+            if (wt)
+                rust_collect_bounds_from_text(ctx, wt);
+        }
     }
 
     TSNode body = ts_node_child_by_field_name(impl_node, "body", 4);
@@ -5293,6 +5333,76 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     ctx->self_type_qn = saved_self;
     ctx->self_trait_qn = saved_trait;
+    ctx->type_param_bound_count = saved_impl_bound_count;
+}
+
+/* Walk a trait_item's default-method bodies (`trait T { fn d(&self) {...} }`).
+ * Required methods are function_signature_item nodes (no body) and are
+ * skipped naturally; defaults are function_item children. self binds to the
+ * trait's own QN so self.other() dispatches through the trait's method set,
+ * and caller_qn matches the def side (trait_item is a class type, so its
+ * function children are Methods with parent_class = the trait QN). */
+static void rust_process_trait_defaults(RustLSPContext *ctx, TSNode trait_node) {
+    TSNode name = ts_node_child_by_field_name(trait_node, "name", 4);
+    if (ts_node_is_null(name))
+        return;
+    char *tname = rust_node_text(ctx, name);
+    if (!tname || !tname[0])
+        return;
+    const char *trait_qn = rust_resolve_path_expr(ctx, tname);
+    if (!trait_qn)
+        return;
+
+    const char *saved_self = ctx->self_type_qn;
+    const char *saved_trait = ctx->self_trait_qn;
+    ctx->self_type_qn = trait_qn;
+    ctx->self_trait_qn = trait_qn;
+
+    TSNode body = ts_node_child_by_field_name(trait_node, "body", 4);
+    if (!ts_node_is_null(body)) {
+        uint32_t nc = ts_node_child_count(body);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_child(body, i);
+            if (ts_node_is_null(c) || !ts_node_is_named(c))
+                continue;
+            if (strcmp(ts_node_type(c), "function_item") != 0)
+                continue;
+            TSNode fb = ts_node_child_by_field_name(c, "body", 4);
+            if (ts_node_is_null(fb))
+                continue; /* required method — nothing to walk */
+            rust_process_function(ctx, c, trait_qn);
+        }
+    }
+
+    ctx->self_type_qn = saved_self;
+    ctx->self_trait_qn = saved_trait;
+}
+
+/* Pass-2 item walker: functions, impls, trait defaults, and inline modules —
+ * RECURSIVE through nested inline mods (`mod a { mod b { fn f() {} } }`),
+ * whose defs share the flattened module-QN convention with the def side.
+ * Depth-capped defensively; real code nests inline mods a handful deep. */
+static void rust_process_items(RustLSPContext *ctx, TSNode container, int depth) {
+    if (depth > 16)
+        return;
+    uint32_t nc = ts_node_child_count(container);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(container, i);
+        if (ts_node_is_null(c))
+            continue;
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "function_item") == 0) {
+            rust_process_function(ctx, c, NULL);
+        } else if (strcmp(ck, "impl_item") == 0) {
+            rust_process_impl(ctx, c);
+        } else if (strcmp(ck, "trait_item") == 0) {
+            rust_process_trait_defaults(ctx, c);
+        } else if (strcmp(ck, "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(c, "body", 4);
+            if (!ts_node_is_null(body))
+                rust_process_items(ctx, body, depth + 1);
+        }
+    }
 }
 
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
@@ -5354,35 +5464,9 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
         }
     }
 
-    /* Pass 2: walk every top-level item. */
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(root, i);
-        if (ts_node_is_null(c))
-            continue;
-        const char *ck = ts_node_type(c);
-        if (strcmp(ck, "function_item") == 0) {
-            rust_process_function(ctx, c, NULL);
-        } else if (strcmp(ck, "impl_item") == 0) {
-            rust_process_impl(ctx, c);
-        } else if (strcmp(ck, "mod_item") == 0) {
-            /* Inline module — recurse into its declaration_list. */
-            TSNode body = ts_node_child_by_field_name(c, "body", 4);
-            if (!ts_node_is_null(body)) {
-                uint32_t mnc = ts_node_child_count(body);
-                for (uint32_t j = 0; j < mnc; j++) {
-                    TSNode mc = ts_node_child(body, j);
-                    if (ts_node_is_null(mc))
-                        continue;
-                    const char *mck = ts_node_type(mc);
-                    if (strcmp(mck, "function_item") == 0) {
-                        rust_process_function(ctx, mc, NULL);
-                    } else if (strcmp(mck, "impl_item") == 0) {
-                        rust_process_impl(ctx, mc);
-                    }
-                }
-            }
-        }
-    }
+    /* Pass 2: walk every item — functions, impls, trait default bodies, and
+     * inline modules recursively (nested `mod a { mod b {...} }` included). */
+    rust_process_items(ctx, root, 0);
 }
 
 /* ════════════════════════════════════════════════════════════════════
@@ -6001,6 +6085,15 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
             char *type_name = cbm_node_text(arena, type_node, source);
             if (!type_name || !type_name[0])
                 continue;
+            /* Strip generic args (`Stack<T>` → `Stack`): registered receivers
+             * are stripped (Phase A / extract_defs), so an unstripped QN here
+             * silently no-ops every strcmp below and generic impls lose their
+             * AST return types (chained calls break). */
+            {
+                char *lt = strchr(type_name, '<');
+                if (lt)
+                    *lt = '\0';
+            }
             const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
 
             RustLSPContext tmp;

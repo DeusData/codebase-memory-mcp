@@ -67,6 +67,14 @@ const char *cbm_service_pattern_http_method(const char *callee_name);
  * Returns NULL if not a known route registration method. */
 const char *cbm_service_pattern_route_method(const char *callee_name);
 
+/* Go 1.22 ServeMux patterns: "[METHOD ][host]/path". When `literal` leads with
+ * a known HTTP method + space, returns the in-place tail at the first '/' of
+ * the remainder (a host prefix like "example.com" is skipped; "{$}" is left
+ * for route canonicalization) and sets *out_method to a static method string.
+ * Returns NULL when the literal is not a method-qualified mux pattern. The
+ * returned pointer aliases `literal` — zero-copy. */
+const char *cbm_go_split_mux_pattern(const char *literal, const char **out_method);
+
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);

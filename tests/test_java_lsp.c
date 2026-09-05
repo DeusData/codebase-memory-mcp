@@ -1808,6 +1808,72 @@ TEST(jlsp_real_corpus_parity_90_percent) {
 
 /* ── Suite registration ──────────────────────────────────────────── */
 
+/* ── Multi-parent inheritance BFS (JLS 8.4.8) ──────────────────── */
+
+TEST(jlsp_extends_plus_implements_default) {
+    /* Members through a SECOND-or-later parent must resolve: the old walk
+     * followed only embedded_types[0] (the extends chain). */
+    const char *src = "interface Greeter {\n"
+                      "    default String hi() { return \"hi\"; }\n"
+                      "}\n"
+                      "class B {}\n"
+                      "class Impl extends B implements Greeter {}\n"
+                      "class Main {\n"
+                      "    void run() {\n"
+                      "        Impl impl = new Impl();\n"
+                      "        impl.hi();\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT(r);
+    ASSERT_GTE(require_resolved(r, "run", "hi"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_second_interface_method) {
+    const char *src = "interface Opener {\n"
+                      "    default void open() {}\n"
+                      "}\n"
+                      "interface Closer {\n"
+                      "    default void close() {}\n"
+                      "}\n"
+                      "class Door implements Opener, Closer {}\n"
+                      "class Main {\n"
+                      "    void run() {\n"
+                      "        Door d = new Door();\n"
+                      "        d.close();\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT(r);
+    ASSERT_GTE(require_resolved(r, "run", "close"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_diamond_interface_method) {
+    /* Method from I2 must be reachable through I3-typed receiver where
+     * I3 extends I1, I2 (I2 is the SECOND parent). */
+    const char *src = "interface I1 {\n"
+                      "    default void a() {}\n"
+                      "}\n"
+                      "interface I2 {\n"
+                      "    default void b() {}\n"
+                      "}\n"
+                      "interface I3 extends I1, I2 {}\n"
+                      "class Main {\n"
+                      "    void run(I3 x) {\n"
+                      "        x.b();\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT(r);
+    ASSERT_GTE(require_resolved(r, "run", "b"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 void suite_java_lsp(void) {
     /* Strings / java.lang */
     RUN_TEST(jlsp_string_length);
@@ -1961,4 +2027,9 @@ void suite_java_lsp(void) {
 
     /* Real-corpus 90% parity benchmark (multi-class realistic Java). */
     RUN_TEST(jlsp_real_corpus_parity_90_percent);
+
+    /* Multi-parent inheritance BFS */
+    RUN_TEST(jlsp_extends_plus_implements_default);
+    RUN_TEST(jlsp_second_interface_method);
+    RUN_TEST(jlsp_diamond_interface_method);
 }

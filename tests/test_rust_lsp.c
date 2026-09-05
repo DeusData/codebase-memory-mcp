@@ -6764,6 +6764,77 @@ TEST(rustlsp_followup_b_pathological_no_hang) {
     cbm_free_result(r); PASS();
 }
 
+/* ── Generic-impl QN alignment + trait defaults + nested mods + bounds ── */
+
+TEST(rustlsp_generic_impl_caller_qn) {
+    /* Calls FROM a generic impl method must attribute to Stack.push (stripped,
+     * matching the def-side Method QN), and self.grow() must dispatch through
+     * the stripped receiver registration. */
+    const char *src = "struct Stack<T> { v: Vec<T> }\n"
+                      "fn helper() {}\n"
+                      "impl<T> Stack<T> {\n"
+                      "    fn push(&mut self, x: T) { helper(); self.grow(); }\n"
+                      "    fn grow(&mut self) {}\n"
+                      "}\n";
+    CBMFileResult *r = extract_rust(src);
+    ASSERT(r);
+    int idx = require_resolved(r, "Stack.push", "helper");
+    ASSERT(idx >= 0);
+    ASSERT(strchr(r->resolved_calls.items[idx].caller_qn, '<') == NULL);
+    ASSERT(require_resolved(r, "Stack.push", "Stack.grow") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_trait_default_body_calls) {
+    /* Trait default-method bodies must be walked: audit() resolves from
+     * Counter.double, and self.count() dispatches to the trait's own method. */
+    const char *src = "fn audit() {}\n"
+                      "trait Counter {\n"
+                      "    fn count(&self) -> usize;\n"
+                      "    fn double(&self) -> usize { audit(); self.count() * 2 }\n"
+                      "}\n";
+    CBMFileResult *r = extract_rust(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "Counter.double", "audit") >= 0);
+    ASSERT(require_resolved(r, "Counter.double", "count") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_nested_inline_mod_walk) {
+    /* Bodies inside nested inline modules must be resolved (one-level-only
+     * recursion used to drop `mod a { mod b { ... } }` entirely). */
+    const char *src = "fn helper() {}\n"
+                      "mod a {\n"
+                      "    pub mod b {\n"
+                      "        pub fn f() { crate::helper(); inner(); }\n"
+                      "        pub fn inner() {}\n"
+                      "    }\n"
+                      "}\n";
+    CBMFileResult *r = extract_rust(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "f", "inner") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_impl_level_bound_dispatch) {
+    /* Impl-level bounds must join the chalk-lite env: `impl<T: Renderer>`
+     * routes t.render() through the bound trait exactly like an fn-level
+     * bound does. */
+    const char *src = "trait Renderer { fn render(&self); }\n"
+                      "struct Holder<T> { t: T }\n"
+                      "impl<T: Renderer> Holder<T> {\n"
+                      "    fn show(&self, t: &T) { t.render(); }\n"
+                      "}\n";
+    CBMFileResult *r = extract_rust(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "Holder.show", "render") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);
@@ -7382,4 +7453,10 @@ void suite_rust_lsp(void) {
 
     /* FOLLOWUP B: eval-step hardening */
     RUN_TEST(rustlsp_followup_b_pathological_no_hang);
+
+    /* Generic-impl QN alignment, trait defaults, nested mods, impl bounds */
+    RUN_TEST(rustlsp_generic_impl_caller_qn);
+    RUN_TEST(rustlsp_trait_default_body_calls);
+    RUN_TEST(rustlsp_nested_inline_mod_walk);
+    RUN_TEST(rustlsp_impl_level_bound_dispatch);
 }

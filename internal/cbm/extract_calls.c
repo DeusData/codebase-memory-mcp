@@ -3726,7 +3726,12 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                                    : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
                     }
                 }
-                if (call.first_string_arg && call.first_string_arg[0] == '/') {
+                if (call.first_string_arg &&
+                    (call.first_string_arg[0] == '/' ||
+                     cbm_go_split_mux_pattern(call.first_string_arg, NULL) != NULL)) {
+                    /* Go 1.22 mux literals carry the handler in arg 2 exactly
+                     * like '/'-prefixed routes; without this the HANDLES edge
+                     * loses its handler name. */
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
                 if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||

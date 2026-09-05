@@ -447,6 +447,14 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
                has_suffix(base, "_test.cpp") || has_prefix(base, "test_");
     case CBM_LANG_MATLAB:
         return has_prefix(base, "test_") || has_prefix(base, "Test");
+    case CBM_LANG_PERL:
+        /* CPAN layout: .t harness scripts under t/ (xt/ for author tests).
+         * The t//xt/ segment rules are language-gated here so a stray /t/ path
+         * in another language's repo stays non-test; keep in lockstep with
+         * cbm_is_test_path's Perl rules (#1294). */
+        return has_suffix(base, ".t") || has_prefix(rel_path, "t/") ||
+               has_prefix(rel_path, "xt/") || strstr(rel_path, "/t/") != NULL ||
+               strstr(rel_path, "/xt/") != NULL;
     default:
         return false;
     }
