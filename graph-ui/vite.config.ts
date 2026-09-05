@@ -46,13 +46,15 @@ function atlasVersion(): string {
  * Loopback-Authority akzeptiert. Fremde Browser-Origins werden vor dem
  * Rewrite abgewiesen, damit der Proxy kein Loch in den Origin-Check reisst.
  *
- * Ports dieses Projekts liegen bei 4200 aufwaerts; 3000-3019 sind tabu.
+ * The dev server listens on 5173, the port this repository's dev-proxy
+ * contract test (tests/test_ui_dev_proxy_security.sh) pins together with
+ * the two literal origins below.
  */
 const uiBackendOrigin = 'http://127.0.0.1:9749';
-const devPort = 4200;
+const devPort = 5173;
 const uiDevOrigins = new Set([
-  `http://127.0.0.1:${devPort}`,
-  `http://localhost:${devPort}`,
+  'http://127.0.0.1:5173',
+  'http://localhost:5173',
 ]);
 
 const uiBackendProxy = (): ProxyOptions => ({

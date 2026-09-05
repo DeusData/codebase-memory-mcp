@@ -962,6 +962,30 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     PASS();
 }
 
+/* The UI's CSP stays loopback-only: the served page may reach the server
+ * itself and the two loopback services the reader can start (the local-model
+ * sidecar on 4141, the agent bridge on 4142), and nothing else. Every host
+ * named in the policy is 127.0.0.1 on one of those two ports. */
+TEST(ui_csp_connect_src_is_loopback_only) {
+    const char *csp = CBM_UI_CSP_VALUE;
+    ASSERT_NOT_NULL(strstr(csp, "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142;"));
+    ASSERT_TRUE(strstr(csp, "https://") == NULL);
+    ASSERT_TRUE(strstr(csp, "ws://") == NULL);
+    ASSERT_TRUE(strstr(csp, "wss://") == NULL);
+    int hosts = 0;
+    const char *p = csp;
+    while ((p = strstr(p, "http://")) != NULL) {
+        ASSERT_TRUE(strncmp(p, "http://127.0.0.1:4141", 21) == 0 ||
+                    strncmp(p, "http://127.0.0.1:4142", 21) == 0);
+        hosts++;
+        p += 7;
+    }
+    ASSERT_EQ(hosts, 2);
+    ASSERT_NOT_NULL(strstr(csp, "frame-ancestors 'none'"));
+    ASSERT_NOT_NULL(strstr(csp, "object-src 'none'"));
+    PASS();
+}
+
 TEST(ui_server_root_without_embedded_assets_is_not_found) {
     /* The frontend is linked into the image, so its availability is decided at
      * build time, not warmed at runtime: a binary built without --with-ui has
@@ -2357,6 +2381,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
+    RUN_TEST(ui_csp_connect_src_is_loopback_only);
     RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);

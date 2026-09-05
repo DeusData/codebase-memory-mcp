@@ -193,18 +193,9 @@ struct cbm_http_server {
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
-/* Content-Security-Policy for the served UI. No external host appears in any
- * directive, so the browser cannot load or connect to anything off-origin —
- * this ENFORCES the airgap (the code makes no external calls; this stops a
- * future dependency or injected content from doing so). connect-src 'self'
- * confines fetch/XHR/WebSocket to the local server. The 'self'/data:/blob:/
- * 'unsafe-inline'-style/'wasm-unsafe-eval' allowances cover the bundled app's
- * own needs (React inline styles, three.js textures/workers/WASM). */
-#define CBM_UI_CSP                                                       \
-    "Content-Security-Policy: default-src 'self'; connect-src 'self'; "  \
-    "img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; " \
-    "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
-    "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n"
+/* Content-Security-Policy for the served UI. The directives live in
+ * http_server.h (CBM_UI_CSP_VALUE) so the loopback-only contract is testable. */
+#define CBM_UI_CSP "Content-Security-Policy: " CBM_UI_CSP_VALUE "\r\n"
 
 static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
     const cbm_embedded_file_t *f = cbm_embedded_lookup(path);
