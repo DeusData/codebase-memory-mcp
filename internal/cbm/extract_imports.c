@@ -133,6 +133,19 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
         return;
     }
 
+    /* cgo: `import "C"` names the cgo PSEUDO-package, not a real one — "C" is
+     * reserved by go/build and no package with that import path can exist.
+     * Emitting it as an ordinary import makes the import resolver fall through
+     * to its symbol-name fallback (cbm_pipeline_resolve_import_node Strategy 3,
+     * pass_pkgmap.c), which matches the literal name "C" against every project
+     * node called C and picks the lexicographically smallest: on a real Go repo
+     * all 27 cgo files pointed their IMPORTS edge at the same unrelated `C`
+     * member of a test helper. Drop it — the C side is not a graph package, and
+     * the file's remaining imports are unaffected. */
+    if (strcmp(path, "C") == 0) {
+        return;
+    }
+
     TSNode name_node = ts_node_child_by_field_name(spec, TS_FIELD("name"));
     const char *local_name =
         !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source) : path_last(a, path);
