@@ -916,6 +916,16 @@ TEST(incr_perf_single_file_fast) {
     }
 
     delete_file_at("fastapi/incr_perf_probe.py");
+    /* Publish the cleanup too. search_code now consumes the complete scoped
+     * file list and fails closed when the graph names a source file that grep
+     * cannot read; leaving this probe indexed would make every later matching
+     * search correctly report an incomplete snapshot instead of exercising
+     * the search parameter contract this fixture is meant to cover. The
+     * cleanup reindex is deliberately outside the measured interval above. */
+    resp = index_repo();
+    ASSERT(resp != NULL);
+    ASSERT(strstr(resp, "indexed") != NULL);
+    free(resp);
     PASS();
 }
 
@@ -1568,26 +1578,29 @@ TEST(tool_qg_two_hop) {
 
 TEST(tool_qg_max_rows) {
     double ms;
-    /* Query without max_rows — gets many results */
+    /* Query without max_rows — its explicit Cypher LIMIT is the visible cap. */
     char *r1 = call_tool_timed("query_graph", &ms,
                                "{\"project\":\"%s\","
                                "\"query\":\"MATCH (n:Function) RETURN n.name LIMIT 100\"}",
                                g_project);
     TOOL_OK(r1, ms);
-    int total_unlimited = count_in_response(r1, "total");
+    int returned_unlimited = count_in_response(r1, "returned");
     free(r1);
 
-    /* Same query without LIMIT but with max_rows=3 — must cap results */
+    /* max_rows caps presentation, not evaluation: returned is bounded while
+     * total remains the exact full materialized count. */
     char *r2 = call_tool_timed("query_graph", &ms,
                                "{\"project\":\"%s\","
                                "\"query\":\"MATCH (n:Function) RETURN n.name\","
                                "\"max_rows\":3}",
                                g_project);
     TOOL_OK(r2, ms);
+    int returned_limited = count_in_response(r2, "returned");
     int total_limited = count_in_response(r2, "total");
-    ASSERT_LTE(total_limited, 3);
-    /* Without max_rows should have more than with */
-    ASSERT_GT(total_unlimited, total_limited);
+    ASSERT_EQ(returned_limited, 3);
+    ASSERT_GT(total_limited, returned_limited);
+    ASSERT_GT(returned_unlimited, returned_limited);
+    ASSERT_NOT_NULL(strstr(r2, "page_limit"));
     free(r2);
     PASS();
 }
@@ -1908,12 +1921,22 @@ TEST(tool_arch_no_aspects) {
 
 TEST(tool_detect_changes_default) {
     double ms;
-    char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\"}", g_project);
+    /* The fixture is intentionally detached, so pin only the base while
+     * exercising every other default (scope, direction, depth, and budget). */
+    char *r = call_tool_timed("detect_changes", &ms,
+                              "{\"project\":\"%s\",\"base_branch\":\"HEAD\"}", g_project);
     TOOL_OK(r, ms);
-    /* New tree contract: base + direction scalars, a changed_files section,
-     * and the seed/impact accounting. (The old changed_count/impacted_symbols/
-     * depth keys are gone — impact is now a real traversal, not bare names.) */
-    ASSERT(strstr(r, "changed_files:") != NULL);
+    NOT_ERROR(r);
+    /* Lean tree contract: preserve exact changed-file accounting, but do not
+     * spend tokens on a zero-row table. A non-empty page still carries the
+     * changed_files rows; an empty page is represented by its exact scalars. */
+    int changed_total = count_in_response(r, "changed_total");
+    int changed_returned = count_in_response(r, "changed_returned");
+    ASSERT_GTE(changed_total, 0);
+    ASSERT_GTE(changed_returned, 0);
+    ASSERT_LTE(changed_returned, changed_total);
+    ASSERT(changed_returned > 0 ? resp_has_key(r, "changed_files")
+                                : resp_lacks_key(r, "changed_files"));
     ASSERT(strstr(r, "direction:") != NULL);
     ASSERT(strstr(r, "seed_symbols:") != NULL);
     free(r);
@@ -1961,7 +1984,15 @@ TEST(tool_detect_changes_since) {
     char *r = call_tool_timed("detect_changes", &ms, "{\"project\":\"%s\",\"since\":\"HEAD\"}",
                               g_project);
     TOOL_OK(r, ms);
-    ASSERT(resp_has_key(r, "changed_files"));
+    NOT_ERROR(r);
+    ASSERT(strstr(r, "base: HEAD") != NULL);
+    int changed_total = count_in_response(r, "changed_total");
+    int changed_returned = count_in_response(r, "changed_returned");
+    ASSERT_GTE(changed_total, 0);
+    ASSERT_GTE(changed_returned, 0);
+    ASSERT_LTE(changed_returned, changed_total);
+    ASSERT(changed_returned > 0 ? resp_has_key(r, "changed_files")
+                                : resp_lacks_key(r, "changed_files"));
     free(r);
     PASS();
 }
@@ -2262,8 +2293,11 @@ TEST(tool_qg_max_rows_1) {
                               "\"max_rows\":1}",
                               g_project);
     TOOL_OK(r, ms);
+    int returned = count_in_response(r, "returned");
     int total = count_in_response(r, "total");
-    ASSERT_EQ(total, 1);
+    ASSERT_EQ(returned, 1);
+    ASSERT_GT(total, returned);
+    ASSERT_NOT_NULL(strstr(r, "page_limit"));
     free(r);
     PASS();
 }

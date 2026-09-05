@@ -2,7 +2,7 @@
 <package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
   <metadata>
     <id>codebase-memory-mcp</id>
-    <version>0.8.1</version>
+    <version>0.10.8</version>
     <title>codebase-memory-mcp</title>
     <authors>DeusData</authors>
     <projectUrl>https://github.com/DeusData/codebase-memory-mcp</projectUrl>
@@ -18,7 +18,7 @@ release-owned runtime assets. Chocolatey retains the complete extracted runtime
 set and exposes its executable through a PATH shim.
 
 Full indexes an average repository in milliseconds, the Linux kernel (28M LOC) in
-3 minutes. Answers structural queries in under 1ms. Supports 159 languages via
+3 minutes. Answers structural queries in under 1ms. Supports 162 languages via
 vendored tree-sitter grammars. No hosted service or API key. Plug and play across
 11 coding agents including Claude Code, Codex CLI, Gemini CLI, and Zed.
 
@@ -28,7 +28,7 @@ After installation, run:
 
 to configure your coding agents automatically.
     </description>
-    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.8.1</releaseNotes>
+    <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.10.8</releaseNotes>
   </metadata>
   <files>
     <file src="tools\**" target="tools" />

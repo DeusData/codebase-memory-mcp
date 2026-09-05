@@ -63,19 +63,46 @@ def cond(job):
         return ""
     return " ".join(m.group(2).split())
 
-# 1. Downstream-of-optional jobs must tolerate a deliberately skipped ancestor.
-#    `test` is the optional phase (if: !inputs.skip_tests); everything after it
-#    in the chain has to survive that.
-TOLERATE = ["build", "smoke", "soak", "release-draft"]
-for job in TOLERATE:
+# 1. Gate conditions: tolerate ONLY the sanctioned skip, fail closed otherwise.
+#    `test` is the optional phase (if: !inputs.skip_tests). The old contract
+#    required the bare `!cancelled() && !failure()` idiom — but failure() does
+#    NOT cover a needed job that was CANCELLED (e.g. a lint timeout), so that
+#    idiom let a cancelled gate cascade test into 'skipped' and publish with
+#    the whole test matrix silently gone (v0.10.7 incident, 2026-08-18).
+#    Each gate must name the results it accepts explicitly.
+GATE_REQUIREMENTS = {
+    "build": [
+        "!cancelled()",
+        "needs.lint.result == 'success'",
+        "needs.test.result == 'success'",
+        "inputs.skip_tests && needs.test.result == 'skipped'",
+    ],
+    "smoke": ["!cancelled()", "needs.build.result == 'success'"],
+    "soak": ["!cancelled()", "needs.build.result == 'success'"],
+    "release-draft": ["!cancelled()", "!failure()"],
+}
+for job, required in GATE_REQUIREMENTS.items():
     if job not in blocks:
         failures.append(f"{job}: job missing from release.yml — update this contract")
         continue
     c = cond(job)
-    if "!cancelled()" not in c or "!failure()" not in c:
-        failures.append(
-            f"{job}: `if:` lacks `!cancelled() && !failure()` (got: {c or '<none>'}).\n"
-            f"      With skip_tests=true a skipped ancestor SKIPS this job silently.")
+    for fragment in required:
+        if fragment not in c:
+            failures.append(
+                f"{job}: `if:` must contain `{fragment}` (got: {c or '<none>'}).\n"
+                f"      Explicit results only: failure() misses CANCELLED needed\n"
+                f"      jobs, and a bare tolerate-skip idiom is fail-open.")
+
+# 1b. The preflight input guard must exist and gate the whole chain: the tag is
+#     inputs.version verbatim, and a bare (non-v-prefixed) version publishes a
+#     release installers can never resolve — unrecoverable under immutability.
+if "preflight" not in blocks:
+    failures.append("preflight: job missing — the version-input guard must exist")
+lint_needs = re.search(r"^    needs:\s*(.*)$", blocks.get("lint", ""), re.M)
+if not lint_needs or "preflight" not in lint_needs.group(1):
+    failures.append(
+        "lint: must `needs: [preflight]` so a malformed version stops the\n"
+        "      chain before any gate runs.")
 
 # 2. The draft must require both runtime gates to have genuinely succeeded.
 draft = cond("release-draft")

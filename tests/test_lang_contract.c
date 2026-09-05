@@ -24,6 +24,7 @@
 #include <store/store.h>
 #include <pipeline/pipeline.h>
 #include <foundation/log.h>
+#include <sqlite3.h>
 
 #include <string.h>
 #include <stdlib.h>
@@ -693,6 +694,58 @@ static void breadth_diag(cbm_store_t *store, const char *project, const char *re
     }
 }
 
+/* Chialisp: a constant defined in an included .clib must resolve from the
+ * puzzle that includes it.
+ *
+ * This is the whole reason `Constant` is admitted to the cross-file name
+ * registry (cbm_label_is_registry_symbol). Chialisp's condition codes,
+ * CREATE_COIN and friends, are `(defconstant ...)` forms in a shared .clib and
+ * are referenced by name from every puzzle. Labelled `Constant` but left OUT of
+ * the registry, they are seeded nowhere, cbm_registry_resolve returns nothing,
+ * and roughly half of a Chialisp graph is unreachable — present as nodes, but
+ * never the target of an edge. This test fails (zero cross-file USAGE edges)
+ * the moment "Constant" is dropped from that predicate. */
+TEST(contract_chialisp_constant_resolves_across_files) {
+    static const LangFile f[] = {{"condition_codes.clib", "(\n  (defconstant CREATE_COIN 51)\n)\n"},
+                                 {"puzzle.clsp", "(mod (ARG)\n"
+                                                 "  (include condition_codes.clib)\n"
+                                                 "  (defun run (amount)\n"
+                                                 "    (list CREATE_COIN amount))\n"
+                                                 ")\n"}};
+    LangProj lp;
+    cbm_store_t *store = lang_index_files(&lp, f, 2);
+    ASSERT_TRUE(store != NULL);
+
+    cbm_node_t *consts = NULL;
+    int nconst = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_name(store, lp.project, "CREATE_COIN", &consts, &nconst),
+              CBM_STORE_OK);
+    ASSERT_TRUE(nconst >= 1);
+    ASSERT_TRUE(consts[0].label != NULL && strcmp(consts[0].label, "Constant") == 0);
+    ASSERT_TRUE(consts[0].file_path != NULL && strstr(consts[0].file_path, "condition_codes.clib"));
+
+    cbm_edge_t *edges = NULL;
+    int nedges = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_target_type(store, consts[0].id, "USAGE", &edges, &nedges),
+              CBM_STORE_OK);
+    int cross_file = 0;
+    for (int i = 0; i < nedges; i++) {
+        cbm_node_t src;
+        if (cbm_store_find_node_by_id(store, edges[i].source_id, &src) != CBM_STORE_OK) {
+            continue;
+        }
+        if (src.file_path && strstr(src.file_path, "puzzle.clsp")) {
+            cross_file++;
+        }
+        cbm_node_free_fields(&src);
+    }
+    cbm_store_free_edges(edges, nedges);
+    cbm_store_free_nodes(consts, nconst);
+    lang_cleanup(&lp, store);
+    ASSERT_TRUE(cross_file >= 1);
+    PASS();
+}
+
 TEST(contract_all_grammars_in_graph) {
     int n = (int)CBM_GRAMMAR_CASES_COUNT;
     if (n > GRAMMAR_BREADTH_MAX) {
@@ -858,6 +911,9 @@ static const CallCase CALL_CASES[] = {
      "fn helper(x: felt252) -> felt252 {\n    x + 1\n}\n\nfn run() -> felt252 {\n    "
      "helper(41)\n}\n",
      true, NULL},
+    {"chialisp", "a.clsp",
+     "(mod ()\n  (defun helper (x)\n    (* x 2))\n  (defun run ()\n    (helper 21))\n)\n", true,
+     NULL},
     {"clojure", "a.clj", "(defn helper [] 42)\n\n(defn run [] (helper))\n", false,
      "lisp: call is a list_lit whose head is a sym_lit (not a field, not a first-child "
      "'identifier'); no lisp branch in extract_callee_name"},
@@ -1656,7 +1712,9 @@ TEST(contract_edge_parallel_service_edges) {
         {"gql.py", "def gql(query_string):\n    return query_string\n"},
         {"client.py",
          "from gql import gql\n\n\ndef fetch_user():\n"
-         "    return gql(\"query GetUser { user { id name } }\")\n\n\n"
+         /* The embedded double quote survives extraction from this single-quoted
+          * Python string and breaks GRAPHQL_CALLS JSON unless operation is escaped. */
+         "    return gql('query GetUser { user(name: \"quoted\") { id name } }')\n\n\n"
          "def create_user():\n"
          "    return gql(\"mutation CreateUser { addUser(name: \\\"x\\\") { id } }\")\n"},
         /* TRPC_CALLS: local createTRPCProxyClient (same-module resolution). */
@@ -1697,6 +1755,19 @@ TEST(contract_edge_parallel_service_edges) {
     int grpc = store ? cbm_store_count_edges_by_type(store, lp.project, "GRPC_CALLS") : -1;
     int trpc = store ? cbm_store_count_edges_by_type(store, lp.project, "TRPC_CALLS") : -1;
     int infra = store ? cbm_store_count_edges_by_type(store, lp.project, "INFRA_MAPS") : -1;
+    int invalid_props = -1;
+    if (store) {
+        sqlite3_stmt *stmt = NULL;
+        sqlite3 *db = cbm_store_get_db(store);
+        if (db && sqlite3_prepare_v2(db,
+                                    "SELECT count(*) FROM edges WHERE properties IS NOT NULL "
+                                    "AND properties != '' AND json_valid(properties)=0;",
+                                    -1, &stmt, NULL) == SQLITE_OK &&
+            sqlite3_step(stmt) == SQLITE_ROW) {
+            invalid_props = sqlite3_column_int(stmt, 0);
+        }
+        sqlite3_finalize(stmt);
+    }
     if (graphql < 1 || grpc < 1 || trpc < 1 || infra < 1) {
         fprintf(stderr,
                 "  [EDGE] parallel-service: GRAPHQL_CALLS=%d GRPC_CALLS=%d TRPC_CALLS=%d "
@@ -1709,6 +1780,7 @@ TEST(contract_edge_parallel_service_edges) {
     ASSERT_TRUE(grpc >= 1);
     ASSERT_TRUE(trpc >= 1);
     ASSERT_TRUE(infra >= 1);
+    ASSERT_EQ(invalid_props, 0);
     PASS();
 }
 
@@ -1792,6 +1864,7 @@ SUITE(lang_contract) {
     RUN_TEST(contract_typescript_relative_import);
 
     /* Graph-level breadth across all grammars (P4). */
+    RUN_TEST(contract_chialisp_constant_resolves_across_files);
     RUN_TEST(contract_all_grammars_in_graph);
 
     /* CALLS-edge breadth across non-LSP languages (P5). */

@@ -75,6 +75,10 @@ typedef struct {
     uint64_t last_dirty_sig;       /* committed dirty-state signature */
     uint64_t pending_dirty_sig;    /* observed at check time */
     char pending_head[CBM_SZ_128]; /* HEAD observed at check time */
+    /* Hop from root_path up to the repository root ("" when they are the same),
+     * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
+     * the signature needs this to stat them. Resolved once at baseline. */
+    char repo_cdup[CBM_SZ_4K];
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -452,6 +456,86 @@ static watcher_git_status_t git_repo_status(cbm_watcher_t *w, project_state_t *s
     return watcher_git_run(w, state, argv, 0, NULL);
 }
 
+/* True when root_path carries its OWN repository marker: a `.git` directory, or
+ * a `.git` file (the gitlink form used by linked worktrees and initialized
+ * submodules). Deliberately a filesystem check, not a git invocation — the whole
+ * point is to learn something `rev-parse` cannot tell us, because it walks up. */
+static bool git_has_own_dot_git(const char *root_path) {
+    char path[CBM_SZ_4K];
+    int written = snprintf(path, sizeof(path), "%s/.git", root_path);
+    if (written <= 0 || (size_t)written >= sizeof(path)) {
+        return false;
+    }
+    struct stat st;
+    return stat(path, &st) == 0 && (S_ISDIR(st.st_mode) || S_ISREG(st.st_mode));
+}
+
+/* Does the ancestor repository actually track anything inside this directory?
+ * Emptiness distinguishes "a scratch folder that merely sits under a repo" from
+ * "a genuine subdirectory of one". Output is capped: we only care whether the
+ * first byte exists, never what it is. */
+static watcher_git_status_t git_tracks_anything_here(cbm_watcher_t *w, project_state_t *state,
+                                                     bool *tracked_out) {
+    *tracked_out = false;
+    const char *argv[] = {"git", "-C", state->root_path, "ls-files", "-z", "--", ".", NULL};
+    watcher_git_output_t output;
+    watcher_git_status_t status = watcher_git_run(w, state, argv, WATCHER_GIT_HEAD_MAX, &output);
+    if (status != WATCHER_GIT_OK) {
+        return status;
+    }
+    FILE *fp = cbm_fopen(output.path, "rb");
+    if (fp) {
+        *tracked_out = fgetc(fp) != EOF;
+        (void)fclose(fp);
+    }
+    watcher_git_output_cleanup(&output);
+    return fp ? WATCHER_GIT_OK : WATCHER_GIT_SUPERVISION_FAILED;
+}
+
+/* Relative hop from root_path up to the repository root, as `git rev-parse
+ * --show-cdup` reports it ("" at the root, "../" one level down, and so on).
+ *
+ * This matters because `git status --porcelain` prints paths relative to the
+ * REPOSITORY root, while the signature stats them relative to root_path. For a
+ * project watched at the repository root the two coincide and the bug is
+ * invisible; for a subdirectory project every stat silently misses, and the
+ * signature quietly degrades to text-only — losing the size/mtime component
+ * that makes an edit to an already-dirty file detectable.
+ *
+ * --show-cdup rather than --show-toplevel: under MSYS/Cygwin git, --show-toplevel
+ * returns a translated absolute path (/c/... or a drive-letter form) that does
+ * not join cleanly onto the native root_path we hold. A relative hop composes
+ * correctly on every platform because it never leaves our own path space. */
+static watcher_git_status_t git_repo_cdup(cbm_watcher_t *w, project_state_t *state, char *out,
+                                          size_t out_size) {
+    if (!out || out_size < 2) {
+        return WATCHER_GIT_SUPERVISION_FAILED;
+    }
+    out[0] = '\0';
+    const char *argv[] = {"git", "-C", state->root_path, "rev-parse", "--show-cdup", NULL};
+    watcher_git_output_t output;
+    watcher_git_status_t status = watcher_git_run(w, state, argv, WATCHER_GIT_HEAD_MAX, &output);
+    if (status != WATCHER_GIT_OK) {
+        return status;
+    }
+    FILE *file = cbm_fopen(output.path, "rb");
+    bool read = file && fgets(out, (int)out_size, file) != NULL;
+    if (file) {
+        (void)fclose(file);
+    }
+    watcher_git_output_cleanup(&output);
+    if (!read) {
+        /* At the repository root git prints an empty line; that is success. */
+        out[0] = '\0';
+        return WATCHER_GIT_OK;
+    }
+    size_t len = strlen(out);
+    while (len > 0 && (out[len - 1] == '\n' || out[len - 1] == '\r')) {
+        out[--len] = '\0';
+    }
+    return WATCHER_GIT_OK;
+}
+
 static watcher_git_status_t git_head(cbm_watcher_t *w, project_state_t *state, char *out,
                                      size_t out_size) {
     if (!out || out_size < 2) {
@@ -511,9 +595,14 @@ static int64_t sig_stat_mtime_ns(const struct stat *st) {
  * of an already-dirty file still produces a new signature. A failed stat
  * (deleted file, quoting artifact) degrades to the entry text alone — the
  * deletion itself is represented by the porcelain status. */
-static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char *rel) {
+/* `rel` is repository-relative (that is what porcelain prints), so it is joined
+ * through `cdup` — the hop from root_path up to the repository root — rather than
+ * onto root_path directly. cdup is "" when the project IS the repository root,
+ * which reduces this to the original join. */
+static uint64_t sig_fold_path_stat(uint64_t h, const char *root_path, const char *cdup,
+                                   const char *rel) {
     char abs[CBM_SZ_4K];
-    snprintf(abs, sizeof(abs), "%s/%s", root_path, rel);
+    snprintf(abs, sizeof(abs), "%s/%s%s", root_path, cdup ? cdup : "", rel);
     struct stat st;
     if (stat(abs, &st) == 0) {
         int64_t mt = sig_stat_mtime_ns(&st);
@@ -538,8 +627,16 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
         return WATCHER_GIT_SUPERVISION_FAILED;
     }
     *signature_out = 0;
-    const char *status_argv[] = {"git",    "--no-optional-locks", "-C",    state->root_path,
-                                 "status", "--porcelain",         "-uall", "-z",
+    /* `-- .` scopes the report to the watched directory. Without it a project
+     * watched at a sub-package of a monorepo reindexes whenever any SIBLING
+     * package changes, because git reports the whole repository's dirty state
+     * regardless of -C. Paths stay repository-relative either way, which is
+     * what repo_cdup is for. */
+    const char *status_argv[] = {"git",    "--no-optional-locks",
+                                 "-C",     state->root_path,
+                                 "status", "--porcelain",
+                                 "-uall",  "-z",
+                                 "--",     ".",
                                  NULL};
     watcher_git_output_t output;
     watcher_git_status_t status =
@@ -585,7 +682,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
                 if (entry[0] == 'R' || entry[0] == 'C') {
                     origin_token = true;
                 }
-                h = sig_fold_path_stat(h, state->root_path, entry + 3);
+                h = sig_fold_path_stat(h, state->root_path, state->repo_cdup, entry + 3);
             }
         }
         elen = 0;
@@ -638,7 +735,7 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
             h = sig_fold(h, line, len);
             h = sig_fold(h, "", 1);
             if (len > 3 && line[2] == ' ') {
-                h = sig_fold_path_stat(h, state->root_path, line + 3);
+                h = sig_fold_path_stat(h, state->root_path, state->repo_cdup, line + 3);
             }
         }
         parsed = !ferror(fp) && fclose(fp) == 0;
@@ -1060,9 +1157,39 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
         return false;
     }
     s->is_git = repository_status == WATCHER_GIT_OK;
+
+    /* `rev-parse --git-dir` walks UP, so an ordinary folder that merely happens
+     * to live under some unrelated repository answers yes. Treating it as a git
+     * project is what produced the runaway churn: it inherits the ancestor's
+     * dirty state, which is permanently non-empty and has nothing to do with
+     * this directory, so every poll looked like a change.
+     *
+     * A directory is only really git-managed here if it carries its own .git,
+     * or the ancestor repository actually tracks something inside it. A
+     * genuine sub-package of a monorepo passes the second test; a scratch or
+     * gitignored folder sitting under a repo fails both and is polled as a
+     * plain directory instead. */
+    if (s->is_git && !git_has_own_dot_git(s->root_path)) {
+        bool tracked = false;
+        watcher_git_status_t tracked_status = git_tracks_anything_here(w, s, &tracked);
+        if (tracked_status != WATCHER_GIT_OK && tracked_status != WATCHER_GIT_COMMAND_FAILED) {
+            return false;
+        }
+        if (!tracked) {
+            s->is_git = false;
+            cbm_log_info("watcher.nested_non_git", "project", s->project_name, "path",
+                         s->root_path);
+        }
+    }
+
     s->baseline_done = true;
 
     if (s->is_git) {
+        watcher_git_status_t cdup_status = git_repo_cdup(w, s, s->repo_cdup, sizeof(s->repo_cdup));
+        if (cdup_status != WATCHER_GIT_OK && cdup_status != WATCHER_GIT_COMMAND_FAILED) {
+            s->baseline_done = false;
+            return false;
+        }
         watcher_git_status_t head_status = git_head(w, s, s->last_head, sizeof(s->last_head));
         if (head_status != WATCHER_GIT_OK && head_status != WATCHER_GIT_COMMAND_FAILED) {
             s->baseline_done = false;

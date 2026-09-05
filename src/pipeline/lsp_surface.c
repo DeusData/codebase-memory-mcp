@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "cbm.h" /* cbm_label_is_relation — reg-only surface membership */
 #include "foundation/log.h"
 #include "foundation/sha256.h"
 #include "yyjson/yyjson.h"
@@ -30,12 +31,13 @@ enum { SURFACE_CODEC_VERSION = 1 };
 /* Labels the incremental name registry serves that pxc_map_label does NOT
  * carry into the CBMLSPDef set. Their (name, qn, label) triple must still
  * participate in the surface hash, or renaming one would slip past the
- * early cutoff while stale references to it survive in dependent files.
- * KEEP IN SYNC with pxc_map_label (pass_lsp_cross.c) and
- * incr_label_is_registry_symbol (pipeline_incremental.c); the codec unit
- * test cross-checks the three. */
+ * early cutoff while stale references to it survive in dependent files —
+ * for Table/View that means a renamed table keeping stale FROM/JOIN lineage
+ * edges from dependent SQL files. KEEP IN SYNC with pxc_map_label
+ * (pass_lsp_cross.c) and incr_label_is_registry_symbol
+ * (pipeline_incremental.c); the codec unit test cross-checks the three. */
 static bool surface_reg_only_label(const char *label) {
-    return label && strcmp(label, "Field") == 0;
+    return label && (strcmp(label, "Field") == 0 || cbm_label_is_relation(label));
 }
 
 static void add_str_or_null(yyjson_mut_doc *doc, yyjson_mut_val *obj, const char *key,

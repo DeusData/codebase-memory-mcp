@@ -506,8 +506,8 @@ static bool process_commonjs_require(CBMExtractCtx *ctx, TSNode call) {
 
 static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -540,7 +540,7 @@ static void walk_es_imports(CBMExtractCtx *ctx, TSNode root) {
         }
 
         if (push_children) {
-            ts_nstack_push_children(&stack, ctx->arena, node);
+            ts_nstack_push_children(&stack, node);
         }
     }
 }
@@ -1093,8 +1093,8 @@ static void parse_haskell_imports(CBMExtractCtx *ctx) {
 static void parse_zig_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "builtin_function") == 0) {
@@ -1111,7 +1111,7 @@ static void parse_zig_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1163,8 +1163,8 @@ static void process_wolfram_needs(CBMExtractCtx *ctx, TSNode node) {
 
 static void walk_wolfram_imports(CBMExtractCtx *ctx, TSNode root) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, root);
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
@@ -1176,7 +1176,7 @@ static void walk_wolfram_imports(CBMExtractCtx *ctx, TSNode root) {
             process_wolfram_needs(ctx, node);
         }
 
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1395,8 +1395,13 @@ static void parse_spec_imports(CBMExtractCtx *ctx) {
 // that the main parser uses.  Adding another host language is a one-line
 // declaration in lang_specs.c.
 
+typedef struct {
+    TSNode script;
+    TSNode content;
+} CBMEmbeddedBlock;
+
 static void embedded_collect_content_nodes(TSNode root, const CBMEmbeddedLangSpec *spec,
-                                           TSNode *out, int *out_count, int max_out) {
+                                           CBMEmbeddedBlock *out, int *out_count, int max_out) {
     /* Iterative DFS so deeply-nested script blocks are still found.  Cap the
      * stack to a sane bound (host grammars do not have million-deep markup
      * trees) — no need to introduce TSNodeStack here. */
@@ -1412,7 +1417,8 @@ static void embedded_collect_content_nodes(TSNode root, const CBMEmbeddedLangSpe
             for (uint32_t k = 0; k < cc; k++) {
                 TSNode c = ts_node_child(node, k);
                 if (strcmp(ts_node_type(c), spec->content_node_type) == 0) {
-                    out[(*out_count)++] = c;
+                    out[*out_count] = (CBMEmbeddedBlock){.script = node, .content = c};
+                    (*out_count)++;
                     if (*out_count >= max_out) {
                         return;
                     }
@@ -1429,50 +1435,176 @@ static void embedded_collect_content_nodes(TSNode root, const CBMEmbeddedLangSpe
     }
 }
 
+static bool ascii_trimmed_equals(const char *value, const char *expected) {
+    if (!value || !expected) {
+        return false;
+    }
+    while (*value && isspace((unsigned char)*value)) {
+        value++;
+    }
+    size_t len = strlen(value);
+    while (len > 0 && isspace((unsigned char)value[len - 1])) {
+        len--;
+    }
+    size_t expected_len = strlen(expected);
+    if (len != expected_len) {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        if (tolower((unsigned char)value[i]) != tolower((unsigned char)expected[i])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Vue is the only host that opts into structural embedded extraction. Restrict
+ * its inline programs to the language forms whose parsers we can select
+ * exactly. A src attribute always denotes an external program and therefore
+ * suppresses any inline extraction, even for malformed mixed markup. */
+static bool vue_embedded_language(CBMExtractCtx *ctx, TSNode script, CBMLanguage *language) {
+    enum { VUE_ATTR_STACK_CAP = 128 };
+    TSNode stack[VUE_ATTR_STACK_CAP];
+    int top = 0;
+    bool has_lang = false;
+    bool lang_supported = true;
+    CBMLanguage selected = CBM_LANG_JAVASCRIPT;
+    stack[top++] = script;
+    while (top > 0) {
+        TSNode node = stack[--top];
+        if (strcmp(ts_node_type(node), "attribute") == 0) {
+            uint32_t named_count = ts_node_named_child_count(node);
+            if (named_count == 0) {
+                return false;
+            }
+            TSNode name_node = ts_node_named_child(node, 0);
+            char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
+            if (ascii_trimmed_equals(name, "src")) {
+                return false;
+            }
+            if (ascii_trimmed_equals(name, "lang")) {
+                TSNode value_node = node;
+                if (!find_first_descendant_of(node, "attribute_value", &value_node)) {
+                    return false;
+                }
+                char *value = cbm_node_text(ctx->arena, value_node, ctx->source);
+                has_lang = true;
+                if (ascii_trimmed_equals(value, "js") ||
+                    ascii_trimmed_equals(value, "javascript")) {
+                    selected = CBM_LANG_JAVASCRIPT;
+                } else if (ascii_trimmed_equals(value, "ts") ||
+                           ascii_trimmed_equals(value, "typescript")) {
+                    selected = CBM_LANG_TYPESCRIPT;
+                } else {
+                    lang_supported = false;
+                }
+            }
+            continue;
+        }
+        uint32_t count = ts_node_named_child_count(node);
+        if ((int)count > VUE_ATTR_STACK_CAP - top) {
+            return false;
+        }
+        for (int i = (int)count - 1; i >= 0; i--) {
+            stack[top++] = ts_node_named_child(node, (uint32_t)i);
+        }
+    }
+    if (has_lang && !lang_supported) {
+        return false;
+    }
+    *language = selected;
+    return true;
+}
+
+static void parse_one_embedded_block(CBMExtractCtx *ctx, const CBMEmbeddedBlock *block,
+                                     CBMLanguage embedded_language, bool extract_structure) {
+    const TSLanguage *language = cbm_ts_language(embedded_language);
+    if (!language || ctx->source_len < 0) {
+        return;
+    }
+    TSRange range = {
+        .start_point = ts_node_start_point(block->content),
+        .end_point = ts_node_end_point(block->content),
+        .start_byte = ts_node_start_byte(block->content),
+        .end_byte = ts_node_end_byte(block->content),
+    };
+    if (range.end_byte <= range.start_byte || range.end_byte > (uint32_t)ctx->source_len) {
+        return;
+    }
+
+    /* One fresh parser/tree per block prevents parser state or error recovery
+     * from one script from changing the next script's result. Parsing the full
+     * original buffer through the absolute included range preserves byte and
+     * point coordinates across CRLF and UTF-8 prefixes. */
+    TSParser *parser = ts_parser_new();
+    if (!parser) {
+        return;
+    }
+    if (!ts_parser_set_language(parser, language) ||
+        !ts_parser_set_included_ranges(parser, &range, 1)) {
+        ts_parser_delete(parser);
+        return;
+    }
+    TSTree *tree = ts_parser_parse_string(parser, NULL, ctx->source, (uint32_t)ctx->source_len);
+    if (!tree) {
+        ts_parser_delete(parser);
+        return;
+    }
+
+    CBMExtractCtx sub_ctx = {
+        .arena = ctx->arena,
+        .result = ctx->result,
+        .source = ctx->source,
+        .source_len = ctx->source_len,
+        .language = embedded_language,
+        .project = ctx->project,
+        .rel_path = ctx->rel_path,
+        .module_qn = ctx->module_qn,
+        .root = ts_tree_root_node(tree),
+        .macro_table = ctx->macro_table,
+        .return_type_table = ctx->return_type_table,
+    };
+    if (extract_structure) {
+        cbm_extract_definitions_without_module(&sub_ctx);
+    }
+    walk_es_imports(&sub_ctx, sub_ctx.root);
+    if (extract_structure) {
+        cbm_extract_unified(&sub_ctx);
+    }
+
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+}
+
 static void parse_embedded_imports(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec || !spec->embedded_imports) {
         return;
     }
     for (const CBMEmbeddedLangSpec *e = spec->embedded_imports; e->script_node_type != NULL; e++) {
-        const TSLanguage *embedded_lang = cbm_ts_language(e->embedded_language);
-        if (!embedded_lang) {
-            continue; /* embedded grammar not linked in — silently skip */
-        }
         enum { MAX_EMBEDDED_BLOCKS = 16 };
-        TSNode hits[MAX_EMBEDDED_BLOCKS];
+        CBMEmbeddedBlock hits[MAX_EMBEDDED_BLOCKS];
         int hit_count = 0;
         embedded_collect_content_nodes(ctx->root, e, hits, &hit_count, MAX_EMBEDDED_BLOCKS);
-        if (hit_count == 0) {
-            continue;
-        }
-        TSParser *parser = ts_parser_new();
-        if (!parser) {
-            continue;
-        }
-        if (!ts_parser_set_language(parser, embedded_lang)) {
-            ts_parser_delete(parser);
-            continue;
-        }
         for (int i = 0; i < hit_count; i++) {
-            uint32_t s = ts_node_start_byte(hits[i]);
-            uint32_t end = ts_node_end_byte(hits[i]);
-            if (end <= s) {
+            CBMLanguage embedded_language = e->embedded_language;
+            /* Structure (defs + calls), not just imports, for hosts whose
+             * embedded language carries real code. Vue since #1852; CFML's
+             * <cfscript> since the #1412 distillation. */
+            bool extract_structure =
+                ctx->language == CBM_LANG_VUE || ctx->language == CBM_LANG_CFML;
+            /* The attribute resolver is Vue's: it inspects <script lang=/src=>
+             * and OVERRIDES the spec's embedded language (JS default, TS on
+             * lang="ts", bail on src=). CFML's cf_script_tag carries no such
+             * attributes and its embedded language is fixed by the spec row
+             * (CFSCRIPT) — running the resolver would silently rewrite it to
+             * JavaScript. Resolve only for Vue. */
+            if (ctx->language == CBM_LANG_VUE &&
+                !vue_embedded_language(ctx, hits[i].script, &embedded_language)) {
                 continue;
             }
-            const char *sub_src = ctx->source + s;
-            uint32_t sub_len = end - s;
-            TSTree *sub_tree = ts_parser_parse_string(parser, NULL, sub_src, sub_len);
-            if (!sub_tree) {
-                continue;
-            }
-            CBMExtractCtx sub_ctx = *ctx;
-            sub_ctx.source = sub_src;
-            sub_ctx.root = ts_tree_root_node(sub_tree);
-            walk_es_imports(&sub_ctx, sub_ctx.root);
-            ts_tree_delete(sub_tree);
+            parse_one_embedded_block(ctx, &hits[i], embedded_language, extract_structure);
         }
-        ts_parser_delete(parser);
     }
 }
 
@@ -1534,8 +1666,8 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
 static void parse_hare_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_statement") == 0) {
@@ -1554,7 +1686,7 @@ static void parse_hare_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1566,8 +1698,8 @@ static void parse_hare_imports(CBMExtractCtx *ctx) {
 static void parse_pascal_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "declUses") == 0) {
@@ -1585,7 +1717,7 @@ static void parse_pascal_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1598,8 +1730,8 @@ static void parse_pascal_imports(CBMExtractCtx *ctx) {
 static void parse_powershell_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
@@ -1609,8 +1741,8 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                 /* Find the last generic_token anywhere under the command — that
                  * is the module path / namespace / assembly being imported. */
                 TSNodeStack inner;
-                ts_nstack_init(&inner, a, CBM_SZ_512);
-                ts_nstack_push(&inner, a, node);
+                ts_nstack_init(&inner, ctx, CBM_SZ_512);
+                ts_nstack_push(&inner, node);
                 const char *last_tok = NULL;
                 uint32_t last_start = 0;
                 while (inner.count > 0) {
@@ -1624,7 +1756,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
                             last_start = sb;
                         }
                     }
-                    ts_nstack_push_children(&inner, a, c);
+                    ts_nstack_push_children(&inner, c);
                 }
                 if (last_tok && last_tok[0]) {
                     CBMImport imp = {.local_name = path_last(a, last_tok),
@@ -1634,7 +1766,7 @@ static void parse_powershell_imports(CBMExtractCtx *ctx) {
             }
             continue; /* commands don't nest imports further */
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1799,6 +1931,46 @@ static void lisp_process_list(CBMExtractCtx *ctx, TSNode node) {
         return;
     }
 
+    /* Chialisp include/embed forms.
+     *
+     * `(include *standard-cl-26*)` selects a dialect; every `*...*` sigil is a
+     * compiler directive, not a file dependency. The Chialisp compiler filters
+     * these with its own `!name.starts_with("*")` check and so do we — recording
+     * one as an import would invent a dependency on a file that does not exist.
+     *
+     * `(embed-file NAME kind "file")` / `(compile-file NAME "file")` DO create a
+     * real dependency on the embedded/compiled artifact; the path is the string
+     * argument. There is no dedicated EMBEDS edge type, so it is recorded as an
+     * import — which is what it is for reachability. */
+    if (ctx->language == CBM_LANG_CHIALISP) {
+        if (strcmp(hn, "include") == 0) {
+            for (uint32_t j = 1; j < nc; j++) {
+                TSNode mod_node = ts_node_named_child(node, j);
+                const char *mk = ts_node_type(mod_node);
+                if (strcmp(mk, "symbol") == 0 || strcmp(mk, "sym_lit") == 0) {
+                    char *sig = cbm_node_text(ctx->arena, mod_node, ctx->source);
+                    if (sig && sig[0] == '*') {
+                        continue; /* dialect sigil, not a file */
+                    }
+                }
+                lisp_push_module(ctx, mod_node);
+            }
+            return;
+        }
+        if (strcmp(hn, "embed-file") == 0 || strcmp(hn, "compile-file") == 0) {
+            /* the embedded/compiled path is the last string argument. */
+            for (uint32_t j = nc; j-- > 1;) {
+                TSNode arg = ts_node_named_child(node, j);
+                const char *ak = ts_node_type(arg);
+                if (strcmp(ak, "string") == 0 || strcmp(ak, "str_lit") == 0) {
+                    lisp_push_module(ctx, arg);
+                    break;
+                }
+            }
+            return;
+        }
+    }
+
     /* Plain import head: `(require :util)`, `(import ...)`, `(use ...)`. */
     if (strcmp(hn, "import") == 0 || strcmp(hn, "require") == 0 || strcmp(hn, "load") == 0 ||
         strcmp(hn, "use") == 0 || strcmp(hn, "include") == 0) {
@@ -1821,17 +1993,16 @@ static void lisp_process_list(CBMExtractCtx *ctx, TSNode node) {
  * just root children. Stack-based (not recursive) to avoid deep-nesting stack
  * overflow, matching the other walkers in this file. */
 static void parse_lisp_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *nt = ts_node_type(node);
         if (strcmp(nt, "list") == 0 || strcmp(nt, "list_lit") == 0) {
             lisp_process_list(ctx, node);
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1841,8 +2012,8 @@ static void parse_lisp_imports(CBMExtractCtx *ctx) {
 static void parse_starlark_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "call") == 0) {
@@ -1870,7 +2041,7 @@ static void parse_starlark_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1881,8 +2052,8 @@ static void parse_starlark_imports(CBMExtractCtx *ctx) {
 static void parse_tcl_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
@@ -1904,7 +2075,7 @@ static void parse_tcl_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1915,8 +2086,8 @@ static void parse_tcl_imports(CBMExtractCtx *ctx) {
 static void parse_teal_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "function_call") == 0) {
@@ -1940,7 +2111,7 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -1950,8 +2121,8 @@ static void parse_teal_imports(CBMExtractCtx *ctx) {
 static void parse_zsh_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "command") == 0) {
@@ -1971,7 +2142,7 @@ static void parse_zsh_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2058,15 +2229,15 @@ static void parse_html_imports(CBMExtractCtx *ctx) {
     parse_embedded_imports(ctx);
 
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "start_tag") == 0 ||
             strcmp(ts_node_type(node), "self_closing_tag") == 0) {
             html_extract_tag_src(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2125,8 +2296,8 @@ static void push_string_descendant_import(CBMExtractCtx *ctx, TSNode node) {
 static void parse_cmake_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "normal_command") == 0) {
@@ -2144,15 +2315,15 @@ static void parse_cmake_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- BitBake imports: require/include path ---
 static void parse_bitbake_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2160,7 +2331,7 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx) {
             strcmp(k, "inherit_directive") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2172,8 +2343,8 @@ static void parse_bitbake_imports(CBMExtractCtx *ctx) {
 static void parse_meson_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2196,35 +2367,35 @@ static void parse_meson_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Kconfig imports: source "path" ---
 static void parse_kconfig_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "source") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- GN imports: import("//path") ---
 static void parse_gn_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_statement") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2248,8 +2419,8 @@ static void parse_just_imports(CBMExtractCtx *ctx) {
 static void parse_nix_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "apply_expression") == 0) {
@@ -2268,15 +2439,15 @@ static void parse_nix_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Jsonnet imports: import 'path' / importstr 'path' ---
 static void parse_jsonnet_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2284,15 +2455,15 @@ static void parse_jsonnet_imports(CBMExtractCtx *ctx) {
                                        strcmp(k, "importbin") == 0)) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Pkl imports: amends/extends/import "path" ---
 static void parse_pkl_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2300,7 +2471,7 @@ static void parse_pkl_imports(CBMExtractCtx *ctx) {
             strcmp(k, "importExpr") == 0) {
             push_string_descendant_import(ctx, node);
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2308,8 +2479,8 @@ static void parse_pkl_imports(CBMExtractCtx *ctx) {
 static void parse_nickel_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         /* The grammar emits an anonymous `import` token followed by a
@@ -2330,7 +2501,7 @@ static void parse_nickel_imports(CBMExtractCtx *ctx) {
                 }
             }
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2354,8 +2525,8 @@ static void parse_thrift_imports(CBMExtractCtx *ctx) {
 // --- Cap'n Proto imports: using X = import "path" ---
 static void parse_capnp_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2364,7 +2535,7 @@ static void parse_capnp_imports(CBMExtractCtx *ctx) {
             push_string_descendant_import(ctx, node);
             continue; /* don't double-emit from nested import_path */
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2372,8 +2543,8 @@ static void parse_capnp_imports(CBMExtractCtx *ctx) {
 static void parse_dlang_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_declaration") == 0) {
@@ -2387,15 +2558,15 @@ static void parse_dlang_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- TableGen imports: include "path.td" ---
 static void parse_tablegen_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2404,22 +2575,22 @@ static void parse_tablegen_imports(CBMExtractCtx *ctx) {
             push_string_descendant_import(ctx, node);
             continue;
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
 // --- Crystal imports: require "./path" ---
 static void parse_crystal_imports(CBMExtractCtx *ctx) {
     TSNodeStack stack;
-    ts_nstack_init(&stack, ctx->arena, CBM_SZ_512);
-    ts_nstack_push(&stack, ctx->arena, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (ts_node_is_named(node) && strcmp(ts_node_type(node), "require") == 0) {
             push_string_descendant_import(ctx, node);
             continue;
         }
-        ts_nstack_push_children(&stack, ctx->arena, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2427,8 +2598,8 @@ static void parse_crystal_imports(CBMExtractCtx *ctx) {
 static void parse_fsharp_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2444,7 +2615,7 @@ static void parse_fsharp_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2452,8 +2623,8 @@ static void parse_fsharp_imports(CBMExtractCtx *ctx) {
 static void parse_ada_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "with_clause") == 0) {
@@ -2472,7 +2643,7 @@ static void parse_ada_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2483,8 +2654,8 @@ static void parse_ada_imports(CBMExtractCtx *ctx) {
 static void parse_elm_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "import_clause") == 0) {
@@ -2506,7 +2677,7 @@ static void parse_elm_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2517,8 +2688,8 @@ static void parse_elm_imports(CBMExtractCtx *ctx) {
 static void parse_move_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_declaration") == 0) {
@@ -2535,7 +2706,7 @@ static void parse_move_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2569,8 +2740,8 @@ static char *smali_demangle_descriptor(CBMArena *a, const char *desc) {
 static void parse_smali_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2585,7 +2756,7 @@ static void parse_smali_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2595,8 +2766,8 @@ static void parse_smali_imports(CBMExtractCtx *ctx) {
 static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         const char *k = ts_node_type(node);
@@ -2615,7 +2786,7 @@ static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2627,8 +2798,8 @@ static void parse_tlaplus_imports(CBMExtractCtx *ctx) {
 static void parse_vhdl_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_clause") == 0) {
@@ -2646,7 +2817,7 @@ static void parse_vhdl_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2656,8 +2827,8 @@ static void parse_vhdl_imports(CBMExtractCtx *ctx) {
 static void parse_wit_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_item") == 0) {
@@ -2675,7 +2846,7 @@ static void parse_wit_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2686,8 +2857,8 @@ static void parse_wit_imports(CBMExtractCtx *ctx) {
 static void parse_smithy_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "use_statement") == 0) {
@@ -2709,7 +2880,7 @@ static void parse_smithy_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2719,8 +2890,8 @@ static void parse_smithy_imports(CBMExtractCtx *ctx) {
 static void parse_hyprlang_imports(CBMExtractCtx *ctx) {
     CBMArena *a = ctx->arena;
     TSNodeStack stack;
-    ts_nstack_init(&stack, a, CBM_SZ_512);
-    ts_nstack_push(&stack, a, ctx->root);
+    ts_nstack_init(&stack, ctx, CBM_SZ_512);
+    ts_nstack_push(&stack, ctx->root);
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
         if (strcmp(ts_node_type(node), "source") == 0) {
@@ -2737,7 +2908,7 @@ static void parse_hyprlang_imports(CBMExtractCtx *ctx) {
             }
             continue;
         }
-        ts_nstack_push_children(&stack, a, node);
+        ts_nstack_push_children(&stack, node);
     }
 }
 
@@ -2764,6 +2935,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_JAVASCRIPT:
     case CBM_LANG_TYPESCRIPT:
     case CBM_LANG_TSX:
+    case CBM_LANG_ARKTS:
         parse_es_imports(ctx);
         break;
     case CBM_LANG_JAVA:
@@ -2863,6 +3035,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_FENNEL:
     case CBM_LANG_COMMONLISP:
     case CBM_LANG_CLOJURE:
+    case CBM_LANG_CHIALISP:
         parse_lisp_imports(ctx);
         break;
     case CBM_LANG_STARLARK:
@@ -2960,6 +3133,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_SVELTE:
     case CBM_LANG_VUE:
     case CBM_LANG_ASTRO:
+    /* Tag-dialect CFML: <cfscript> bodies are opaque cf_script_content to the
+     * cfml grammar; the embedded spec re-parses them as CFSCRIPT (#1412). */
+    case CBM_LANG_CFML:
         parse_embedded_imports(ctx);
         break;
     default:
