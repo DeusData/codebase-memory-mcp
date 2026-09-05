@@ -68,6 +68,8 @@ typedef struct {
                                       * ms with no new completed log line */
     int cancel_grace_ms;             /* graceful tree-termination window; <= 0 uses the finite
                                       * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
+    size_t memory_limit_bytes;       /* Windows-only hard commit limit for the entire Job Object;
+                                      * 0 => no OS-enforced memory limit */
     bool delete_log_on_exit;         /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 
