@@ -4119,6 +4119,16 @@ static bool win_file_acl_secure(win_security_t *security, HANDLE file, DWORD mut
     bool secure =
         status == ERROR_SUCCESS && descriptor && dacl && security->is_valid_acl(dacl) &&
         security->get_acl_information(dacl, &information, sizeof(information), AclSizeInformation);
+    if (!cbm_windows_dacl_hardening_enabled()) {
+        /* Hardening disabled (D3): accept the OS-default inherited DACL — the
+         * owner-only one-ACE shape is no longer required, and the
+         * runtime-directory walk has already restored inheritance. The owner
+         * is still validated by win_file_owner_secure. */
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+        return secure;
+    }
     enum {
         WIN_FILE_ACE_ALLOW = 0x00,
         WIN_FILE_ACE_DENY = 0x01,
@@ -4370,6 +4380,77 @@ static void win_repair_runtime_children(win_security_t *security, const wchar_t 
     }
 }
 
+/* True when the object's DACL is protected (inheritance disabled) — the state
+ * hardening applies and the opt-out restores. */
+static bool win_directory_dacl_protected(win_security_t *security, HANDLE directory) {
+    if (!security || !directory) {
+        return false;
+    }
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    DWORD status = security->get_security_info(directory, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                               NULL, NULL, NULL, NULL, &descriptor);
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    bool protected_dacl =
+        status == ERROR_SUCCESS && descriptor &&
+        security->get_security_descriptor_control(descriptor, &control, &revision) != 0 &&
+        (control & SE_DACL_PROTECTED) != 0;
+    if (descriptor) {
+        (void)LocalFree(descriptor);
+    }
+    return protected_dacl;
+}
+
+/* Copy the parent directory's DACL — the ACE set a freshly created child
+ * inherits — so the opt-out can restore the OS-default inherited shape. The
+ * returned DACL is owned by *descriptor_out (LocalFree) and must stay alive
+ * until the SetSecurityInfo call that consumes it. */
+static bool win_directory_parent_dacl(win_security_t *security, const wchar_t *directory_path,
+                                      PACL *dacl_out, PSECURITY_DESCRIPTOR *descriptor_out) {
+    if (!security || !directory_path || !directory_path[0] || !dacl_out || !descriptor_out) {
+        return false;
+    }
+    size_t length = wcslen(directory_path);
+    if (length == 0) {
+        return false;
+    }
+    wchar_t *parent_path = wide_copy(directory_path);
+    if (!parent_path) {
+        return false;
+    }
+    size_t separator = length;
+    while (separator > 0 && parent_path[separator - 1] != L'\\' &&
+           parent_path[separator - 1] != L'/') {
+        separator--;
+    }
+    if (separator == 0) {
+        free(parent_path);
+        return false;
+    }
+    parent_path[separator - 1] = L'\0';
+    HANDLE parent = CreateFileW(
+        parent_path, READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    free(parent_path);
+    if (parent == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    PACL dacl = NULL;
+    PSECURITY_DESCRIPTOR descriptor = NULL;
+    DWORD status = security->get_security_info(parent, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                               NULL, NULL, &dacl, NULL, &descriptor);
+    (void)CloseHandle(parent);
+    if (status != ERROR_SUCCESS || !descriptor || !dacl || !security->is_valid_acl(dacl)) {
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+        return false;
+    }
+    *dacl_out = dacl;
+    *descriptor_out = descriptor;
+    return true;
+}
+
 static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
     win_security_t security;
     if (!win_security_init(&security)) {
@@ -4435,16 +4516,49 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
      * check, there is nothing to fix and the correct action is to leave it
      * alone. When it IS wrong we still repair exactly as before. */
     DWORD secure_result = ERROR_ACCESS_DENIED;
-    bool already_correct =
-        valid_handle && owner_exact && win_file_dacl_is_owner_only(&security, directory);
-    if (already_correct) {
-        secure_result = ERROR_SUCCESS;
+    if (cbm_windows_dacl_hardening_enabled()) {
+        bool already_correct =
+            valid_handle && owner_exact && win_file_dacl_is_owner_only(&security, directory);
+        if (already_correct) {
+            secure_result = ERROR_SUCCESS;
+        } else if (valid_handle && owner_ok) {
+            secure_result = security.set_security_info(
+                directory, SE_FILE_OBJECT,
+                (owner_exact ? 0U : (DWORD)OWNER_SECURITY_INFORMATION) | DACL_SECURITY_INFORMATION |
+                    PROTECTED_DACL_SECURITY_INFORMATION,
+                owner_exact ? NULL : security.user_sid, NULL, security.directory_acl, NULL);
+        }
     } else if (valid_handle && owner_ok) {
-        secure_result = security.set_security_info(
-            directory, SE_FILE_OBJECT,
-            (owner_exact ? 0U : (DWORD)OWNER_SECURITY_INFORMATION) | DACL_SECURITY_INFORMATION |
-                PROTECTED_DACL_SECURITY_INFORMATION,
-            owner_exact ? NULL : security.user_sid, NULL, security.directory_acl, NULL);
+        /* Hardening disabled (D3): keep the exact-owner repair (owner
+         * validators stay active) but never re-protect the DACL, and
+         * restore inheritance on a directory hardened by a previous run
+         * so rename-replace works again without manual icacls. */
+        secure_result = ERROR_SUCCESS;
+        if (!owner_exact && can_write_owner) {
+            secure_result =
+                security.set_security_info(directory, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                                           security.user_sid, NULL, NULL, NULL);
+        }
+        if (secure_result == ERROR_SUCCESS && win_directory_dacl_protected(&security, directory)) {
+            /* Restore the inherited DACL shape: copy the parent's DACL
+             * (the ACEs a freshly created directory inherits) and clear
+             * SE_DACL_PROTECTED. A NULL pDacl with
+             * DACL_SECURITY_INFORMATION would create a NULL DACL — full
+             * access to everyone — so a real ACL is always supplied. */
+            PACL inherited = NULL;
+            PSECURITY_DESCRIPTOR parent_descriptor = NULL;
+            if (win_directory_parent_dacl(&security, runtime_dir, &inherited, &parent_descriptor)) {
+                secure_result = security.set_security_info(directory, SE_FILE_OBJECT,
+                                                           UNPROTECTED_DACL_SECURITY_INFORMATION |
+                                                               DACL_SECURITY_INFORMATION,
+                                                           NULL, NULL, inherited, NULL);
+            } else {
+                secure_result = ERROR_ACCESS_DENIED;
+            }
+            if (parent_descriptor) {
+                (void)LocalFree(parent_descriptor);
+            }
+        }
     }
     if (valid_handle && owner_ok && secure_result != ERROR_SUCCESS) {
         ipc_validation_detail_set("owner/DACL repair failed (status %lu%s)",
