@@ -205,19 +205,18 @@ jobs:
         shell: bash
         run: scripts/ci/test-package-wrappers.sh
 
-  # CodeAtlasWeb (graph-ui) gates. The frontend's own vitest suite (2000+
+  # CodeAtlasWeb (graph-ui) leg: the frontend's own vitest suite (2000+
   # tests; the render tests run under jsdom), its hardcoded-string and
-  # promise scans, its frozen acceptance checks, and a production build with
-  # the same npm ci the product build runs. No browser is downloaded: the
-  # browser proofs (graph-ui/tools/smoke-*.mjs) need a running server and
-  # Playwright browsers, and they stay a local, manually dispatched venue
-  # documented in graph-ui/README.md rather than a hosted gate.
+  # promise scans, its portable frozen acceptance checks, and a production
+  # build with the same npm ci the product build runs. One canonical script
+  # (scripts/ci/test-ui.sh) is the whole leg, here and locally. No browser
+  # is downloaded: the browser proofs (graph-ui/tools/smoke-*.mjs) need a
+  # running server and Playwright browsers, and they stay a local, manually
+  # dispatched venue documented in graph-ui/README.md rather than a hosted
+  # gate.
   test-ui:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: graph-ui
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -225,28 +224,8 @@ jobs:
         with:
           node-version: "22"
 
-      - name: Install (no browser download)
-        env:
-          PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD: "1"
-        run: npm ci
-
-      - name: Unit tests (vitest)
-        run: npm run test:unit
-
-      - name: Style and promise gates
-        run: |
-          npm run check:style
-          npm run check:promises
-
-      # The two release-binding files (release-current, release-proof-binding)
-      # tie the recorded release report to the commits of the frontend's
-      # original repository and cannot pass anywhere else; test:acceptance is
-      # every other frozen check.
-      - name: Frozen acceptance checks
-        run: npm run test:acceptance
-
-      - name: Build
-        run: npm run build
+      - name: CodeAtlasWeb leg (install, unit, style, promises, acceptance, build)
+        run: scripts/ci/test-ui.sh
 
   # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
   # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable

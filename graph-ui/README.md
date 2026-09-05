@@ -20,9 +20,11 @@ What the maintainers added on top:
   check or remove an index, edit the decision record, read the server's
   processes and log. It is the one surface that asks the server to write,
   and it names every route it uses.
-- **Gates in CI** (`.github/workflows/_test.yml`, job `test-ui`):
-  `npm run test:unit`, `npm run check:style`, `npm run check:promises`,
-  `npm run test:acceptance` and `npm run build`. `test:acceptance` is
+- **Gates in CI** (`.github/workflows/_test.yml`, job `test-ui`, which
+  runs `scripts/ci/test-ui.sh`; run that script locally for the identical
+  leg): `npm run test:unit`, `npm run check:style`,
+  `npm run check:promises`, `npm run test:acceptance` and
+  `npm run build`. `test:acceptance` is
   every frozen check except the two release-binding files
   (`release-current`, `release-proof-binding`), which tie the recorded
   release report to the commits of the original repository and cannot
