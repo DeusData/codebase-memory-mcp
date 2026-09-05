@@ -441,6 +441,19 @@ typedef void (*cbm_daemon_runtime_containment_hook_t)(const char *component);
 void cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(uint32_t timeout_ms);
 void cbm_daemon_runtime_set_containment_hook_for_testing(
     cbm_daemon_runtime_containment_hook_t hook);
+
+/* Executable-image fingerprint-cache seams: reset the cache and hash counter
+ * between cases, substitute a stub for the expensive image hash so cache
+ * hit/miss/key-roll are observable without a real 295 MB read, and resolve a
+ * synthetic file identity through the exact cached path the acquire fingerprint
+ * sites use. */
+void cbm_daemon_runtime_fingerprint_cache_reset_for_testing(void);
+void cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(const char *digest);
+int cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(void);
+bool cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(
+    uint64_t device, uint64_t inode, uint64_t size, int64_t mtime_seconds,
+    int64_t mtime_nanoseconds, int64_t ctime_seconds, int64_t ctime_nanoseconds,
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE]);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

@@ -17,6 +17,16 @@ typedef struct {
     uint64_t bitlen;
     uint8_t buf[64];
     size_t buflen;
+#ifdef __APPLE__
+    /* On Apple the streaming API is backed by CommonCrypto's hardware-
+     * accelerated SHA-256 (~9x the scalar path on Apple silicon). This
+     * over-aligned opaque store holds its CC_SHA256_CTX without leaking
+     * <CommonCrypto/CommonDigest.h> into every includer; sha256.c static-asserts
+     * it is large enough. The state/buf fields above then go unused, but are
+     * retained so the portable scalar path stays compilable for the test that
+     * asserts the two implementations are bit-identical. */
+    _Alignas(8) unsigned char apple_cc[128];
+#endif
 } cbm_sha256_ctx;
 
 void cbm_sha256_init(cbm_sha256_ctx *c);
@@ -32,5 +42,12 @@ void cbm_sha256_hex(const void *data, size_t len, char out[CBM_SHA256_HEX_LEN + 
  * zero. */
 void cbm_hmac_sha256(const void *key, size_t key_len, const void *data, size_t data_len,
                      uint8_t out[CBM_SHA256_DIGEST_LEN]);
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Always runs the portable scalar SHA-256, on every platform, so a test can
+ * assert the platform-optimized cbm_sha256_* path is bit-identical to it. */
+void cbm_sha256_scalar_hex_for_testing(const void *data, size_t len,
+                                       char out[CBM_SHA256_HEX_LEN + 1]);
+#endif
 
 #endif /* CBM_SHA256_H */
