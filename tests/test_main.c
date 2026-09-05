@@ -827,6 +827,7 @@ extern void suite_store_pragmas(void);
 extern void suite_store_checkpoint(void);
 extern void suite_traces(void);
 extern void suite_configlink(void);
+extern void suite_doclinks(void);
 extern void suite_infrascan(void);
 extern void suite_cli(void);
 extern void suite_agent_clients(void);
@@ -1129,6 +1130,9 @@ int main(int argc, char **argv) {
 
     /* Config link */
     RUN_SELECTED_SUITE(configlink);
+
+    /* Doc/shell file reference link */
+    RUN_SELECTED_SUITE(doclinks);
 
     /* Infrastructure scanning */
     RUN_SELECTED_SUITE(infrascan);
