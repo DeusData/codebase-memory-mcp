@@ -19,8 +19,9 @@
 #include <stdint.h>
 #include <stdatomic.h>
 
-#include "discover/discover.h"    /* cbm_ignored_file_t (#963) */
-#include "foundation/constants.h" /* CBM_SZ_512 */
+#include "discover/discover.h"     /* cbm_ignored_file_t (#963) */
+#include "foundation/constants.h"  /* CBM_SZ_512 */
+#include "foundation/hash_table.h" /* CBMHashTable (#1355 pkgmap lookup) */
 
 /* Forward declarations */
 typedef struct cbm_store cbm_store_t;
@@ -291,6 +292,20 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
+/* #1355: drop a project-wide same-name guess (suffix_match / unique_name /
+ * field_type_hint / fuzzy) for a BARE call whose name the calling file binds to
+ * a NON-RELATIVE (package) import that resolved to nothing in the graph —
+ * `import { eq } from "drizzle-orm"` must not make `eq(...)` a CALLS edge to an
+ * unrelated project `eq`. A name the import map does bind, a relative
+ * specifier, a member/qualified callee, and every import-/receiver-aware
+ * strategy are all kept. `indexed_packages` is the pipeline package map: a
+ * specifier naming a package the tree itself declares (a workspace sibling)
+ * counts as in-tree and is kept too; NULL disables that check.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
+                                         const CBMImportArray *file_imports,
+                                         const char **import_map_keys, int import_map_count,
+                                         const CBMHashTable *indexed_packages);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572

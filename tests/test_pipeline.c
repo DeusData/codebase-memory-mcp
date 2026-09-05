@@ -5055,6 +5055,252 @@ static int count_nodes_named(cbm_store_t *s, const char *project, const char *na
  * (axios.get, api.patch on a renamed-axios instance, supertest request(app).get).
  * The regex false edge must stay suppressed in parallel too. CBM_WORKERS forces
  * >1 worker so the parallel path is taken regardless of the host core count. */
+/* #1355: padding count for write_external_import_shadow_fixture, deliberately
+ * well past MIN_FILES_FOR_PARALLEL (=50, a private #define in
+ * src/pipeline/pipeline.c — not exposed to tests, so this cannot be a
+ * static_assert against it) rather than sitting right at the threshold. The
+ * margin, not the exact value, is what the test depends on: a modest bump to
+ * the real threshold must not silently drop this fixture back onto the
+ * sequential-only path and leave the parallel resolver unexercised. Same
+ * pattern as ET_PARALLEL_PAD / CP_PARALLEL_PAD in test_edge_types_probe.c /
+ * test_convergence_probe.c. */
+enum { EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD = 64 };
+
+/* #1355: write the shared external-import-shadow fixture into `dir`.
+ * `pad_files` filler modules push the run over MIN_FILES_FOR_PARALLEL so the
+ * same tree can be indexed by both resolvers. */
+static void write_external_import_shadow_fixture(const char *dir, int pad_files) {
+    /* The lone project symbols named eq/sql — ordinary local helpers. */
+    write_temp_file(dir, "src/text-utils.ts",
+                    "export function eq(a: string, b: string): boolean {\n"
+                    "  return a.trim() === b.trim();\n"
+                    "}\n"
+                    "export function sql(chunk: string): string {\n"
+                    "  return chunk.replace(/\\s+/g, ' ');\n"
+                    "}\n"
+                    "export function normalize(s: string): string {\n"
+                    "  return s.trim().toLowerCase();\n"
+                    "}\n");
+    /* `eq` and `sql` come from an external package that is not in the tree, so
+     * the registry falls through to a project-wide same-name guess. These are
+     * the fabricated edges. `normalize` is imported relatively from the SAME
+     * file the guess would have picked — it must survive. */
+    write_temp_file(dir, "src/queries.ts",
+                    "import { eq, sql } from 'drizzle-orm';\n"
+                    "import { normalize } from './text-utils';\n"
+                    "export function buildQuery(id: string): unknown {\n"
+                    "  return [eq({ id }, id), sql('select 1'), normalize(id)];\n"
+                    "}\n");
+    /* No import of `eq` at all: nothing in the caller's source contradicts the
+     * guess, so the pre-existing fallback keeps its edge. */
+    write_temp_file(dir, "src/no-import.ts",
+                    "export function callsWithoutImport(a: string, b: string): boolean {\n"
+                    "  return eq(a, b);\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function shadowPad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+/* #1355: assert the guard's whole contract against one indexed store. */
+static int assert_external_import_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the reported bug: an externally-imported name must not bind to the
+     * local homonym (RED before the fix, on both resolvers). */
+    if (cross_file_call_exists(s, project, "buildQuery", "eq")) {
+        rc = 4;
+    }
+    if (rc == 0 && cross_file_call_exists(s, project, "buildQuery", "sql")) {
+        rc = 5;
+    }
+    /* (2) the relative import to the very same file still resolves. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "buildQuery", "normalize")) {
+        rc = 6;
+    }
+    /* (3) a bare call the caller never imports keeps its pre-existing edge. */
+    if (rc == 0 && !cross_file_call_exists(s, project, "callsWithoutImport", "eq")) {
+        rc = 7;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ext_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    /* Enough files that CBM_WORKERS can take the fused-parallel path; the same
+     * tree is then indexed by each resolver in turn, because the guard lives at
+     * two independent emit sites (pass_calls.c and pass_parallel.c). */
+    write_external_import_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    /* getenv() returns a pointer into the process environment that must be
+     * treated as read-only; strdup() below only ever reads through it. */
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_external_import_shadow_contract(tmp, "shadow-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_external_import_shadow_contract(tmp, "shadow-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
+/* #1355 / #1732: the same tree, but the bare specifier now names a WORKSPACE
+ * package that the repository itself ships. `main` deliberately points at a
+ * build artifact that is not checked in — the shape every real monorepo has,
+ * and the reason an entry-file lookup cannot answer this question. */
+static void write_workspace_shadow_fixture(const char *dir, int pad_files) {
+    /* One directory level only: write_temp_file's mkdir is documented as
+     * "simple version, one level", and a deeper path fails silently — which
+     * makes the fixture look healthy while the file never lands. */
+    write_temp_file(dir, "lib/package.json",
+                    "{\n  \"name\": \"@fixture/lib\",\n  \"main\": \"./dist/index.js\"\n}\n");
+    write_temp_file(dir, "lib/index.ts",
+                    "export function wsEq(a: string, b: string): boolean {\n"
+                    "  return a === b;\n"
+                    "}\n");
+    write_temp_file(dir, "app/package.json", "{\n  \"name\": \"@fixture/app\"\n}\n");
+    /* The lone project symbol named wsSpec — an ordinary local helper that a
+     * project-wide guess would happily bind an external `wsSpec` to. */
+    write_temp_file(dir, "app/spec-helpers.ts",
+                    "export function wsSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    write_temp_file(dir, "app/query.ts",
+                    "import { wsEq } from '@fixture/lib';\n"
+                    "import { wsSpec } from 'vitest';\n"
+                    "export function wsBuild(id: string): unknown {\n"
+                    "  return [wsEq(id, id), wsSpec('case')];\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function wsPad%02d(): number { return %d; }\n", i, i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_workspace_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the workspace sibling: the tree declares @fixture/lib, so the bare
+     * specifier is in-project and the fallback keeps its chance. RED without
+     * the package-map check — this is the 1377-edge class measured on
+     * drizzle-team/drizzle-orm. */
+    if (!cross_file_call_exists(s, project, "wsBuild", "wsEq")) {
+        rc = 4;
+    }
+    /* (2) a genuine third-party package in the very same file is still cut:
+     * the check must not disarm the guard wholesale. */
+    if (rc == 0 && cross_file_call_exists(s, project, "wsBuild", "wsSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_ws_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_workspace_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_workspace_shadow_contract(tmp, "ws-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_workspace_shadow_contract(tmp, "ws-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_par_XXXXXX");
@@ -13471,6 +13717,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
