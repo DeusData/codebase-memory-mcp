@@ -13409,6 +13409,87 @@ TEST(pipeline_markdown_and_config_prose_reaches_fts_body) {
     PASS();
 }
 
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Join two Studio Export range strings and hand back the result. The caller
+ * owns nothing: the string lives in the aggregate's arena, so copy it out
+ * before the arena goes away. */
+static void join_export_ranges(const char *agg_ranges, int agg_regions, const char *part_ranges,
+                               int part_regions, char *out, size_t out_size, int *out_regions) {
+    CBMFileResult aggregate;
+    CBMFileResult part;
+    memset(&aggregate, 0, sizeof(aggregate));
+    memset(&part, 0, sizeof(part));
+    cbm_arena_init(&aggregate.arena);
+    cbm_arena_init(&part.arena);
+    aggregate.error_ranges = agg_ranges;
+    aggregate.error_region_count = agg_regions;
+    aggregate.parse_incomplete = true;
+    part.error_ranges = part_ranges;
+    part.error_region_count = part_regions;
+    part.parse_incomplete = true;
+
+    out[0] = '\0';
+    *out_regions = 0;
+    if (cbm_pipeline_coverage_marker_test_join(&aggregate, &part)) {
+        snprintf(out, out_size, "%s", aggregate.error_ranges ? aggregate.error_ranges : "");
+        *out_regions = aggregate.error_region_count;
+    }
+    cbm_arena_destroy(&aggregate.arena);
+    cbm_arena_destroy(&part.arena);
+}
+
+/* Count the "+" characters in a range string. A truncation marker must appear
+ * once and only at the end: every reader stops at the first token that is not
+ * a range, so a marker in the middle silently hides every range after it. */
+static int count_plus(const char *s) {
+    int n = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '+') {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
+    char joined[256];
+    int regions = 0;
+
+    /* Neither side dropped anything, so nothing invents a marker. */
+    join_export_ranges("1-2,5-9", 2, "20-24", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,5-9,20-24", joined);
+    ASSERT_EQ(0, count_plus(joined));
+    ASSERT_EQ(3, regions);
+
+    /* The first class overran the cap. Its marker must move to the end, so the
+     * second class's ranges stay visible in front of it. */
+    join_export_ranges("1-2,5-9,+7", 2, "20-24", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,5-9,20-24,+7", joined);
+    ASSERT_EQ(1, count_plus(joined));
+
+    /* The second class overran the cap. Same single trailing marker. */
+    join_export_ranges("1-2", 1, "20-24,+3", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,20-24,+3", joined);
+    ASSERT_EQ(1, count_plus(joined));
+
+    /* Both overran. One marker, carrying the sum, or the report would
+     * under-count what it threw away. */
+    join_export_ranges("1-2,+7", 1, "20-24,+3", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,20-24,+10", joined);
+    ASSERT_EQ(1, count_plus(joined));
+
+    /* An empty aggregate is the first class in the file. No leading comma. */
+    join_export_ranges(NULL, 0, "20-24,+3", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("20-24,+3", joined);
+    ASSERT_EQ(1, regions);
+
+    /* A part with nothing to say leaves the aggregate exactly as it was. */
+    join_export_ranges("1-2,+7", 1, "", 0, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,+7", joined);
+    PASS();
+}
+#endif
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -13453,6 +13534,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+    RUN_TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker);
+#endif
     RUN_TEST(pipeline_env_access_configures_sequential_parallel_parity);
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);

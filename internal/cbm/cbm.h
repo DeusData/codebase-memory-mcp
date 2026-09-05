@@ -522,6 +522,21 @@ typedef struct CBMFileResult {
      * completeness guarantee. Callers should treat a flagged file as "prefer
      * grep here", never treat an unflagged file as provably complete. */
     bool parse_incomplete;
+    /* True when the ranges cover so much of the file that they are no longer
+     * useful advice — one range over 80% of the line count. The file WAS
+     * indexed, but pointing a reader at almost every line tells them nothing,
+     * so the report says "read the source" instead of listing the range.
+     *
+     * Its main customers are non-C languages. The refinement that narrows a
+     * whole-file range using the preprocessed parse only runs for C, C++ and
+     * CUDA, so a Python, Java or Ruby file whose root node is ERROR still
+     * reports 1-N.
+     *
+     * Note the naming: this field and the phase string it produces are both
+     * `parse_unusable`. The older `parse_incomplete` field emits the phase
+     * `parse_partial` instead. That mismatch is historical, not deliberate —
+     * do not copy it. */
+    bool parse_unusable;
     const char *error_ranges;
     int error_region_count;
     bool is_test_file;
