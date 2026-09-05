@@ -45,6 +45,23 @@ if [[ "$probe_sites" == *kill_grace* ]]; then
     exit 1
 fi
 
+# Barrier files must be published atomically. Path.write_text creates and
+# truncates before it writes, so a poller that saw `<suite>.ready` appear and
+# then parsed the leader pid could read the zero-byte window and fail on
+# int("") -- a scheduler-side race surfacing as a harness flake. Asserted
+# structurally: no barrier file is written in place, and the scheduler renames
+# a same-directory temp file onto the destination instead.
+barrier_writes=$(grep -nE '^[[:space:]]*(ready|leader_exited)\.write_text\(' "$scheduler" || true)
+if [ -n "$barrier_writes" ]; then
+    echo "FAIL: scheduler barrier files are written in place (non-atomic):" >&2
+    echo "$barrier_writes" >&2
+    exit 1
+fi
+if ! grep -Fq 'os.replace(' "$scheduler"; then
+    echo "FAIL: scheduler does not rename barrier files into place" >&2
+    exit 1
+fi
+
 python3 - "$scheduler" <<'PROBE'
 from __future__ import annotations
 

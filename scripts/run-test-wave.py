@@ -17,6 +17,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 
@@ -103,6 +104,31 @@ def append_log(path: pathlib.Path, message: str) -> None:
     with path.open("a", encoding="utf-8", newline="\n") as stream:
         stream.write(message)
         stream.write("\n")
+
+
+def publish_barrier_file(path: pathlib.Path, text: str) -> None:
+    """Publish a barrier file so a poller sees either no file or its content.
+
+    Path.write_text creates and truncates before it writes, so a reader that
+    polls for existence and then parses the content can observe the zero-byte
+    window in between.  Write next to the destination and rename into place.
+    """
+    with tempfile.NamedTemporaryFile(
+        mode="w",
+        encoding="utf-8",
+        newline="\n",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        delete=False,
+    ) as temporary:
+        temporary.write(text)
+        temporary.flush()
+        temporary_path = pathlib.Path(temporary.name)
+    try:
+        os.replace(temporary_path, path)
+    except BaseException:
+        temporary_path.unlink(missing_ok=True)
+        raise
 
 
 def start_suite(
@@ -288,12 +314,12 @@ def wait_for_test_pre_terminate_barrier(
     ready = barrier_dir / f"{active.name}.ready"
     leader_exited = barrier_dir / f"{active.name}.leader-exited"
     release = barrier_dir / f"{active.name}.release"
-    ready.write_text(f"{active.process.pid}\n", encoding="utf-8")
+    publish_barrier_file(ready, f"{active.process.pid}\n")
     deadline = time.monotonic() + 10
     while not release.exists():
         returncode = active.process.poll()
         if returncode is not None and not leader_exited.exists():
-            leader_exited.write_text(f"{returncode}\n", encoding="utf-8")
+            publish_barrier_file(leader_exited, f"{returncode}\n")
         if time.monotonic() >= deadline:
             raise RuntimeError(
                 f"test pre-terminate barrier for {active.name!r} was not released"
@@ -312,7 +338,7 @@ def wait_for_test_post_exit_barrier(
         return
     ready = barrier_dir / f"{suite}.ready"
     release = barrier_dir / f"{suite}.release"
-    ready.write_text("child exited; result intentionally not recorded\n", encoding="utf-8")
+    publish_barrier_file(ready, "child exited; result intentionally not recorded\n")
     deadline = time.monotonic() + 10
     while not release.exists():
         if time.monotonic() >= deadline:
