@@ -196,7 +196,13 @@ static const char *enclosing_function_qn(CBMExtractCtx *ctx, TSNode node) {
             if (!ts_node_is_null(name_node)) {
                 char *name = cbm_node_text(ctx->arena, name_node, ctx->source);
                 if (name && name[0]) {
-                    return name;
+                    /* #1930: return a resolvable QN — def QNs are
+                     * module-qualified, so a bare name never matched any node
+                     * and every channel edge silently degraded to the file
+                     * node through find_channel_source's fallback. A miss
+                     * (e.g. a class-nested member) still falls back exactly
+                     * as before. */
+                    return cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, name);
                 }
             }
             return NULL;
@@ -625,6 +631,64 @@ static void go_process_call(CBMExtractCtx *ctx, TSNode call) {
     push_channel(ctx, channel_name, "websocket", direction, call);
 }
 
+/* ── #1930: Go native channels ───────────────────────────────────────
+ * `x <- v` and `<-x` are channel operations by GRAMMAR — no type inference is
+ * needed for precision, unlike the WebSocket name-heuristics above. The
+ * channel's v1 identity is its package-qualified tail identifier (the struct
+ * field or variable the operation touches): `s.out <- ev` in package p and
+ * `<-w.out` in another file of p join on `p…out`, which is exactly the
+ * producer/consumer topology trace_path could not cross before. Deliberately
+ * deferred: element types on the node, `go` statements (CROSS_ASYNC), and
+ * `for range ch` receives (range needs the operand's TYPE to know it is a
+ * channel — a name-shape guess here would be the #1932 anti-pattern). */
+static const char *go_chan_expr_name(CBMExtractCtx *ctx, TSNode expr) {
+    const char *kind = ts_node_type(expr);
+    if (strcmp(kind, "parenthesized_expression") == 0 && ts_node_named_child_count(expr) == 1) {
+        return go_chan_expr_name(ctx, ts_node_named_child(expr, 0));
+    }
+    if (strcmp(kind, "identifier") == 0) {
+        return cbm_node_text(ctx->arena, expr, ctx->source);
+    }
+    if (strcmp(kind, "selector_expression") == 0) {
+        TSNode field = ts_node_child_by_field_name(expr, "field", 5);
+        if (!ts_node_is_null(field)) {
+            return cbm_node_text(ctx->arena, field, ctx->source);
+        }
+    }
+    return NULL;
+}
+
+static void go_push_native_channel(CBMExtractCtx *ctx, TSNode site, TSNode chan_expr,
+                                   CBMChannelDirection direction) {
+    const char *tail = go_chan_expr_name(ctx, chan_expr);
+    if (!tail || !tail[0] || strcmp(tail, "_") == 0) {
+        return;
+    }
+    /* Package-qualify so same-named channels in different packages stay
+     * distinct while cross-file uses within one package join. */
+    const char *qualified = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, tail);
+    push_channel(ctx, qualified, "gochan", direction, site);
+}
+
+static void go_process_native_send(CBMExtractCtx *ctx, TSNode node) {
+    TSNode chan_expr = ts_node_child_by_field_name(node, "channel", 7);
+    if (!ts_node_is_null(chan_expr)) {
+        go_push_native_channel(ctx, node, chan_expr, CBM_CHANNEL_EMIT);
+    }
+}
+
+static void go_process_native_receive(CBMExtractCtx *ctx, TSNode node) {
+    TSNode op = ts_node_child_by_field_name(node, "operator", 8);
+    if (ts_node_is_null(op) || ts_node_end_byte(op) - ts_node_start_byte(op) != 2 ||
+        strncmp(ctx->source + ts_node_start_byte(op), "<-", 2) != 0) {
+        return;
+    }
+    TSNode operand = ts_node_child_by_field_name(node, "operand", 7);
+    if (!ts_node_is_null(operand)) {
+        go_push_native_channel(ctx, node, operand, CBM_CHANNEL_LISTEN);
+    }
+}
+
 static void extract_channels_go(CBMExtractCtx *ctx) {
     TSNodeStack stack;
     ts_nstack_init(&stack, ctx, CHAN_STACK_CAP);
@@ -632,8 +696,13 @@ static void extract_channels_go(CBMExtractCtx *ctx) {
 
     while (stack.count > 0) {
         TSNode node = ts_nstack_pop(&stack);
-        if (strcmp(ts_node_type(node), "call_expression") == 0) {
+        const char *kind = ts_node_type(node);
+        if (strcmp(kind, "call_expression") == 0) {
             go_process_call(ctx, node);
+        } else if (strcmp(kind, "send_statement") == 0) {
+            go_process_native_send(ctx, node);
+        } else if (strcmp(kind, "unary_expression") == 0) {
+            go_process_native_receive(ctx, node);
         }
         uint32_t count = ts_node_child_count(node);
         for (int i = (int)count - SKIP_ONE; i >= 0; i--) {

@@ -4772,6 +4772,106 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* #1930: does an edge of this type run from the named function to the named
+ * Channel node? */
+static bool channel_edge_exists(cbm_store_t *s, const char *project, const char *func_name,
+                                const char *channel_name, const char *edge_type) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, func_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, channel_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, edge_type, &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
+TEST(pipeline_go_native_channel_topology) {
+    /* #1930: the producer/consumer topology of a Go channel pipeline — a send
+     * in one file, a select-receive in another file of the same package —
+     * must materialize as one gochan Channel node with EMITS/LISTENS_ON
+     * edges, so trace_path can cross the channel. RED on main: zero gochan
+     * Channel nodes exist. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_chan_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "go.mod", "module example.com/fxchan\n\ngo 1.22\n");
+    write_temp_file(tmp, "state/state.go",
+                    "package state\n"
+                    "\n"
+                    "var events = make(chan int, 8)\n"
+                    "\n"
+                    "func Produce(v int) {\n"
+                    "\tevents <- v\n"
+                    "}\n");
+    write_temp_file(tmp, "state/drain.go",
+                    "package state\n"
+                    "\n"
+                    "func Drain() int {\n"
+                    "\tselect {\n"
+                    "\tcase v := <-events:\n"
+                    "\t\treturn v\n"
+                    "\tdefault:\n"
+                    "\t\treturn 0\n"
+                    "\t}\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_chan.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* One package-qualified channel node, transport gochan. */
+    char chan_name[512];
+    snprintf(chan_name, sizeof(chan_name), "%s.state.events", project);
+    cbm_node_t *chans = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_name(s, project, chan_name, &chans, &cc);
+    ASSERT_EQ(cc, 1);
+    ASSERT_TRUE(chans[0].label && strcmp(chans[0].label, "Channel") == 0);
+    ASSERT_NOT_NULL(chans[0].properties_json);
+    ASSERT_NOT_NULL(strstr(chans[0].properties_json, "\"transport\":\"gochan\""));
+    cbm_store_free_nodes(chans, cc);
+
+    /* Producer and consumer link the SAME node across files. */
+    ASSERT_TRUE(channel_edge_exists(s, project, "Produce", chan_name, "EMITS"));
+    ASSERT_TRUE(channel_edge_exists(s, project, "Drain", chan_name, "LISTENS_ON"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -13463,6 +13563,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_native_channel_topology);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
