@@ -1823,6 +1823,53 @@ static bool app_env_backup_restore(app_env_backup_t *backup) {
     return status == 0;
 }
 
+/* The Graph UI enters through the daemon's background coordinator rather than
+ * the MCP tool path. Keep that path UTF-8-safe as well. */
+TEST(daemon_application_ui_index_accepts_non_ascii_directory) {
+    app_env_backup_t cache_environment;
+    bool cache_saved = app_env_backup_capture(&cache_environment, "CBM_CACHE_DIR");
+    char root[APP_TEST_PATH_CAP];
+    char cache[APP_TEST_PATH_CAP];
+    (void)snprintf(root, sizeof(root),
+                   "%s/cbm-app-ui-index-\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-app-ui-index-cache-XXXXXX", cbm_tmpdir());
+    bool dirs_created = cbm_mkdtemp(root) != NULL && cbm_mkdtemp(cache) != NULL;
+    bool cache_set = cache_saved && dirs_created && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.allow_completion, true);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cache_set ? cbm_daemon_application_new(&config) : NULL;
+    int result = application ? cbm_daemon_application_index(application, "", root) : -1;
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    bool root_cleaned = th_rmtree(root) == 0;
+    bool cache_cleaned = th_rmtree(cache) == 0;
+    bool cache_restored = app_env_backup_restore(&cache_environment);
+
+    ASSERT_TRUE(cache_saved);
+    ASSERT_TRUE(dirs_created);
+    ASSERT_TRUE(cache_set);
+    ASSERT_NOT_NULL(application);
+    ASSERT_EQ(result, 0);
+    ASSERT_EQ(atomic_load(&fake.starts), 1);
+    ASSERT_EQ(atomic_load(&fake.destroys), 1);
+    ASSERT_TRUE(stopped);
+    ASSERT_TRUE(root_cleaned);
+    ASSERT_TRUE(cache_cleaned);
+    ASSERT_TRUE(cache_restored);
+    PASS();
+}
+
 typedef struct {
     atomic_int starts;
     atomic_int start_failures_remaining;
@@ -5400,6 +5447,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_ui_index_accepts_non_ascii_directory);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

@@ -8,8 +8,9 @@
  * (input_path), not to worktree_root. Joining it with worktree_root and then
  * string-stripping "/.git" left unresolved ".." components in the result.
  *
- * These tests shell out to `git`, so they SKIP_PLATFORM on Windows (the CI
- * shell there cannot init a repo via system()).
+ * The canonical_root tests shell out to `git`, so they SKIP_PLATFORM on
+ * Windows (the CI shell there cannot init a repo via system()). The root-path
+ * existence test runs on every platform.
  *
  * Reproduce-first guard: canonical_root_subdir is the genuine RED-without-the-fix
  * guard — a repo indexed from a subdirectory yields a relative --git-common-dir
@@ -34,9 +35,29 @@
 #include <limits.h>
 #endif
 
-/* These helpers shell out to git and are only used by the non-Windows test
- * bodies below; on Windows every test SKIP_PLATFORMs, so guard them here too or
- * they'd be unused-static functions and fail the -Werror build. */
+/* The Windows narrow stat() API interprets UTF-8 paths through the active ANSI
+ * code page. That made an existing Unicode repository root appear absent and
+ * stopped Git discovery before git was invoked (#1240). */
+TEST(root_exists_non_ascii_directory) {
+    /* UTF-8 for "Japanese language", written as bytes to keep the source ASCII. */
+    char *tmp = th_mktempdir("cbm_gitctx_\xE6\x97\xA5\xE6\x9C\xAC\xE8\xAA\x9E");
+    if (!tmp)
+        FAIL("th_mktempdir returned NULL for non-ASCII path");
+
+    cbm_git_context_t ctx = {0};
+    int rc = cbm_git_context_resolve(tmp, &ctx);
+    bool root_exists = ctx.root_exists;
+    cbm_git_context_free(&ctx);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(root_exists);
+    PASS();
+}
+
+/* These helpers shell out to git and are only used by the non-Windows
+ * canonical_root test bodies below; guard them here too or they'd be
+ * unused-static functions and fail the -Werror build on Windows. */
 #ifndef _WIN32
 /* Run a git command inside dir, return 0 on success. */
 static int git_run(const char *dir, const char *args) {
@@ -235,6 +256,7 @@ TEST(canonical_root_linked_worktree) {
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
+    RUN_TEST(root_exists_non_ascii_directory);
     RUN_TEST(canonical_root_repo_root);
     RUN_TEST(canonical_root_subdir);
     RUN_TEST(canonical_root_linked_worktree);
