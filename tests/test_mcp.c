@@ -10118,6 +10118,73 @@ TEST(search_code_path_filter_prefilter_keeps_matches) {
     PASS();
 }
 
+/* #2011: a grep record longer than the read buffer used to be split across two
+ * fgets calls, and the continuation was parsed as a fresh file:line:content
+ * record — inventing a file path out of matched content and a line number of 0.
+ * A single >2 KiB line containing colons reproduces it: the repository holds
+ * two matches, and the split used to report three. */
+TEST(search_code_long_line_does_not_invent_matches) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_longline_XXXXXX");
+    ASSERT_TRUE(cbm_mkdtemp(tmp) != NULL);
+
+    char big_path[768], normal_path[768];
+    snprintf(big_path, sizeof(big_path), "%s/big.js", tmp);
+    snprintf(normal_path, sizeof(normal_path), "%s/normal.js", tmp);
+
+    /* One line well over the 2 KiB read buffer, full of colons, with the
+     * needle at the very end so the match lands past the split point. */
+    FILE *fp = fopen(big_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "var CFG=({");
+    for (int i = 0; i < 260; i++) {
+        fprintf(fp, "k%d:\"v%d\",", i, i);
+    }
+    fprintf(fp, "NEEDLEmarker:1});\n");
+    fclose(fp);
+
+    fp = fopen(normal_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fprintf(fp, "const NEEDLEmarker = 42;\n");
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *proj = "longline-search";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(cbm_mcp_server_store(srv), proj, tmp);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\","
+             "\"arguments\":{\"pattern\":\"NEEDLEmarker\",\"project\":\"longline-search\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+
+    /* Exactly the two real matches — the split must not produce a third. */
+    int grep_matches = -1;
+    const char *g = strstr(inner, "\"total_grep_matches\":");
+    if (g) {
+        sscanf(g, "\"total_grep_matches\":%d", &grep_matches);
+    } else if ((g = strstr(inner, "total_grep_matches: ")) != NULL) {
+        sscanf(g, "total_grep_matches: %d", &grep_matches);
+    }
+    ASSERT_EQ(grep_matches, 2);
+
+    /* Every reported line number belongs to a real line: the fabricated row
+     * carried line 0, which no grep -n record can produce. */
+    ASSERT_TRUE(strstr(inner, "\"line\":0") == NULL);
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    unlink(big_path);
+    unlink(normal_path);
+    rmdir(tmp);
+    PASS();
+}
+
 /* PR #756 (distilled): path_filter matching ZERO indexed files. With the
  * prefilter the scoped filelist has 0 records, and handle_search_code now
  * skips the grep subprocess entirely (xargs on an empty filelist is
@@ -19923,6 +19990,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_scoped_path_with_cjk_root_issue903);
 #endif
     RUN_TEST(search_code_path_filter_prefilter_keeps_matches);
+    RUN_TEST(search_code_long_line_does_not_invent_matches);
     RUN_TEST(search_code_path_filter_matches_nothing);
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
