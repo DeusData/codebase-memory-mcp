@@ -360,6 +360,7 @@ static bool diagnostics_discovery_value(const char *key, char *out, size_t out_s
 TEST(diagnostics_discovery_record_survives_suppressed_log_level) {
     diagnostics_discovery_records = 0;
     diagnostics_discovery_line[0] = '\0';
+    CBMLogLevel previous_log_level = cbm_log_get_level();
     cbm_log_set_level(CBM_LOG_NONE);
     cbm_log_set_sink_ex(diagnostics_discovery_sink, CBM_LOG_SINK_REPLACE);
     ASSERT_EQ(cbm_setenv("CBM_DIAGNOSTICS", "1", 1), 0);
@@ -369,7 +370,7 @@ TEST(diagnostics_discovery_record_survives_suppressed_log_level) {
     cbm_diag_stop();
     (void)cbm_unsetenv("CBM_DIAGNOSTICS");
     cbm_log_set_sink(NULL);
-    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_level(previous_log_level);
 
     char recorded_snapshot[1024] = "";
     char recorded_trajectory[1024] = "";

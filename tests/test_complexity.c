@@ -353,6 +353,8 @@ typedef struct {
     uint64_t tail_lookups;
     uint64_t tail_candidates;
     uint64_t fallback_rows;
+    uint64_t imp_nodes;       /* symbols scored by the importance pass */
+    uint64_t imp_name_visits; /* same-name-group members visited by that pass */
     double wall_s;
 } CxMetrics;
 
@@ -373,6 +375,8 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     uint64_t tl0 = atomic_load_explicit(&g_lsp_tail_lookups, memory_order_relaxed);
     uint64_t tc0 = atomic_load_explicit(&g_lsp_tail_candidates, memory_order_relaxed);
     uint64_t fb0 = cbm_pp_lsp_linear_fallback_rows();
+    uint64_t in0 = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed);
+    uint64_t iv0 = atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed);
 
     atomic_store_explicit(&g_cx_pass_count, 0, memory_order_relaxed);
     cbm_log_set_sink_ex(cx_pass_sink, CBM_LOG_SINK_TEE);
@@ -407,6 +411,9 @@ static int cx_run(const char *root, const char *db_path, CxMetrics *out) {
     out->tail_lookups = atomic_load_explicit(&g_lsp_tail_lookups, memory_order_relaxed) - tl0;
     out->tail_candidates = atomic_load_explicit(&g_lsp_tail_candidates, memory_order_relaxed) - tc0;
     out->fallback_rows = cbm_pp_lsp_linear_fallback_rows() - fb0;
+    out->imp_nodes = atomic_load_explicit(&g_importance_nodes, memory_order_relaxed) - in0;
+    out->imp_name_visits =
+        atomic_load_explicit(&g_importance_name_visits, memory_order_relaxed) - iv0;
 
     cbm_store_t *s = cbm_store_open_path(db_path);
     if (!s) {
@@ -717,9 +724,46 @@ TEST(complexity_throughput_report_written) {
     PASS();
 }
 
+/* Importance scoring must stay linear in the graph. Its generic-name
+ * multiplier needs |{files a name is defined in}|; computing that per NODE
+ * instead of once per distinct NAME makes a same-name group of size k cost
+ * O(k^3) — measured on a large Java corpus as a multi-minute cost for a
+ * handful of names. Under replication the same-name groups grow with the copy
+ * count, so the per-node shape lands at ~4x per doubling here while the
+ * memoized shape stays at ~2x. Gated on the counter ratio, never on wall time
+ * (O9). This counter is GATED, not merely recorded: the whole point of the
+ * work is that this quantity must not go superlinear. */
+TEST(complexity_importance_scoring_is_linear) {
+    if (cx_measure_pair() != 0) {
+        FAIL("failed to build/run the complexity corpus pair");
+    }
+    const CxMetrics *a = &g_cx_base;
+    const CxMetrics *b = &g_cx_doubled;
+
+    printf("    imp_nodes %llu -> %llu  imp_name_visits %llu -> %llu\n",
+           (unsigned long long)a->imp_nodes, (unsigned long long)b->imp_nodes,
+           (unsigned long long)a->imp_name_visits, (unsigned long long)b->imp_name_visits);
+
+    /* Non-vacuous, twice over: the pass must have run at all (a miscounted
+     * PREDUMP_PASS_COUNT would silently skip it and zero both counters), and
+     * the base leg must have produced enough work for a ratio to mean
+     * anything. A zero here is a wiring defect to fix, never a pass. */
+    ASSERT_GT((long long)a->imp_nodes, 0);
+    ASSERT_GT((long long)a->imp_name_visits, (long long)CX_MIN_BASE_WORK);
+
+    double node_r = cx_ratio((double)b->imp_nodes, (double)a->imp_nodes);
+    double visit_r = cx_ratio((double)b->imp_name_visits, (double)a->imp_name_visits);
+    printf("    imp_nodes ratio %.2f  imp_name_visits ratio %.2f (linear ~2, per-node ~4)\n",
+           node_r, visit_r);
+    ASSERT_TRUE(node_r >= CX_RATIO_LO && node_r <= CX_RATIO_HI);
+    ASSERT_TRUE(visit_r <= CX_RATIO_HI);
+    PASS();
+}
+
 SUITE(complexity) {
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
+    RUN_TEST(complexity_importance_scoring_is_linear);
     RUN_TEST(complexity_shared_package_growth_stays_linear);
     RUN_TEST(complexity_throughput_report_written);
 }

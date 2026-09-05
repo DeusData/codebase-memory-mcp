@@ -174,6 +174,9 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
+    CBM_LANG_ARKTS,    // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
+    CBM_LANG_PLSQL,    // Oracle PL/SQL
+    CBM_LANG_CHIALISP, // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -257,11 +260,19 @@ typedef struct {
     uint32_t site_start_byte;           // exact AST occurrence span; end > start when present
     uint32_t site_end_byte;             // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;      // raw source or C-family preprocessed buffer
-    bool is_method;                     // method/member call with a non-self receiver. Perl:
+    bool is_method;                     // method/member call with an UNRESOLVED receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
-                                        // x.foo() whose receiver is not this/super. Default false.
+                                        // x.foo() whose receiver is not this/super. Python:
+                                        // x.foo() where x is not self/cls/super() and is not
+                                        // rooted in an imported name. Read by the weak-member
+                                        // guard and by the pxc synthetic-carrier dedup key in
+                                        // pass_lsp_cross.c. Default false.
     bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
                                         // C++ operator). Never fall back to textual resolution.
+    bool callee_is_locally_bound;       // bare call foo() whose callee identifier is bound as a
+                                        // parameter of an enclosing function, so it cannot be the
+                                        // module-level foo. Python only today. Read by the
+                                        // weak-local-binding guard. Default false.
 } CBMCall;
 
 typedef struct {
@@ -285,6 +296,10 @@ typedef struct {
     uint32_t site_start_byte;             // exact reference-token span; end > start when present
     uint32_t site_end_byte;               // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;        // raw source or C-family preprocessed buffer
+    bool is_member_access;                // token is the member half of a selector/attribute
+                                          // (Go x.f — field_identifier). The extractor strips
+                                          // the receiver, so this is the only surviving record
+                                          // of selector shape (#1962). Default false.
 } CBMUsage;
 
 typedef struct {
@@ -296,6 +311,9 @@ typedef struct {
     const char *var_name;          // variable name
     const char *enclosing_func_qn; // QN of enclosing function
     bool is_write;                 // true = write, false = read
+    bool is_member_access;         // var_name is the field half of a selector/member LHS
+                                   // (`t.err = x` → "err"); the receiver is stripped here,
+                                   // so this is the only record of selector shape (#1962)
 } CBMReadWrite;
 
 typedef struct {
@@ -551,6 +569,7 @@ typedef struct {
 typedef struct {
     const char *names[CBM_MAX_STRING_CONSTANTS];
     const char *values[CBM_MAX_STRING_CONSTANTS];
+    bool is_url_builder[CBM_MAX_STRING_CONSTANTS];
     int count;
 } CBMStringConstantMap;
 
@@ -574,6 +593,13 @@ typedef struct {
 
 typedef struct {
     CBMArena *arena;
+    /* Scratch for AST traversal, owned by the cbm_extract_file_ex call that
+     * built this context and destroyed when it returns. Nothing a
+     * CBMFileResult points at may be allocated here: `arena` is the result's
+     * own, and it outlives extraction by the whole pipeline (#1997). NULL in a
+     * context built without one, in which case the stacks fall back to
+     * `arena`. */
+    CBMArena *scratch;
     CBMFileResult *result;
     const char *source;
     int source_len;
@@ -726,6 +752,13 @@ void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);
+/* Internal companion for embedded-language trees that contribute definitions
+ * to an existing host-file Module rather than minting a second Module. */
+void cbm_extract_definitions_without_module(CBMExtractCtx *ctx);
+// dbt lineage for Jinja-templated SQL models: emits a Model def plus one usage
+// per ref()/source() call. No-op unless the file parses as SQL and actually
+// contains a dbt builtin call. Defined in extract_dbt.c.
+void cbm_extract_dbt(CBMExtractCtx *ctx);
 void cbm_extract_imports(CBMExtractCtx *ctx);
 void cbm_extract_usages(CBMExtractCtx *ctx);
 void cbm_extract_semantic(CBMExtractCtx *ctx);
@@ -752,5 +785,18 @@ void cbm_extract_k8s(CBMExtractCtx *ctx);
 // instead of scattering `|| strcmp(label,"Struct")==0` across the tree.
 // `label` may be NULL (returns false). Defined in helpers.c.
 bool cbm_label_is_type_like(const char *label);
+
+// True for data-relation labels (Table, View — SQL DDL). Relations resolve as
+// lineage targets only: registry members, but never type-like and never valid
+// CALLS/THROWS/READS/WRITES targets. `label` may be NULL. Defined in helpers.c.
+bool cbm_label_is_relation(const char *label);
+
+// True for labels admitted to the cross-file name registry: Function, Method,
+// every type-like container, Variable, Field, and the relation labels. Single
+// source of truth for registry seeding — the full (pass_definitions.c),
+// parallel (pass_parallel.c) and incremental (pipeline_incremental.c) pipelines
+// all seed through this predicate so their registries never diverge.
+// `label` may be NULL (returns false). Defined in helpers.c.
+bool cbm_label_is_registry_symbol(const char *label);
 
 #endif // CBM_H

@@ -229,6 +229,19 @@ require(
     "install.ps1 must verify and install through the downloaded binary",
 )
 
+# PS 5.1 wraps redirected native stderr into ErrorRecords; under the global
+# ErrorActionPreference=Stop a healthy binary that warns on stderr aborts the
+# version probes (#1255). Pin the guard's two load-bearing parts so neither
+# can be silently dropped: the probe-scoped relaxation with an exception-safe
+# restore, and the $LASTEXITCODE pre-seed that keeps a start-failure from
+# inheriting a stale 0 and reading as success.
+require(
+    installer.count('$ErrorActionPreference = "Continue"') == 2
+    and installer.count("$global:LASTEXITCODE = 1") == 2
+    and installer.count("$ErrorActionPreference = $ProbeEap") == 2,
+    "install.ps1 version probes must relax EAP with restore and pre-seed LASTEXITCODE (#1255)",
+)
+
 # ── 4. Package-manager shims resolve the single Windows binary ───────────────
 single_binary_contracts = {
     "pkg/npm/install.js": (

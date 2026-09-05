@@ -49,6 +49,7 @@ static cbm_agent_client_resolve_options_t agent_options(agent_probe_t *probe) {
         .trae_config_path = NULL,
         .roo_config_path = NULL,
         .cody_config_path = NULL,
+        .omp_agent_dir = NULL,
         .is_windows = false,
         .path_exists = agent_path_exists,
         .command_exists = agent_command_exists,
@@ -161,6 +162,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         "qoder",     "kimi",        "gitlab-duo",    "rovo-dev", "amp",      "devin",
         "tabnine",   "continue",    "visual-studio", "trae",     "roo-code", "amazon-q",
         "codebuddy", "ibm-bob-ide", "ibm-bob-shell", "pochi",    "pi",       "sourcegraph-cody",
+        "omp",
     };
     static const uint32_t expected_capabilities[] = {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT | CBM_AGENT_CAP_HOOK,
@@ -181,6 +183,7 @@ TEST(agent_clients_registry_is_stable_and_callback_driven) {
         CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
         CBM_AGENT_CAP_INSTRUCTIONS | CBM_AGENT_CAP_SKILL,
         CBM_AGENT_CAP_MCP,
+        CBM_AGENT_CAP_MCP | CBM_AGENT_CAP_SKILL | CBM_AGENT_CAP_AGENT,
     };
     ASSERT_EQ(cbm_agent_client_count(), CBM_AGENT_CLIENT_COUNT);
     ASSERT_EQ(CBM_AGENT_CLIENT_COUNT, sizeof(expected) / sizeof(expected[0]));
@@ -829,6 +832,7 @@ TEST(agent_clients_json_schemas_are_exact_and_policy_neutral) {
         {CBM_AGENT_CLIENT_IBM_BOB_IDE, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_IBM_BOB_SHELL, "\"mcpServers\""},
         {CBM_AGENT_CLIENT_POCHI, "\"mcp\""},
+        {CBM_AGENT_CLIENT_OMP, "\"type\": \"stdio\""},
     };
     const char *binary = "/opt/Codebase Memory/bin/cbm\\\"special";
     for (size_t i = 0U; i < sizeof(cases) / sizeof(cases[0]); i++) {
@@ -866,6 +870,7 @@ TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries) {
         CBM_AGENT_CLIENT_IBM_BOB_IDE,
         CBM_AGENT_CLIENT_IBM_BOB_SHELL,
         CBM_AGENT_CLIENT_POCHI,
+        CBM_AGENT_CLIENT_OMP,
     };
     for (size_t i = 0U; i < sizeof(clients) / sizeof(clients[0]); i++) {
         const char *foreign =
@@ -929,6 +934,45 @@ TEST(agent_clients_refuse_foreign_and_preserve_modified_entries) {
     th_cleanup(dir);
     PASS();
 }
+
+TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided) {
+    agent_probe_t probe = {0};
+    cbm_agent_client_resolve_options_t options = agent_options(&probe);
+    char resolved[512];
+
+    /* Default (no env) keeps the documented ~/.omp/agent path. */
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/home/tester/.omp/agent/mcp.json");
+
+    /* Named profile directory takes precedence over the home-relative default. */
+    options.omp_agent_dir = "/home/tester/.omp/profiles/work/agent";
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/home/tester/.omp/profiles/work/agent/mcp.json");
+
+    /* PI_CODING_AGENT_DIR relocations also flow through the resolved option. */
+    options.omp_agent_dir = "/srv/omp-shared/agent";
+    ASSERT_EQ(cbm_agent_client_resolve_path(CBM_AGENT_CLIENT_OMP, &options, resolved,
+                                            sizeof(resolved)),
+              0);
+    ASSERT_STR_EQ(resolved, "/srv/omp-shared/agent/mcp.json");
+    PASS();
+}
+
+TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability) {
+    const cbm_agent_client_profile_t *profile =
+        cbm_agent_client_by_id(CBM_AGENT_CLIENT_OMP);
+    ASSERT_NOT_NULL(profile);
+    ASSERT_EQ(profile->capabilities & CBM_AGENT_CAP_INSTRUCTIONS, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_MCP, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_SKILL, 0U);
+    ASSERT_NEQ(profile->capabilities & CBM_AGENT_CAP_AGENT, 0U);
+    PASS();
+}
+
 
 TEST(agent_clients_remove_only_canonical_and_missing_is_noop) {
     char *dir = NULL;
@@ -1114,6 +1158,87 @@ TEST(client_adapter_pi_default_exports_its_factory_issue1550) {
     PASS();
 }
 
+/* Pi's ToolDefinition requires `parameters` and `execute`. The adapter used to
+ * emit `{ name, run }`, which Pi accepted but treated as a tool with no
+ * parameter schema — strict providers (xAI/Grok) then reject the request with
+ * a 422 "missing field parameters", and the tool is uncallable because Pi
+ * invokes `execute`, never `run`. Pin the corrected shape. */
+TEST(client_adapter_pi_emits_parameters_and_execute) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "execute: async (toolCallId, params, signal, _onUpdate, ctx) => {"));
+    ASSERT_NOT_NULL(strstr(js, ", params, signal ?? ctx?.signal)"));
+    ASSERT_NULL(strstr(js, "execute: async (args, ctx) => {"));
+    ASSERT_NULL(strstr(js, ", args, ctx?.signal)"));
+    ASSERT_NOT_NULL(strstr(js, "@earendil-works/pi-coding-agent"));
+    ASSERT_NOT_NULL(strstr(js, "result.content"));
+    ASSERT_NULL(strstr(js, "run: (args, ctx)"));
+    ASSERT_NOT_NULL(strstr(js, "parameters:"));
+    /* The registry input_schema is embedded as a JSON object literal. */
+    ASSERT_NOT_NULL(strstr(js, "\"type\":\"object\""));
+    /* Raw JSON output is required so the bridge can parse the MCP result; the
+     * human-readable path would leave `call` with nothing to JSON.parse. */
+    ASSERT_NOT_NULL(strstr(js, "'cli', '--json'"));
+    free(js);
+    PASS();
+}
+
+/* #1834: raw JSON in argv selects the deprecated compatibility path. The Pi
+ * bridge must keep arguments out of process listings and feed the existing
+ * stdin transport only after all child handlers are attached. */
+TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+
+    const char *spawn = strstr(js, "spawn(BIN, ['cli', '--json', tool], {");
+    const char *stdio = strstr(js, "stdio: ['pipe', 'pipe', 'pipe']");
+    const char *stdout_handler = strstr(js, "child.stdout.on('data'");
+    const char *stdin_error_handler = strstr(js, "child.stdin.on('error'");
+    const char *error_handler = strstr(js, "child.on('error'");
+    const char *close_handler = strstr(js, "child.on('close'");
+    const char *stdin_end = strstr(js, "child.stdin.end(JSON.stringify(args ?? {}));");
+
+    ASSERT_NOT_NULL(spawn);
+    ASSERT_NOT_NULL(stdio);
+    ASSERT_NOT_NULL(stdout_handler);
+    ASSERT_NOT_NULL(stdin_error_handler);
+    ASSERT_NOT_NULL(error_handler);
+    ASSERT_NOT_NULL(close_handler);
+    ASSERT_NOT_NULL(stdin_end);
+    ASSERT(stdout_handler < stdin_end);
+    ASSERT(stdin_error_handler < stdin_end);
+    ASSERT(error_handler < stdin_end);
+    ASSERT(close_handler < stdin_end);
+    ASSERT_NOT_NULL(strstr(js, "let stdinError;"));
+    ASSERT_NOT_NULL(strstr(js, "stdinError = e;"));
+    ASSERT_NOT_NULL(strstr(js, "if (stdinError)"));
+
+    /* These are the exact deprecated transport shapes being retired. */
+    ASSERT_NULL(strstr(js, "tool, JSON.stringify(args ?? {})]"));
+    ASSERT_NULL(strstr(js, "stdio: ['ignore', 'pipe', 'pipe']"));
+
+    free(js);
+    PASS();
+}
+
+/* Result wrap + abort: Pi's TUI reads result.content; a spawn/parse failure
+ * must throw rather than return a result without content; AbortSignal must
+ * kill the cli child. String-shape only; a live Pi process is not gated. */
+TEST(client_adapter_pi_wraps_result_and_honors_abort) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "return { content, details: result ?? {} };"));
+    ASSERT_NOT_NULL(strstr(js, "if (result && typeof result === 'object' && result.error)"));
+    ASSERT_NOT_NULL(strstr(js, "throw new Error(String(result.error));"));
+    ASSERT_NOT_NULL(strstr(js, "Array.isArray(result.content)"));
+    ASSERT_NOT_NULL(
+        strstr(js, "[{ type: 'text', text: JSON.stringify(result ?? null, null, 2) }]"));
+    ASSERT_NOT_NULL(strstr(js, "signal?.addEventListener('abort', onAbort, { once: true })"));
+    ASSERT_NOT_NULL(strstr(js, "if (!child.killed) child.kill();"));
+    free(js);
+    PASS();
+}
+
 /* #616 rejected `"` in its path template but not `\`, so a Windows home like
  * C:\Users\urs\bin produced `\u` — an invalid unicode escape — and the whole
  * auto-loaded plugin failed to parse. A broken plugin in an auto-load directory
@@ -1166,6 +1291,28 @@ TEST(client_adapter_opencode_sends_the_required_hook_event) {
     PASS();
 }
 
+/* The richer OpenCode adapter carries every context surface the plugin API
+ * documents: session-start tier routing on the first tool result of each
+ * session, post-read coverage notes, and post-compaction reinjection through
+ * the documented experimental surface. It must unwrap hook-augment's Claude
+ * JSON envelope so plain text — not raw JSON — reaches the model. */
+TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'SessionStart'"));
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PostToolUse'"));
+    ASSERT_NOT_NULL(strstr(js, "tool_name: 'Read'"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
+    ASSERT_NOT_NULL(strstr(js, "additionalContext"));
+    /* file_path is the key hook-augment's default dialect reads; OpenCode's
+     * read tool argues filePath, so the adapter must map it. */
+    ASSERT_NOT_NULL(strstr(js, "file_path: filePath"));
+    /* Session context may only be injected once per session id. */
+    ASSERT_NOT_NULL(strstr(js, "seen.has(sid)"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1196,6 +1343,8 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_json_schemas_are_exact_and_policy_neutral);
     RUN_TEST(agent_clients_new_standard_json_profiles_preserve_foreign_entries);
     RUN_TEST(agent_clients_refuse_foreign_and_preserve_modified_entries);
+    RUN_TEST(agent_clients_omp_resolves_to_injected_agent_dir_when_provided);
+    RUN_TEST(agent_clients_omp_profile_does_not_register_global_instructions_capability);
     RUN_TEST(agent_clients_remove_only_canonical_and_missing_is_noop);
     RUN_TEST(agent_clients_registry_callbacks_apply_the_selected_schema);
     RUN_TEST(agent_clients_malformed_json_fails_byte_identically);
@@ -1204,7 +1353,11 @@ SUITE(agent_clients) {
     RUN_TEST(agent_clients_continue_refuses_foreign_same_name_and_nonsequence_section);
     RUN_TEST(client_adapter_pi_registers_every_registry_tool);
     RUN_TEST(client_adapter_pi_default_exports_its_factory_issue1550);
+    RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
+    RUN_TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834);
+    RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
+    RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

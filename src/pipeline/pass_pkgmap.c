@@ -1397,7 +1397,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 1. Try relative import resolution (existing logic) */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        /* The relative resolver has already removed an explicit JS/TS file
+         * extension.  Treat the remaining path as a module path verbatim so a
+         * dotted extensionless basename such as `featureX.engine` is not
+         * stripped a second time by cbm_pipeline_fqn_module. */
+        char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         free(resolved);
         return qn;
     }
@@ -1537,6 +1541,21 @@ static bool import_targetable_label(const char *label) {
         }
     }
     return false;
+}
+
+/* #1934: whether the name-guess import fallbacks — Strategy 1b (sibling file,
+ * whose label filter admits symbols) and Strategy 3 (symbol name) — may run
+ * for imports from this language. A Go import path names a package — never a
+ * function, method
+ * or field — and every correct Go import resolves in Strategy 1 (module path
+ * → the package's Folder node); when that misses the import is external and
+ * the correct result is NO edge. The fallback instead bound the last path
+ * segment to an arbitrary same-named project symbol (`import "os/exec"` → a
+ * test harness's exec() method, two imports → a Makefile target). Languages
+ * whose import genuinely can name a member (Python `from m import f`, Java
+ * `import com.example.Foo`, Rust `use crate::ops::helper`) keep it. */
+bool cbm_import_symbol_fallback_allowed(CBMLanguage lang) {
+    return lang != CBM_LANG_GO;
 }
 
 static const char *path_leaf(const char *path) {
@@ -1817,10 +1836,24 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         return target;
     }
 
+    /* Name-guess fallbacks below (Strategy 1b sibling-file, Strategy 3
+     * symbol-name) are gated per importing-file language — see
+     * cbm_import_symbol_fallback_allowed (#1934). */
+    const char *src_base = source_rel ? source_rel : "";
+    for (const char *pb = src_base; *pb; pb++) {
+        if (*pb == '/' || *pb == '\\') {
+            src_base = pb + SKIP_ONE;
+        }
+    }
+    const bool symbol_fallback_allowed =
+        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
-     * BitBake/func includes, Meson subdir, Pony use). */
-    {
+     * BitBake/func includes, Meson subdir, Pony use). Its label filter admits
+     * symbols too, so for Go it re-creates the Strategy-3 bug one directory
+     * closer (`os/exec` → a same-package exec() method) — gated the same. */
+    if (symbol_fallback_allowed) {
         const cbm_gbuf_node_t *sib =
             resolve_sibling_file(ctx, source_rel, source_file_qn, imp->module_path);
         if (sib) {
@@ -1898,7 +1931,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
     /* Strategy 3: symbol-name fallback.  Derive a representative imported
      * symbol (handling alias / glob / grouped forms) and match it against an
      * in-graph definition of the same simple name in another file
-     * (Rust `helper`, Java `Util`, Kotlin grouped, ...). */
+     * (Rust `helper`, Java `Util`, Kotlin grouped, ...).
+     * Gated per importing-file language, like Strategy 1b above (#1934). */
     char symbuf[256];
     /* Prefer the clean candidate from the module path; the local_name may be an
      * alias (Rust `as h`, Kotlin `as U`) that names no real symbol. */
@@ -1962,7 +1996,7 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             *dot = '\0';
             end = dot;
         }
-        for (int ci = 0; ci < ncands; ci++) {
+        for (int ci = 0; symbol_fallback_allowed && ci < ncands; ci++) {
             const cbm_gbuf_node_t **hits = NULL;
             int n = 0;
             if (cbm_gbuf_find_by_name(ctx->gbuf, cands[ci], &hits, &n) == 0 && hits) {

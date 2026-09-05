@@ -14,6 +14,8 @@
 #include "graph_buffer/graph_buffer.h"
 #include "discover/discover.h"
 #include "cbm.h"
+#include "lang_specs.h"           /* cbm_ts_language */
+#include "foundation/constants.h" /* CBM_SZ_* */
 
 #include <stdatomic.h>
 #include <stdint.h>
@@ -516,6 +518,11 @@ TEST(resolve_budget_override_when_total_unknown) {
     PASS();
 }
 
+/* CBM_MEM_BUDGET_MB is an aggregate ceiling the parent divides across job
+ * slots. A lower explicit value still wins; a raise is clipped to the per-slot
+ * share so N workers cannot oversubscribe the host (#1654). The source stays
+ * CBM_MEM_BUDGET_MB so the clip is the user's aggregate, not a silent
+ * daemon_worker_cap rewrite of a fraction-derived default. */
 TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
     size_t total = 8192 * CBM_TEST_MB;
     size_t worker_cap = 16 * CBM_TEST_MB;
@@ -524,10 +531,15 @@ TEST(resolve_budget_worker_cap_preserves_lower_user_override) {
     ASSERT_STR_EQ(lower.source, "CBM_MEM_BUDGET_MB");
     ASSERT_FALSE(lower.hard_capped);
 
-    cbm_mem_budget_t capped = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
-    ASSERT_EQ(capped.budget, worker_cap);
-    ASSERT_STR_EQ(capped.source, "daemon_worker_cap");
-    ASSERT_TRUE(capped.hard_capped);
+    cbm_mem_budget_t raised = cbm_mem_resolve_budget_capped(total, 0.5, "64", worker_cap);
+    ASSERT_EQ(raised.budget, worker_cap);
+    ASSERT_STR_EQ(raised.source, "CBM_MEM_BUDGET_MB");
+    ASSERT_TRUE(raised.hard_capped);
+
+    cbm_mem_budget_t fraction = cbm_mem_resolve_budget_capped(total, 0.5, NULL, worker_cap);
+    ASSERT_EQ(fraction.budget, worker_cap);
+    ASSERT_STR_EQ(fraction.source, "daemon_worker_cap");
+    ASSERT_TRUE(fraction.hard_capped);
     PASS();
 }
 
@@ -1277,6 +1289,53 @@ TEST(mem_map_attributes_a_known_allocation) {
     PASS();
 }
 
+/* #2010, the lifetime half. traversal_stack_not_in_result_arena in
+ * test_extraction.c pins the byte budget of the result arena, but a smaller
+ * CHAN_STACK_CAP would satisfy that too. This pins where the bytes actually
+ * went: the scratch arena takes the two 128 KB channel walks and the result
+ * arena does not. Builds the extraction context directly, since a completed
+ * cbm_extract_file_ex has already destroyed its scratch. */
+TEST(extract_traversal_stacks_come_from_ctx_scratch_issue2010) {
+    enum { CHANNEL_WALK_BYTES = 2 * 4096 * (int)sizeof(TSNode) };
+    const char *src = "export const x = 1;\n";
+    const TSLanguage *ts_lang = cbm_ts_language(CBM_LANG_TYPESCRIPT);
+    ASSERT_NOT_NULL((void *)ts_lang);
+
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    ts_parser_set_language(parser, ts_lang);
+    TSTree *tree = ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+    ASSERT_NOT_NULL(tree);
+
+    CBMFileResult result;
+    memset(&result, 0, sizeof(result));
+    cbm_arena_init(&result.arena);
+    CBMArena scratch;
+    cbm_arena_init_sized(&scratch, (size_t)CBM_SZ_512 * CBM_SZ_1K);
+
+    CBMExtractCtx ctx = {
+        .arena = &result.arena,
+        .scratch = &scratch,
+        .result = &result,
+        .source = src,
+        .source_len = (int)strlen(src),
+        .language = CBM_LANG_TYPESCRIPT,
+        .project = "t",
+        .rel_path = "a.ts",
+        .root = ts_tree_root_node(tree),
+    };
+    cbm_extract_channels(&ctx);
+
+    ASSERT_GTE(cbm_arena_total(&scratch), (size_t)CHANNEL_WALK_BYTES);
+    ASSERT_LT(cbm_arena_total(&result.arena), (size_t)CBM_SZ_64 * CBM_SZ_1K);
+
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&result.arena);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 SUITE(mem) {
     /* mem API */
     RUN_TEST(mem_arena_eager_commit_follows_platform_commit_cost);
@@ -1340,4 +1399,7 @@ SUITE(mem) {
     RUN_TEST(parallel_extract_without_source_retention);
     RUN_TEST(parallel_extract_tiny_source_retention_budget);
     RUN_TEST(parallel_extract_with_slab);
+
+    /* extraction scratch arena (#2010) */
+    RUN_TEST(extract_traversal_stacks_come_from_ctx_scratch_issue2010);
 }

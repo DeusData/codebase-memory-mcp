@@ -9,12 +9,23 @@
  * safety tests. This header is internal and is not part of the MCP API. */
 typedef bool (*cbm_mcp_quarantine_test_hook_fn)(void *context, const char *step);
 typedef bool (*cbm_mcp_command_test_hook_fn)(void *context, const char *command);
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef void (*cbm_mcp_auto_index_count_test_hook_fn)(void *context);
+#endif
 
 void cbm_mcp_server_set_quarantine_test_hook(cbm_mcp_server_t *srv,
                                              cbm_mcp_quarantine_test_hook_fn hook, void *context);
 void cbm_mcp_server_set_command_test_hook(cbm_mcp_server_t *srv, cbm_mcp_command_test_hook_fn hook,
                                           void *context);
 void cbm_mcp_server_set_search_output_limit_for_test(cbm_mcp_server_t *srv, size_t limit);
+#ifdef CBM_ENABLE_TEST_SEAMS
+void cbm_mcp_server_set_auto_index_count_test_hook(cbm_mcp_server_t *srv,
+                                                   cbm_mcp_auto_index_count_test_hook_fn hook,
+                                                   void *context);
+#endif
+void cbm_mcp_server_set_search_scan_command_for_test(cbm_mcp_server_t *srv, const char *command);
+void cbm_mcp_server_set_search_scan_timeout_for_test(cbm_mcp_server_t *srv, uint64_t timeout_ms,
+                                                     bool override_set);
 
 /* Release only the constructor-created pristine in-memory store. Public
  * cbm_mcp_server_new(NULL) semantics remain unchanged; daemon sessions use
@@ -56,6 +67,7 @@ bool cbm_detect_node_in_hunks(const cbm_node_t *node, const cbm_changed_hunk_t *
  * PowerShell -like contract. Exposed for
  * direct boundary tests only. */
 bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern);
+bool cbm_search_code_windows_path_matches_prefilter(const char *path, const char *file_pattern);
 
 /* Internal command builder exposed so tests can pin the PowerShell pipeline
  * ordering without
@@ -63,5 +75,33 @@ bool cbm_search_code_file_pattern_can_prefilter(const char *file_pattern);
 void cbm_search_code_build_grep_cmd(char *cmd, size_t cmd_sz, bool use_regex, bool scoped,
                                     const char *file_pattern, const char *tmpfile,
                                     const char *filelist, const char *root_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Reject opening one changed file while detect_changes fingerprints its live
+ * snapshot. This makes otherwise platform-specific permission/read races
+ * deterministic without changing production filesystem behavior. */
+typedef bool (*cbm_mcp_snapshot_read_test_hook_fn)(void *context, const char *absolute_path);
+void cbm_mcp_server_set_snapshot_read_test_hook(cbm_mcp_server_t *srv,
+                                                cbm_mcp_snapshot_read_test_hook_fn hook,
+                                                void *context);
+
+/* Filesystem PATH_MAX prevents a portable end-to-end fixture for multi-KiB
+ * stored paths. This seam drives the normal search result ownership,
+ * directory aggregation, and renderer pipeline with synthetic identities. */
+char *cbm_mcp_render_search_rows_for_testing(const char *const *qualified_names,
+                                             const char *const *file_paths, int row_count,
+                                             bool json_format);
+
+/* Drive the production raw-source slicer and renderer without relying on an
+ * external grep/PowerShell text decoder. This keeps malformed-byte paging
+ * deterministic on every test platform. */
+char *cbm_mcp_render_raw_preview_for_testing(const char *content, bool content_offset_set,
+                                             size_t content_offset, bool json_format);
+
+/* Exercise search_graph's semantic continuation metadata without allocating
+ * a 100k-row vector fixture. The production emitters remain the code under
+ * test; this seam only supplies their already-ranked page descriptor. */
+char *cbm_mcp_render_semantic_paging_for_testing(int total, int offset, int returned, int limit,
+                                                 bool total_exact, bool json_format);
+#endif
 
 #endif

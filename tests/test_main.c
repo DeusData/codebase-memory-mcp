@@ -16,12 +16,14 @@ int tf_skip_count = 0;
 #include "foundation/constants.h"  /* CBM_SZ_4K — forced stderr buffer */
 #include "foundation/log.h"        /* crash-durable worker log probe */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
+#include "foundation/log.h"        /* worker liveness heartbeat probe */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
+#include "ui/http_server.h"       /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -195,6 +197,8 @@ static const char *const tf_client_home_overrides[] = {
     "CBM_TRAE_CONFIG_PATH",
     "CBM_ROO_CONFIG_PATH",
     "CBM_CODY_CONFIG_PATH",
+    "OMP_PROFILE",
+    "PI_CODING_AGENT_DIR",
 };
 
 static bool tf_setup_cache_sentinel(void) {
@@ -228,6 +232,17 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
             (void)fclose(response);
         }
         (void)fprintf(stderr, "async worker clean probe\n");
+        fflush(NULL);
+        _Exit(response ? 0 : 1);
+    }
+    if (strstr(args_json, "\"heartbeat\"")) {
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        if (response) {
+            (void)fputs("{\"probe\":\"heartbeat\"}", response);
+            (void)fclose(response);
+        }
+        cbm_log_info("pipeline.discover", "files", "1");
+        (void)fprintf(stderr, "async worker heartbeat probe ready\n");
         fflush(NULL);
         _Exit(response ? 0 : 1);
     }
@@ -343,6 +358,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
+    cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
@@ -500,9 +516,19 @@ static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
     Sleep(INFINITE);
     return 25;
 #else
-    (void)argc;
-    (void)argv;
-    return -1;
+    /* POSIX copied-image holder: block reading stdin until the parent closes
+     * the release pipe, exactly like the cat(1) donor this replaced. A system
+     * utility cannot serve as the copied image — a multi-call coreutils
+     * binary (uutils cat) refuses to execute under the copied name. */
+    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
+        return -1;
+    }
+    char release[16];
+    ssize_t count;
+    do {
+        count = read(STDIN_FILENO, release, sizeof(release));
+    } while (count > 0 || (count < 0 && errno == EINTR));
+    return count == 0 ? 0 : 25;
 #endif
 }
 
@@ -615,6 +641,55 @@ static int tf_maybe_run_mcp_idxfailclosed_probe(int argc, char **argv) {
 #endif
 }
 
+static int tf_maybe_run_deleted_self_probe(int argc, char **argv) {
+#if defined(__linux__) || defined(__APPLE__)
+    if (argc != 5 || strcmp(argv[1], "__cbm_deleted_self_probe") != 0) {
+        return -1;
+    }
+    int ready_fd = atoi(argv[2]);
+    int continue_fd = atoi(argv[3]);
+    cbm_http_server_set_binary_path(argv[4]);
+    if (write(ready_fd, "R", 1) != 1) {
+        return 41;
+    }
+    char go = '\0';
+    if (read(continue_fd, &go, 1) != 1) {
+        return 42;
+    }
+    char resolved[1024];
+    bool ok = cbm_http_server_resolve_binary_path(NULL, resolved, sizeof(resolved));
+#if defined(__linux__)
+    /* Contract (#1204 strategy ruling): after a rename-over, the resolver
+     * hands back the /proc/self/exe magic link — the in-memory OLD build,
+     * the only spawn the worker's build-fingerprint gate accepts. First
+     * prove we really are in the deleted state, or the assertions below
+     * would pass vacuously on an intact image. */
+    char link_target[1024];
+    ssize_t n = readlink("/proc/self/exe", link_target, sizeof(link_target) - 1);
+    if (n <= 0) {
+        return 45;
+    }
+    link_target[n] = '\0';
+    if (strstr(link_target, " (deleted)") == NULL) {
+        return 46;
+    }
+    if (!ok) {
+        return 43;
+    }
+    return strcmp(resolved, "/proc/self/exe") == 0 && access(resolved, X_OK) == 0 ? 0 : 44;
+#else
+    /* macOS has no magic link: the ruling is fail-closed. Success here is
+     * the resolver REFUSING, so the supervisor logs no_self_path instead of
+     * spawning a missing or mismatched binary. */
+    return ok ? 44 : 0;
+#endif
+#else
+    (void)argc;
+    (void)argv;
+    return -1;
+#endif
+}
+
 static int g_suite_argc = 0;
 static char **g_suite_argv = NULL;
 static bool *g_suite_arg_matched = NULL;
@@ -716,9 +791,11 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
 extern void suite_index_resilience(void);
+extern void suite_index_format(void);
 extern void suite_fqn(void);
 extern void suite_route_canon(void);
 extern void suite_path_alias(void);
@@ -866,6 +943,10 @@ int main(int argc, char **argv) {
     if (daemon_ipc_probe_rc >= 0) {
         return daemon_ipc_probe_rc;
     }
+    int deleted_self_rc = tf_maybe_run_deleted_self_probe(argc, argv);
+    if (deleted_self_rc >= 0) {
+        return deleted_self_rc;
+    }
 
     /* #798 follow-up: if spawned as the socket-isolation probe, report whether an
      * inheritable socket handle crossed into this child and exit before any suite. */
@@ -984,6 +1065,8 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(importance);
+    RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
     RUN_SELECTED_SUITE(call_reference_contract);
     RUN_SELECTED_SUITE(call_reference_language_complex_contract);

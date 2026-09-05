@@ -780,6 +780,32 @@ TEST(daemon_bootstrap_rejected_connect_is_reserved_and_never_unavailable) {
     PASS();
 }
 
+/* 2026-08-29 zombie regression: a connect that reached a live process but got
+ * no answer names that holder in muted_endpoint_holder_pid. That endpoint is
+ * owned regardless of what the advisory locks read, so classification must be
+ * RESERVED on every lifetime answer — never absence, never a spawn license. */
+TEST(daemon_bootstrap_mute_endpoint_holder_is_reserved_and_never_unavailable) {
+    cbm_daemon_runtime_connect_result_t mute = {0};
+    mute.status = CBM_DAEMON_RUNTIME_CONNECT_ERROR;
+    mute.muted_endpoint_holder_pid = 4242;
+    ASSERT_EQ(cbm_daemon_bootstrap_classify_failed_connect(&mute, 1),
+              CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED);
+    ASSERT_EQ(cbm_daemon_bootstrap_classify_failed_connect(&mute, 0),
+              CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED);
+    ASSERT_EQ(cbm_daemon_bootstrap_classify_failed_connect(&mute, -1),
+              CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED);
+
+    /* A protocol-level rejection still wins over the holder pid: an answering
+     * generation is more precise evidence than a silent one. */
+    cbm_daemon_runtime_connect_result_t rejected = {0};
+    rejected.status = CBM_DAEMON_RUNTIME_CONNECT_REJECTED;
+    rejected.muted_endpoint_holder_pid = 4242;
+    snprintf(rejected.message, sizeof(rejected.message), "CBM daemon is stopping");
+    ASSERT_EQ(cbm_daemon_bootstrap_classify_failed_connect(&rejected, 0),
+              CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL);
+    PASS();
+}
+
 TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon) {
     bootstrap_endpoint_fixture_t fixture;
     ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "startup-race"));
@@ -872,6 +898,7 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_reserved_then_absent_spawns_replacement);
     RUN_TEST(daemon_bootstrap_releases_handoff_when_spawned_generation_is_reserved);
     RUN_TEST(daemon_bootstrap_rejected_connect_is_reserved_and_never_unavailable);
+    RUN_TEST(daemon_bootstrap_mute_endpoint_holder_is_reserved_and_never_unavailable);
     RUN_TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon);
 #ifdef __APPLE__
     RUN_TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous);
