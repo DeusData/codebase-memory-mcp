@@ -27,7 +27,7 @@
 # USAGE
 #   bash scripts/check-lsp-originality.sh [--lang NAME] [--refresh]
 #                                         [--list-candidates] [--help]
-#     --lang NAME        scan against ONE reference only (py|ts|go|cs|c|java|kotlin|rust|php|perl)
+#     --lang NAME        scan against ONE reference only (py|ts|go|cs|c|java|kotlin|rust|php|perl|ruby)
 #     --refresh          re-fetch reference sources even if cached
 #     --list-candidates  print the extracted local tokens and exit (no fetch; self-test)
 #   Exit 0 = no verbatim overlap found.  Exit 1 = overlap(s) to review by a human.
@@ -64,6 +64,10 @@ REFS=(
   # Perl (PR #461) was authored clean-room. We scan against PerlNavigator (MIT)
   # — the leading OSS Perl language server — for defensive copy-detection.
   "perl|https://github.com/bscan/PerlNavigator|server/src"
+  # Ruby was authored clean-room from the tree-sitter-ruby grammar + Ruby
+  # language semantics. We scan against Shopify's ruby-lsp (MIT) — the
+  # leading OSS Ruby language server — for defensive copy-detection.
+  "ruby|https://github.com/Shopify/ruby-lsp|lib"
 )
 
 ONLY_LANG=""; REFRESH=0; LIST_ONLY=0

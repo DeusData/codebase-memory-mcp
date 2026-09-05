@@ -12,6 +12,7 @@
 #include "lsp/php_lsp.h"
 #include "lsp/perl_lsp.h"
 #include "lsp/py_lsp.h"
+#include "lsp/ruby_lsp.h"
 #include "lsp/ts_lsp.h"
 #include "lsp/cs_lsp.h"
 #include "lsp/java_lsp.h"
@@ -1375,6 +1376,9 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         }
         if (language == CBM_LANG_PERL) {
             cbm_run_perl_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_RUBY) {
+            cbm_run_ruby_lsp(a, result, source, source_len, root);
         }
         if (language == CBM_LANG_PYTHON) {
             cbm_run_py_lsp(a, result, source, source_len, root);
