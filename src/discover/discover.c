@@ -758,14 +758,18 @@ static int wide_stat(const char *path, struct stat *st) {
 /* Stat a path, skipping symlinks (POSIX) and junctions / reparse points
  * (Windows). Returns 0 on success, -1 to skip. Skipping reparse points keeps
  * discovery from walking through a junction that points outside the project
- * root, mirroring the POSIX S_ISLNK skip. */
-static int safe_stat(const char *abs_path, struct stat *st) {
+ * root, mirroring the POSIX S_ISLNK skip. *is_symlink reports whether the
+ * skip (if any) was specifically the symlink/reparse-point check, as
+ * opposed to some other stat failure (permissions, a race with a delete). */
+static int safe_stat(const char *abs_path, struct stat *st, bool *is_symlink) {
+    *is_symlink = false;
 #ifdef _WIN32
     wchar_t *wpath = cbm_path_to_wide(abs_path);
     if (wpath) {
         DWORD attr = GetFileAttributesW(wpath);
         free(wpath);
         if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+            *is_symlink = true;
             return CBM_NOT_FOUND;
         }
     }
@@ -775,6 +779,7 @@ static int safe_stat(const char *abs_path, struct stat *st) {
         return CBM_NOT_FOUND;
     }
     if (S_ISLNK(st->st_mode)) {
+        *is_symlink = true;
         return CBM_NOT_FOUND;
     }
     return 0;
@@ -891,9 +896,15 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
     }
 
     struct stat st;
-    if (safe_stat(abs_path, &st) != 0) {
+    bool is_symlink = false;
+    if (safe_stat(abs_path, &st, &is_symlink) != 0) {
         if (out->count_only) {
             out->failed = true;
+        } else if (is_symlink) {
+            /* Deliberately not indexed (#963): record so callers can
+             * surface it, matching the directory-exclusion and file
+             * skip_reason paths a few lines below. */
+            file_list_add_ignored(out, rel_path, "symlink");
         }
         return;
     }
