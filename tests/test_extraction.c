@@ -5089,6 +5089,38 @@ TEST(extract_perl_t_file_is_test) {
     PASS();
 }
 
+/* INFORMATIONAL probe: print the def table and top-level AST node kinds for a
+ * Corinna (5.38 feature 'class') fixture so the perllsp_corinna_* dispatch
+ * work can pin the real grammar shape. Always passes; read its output in the
+ * suite log. Remove once the Corinna dispatch tests are green. */
+TEST(extract_perl_corinna_probe) {
+    const char *src = "use v5.38;\n"
+                      "use experimental 'class';\n"
+                      "class Animal {\n"
+                      "    method speak { return 1 }\n"
+                      "}\n"
+                      "class Dog :isa(Animal) {\n"
+                      "    method fetch { return $self->speak() }\n"
+                      "}\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PERL, "t", "corinna.pl");
+    ASSERT_NOT_NULL(r);
+    printf("  corinna probe: has_error=%d defs=%d calls=%d resolved=%d\n", (int)r->has_error,
+           r->defs.count, r->calls.count, r->resolved_calls.count);
+    for (int i = 0; i < r->defs.count && i < 12; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        printf("    def[%d] name=%s label=%s qn=%s parent=%s\n", i, d->name ? d->name : "?",
+               d->label ? d->label : "?", d->qualified_name ? d->qualified_name : "?",
+               d->parent_class ? d->parent_class : "-");
+    }
+    for (int i = 0; i < r->calls.count && i < 8; i++) {
+        printf("    call[%d] callee=%s caller=%s\n", i,
+               r->calls.items[i].callee_name ? r->calls.items[i].callee_name : "?",
+               r->calls.items[i].enclosing_func_qn ? r->calls.items[i].enclosing_func_qn : "-");
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Calls inside a generic impl must attribute to the STRIPPED receiver QN
  * (Stack.push, matching the def side which strips `<T>`), not Stack<T>.push —
  * otherwise pass_calls finds no caller node and attributes them to the File. */
@@ -7147,6 +7179,7 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_builtin_call_is_function_not_method);
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_perl_t_file_is_test);
+    RUN_TEST(extract_perl_corinna_probe);
     RUN_TEST(extract_go_interface_method_parent);
     RUN_TEST(extract_go_mux_call_ingredients);
     RUN_TEST(extract_rust_generic_impl_caller_qn);

@@ -1179,6 +1179,16 @@ static void process_subroutine(PerlLSPContext *ctx, TSNode node) {
 
     perl_bind_signature_invocant(ctx, node);
 
+    /* Corinna methods (5.38 feature 'class') carry an implicit $self bound to
+     * the enclosing class — no `= shift` or signature needed. */
+    if (strcmp(ts_node_type(node), "method_declaration_statement") == 0) {
+        const char *mpkg = ctx->enclosing_package_qn && ctx->enclosing_package_qn[0]
+                               ? ctx->enclosing_package_qn
+                               : ctx->current_package_qn;
+        if (mpkg && mpkg[0])
+            cbm_scope_bind(ctx->current_scope, "self", cbm_type_named(ctx->arena, mpkg));
+    }
+
     /* Locate the body block. */
     TSNode body = ts_node_child_by_field_name(node, "body", 4);
     if (ts_node_is_null(body))
@@ -1400,6 +1410,53 @@ static void perl_collect_isa_assignment(PerlLSPContext *ctx, TSNode assign) {
     free(kids);
 }
 
+/* Corinna (5.38 feature 'class'): `class Dog :isa(Animal) { ... }` — record
+ * the :isa parent so inherited dispatch and SUPER:: work exactly like @ISA.
+ * The attribute hangs off the class_statement as attribute_name "isa" with an
+ * attribute_value carrying the parent name; scan shallow descendants (the
+ * attributes precede the block, so the walk is tiny and depth-capped). */
+static void perl_scan_isa_attribute(PerlLSPContext *ctx, TSNode node, const char *class_qn,
+                                    bool *pending_isa, int depth) {
+    if (ts_node_is_null(node) || depth > 4)
+        return;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "block") == 0)
+        return; /* attributes never live inside the class body */
+    if (strcmp(k, "attribute_name") == 0) {
+        char *t = perl_node_text(ctx, node);
+        *pending_isa = t && strcmp(t, "isa") == 0;
+        return;
+    }
+    if (strcmp(k, "attribute_value") == 0) {
+        if (*pending_isa) {
+            char *parent = perl_node_text(ctx, node);
+            if (parent && parent[0])
+                perl_add_isa(ctx, class_qn, parent);
+            *pending_isa = false;
+        }
+        return;
+    }
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc && i < 32; i++) {
+        TSNode c = ts_node_child(node, i);
+        if (!ts_node_is_null(c) && ts_node_is_named(c))
+            perl_scan_isa_attribute(ctx, c, class_qn, pending_isa, depth + 1);
+    }
+}
+
+static void perl_collect_class_isa(PerlLSPContext *ctx, TSNode class_node) {
+    const char *class_qn = ctx->current_package_qn;
+    if (!class_qn || !class_qn[0])
+        return;
+    bool pending = false;
+    uint32_t nc = ts_node_child_count(class_node);
+    for (uint32_t i = 0; i < nc && i < 32; i++) {
+        TSNode c = ts_node_child(class_node, i);
+        if (!ts_node_is_null(c) && ts_node_is_named(c))
+            perl_scan_isa_attribute(ctx, c, class_qn, &pending, 0);
+    }
+}
+
 /* Recursively scan (PASS 1) for package context, @ISA assignments, and `use`
  * statements. */
 /* Depth-guarded entry (see perl_resolve_calls_in_node for the rationale). */
@@ -1418,6 +1475,12 @@ static void perl_pass1_scan_inner(PerlLSPContext *ctx, TSNode node) {
     if (strcmp(k, "package_statement") == 0) {
         process_package_decl(ctx, node);
         /* Fall through: a block-scoped package's body follows as children. */
+    } else if (strcmp(k, "class_statement") == 0) {
+        /* Corinna class: package context + :isa parent (5.38 feature 'class').
+         * The name field matches package_statement's shape. */
+        process_package_decl(ctx, node);
+        perl_collect_class_isa(ctx, node);
+        /* Fall through: the class block's body follows as children. */
     } else if (strcmp(k, "use_statement") == 0) {
         perl_collect_use_statement(ctx, node);
         return;
@@ -1459,9 +1522,10 @@ void perl_lsp_process_file(PerlLSPContext *ctx, TSNode root) {
         if (ts_node_is_null(c))
             continue;
         const char *k = ts_node_type(c);
-        if (strcmp(k, "package_statement") == 0) {
+        if (strcmp(k, "package_statement") == 0 || strcmp(k, "class_statement") == 0) {
             process_package_decl(ctx, c);
-            /* Walk the (possibly block-scoped) package body for nested subs. */
+            /* Walk the (possibly block-scoped) package/class body for nested
+             * subs and methods. */
             uint32_t bn = ts_node_child_count(c);
             TSNode *bkids = perl_collect_children(c, bn);
             for (uint32_t bi = 0; bi < bn; bi++) {
@@ -1647,7 +1711,7 @@ static void perl_attach_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, TSNod
         if (ts_node_is_null(c))
             continue;
         const char *k = ts_node_type(c);
-        if (strcmp(k, "package_statement") == 0) {
+        if (strcmp(k, "package_statement") == 0 || strcmp(k, "class_statement") == 0) {
             TSNode name = ts_node_child_by_field_name(c, "name", 4);
             if (ts_node_is_null(name))
                 name = perl_first_child_of_type(c, "package");
@@ -1656,26 +1720,47 @@ static void perl_attach_methods(PerlLSPContext *ctx, CBMTypeRegistry *reg, TSNod
                 if (p && p[0])
                     cur_pkg = cbm_arena_strdup(ctx->arena, p);
             }
-            /* Block-scoped package body: subs are nested children. */
+            /* Block-scoped package body: subs are DIRECT children of the
+             * package_statement; a Corinna class_statement instead wraps its
+             * methods in a `block` child — descend one level into it. */
             uint32_t bn = ts_node_child_count(c);
             TSNode *bkids = perl_collect_children(c, bn);
             for (uint32_t bi = 0; bi < bn; bi++) {
                 TSNode bc = bkids ? bkids[bi] : ts_node_child(c, bi);
                 if (ts_node_is_null(bc) || !ts_node_is_named(bc))
                     continue;
-                if (strcmp(ts_node_type(bc), "subroutine_declaration_statement") != 0 &&
-                    strcmp(ts_node_type(bc), "method_declaration_statement") != 0)
-                    continue;
-                TSNode bname = ts_node_child_by_field_name(bc, "name", 4);
-                if (ts_node_is_null(bname))
-                    continue;
-                char *bsn = perl_node_text(ctx, bname);
-                if (!bsn || !bsn[0])
-                    continue;
-                const char *bqn = ctx->module_qn
-                                      ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, bsn)
-                                      : cbm_arena_strdup(ctx->arena, bsn);
-                perl_mvec_push(&mv, cur_pkg, bsn, bqn);
+                const char *bk = ts_node_type(bc);
+                TSNode subs_parent = c;
+                uint32_t sn = 1;
+                TSNode single = bc;
+                TSNode *skids = NULL;
+                if (strcmp(bk, "block") == 0) {
+                    subs_parent = bc;
+                    sn = ts_node_child_count(bc);
+                    skids = perl_collect_children(bc, sn);
+                }
+                for (uint32_t si = 0; si < sn; si++) {
+                    TSNode sc = (subs_parent.id == c.id)
+                                    ? single
+                                    : (skids ? skids[si] : ts_node_child(subs_parent, si));
+                    if (ts_node_is_null(sc) || !ts_node_is_named(sc))
+                        continue;
+                    if (strcmp(ts_node_type(sc), "subroutine_declaration_statement") != 0 &&
+                        strcmp(ts_node_type(sc), "method_declaration_statement") != 0)
+                        continue;
+                    TSNode bname = ts_node_child_by_field_name(sc, "name", 4);
+                    if (ts_node_is_null(bname))
+                        continue;
+                    char *bsn = perl_node_text(ctx, bname);
+                    if (!bsn || !bsn[0])
+                        continue;
+                    const char *bqn =
+                        ctx->module_qn
+                            ? cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, bsn)
+                            : cbm_arena_strdup(ctx->arena, bsn);
+                    perl_mvec_push(&mv, cur_pkg, bsn, bqn);
+                }
+                free(skids);
             }
             free(bkids);
             continue;
