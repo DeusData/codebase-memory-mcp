@@ -1,0 +1,106 @@
+{
+  "promiseHits": 0,
+  "promiseMatches": [],
+  "deadAffordances": 0,
+  "deadAffordanceMatches": [],
+  "filesScanned": 149,
+  "whitelist": [
+    {
+      "rule": "disabled",
+      "reason": "Ein Knopf mit `disabled` sagt selbst, dass er gerade nichts tut, und der Browser laesst ihn nicht anklicken. Das ist eine Auskunft und keine Attrappe."
+    },
+    {
+      "rule": "type=submit",
+      "reason": "Ein Absende-Knopf in einem Formular wird vom Formular bedient und nicht von sich selbst."
+    },
+    {
+      "rule": "spread-props",
+      "reason": "Ein Element, das `{...props}` bekommt, kann seinen Griff von aussen tragen. Der Parser sieht das nicht, und eine Meldung dazu waere geraten."
+    },
+    {
+      "rule": "test-files",
+      "reason": "Tests beschreiben, was nicht passieren darf, und bauen dafuer Attrappen. Sie werden gar nicht erst gelesen."
+    }
+  ],
+  "patterns": [
+    {
+      "name": "not wired",
+      "scope": "text",
+      "source": "not wired",
+      "flags": "i",
+      "reason": "eine Flaeche, die zugibt, nichts zu tun, statt zu verschwinden"
+    },
+    {
+      "name": "coming soon",
+      "scope": "text",
+      "source": "coming soon",
+      "flags": "i",
+      "reason": "ein Termin, den niemand halten muss"
+    },
+    {
+      "name": "arrives later",
+      "scope": "text",
+      "source": "arrives? later",
+      "flags": "i",
+      "reason": "dieselbe Zusage in der eigenen Stimme des Produkts"
+    },
+    {
+      "name": "when ... lands",
+      "scope": "text",
+      "source": "\\bwhen\\b[^.\\n]{0,60}\\blands?\\b",
+      "flags": "i",
+      "reason": "ein Versprechen ueber eine fremde Roadmap"
+    },
+    {
+      "name": "TODO",
+      "scope": "text",
+      "source": "\\bTODO\\b",
+      "flags": "",
+      "reason": "eine offene Aufgabe im Produktpfad, die niemand verfolgt"
+    },
+    {
+      "name": "FIXME",
+      "scope": "text",
+      "source": "\\bFIXME\\b",
+      "flags": "",
+      "reason": "wie TODO, nur lauter"
+    },
+    {
+      "name": "demnaechst",
+      "scope": "text",
+      "source": "demn(ae|ä)chst",
+      "flags": "i",
+      "reason": "dasselbe auf Deutsch"
+    },
+    {
+      "name": "noch nicht",
+      "scope": "visible",
+      "source": "noch nicht",
+      "flags": "i",
+      "reason": "im Bildschirmtext ein Versprechen (und in dieser Oberflaeche ausserdem die falsche Sprache); in einem Kommentar eine Auskunft ueber einen Zustand und deshalb erlaubt"
+    },
+    {
+      "name": "not implemented",
+      "scope": "visible",
+      "source": "not implemented|nicht implementiert",
+      "flags": "i",
+      "reason": "ein Zustand, den der Leser nicht aendern kann, als Antwort verkauft"
+    }
+  ],
+  "handlerAttributes": [
+    "onClick",
+    "onKeyDown",
+    "onKeyUp",
+    "onMouseDown",
+    "onMouseUp",
+    "onPointerDown",
+    "onPointerUp",
+    "onSelect",
+    "onChange",
+    "onInput",
+    "onSubmit",
+    "onToggle"
+  ],
+  "scanned": "src/**/*.{ts,tsx} ohne *.test.*",
+  "generatedAt": "2026-08-30T18:51:16.558Z"
+}

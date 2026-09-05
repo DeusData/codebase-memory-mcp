@@ -1,0 +1,35 @@
+{
+  "symbolSelected": "createUser",
+  "commandEmpty": true,
+  "commandFocused": true,
+  "examplesVisible": true,
+  "examplesCount": 3,
+  "unfoldVisible": true,
+  "measuredGeometry": {
+    "unfold": {
+      "x": 1160.25,
+      "y": 961.015625,
+      "width": 57.75,
+      "height": 21.59375
+    },
+    "examples": {
+      "x": 0,
+      "y": 914.015625,
+      "width": 1680,
+      "height": 34.59375
+    }
+  },
+  "unfoldHitTarget": "atlas-explain-collapse",
+  "unfoldClickSucceeded": true,
+  "explainOpened": true,
+  "exampleHitTarget": "atlas-command-example",
+  "exampleClickSucceeded": true,
+  "exampleText": "cr",
+  "commandAfterExample": "cr",
+  "consoleErrors": 0,
+  "uncaughtExceptions": 0,
+  "leftoverProcesses": 0,
+  "port": 4701,
+  "blockedRequests": [],
+  "error": null
+}
