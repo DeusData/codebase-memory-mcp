@@ -3901,6 +3901,170 @@ TEST(daemon_ipc_posix_unknown_socket_without_identity_refuses_cleanup) {
     PASS();
 }
 
+TEST(daemon_ipc_posix_markerless_linked_socket_recovers_under_startup_lock) {
+    static const char key[] = "d1e2f30415263748";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char anchor_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+    int raw_listener = -1;
+    struct sockaddr_un address;
+    socklen_t address_length = 0;
+    struct stat socket_status = {0};
+    struct stat anchor_status = {0};
+    struct stat absent_status = {0};
+    bool paths_ok = false;
+    bool orphan_created = false;
+    int startup_result = -1;
+    int cleanup_result = -1;
+    int endpoint_after_cleanup = -1;
+    bool names_removed = false;
+
+    if (ipc_test_parent_new(parent, "markerless-linked-socket")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+        paths_ok = ipc_test_socket_anchor_path(anchor_path, runtime_dir, key) &&
+                   ipc_test_unix_address_set(&address, socket_path, &address_length);
+    }
+    if (paths_ok) {
+        raw_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    }
+    if (raw_listener >= 0) {
+        orphan_created =
+            bind(raw_listener, (const struct sockaddr *)&address, address_length) == 0 &&
+            chmod(socket_path, 0600) == 0 && listen(raw_listener, 1) == 0 &&
+            link(socket_path, anchor_path) == 0 && lstat(socket_path, &socket_status) == 0 &&
+            lstat(anchor_path, &anchor_status) == 0 && S_ISSOCK(socket_status.st_mode) &&
+            S_ISSOCK(anchor_status.st_mode) && socket_status.st_nlink == 2 &&
+            anchor_status.st_nlink == 2 && socket_status.st_dev == anchor_status.st_dev &&
+            socket_status.st_ino == anchor_status.st_ino;
+        (void)close(raw_listener);
+        raw_listener = -1;
+    }
+    if (orphan_created) {
+        startup_result = cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup);
+    }
+    if (startup) {
+        cleanup_result = cbm_daemon_ipc_stale_generation_cleanup(endpoint, startup);
+        endpoint_after_cleanup = cbm_daemon_ipc_endpoint_probe(endpoint, 0);
+        errno = 0;
+        bool socket_removed = lstat(socket_path, &absent_status) != 0 && errno == ENOENT;
+        errno = 0;
+        bool anchor_removed = lstat(anchor_path, &absent_status) != 0 && errno == ENOENT;
+        names_removed = socket_removed && anchor_removed;
+    }
+
+    cbm_daemon_ipc_startup_lock_release(&startup);
+    if (raw_listener >= 0) {
+        (void)close(raw_listener);
+    }
+    (void)unlink(anchor_path);
+    (void)unlink(socket_path);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(orphan_created);
+    ASSERT_EQ(startup_result, 1);
+    ASSERT_EQ(cleanup_result, 1);
+    ASSERT_EQ(endpoint_after_cleanup, 0);
+    ASSERT_TRUE(names_removed);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved) {
+    static const char key[] = "e1f2031425364758";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char anchor_path[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_startup_lock_t *startup = NULL;
+    int stable_listener = -1;
+    int anchor_listener = -1;
+    struct sockaddr_un stable_address;
+    struct sockaddr_un anchor_address;
+    socklen_t stable_address_length = 0;
+    socklen_t anchor_address_length = 0;
+    struct stat stable_before = {0};
+    struct stat anchor_before = {0};
+    struct stat stable_after = {0};
+    struct stat anchor_after = {0};
+    bool paths_ok = false;
+    bool mismatch_created = false;
+    int startup_result = -1;
+    int cleanup_result = -1;
+    bool mismatch_preserved = false;
+
+    if (ipc_test_parent_new(parent, "markerless-mismatch")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+        paths_ok =
+            ipc_test_socket_anchor_path(anchor_path, runtime_dir, key) &&
+            ipc_test_unix_address_set(&stable_address, socket_path, &stable_address_length) &&
+            ipc_test_unix_address_set(&anchor_address, anchor_path, &anchor_address_length);
+    }
+    if (paths_ok) {
+        stable_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+        anchor_listener = socket(AF_UNIX, SOCK_STREAM, 0);
+    }
+    if (stable_listener >= 0 && anchor_listener >= 0) {
+        mismatch_created = bind(stable_listener, (const struct sockaddr *)&stable_address,
+                                stable_address_length) == 0 &&
+                           chmod(socket_path, 0600) == 0 && listen(stable_listener, 1) == 0 &&
+                           bind(anchor_listener, (const struct sockaddr *)&anchor_address,
+                                anchor_address_length) == 0 &&
+                           chmod(anchor_path, 0600) == 0 && listen(anchor_listener, 1) == 0 &&
+                           lstat(socket_path, &stable_before) == 0 &&
+                           lstat(anchor_path, &anchor_before) == 0 &&
+                           S_ISSOCK(stable_before.st_mode) && S_ISSOCK(anchor_before.st_mode) &&
+                           stable_before.st_ino != anchor_before.st_ino;
+        (void)close(stable_listener);
+        stable_listener = -1;
+        (void)close(anchor_listener);
+        anchor_listener = -1;
+    }
+    if (mismatch_created) {
+        startup_result = cbm_daemon_ipc_startup_lock_try_acquire(endpoint, &startup);
+    }
+    if (startup) {
+        cleanup_result = cbm_daemon_ipc_stale_generation_cleanup(endpoint, startup);
+        mismatch_preserved = lstat(socket_path, &stable_after) == 0 &&
+                             lstat(anchor_path, &anchor_after) == 0 &&
+                             stable_after.st_dev == stable_before.st_dev &&
+                             stable_after.st_ino == stable_before.st_ino &&
+                             anchor_after.st_dev == anchor_before.st_dev &&
+                             anchor_after.st_ino == anchor_before.st_ino;
+    }
+
+    cbm_daemon_ipc_startup_lock_release(&startup);
+    if (stable_listener >= 0) {
+        (void)close(stable_listener);
+    }
+    if (anchor_listener >= 0) {
+        (void)close(anchor_listener);
+    }
+    (void)unlink(anchor_path);
+    (void)unlink(socket_path);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(mismatch_created);
+    ASSERT_EQ(startup_result, 1);
+    ASSERT_EQ(cleanup_result, 0);
+    ASSERT_TRUE(mismatch_preserved);
+    PASS();
+}
+
 TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure) {
     static const char key[] = "c1d2e3f405162738";
     enum { CLIENT_CAP = 64 };
@@ -4838,6 +5002,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_pending_without_anchor_never_deletes_stable);
     RUN_TEST(daemon_ipc_posix_current_generation_crash_cleanup_requires_startup_lock);
     RUN_TEST(daemon_ipc_posix_unknown_socket_without_identity_refuses_cleanup);
+    RUN_TEST(daemon_ipc_posix_markerless_linked_socket_recovers_under_startup_lock);
+    RUN_TEST(daemon_ipc_posix_markerless_mismatched_socket_and_anchor_are_preserved);
     RUN_TEST(daemon_ipc_posix_active_listener_is_never_cleaned_under_queue_pressure);
     RUN_TEST(daemon_ipc_posix_partial_frame_timeout_poisons_connection);
 #ifdef __APPLE__
