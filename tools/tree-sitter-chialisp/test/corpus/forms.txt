@@ -1,0 +1,136 @@
+================================================================================
+Include with a dotted filename
+================================================================================
+
+(include condition_codes.clib)
+(include curry-and-treehash.clinc)
+(include *standard-cl-26*)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list
+    (symbol)
+    (symbol))
+  (list
+    (symbol)
+    (symbol))
+  (list
+    (symbol)
+    (symbol)))
+
+================================================================================
+defconstant bound to an arbitrary expression
+================================================================================
+
+(defconstant HASH (sha256 1))
+(defconstant TWO 2)
+(defconst MAX 1000)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list
+    (symbol)
+    (symbol)
+    (list
+      (symbol)
+      (number)))
+  (list
+    (symbol)
+    (symbol)
+    (number))
+  (list
+    (symbol)
+    (symbol)
+    (number)))
+
+================================================================================
+Nested mod / defun / defun-inline / defmacro / defmac / let / assign
+================================================================================
+
+(mod (ARG)
+  (defun-inline sq (x) (* x x))
+  (defmacro assert items (f items))
+  (defmac and ARGS 1)
+  (defun outer (y) (let ((a 1)) (+ a y)))
+  (defun outer2 (y) (assign z (* y 2) (+ z 1)))
+  (sq ARG)
+)
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list
+    (symbol)
+    (list
+      (symbol))
+    (list
+      (symbol)
+      (symbol)
+      (list
+        (symbol))
+      (list
+        (symbol)
+        (symbol)
+        (symbol)))
+    (list
+      (symbol)
+      (symbol)
+      (symbol)
+      (list
+        (symbol)
+        (symbol)))
+    (list
+      (symbol)
+      (symbol)
+      (symbol)
+      (number))
+    (list
+      (symbol)
+      (symbol)
+      (list
+        (symbol))
+      (list
+        (symbol)
+        (list
+          (list
+            (symbol)
+            (number)))
+        (list
+          (symbol)
+          (symbol)
+          (symbol))))
+    (list
+      (symbol)
+      (symbol)
+      (list
+        (symbol))
+      (list
+        (symbol)
+        (symbol)
+        (list
+          (symbol)
+          (symbol)
+          (number))
+        (list
+          (symbol)
+          (symbol)
+          (number))))
+    (list
+      (symbol)
+      (symbol))))
+
+================================================================================
+Empty list and empty file body
+================================================================================
+
+(mod () ())
+
+--------------------------------------------------------------------------------
+
+(source_file
+  (list
+    (symbol)
+    (list)
+    (list)))

@@ -80,6 +80,7 @@ extern const TSLanguage *tree_sitter_powershell(void);
 extern const TSLanguage *tree_sitter_pascal(void);
 extern const TSLanguage *tree_sitter_d(void);
 extern const TSLanguage *tree_sitter_scheme(void);
+extern const TSLanguage *tree_sitter_chialisp(void);
 extern const TSLanguage *tree_sitter_fennel(void);
 extern const TSLanguage *tree_sitter_fish(void);
 extern const TSLanguage *tree_sitter_awk(void);
@@ -1107,6 +1108,13 @@ static const char *scheme_func_types[] = {"list", NULL};
 static const char *scheme_call_types[] = {"list", NULL};
 static const char *scheme_var_types[] = {"symbol", NULL};
 static const char *scheme_module_types[] = {"program", NULL};
+// Chialisp: a deliberately generic s-expression grammar (tools/tree-sitter-chialisp).
+// Every parenthesized form is a `list` and every atom a `symbol`; which lists are
+// definitions is decided in extract_defs.c, not by the parser. Root is `source_file`.
+static const char *chialisp_func_types[] = {"list", NULL};
+static const char *chialisp_call_types[] = {"list", NULL};
+static const char *chialisp_var_types[] = {"symbol", NULL};
+static const char *chialisp_module_types[] = {"source_file", NULL};
 static const char *fennel_func_types[] = {"fn", "lambda", "hashfn", NULL};
 static const char *fennel_call_types[] = {"list", NULL};
 static const char *fennel_branch_types[] = {"each", "for", "match", NULL};
@@ -1586,11 +1594,21 @@ static const char *tlaplus_branch_types[] = {"if_then_else", "case", NULL};
 static const char *tlaplus_var_types[] = {"variable_declaration", NULL};
 static const char *tlaplus_module_types[] = {"source_file", NULL};
 static const char *pkl_func_types[] = {"classMethod", "objectMethod", NULL};
-static const char *pkl_class_types[] = {"clazz", NULL};
-static const char *pkl_import_types[] = {"importClause", "extendsOrAmendsClause", "extends",
-                                         "import", NULL};
+static const char *pkl_class_types[] = {"clazz", "typeAlias", NULL};
+static const char *pkl_import_types[] = {
+    "importClause", "importGlobClause", "importExpr", "extendsOrAmendsClause",
+    "extends",      "import",           NULL};
 static const char *pkl_var_types[] = {"classProperty", "objectProperty", NULL};
 static const char *pkl_module_types[] = {"module", NULL};
+/* Both access exprs double as plain property reads; extract_pkl_callee keeps
+ * only the ones carrying an argumentList. `newExpr` resolves to its type. */
+static const char *pkl_call_types[] = {"unqualifiedAccessExpr", "qualifiedAccessExpr", "newExpr",
+                                       NULL};
+/* Control-flow only, matching every other spec (short-circuit operators are
+ * deliberately excluded). `forGenerator` is also a loop — see helpers.c. */
+static const char *pkl_branch_types[] = {"ifExpr", "whenGenerator", "forGenerator", NULL};
+static const char *pkl_throw_types[] = {"throwExpr", NULL};
+static const char *pkl_decorator_types[] = {"annotation", NULL};
 static const char *gomod_var_types[] = {"require_directive", "replace_directive", NULL};
 static const char *gomod_import_types[] = {"require", NULL};
 static const char *gomod_module_types[] = {"source_file", NULL};
@@ -2161,6 +2179,12 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                          empty_types, scheme_var_types, empty_types, empty_types, NULL, empty_types,
                          NULL, NULL, tree_sitter_scheme, NULL},
 
+    // CBM_LANG_CHIALISP — lisp-family shape (generic list/symbol nodes)
+    [CBM_LANG_CHIALISP] = {CBM_LANG_CHIALISP, chialisp_func_types, empty_types, empty_types,
+                           chialisp_module_types, chialisp_call_types, empty_types, empty_types,
+                           empty_types, chialisp_var_types, empty_types, empty_types, NULL,
+                           empty_types, NULL, NULL, tree_sitter_chialisp, NULL},
+
     // CBM_LANG_FENNEL
     [CBM_LANG_FENNEL] = {CBM_LANG_FENNEL, fennel_func_types, empty_types, empty_types,
                          fennel_module_types, fennel_call_types, empty_types, empty_types,
@@ -2616,9 +2640,9 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
 
     // CBM_LANG_PKL
     [CBM_LANG_PKL] = {CBM_LANG_PKL, pkl_func_types, pkl_class_types, empty_types, pkl_module_types,
-                      empty_types, pkl_import_types, empty_types, empty_types, pkl_var_types,
-                      empty_types, empty_types, NULL, empty_types, NULL, NULL, tree_sitter_pkl,
-                      NULL},
+                      pkl_call_types, pkl_import_types, empty_types, pkl_branch_types,
+                      pkl_var_types, empty_types, pkl_throw_types, NULL, pkl_decorator_types, NULL,
+                      NULL, tree_sitter_pkl, NULL},
 
     // CBM_LANG_GOMOD
     [CBM_LANG_GOMOD] = {CBM_LANG_GOMOD, empty_types, empty_types, empty_types, gomod_module_types,

@@ -1291,6 +1291,28 @@ TEST(client_adapter_opencode_sends_the_required_hook_event) {
     PASS();
 }
 
+/* The richer OpenCode adapter carries every context surface the plugin API
+ * documents: session-start tier routing on the first tool result of each
+ * session, post-read coverage notes, and post-compaction reinjection through
+ * the documented experimental surface. It must unwrap hook-augment's Claude
+ * JSON envelope so plain text — not raw JSON — reaches the model. */
+TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'SessionStart'"));
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PostToolUse'"));
+    ASSERT_NOT_NULL(strstr(js, "tool_name: 'Read'"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
+    ASSERT_NOT_NULL(strstr(js, "additionalContext"));
+    /* file_path is the key hook-augment's default dialect reads; OpenCode's
+     * read tool argues filePath, so the adapter must map it. */
+    ASSERT_NOT_NULL(strstr(js, "file_path: filePath"));
+    /* Session context may only be injected once per session id. */
+    ASSERT_NOT_NULL(strstr(js, "seen.has(sid)"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1336,5 +1358,6 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
+    RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

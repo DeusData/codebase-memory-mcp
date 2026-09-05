@@ -141,6 +141,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"racket", "Function:2,Module:1"},
     {"rescript", "Function:2,Module:1"},
     {"scheme", "Function:2,Module:1"},
+    {"chialisp", "Constant:1,Function:1,Macro:1,Module:2"},
     {"slang", "Function:2,Module:1"},
     {"squirrel", "Function:2,Module:1"},
     {"starlark", "Function:2,Module:1"},

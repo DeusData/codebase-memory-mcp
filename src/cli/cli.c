@@ -322,6 +322,10 @@ void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent) 
     g_cli_activation_runtime_parent_for_test = runtime_parent;
 }
 
+const char *cbm_cli_activation_runtime_parent_for_test(void) {
+    return g_cli_activation_runtime_parent_for_test;
+}
+
 static const char *cli_activation_action_text(cbm_daemon_runtime_activation_action_t action) {
     switch (action) {
     case CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL:
@@ -1765,14 +1769,25 @@ static bool cbm_json_mcp_command_path_probe_safe(const char *command) {
 #endif
 
 #ifdef CBM_CLI_ENABLE_TEST_API
+#ifdef _WIN32
 static CBM_TLS int *g_mcp_command_path_probe_counter = NULL;
+#endif
 
 bool cbm_mcp_command_path_probe_safe_for_testing(const char *command, bool windows) {
     return cbm_json_mcp_command_path_probe_safe_for_platform(command, windows);
 }
 
 void cbm_set_mcp_command_path_probe_counter_for_testing(int *counter) {
+#ifdef _WIN32
     g_mcp_command_path_probe_counter = counter;
+#else
+    /* The command-path classifier (cbm_json_mcp_probe_command_path) is compiled
+     * for Windows only, so on POSIX there is no probe to count. The tests still
+     * install a counter on every platform and assert it stays at zero; a pointer
+     * stored here but never read is what Clang 23 rejects under -Werror
+     * (-Wunused-but-set-global). */
+    (void)counter;
+#endif
 }
 #endif
 
@@ -4160,6 +4175,7 @@ static int cbm_remove_grok_mcp_owned(const char *binary_path, const char *config
 /* Hard backstop in settings.json; the binary also self-bounds with an
  * in-process deadline well under this. */
 #define CMM_HOOK_TIMEOUT_SEC 5
+static const char *const cmm_claude_exec_args[] = {"hook-augment"};
 
 /* Old matcher values from previous versions — recognized during upgrade so
  * upsert/remove can clean them up before inserting the current matcher.
@@ -4181,6 +4197,26 @@ static const char *const cmm_gemini_session_old_matchers[] = {
     NULL,
 };
 
+static bool cmm_hook_args_equal(yyjson_mut_val *hook, const char *const *expected_args,
+                                size_t expected_arg_count) {
+    yyjson_mut_val *args = yyjson_mut_is_obj(hook) ? yyjson_mut_obj_get(hook, "args") : NULL;
+    if (expected_arg_count == 0U) {
+        return args == NULL;
+    }
+    if (!expected_args || !args || !yyjson_mut_is_arr(args) ||
+        yyjson_mut_arr_size(args) != expected_arg_count) {
+        return false;
+    }
+    for (size_t i = 0U; i < expected_arg_count; i++) {
+        yyjson_mut_val *arg = yyjson_mut_arr_get(args, i);
+        if (!expected_args[i] || !arg || !yyjson_mut_is_str(arg) ||
+            strcmp(yyjson_mut_get_str(arg), expected_args[i]) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /* Check if a hook array entry is ours (current matcher or a known old one).
  * Matcher identity is never sufficient because users commonly choose the same
  * catch-all or lifecycle matchers. Ownership always requires the exact command
@@ -4188,6 +4224,7 @@ static const char *const cmm_gemini_session_old_matchers[] = {
 static bool find_cmm_hook_in_entry(yyjson_mut_val *entry, const char *matcher_str,
                                    const char *const *old_matchers,
                                    const char *require_command_exact,
+                                   const char *const *require_args, size_t require_arg_count,
                                    const char *const *old_commands, size_t *hook_index_out) {
     if (!entry || !require_command_exact) {
         return false;
@@ -4225,9 +4262,10 @@ static bool find_cmm_hook_in_entry(yyjson_mut_val *entry, const char *matcher_st
         if (cmd && yyjson_mut_is_str(cmd) && type && yyjson_mut_is_str(type) &&
             strcmp(yyjson_mut_get_str(type), "command") == 0) {
             const char *cs = yyjson_mut_get_str(cmd);
-            bool command_ok = cs && strcmp(cs, require_command_exact) == 0;
+            bool command_ok = cs && strcmp(cs, require_command_exact) == 0 &&
+                              cmm_hook_args_equal(h, require_args, require_arg_count);
             for (size_t i = 0U; !command_ok && cs && old_commands && old_commands[i]; i++) {
-                command_ok = strcmp(cs, old_commands[i]) == 0;
+                command_ok = strcmp(cs, old_commands[i]) == 0 && cmm_hook_args_equal(h, NULL, 0U);
             }
             if (command_ok) {
                 if (hook_index_out) {
@@ -4254,6 +4292,8 @@ static bool cmm_hook_outer_is_canonical(yyjson_mut_val *entry, bool has_matcher)
 static size_t remove_all_owned_hooks_from_event(yyjson_mut_val *event_arr, const char *matcher_str,
                                                 const char *const *old_matchers,
                                                 const char *match_command_exact,
+                                                const char *const *match_args,
+                                                size_t match_arg_count,
                                                 const char *const *old_commands) {
     if (!event_arr || !yyjson_mut_is_arr(event_arr) || !match_command_exact) {
         return 0U;
@@ -4265,7 +4305,7 @@ static size_t remove_all_owned_hooks_from_event(yyjson_mut_val *event_arr, const
         bool entry_removed = false;
         size_t hook_index = 0U;
         while (find_cmm_hook_in_entry(entry, matcher_str, old_matchers, match_command_exact,
-                                      old_commands, &hook_index)) {
+                                      match_args, match_arg_count, old_commands, &hook_index)) {
             yyjson_mut_val *entry_hooks = yyjson_mut_obj_get(entry, "hooks");
             yyjson_mut_arr_remove(entry_hooks, hook_index);
             removed++;
@@ -4292,6 +4332,8 @@ typedef struct {
     const char *command_str;
     const char *command_windows;
     const char *shell;
+    const char *const *command_args;
+    size_t command_arg_count;
     const char *const *old_matchers; /* NULL-terminated; may be NULL */
     const char *const *old_commands; /* finite exact identities; may be NULL */
     int timeout_value;               /* >0 adds runtime-native "timeout" */
@@ -4406,6 +4448,7 @@ static int upsert_hooks_json(hooks_upsert_args_t args) {
      * one canonical entry. Foreign commands remain untouched. */
     const char *effective_exact = args.match_command_exact ? args.match_command_exact : command_str;
     (void)remove_all_owned_hooks_from_event(event_arr, matcher_str, old_matchers, effective_exact,
+                                            args.command_args, args.command_arg_count,
                                             args.old_commands);
 
     /* Build our hook entry */
@@ -4418,6 +4461,21 @@ static int upsert_hooks_json(hooks_upsert_args_t args) {
     yyjson_mut_val *hook_obj = yyjson_mut_obj(mdoc);
     yyjson_mut_obj_add_str(mdoc, hook_obj, "type", "command");
     yyjson_mut_obj_add_str(mdoc, hook_obj, "command", command_str);
+    if (args.command_arg_count > 0U) {
+        yyjson_mut_val *command_args = yyjson_mut_arr(mdoc);
+        if (!args.command_args || !command_args) {
+            goto cleanup;
+        }
+        for (size_t i = 0U; i < args.command_arg_count; i++) {
+            if (!args.command_args[i] ||
+                !yyjson_mut_arr_add_str(mdoc, command_args, args.command_args[i])) {
+                goto cleanup;
+            }
+        }
+        if (!yyjson_mut_obj_add_val(mdoc, hook_obj, "args", command_args)) {
+            goto cleanup;
+        }
+    }
     if (args.command_windows) {
         yyjson_mut_obj_add_str(mdoc, hook_obj, "command_windows", args.command_windows);
     }
@@ -4451,6 +4509,8 @@ typedef struct {
     const char *const *old_matchers; /* NULL-terminated; may be NULL */
     const char *const *old_commands; /* finite exact identities; may be NULL */
     const char *match_command_exact;
+    const char *const *match_args;
+    size_t match_arg_count;
 } hooks_remove_args_t;
 static int remove_hooks_json(hooks_remove_args_t args) {
     const char *settings_path = args.settings_path;
@@ -4520,7 +4580,8 @@ static int remove_hooks_json(hooks_remove_args_t args) {
     }
 
     size_t removed = remove_all_owned_hooks_from_event(event_arr, matcher_str, old_matchers,
-                                                       args.match_command_exact, args.old_commands);
+                                                       args.match_command_exact, args.match_args,
+                                                       args.match_arg_count, args.old_commands);
 
     if (removed == 0U) {
         yyjson_mut_doc_free(mdoc);
@@ -4847,13 +4908,33 @@ static int cbm_remove_hermes_context_hook(const char *config_path, const char *b
     return CBM_YAML_IDENTITY_EDIT_OK;
 }
 
-int cbm_upsert_claude_hooks(const char *settings_path) {
-    char command[CLI_BUF_8K];
+static int cbm_remove_previous_claude_exec_hook(const char *settings_path, const char *hook_event,
+                                                const char *matcher_str,
+                                                const char *const *old_matchers,
+                                                const char *binary_path) {
+    if (!g_previous_managed_mcp_command || !g_previous_managed_mcp_command[0] ||
+        (binary_path && strcmp(g_previous_managed_mcp_command, binary_path) == 0)) {
+        return CLI_OK;
+    }
+    return remove_hooks_json((hooks_remove_args_t){
+        .settings_path = settings_path,
+        .hook_event = hook_event,
+        .matcher_str = matcher_str,
+        .old_matchers = old_matchers,
+        .match_command_exact = g_previous_managed_mcp_command,
+        .match_args = cmm_claude_exec_args,
+        .match_arg_count = sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0]),
+    });
+}
+
+static int cbm_upsert_claude_hooks_with_binary(const char *settings_path, const char *binary_path) {
+    char shell_command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     char previous_legacy_command[CLI_BUF_8K];
     char released_legacy_command[CLI_BUF_8K];
-    if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command)) != CLI_OK ||
+    if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, shell_command, sizeof(shell_command)) !=
+            CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT, released_command,
@@ -4864,13 +4945,27 @@ int cbm_upsert_claude_hooks(const char *settings_path) {
                                           sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+    const char *command = binary_path && binary_path[0] ? binary_path : shell_command;
+    const char *const *command_args = binary_path && binary_path[0] ? cmm_claude_exec_args : NULL;
+    size_t command_arg_count = binary_path && binary_path[0]
+                                   ? sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0])
+                                   : 0U;
+    const char *const old_commands[] = {shell_command,           released_command,
+                                        previous_command,        released_legacy_command,
                                         previous_legacy_command, NULL};
+    if (cbm_remove_previous_claude_exec_hook(settings_path, "PreToolUse", CMM_HOOK_SEARCH_MATCHER,
+                                             cmm_claude_old_matchers, binary_path) != CLI_OK ||
+        cbm_remove_previous_claude_exec_hook(settings_path, "PostToolUse", CMM_HOOK_READ_MATCHER,
+                                             NULL, binary_path) != CLI_OK) {
+        return CLI_ERR;
+    }
     int search_result = upsert_hooks_json((hooks_upsert_args_t){
         .settings_path = settings_path,
         .hook_event = "PreToolUse",
         .matcher_str = CMM_HOOK_SEARCH_MATCHER,
         .command_str = command,
+        .command_args = command_args,
+        .command_arg_count = command_arg_count,
         .old_matchers = cmm_claude_old_matchers,
         .old_commands = old_commands,
         .timeout_value = CMM_HOOK_TIMEOUT_SEC,
@@ -4881,6 +4976,8 @@ int cbm_upsert_claude_hooks(const char *settings_path) {
         .hook_event = "PostToolUse",
         .matcher_str = CMM_HOOK_READ_MATCHER,
         .command_str = command,
+        .command_args = command_args,
+        .command_arg_count = command_arg_count,
         .old_commands = old_commands,
         .timeout_value = CMM_HOOK_TIMEOUT_SEC,
         .match_command_exact = command,
@@ -4888,13 +4985,18 @@ int cbm_upsert_claude_hooks(const char *settings_path) {
     return search_result == CLI_OK && read_result == CLI_OK ? CLI_OK : CLI_ERR;
 }
 
-int cbm_remove_claude_hooks(const char *settings_path) {
-    char command[CLI_BUF_8K];
+int cbm_upsert_claude_hooks(const char *settings_path) {
+    return cbm_upsert_claude_hooks_with_binary(settings_path, NULL);
+}
+
+static int cbm_remove_claude_hooks_with_binary(const char *settings_path, const char *binary_path) {
+    char shell_command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     char previous_legacy_command[CLI_BUF_8K];
     char released_legacy_command[CLI_BUF_8K];
-    if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, command, sizeof(command)) != CLI_OK ||
+    if (cbm_resolve_hook_command(CMM_HOOK_GATE_SCRIPT, shell_command, sizeof(shell_command)) !=
+            CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_HOOK_GATE_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_HOOK_GATE_SCRIPT, released_command,
@@ -4905,7 +5007,13 @@ int cbm_remove_claude_hooks(const char *settings_path) {
                                           sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+    const char *command = binary_path && binary_path[0] ? binary_path : shell_command;
+    const char *const *command_args = binary_path && binary_path[0] ? cmm_claude_exec_args : NULL;
+    size_t command_arg_count = binary_path && binary_path[0]
+                                   ? sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0])
+                                   : 0U;
+    const char *const old_commands[] = {shell_command,           released_command,
+                                        previous_command,        released_legacy_command,
                                         previous_legacy_command, NULL};
     int search_result = remove_hooks_json((hooks_remove_args_t){
         .settings_path = settings_path,
@@ -4914,6 +5022,8 @@ int cbm_remove_claude_hooks(const char *settings_path) {
         .old_matchers = cmm_claude_old_matchers,
         .old_commands = old_commands,
         .match_command_exact = command,
+        .match_args = command_args,
+        .match_arg_count = command_arg_count,
     });
     int read_result = remove_hooks_json((hooks_remove_args_t){
         .settings_path = settings_path,
@@ -4921,8 +5031,14 @@ int cbm_remove_claude_hooks(const char *settings_path) {
         .matcher_str = CMM_HOOK_READ_MATCHER,
         .old_commands = old_commands,
         .match_command_exact = command,
+        .match_args = command_args,
+        .match_arg_count = command_arg_count,
     });
     return search_result == CLI_OK && read_result == CLI_OK ? CLI_OK : CLI_ERR;
+}
+
+int cbm_remove_claude_hooks(const char *settings_path) {
+    return cbm_remove_claude_hooks_with_binary(settings_path, NULL);
 }
 
 /* Encode one shell word without permitting expansion or command substitution.
@@ -5404,14 +5520,15 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
     return cbm_write_owned_hook_script_with_legacy(script_path, script, legacy, 1U);
 }
 
-static int cbm_upsert_session_hooks(const char *settings_path) {
+static int cbm_upsert_session_hooks(const char *settings_path, const char *binary_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
-    char command[CLI_BUF_8K];
+    char shell_command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     char previous_legacy_command[CLI_BUF_8K];
     char released_legacy_command[CLI_BUF_8K];
-    if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command)) != CLI_OK ||
+    if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, shell_command,
+                                 sizeof(shell_command)) != CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_SESSION_REMINDER_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SESSION_REMINDER_SCRIPT, released_command,
@@ -5424,14 +5541,27 @@ static int cbm_upsert_session_hooks(const char *settings_path) {
                                           sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+    const char *command = binary_path && binary_path[0] ? binary_path : shell_command;
+    const char *const *command_args = binary_path && binary_path[0] ? cmm_claude_exec_args : NULL;
+    size_t command_arg_count = binary_path && binary_path[0]
+                                   ? sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0])
+                                   : 0U;
+    const char *const old_commands[] = {shell_command,           released_command,
+                                        previous_command,        released_legacy_command,
                                         previous_legacy_command, NULL};
     int rc = 0;
     for (int i = 0; i < NUM_DIRS; i++) {
+        if (cbm_remove_previous_claude_exec_hook(settings_path, "SessionStart", matchers[i], NULL,
+                                                 binary_path) != CLI_OK) {
+            rc = CLI_ERR;
+            continue;
+        }
         if (upsert_hooks_json((hooks_upsert_args_t){.settings_path = settings_path,
                                                     .hook_event = "SessionStart",
                                                     .matcher_str = matchers[i],
                                                     .command_str = command,
+                                                    .command_args = command_args,
+                                                    .command_arg_count = command_arg_count,
                                                     .old_commands = old_commands,
                                                     .timeout_value = CMM_HOOK_TIMEOUT_SEC,
                                                     .match_command_exact = command}) != 0) {
@@ -5441,14 +5571,15 @@ static int cbm_upsert_session_hooks(const char *settings_path) {
     return rc;
 }
 
-static int cbm_remove_session_hooks(const char *settings_path) {
+static int cbm_remove_session_hooks(const char *settings_path, const char *binary_path) {
     static const char *matchers[] = {"startup", "resume", "clear", "compact"};
-    char command[CLI_BUF_8K];
+    char shell_command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     char previous_legacy_command[CLI_BUF_8K];
     char released_legacy_command[CLI_BUF_8K];
-    if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, command, sizeof(command)) != CLI_OK ||
+    if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, shell_command,
+                                 sizeof(shell_command)) != CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_SESSION_REMINDER_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SESSION_REMINDER_SCRIPT, released_command,
@@ -5461,7 +5592,13 @@ static int cbm_remove_session_hooks(const char *settings_path) {
                                           sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+    const char *command = binary_path && binary_path[0] ? binary_path : shell_command;
+    const char *const *command_args = binary_path && binary_path[0] ? cmm_claude_exec_args : NULL;
+    size_t command_arg_count = binary_path && binary_path[0]
+                                   ? sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0])
+                                   : 0U;
+    const char *const old_commands[] = {shell_command,           released_command,
+                                        previous_command,        released_legacy_command,
                                         previous_legacy_command, NULL};
     int rc = 0;
     for (int i = 0; i < NUM_DIRS; i++) {
@@ -5469,21 +5606,31 @@ static int cbm_remove_session_hooks(const char *settings_path) {
                                                     .hook_event = "SessionStart",
                                                     .matcher_str = matchers[i],
                                                     .old_commands = old_commands,
-                                                    .match_command_exact = command}) != 0) {
+                                                    .match_command_exact = command,
+                                                    .match_args = command_args,
+                                                    .match_arg_count = command_arg_count}) != 0) {
             rc = CLI_ERR;
         }
     }
     return rc;
 }
 
-static bool cbm_has_complete_claude_session_hooks(const char *home) {
+static bool cbm_has_complete_claude_session_hooks(const char *home, const char *binary_path) {
     static const char *const matchers[] = {"startup", "resume", "clear", "compact"};
     char config_dir[CLI_BUF_1K];
     char settings_path[CLI_BUF_1K];
     char expected_command[CLI_BUF_8K];
     cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
-    if (!config_dir[0] || cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, expected_command,
-                                                   sizeof(expected_command)) != CLI_OK) {
+    if (!config_dir[0]) {
+        return false;
+    }
+    if (binary_path && binary_path[0]) {
+        if (snprintf(expected_command, sizeof(expected_command), "%s", binary_path) <= 0 ||
+            strlen(binary_path) >= sizeof(expected_command)) {
+            return false;
+        }
+    } else if (cbm_resolve_hook_command(CMM_SESSION_REMINDER_SCRIPT, expected_command,
+                                        sizeof(expected_command)) != CLI_OK) {
         return false;
     }
     int written = snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
@@ -5524,11 +5671,21 @@ static bool cbm_has_complete_claude_session_hooks(const char *home) {
             yyjson_arr_foreach(entry_hooks, hook_index, hook_count, hook) {
                 yyjson_val *type = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "type") : NULL;
                 yyjson_val *command = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "command") : NULL;
+                yyjson_val *args = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "args") : NULL;
                 yyjson_val *timeout = yyjson_is_obj(hook) ? yyjson_obj_get(hook, "timeout") : NULL;
+                yyjson_val *first_arg =
+                    args && yyjson_is_arr(args) ? yyjson_arr_get(args, 0U) : NULL;
+                bool args_match =
+                    binary_path && binary_path[0]
+                        ? args && yyjson_is_arr(args) && yyjson_arr_size(args) == 1U && first_arg &&
+                              yyjson_is_str(first_arg) &&
+                              strcmp(yyjson_get_str(first_arg), cmm_claude_exec_args[0]) == 0
+                        : args == NULL;
                 if (type && yyjson_is_str(type) && strcmp(yyjson_get_str(type), "command") == 0 &&
                     command && yyjson_is_str(command) &&
-                    strcmp(yyjson_get_str(command), expected_command) == 0 && timeout &&
-                    yyjson_is_int(timeout) && yyjson_get_int(timeout) == CMM_HOOK_TIMEOUT_SEC) {
+                    strcmp(yyjson_get_str(command), expected_command) == 0 && args_match &&
+                    timeout && yyjson_is_int(timeout) &&
+                    yyjson_get_int(timeout) == CMM_HOOK_TIMEOUT_SEC) {
                     found = true;
                     break;
                 }
@@ -5645,14 +5802,15 @@ static bool cbm_hook_script_write_would_succeed(const char *home, const char *bi
     return cbm_text_owned_document_status(script_path, script, candidates, candidate_count) == 0;
 }
 
-int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
-    char command[CLI_BUF_8K];
+static int cbm_upsert_claude_subagent_hooks_with_binary(const char *settings_path,
+                                                        const char *binary_path) {
+    char shell_command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     char previous_legacy_command[CLI_BUF_8K];
     char released_legacy_command[CLI_BUF_8K];
-    if (cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command)) !=
-            CLI_OK ||
+    if (cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, shell_command,
+                                 sizeof(shell_command)) != CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, released_command,
@@ -5665,8 +5823,18 @@ int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
                                           sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+    const char *command = binary_path && binary_path[0] ? binary_path : shell_command;
+    const char *const *command_args = binary_path && binary_path[0] ? cmm_claude_exec_args : NULL;
+    size_t command_arg_count = binary_path && binary_path[0]
+                                   ? sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0])
+                                   : 0U;
+    const char *const old_commands[] = {shell_command,           released_command,
+                                        previous_command,        released_legacy_command,
                                         previous_legacy_command, NULL};
+    if (cbm_remove_previous_claude_exec_hook(settings_path, "SubagentStart", "*", NULL,
+                                             binary_path) != CLI_OK) {
+        return CLI_ERR;
+    }
     /* matcher "*" is the natural choice a user would also pick for their own
      * catch-all SubagentStart hook, so claim ownership by command too — never
      * clobber or remove a foreign "*" entry. */
@@ -5674,19 +5842,26 @@ int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
                                                    .hook_event = "SubagentStart",
                                                    .matcher_str = "*",
                                                    .command_str = command,
+                                                   .command_args = command_args,
+                                                   .command_arg_count = command_arg_count,
                                                    .old_commands = old_commands,
                                                    .timeout_value = CMM_HOOK_TIMEOUT_SEC,
                                                    .match_command_exact = command});
 }
 
-int cbm_remove_claude_subagent_hooks(const char *settings_path) {
-    char command[CLI_BUF_8K];
+int cbm_upsert_claude_subagent_hooks(const char *settings_path) {
+    return cbm_upsert_claude_subagent_hooks_with_binary(settings_path, NULL);
+}
+
+static int cbm_remove_claude_subagent_hooks_with_binary(const char *settings_path,
+                                                        const char *binary_path) {
+    char shell_command[CLI_BUF_8K];
     char previous_command[CLI_BUF_8K];
     char released_command[CLI_BUF_8K];
     char previous_legacy_command[CLI_BUF_8K];
     char released_legacy_command[CLI_BUF_8K];
-    if (cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, command, sizeof(command)) !=
-            CLI_OK ||
+    if (cbm_resolve_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, shell_command,
+                                 sizeof(shell_command)) != CLI_OK ||
         cbm_resolve_previous_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, previous_command,
                                           sizeof(previous_command)) != CLI_OK ||
         cbm_resolve_released_hook_command(CMM_SUBAGENT_REMINDER_SCRIPT, released_command,
@@ -5699,13 +5874,25 @@ int cbm_remove_claude_subagent_hooks(const char *settings_path) {
                                           sizeof(released_legacy_command)) != CLI_OK) {
         return CLI_ERR;
     }
-    const char *const old_commands[] = {released_command, previous_command, released_legacy_command,
+    const char *command = binary_path && binary_path[0] ? binary_path : shell_command;
+    const char *const *command_args = binary_path && binary_path[0] ? cmm_claude_exec_args : NULL;
+    size_t command_arg_count = binary_path && binary_path[0]
+                                   ? sizeof(cmm_claude_exec_args) / sizeof(cmm_claude_exec_args[0])
+                                   : 0U;
+    const char *const old_commands[] = {shell_command,           released_command,
+                                        previous_command,        released_legacy_command,
                                         previous_legacy_command, NULL};
     return remove_hooks_json((hooks_remove_args_t){.settings_path = settings_path,
                                                    .hook_event = "SubagentStart",
                                                    .matcher_str = "*",
                                                    .old_commands = old_commands,
-                                                   .match_command_exact = command});
+                                                   .match_command_exact = command,
+                                                   .match_args = command_args,
+                                                   .match_arg_count = command_arg_count});
+}
+
+int cbm_remove_claude_subagent_hooks(const char *settings_path) {
+    return cbm_remove_claude_subagent_hooks_with_binary(settings_path, NULL);
 }
 
 /* Matcher excludes read_file for consistency with the Claude fix: the hook
@@ -7464,6 +7651,12 @@ static const char *detect_arch(void) {
 
 /* ── Agent config install/refresh (shared by install + update) ── */
 
+/* Set by `install --clients=...` after validation and consumed by both the
+ * legacy detector and the registry-backed client path (#1558, #1798). */
+static const char *g_client_selection = NULL;
+static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
+static bool cli_clients_selects_registry_client(const char *spec, cbm_agent_client_id_t client_id);
+static void cli_clients_print_list(FILE *out);
 static void print_detected_registry_agents(const char *home, bool *any);
 
 /* Print detected agent names on a single line. */
@@ -7758,7 +7951,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
          * update into config loss. Entry removal belongs to uninstall only. */
         if (!gate_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-        } else if (cbm_upsert_claude_hooks(settings_path) != CLI_OK) {
+        } else if (cbm_upsert_claude_hooks_with_binary(settings_path, binary_path) != CLI_OK) {
             gate_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
         }
@@ -7768,7 +7961,7 @@ static void install_claude_code_config(const char *home, const char *binary_path
                  CMM_SESSION_REMINDER_SCRIPT);
         if (!session_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-        } else if (cbm_upsert_session_hooks(settings_path) != CLI_OK) {
+        } else if (cbm_upsert_session_hooks(settings_path, binary_path) != CLI_OK) {
             session_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
         }
@@ -7778,7 +7971,8 @@ static void install_claude_code_config(const char *home, const char *binary_path
                  CMM_SUBAGENT_REMINDER_SCRIPT);
         if (!subagent_ok) {
             record_agent_config_error(false, "Claude Code", "hook_script_install", hook_path);
-        } else if (cbm_upsert_claude_subagent_hooks(settings_path) != CLI_OK) {
+        } else if (cbm_upsert_claude_subagent_hooks_with_binary(settings_path, binary_path) !=
+                   CLI_OK) {
             subagent_ok = false;
             record_agent_config_error(false, "Claude Code", "hook_register", settings_path);
         }
@@ -8285,7 +8479,10 @@ static void print_detected_registry_agents(const char *home, bool *any) {
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (profile && cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (profile &&
+            (!g_client_selection ||
+             cli_clients_selects_registry_client(g_client_selection, profile->id)) &&
+            cbm_agent_client_detect(profile->id, &registry.options)) {
             printf(" %s", profile->display_name);
             *any = true;
         }
@@ -8671,7 +8868,10 @@ static void install_agent_client_registry(const char *home, const char *binary_p
     cbm_init_agent_registry_context(home, &registry);
     for (size_t index = 0U; index < cbm_agent_client_count(); index++) {
         const cbm_agent_client_profile_t *profile = cbm_agent_client_at(index);
-        if (!profile || !cbm_agent_client_detect(profile->id, &registry.options)) {
+        if (!profile ||
+            (g_client_selection &&
+             !cli_clients_selects_registry_client(g_client_selection, profile->id)) ||
+            !cbm_agent_client_detect(profile->id, &registry.options)) {
             continue;
         }
         if (!g_install_plan) {
@@ -9545,13 +9745,6 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     }
 }
 
-/* #1558: set by `install --clients=...` after validation, consumed at the one
- * place detection happens. Validation runs in cbm_cmd_install so an unknown
- * token fails before anything is written, not midway through configuring. */
-static const char *g_client_selection = NULL;
-static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t *detected);
-static void cli_clients_print_list(FILE *out);
-
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
@@ -9569,7 +9762,7 @@ int cbm_install_agent_configs(const char *home, const char *binary_path, bool fo
     install_editor_agent_configs(&agents, home, binary_path, force, dry_run);
     install_additional_agent_configs(&agents, home, binary_path, force, dry_run);
     bool inherit_claude_session =
-        agents.claude_code && !dry_run && cbm_has_complete_claude_session_hooks(home);
+        agents.claude_code && !dry_run && cbm_has_complete_claude_session_hooks(home, binary_path);
     install_agent_client_registry(home, binary_path, inherit_claude_session, force, dry_run);
     return g_agent_install_errors == 0 ? CLI_OK : CLI_ERR;
 }
@@ -9679,9 +9872,9 @@ int cbm_install_handle_existing_indexes(const char *home, bool reset, bool dry_r
  * Codex had to revert the OpenCode and Cursor integrations by hand, and the
  * next install silently recreated them. `--clients=claude,codex` restricts it.
  *
- * The table is the flag's vocabulary AND its documentation: 26 clients ship
- * here, with tokens nobody would guess (factory-droid, mistral-vibe,
- * copilot-cli), so `--clients=help` prints every token. A selector whose
+ * The tables are the flag's vocabulary AND its documentation, with tokens
+ * nobody would guess (factory-droid, mistral-vibe, copilot-cli), so
+ * `--clients=help` prints every token. A selector whose
  * accepted values can only be learned from the source is not a usable
  * selector, and an unrecognised token fails loudly with the list rather than
  * silently configuring nothing. */
@@ -9730,8 +9923,38 @@ static void cli_clients_print_list(FILE *out) {
     for (size_t i = 0; i < CLI_CLIENT_COUNT; i++) {
         (void)fprintf(out, "  %-16s %s\n", CLI_CLIENTS[i].token, CLI_CLIENTS[i].display);
     }
+    for (size_t i = 0; i < cbm_agent_client_count(); i++) {
+        const cbm_agent_client_profile_t *profile = cbm_agent_client_at(i);
+        if (profile) {
+            (void)fprintf(out, "  %-16s %s\n", profile->stable_id, profile->display_name);
+        }
+    }
     (void)fprintf(out, "\nExample: --clients=claude,codex\n"
                        "Omit --clients to configure every detected client.\n");
+}
+
+static bool cli_clients_spec_contains(const char *spec, const char *wanted_token) {
+    char buf[CLI_BUF_1K];
+    snprintf(buf, sizeof(buf), "%s", spec ? spec : "");
+    char *save = NULL;
+    for (char *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+        while (*tok == ' ') {
+            tok++;
+        }
+        size_t len = strlen(tok);
+        while (len > 0 && tok[len - 1] == ' ') {
+            tok[--len] = '\0';
+        }
+        if (strcmp(tok, wanted_token) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool cli_clients_selects_registry_client(const char *spec, cbm_agent_client_id_t client_id) {
+    const cbm_agent_client_profile_t *profile = cbm_agent_client_by_id(client_id);
+    return profile && cli_clients_spec_contains(spec, profile->stable_id);
 }
 
 /* Restrict `detected` to the comma-separated token list. Returns false (after
@@ -9763,6 +9986,9 @@ static bool cli_clients_apply_selection(const char *spec, cbm_detected_agents_t 
             }
         }
         if (!matched) {
+            matched = cbm_agent_client_by_stable_id(tok) != NULL;
+        }
+        if (!matched) {
             (void)fprintf(stderr, "error: unknown client: %s\n\n", tok);
             cli_clients_print_list(stderr);
             return false;
@@ -9786,6 +10012,9 @@ size_t cbm_cli_clients_count_for_testing(void) {
 }
 const char *cbm_cli_clients_token_for_testing(size_t index) {
     return index < CLI_CLIENT_COUNT ? CLI_CLIENTS[index].token : NULL;
+}
+void cbm_cli_set_client_selection_for_testing(const char *spec) {
+    g_client_selection = spec;
 }
 #endif
 
@@ -9884,6 +10113,27 @@ static const char *cli_external_manager_name(const char *self_path) {
     if (strstr(self_path, "/.cargo/bin/")) {
         return "cargo";
     }
+#ifdef __FreeBSD__
+    /* FreeBSD ports/pkg install under ${LOCALBASE} (default /usr/local). pkg owns
+     * that file, so install must not drop a second copy in ~/.local/bin or edit a
+     * shell rc, and update must defer to pkg(8). Anchor at the start so a manual
+     * `install --dir=/opt/...` elsewhere is still treated as ours; --force-binary
+     * is the escape hatch for anyone who really does self-manage that prefix.
+     *
+     * LOCALBASE is configurable, so the port passes its real PREFIX via
+     * -DCBM_PKG_PREFIX; when it is absent we fall back to the documented default. */
+#ifdef CBM_PKG_PREFIX
+    if (strncmp(self_path, CBM_PKG_PREFIX "/bin/", sizeof(CBM_PKG_PREFIX "/bin/") - 1) == 0 ||
+        strncmp(self_path, CBM_PKG_PREFIX "/sbin/", sizeof(CBM_PKG_PREFIX "/sbin/") - 1) == 0) {
+        return "FreeBSD pkg";
+    }
+#else
+    if (strncmp(self_path, "/usr/local/bin/", 15) == 0 ||
+        strncmp(self_path, "/usr/local/sbin/", 16) == 0) {
+        return "FreeBSD pkg";
+    }
+#endif
+#endif
     return NULL;
 }
 
@@ -10204,7 +10454,7 @@ int cbm_cmd_install(int argc, char **argv) {
             }
         } else if (strcmp(argv[i], "--clients") == 0) {
             /* Bare `--clients` (and `--clients=help`/`list`) print the
-             * vocabulary. 26 clients ship with tokens nobody would guess. */
+             * vocabulary, including tokens users would not readily guess. */
             cli_clients_print_list(stdout);
             return 0;
         } else if (strcmp(argv[i], "--skip-binary") == 0) {
@@ -10538,9 +10788,7 @@ int cbm_cmd_install(int argc, char **argv) {
 /* ── Subcommand: uninstall ────────────────────────────────────── */
 
 /* Remove Claude Code agent configs. */
-static void uninstall_claude_code(const char *home, bool dry_run) {
-    char installed_binary[CLI_BUF_1K];
-    cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
+static void uninstall_claude_code(const char *home, const char *installed_binary, bool dry_run) {
     char config_dir[CLI_BUF_1K];
     cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
     char user_root[CLI_BUF_1K];
@@ -10578,13 +10826,14 @@ static void uninstall_claude_code(const char *home, bool dry_run) {
     char settings_path[CLI_BUF_1K];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
     if (!dry_run) {
-        if (cbm_remove_claude_hooks(settings_path) != CLI_OK) {
+        if (cbm_remove_claude_hooks_with_binary(settings_path, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Claude Code", "pretool_hook_uninstall", settings_path);
         }
-        if (cbm_remove_session_hooks(settings_path) != CLI_OK) {
+        if (cbm_remove_session_hooks(settings_path, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Claude Code", "session_hook_uninstall", settings_path);
         }
-        if (cbm_remove_claude_subagent_hooks(settings_path) != CLI_OK) {
+        if (cbm_remove_claude_subagent_hooks_with_binary(settings_path, installed_binary) !=
+            CLI_OK) {
             record_agent_config_error(true, "Claude Code", "subagent_hook_uninstall",
                                       settings_path);
         }
@@ -11788,7 +12037,7 @@ static int cli_uninstall_activate(void *opaque) {
     }
 
     if (activation->agents.claude_code) {
-        uninstall_claude_code(activation->home, activation->dry_run);
+        uninstall_claude_code(activation->home, activation->bin_path, activation->dry_run);
     }
     uninstall_cli_agents(&activation->agents, activation->home, activation->dry_run);
     uninstall_editor_agents(&activation->agents, activation->home, activation->dry_run);
@@ -11937,6 +12186,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         (void)fprintf(stderr, "error: uninstall target path is too long\n");
         return CLI_TRUE;
     }
+    cbm_normalize_path_sep(bin_path_storage);
     cbm_path_info_t binary_status;
     bool binary_exists = cbm_path_info_utf8(bin_path, &binary_status) == 0;
     cbm_activation_transaction_t *binary_transaction = NULL;
@@ -12467,6 +12717,8 @@ int cbm_cmd_update(int argc, char **argv) {
                 (void)fprintf(stderr, "  update it with: mise upgrade codebase-memory-mcp\n");
             } else if (manager && strcmp(manager, "Homebrew") == 0) {
                 (void)fprintf(stderr, "  update it with: brew upgrade codebase-memory-mcp\n");
+            } else if (manager && strcmp(manager, "FreeBSD pkg") == 0) {
+                (void)fprintf(stderr, "  update it with: pkg upgrade codebase-memory-mcp\n");
             } else {
                 (void)fprintf(stderr, "  update it through whichever tool installed it.\n");
             }
@@ -12987,6 +13239,18 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
     return result;
 }
 
+static void cli_print_schema_value(const yyjson_val *value) {
+    if (yyjson_is_str(value)) {
+        fputs(yyjson_get_str(value), stdout);
+        return;
+    }
+    char *json = yyjson_val_write(value, 0, NULL);
+    if (json) {
+        fputs(json, stdout);
+        free(json);
+    }
+}
+
 int cbm_cli_print_tool_help(const char *tool_name) {
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
@@ -13017,6 +13281,8 @@ int cbm_cli_print_tool_help(const char *tool_name) {
             }
             const char *type = "string";
             const char *desc = "";
+            yyjson_val *choices = NULL;
+            yyjson_val *default_value = NULL;
             if (yyjson_is_obj(pval)) {
                 yyjson_val *t = yyjson_obj_get(pval, "type");
                 if (t && yyjson_is_str(t)) {
@@ -13026,12 +13292,36 @@ int cbm_cli_print_tool_help(const char *tool_name) {
                 if (d && yyjson_is_str(d)) {
                     desc = yyjson_get_str(d);
                 }
+                choices = yyjson_obj_get(pval, "enum");
+                default_value = yyjson_obj_get(pval, "default");
             }
             char flag[CLI_BUF_256];
             snprintf(flag, sizeof(flag), "%s", name);
             cli_snake_to_kebab(flag);
             bool req = cli_schema_required_has(required, name);
-            printf("  --%s <%s>%s", flag, type, req ? " [required]" : "");
+            printf("  --%s <", flag);
+            if (choices && yyjson_is_arr(choices) && yyjson_arr_size(choices) > 0) {
+                size_t idx;
+                size_t max;
+                yyjson_val *choice;
+                yyjson_arr_foreach(choices, idx, max, choice) {
+                    if (idx > 0) {
+                        fputc('|', stdout);
+                    }
+                    cli_print_schema_value(choice);
+                }
+            } else {
+                fputs(type, stdout);
+            }
+            fputc('>', stdout);
+            if (req) {
+                fputs(" [required]", stdout);
+            }
+            if (default_value) {
+                fputs(" [default: ", stdout);
+                cli_print_schema_value(default_value);
+                fputc(']', stdout);
+            }
             if (desc[0]) {
                 printf("  %s", desc);
             }

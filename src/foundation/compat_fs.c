@@ -123,17 +123,20 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     WIN32_FILE_ATTRIBUTE_DATA data;
     BOOL ok = GetFileAttributesExW(wpath, GetFileExInfoStandard, &data);
+    DWORD path_error = ok ? ERROR_SUCCESS : GetLastError();
     free(wpath);
     if (!ok) {
-        return CBM_NOT_FOUND;
+        return path_error == ERROR_FILE_NOT_FOUND || path_error == ERROR_PATH_NOT_FOUND
+                   ? CBM_PATH_INFO_ABSENT
+                   : CBM_PATH_INFO_UNAVAILABLE;
     }
     memset(out, 0, sizeof(*out));
     out->is_directory = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
@@ -154,7 +157,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
         written >= windows_to_unix_ticks
             ? (int64_t)((written - windows_to_unix_ticks) * NANOSECONDS_PER_WINDOWS_TICK)
             : 0;
-    return 0;
+    return CBM_PATH_INFO_OK;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
@@ -795,11 +798,12 @@ cbm_dirent_t *cbm_readdir(cbm_dir_t *d) {
 
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     if (!path || !out) {
-        return CBM_NOT_FOUND;
+        return CBM_PATH_INFO_UNAVAILABLE;
     }
     struct stat state;
     if (lstat(path, &state) != 0) {
-        return CBM_NOT_FOUND;
+        return errno == ENOENT || errno == ENOTDIR ? CBM_PATH_INFO_ABSENT
+                                                   : CBM_PATH_INFO_UNAVAILABLE;
     }
     memset(out, 0, sizeof(*out));
     out->is_regular = S_ISREG(state.st_mode);
@@ -813,7 +817,7 @@ int cbm_path_info_utf8(const char *path, cbm_path_info_t *out) {
     out->mtime_ns =
         ((int64_t)state.st_mtim.tv_sec * INT64_C(1000000000)) + (int64_t)state.st_mtim.tv_nsec;
 #endif
-    return 0;
+    return CBM_PATH_INFO_OK;
 }
 
 void cbm_closedir(cbm_dir_t *d) {
