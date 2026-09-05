@@ -3112,6 +3112,76 @@ TEST(go_imports) {
     PASS();
 }
 
+/* #1911: Go build-constrained twin files (//go:build lines, GOOS/GOARCH
+ * filename suffixes) legally define the same symbols; fold the per-file
+ * constraint τ into func/method QNs (#495's Rust cfg `#`-suffix move) so the
+ * twins stop colliding in the graph upsert. Types/vars stay plain — the
+ * callable surface is what the call graph needs, and plain type QNs keep
+ * parent_class/DEFINES_METHOD joins working. */
+static int def_qn_has_suffix(CBMFileResult *r, const char *name, const char *suffix) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || strcmp(d->name, name) != 0 || !d->qualified_name) {
+            continue;
+        }
+        size_t qlen = strlen(d->qualified_name);
+        size_t slen = strlen(suffix);
+        if (qlen >= slen && strcmp(d->qualified_name + (qlen - slen), suffix) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+TEST(extract_go_buildtag_tau_in_func_qns) {
+    /* //go:build expression wins and is compacted into the suffix. */
+    CBMFileResult *r = extract("//go:build linux && amd64\n\n"
+                               "package mirror\n\n"
+                               "type porter struct{ n int }\n\n"
+                               "func MirrorConfig(path string) string { return path }\n\n"
+                               "func (p *porter) Flush() {}\n",
+                               CBM_LANG_GO, "t", "mirror_impl.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(def_qn_has_suffix(r, "MirrorConfig", "#linux&&amd64"));
+    ASSERT_TRUE(def_qn_has_suffix(r, "Flush", "#linux&&amd64"));
+    /* The type stays plain so DEFINES_METHOD / parent_class joins keep working. */
+    ASSERT_FALSE(def_qn_has_suffix(r, "porter", "#linux&&amd64"));
+    cbm_free_result(r);
+
+    /* GOOS/GOARCH filename suffix when no //go:build line is present. */
+    r = extract("package mirror\n\n"
+                "func MirrorConfig(path string) string { return \"\" }\n",
+                CBM_LANG_GO, "t", "mirror_windows_amd64.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(def_qn_has_suffix(r, "MirrorConfig", "#windows_amd64"));
+    cbm_free_result(r);
+
+    /* _test suffix is stripped before the GOOS check. */
+    r = extract("package mirror\n\n"
+                "func helperLinux() int { return 1 }\n",
+                CBM_LANG_GO, "t", "mirror_linux_test.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(def_qn_has_suffix(r, "helperLinux", "#linux"));
+    cbm_free_result(r);
+
+    /* Unconstrained file → no τ anywhere. */
+    r = extract("package mirror\n\n"
+                "func Plain() int { return 1 }\n",
+                CBM_LANG_GO, "t", "mirror.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].qualified_name) {
+            ASSERT_TRUE(strchr(r->defs.items[i].qualified_name, '#') == NULL);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
 /* #1935: Go struct fields were never extracted — find_class_body() returns the
  * struct_type node, whose only named child is a field_declaration_list, so the
  * member loop matched nothing and every field was silently skipped (0 Field
@@ -7223,6 +7293,7 @@ SUITE(extraction) {
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(extract_go_buildtag_tau_in_func_qns);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);

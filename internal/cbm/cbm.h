@@ -617,7 +617,20 @@ typedef struct {
      * class-body variable def records which class declares it (parent_class)
      * without changing its module-level qualified name. NULL elsewhere. */
     const char *var_parent_class;
+    /* #1911: the Go file's build constraint τ (compacted //go:build expression,
+     * else the GOOS/GOARCH filename suffix), or NULL for an unconstrained
+     * file. Folded into func/method QNs by extract_defs.c and mirrored by the
+     * scope builder in extract_unified.c so build-tag twin files stop
+     * colliding in the graph upsert. Set once in cbm_extract_file. */
+    const char *go_build_tau;
 } CBMExtractCtx;
+
+/* #1911: resolve a Go file's build constraint τ — the compacted //go:build
+ * expression when present (constraint lines precede the package clause), else
+ * the official GOOS/GOARCH filename suffix (name_GOOS.go, name_GOARCH.go,
+ * name_GOOS_GOARCH.go, each optionally followed by _test) — or NULL for an
+ * unconstrained file. Defined in helpers.c. */
+const char *cbm_go_build_tau(CBMArena *a, const char *source, int source_len, const char *rel_path);
 
 // --- Public API ---
 

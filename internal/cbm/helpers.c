@@ -311,6 +311,111 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
     return false;
 }
 
+/* Official GOOS / GOARCH tokens recognized as build-constraint filename
+ * suffixes (go/build's lists; hurd and legacy nacl included for completeness). */
+static const char *const GO_TAU_GOOS[] = {
+    "aix",  "android", "darwin",  "dragonfly", "freebsd", "hurd",   "illumos", "ios", "js", "linux",
+    "nacl", "netbsd",  "openbsd", "plan9",     "solaris", "wasip1", "windows", "zos", NULL};
+static const char *const GO_TAU_GOARCH[] = {
+    "386",     "amd64",  "amd64p32", "arm",   "arm64",   "loong64", "mips",
+    "mipsle",  "mips64", "mips64le", "ppc",   "ppc64",   "ppc64le", "riscv",
+    "riscv64", "s390",   "s390x",    "sparc", "sparc64", "wasm",    NULL};
+
+static bool go_tau_token(const char *s, size_t len, const char *const *table) {
+    for (int i = 0; table[i]; i++) {
+        if (strlen(table[i]) == len && strncmp(s, table[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *cbm_go_build_tau(CBMArena *a, const char *source, int source_len,
+                             const char *rel_path) {
+    /* A //go:build line wins over the filename suffix (both may be present,
+     * and the directive is the authoritative constraint since Go 1.17). */
+    if (source && source_len > 0) {
+        static const char kPrefix[] = "//go:build";
+        const char *p = source;
+        const char *end = source + source_len;
+        while (p < end) {
+            const char *nl = memchr(p, '\n', (size_t)(end - p));
+            size_t linelen = nl ? (size_t)(nl - p) : (size_t)(end - p);
+            if (linelen >= SLEN("package ") && strncmp(p, "package ", SLEN("package ")) == 0) {
+                break; /* constraints cannot appear after the package clause */
+            }
+            if (linelen > SLEN(kPrefix) && strncmp(p, kPrefix, SLEN(kPrefix)) == 0 &&
+                (p[SLEN(kPrefix)] == ' ' || p[SLEN(kPrefix)] == '\t')) {
+                /* Compact the expression: drop whitespace and CR so the QN
+                 * suffix stays readable and stable (the #495 Rust move). */
+                char buf[CBM_SZ_256];
+                size_t bi = 0;
+                for (size_t i = SLEN(kPrefix); i < linelen && bi + SKIP_ONE < sizeof(buf); i++) {
+                    char c = p[i];
+                    if (c == ' ' || c == '\t' || c == '\r') {
+                        continue;
+                    }
+                    buf[bi++] = c;
+                }
+                buf[bi] = '\0';
+                return bi > 0 ? cbm_arena_sprintf(a, "%s", buf) : NULL;
+            }
+            if (!nl) {
+                break;
+            }
+            p = nl + SKIP_ONE;
+        }
+    }
+
+    /* GOOS/GOARCH filename suffix: name_GOOS.go, name_GOARCH.go,
+     * name_GOOS_GOARCH.go, each optionally followed by _test. */
+    if (!rel_path || !rel_path[0]) {
+        return NULL;
+    }
+    const char *base = rel_path;
+    for (const char *pb = rel_path; *pb; pb++) {
+        if (*pb == '/' || *pb == '\\') {
+            base = pb + SKIP_ONE;
+        }
+    }
+    size_t blen = strlen(base);
+    if (blen <= SLEN(".go") || strcmp(base + blen - SLEN(".go"), ".go") != 0) {
+        return NULL;
+    }
+    size_t stem_len = blen - SLEN(".go");
+    if (stem_len > SLEN("_test") &&
+        strncmp(base + stem_len - SLEN("_test"), "_test", SLEN("_test")) == 0) {
+        stem_len -= SLEN("_test");
+    }
+    /* Walk the last two '_'-separated segments. */
+    size_t last = stem_len;
+    while (last > 0 && base[last - SKIP_ONE] != '_') {
+        last--;
+    }
+    if (last == 0) {
+        return NULL; /* no '_' — unconstrained */
+    }
+    const char *seg2 = base + last;
+    size_t seg2_len = stem_len - last;
+    size_t prev_end = last - SKIP_ONE; /* the '_' before seg2 */
+    if (go_tau_token(seg2, seg2_len, GO_TAU_GOARCH)) {
+        size_t prev = prev_end;
+        while (prev > 0 && base[prev - SKIP_ONE] != '_') {
+            prev--;
+        }
+        const char *seg1 = base + prev;
+        size_t seg1_len = prev_end - prev;
+        if (prev_end > 0 && go_tau_token(seg1, seg1_len, GO_TAU_GOOS)) {
+            return cbm_arena_sprintf(a, "%.*s_%.*s", (int)seg1_len, seg1, (int)seg2_len, seg2);
+        }
+        return cbm_arena_sprintf(a, "%.*s", (int)seg2_len, seg2);
+    }
+    if (go_tau_token(seg2, seg2_len, GO_TAU_GOOS)) {
+        return cbm_arena_sprintf(a, "%.*s", (int)seg2_len, seg2);
+    }
+    return NULL;
+}
+
 // Builtins that appear in the keyword set above (so they are suppressed as bare
 // usages) but for which we mint a real graph node and an LSP resolution, so a
 // CALL to them must still be extracted. MUST stay in sync with kPyBuiltinNodes
