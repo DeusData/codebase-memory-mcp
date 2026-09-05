@@ -1,5 +1,35 @@
 # CodeAtlasWeb
 
+## In this repository
+
+This directory is the frontend that `codebase-memory-mcp --ui=true` serves.
+It came in as CodeAtlasWeb by Bernhard Jackiewicz (design and tracking in
+issue #1964); the text below this section is his README, kept as written.
+What the maintainers added on top:
+
+- **Build and embed.** `make -f Makefile.cbm cbm-with-ui` runs `npm ci`
+  (with `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`) and `npm run build` here, then
+  embeds `dist/` into the binary. The dev server (`npm run dev`) listens on
+  5173 and proxies `/rpc` and `/api` to a server on 9749, which is the
+  contract `tests/test_ui_dev_proxy_security.sh` pins.
+- **CSP.** The served page may reach the server itself plus two loopback
+  services the reader can start: the local-model sidecar on 127.0.0.1:4141
+  and the agent bridge on 127.0.0.1:4142 (`src/ui/http_server.h`,
+  `CBM_UI_CSP_VALUE`). Nothing else, and a test holds that.
+- **The `[p]rojects` panel** (alt+p, `src/projects/`): index a repository,
+  check or remove an index, edit the decision record, read the server's
+  processes and log. It is the one surface that asks the server to write,
+  and it names every route it uses.
+- **Gates in CI** (`.github/workflows/_test.yml`, job `test-ui`):
+  `npm run test:unit`, `npm run check:style`, `npm run check:promises`,
+  `npm run test:acceptance` and `npm run build`. `test:acceptance` is
+  every frozen check except the two release-binding files
+  (`release-current`, `release-proof-binding`), which tie the recorded
+  release report to the commits of the original repository and cannot
+  pass here. The browser proofs (`npm run smoke:*`) need a running server
+  and Playwright browsers and stay a local venue; run them by hand with
+  `npx playwright install chromium` first.
+
 Eine lokale Lese-IDE fuer ein indiziertes Repository: Baum, Editor,
 Galaxie, Erklaerungen. Sie laeuft im Browser, sie hat kein eigenes Backend, und
 sie ist per Vorgabe abgeschottet. Der genehmigte Plan steht in `PLAN.md`, die

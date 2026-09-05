@@ -35,7 +35,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **158 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **43 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
-- **CBM Atlas** — the built-in human interface at `localhost:9749`: overview, modules treemap, region-level 3D galaxy, call flows, change impact, symbol pages and a prompt composer, served from the binary itself.
+- **CBM Atlas** — the built-in human interface at `localhost:9749`: a reading IDE over the index (explorer and read-only Monaco reader, a semantic twin that follows the caret, flow, bug-hunt and change-scope reading modes, the 3D galaxy, source-cited answers, project management), served from the binary itself.
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
@@ -141,17 +141,18 @@ codebase-memory-mcp --ui=true --port=9749
 
 Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
 
-Atlas is a code-discovery instrument, not a chart: every insight is deterministic, carries the reason it is shown, and links onward.
+Atlas is **CodeAtlasWeb**, a reading IDE built by [Bernhard Jackiewicz](https://github.com/BernhardJackiewicz) on the CBM read surface (design and tracking in #1964). It runs air-gapped on loopback, reaches no cloud, and every panel names where its facts come from; what the index did not record is shown as a gap, never filled in with a guess.
 
-- **Overview** — the first read of a project: regions (Leiden call communities voted per file, named with provenance and cohesion), hubs by fan-in, entry points, surprising cross-region couplings with reasons, suggested questions, cross-package boundaries.
-- **Modules** — a treemap of any folder, sized by symbols, colored by region, hatched where indexing was incomplete; drill to files and symbols.
-- **Galaxy** — the 3D view, opening at region level of detail (one body per region, weighted arcs) so any project size renders; open a region for full detail, or load the whole galaxy explicitly.
-- **Flows** — named entry→terminal call journeys as clickable call trees, with truncation stated, exportable as mermaid.
-- **Changes** — `detect_changes` on the working tree: affected symbols grouped by risk before you ask an agent to finish the job.
-- **Symbol pages** — docstring, region, callers/callees with true totals and per-edge confidence (resolved / reference / unproven), tests, co-change partners, near-clones, editor and GitHub links.
-- **⌘K** search across symbol names and code text; a **prompt composer** turns anything you cite into a precise, identifier-exact prompt for your coding agent.
+- **Explorer and reader** — the indexed file tree and a read-only Monaco reader whose source comes from the index.
+- **Semantic twin** — follows the caret: what the symbol under it holds, calls, raises and touches, as facts or as pseudocode, pitched at who is reading.
+- **Reading modes** — `[w]hy am I here` picks a way in (hunt a bug, scope a change, understand the project, pick an entry point); **flow** walks the calls in the order they run; **bug hunt** compares the expected path into a symbol with what `ingest_traces` observed; **change scope** shows what a change reaches and what covers it.
+- **Galaxy** — the persistent 3D graph with focus following in both directions, and a hierarchy view of the entry subgraph.
+- **Command line** — search by meaning while you type; a line ending in `?` builds a source-cited answer from indexed fact cards, with an optional local-model wording pass (a llama-server sidecar you start yourself; off by default, and no model or binary ships).
+- **Live agents** — an opt-in overlay of AI agents working in the same repository, fed by a loopback bridge over tool-hook events (`graph-ui/agents/`).
+- **`[p]rojects`** — index a repository, check or remove an index, edit the project's decision record, and see the server's processes and log.
+- **`[?]help`** — what it reads, what it cannot do, and every key it listens to, derived from the wiring itself.
 
-Every screen deep-links (`?tab=…&project=…&sym=…&region=…&flow=…`), so a place in the codebase is a URL you can share.
+Open a project with `?project=<name>` in the address, or pick it in the projects panel. The frontend's own README, plan, honesty rules and recorded proof runs live under `graph-ui/`.
 
 ### Auto-Index
 

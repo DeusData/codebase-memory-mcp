@@ -8,6 +8,7 @@
     "dev": "vite",
     "build": "tsc -b tsconfig.json tsconfig.node.json && vite build",
     "test": "node --test tests/scaffold/*.test.mjs",
+    "test:acceptance": "node --test tests/scaffold/w*.test.mjs tests/scaffold/release-blockers.test.mjs",
     "test:unit": "vitest run",
     "verify": "node --test tests/scaffold/*.test.mjs",
     "smoke:spike": "node tools/smoke-spike.mjs",
