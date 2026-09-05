@@ -609,7 +609,8 @@ static const char *dart_throw_types[] = {"throw_expression", NULL};
 static const char *dart_decorator_types[] = {"annotation", NULL};
 
 // ==================== PERL ====================
-static const char *perl_func_types[] = {"subroutine_declaration_statement", NULL};
+static const char *perl_func_types[] = {"subroutine_declaration_statement",
+                                        "method_declaration_statement", NULL};
 static const char *perl_module_types[] = {"source_file", NULL};
 static const char *perl_call_types[] = {"ambiguous_function_call_expression",
                                         "function_call_expression", "func1op_call_expression",

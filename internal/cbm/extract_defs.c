@@ -4632,6 +4632,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
+    /* A type declared in a test file is itself test code, mirroring free
+     * functions, class methods, and modules (#1294 lockstep). Go's
+     * sole-implementer interface scan reads from_test_file off the TYPE def;
+     * without this bit a _test.go fake implementer ambiguates the sole
+     * production implementer. */
+    def.is_test = ctx->result->is_test_file;
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
