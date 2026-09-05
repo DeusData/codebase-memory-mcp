@@ -1283,6 +1283,9 @@ TEST(client_adapter_opencode_sends_the_required_hook_event) {
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PreToolUse'"));
     ASSERT_NOT_NULL(strstr(js, "tool.execute.after"));
+    ASSERT_NOT_NULL(strstr(js, "const args = input?.args ?? {};"));
+    ASSERT_NOT_NULL(strstr(js, "tool_input: args"));
+    ASSERT_NULL(strstr(js, "output?.args"));
     /* OpenCode reaches the tools over MCP already; this adapter must not
      * register any, or we reintroduce the second tool surface. */
     ASSERT_NULL(strstr(js, "registerTool"));

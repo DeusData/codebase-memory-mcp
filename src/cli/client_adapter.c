@@ -315,7 +315,7 @@ char *cbm_client_adapter_opencode(const char *binary_path) {
               "        seen.add(sid);\n"
               "        pieces.push(await lifecycle());\n"
               "      }\n"
-              "      const args = output?.args ?? {};\n"
+              "      const args = input?.args ?? {};\n"
               "      const search =\n"
               "        input?.tool === 'grep' ? 'Grep' : input?.tool === 'glob' ? 'Glob' : null;\n"
               "      if (search) {\n"
