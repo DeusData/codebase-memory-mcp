@@ -109,7 +109,7 @@ SH
 chmod +x "${tmpdir}/wrapper.sh"
 
 CBM_BINARY="${BINARY}" BUILD_FINGERPRINT="${BUILD_FINGERPRINT}" TMPDIR_PATH="${tmpdir}" \
-  ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\"}" \
+  ARGS_JSON="{\"repo_path\":\"${tmpdir}/repo\",$(cbm_test_index_worker_policy_json)}" \
   CBM_TEST_HANG_ON=hang_me \
   CBM_TEST_WORKER_DESCENDANT_PID_FILE="${tmpdir}/descendant.pid" \
   "${tmpdir}/wrapper.sh" &
