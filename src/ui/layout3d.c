@@ -867,3 +867,7 @@ char *cbm_layout_to_json(const cbm_layout_result_t *r) {
     }
     return json;
 }
+
+void cbm_layout_free_json(char *json) {
+    free(json);
+}

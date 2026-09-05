@@ -548,7 +548,7 @@ TEST(layout_to_json) {
     ASSERT(strstr(json, "\"hello\"") != NULL);
     ASSERT(strstr(json, "\"Function\"") != NULL);
 
-    free(json);
+    cbm_layout_free_json(json);
     cbm_layout_free(r);
     cbm_store_close(store);
     PASS();
@@ -719,7 +719,7 @@ TEST(layout_dead_code_classification) {
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "\"status\":\"dead\"") != NULL);
     ASSERT(strstr(json, "\"in_calls\":2") != NULL);
-    free(json);
+    cbm_layout_free_json(json);
 
     cbm_layout_free(r);
     cbm_store_close(store);

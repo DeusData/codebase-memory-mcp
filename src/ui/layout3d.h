@@ -71,4 +71,7 @@ void cbm_layout_free(cbm_layout_result_t *result);
 /* Serialize layout result to JSON string. Caller must free(). */
 char *cbm_layout_to_json(const cbm_layout_result_t *result);
 
+/* Free the JSON string returned by cbm_layout_to_json. */
+void cbm_layout_free_json(char *json);
+
 #endif /* CBM_UI_LAYOUT3D_H */
