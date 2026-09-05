@@ -4268,6 +4268,125 @@ TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent) {
     PASS();
 }
 
+/* #915 residual: a semantic_query array with a non-string element used to be
+ * silently narrowed to its string members, so ["publish",42] ran as
+ * ["publish"] and the caller never learned its input was malformed. Every
+ * element must be a string; anything else is the same type error as a bare
+ * string semantic_query. */
+TEST(tool_search_graph_semantic_query_rejects_non_string_elements) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "semantic-element-type";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/semantic-element-type"), CBM_STORE_OK);
+
+    static const char *const bad_args[] = {
+        "{\"project\":\"semantic-element-type\",\"semantic_query\":[\"publish\",42]}",
+        "{\"project\":\"semantic-element-type\",\"semantic_query\":[null]}",
+        "{\"project\":\"semantic-element-type\",\"semantic_query\":[[\"publish\"]]}",
+    };
+    for (size_t i = 0; i < sizeof(bad_args) / sizeof(bad_args[0]); i++) {
+        char *response = cbm_mcp_handle_tool(srv, "search_graph", bad_args[i]);
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+        char *inner = extract_text_content(response);
+        ASSERT_NOT_NULL(inner);
+        ASSERT_NOT_NULL(strstr(inner, "semantic_query must be an array of keyword strings"));
+        ASSERT_NULL(strstr(inner, "semantic search failed"));
+        free(inner);
+        free(response);
+    }
+
+    /* An all-string array is still accepted. */
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"semantic-element-type\",\"semantic_query\":[\"publish\",\"send\"],"
+        "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "\"isError\":true"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+static void mcp_test_semantic_scan_failure(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    (void)argc;
+    (void)argv;
+    sqlite3_result_error(ctx, "forced semantic scan failure", -1);
+}
+
+/* #915 residual: a vector scan that FAILS must never be reported as "0
+ * semantic matches" — the caller would keep broadening keywords against a
+ * broken index. A project without a vector table (lean index) is not a
+ * failure and keeps the moderate/full-index hint. */
+TEST(tool_search_graph_semantic_store_error_fails_closed) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "semantic-store-error";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/semantic-store-error"), CBM_STORE_OK);
+    cbm_node_t node = {.project = project,
+                       .label = "Function",
+                       .name = "semantic_error_probe",
+                       .qualified_name = "semantic.error.probe",
+                       .file_path = "src/semantic_error_probe.c",
+                       .start_line = 1,
+                       .end_line = 2};
+    int64_t id = cbm_store_upsert_node(store, &node);
+    ASSERT_GT(id, 0);
+
+    /* No node_vectors table at all: an empty page with the reindex hint. */
+    const char *semantic_only_args =
+        "{\"project\":\"semantic-store-error\",\"semantic_query\":[\"semantic-error-token\"],"
+        "\"format\":\"json\"}";
+    char *response = cbm_mcp_handle_tool(srv, "search_graph", semantic_only_args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(response, "moderate/full index"));
+    free(response);
+
+    /* The table exists and holds a vector, but scoring fails mid-scan. */
+    ASSERT_EQ(cbm_store_exec(store, "CREATE TABLE node_vectors(node_id INTEGER PRIMARY KEY,"
+                                    "project TEXT NOT NULL,vector BLOB NOT NULL);"),
+              CBM_STORE_OK);
+    ASSERT_EQ(mcp_test_insert_semantic_vector(store, "node_vectors", project, id, NULL, 127, 0),
+              CBM_STORE_OK);
+    sqlite3 *db = cbm_store_get_db(store);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(sqlite3_create_function(db, "cbm_cosine_i8", 2, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
+                                      NULL, mcp_test_semantic_scan_failure, NULL, NULL),
+              SQLITE_OK);
+
+    response = cbm_mcp_handle_tool(srv, "search_graph", semantic_only_args);
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    char *inner = extract_text_content(response);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "semantic search failed"));
+    ASSERT_NULL(strstr(inner, "moderate/full index"));
+    free(inner);
+    free(response);
+
+    /* Combined with a structural filter the whole call fails closed too: no
+     * structural page pretends the semantic half simply found nothing. */
+    response = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"semantic-store-error\",\"semantic_query\":[\"semantic-error-token\"],"
+        "\"name_pattern\":\"semantic_error\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NULL(strstr(response, "semantic_error_probe"));
+    free(response);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_search_graph_budget_preserves_long_values_and_continuation) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
@@ -19834,6 +19953,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
     RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
+    RUN_TEST(tool_search_graph_semantic_query_rejects_non_string_elements);
+    RUN_TEST(tool_search_graph_semantic_store_error_fails_closed);
     RUN_TEST(tool_search_graph_budget_preserves_long_values_and_continuation);
     RUN_TEST(mcp_resource_discovery_methods_return_empty_lists);
     RUN_TEST(tool_query_graph_basic);

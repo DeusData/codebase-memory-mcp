@@ -4195,18 +4195,19 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
 }
 
 /* Extract keyword strings from a yyjson array into `keywords`.  Returns the
- * number of strings copied (capped at `max_out`). */
+ * number of strings copied (capped at `max_out`), or -1 when any element is
+ * not a string: a mixed-type array is a caller error and is never silently
+ * narrowed to its string members. */
 static int extract_semantic_keywords(yyjson_val *sq_val, const char **keywords, int max_out) {
-    int kw_count = (int)yyjson_arr_size(sq_val);
-    if (kw_count > max_out) {
-        kw_count = max_out;
-    }
     size_t kw_idx = 0;
     size_t kw_max = 0;
     yyjson_val *kw_val;
     int ki = 0;
     yyjson_arr_foreach(sq_val, kw_idx, kw_max, kw_val) {
-        if (ki < kw_count && yyjson_is_str(kw_val)) {
+        if (!yyjson_is_str(kw_val)) {
+            return -1;
+        }
+        if (ki < max_out) {
             keywords[ki++] = yyjson_get_str(kw_val);
         }
     }
@@ -4237,13 +4238,20 @@ static void emit_semantic_results(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_val(doc, root, "semantic", sem);
 }
 
+typedef enum {
+    SQ_RUN_OK = 0,
+    SQ_RUN_TYPE_ERROR,  /* semantic_query is not an array of strings */
+    SQ_RUN_STORE_ERROR, /* the vector scan itself failed */
+} sq_run_status_t;
+
 /* Run the semantic_query vector search from raw args. Sets *out_vresults /
  * *out_vcount (caller frees via cbm_store_free_vector_results when vcount>0).
- * Returns true if semantic_query was provided as a non-array (type error —
- * caller should surface to the user). */
-static bool run_semantic_query_core(const char *args, cbm_store_t *store, const char *project,
-                                    int materialize_limit, cbm_vector_result_t **out_vresults,
-                                    int *out_vcount, bool *out_present) {
+ * A store without a vector table (lean index) is an empty result; a failed
+ * scan is SQ_RUN_STORE_ERROR and must never be rendered as zero matches. */
+static sq_run_status_t run_semantic_query_core(const char *args, cbm_store_t *store,
+                                               const char *project, int materialize_limit,
+                                               cbm_vector_result_t **out_vresults, int *out_vcount,
+                                               bool *out_present) {
     enum { MAX_KW_SEARCH = 32 };
     *out_vresults = NULL;
     *out_vcount = 0;
@@ -4256,25 +4264,31 @@ static bool run_semantic_query_core(const char *args, cbm_store_t *store, const 
     if (out_present && sq_val) {
         *out_present = true;
     }
-    bool type_error = false;
+    sq_run_status_t status = SQ_RUN_OK;
     if (sq_val && !yyjson_is_arr(sq_val)) {
-        type_error = true;
+        status = SQ_RUN_TYPE_ERROR;
     } else if (sq_val && yyjson_arr_size(sq_val) > 0) {
         const char *keywords[MAX_KW_SEARCH];
         int ki = extract_semantic_keywords(sq_val, keywords, MAX_KW_SEARCH);
-        cbm_vector_result_t *vresults = NULL;
-        int vcount = 0;
-        if (cbm_store_vector_search(store, project, keywords, ki, materialize_limit, &vresults,
-                                    &vcount) == CBM_STORE_OK &&
-            vcount > 0) {
-            *out_vresults = vresults;
-            *out_vcount = vcount;
+        if (ki < 0) {
+            status = SQ_RUN_TYPE_ERROR;
+        } else {
+            cbm_vector_result_t *vresults = NULL;
+            int vcount = 0;
+            int rc = cbm_store_vector_search(store, project, keywords, ki, materialize_limit,
+                                             &vresults, &vcount);
+            if (rc == CBM_STORE_ERR) {
+                status = SQ_RUN_STORE_ERROR;
+            } else if (rc == CBM_STORE_OK && vcount > 0) {
+                *out_vresults = vresults;
+                *out_vcount = vcount;
+            }
         }
     }
     if (args_doc) {
         yyjson_doc_free(args_doc);
     }
-    return type_error;
+    return status;
 }
 
 static bool search_graph_arg_present(const char *args, const char *name) {
@@ -5134,9 +5148,9 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     cbm_vector_result_t *vresults = NULL;
     int vcount = 0;
     bool sq_present = false;
-    bool sq_type_error = run_semantic_query_core(args, store, project, semantic_materialize_limit,
-                                                 &vresults, &vcount, &sq_present);
-    if (sq_type_error) {
+    sq_run_status_t sq_status = run_semantic_query_core(
+        args, store, project, semantic_materialize_limit, &vresults, &vcount, &sq_present);
+    if (sq_status != SQ_RUN_OK) {
         if (fields_owner) {
             yyjson_doc_free(fields_owner);
         }
@@ -5146,11 +5160,17 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
         free(qn_pattern);
         free(file_pattern);
         free(relationship);
+        if (sq_status == SQ_RUN_STORE_ERROR) {
+            return cbm_mcp_text_result(
+                "semantic search failed: the vector index could not be scanned — see the "
+                "server log for the SQLite error; reindex the project if it persists.",
+                true);
+        }
         return cbm_mcp_text_result(
             "semantic_query must be an array of keyword strings, e.g. "
-            "[\"send\",\"pubsub\",\"publish\"] — not a single string. Split your query "
-            "into individual keywords; each is scored independently via per-keyword "
-            "min-cosine.",
+            "[\"send\",\"pubsub\",\"publish\"] — not a single string, and every element "
+            "must be a string. Split your query into individual keywords; each is scored "
+            "independently via per-keyword min-cosine.",
             true);
     }
 
