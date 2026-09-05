@@ -1826,20 +1826,27 @@ tail:
         }
     }
 
-    /* Optional SKIP */
+    /* Optional SKIP. A non-numeric operand is a loud parse error: expect() has
+     * already filled p->error, and dropping the clause instead would leave
+     * r->skip at its "none" default while the query still reports success. */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
-    /* Optional LIMIT */
+    /* Optional LIMIT. Same rule: a dropped LIMIT is the failure mode #1334
+     * banned - the caller would silently receive the whole result set. */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
