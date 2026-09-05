@@ -6580,3 +6580,313 @@ button.atlas-settings-model-pick:focus-visible {
     outline: 1px solid var(--atlas-alarm);
     outline-offset: -1px;
 }
+
+
+/* ----------------------------------------------------------------------- */
+/* The projects panel. Same frame as the settings panel; its own blocks for */
+/* the list rows, the index form, the folder browser and the log tail.     */
+/* ----------------------------------------------------------------------- */
+
+.atlas-projects {
+    position: absolute;
+    inset: 0;
+    z-index: 14;
+    padding: 14px 20px 20px;
+    background-color: var(--atlas-bg);
+    overflow-y: auto;
+}
+
+.atlas-projects:focus {
+    outline: none;
+}
+
+.atlas-projects > * {
+    max-width: 108ch;
+}
+
+.atlas-projects-head {
+    display: flex;
+    align-items: baseline;
+    gap: 14px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--atlas-line);
+}
+
+.atlas-projects-title {
+    color: var(--atlas-phosphor);
+    font-size: 14px;
+    letter-spacing: 0.08em;
+}
+
+.atlas-projects-subtitle {
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-projects-close {
+    margin-left: auto;
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: transparent;
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 0 8px;
+    cursor: pointer;
+}
+
+.atlas-projects-close:hover,
+.atlas-projects-close:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-projects-section {
+    margin-top: 18px;
+}
+
+.atlas-projects-section-title {
+    margin: 0 0 6px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    font-weight: normal;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.atlas-projects-subtitle-inline {
+    margin: 14px 0 4px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+    font-weight: normal;
+}
+
+.atlas-projects-source,
+.atlas-projects-note {
+    margin: 0 0 6px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+}
+
+.atlas-projects-text {
+    margin: 0 0 6px;
+    color: var(--atlas-fg);
+    line-height: 1.5;
+}
+
+.atlas-projects-notice {
+    margin: 6px 0;
+    color: var(--atlas-cyan);
+    font-size: 12px;
+}
+
+.atlas-projects-list,
+.atlas-projects-jobs,
+.atlas-projects-browse-list,
+.atlas-projects-proc-list {
+    margin: 0 0 8px;
+    padding: 0;
+    list-style: none;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.atlas-projects-row {
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    padding: 6px 10px;
+}
+
+.atlas-projects-row[data-open='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    background: var(--atlas-select);
+}
+
+.atlas-projects-row-line {
+    display: flex;
+    align-items: baseline;
+    gap: 12px;
+}
+
+.atlas-projects-row-name {
+    color: var(--atlas-cyan);
+    overflow-wrap: anywhere;
+}
+
+.atlas-projects-row-meta,
+.atlas-projects-row-path,
+.atlas-projects-row-note {
+    color: var(--atlas-dim);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
+.atlas-projects-row-open {
+    margin-left: auto;
+    color: var(--atlas-phosphor);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.atlas-projects-row-health {
+    margin-top: 4px;
+    color: var(--atlas-fg);
+    font-size: 12px;
+}
+
+.atlas-projects-row-actions,
+.atlas-projects-armed {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    margin-top: 6px;
+}
+
+.atlas-projects-armed {
+    color: var(--atlas-alarm);
+    font-size: 12px;
+}
+
+.atlas-projects-action,
+.atlas-projects-browse-dir {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel-raised);
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    padding: 2px 8px;
+    cursor: pointer;
+}
+
+.atlas-projects-action:hover,
+.atlas-projects-action:focus-visible,
+.atlas-projects-browse-dir:hover,
+.atlas-projects-browse-dir:focus-visible {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-projects-action[data-primary='true'] {
+    border-color: var(--atlas-phosphor-mute);
+    color: var(--atlas-phosphor);
+}
+
+.atlas-projects-action[data-danger='true']:hover,
+.atlas-projects-action[data-danger='true']:focus-visible {
+    border-color: var(--atlas-alarm);
+    color: var(--atlas-alarm);
+}
+
+.atlas-projects-form {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0;
+}
+
+.atlas-projects-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+}
+
+.atlas-projects-label {
+    color: var(--atlas-dim);
+    font-size: 11px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.atlas-projects-input,
+.atlas-projects-adr-text {
+    appearance: none;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-fg);
+    font: inherit;
+    padding: 4px 8px;
+}
+
+.atlas-projects-input:focus,
+.atlas-projects-adr-text:focus {
+    outline: none;
+    border-color: var(--atlas-phosphor-mute);
+}
+
+.atlas-projects-adr-text {
+    width: 100%;
+    min-height: 14em;
+    resize: vertical;
+    line-height: 1.5;
+}
+
+.atlas-projects-browse {
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    padding: 6px 10px;
+}
+
+.atlas-projects-browse-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 6px;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    overflow-wrap: anywhere;
+}
+
+.atlas-projects-browse-list {
+    flex-direction: row;
+    flex-wrap: wrap;
+}
+
+.atlas-projects-job {
+    display: flex;
+    gap: 12px;
+    align-items: baseline;
+}
+
+.atlas-projects-job-path {
+    color: var(--atlas-fg);
+    overflow-wrap: anywhere;
+}
+
+.atlas-projects-job-state {
+    margin-left: auto;
+    color: var(--atlas-dim);
+    font-size: 11px;
+    white-space: nowrap;
+}
+
+.atlas-projects-job[data-status='indexing'] .atlas-projects-job-state {
+    color: var(--atlas-phosphor);
+}
+
+.atlas-projects-job[data-status='error'] .atlas-projects-job-state {
+    color: var(--atlas-alarm);
+}
+
+.atlas-projects-proc-list li {
+    color: var(--atlas-fg);
+    font-size: 12px;
+}
+
+.atlas-projects-logs {
+    margin: 0 0 8px;
+    max-height: 24em;
+    overflow: auto;
+    border: 1px solid var(--atlas-line);
+    background: var(--atlas-panel);
+    color: var(--atlas-dim);
+    font: inherit;
+    font-size: 11px;
+    line-height: 1.4;
+    padding: 6px 10px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}

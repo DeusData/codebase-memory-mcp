@@ -296,6 +296,9 @@ import { readLlmPreference, recordLlmPreference } from './llm/preference';
 import { llmChipValue, llmMenuLabel, llmMenuTitle } from './llm/strings';
 import SettingsPanel from './settings/SettingsPanel';
 import type { SettingsMeasurement } from './settings/SettingsPanel';
+import ProjectsPanel from './projects/ProjectsPanel';
+import type { ProjectsSource } from './projects/ProjectsPanel';
+import { projectHref } from './projects/projects-model';
 import { MODEL_SUGGESTIONS, fetchCommand } from './settings/model-catalog';
 import { modelKey, readModelPreference, recordModelPreference } from './settings/model-preference';
 import {
@@ -734,6 +737,32 @@ export default function App(): JSX.Element {
     const client = useMemo(() => new RpcIntelligenceClient({}), []);
     const api = useMemo(() => new AtlasApi({}), []);
 
+    /*
+     * What the projects panel asks the server. The list comes over /rpc like
+     * every other read of this window; the rest are the /api routes the panel
+     * names in its own text. Opening a project reloads the page with the
+     * query the start-up code reads, because every panel of this window is
+     * keyed to the project it started with.
+     */
+    const projectsSource = useMemo<ProjectsSource>(
+        () => ({
+            listProjects: () => client.listProjects().then((result) => result.projects),
+            projectHealth: (name) => api.projectHealth(name),
+            deleteProject: (name) => api.deleteProject(name),
+            browse: (path) => api.browse(path),
+            startIndex: (rootPath, projectName) => api.startIndex(rootPath, projectName),
+            indexJobs: () => api.indexJobs(),
+            adr: (name) => api.adr(name),
+            saveAdr: (name, content) => api.saveAdr(name, content),
+            logs: (lines) => api.logs(lines),
+            processes: () => api.processes(),
+        }),
+        [client, api],
+    );
+    const openProject = useCallback((name: string) => {
+        window.location.assign(projectHref(name));
+    }, []);
+
     const [project, setProject] = useState('');
     const [projectDetail, setProjectDetail] = useState('resolving project ...');
     const [serverOk, setServerOk] = useState<boolean | undefined>(undefined);
@@ -854,6 +883,7 @@ export default function App(): JSX.Element {
      * die Hilfe: eine Flaeche ueber dem Editor geht nicht ungefragt auf.
      */
     const [settingsOpen, setSettingsOpen] = useState(false);
+    const [projectsOpen, setProjectsOpen] = useState(false);
     /*
      * Die Anzeige-Einstellungen des Lesers.
      *
@@ -2579,7 +2609,7 @@ export default function App(): JSX.Element {
          * eigenes Eingabefeld. Ohne diesen Eintrag fielen Buchstaben, die
          * jemand vor dem offenen Panel tippt, in die Kommandozeile dahinter.
          */
-        overlayOpen: helpOpen || entryOpen || settingsOpen,
+        overlayOpen: helpOpen || entryOpen || settingsOpen || projectsOpen,
         walkRunning: tour !== undefined,
     };
 
@@ -3860,6 +3890,22 @@ export default function App(): JSX.Element {
         return () => window.removeEventListener('keydown', onKeyDown);
     }, [settingsOpen]);
 
+    // And for the projects panel, which has input fields of its own as well.
+    useEffect(() => {
+        if (!projectsOpen) {
+            return;
+        }
+        const onKeyDown = (event: globalThis.KeyboardEvent): void => {
+            if (event.key !== 'Escape' || event.defaultPrevented) {
+                return;
+            }
+            event.preventDefault();
+            setProjectsOpen(false);
+        };
+        window.addEventListener('keydown', onKeyDown);
+        return () => window.removeEventListener('keydown', onKeyDown);
+    }, [projectsOpen]);
+
     /**
      * Die vier Tasten einer laufenden Fuehrung.
      *
@@ -4429,6 +4475,18 @@ export default function App(): JSX.Element {
             onSelect: () => setSettingsOpen((open) => !open),
         },
         /*
+         * The projects panel, as an entry of the atlas row. It toggles like
+         * [s]ettings next to it: the letter stands for the surface, and a
+         * second press closes it again.
+         */
+        {
+            key: 'projects',
+            shortcut: 'p',
+            label: messages.projects.menuLabel,
+            title: messages.menu.projects,
+            onSelect: () => setProjectsOpen((open) => !open),
+        },
+        /*
          * Der Live-Modus der Agenten (W11a), als Eintrag der Atlas-Zeile.
          *
          * Er schaltet, wie [l]ocal llm daneben, und sein Etikett traegt den
@@ -4587,7 +4645,7 @@ export default function App(): JSX.Element {
              * braucht. Dieselbe Reihenfolge wie ueberall in dieser Datei: was
              * ueber dem Panel liegt, hat den Vortritt.
              */
-            escapeTaken={helpOpen || entryOpen || overlayOpen || settingsOpen}
+            escapeTaken={helpOpen || entryOpen || overlayOpen || settingsOpen || projectsOpen}
             fullscreenToggle={fullscreenToggle}
         />
     );
@@ -4987,6 +5045,20 @@ export default function App(): JSX.Element {
                             [measurement.setting]: measurement,
                         }))}
                     onClose={() => setSettingsOpen(false)}
+                />
+            )}
+            {/*
+              * The projects panel sits on the same level as the settings and
+              * for the same reason: a reader opens it BECAUSE something is
+              * missing (no project, a stale index), and it must not sit
+              * behind what sent them there.
+              */}
+            {projectsOpen && (
+                <ProjectsPanel
+                    project={project}
+                    source={projectsSource}
+                    onOpenProject={openProject}
+                    onClose={() => setProjectsOpen(false)}
                 />
             )}
         </AtlasChrome>

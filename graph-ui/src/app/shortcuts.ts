@@ -52,8 +52,9 @@ export interface AtlasShortcut {
  * dem 2026-08-29 ihre eigenen: `w` die Frage nach dem Warum, `b` den
  * BUG-Assistenten, `c` die Aenderungsansicht, `l` den Schalter des lokalen
  * Modells, `r` seit W8 den Weg zurueck zum Vorgabe-Layout, `s` seit W10 das
- * Einstellungen-Panel, `g` seit W11a den Live-Modus der Agenten. `?` schlaegt
- * seit W7a die Hilfe auf und wieder zu.
+ * Einstellungen-Panel, `g` seit W11a den Live-Modus der Agenten, `p` das
+ * Projekte-Panel (Index anlegen, entfernen, Entscheidungsakte, Serverzustand).
+ * `?` schlaegt seit W7a die Hilfe auf und wieder zu.
  *
  * Warum das vorher nicht so war und warum es jetzt so ist: die Zeile war ein
  * Menue, dessen Eintraege nur mit der Maus erreichbar waren, in einer
@@ -67,7 +68,7 @@ export interface AtlasShortcut {
  * gepflegte Liste, denn eine gepflegte Liste ist genau die Stelle, an der ein
  * Punkt ohne Verdrahtung wieder hereinrutscht.
  */
-export const WIRED_MENU_SHORTCUTS: readonly string[] = ['a', 'w', 'b', 'c', 'l', 'r', 's', 'g', '?'];
+export const WIRED_MENU_SHORTCUTS: readonly string[] = ['a', 'w', 'b', 'c', 'l', 'r', 's', 'g', 'p', '?'];
 
 /**
  * Das Alphabet, gegen das die beiden Absichtsfunktionen befragt werden.

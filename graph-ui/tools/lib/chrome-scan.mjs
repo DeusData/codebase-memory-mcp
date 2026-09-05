@@ -91,6 +91,9 @@ export const CHROME_FILES = [
     // was das Zeichnen kostet) und ueber kein einzelnes Fachgebiet. Sein Text
     // steht darum im Katalog und nicht neben ihm.
     'src/settings/SettingsPanel.tsx',
+    // The projects panel speaks about the product as a whole too (what is
+    // indexed, what the server is doing); its text sits in the catalog.
+    'src/projects/ProjectsPanel.tsx',
     'src/why/WhyPanel.tsx',
     'src/tours/TourCard.tsx',
     'src/search/SearchOverlay.tsx',

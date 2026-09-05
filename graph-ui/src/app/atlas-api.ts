@@ -21,6 +21,24 @@ import {
     readTraceAnswer,
 } from '../traces/trace-schemas';
 import type { FlowDetail, FlowSummary, TraceAnswer } from '../traces/trace-schemas';
+import {
+    readAdr,
+    readBrowse,
+    readHealth,
+    readIndexJobs,
+    readIndexStarted,
+    readLogs,
+    readProcesses,
+} from '../projects/projects-model';
+import type {
+    AdrRecord,
+    BrowseLevel,
+    IndexJob,
+    IndexStarted,
+    LogTail,
+    ProcessReport,
+    ProjectHealth,
+} from '../projects/projects-model';
 
 export interface AtlasApiOptions {
     /** Ursprung des Servers, ohne Schraegstrich am Ende. Leer heisst same-origin. */
@@ -58,12 +76,27 @@ export class AtlasApi {
 
     constructor(private readonly options: AtlasApiOptions = {}) { }
 
-    private async getJson(route: string): Promise<unknown> {
+    private getJson(route: string): Promise<unknown> {
+        return this.request('GET', route);
+    }
+
+    /**
+     * One request, any method. The writing routes of the projects panel
+     * (POST /api/index, POST /api/adr, DELETE /api/project) go through here
+     * with a JSON body; the error carries the status so a caller can tell
+     * "busy, try later" (423) from "refused" (403) from "not there" (404).
+     */
+    private async request(method: 'GET' | 'POST' | 'DELETE', route: string, payload?: unknown): Promise<unknown> {
         const url = `${this.options.base ?? ''}${route}`;
         const doFetch = this.options.fetch ?? globalThis.fetch;
         let response: Response;
         try {
-            response = await doFetch(url, { headers: { Accept: 'application/json' } });
+            const init: RequestInit = { method, headers: { Accept: 'application/json' } };
+            if (payload !== undefined) {
+                init.headers = { Accept: 'application/json', 'Content-Type': 'application/json' };
+                init.body = JSON.stringify(payload);
+            }
+            response = await doFetch(url, init);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
             throw new AtlasApiError(route, 0, `${route} war nicht erreichbar: ${message}`);
@@ -117,6 +150,60 @@ export class AtlasApi {
     async flow(project: string, id: number): Promise<FlowDetail> {
         const query = new URLSearchParams({ project, id: String(id) });
         return readFlowDetail(await this.getJson(`${FLOW_ROUTE}?${query.toString()}`));
+    }
+
+    // ------------------------------------------------ the projects panel --
+
+    /** The folders under `path`; the server's own roots when `path` is empty. */
+    async browse(path = ''): Promise<BrowseLevel> {
+        const query = new URLSearchParams();
+        if (path.length > 0) {
+            query.set('path', path);
+        }
+        const suffix = path.length > 0 ? `?${query.toString()}` : '';
+        return readBrowse(await this.getJson(`/api/browse${suffix}`));
+    }
+
+    /** Ask the server to index `rootPath` under `projectName`, in the background. */
+    async startIndex(rootPath: string, projectName: string): Promise<IndexStarted> {
+        return readIndexStarted(
+            await this.request('POST', '/api/index', { root_path: rootPath, project_name: projectName }),
+        );
+    }
+
+    /** Every index job the server has run since it started, with its state. */
+    async indexJobs(): Promise<IndexJob[]> {
+        return readIndexJobs(await this.getJson('/api/index-status'));
+    }
+
+    /** Remove the index file of a project. The repository itself is not touched. */
+    async deleteProject(name: string): Promise<void> {
+        await this.request('DELETE', `/api/project?${new URLSearchParams({ name }).toString()}`);
+    }
+
+    /** Does the index file open, and what does it hold. */
+    async projectHealth(name: string): Promise<ProjectHealth> {
+        return readHealth(await this.getJson(`/api/project-health?${new URLSearchParams({ name }).toString()}`));
+    }
+
+    /** The decision record the server keeps for a project. */
+    async adr(project: string): Promise<AdrRecord> {
+        return readAdr(await this.getJson(`/api/adr?${new URLSearchParams({ project }).toString()}`));
+    }
+
+    /** Store the decision record of a project. */
+    async saveAdr(project: string, content: string): Promise<void> {
+        await this.request('POST', '/api/adr', { project, content });
+    }
+
+    /** The last `lines` lines of the server log. */
+    async logs(lines: number): Promise<LogTail> {
+        return readLogs(await this.getJson(`/api/logs?${new URLSearchParams({ lines: String(lines) }).toString()}`));
+    }
+
+    /** The codebase-memory-mcp processes on this machine, as the server sees them. */
+    async processes(): Promise<ProcessReport> {
+        return readProcesses(await this.getJson('/api/processes'));
     }
 
     /** Wurzelpfad, Branch und Remote eines Projekts. Leere Felder bleiben leer. */

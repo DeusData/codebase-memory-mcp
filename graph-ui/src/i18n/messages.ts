@@ -116,6 +116,7 @@ export const messages = {
         impact: 'atlas: what a change would reach, and what covers it (alt+c)',
         helpOpen: 'help: what this reads, what it cannot do, and every key it listens to (?)',
         helpClose: 'help: close this page (?)',
+        projects: 'atlas: what this server has indexed, index more, and what the server is doing (alt+p)',
     },
 
     /**
@@ -155,15 +156,18 @@ export const messages = {
         limitsTitle: 'What it cannot do',
         limits: [
             'The reader is read-only: you cannot edit a file here, and what you type into it changes nothing.',
-            'It cannot run code, and there is no terminal: no build, no test run, no shell, '
-            + 'no process started from this window.',
+            'It cannot run code, and there is no terminal: no build, no test run, no shell. '
+            + 'The one job it can ask for is an index run, and the analysis server does that in its '
+            + 'own process, from the [p]rojects panel.',
             'It reaches no cloud. The only model it can use is a sidecar on this machine, '
             + 'started by hand, and it stays off until it answers.',
         ],
         limitsWhy:
             'That is the shape of the product and not a missing release: this surface has no backend of '
-            + 'its own, and the analysis server offers a read-only surface. Everything that writes, builds '
-            + 'or executes happens where the repository lives, on the command line.',
+            + 'its own. Apart from the three requests the [p]rojects panel makes (index a repository, '
+            + 'remove an index, store a decision record), the analysis server offers it a read-only '
+            + 'surface, and everything that writes, builds or executes happens where the repository '
+            + 'lives, on the command line.',
 
         panelsTitle: 'The panels, and what each one answers',
         panels: [
@@ -180,6 +184,12 @@ export const messages = {
                 answers:
                     'which model in your cache answers, how to get another one, and what the drawing '
                     + 'of the graph costs on this machine',
+            },
+            {
+                name: '[p]rojects',
+                answers:
+                    'what this server has indexed, how to index or remove a repository, the decision '
+                    + 'record of the open project, and what the server is doing',
             },
             {
                 name: 'command line',
@@ -278,6 +288,7 @@ export const messages = {
             'mnemonic:r': 'put every zone back to the width and height it starts with',
             'mnemonic:s': 'open or close the settings: the model, and what the drawing costs',
             'mnemonic:g': 'turn the live agent mode on or off. Off asks the bridge nothing at all',
+            'mnemonic:p': 'open or close the projects: what is indexed, index more, and what the server is doing',
             'bare:?': 'open or close this page',
             'line:/': 'put the cursor in the command line, without typing the slash itself',
             'walk:Enter': 'go to the next step of the walk, and finish it on the last one',
@@ -292,8 +303,9 @@ export const messages = {
 
         operationsTitle: 'Running it',
         operations: [
-            'Index a project with the CLI of the analysis server, then open this page with the project '
-            + 'name in the address (?project=<name>). This window indexes nothing itself.',
+            'Index a project from the [p]rojects panel (alt+p) or with the CLI of the analysis server, '
+            + 'then open it from that panel or with the project name in the address (?project=<name>). '
+            + 'The server indexes; this window asks.',
             'Start the local model with llm/start.sh class-a. It listens on the loopback address of this '
             + 'machine; the [l]lm card turns green as soon as it answers, and says why when it does not.',
             'Bring recorded runs in with ingest_traces on the command line. There is no importer on this '
@@ -350,7 +362,7 @@ export const messages = {
         serverReady: 'ready',
         serverUnreachable: 'unreachable',
         noFileLoaded: 'no file loaded',
-        noProjectIndexed: 'no project: this server has nothing indexed',
+        noProjectIndexed: 'no project: this server has nothing indexed. alt+p opens the projects panel to index one',
         noProjectError: (detail: string): string => `no project: ${detail}`,
     },
 
@@ -952,6 +964,124 @@ export const messages = {
             + 'panels: the detail level of the twin, the legend, the galaxy and hierarchy switch, and '
             + 'the edge-kind filters inside the legend. The point was to bundle the expensive things, '
             + 'not to build a menu that everything disappears into.',
+    },
+
+    /**
+     * The projects panel: the one surface that asks the server to write.
+     *
+     * Its text lives here, like the settings panel's, because it speaks about
+     * the product as a whole (what is indexed, what the server is doing) and
+     * not about one subject area.
+     */
+    projects: {
+        title: 'CODEATLAS PROJECTS',
+        subtitle: 'what this server has indexed, and how to give it more',
+        panelLabel: 'projects',
+        close: '[esc] close',
+        closeLabel: CLOSE,
+        /** The entry in the atlas row. The letter sits in brackets. */
+        menuLabel: '[p]rojects',
+
+        /* ------------------------------------------------------- the list */
+
+        listTitle: 'Projects on this server',
+        listSource: 'read from list_projects over /rpc',
+        listLoading: 'asking the server ...',
+        listEmpty:
+            'nothing is indexed yet. Index a repository below, or on the command line: '
+            + 'codebase-memory-mcp cli index_repository',
+        listError: (detail: string): string => `the list did not arrive: ${detail}`,
+        refresh: 'refresh',
+        openNow: 'open now',
+        open: 'open',
+        openTitle: (name: string): string => `open ${name}: the page reloads with ?project=${name}`,
+        counts: (nodes: number, edges: number): string => `${nodes} sym, ${edges} edg`,
+        countsUnknown: 'counts not sent',
+        check: 'check',
+        checkTitle: 'GET /api/project-health: does the index file open, and what does it hold',
+        healthHealthy: (nodes: number, edges: number, mb: string): string =>
+            `healthy: ${nodes} symbols, ${edges} edges, ${mb} MB on disk`,
+        healthMissing: 'missing: the server has no index file under this name',
+        healthCorrupt: (reason: string): string => `corrupt: ${reason}`,
+        healthUnknown: 'the server answered with a verdict this panel does not know',
+        reindex: 'reindex',
+        reindexTitle: (root: string): string => `POST /api/index for ${root}: rebuilds the index in the background`,
+        noRoot: 'root path not sent by the server; reindex from the form below',
+        remove: 'delete',
+        removeTitle: 'DELETE /api/project: removes the index file, never the repository',
+        removeArmed: (name: string): string =>
+            `delete the index of ${name}? The repository on disk stays as it is.`,
+        removeConfirm: 'yes, delete the index',
+        cancel: 'cancel',
+        removed: (name: string): string => `${name}: index deleted`,
+        removeError: (detail: string): string => `not deleted: ${detail}`,
+
+        /* ------------------------------------------------------- the form */
+
+        indexTitle: 'Index a repository',
+        indexIntro:
+            'The server does the indexing; this window only asks. The path has to be a folder the '
+            + 'server may read (its workspace boundary applies), and the job runs in the background '
+            + 'while you keep reading.',
+        pathLabel: 'repository path',
+        pathPlaceholder: '/absolute/path/to/repository',
+        browse: 'browse',
+        browseTitle: 'GET /api/browse: list the folders under this path',
+        browseClose: 'close browser',
+        browseAt: (path: string): string => `folders in ${path}`,
+        browseUp: 'up one level',
+        browseUse: 'use this folder',
+        browseEmpty: 'no folders here',
+        browseError: (detail: string): string => `browsing failed: ${detail}`,
+        nameLabel: 'project name',
+        nameHint: 'suggested from the last path segment; change it if you like',
+        start: 'index',
+        startTitle: 'POST /api/index: start a background job for this path',
+        started: (path: string): string => `job accepted for ${path}; its state appears below`,
+        startError: (detail: string): string => `the server refused: ${detail}`,
+        jobsTitle: 'Index jobs since the server started',
+        jobsSource: (seconds: string): string =>
+            `read from GET /api/index-status, asked again every ${seconds} s while a job runs`,
+        jobsNone: 'no job has run yet',
+        jobIndexing: 'indexing',
+        jobDone: 'done',
+        jobError: (error: string): string => `failed: ${error}`,
+        jobUnknown: 'state not known to this panel',
+
+        /* -------------------------------------------------------- the adr */
+
+        adrTitle: 'Decision record',
+        adrIntro: (project: string): string =>
+            `The architecture decision record the server keeps for ${project}, as markdown. Saving `
+            + 'stores it in the project index; a reindex keeps it.',
+        adrNoProject: 'open a project to read or write its decision record',
+        adrLoading: 'reading ...',
+        adrNone: 'no record yet; what you save here becomes the first one',
+        adrUpdated: (at: string): string => `last saved ${at}`,
+        adrLabel: 'decision record, markdown',
+        adrSave: 'save',
+        adrSaveTitle: 'POST /api/adr: store this text for the open project',
+        adrSaved: 'saved',
+        adrBusy: 'the project is being indexed right now; save again when the job is done',
+        adrError: (detail: string): string => `not saved: ${detail}`,
+        adrReadError: (detail: string): string => `the record did not arrive: ${detail}`,
+
+        /* ----------------------------------------------------- the server */
+
+        serverTitle: 'This server',
+        processesSource: 'read from GET /api/processes',
+        processesSelf: (pid: number, mb: string): string => `serving this page: pid ${pid}, ${mb} MB resident`,
+        processesOthers: (count: number): string =>
+            count === 1 ? 'one other codebase-memory-mcp process' : `${count} other codebase-memory-mcp processes`,
+        processesNone: 'no other codebase-memory-mcp process is running',
+        processRow: (pid: number, cpu: string, mb: string, elapsed: string): string =>
+            `pid ${pid}: ${cpu}% cpu, ${mb} MB, up ${elapsed}`,
+        processesError: (detail: string): string => `the process list did not arrive: ${detail}`,
+        logsTitle: 'Log tail',
+        logsSource: (shown: number, total: number): string => `read from GET /api/logs: ${shown} of ${total} lines`,
+        logsEmpty: 'the log ring is empty',
+        logsError: (detail: string): string => `the log did not arrive: ${detail}`,
+        reload: 'reload',
     },
 
     /** Der Rahmen des Twins. Seine Fakten-Saetze stehen in twin/strings.ts. */
