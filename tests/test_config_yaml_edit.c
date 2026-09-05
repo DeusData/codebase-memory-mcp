@@ -2,6 +2,7 @@
  * test_config_yaml_edit.c — Conservative YAML config editor tests.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 
@@ -1826,6 +1827,37 @@ TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item) {
     PASS();
 }
 
+/* Uninstall must be idempotent against a config that was never written. Hermes
+ * is detected by its binary on PATH, so a HOME without `.hermes/` reached the
+ * YAML removers with an absent target — and they failed acquiring the lock
+ * beside a file whose directory does not exist, which `uninstall` then
+ * counted as an agent cleanup error and refused to remove the executable.
+ * Every remover answers OK for a genuinely absent path and creates nothing.
+ * Runs on every platform: the fix has a separate Windows branch. */
+TEST(config_yaml_edit_remove_on_absent_config_is_a_no_op) {
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, NULL), 0);
+    char absent[sizeof(fixture.path) + 32U];
+    ASSERT(snprintf(absent, sizeof(absent), "%s/no-such-dir/config.yaml", fixture.dir) > 0);
+
+    ASSERT_EQ(cbm_yaml_remove_mapping_sequence_item(absent, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(cbm_yaml_remove_owned_mapping_entry(absent, "mcp_servers", "codebase-memory-mcp",
+                                                  "    command: \"/opt/cbm\"\n"),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(cbm_yaml_remove_mapping_entry(absent, "hooks", "pre_llm_call"), 0);
+    ASSERT_EQ(cbm_yaml_remove_string_list_item(absent, "read", "AGENTS.md"), 0);
+
+    /* Nothing was created. cbm_path_info_utf8 rather than lstat: same meaning
+     * — it reports the link instead of following it — and it compiles on
+     * Windows, which is exactly where the fix has its own branch. */
+    cbm_path_info_t absent_info;
+    ASSERT(cbm_path_info_utf8(absent, &absent_info) != 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically) {
     const char *cases[] = {
         "hooks:\n   pre_llm_call:\n    - id: \"bad-indent\"\n",
@@ -1980,6 +2012,7 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_nested_sequence_foreign_identity_is_preserved);
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);
     RUN_TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically);
+    RUN_TEST(config_yaml_edit_remove_on_absent_config_is_a_no_op);
 #ifndef _WIN32
     RUN_TEST(config_yaml_edit_accepts_interior_asterisk_in_plain_scalar_issue1631);
     RUN_TEST(config_yaml_edit_still_refuses_leading_alias_issue1631);
