@@ -2033,6 +2033,15 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     char *old_cache = NULL;
     cli_activation_save_env(&old_home, &old_cache);
     cbm_setenv("HOME", tmpdir, 1);
+    /* PATH has to move with HOME. Agent detection asks cbm_find_cli, which
+     * reads PATH before anything else, so a real agent binary on the developer's
+     * PATH is found even though HOME points at this fixture. Uninstall then
+     * tries to edit that agent's config file here, fails because the fixture
+     * never created one, and stops before removing the binary and the index —
+     * which is exactly what this test measures. Redirecting PATH makes the
+     * result the same on every machine. */
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
 
     char cache_dir[512];
     char index_path[640];
@@ -2070,6 +2079,7 @@ TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index) {
     bool binary_preserved =
         installed && strcmp(installed, "binary must survive active-daemon refusal") == 0;
     cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
     test_rmdir_r(tmpdir);
 
     ASSERT_EQ(rc, 0);
