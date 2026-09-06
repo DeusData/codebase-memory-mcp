@@ -1912,4 +1912,12 @@ SUITE(go_lsp) {
     RUN_TEST(golsp_crossfile_stdlib_interface);
     RUN_TEST(golsp_crossfile_local_interface_single_impl);
     RUN_TEST(golsp_crossfile_interface_skips_test_file_impls);
+    RUN_TEST(golsp_crossfile_embeds_enable_promoted_dispatch);
+    RUN_TEST(golsp_crossfile_iface_embedding_sole_impl);
+    RUN_TEST(golsp_crossfile_promoted_method_satisfaction);
+    RUN_TEST(golsp_interface_embedding_method_set);
+    RUN_TEST(golsp_stdlib_maps_keys);
+    RUN_TEST(golsp_stdlib_randv2);
+    RUN_TEST(golsp_stdlib_slices);
+    RUN_TEST(golsp_stdlib_unique_synctest);
 }
