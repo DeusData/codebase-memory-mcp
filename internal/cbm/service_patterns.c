@@ -507,6 +507,7 @@ static const method_suffix_t route_reg_suffixes[] = {
     /* Router mounting / prefix registration (any method) */
     {".include_router", "ANY"},
     {".mount", "ANY"},
+    {".nest", "ANY"}, /* axum Router::nest("/api", inner) — prefix Route */
     {".add_url_rule", "ANY"},
     {".register_blueprint", "ANY"},
     {".use", "ANY"},

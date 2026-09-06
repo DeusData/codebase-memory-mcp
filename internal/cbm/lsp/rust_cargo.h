@@ -33,6 +33,9 @@ typedef struct {
 typedef struct {
     const char* member_name;   /* directory name */
     const char* member_path;   /* relative path inside workspace root */
+    const char* package_name;  /* member's own [package].name (NULL until its
+                                  Cargo.toml has been merged) — may differ
+                                  from the directory name */
 } CBMCargoMember;
 
 typedef struct CBMCargoManifest {
@@ -54,11 +57,30 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
 
 /* Convenience: does a given path-prefix look like one of the listed
  * dependency names? Used by the resolver to recognise external crate
- * paths. */
+ * paths. Comparison hyphen-folds ('-' ≡ '_'): crates.io names are
+ * hyphenated (`async-trait`) while Rust path heads are underscored
+ * (`async_trait`), so a literal strcmp could never match them. */
 bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head);
 
-/* Find a workspace member by crate name. Returns NULL if absent. */
+/* Find a workspace member by crate name (directory name or, when the
+ * member's own manifest has been merged, its [package].name). Returns
+ * NULL if absent. Hyphen-folding as above. */
 const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
     const char* name);
+
+/* Hyphen-folding name equality: '-' and '_' compare equal, everything
+ * else is byte-exact. NULL never matches. */
+bool cbm_cargo_name_eq(const char* a, const char* b);
+
+/* Parse a MEMBER crate's own Cargo.toml and merge its [dependencies] /
+ * [dev-dependencies] keys into `dst` (duplicates by hyphen-folded name are
+ * skipped; capacity capped at CBM_CARGO_MAX_DEPS). Workspace-inheritance
+ * entries (`tokio = { workspace = true }`) merge for free since only the
+ * key matters, and `local = { package = "real" }` renames store the LOCAL
+ * key — the spelling that appears in use paths. Returns the member's
+ * [package].name (arena-owned) or NULL. Pure parser — no file I/O; the
+ * pipeline driver reads the file and calls this. */
+const char* cbm_cargo_merge_member_deps(CBMArena* arena, CBMCargoManifest* dst,
+    const char* toml, int toml_len);
 
 #endif /* CBM_LSP_RUST_CARGO_H */

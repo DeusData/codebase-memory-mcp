@@ -230,6 +230,18 @@ void rust_lsp_init(RustLSPContext *ctx, CBMArena *arena, const char *source, int
 void rust_lsp_add_use(RustLSPContext *ctx, const char *local_name, const char *module_path);
 void rust_lsp_add_glob(RustLSPContext *ctx, const char *module_qn);
 
+/* AST-accurate expansion of one `use_declaration` node into (alias, full
+ * `::`-path) leaf entries — nested brace groups, `as` renames, `self`, and
+ * globs included; `pub`/`pub(crate)` is skipped structurally and `use x as _`
+ * binds nothing. Each leaf is delivered through `sink`: `alias` is the local
+ * name (NULL for globs), `path` the full `::`-separated module path (for a
+ * glob, the module WITHOUT the trailing `::*`). Shared by the LSP use-map
+ * builder (rust_collect_uses) and the unified import extractor
+ * (extract_imports.c parse_rust_imports) so both sides agree byte-for-byte. */
+typedef void (*CBMRustUseSink)(void *sink_ctx, const char *alias, const char *path, bool is_glob);
+void cbm_rust_expand_use_decl(CBMArena *arena, TSNode use_decl, const char *source,
+                              CBMRustUseSink sink, void *sink_ctx);
+
 /* Process every function/method in the file, walking statements and
  * evaluating expression types as we go. */
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root);
@@ -322,6 +334,11 @@ typedef struct {
     bool is_interface;            /* true for traits                          */
     bool is_rust_impl_relation;   /* independent type-level impl record       */
     bool is_abstract;             /* required trait declaration (no default)  */
+    /* Raw decorator texts on type-like defs (`#[derive(Clone)]`, ...), borrowed
+     * from CBMLSPDef.decorators. The cross registrars run the same curated
+     * derive-synthesis table the per-file Phase A2 build uses, so derived
+     * clone()/default()/parse() resolve cross-file too. NULL when absent. */
+    const char *const *decorators;
 } CBMRustLSPDef;
 
 /* Run cross-file resolution on a single file. */

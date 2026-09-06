@@ -6835,6 +6835,524 @@ TEST(rustlsp_impl_level_bound_dispatch) {
     PASS();
 }
 
+/* ── Wave 2/3: use fidelity, impl-method return types, crate roots,
+ *    cargo fidelity, derive parity, crates seeds ─────────────── */
+
+static const CBMDefinition *rustlsp_find_def(const CBMFileResult *r, const char *label,
+                                             const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && d->label && strcmp(d->name, name) == 0 && strcmp(d->label, label) == 0) {
+            return d;
+        }
+    }
+    return NULL;
+}
+
+TEST(rustlsp_use_nested_groups) {
+    CBMFileResult *r = extract_rust("mod a { pub mod b { pub fn f(){} } pub fn g(){} }\n"
+                                    "use a::{b::{f}, g};\n"
+                                    "fn run(){ f(); g(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "a.b.f"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "a.g"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_pub_use_alias) {
+    /* `pub use` used to store "pub use m::work" verbatim as a module path. */
+    CBMFileResult *r = extract_rust("mod m { pub fn work(){} }\n"
+                                    "pub use m::work;\n"
+                                    "fn run(){ work(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "m.work"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_pub_use_glob_regression) {
+    /* Glob re-export: the glob module must be recorded (not a garbage alias)
+     * and nothing may crash or fabricate a bogus alias-based edge. */
+    CBMFileResult *r = extract_rust("mod m { pub fn work(){} pub fn other(){} }\n"
+                                    "pub use m::*;\n"
+                                    "fn run(){ work(); }\n");
+    ASSERT_NOT_NULL(r);
+    bool glob_row = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->module_path && strcmp(imp->module_path, "m::*") == 0 && imp->local_name &&
+            strcmp(imp->local_name, "*") == 0) {
+            glob_row = true;
+        }
+    }
+    ASSERT_TRUE(glob_row);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_use_as_underscore_binds_nothing) {
+    /* `use x as _` is the trait-import idiom — it must not map `_`. */
+    CBMFileResult *r = extract_rust("use std::fmt::Write as _;\n"
+                                    "fn run() { let mut s = String::new(); s.len(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.new"), 0);
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        ASSERT_TRUE(!(imp->local_name && strcmp(imp->local_name, "_") == 0));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_impl_method_return_type_def) {
+    /* Item rust-impl-method-return-types: extraction must record impl-method
+     * return-type text (free fns already did) so the def-driven cross-file
+     * registries stop typing every project method chain as unknown. The
+     * self-generic head is stripped (`-> Stack<T>` in impl<T> Stack<T> →
+     * `Stack`, matching the registered receiver); std templates keep args. */
+    CBMFileResult *r = extract_rust(
+        "struct S;\n"
+        "impl S { fn make() -> S { S } fn me(&self) -> Self { S }\n"
+        "         fn count(&self) -> usize { 0 } fn names(&self) -> Vec<String> { Vec::new() } }\n"
+        "struct Stack<T> { v: Vec<T> }\n"
+        "impl<T> Stack<T> { fn dup(&self) -> Stack<T> { Stack { v: Vec::new() } } }\n");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *make = rustlsp_find_def(r, "Method", "make");
+    ASSERT_NOT_NULL(make);
+    ASSERT_NOT_NULL(make->return_type);
+    ASSERT_STR_EQ(make->return_type, "S");
+    const CBMDefinition *me = rustlsp_find_def(r, "Method", "me");
+    ASSERT_NOT_NULL(me);
+    ASSERT_STR_EQ(me->return_type, "Self");
+    const CBMDefinition *count = rustlsp_find_def(r, "Method", "count");
+    ASSERT_NOT_NULL(count);
+    ASSERT_STR_EQ(count->return_type, "usize");
+    const CBMDefinition *names = rustlsp_find_def(r, "Method", "names");
+    ASSERT_NOT_NULL(names);
+    ASSERT_STR_EQ(names->return_type, "Vec<String>");
+    const CBMDefinition *dup = rustlsp_find_def(r, "Method", "dup");
+    ASSERT_NOT_NULL(dup);
+    ASSERT_STR_EQ(dup->return_type, "Stack");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_xf_impl_method_return_type_chain) {
+    /* Cross-file chain typed through extraction-shaped RAW return text
+     * ("Thing" — qualified against def_module_qn by the registrar). */
+    const char *caller = "fn run(m: &util::Maker) { let t = m.build(); t.use_it(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "p.util.Maker";
+    defs[0].short_name = "Maker";
+    defs[0].label = "Type";
+    defs[0].def_module_qn = "p.util";
+    defs[1].qualified_name = "p.util.Thing";
+    defs[1].short_name = "Thing";
+    defs[1].label = "Type";
+    defs[1].def_module_qn = "p.util";
+    defs[2].qualified_name = "p.util.Maker.build";
+    defs[2].short_name = "build";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "p.util.Maker";
+    defs[2].def_module_qn = "p.util";
+    defs[2].return_types = "Thing";
+    defs[3].qualified_name = "p.util.Thing.use_it";
+    defs[3].short_name = "use_it";
+    defs[3].label = "Method";
+    defs[3].receiver_type = "p.util.Thing";
+    defs[3].def_module_qn = "p.util";
+    const char *imp_n[] = {"util"};
+    const char *imp_q[] = {"p::util"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "p.caller", defs, 4, imp_n, imp_q, 1,
+                           NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "Maker.build"), 0);
+    ASSERT_GTE(find_confident(&out, "run", "Thing.use_it"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_xf_impl_method_self_return_chain) {
+    /* `-> Self` recorded def-side must substitute the receiver in the cross
+     * registrars (mirrors the per-file Phase-B2 harvest). */
+    const char *caller = "fn run(m: &util::Maker) { let m2 = m.dup(); m2.fire(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "p.util.Maker";
+    defs[0].short_name = "Maker";
+    defs[0].label = "Type";
+    defs[0].def_module_qn = "p.util";
+    defs[1].qualified_name = "p.util.Maker.dup";
+    defs[1].short_name = "dup";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "p.util.Maker";
+    defs[1].def_module_qn = "p.util";
+    defs[1].return_types = "Self";
+    defs[2].qualified_name = "p.util.Maker.fire";
+    defs[2].short_name = "fire";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "p.util.Maker";
+    defs[2].def_module_qn = "p.util";
+    const char *imp_n[] = {"util"};
+    const char *imp_q[] = {"p::util"};
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "p.caller", defs, 3, imp_n, imp_q, 1,
+                           NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "Maker.dup"), 0);
+    ASSERT_GTE(find_confident(&out, "run", "Maker.fire"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_nested_mod_registry_harvest) {
+    /* Registry-harvest recursion: types, impls and functions inside inline
+     * mod bodies keep fields + AST return types (the harvest used to walk
+     * only root children, so nested-mod chains lost typing). */
+    CBMFileResult *r = extract_rust(
+        "mod outer { pub mod inner {\n"
+        "    pub struct Cfg { pub name: String }\n"
+        "    impl Cfg {\n"
+        "        pub fn label(&self) -> String { self.name.clone() }\n"
+        "        pub fn fresh() -> Cfg { Cfg { name: String::new() } }\n"
+        "    }\n"
+        "} }\n"
+        "fn run() { let c = outer::inner::Cfg::fresh(); let l = c.label(); let _ = l.len(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Cfg.fresh"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Cfg.label"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.len"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_crate_path_workspace_member) {
+    /* crate:: inside a workspace member file must root at the MEMBER's src
+     * tree, not the historical first-two-segments guess. */
+    const char *caller = "fn run() { crate::util::parse(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *toml = "[workspace]\nmembers = [\"crates/net\"]\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, toml, (int)strlen(toml), &m);
+
+    CBMRustLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "proj.crates.net.src.util.parse";
+    defs[0].short_name = "parse";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "proj.crates.net.src.util";
+
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_manifest(&a, caller, (int)strlen(caller),
+                                         "proj.crates.net.src.client", defs, 1, NULL, NULL, 0,
+                                         NULL, &m, &out, NULL);
+    ASSERT_GTE(find_confident(&out, "run", "crates.net.src.util.parse"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_crate_path_lib_rs_item) {
+    /* Items defined in lib.rs carry the `lib` stem; the crate-rooted probe
+     * must retry with `.lib` when the direct candidate misses (gated). */
+    const char *caller = "fn run(c: &crate::Config) { c.ping(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "proj.src.lib.Config";
+    defs[0].short_name = "Config";
+    defs[0].label = "Type";
+    defs[0].def_module_qn = "proj.src.lib";
+    defs[1].qualified_name = "proj.src.lib.Config.ping";
+    defs[1].short_name = "ping";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "proj.src.lib.Config";
+    defs[1].def_module_qn = "proj.src.lib";
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "proj.src.server", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "Config.ping"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_crate_path_test_target_own_crate) {
+    /* Files under tests/ are their own crates: crate:: resolves within the
+     * test file's tree, never into src/. */
+    const char *caller = "fn run() { crate::helper(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMRustLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "proj.tests.integration.helper";
+    defs[0].short_name = "helper";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "proj.tests.integration";
+    /* Decoy in src/ with the same short name — must NOT win. */
+    defs[1].qualified_name = "proj.src.helper";
+    defs[1].short_name = "helper";
+    defs[1].label = "Function";
+    defs[1].def_module_qn = "proj.src";
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "proj.tests.integration", defs, 2,
+                           NULL, NULL, 0, NULL, &out);
+    ASSERT_GTE(find_confident(&out, "run", "tests.integration.helper"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_mod_rs_relative_type_probe) {
+    /* dir/mod.rs items carry the `mod` stem — `dir::S` needs the collapsed
+     * candidate, uniqueness-gated. */
+    const char *caller = "mod dir;\nfn caller(s: &dir::S) { s.ping(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.src.dir.mod.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "test.src.dir.mod";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.src.dir.mod.S.ping";
+    defs[1].short_name = "ping";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.src.dir.mod.S";
+    defs[1].def_module_qn = "test.src.dir.mod";
+    defs[1].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 2);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.src.main", reg,
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+    ASSERT_GTE(find_confident(&out, "caller", "S.ping"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_mod_rs_relative_type_ambiguous_fails_closed) {
+    /* Both the plain sibling and the mod-collapsed candidate exist →
+     * ambiguous → no edge. */
+    const char *caller = "mod dir;\nfn caller(s: &dir::S) { s.ping(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMLSPDef defs[4];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.src.dir.mod.S";
+    defs[0].short_name = "S";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "test.src.dir.mod";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[1].qualified_name = "test.src.dir.mod.S.ping";
+    defs[1].short_name = "ping";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.src.dir.mod.S";
+    defs[1].def_module_qn = "test.src.dir.mod";
+    defs[1].lang = CBM_LANG_RUST;
+    defs[2].qualified_name = "test.src.dir.S";
+    defs[2].short_name = "S";
+    defs[2].label = "Struct";
+    defs[2].def_module_qn = "test.src.dir";
+    defs[2].lang = CBM_LANG_RUST;
+    defs[3].qualified_name = "test.src.dir.S.ping";
+    defs[3].short_name = "ping";
+    defs[3].label = "Method";
+    defs[3].receiver_type = "test.src.dir.S";
+    defs[3].def_module_qn = "test.src.dir";
+    defs[3].lang = CBM_LANG_RUST;
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 4);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.src.main", reg,
+                                         NULL, NULL, 0, NULL, NULL, &out, NULL);
+    ASSERT_EQ(find_confident(&out, "caller", "S.ping"), -1);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_cargo_hyphen_dep_head) {
+    /* crates.io hyphenates (`async-trait`); Rust path heads underscore
+     * (`async_trait`) — the manifest match must hyphen-fold. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *toml = "[dependencies]\nasync-trait = \"0.1\"\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, toml, (int)strlen(toml), &m);
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "async_trait"));
+    ASSERT_EQ(false, cbm_cargo_is_known_dep(&m, "async_traitor"));
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_cargo_target_deps_section) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *toml = "[target.'cfg(unix)'.dependencies]\nnix = \"0.29\"\n"
+                       "[target.x86_64-pc-windows-msvc.dependencies]\nwinapi = \"0.3\"\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, toml, (int)strlen(toml), &m);
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "nix"));
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "winapi"));
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_cargo_member_manifest_merge) {
+    /* Member Cargo.toml merge: local dep keys (incl. workspace-inheritance
+     * and `package=` renames — the LOCAL key is stored) become known heads,
+     * and the member's package name maps to the member. */
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *root_toml = "[workspace]\nmembers = [\"net\"]\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, root_toml, (int)strlen(root_toml), &m);
+    ASSERT_EQ(1, m.member_count);
+    const char *member_toml = "[package]\nname = \"net-lib\"\n"
+                              "[dependencies]\n"
+                              "tokio = { workspace = true }\n"
+                              "mylib = { path = \"../x\", package = \"other\" }\n";
+    const char *pkg = cbm_cargo_merge_member_deps(&a, &m, member_toml, (int)strlen(member_toml));
+    ASSERT_NOT_NULL(pkg);
+    ASSERT_STR_EQ(pkg, "net-lib");
+    m.members[0].package_name = pkg;
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "tokio"));
+    ASSERT_EQ(true, cbm_cargo_is_known_dep(&m, "mylib"));
+    ASSERT_EQ(false, cbm_cargo_is_known_dep(&m, "other"));
+    /* Member findable by hyphen-folded package name AND by directory name. */
+    ASSERT_NOT_NULL(cbm_cargo_find_member(&m, "net_lib"));
+    ASSERT_NOT_NULL(cbm_cargo_find_member(&m, "net"));
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_cargo_package_name_head_routes_to_src) {
+    /* Integration tests reference the library by PACKAGE NAME — the only
+     * spelling available to them. Registry-gated probes route it into the
+     * root crate's src tree. */
+    const char *caller = "fn run() { my_crate::api_run(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    const char *toml = "[package]\nname = \"my-crate\"\n";
+    CBMCargoManifest m;
+    cbm_cargo_parse(&a, toml, (int)strlen(toml), &m);
+    CBMRustLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "proj.src.lib.api_run";
+    defs[0].short_name = "api_run";
+    defs[0].label = "Function";
+    defs[0].def_module_qn = "proj.src.lib";
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_rust_lsp_cross_with_manifest(&a, caller, (int)strlen(caller), "proj.tests.integration",
+                                         defs, 1, NULL, NULL, 0, NULL, &m, &out, NULL);
+    ASSERT_GTE(find_confident(&out, "run", "src.lib.api_run"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_xf_derive_clone_cross_file) {
+    /* Derive parity: decorators on a type-like def must synthesize the
+     * curated derive surface in the SHARED cross registry, so another file's
+     * `c.clone()` / `Cfg::default()` resolve — byte-parity with per-file. */
+    const char *caller = "fn run(c: &demo::Cfg) { c.clone(); let _d = demo::Cfg::default(); }\n";
+    CBMArena a;
+    cbm_arena_init(&a);
+    static const char *cfg_decorators[] = {"#[derive(Clone, Default)]", NULL};
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.demo.Cfg";
+    defs[0].short_name = "Cfg";
+    defs[0].label = "Struct";
+    defs[0].def_module_qn = "test.demo";
+    defs[0].lang = CBM_LANG_RUST;
+    defs[0].decorators = cfg_decorators;
+    const char *imp_n[] = {"demo"};
+    const char *imp_q[] = {"test::demo"};
+
+    CBMTypeRegistry *reg = cbm_rust_build_cross_registry(&a, defs, 1);
+    ASSERT_NOT_NULL(reg);
+    CBMResolvedCallArray shared_out = {0};
+    cbm_run_rust_lsp_cross_with_registry(&a, caller, (int)strlen(caller), "test.caller", reg,
+                                         imp_n, imp_q, 1, NULL, NULL, &shared_out, NULL);
+    ASSERT_GTE(find_confident(&shared_out, "run", "Cfg.clone"), 0);
+    ASSERT_GTE(find_confident(&shared_out, "run", "Cfg.default"), 0);
+
+    /* Parity: the per-file cross path (def-driven, same registrar). */
+    CBMRustLSPDef rdefs[1];
+    memset(rdefs, 0, sizeof(rdefs));
+    rdefs[0].qualified_name = "test.demo.Cfg";
+    rdefs[0].short_name = "Cfg";
+    rdefs[0].label = "Struct";
+    rdefs[0].def_module_qn = "test.demo";
+    rdefs[0].decorators = cfg_decorators;
+    CBMResolvedCallArray perfile_out = {0};
+    cbm_run_rust_lsp_cross(&a, caller, (int)strlen(caller), "test.caller", rdefs, 1, imp_n, imp_q,
+                           1, NULL, &perfile_out);
+    ASSERT_GTE(find_confident(&perfile_out, "run", "Cfg.clone"), 0);
+    ASSERT_GTE(find_confident(&perfile_out, "run", "Cfg.default"), 0);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(rustlsp_a3_tracing_macros) {
+    /* Crate-provenanced macros resolve to the seeded free-fn surfaces:
+     * bare `info!` under `use tracing::info;` and scoped `tracing::warn!`. */
+    CBMFileResult *r = extract_rust("use tracing::info;\n"
+                                    "fn run() { info!(\"hi\"); tracing::warn!(\"x\"); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "tracing.info"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "tracing.warn"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_a3_bare_macro_never_binds_local_fn) {
+    /* A bare macro with NO crate provenance must not bind a same-named
+     * local function (zero-edge rule). */
+    CBMFileResult *r = extract_rust("fn info() {}\n"
+                                    "fn run() { info!(\"x\"); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "run", "main.info"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_a3_axum_router_chain) {
+    CBMFileResult *r = extract_rust(
+        "use axum::{Router, routing::get};\n"
+        "async fn root() {}\n"
+        "fn app() { let _r = Router::new().route(\"/\", get(root)).layer(1); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "app", "Router.new"), 0);
+    ASSERT_GTE(require_resolved(r, "app", "Router.route"), 0);
+    ASSERT_GTE(require_resolved(r, "app", "Router.layer"), 0);
+    ASSERT_GTE(require_resolved(r, "app", "routing.get"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(rustlsp_a3_sqlx_and_reqwest_seeds) {
+    CBMFileResult *r = extract_rust(
+        "use sqlx::query;\n"
+        "async fn run() { let _ = query(\"SELECT 1\"); let _ = reqwest::get(\"https://x\"); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "sqlx.query"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "reqwest.get"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 void suite_rust_lsp(void) {
     /* Free function dispatch */
     RUN_TEST(rustlsp_free_function_call);

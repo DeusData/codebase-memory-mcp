@@ -1200,6 +1200,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
         out[i].is_abstract = defs[i].is_abstract;
+        out[i].decorators = defs[i].decorators;
     }
     return out;
 }
@@ -1511,6 +1512,75 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     free(filtered);
 }
 
+/* Expand a trailing slash-star workspace-member glob (members = ["crates" +
+ * glob]) by listing the directory and admitting each subdirectory that
+ * contains a Cargo.toml. Uses the cross-platform cbm_opendir wrappers (POSIX
+ * opendir, Windows FindFirstFileW behind one API) — file I/O, no processes. */
+static void pxc_expand_member_globs(const char *repo_path, CBMArena *marena,
+                                    CBMCargoManifest *m) {
+    int original_count = m->member_count;
+    for (int i = 0; i < original_count; i++) {
+        const char *mp = m->members[i].member_path;
+        size_t plen = mp ? strlen(mp) : 0;
+        if (plen < 2 || mp[plen - 1] != '*' || mp[plen - 2] != '/')
+            continue;
+        /* Blank out the glob entry itself (`member_name` was "*"). */
+        m->members[i].member_name = NULL;
+        m->members[i].package_name = NULL;
+        char *prefix = (char *)cbm_arena_strndup(marena, mp, plen - 2); /* "crates" */
+        m->members[i].member_path = NULL;
+        char dirpath[1024];
+        int n = snprintf(dirpath, sizeof(dirpath), "%s/%s", repo_path, prefix);
+        if (n <= 0 || (size_t)n >= sizeof(dirpath))
+            continue;
+        cbm_dir_t *d = cbm_opendir(dirpath);
+        if (!d)
+            continue;
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL && m->member_count < CBM_CARGO_MAX_MEMBERS) {
+            if (!ent->is_dir || ent->name[0] == '.')
+                continue;
+            char member_toml[1024];
+            n = snprintf(member_toml, sizeof(member_toml), "%s/%s/Cargo.toml", dirpath, ent->name);
+            if (n <= 0 || (size_t)n >= sizeof(member_toml))
+                continue;
+            cbm_path_info_t info;
+            if (cbm_path_info_utf8(member_toml, &info) != 0 || !info.is_regular)
+                continue;
+            CBMCargoMember *mem = &m->members[m->member_count++];
+            mem->member_name = cbm_arena_strdup(marena, ent->name);
+            mem->member_path = cbm_arena_sprintf(marena, "%s/%s", prefix, ent->name);
+            mem->package_name = NULL;
+        }
+        cbm_closedir(d);
+    }
+}
+
+/* Merge each member crate's own Cargo.toml into the root manifest: its
+ * [dependencies] keys become known path heads (the root-only read left every
+ * member-crate dep invisible to routing) and its [package].name is recorded
+ * so integration tests referencing the crate by package name connect. */
+static void pxc_merge_member_manifests(const char *repo_path, CBMArena *marena,
+                                       CBMCargoManifest *m) {
+    for (int i = 0; i < m->member_count && i < CBM_CARGO_MAX_MEMBERS; i++) {
+        if (!m->members[i].member_path)
+            continue;
+        char path[1024];
+        int n = snprintf(path, sizeof(path), "%s/%s/Cargo.toml", repo_path,
+                         m->members[i].member_path);
+        if (n <= 0 || (size_t)n >= sizeof(path))
+            continue;
+        int len = 0;
+        char *toml = pxc_read_file(path, &len);
+        if (!toml || len <= 0) {
+            free(toml);
+            continue;
+        }
+        m->members[i].package_name = cbm_cargo_merge_member_deps(marena, m, toml, len);
+        free(toml);
+    }
+}
+
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
                                  CBMCargoManifest *out_m) {
     if (!ctx || !ctx->repo_path || !marena || !out_m)
@@ -1528,6 +1598,8 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
+    pxc_expand_member_globs(ctx->repo_path, marena, out_m);
+    pxc_merge_member_manifests(ctx->repo_path, marena, out_m);
     return true;
 }
 

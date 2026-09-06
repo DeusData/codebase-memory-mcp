@@ -1348,6 +1348,12 @@ static const char *decorator_method_name(const char *attr_text) {
     if (strcmp(method, "patch") == 0 || strcmp(method, "Patch") == 0) {
         return "PATCH";
     }
+    if (strcmp(method, "head") == 0 || strcmp(method, "Head") == 0) {
+        return "HEAD";
+    }
+    if (strcmp(method, "options") == 0 || strcmp(method, "Options") == 0) {
+        return "OPTIONS";
+    }
     if (strcmp(method, "route") == 0 || strcmp(method, "api_route") == 0) {
         return "ANY";
     }
@@ -1776,6 +1782,97 @@ static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const 
     return true;
 }
 
+/* Rust attribute-macro routes: actix-web `#[get("/p")]` / `#[route("/p",
+ * method = "GET")]` and rocket `#[get("/item/<id>")]`. The attribute_item's
+ * `attribute` child carries the macro path (identifier or scoped_identifier)
+ * and an `arguments` token_tree whose first '/'-leading string_literal is the
+ * route path. The mandatory '/'-gate keeps arbitrary user attribute macros
+ * that happen to be named `get` from minting routes. */
+static const char *rust_attr_token_tree_method_kwarg(CBMArena *a, TSNode token_tree,
+                                                     const char *source) {
+    /* Scan for `method = "GET"`: an identifier named `method` followed by a
+     * string_literal among the token_tree's named children. */
+    uint32_t nc = ts_node_named_child_count(token_tree);
+    bool method_key_seen = false;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(token_tree, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "identifier") == 0) {
+            char *t = cbm_node_text(a, c, source);
+            method_key_seen = (t && strcmp(t, "method") == 0);
+            continue;
+        }
+        if (method_key_seen && strcmp(ck, "string_literal") == 0) {
+            char *v = cbm_node_text(a, c, source);
+            if (!v) {
+                return NULL;
+            }
+            size_t vlen = strlen(v);
+            if (vlen >= CBM_QUOTE_PAIR && (v[0] == '"' || v[0] == '\'')) {
+                v = cbm_arena_strndup(a, v + SKIP_CHAR, vlen - PAIR_CHARS);
+            }
+            for (char *p = v; *p; p++) {
+                if (*p >= 'a' && *p <= 'z') {
+                    *p = (char)(*p - 'a' + 'A');
+                }
+            }
+            return v[0] ? v : NULL;
+        }
+        method_key_seen = false;
+    }
+    return NULL;
+}
+
+static bool try_route_from_rust_attribute(CBMArena *a, TSNode attr_item, const char *source,
+                                          const char **out_path, const char **out_method) {
+    TSNode attr = cbm_find_child_by_kind(attr_item, "attribute");
+    if (ts_node_is_null(attr)) {
+        return false;
+    }
+    TSNode path_node = ts_node_named_child(attr, 0);
+    if (ts_node_is_null(path_node)) {
+        return false;
+    }
+    const char *pk = ts_node_type(path_node);
+    if (strcmp(pk, "identifier") != 0 && strcmp(pk, "scoped_identifier") != 0) {
+        return false;
+    }
+    char *macro_path = cbm_node_text(a, path_node, source);
+    if (!macro_path || !macro_path[0]) {
+        return false;
+    }
+    /* Take the last `::` segment (`actix_web::get` → `get`); the
+     * dot-splitting in decorator_method_name then sees the bare verb. */
+    const char *verb = macro_path;
+    for (const char *p = macro_path; p[0]; p++) {
+        if (p[0] == ':' && p[1] == ':' && p[2]) {
+            verb = p + PAIR_CHARS;
+        }
+    }
+    const char *method = decorator_method_name(verb);
+    if (!method) {
+        return false;
+    }
+    TSNode args = ts_node_child_by_field_name(attr, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return false; /* bare `#[get]` — not a route */
+    }
+    const char *path = find_route_path_literal(a, args, source, CBM_DESCENDANT_MAX_DEPTH);
+    if (!path) {
+        return false; /* mandatory '/'-leading string-literal gate */
+    }
+    /* actix `#[route("/p", method = "GET")]` carries the verb as a kwarg. */
+    if (strcmp(method, "ANY") == 0) {
+        const char *kw = rust_attr_token_tree_method_kwarg(a, args, source);
+        if (kw) {
+            method = kw;
+        }
+    }
+    *out_path = path;
+    *out_method = method;
+    return true;
+}
+
 static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const char *source,
                                           const CBMLangSpec *spec, const char **out_path,
                                           const char **out_method) {
@@ -1783,6 +1880,19 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
     *out_method = NULL;
 
     if (!spec->decorator_node_types || !spec->decorator_node_types[0]) {
+        return;
+    }
+
+    /* Rust routes ride on prev-sibling attribute_item macros, whose AST shape
+     * (attribute → macro path + token_tree) matches no other language here. */
+    if (spec->language == CBM_LANG_RUST) {
+        TSNode rprev = ts_node_prev_sibling(func_node);
+        while (!ts_node_is_null(rprev) && cbm_kind_in_set(rprev, spec->decorator_node_types)) {
+            if (try_route_from_rust_attribute(a, rprev, source, out_path, out_method)) {
+                return;
+            }
+            rprev = ts_node_prev_sibling(rprev);
+        }
         return;
     }
 
@@ -2046,13 +2156,23 @@ static bool rust_def_is_test(const char *const *decorators) {
         /* Path-qualified async/param test macros (substring match, robust to the
          * optional argument list and the surrounding #[ ]). */
         if (strstr(d, "tokio::test") || strstr(d, "async_std::test") ||
-            strstr(d, "actix_rt::test") || strstr(d, "test_case::case")) {
+            strstr(d, "actix_rt::test") || strstr(d, "test_case::case") ||
+            strstr(d, "test_log::test") || strstr(d, "sqlx::test")) {
             return true;
         }
         /* Bare #[test] / #[test(...)]: match the bracketed path exactly so we do
          * NOT match the unrelated #[test_case::case] (handled above) or a
          * hypothetical #[test_crate]. */
         if (strstr(d, "#[test]") || strstr(d, "#[test(")) {
+            return true;
+        }
+        /* Parameterised / property test frameworks whose attribute IS the test
+         * marker: rstest, test-strategy's #[proptest], quickcheck, and bare
+         * #[test_case(...)] (the path-qualified form matches above). Bracketed
+         * forms only, so e.g. #[rstest_reuse] stays unmatched. */
+        if (strstr(d, "#[rstest]") || strstr(d, "#[rstest(") || strstr(d, "#[proptest]") ||
+            strstr(d, "#[proptest(") || strstr(d, "#[quickcheck]") || strstr(d, "#[quickcheck(") ||
+            strstr(d, "#[test_case(")) {
             return true;
         }
     }
@@ -5228,6 +5348,26 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
             def.signature_param_types = extract_signature_param_types(
                 a, params, ctx->source, ctx->language, true, &def.signature_param_count);
+        }
+
+        /* Return type. The free-function path records this via the generic
+         * rt_fields loop; impl methods never did, so the def-driven cross-file
+         * registries typed every project method chain as unknown (the per-file
+         * Phase B2 AST harvest masked it locally). Strip the generic argument
+         * list only when the head names the impl's own (already-stripped) type
+         * — `-> Stack<T>` in `impl<T> Stack<T>` becomes `Stack`, matching the
+         * registered receiver, while `-> Vec<String>` keeps its template args. */
+        TSNode ret_node = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+        if (!ts_node_is_null(ret_node)) {
+            char *ret_text = cbm_node_text(a, ret_node, ctx->source);
+            if (ret_text && ret_text[0]) {
+                char *lt = strchr(ret_text, '<');
+                if (lt && (size_t)(lt - ret_text) == strlen(type_name) &&
+                    strncmp(ret_text, type_name, (size_t)(lt - ret_text)) == 0) {
+                    ret_text = cbm_arena_strndup(a, ret_text, (size_t)(lt - ret_text));
+                }
+                def.return_type = ret_text;
+            }
         }
 
         if (spec->branching_node_types && spec->branching_node_types[0]) {
