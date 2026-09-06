@@ -2490,8 +2490,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
 
         /* Perl call-graph noise guard (#476), mirroring the sequential pass
-         * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/
-         * keys/...) and method calls ($obj->m, unresolved receiver), suppress
+         * (pass_calls.c). The Perl LSP resolves typed/exact calls first
+         * (per-file + cross-file); for the residue — builtins (push/shift/
+         * keys/...) and method calls ($obj->m, unresolved receiver) — suppress
          * only WEAK cross-file short-name matches and keep the high-confidence
          * same_module / import_map strategies so a genuine same-file or
          * imported call to a builtin-named sub still resolves. Placed after the
@@ -2499,6 +2500,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * Gated to Perl — other languages are unaffected. */
         if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method,
                                             call->callee_name, res.strategy)) {
+            /* A weakly-matched `$r->get('/x' => sub)` is still a genuine route
+             * registration — drop the CALLS noise, keep the Route node.
+             * Lockstep twin of the sequential branch in pass_calls.c. */
+            if (lang == CBM_LANG_PERL && call->first_string_arg &&
+                call->first_string_arg[0] == '/') {
+                const char *perl_method =
+                    cbm_service_pattern_perl_route_method(call->callee_name, call->is_method);
+                if (perl_method != NULL) {
+                    const char *handler_ref = NULL;
+                    const char *route_method = NULL;
+                    const char *route_path =
+                        find_route_path_in_args(call, &handler_ref, &route_method);
+                    if (route_path) {
+                        emit_route_registration(ws->local_edge_buf, source_node, call, route_path,
+                                                handler_ref, perl_method, module_qn, rc->registry,
+                                                rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                    }
+                }
+            }
             continue;
         }
 
@@ -2553,6 +2573,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            /* Perl route DSL (bare "get"/"post"/... callees the suffix table
+             * cannot match) — only on this empty-resolution path, so a
+             * resolved local `sub get` wins. Lockstep twin of pass_calls.c. */
+            if (lang == CBM_LANG_PERL && call->first_string_arg &&
+                call->first_string_arg[0] == '/') {
+                const char *perl_method =
+                    cbm_service_pattern_perl_route_method(call->callee_name, call->is_method);
+                if (perl_method != NULL) {
+                    const char *handler_ref = NULL;
+                    const char *route_method = NULL;
+                    const char *route_path =
+                        find_route_path_in_args(call, &handler_ref, &route_method);
+                    if (route_path) {
+                        emit_route_registration(ws->local_edge_buf, source_node, call, route_path,
+                                                handler_ref, perl_method, module_qn, rc->registry,
+                                                rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                        continue;
+                    }
+                }
+            }
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,

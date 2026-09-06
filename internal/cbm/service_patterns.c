@@ -858,6 +858,37 @@ const char *cbm_service_pattern_route_method(const char *callee_name) {
     return NULL;
 }
 
+const char *cbm_service_pattern_perl_route_method(const char *callee_name, bool is_method) {
+    if (!callee_name || !callee_name[0]) {
+        return NULL;
+    }
+    /* Perl route callees are BARE names (extract_calls.c perl_is_identifier_
+     * callee): Dancer2 / Mojolicious::Lite DSL `get '/x' => sub {...}` and
+     * Mojolicious `$r->get('/x' => sub {...})` both extract callee "get", so
+     * the '.'/'::'-suffix table above can never match them. This matcher is
+     * Perl-gated at its call sites and consulted only on the empty-resolution
+     * / suppressed-weak-match paths, so a resolved local `sub get` always
+     * wins over route classification. `delete` is accepted ONLY in method
+     * form ($r->delete): bare `delete` is the hash-delete named-unary builtin
+     * (func1op_call_expression is a Perl call type), so bare-DSL spells it
+     * `del` (Dancer2). */
+    static const method_suffix_t perl_bare_routes[] = {
+        {"get", "GET"},     {"post", "POST"},       {"put", "PUT"},
+        {"patch", "PATCH"}, {"del", "DELETE"},      {"options", "OPTIONS"},
+        {"any", "ANY"},     {"websocket", "ANY"},   {"under", "ANY"},
+        {NULL, NULL},
+    };
+    for (int i = 0; perl_bare_routes[i].suffix != NULL; i++) {
+        if (strcmp(callee_name, perl_bare_routes[i].suffix) == 0) {
+            return perl_bare_routes[i].method;
+        }
+    }
+    if (is_method && strcmp(callee_name, "delete") == 0) {
+        return "DELETE";
+    }
+    return NULL;
+}
+
 const char *cbm_go_split_mux_pattern(const char *literal, const char **out_method) {
     if (out_method) {
         *out_method = NULL;

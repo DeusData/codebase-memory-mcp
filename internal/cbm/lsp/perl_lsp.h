@@ -39,6 +39,45 @@ typedef struct {
     int use_count;
     int use_cap;
 
+    /* Seeded-imports floor (cross-file mode): perl_lsp_process_file's PASS-1
+     * reset truncates the use map back to this count instead of zero, so
+     * caller-supplied mappings (cbm_run_perl_lsp_cross) survive the reset.
+     * Zero in per-file mode. */
+    int use_floor;
+
+    /* Cross-file package→module map (cbm_run_perl_lsp_cross only): package
+     * spelling as written in source ("My::Util") → resolved dotted module QN
+     * ("test.lib.My.Util"). Consulted when composing qw-import targets and
+     * left empty in per-file mode (naive Module.sym targets then only ever
+     * match stdlib entries — zero-edge safe). */
+    const char **xmod_pkgs;
+    const char **xmod_qns;
+    int xmod_count;
+    int xmod_cap;
+
+    /* Cross-file default-export table: module QN → "|"-joined @EXPORT names
+     * (collected at extraction from `our @EXPORT = qw(...)`, carried on the
+     * EXPORT Variable def's return_type). `use Mod;` with NO import list
+     * imports these names. */
+    const char **xexp_module_qns;
+    const char **xexp_names;
+    int xexp_count;
+    int xexp_cap;
+
+    /* Moose/Moo attribute + mode tables (PASS 1). moose_pkgs lists packages
+     * that `use Moose|Moo|Mouse|Class::Accessor` — the has/extends/with DSL
+     * is honored ONLY inside those packages (per-package gate, not per-file).
+     * attr_* records `has 'name' => (isa => 'Type')` attributes; attr_isa[i]
+     * is the isa class name or NULL when unknown/parameterized. */
+    const char **moose_pkgs;
+    int moose_pkg_count;
+    int moose_pkg_cap;
+    const char **attr_pkgs;
+    const char **attr_names;
+    const char **attr_isa;
+    int attr_count;
+    int attr_cap;
+
     /* @ISA inheritance table: isa_pkg_qns[i] inherits from isa_parent_qns[i].
      * Populated from @ISA assignments and `use parent`/`use base`. */
     const char **isa_pkg_qns;
