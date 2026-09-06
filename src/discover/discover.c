@@ -700,7 +700,7 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     if (dot && strcmp(dot, ".m") == 0) {
         lang = cbm_disambiguate_m(abs_path);
     }
-    /* Special: .cls is shared by ObjectScript UDL and Apex */
+    /* Special: .cls is shared by ObjectScript UDL, Apex and VB6 class modules */
     if (dot && strcmp(dot, ".cls") == 0) {
         lang = cbm_disambiguate_cls(abs_path);
     }
@@ -711,6 +711,10 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     /* Special: .cfc components may be script-dialect or tag-dialect (<cfcomponent>) */
     if (dot && strcmp(dot, ".cfc") == 0) {
         lang = cbm_disambiguate_cfc(abs_path);
+    }
+    /* Special: .frm is shared by FORM and VB6 forms (#721) */
+    if (dot && strcmp(dot, ".frm") == 0) {
+        lang = cbm_disambiguate_frm(abs_path);
     }
     /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
      * detected by content; otherwise .xml stays XML. */

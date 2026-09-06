@@ -5382,6 +5382,30 @@ TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death) {
     PASS();
 }
 
+/* One directory is one root for the job registry. The auto-index job spells
+ * repo_path the way the session policy holds it - the platform's native form,
+ * backslashes on Windows - while an explicit index_repository request arrives
+ * in the handler's forward-slash spelling. Compared byte-exact the two never
+ * matched on Windows, and the request was refused as an options conflict
+ * instead of joining the job already running for its root. The fold runs on
+ * every platform, so this binds wherever the suite runs; every other option
+ * stays exact. */
+TEST(daemon_application_index_args_compare_repo_path_separator_equivalently) {
+    ASSERT_TRUE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\"}", "{\"repo_path\":\"C:/repos/cbm\"}"));
+    ASSERT_TRUE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\",\"mode\":\"full\"}",
+        "{\"mode\":\"full\",\"repo_path\":\"C:/repos/cbm\"}"));
+    ASSERT_FALSE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\"}", "{\"repo_path\":\"C:/repos/cbm2\"}"));
+    ASSERT_FALSE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\"}", "{\"repo_path\":\"C:/repos/cbm/sub\"}"));
+    ASSERT_FALSE(cbm_daemon_application_index_args_equal_for_test(
+        "{\"repo_path\":\"C:\\\\repos\\\\cbm\",\"mode\":\"incremental\"}",
+        "{\"repo_path\":\"C:/repos/cbm\"}"));
+    PASS();
+}
+
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
@@ -5400,6 +5424,7 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
+    RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);
     RUN_TEST(daemon_application_auto_index_file_count_supports_non_git_roots);

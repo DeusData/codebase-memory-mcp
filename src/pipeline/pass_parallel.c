@@ -889,11 +889,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): the file WAS indexed,
              * but its tree contains ERROR/MISSING regions whose constructs are
-             * silently absent from the graph. Not a skip — recorded under the
-             * distinct "parse_partial" phase (reason = the line-range list) so
-             * the MCP layer reports it separately from skipped[]. */
+             * silently absent from the graph. Neither phase is a skip — both
+             * are recorded separately from skipped[] by the MCP layer.
+             * "parse_unusable" means one range covers so much of the file that
+             * naming the lines helps nobody; see parse_unusable in cbm.h. */
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
-                       "parse_partial");
+                       result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
 
         /* Create definition nodes in local gbuf */

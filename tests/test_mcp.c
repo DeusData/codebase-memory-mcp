@@ -5544,6 +5544,86 @@ TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics) {
     PASS();
 }
 
+/* The range string can carry a trailing ",+<N>" marker saying the producer hit
+ * its own cap and threw ranges away. The reader must emit every range in front
+ * of the marker, must not turn the marker itself into a range, and must say
+ * "ranges_truncated" so nobody reads a short list as a complete one. The reader has a
+ * second cap of its own, and that one must report itself the same way. */
+TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
+    enum { WIDE_RANGE_COUNT = 300 };
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *project = "coverage-marker";
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/coverage-marker"), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    /* 300 one-line ranges — past the reader's own 256 limit. */
+    char *wide = calloc(1, WIDE_RANGE_COUNT * 12 + 1);
+    ASSERT_NOT_NULL(wide);
+    size_t off = 0;
+    for (int i = 0; i < WIDE_RANGE_COUNT; i++) {
+        off += (size_t)snprintf(wide + off, WIDE_RANGE_COUNT * 12 + 1 - off, "%s%d-%d",
+                                i ? "," : "", i * 3 + 1, i * 3 + 1);
+    }
+
+    cbm_coverage_row_t rows[3] = {
+        {.rel_path = "src/marked.c", .kind = "parse_partial", .detail = "3-4,9-9,+12"},
+        {.rel_path = "src/plain.c", .kind = "parse_partial", .detail = "3-4,9-9"},
+        {.rel_path = "src/wide.c", .kind = "parse_partial", .detail = wide},
+    };
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(st, project, rows[i].rel_path, "fixture", i + 1, 10),
+                  CBM_STORE_OK);
+    }
+    ASSERT_EQ(cbm_store_coverage_replace(st, project, rows, 3), CBM_STORE_OK);
+
+    /* The marked file: both real ranges survive, the marker is flagged, and the
+     * "12" from the marker never becomes a range of its own. */
+    char *marked =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(marked);
+    char *marked_inner = extract_text_content(marked);
+    ASSERT_NOT_NULL(marked_inner);
+    ASSERT_NOT_NULL(strstr(marked_inner, "\"start\":3"));
+    ASSERT_NOT_NULL(strstr(marked_inner, "\"start\":9"));
+    ASSERT_NULL(strstr(marked_inner, "\"start\":12"));
+    ASSERT_NOT_NULL(strstr(marked_inner, "\"ranges_truncated\":true"));
+    free(marked_inner);
+    free(marked);
+
+    /* The same ranges without a marker must NOT be reported as truncated. */
+    char *plain =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(plain);
+    char *plain_inner = extract_text_content(plain);
+    ASSERT_NOT_NULL(plain_inner);
+    ASSERT_NOT_NULL(strstr(plain_inner, "\"start\":3"));
+    ASSERT_NULL(strstr(plain_inner, "\"ranges_truncated\":true"));
+    free(plain_inner);
+    free(plain);
+
+    /* The reader's own limit stops the list early, so it must say so even
+     * though the producer sent no marker. */
+    char *widest =
+        cbm_mcp_handle_tool(srv, "check_index_coverage",
+                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
+    ASSERT_NOT_NULL(widest);
+    char *wide_inner = extract_text_content(widest);
+    ASSERT_NOT_NULL(wide_inner);
+    ASSERT_NOT_NULL(strstr(wide_inner, "\"ranges_truncated\":true"));
+    free(wide_inner);
+    free(widest);
+
+    free(wide);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges) {
     char tmp[256];
     cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
@@ -20034,6 +20114,7 @@ SUITE(mcp) {
     RUN_TEST(tool_list_projects_preserves_root_beyond_one_kib);
     RUN_TEST(tool_index_status_no_project);
     RUN_TEST(tool_check_index_coverage_finds_path_beyond_status_cap);
+    RUN_TEST(tool_check_index_coverage_reports_truncation_marker_issue963);
     RUN_TEST(tool_check_index_coverage_reports_paths_scopes_and_ranges);
     RUN_TEST(tool_check_index_coverage_pages_exact_paths_and_restores_raw_diagnostics);
     RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
