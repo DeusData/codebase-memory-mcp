@@ -1506,6 +1506,299 @@ TEST(golsp_crossfile_interface_skips_test_file_impls) {
     PASS();
 }
 
+/* ── Modern stdlib addendum (go-stdlib-modern-packages) ────────── */
+
+TEST(golsp_stdlib_slices) {
+    /* slices.Clone carries type_param_names + CBM_TYPE_TYPE_PARAM reps, so the
+     * implicit-generics unifier infers []User and the element chain resolves. */
+    CBMFileResult *r = extract_go("package main\n\n"
+                                  "import \"slices\"\n\n"
+                                  "type User struct{}\n\n"
+                                  "func (u User) Name() string { return \"\" }\n\n"
+                                  "func work(users []User) {\n"
+                                  "\tus := slices.Clone(users)\n"
+                                  "\tus[0].Name()\n}\n");
+    ASSERT_NOT_NULL(r);
+    int idxClone = require_resolved(r, "work", "slices.Clone");
+    ASSERT_GTE(idxClone, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idxClone].strategy, "lsp_direct");
+    int idxName = require_resolved(r, "work", "Name");
+    ASSERT_GTE(idxName, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idxName].strategy, "lsp_type_dispatch");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(golsp_stdlib_maps_keys) {
+    CBMFileResult *r = extract_go("package main\n\n"
+                                  "import \"maps\"\n\n"
+                                  "func work(m map[string]int) {\n"
+                                  "\tks := maps.Keys(m)\n"
+                                  "\t_ = ks\n"
+                                  "\tc := maps.Clone(m)\n"
+                                  "\t_ = c\n}\n");
+    ASSERT_NOT_NULL(r);
+    int idxKeys = require_resolved(r, "work", "maps.Keys");
+    ASSERT_GTE(idxKeys, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idxKeys].strategy, "lsp_direct");
+    /* maps.Keys resolves to the modern-table entry; the iter.Seq return-type
+     * confidence scoring for range-over-func stdlib fns is a follow-up
+     * precision item (tracked in PLAN, go-stdlib-modern-packages). */
+    ASSERT_GTE(require_resolved(r, "work", "maps.Clone"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(golsp_stdlib_randv2) {
+    /* Also pins the /vN import rule: unaliased "math/rand/v2" binds `rand`,
+     * not `v2`. */
+    CBMFileResult *r = extract_go("package main\n\n"
+                                  "import \"math/rand/v2\"\n\n"
+                                  "func roll() int {\n"
+                                  "\tr := rand.New(rand.NewPCG(1, 2))\n"
+                                  "\treturn r.IntN(10)\n}\n");
+    ASSERT_NOT_NULL(r);
+    int idxNew = require_resolved(r, "roll", "math/rand/v2.New");
+    ASSERT_GTE(idxNew, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idxNew].strategy, "lsp_direct");
+    int idxIntN = require_resolved(r, "roll", "math/rand/v2.Rand.IntN");
+    ASSERT_GTE(idxIntN, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idxIntN].strategy, "lsp_type_dispatch");
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(golsp_stdlib_unique_synctest) {
+    CBMFileResult *r = extract_go("package main\n\n"
+                                  "import (\n\t\"testing\"\n\t\"testing/synctest\"\n"
+                                  "\t\"unique\"\n)\n\n"
+                                  "func TestBubble(t *testing.T) {\n"
+                                  "\tsynctest.Test(t, func(t *testing.T) {\n"
+                                  "\t\tsynctest.Wait()\n\t})\n"
+                                  "\th := unique.Make(\"x\")\n"
+                                  "\t_ = h\n}\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "TestBubble", "testing/synctest.Test"), 0);
+    ASSERT_GTE(require_resolved(r, "TestBubble", "testing/synctest.Wait"), 0);
+    ASSERT_GTE(require_resolved(r, "TestBubble", "unique.Make"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Interface embedding method sets (go-interface-embedding) ──── */
+
+TEST(golsp_interface_embedding_method_set) {
+    /* The sole-implementer scan must close the method set over embedding:
+     * RW requires Closer's {CloseIt, Flush} plus its own ReadIt. Full carries
+     * the union — sole implementer; Partial (ReadIt only) must not count. */
+    CBMFileResult *r = extract_go(
+        "package main\n\n"
+        "type Closer interface {\n\tCloseIt() error\n\tFlush() error\n}\n\n"
+        "type RW interface {\n\tCloser\n\tReadIt() int\n}\n\n"
+        "type Full struct{}\n\n"
+        "func (f *Full) CloseIt() error { return nil }\n"
+        "func (f *Full) Flush() error   { return nil }\n"
+        "func (f *Full) ReadIt() int    { return 0 }\n\n"
+        "type Partial struct{}\n\n"
+        "func (p *Partial) ReadIt() int { return 1 }\n\n"
+        "func use(r RW) {\n\tr.ReadIt()\n}\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "use", "ReadIt");
+    ASSERT_GTE(idx, 0);
+    ASSERT_STR_EQ(r->resolved_calls.items[idx].strategy, "lsp_interface_resolve");
+    cbm_free_result(r);
+
+    /* Negative control: with the union-satisfying type gone, the composed
+     * interface must NOT sole-resolve onto the partial implementer. */
+    CBMFileResult *r2 = extract_go(
+        "package main\n\n"
+        "type Closer interface {\n\tCloseIt() error\n\tFlush() error\n}\n\n"
+        "type RW interface {\n\tCloser\n\tReadIt() int\n}\n\n"
+        "type Partial struct{}\n\n"
+        "func (p *Partial) ReadIt() int { return 1 }\n\n"
+        "func use(r RW) {\n\tr.ReadIt()\n}\n");
+    ASSERT_NOT_NULL(r2);
+    int idx2 = require_resolved(r2, "use", "ReadIt");
+    ASSERT_GTE(idx2, 0);
+    ASSERT_STR_EQ(r2->resolved_calls.items[idx2].strategy, "lsp_interface_dispatch");
+    cbm_free_result(r2);
+    PASS();
+}
+
+TEST(golsp_crossfile_iface_embedding_sole_impl) {
+    /* Cross-file: Store embeds Base (raw source spelling in embedded_types —
+     * the registrar qualifies it against def_module_qn) and adds Evict. The
+     * closed set {Get, Put, Evict} has RedisStore as sole implementer, so a
+     * call through a method Store only INHERITS from Base still upgrades. */
+    const char *source = "package main\n\n"
+                         "import \"myapp/svc\"\n\n"
+                         "func process(s svc.Store) {\n\ts.Get(\"key\")\n\ts.Evict()\n}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.process",
+         .short_name = "process",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "myapp/svc.Base",
+         .short_name = "Base",
+         .label = "Interface",
+         .def_module_qn = "myapp/svc",
+         .is_interface = true,
+         .method_names_str = "Get|Put"},
+        {.qualified_name = "myapp/svc.Store",
+         .short_name = "Store",
+         .label = "Interface",
+         .def_module_qn = "myapp/svc",
+         .is_interface = true,
+         .embedded_types = "Base",
+         .method_names_str = "Evict"},
+        {.qualified_name = "myapp/svc.RedisStore",
+         .short_name = "RedisStore",
+         .label = "Class",
+         .def_module_qn = "myapp/svc"},
+        {.qualified_name = "myapp/svc.RedisStore.Get",
+         .short_name = "Get",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.RedisStore"},
+        {.qualified_name = "myapp/svc.RedisStore.Put",
+         .short_name = "Put",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.RedisStore"},
+        {.qualified_name = "myapp/svc.RedisStore.Evict",
+         .short_name = "Evict",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.RedisStore"},
+    };
+    const char *imp_names[] = {"svc"};
+    const char *imp_qns[] = {"myapp/svc"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 7, imp_names,
+                         imp_qns, 1, NULL, &out);
+
+    int idxGet = find_resolved_arr_confident(&out, "process", "Get");
+    ASSERT_GTE(idxGet, 0);
+    ASSERT_STR_EQ(out.items[idxGet].strategy, "lsp_interface_resolve");
+    ASSERT_STR_EQ(out.items[idxGet].callee_qn, "myapp/svc.RedisStore.Get");
+    int idxEvict = find_resolved_arr_confident(&out, "process", "Evict");
+    ASSERT_GTE(idxEvict, 0);
+    ASSERT_STR_EQ(out.items[idxEvict].strategy, "lsp_interface_resolve");
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* ── Promoted-method satisfaction (go-promoted-method-satisfaction) ── */
+
+TEST(golsp_crossfile_promoted_method_satisfaction) {
+    /* RedisStore embeds BaseStore (which owns Get) and adds Put; the
+     * interface needs {Get, Put}. BaseStore alone lacks Put, so RedisStore
+     * is the sole implementer — but only if the satisfaction scan walks
+     * embedded_types. The upgraded target for s.Get() is the PROMOTED
+     * method, i.e. BaseStore.Get. */
+    const char *source = "package main\n\n"
+                         "import \"myapp/svc\"\n\n"
+                         "func process(s svc.Store) {\n\ts.Get(\"key\")\n}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.process",
+         .short_name = "process",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "myapp/svc.Store",
+         .short_name = "Store",
+         .label = "Interface",
+         .def_module_qn = "myapp/svc",
+         .is_interface = true,
+         .method_names_str = "Get|Put"},
+        {.qualified_name = "myapp/svc.BaseStore",
+         .short_name = "BaseStore",
+         .label = "Class",
+         .def_module_qn = "myapp/svc"},
+        {.qualified_name = "myapp/svc.BaseStore.Get",
+         .short_name = "Get",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.BaseStore"},
+        {.qualified_name = "myapp/svc.RedisStore",
+         .short_name = "RedisStore",
+         .label = "Class",
+         .def_module_qn = "myapp/svc",
+         .embedded_types = "BaseStore"},
+        {.qualified_name = "myapp/svc.RedisStore.Put",
+         .short_name = "Put",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.RedisStore"},
+    };
+    const char *imp_names[] = {"svc"};
+    const char *imp_qns[] = {"myapp/svc"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 6, imp_names,
+                         imp_qns, 1, NULL, &out);
+
+    int idxGet = find_resolved_arr_confident(&out, "process", "Get");
+    ASSERT_GTE(idxGet, 0);
+    ASSERT_STR_EQ(out.items[idxGet].strategy, "lsp_interface_resolve");
+    ASSERT_STR_EQ(out.items[idxGet].callee_qn, "myapp/svc.BaseStore.Get");
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(golsp_crossfile_embeds_enable_promoted_dispatch) {
+    /* go-embeds-into-crossfile-defs: a struct defined in ANOTHER file used to
+     * register with empty embedded_types under Tier-2 (Phase 1b is skipped),
+     * so promoted-method calls hit method_not_found. With base_classes carried
+     * on the def and qualified at registration, b.Handle() promoted from the
+     * embedded Base resolves via lsp_embed_dispatch. */
+    const char *source = "package main\n\n"
+                         "import \"myapp/svc\"\n\n"
+                         "func run(o *svc.Outer) {\n\to.Handle()\n}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.run",
+         .short_name = "run",
+         .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "myapp/svc.Base",
+         .short_name = "Base",
+         .label = "Class",
+         .def_module_qn = "myapp/svc"},
+        {.qualified_name = "myapp/svc.Base.Handle",
+         .short_name = "Handle",
+         .label = "Method",
+         .def_module_qn = "myapp/svc",
+         .receiver_type = "myapp/svc.Base"},
+        {.qualified_name = "myapp/svc.Outer",
+         .short_name = "Outer",
+         .label = "Class",
+         .def_module_qn = "myapp/svc",
+         .embedded_types = "*Base"},
+    };
+    const char *imp_names[] = {"svc"};
+    const char *imp_qns[] = {"myapp/svc"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_go_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 4, imp_names,
+                         imp_qns, 1, NULL, &out);
+
+    int idx = find_resolved_arr_confident(&out, "run", "Handle");
+    ASSERT_GTE(idx, 0);
+    ASSERT_STR_EQ(out.items[idx].callee_qn, "myapp/svc.Base.Handle");
+    ASSERT_STR_EQ(out.items[idx].strategy, "lsp_embed_dispatch");
+
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite ─────────────────────────────────────────────────────── */
 
 SUITE(go_lsp) {

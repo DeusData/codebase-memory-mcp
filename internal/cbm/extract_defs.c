@@ -2537,8 +2537,104 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
     return result;
 }
 
+/* Go: embedded types are the Go analog of a base-class list — `type S struct
+ * { Inner; *Outer; io.Reader }` embeds are the UNNAMED field_declarations;
+ * `type I interface { io.Reader; A; M() }` embeds are the single-child
+ * type_elem entries (union elements like `~int | string` have several
+ * children and are skipped). Emitting their SOURCE SPELLING into
+ * base_classes (a) lets the cross-file Go registrars qualify and register
+ * embedded_types for files whose ASTs they never see (the shared Tier-2
+ * registry skips the per-file Phase 1b scan, so promoted-method dispatch on
+ * cross-file structs was dead there), and (b) turns on INHERITS/IMPLEMENTS
+ * edges plus pass_semantic's method-set unions for Go embedding. */
+static const char **extract_go_embedded_bases(CBMArena *a, TSNode type_spec, const char *source) {
+    TSNode inner = ts_node_child_by_field_name(type_spec, TS_FIELD("type"));
+    if (ts_node_is_null(inner)) {
+        return NULL;
+    }
+    const char *ik = ts_node_type(inner);
+    const char *bases[MAX_BASES];
+    int base_count = 0;
+
+    if (strcmp(ik, "struct_type") == 0) {
+        TSNode list = cbm_find_child_by_kind(inner, "field_declaration_list");
+        if (ts_node_is_null(list)) {
+            return NULL;
+        }
+        uint32_t nc = ts_node_child_count(list);
+        for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
+            TSNode field = ts_node_child(list, i);
+            if (ts_node_is_null(field) || !ts_node_is_named(field) ||
+                strcmp(ts_node_type(field), "field_declaration") != 0) {
+                continue;
+            }
+            TSNode fname = ts_node_child_by_field_name(field, TS_FIELD("name"));
+            TSNode ftype = ts_node_child_by_field_name(field, TS_FIELD("type"));
+            if (!ts_node_is_null(fname) || ts_node_is_null(ftype)) {
+                continue; /* named field — not an embed */
+            }
+            char *text = cbm_node_text(a, ftype, source);
+            if (!text || !text[0]) {
+                continue;
+            }
+            /* Keep the source spelling minus pointerness and generic args:
+             * "*Outer" → "Outer", "Base[T]" → "Base", "io.Reader" as-is. */
+            while (*text == '*') {
+                text++;
+            }
+            char *br = strchr(text, '[');
+            if (br) {
+                *br = '\0';
+            }
+            if (text[0]) {
+                bases[base_count++] = text;
+            }
+        }
+    } else if (strcmp(ik, "interface_type") == 0) {
+        uint32_t nc = ts_node_named_child_count(inner);
+        for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
+            TSNode elem = ts_node_named_child(inner, i);
+            if (ts_node_is_null(elem) || strcmp(ts_node_type(elem), "type_elem") != 0 ||
+                ts_node_named_child_count(elem) != 1) {
+                continue;
+            }
+            TSNode et = ts_node_named_child(elem, 0);
+            const char *ek = ts_node_type(et);
+            if (strcmp(ek, "type_identifier") != 0 && strcmp(ek, "qualified_type") != 0) {
+                continue;
+            }
+            char *text = cbm_node_text(a, et, source);
+            if (text && text[0]) {
+                bases[base_count++] = text;
+            }
+        }
+    } else {
+        return NULL;
+    }
+
+    if (base_count == 0) {
+        return NULL;
+    }
+    const char **result = (const char **)cbm_arena_alloc(a, (base_count + 1) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < base_count; i++) {
+        result[i] = bases[i];
+    }
+    result[base_count] = NULL;
+    return result;
+}
+
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    // Go: type_spec embeds (struct + interface) — see extract_go_embedded_bases.
+    if (lang == CBM_LANG_GO) {
+        if (strcmp(ts_node_type(node), "type_spec") == 0) {
+            return extract_go_embedded_bases(a, node, source);
+        }
+        return NULL;
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -3518,6 +3614,78 @@ static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpe
  * Walks to the parameter_declaration's `type` field, unwrapping pointer_type
  * and generic_type, and returns the type_identifier text (e.g. "OrderService").
  * Returns NULL if no type_identifier is found. */
+/* Go subtests: collect `X.Run("name", func(...){...})` names inside a Test*
+ * function body (any receiver named .Run — in practice t / tt). Names land on
+ * CBMDefinition.subtests and are emitted as a "subtests" JSON array in node
+ * properties, so `go test -run TestFoo/case_name` failures map to graph
+ * nodes. Nested t.Run calls are collected flat. Requires a string first arg
+ * AND a func_literal second arg (the PLAN-adjudicated shape) so unrelated
+ * `runner.Run("cmd", args)` calls never masquerade as subtests. */
+enum { GO_SUBTEST_MAX = 32, GO_SUBTEST_WALK_DEPTH = 40 };
+
+static void go_collect_subtests_walk(CBMArena *a, TSNode node, const char *source,
+                                     const char **out, int *count, int depth) {
+    if (ts_node_is_null(node) || depth > GO_SUBTEST_WALK_DEPTH || *count >= GO_SUBTEST_MAX) {
+        return;
+    }
+    if (strcmp(ts_node_type(node), "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "selector_expression") == 0) {
+            TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+            char *fname = ts_node_is_null(field) ? NULL : cbm_node_text(a, field, source);
+            if (fname && strcmp(fname, "Run") == 0) {
+                TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+                if (!ts_node_is_null(args) && ts_node_named_child_count(args) >= 2) {
+                    TSNode a0 = ts_node_named_child(args, 0);
+                    TSNode a1 = ts_node_named_child(args, 1);
+                    const char *k0 = ts_node_type(a0);
+                    if ((strcmp(k0, "interpreted_string_literal") == 0 ||
+                         strcmp(k0, "raw_string_literal") == 0) &&
+                        strcmp(ts_node_type(a1), "func_literal") == 0) {
+                        char *text = cbm_node_text(a, a0, source);
+                        if (text && text[0]) {
+                            size_t len = strlen(text);
+                            if (len >= 2 && (text[0] == '"' || text[0] == '`')) {
+                                text[len - 1] = '\0';
+                                text++;
+                            }
+                            if (text[0] && *count < GO_SUBTEST_MAX) {
+                                out[(*count)++] = text;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && *count < GO_SUBTEST_MAX; i++) {
+        go_collect_subtests_walk(a, ts_node_named_child(node, i), source, out, count, depth + 1);
+    }
+}
+
+static const char **go_collect_subtests(CBMArena *a, TSNode func_node, const char *source) {
+    TSNode body = ts_node_child_by_field_name(func_node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    const char *names[GO_SUBTEST_MAX];
+    int count = 0;
+    go_collect_subtests_walk(a, body, source, names, &count, 0);
+    if (count == 0) {
+        return NULL;
+    }
+    const char **result = (const char **)cbm_arena_alloc(a, (count + 1) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        result[i] = names[i];
+    }
+    result[count] = NULL;
+    return result;
+}
+
 static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
     uint32_t nc = ts_node_child_count(recv);
     for (uint32_t i = 0; i < nc; i++) {
@@ -3823,6 +3991,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // main is always an entry point
     if (strcmp(name, "main") == 0) {
         def.is_entry_point = true;
+    }
+
+    // Go: collect t.Run subtest names onto the enclosing Test* function def
+    // (Fuzz*/Benchmark* take no subtests worth mapping; the Test-prefix shape
+    // rule matches cbm_is_test_func_name in pass_tests.c).
+    if (ctx->language == CBM_LANG_GO &&
+        strcmp(ts_node_type(node), "function_declaration") == 0 &&
+        strncmp(name, "Test", 4) == 0 &&
+        (name[4] == '\0' || (name[4] >= 'A' && name[4] <= 'Z'))) {
+        def.subtests = go_collect_subtests(a, node, ctx->source);
     }
 
     cbm_defs_push(&ctx->result->defs, a, def);

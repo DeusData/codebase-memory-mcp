@@ -493,7 +493,85 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
  * see interfaces with an empty method set and the sole-implementer branch
  * (go_lsp.c lsp_interface_resolve, 0.95) never fires on the production
  * Tier-2/per-file cross paths — only the 0.85 lsp_interface_dispatch
- * fallback. */
+ * fallback.
+ *
+ * The fold is TRANSITIVE over same-file interface embedding: for
+ * `type A interface { B; Extra() }` with B in the same file, A's folded set
+ * is B's methods plus Extra. Embeds of interfaces from OTHER files (or the
+ * stdlib) are left to the resolver's registry-side closure
+ * (go_iface_sole_impl_method walks embedded_types), which sees the whole
+ * project; the fold only ever closes over what this file declares. */
+enum { PXC_GO_IFACE_METHODS_MAX = 64, PXC_GO_IFACE_EMBED_DEPTH = 8 };
+
+/* Append the method names of the interface def at qualified_name `iface_qn`
+ * (its same-file Method defs plus, recursively, same-file embedded
+ * interfaces') into names[]. Embedded spellings come from the CBMDefinition
+ * base_classes source text: bare names match same-file interfaces by short
+ * name under the same module. */
+static void pxc_go_iface_collect(const CBMFileResult *result, const CBMLSPDef *defs, int start,
+                                 int end, const CBMLSPDef *iface, const char **names, int *count,
+                                 const CBMLSPDef **visited, int *vcount, int depth) {
+    if (!iface || depth > PXC_GO_IFACE_EMBED_DEPTH) {
+        return;
+    }
+    for (int i = 0; i < *vcount; i++) {
+        if (visited[i] == iface) {
+            return;
+        }
+    }
+    if (*vcount >= PXC_GO_IFACE_EMBED_DEPTH * 2) {
+        return;
+    }
+    visited[(*vcount)++] = iface;
+
+    for (int di = 0; di < result->defs.count && *count < PXC_GO_IFACE_METHODS_MAX; di++) {
+        const CBMDefinition *md = &result->defs.items[di];
+        if (!md->label || !md->parent_class || !md->name || !md->name[0] ||
+            strcmp(md->label, "Method") != 0 ||
+            strcmp(md->parent_class, iface->qualified_name) != 0) {
+            continue;
+        }
+        bool dup = false;
+        for (int k = 0; k < *count; k++) {
+            if (strcmp(names[k], md->name) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            names[(*count)++] = md->name;
+        }
+    }
+
+    /* Same-file embedded interfaces, matched by short name (bare source
+     * spelling — dotted spellings are cross-package and out of fold scope). */
+    if (iface->embedded_types) {
+        const char *p = iface->embedded_types;
+        while (*p) {
+            const char *sep = strchr(p, '|');
+            size_t len = sep ? (size_t)(sep - p) : strlen(p);
+            if (len > 0 && memchr(p, '.', len) == NULL) {
+                for (int si = start; si < end; si++) {
+                    const CBMLSPDef *cand = &defs[si];
+                    if (cand == iface || !cand->label || !cand->short_name ||
+                        strcmp(cand->label, "Interface") != 0 ||
+                        strlen(cand->short_name) != len ||
+                        strncmp(cand->short_name, p, len) != 0) {
+                        continue;
+                    }
+                    pxc_go_iface_collect(result, defs, start, end, cand, names, count, visited,
+                                         vcount, depth + 1);
+                    break;
+                }
+            }
+            if (!sep) {
+                break;
+            }
+            p = sep + 1;
+        }
+    }
+}
+
 static void pxc_fold_go_interface_methods(CBMArena *arena, const CBMFileResult *result,
                                           CBMLSPDef *defs, int start, int end) {
     if (!arena || !result || !defs || start >= end) {
@@ -507,20 +585,17 @@ static void pxc_fold_go_interface_methods(CBMArena *arena, const CBMFileResult *
         if (dst->method_names_str && dst->method_names_str[0]) {
             continue; /* already carried (e.g. surface round-trip) */
         }
+        const char *names[PXC_GO_IFACE_METHODS_MAX];
         int count = 0;
-        size_t total = 0; /* name bytes; separators and NUL added below */
-        for (int di = 0; di < result->defs.count; di++) {
-            const CBMDefinition *md = &result->defs.items[di];
-            if (!md->label || !md->parent_class || !md->name || !md->name[0] ||
-                strcmp(md->label, "Method") != 0 ||
-                strcmp(md->parent_class, dst->qualified_name) != 0) {
-                continue;
-            }
-            total += strlen(md->name);
-            count++;
-        }
+        const CBMLSPDef *visited[PXC_GO_IFACE_EMBED_DEPTH * 2];
+        int vcount = 0;
+        pxc_go_iface_collect(result, defs, start, end, dst, names, &count, visited, &vcount, 0);
         if (count == 0) {
             continue;
+        }
+        size_t total = 0;
+        for (int i = 0; i < count; i++) {
+            total += strlen(names[i]);
         }
         size_t bufsz = total + (size_t)(count - 1) + 1;
         char *buf = (char *)cbm_arena_alloc(arena, bufsz);
@@ -528,21 +603,13 @@ static void pxc_fold_go_interface_methods(CBMArena *arena, const CBMFileResult *
             continue;
         }
         char *p = buf;
-        int written = 0;
-        for (int di = 0; di < result->defs.count; di++) {
-            const CBMDefinition *md = &result->defs.items[di];
-            if (!md->label || !md->parent_class || !md->name || !md->name[0] ||
-                strcmp(md->label, "Method") != 0 ||
-                strcmp(md->parent_class, dst->qualified_name) != 0) {
-                continue;
-            }
-            size_t n = strlen(md->name);
-            memcpy(p, md->name, n);
+        for (int i = 0; i < count; i++) {
+            size_t n = strlen(names[i]);
+            memcpy(p, names[i], n);
             p += n;
-            if (written + 1 < count) {
+            if (i + 1 < count) {
                 *p++ = '|';
             }
-            written++;
         }
         *p = '\0';
         dst->method_names_str = buf;

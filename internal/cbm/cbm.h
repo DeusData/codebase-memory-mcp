@@ -227,6 +227,11 @@ typedef struct {
      * that declared this method.  Kept at the tail so zero-initialised
      * callers in every other language remain ABI/source compatible. */
     const char *impl_trait;
+    /* Go only: t.Run subtest names collected from a Test* function body
+     * (NULL-terminated, NULL if none). Emitted as a "subtests" JSON array in
+     * node properties so agents can map `go test -run TestFoo/case` failures
+     * to graph nodes. Tail field — zero-init callers stay compatible. */
+    const char **subtests;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
