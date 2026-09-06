@@ -739,8 +739,8 @@ SUITE(perl_lsp) {
      * it) — the whole fixture currently yields zero resolutions, so the tree
      * differs from the assumed package-like shape. Re-enable with the fix.
      * Tracked in docs/lsp-uplift/PLAN.md (perl-corinna-class). */
-    /* RUN_TEST(perllsp_corinna_method_dispatch); */
-    /* RUN_TEST(perllsp_corinna_constructor_dispatch); */
+    RUN_TEST(perllsp_corinna_method_dispatch);
+    RUN_TEST(perllsp_corinna_constructor_dispatch);
     RUN_TEST(perllsp_stdlib_file_basename);
     RUN_TEST(perllsp_stdlib_dbi_typed_chain);
 }
