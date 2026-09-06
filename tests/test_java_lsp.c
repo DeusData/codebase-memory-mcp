@@ -1444,10 +1444,9 @@ TEST(jlsp_record_call) {
         "}\n";
     CBMFileResult *r = extract_java(src);
     ASSERT_NOT_NULL(r);
-    /* Records create accessor methods; we don't currently model them
-     * specially, but the call should at least be registered via the AST
-     * walk (either resolved or as diagnostic). */
-    ASSERT_GTE(r->resolved_calls.count, 1);
+    /* Record components are modeled as fields + synthetic zero-arg
+     * accessors: p.x() resolves to Point.x. */
+    ASSERT_GTE(require_resolved(r, "xCoord", "Point.x"), 0);
     cbm_free_result(r);
     PASS();
 }
@@ -1874,6 +1873,815 @@ TEST(jlsp_diamond_interface_method) {
     PASS();
 }
 
+/* ── Pattern matching (Java 16 instanceof / Java 21 switch patterns) ── */
+
+TEST(jlsp_instanceof_pattern) {
+    const char *src = "public class Main {\n"
+                      "  public int run(Object o) {\n"
+                      "    if (o instanceof String s) return s.length();\n"
+                      "    return 0;\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_switch_type_pattern) {
+    const char *src = "public class Main {\n"
+                      "  public String run(Object x) {\n"
+                      "    return switch (x) {\n"
+                      "      case String s -> s.trim();\n"
+                      "      default -> \"\";\n"
+                      "    };\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.trim"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_switch_guard_binding) {
+    /* The guard (`when` expr) must see the pattern binding, and calls inside
+     * the guard must resolve. */
+    const char *src = "public class Main {\n"
+                      "  public int run(Object x) {\n"
+                      "    return switch (x) {\n"
+                      "      case String s when s.isEmpty() -> 0;\n"
+                      "      case String t -> t.length();\n"
+                      "      default -> -1;\n"
+                      "    };\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.isEmpty"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_switch_record_pattern) {
+    /* Record deconstruction: `case Circle(double r)` binds r by the
+     * component's declared type; a type-pattern arm binds the whole value. */
+    const char *src = "public class Main {\n"
+                      "  record Circle(double radius) {}\n"
+                      "  public double run(Object s, String lim) {\n"
+                      "    return switch (s) {\n"
+                      "      case Circle c -> c.radius();\n"
+                      "      default -> 0.0;\n"
+                      "    };\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Circle.radius"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_switch_record_deconstruction) {
+    /* Deconstructed component (String n) bound by its declared type; the
+     * guard's call on the binding must resolve. */
+    const char *src = "public class Main {\n"
+                      "  record Tag(String name) {}\n"
+                      "  public int run(Object o) {\n"
+                      "    return switch (o) {\n"
+                      "      case Tag(String n) when n.isBlank() -> 0;\n"
+                      "      case Tag(String m) -> m.length();\n"
+                      "      default -> -1;\n"
+                      "    };\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.isBlank"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_switch_record_var_component) {
+    /* `var` deconstruction component falls back to the record's registered
+     * field type by position (depends on record-components field typing). */
+    const char *src = "public class Main {\n"
+                      "  record Named(String label) {}\n"
+                      "  public int run(Object o) {\n"
+                      "    return switch (o) {\n"
+                      "      case Named(var l) -> l.length();\n"
+                      "      default -> 0;\n"
+                      "    };\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_instanceof_pattern_colon_switch) {
+    /* Colon-style statement group with a type pattern (Java 21). */
+    const char *src = "public class Main {\n"
+                      "  public void run(Object x) {\n"
+                      "    switch (x) {\n"
+                      "      case String s:\n"
+                      "        s.trim();\n"
+                      "        break;\n"
+                      "      default:\n"
+                      "        break;\n"
+                      "    }\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.trim"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Constructor delegation (this(...) / super(...)) ─────────────── */
+
+TEST(jlsp_ctor_this_delegation) {
+    const char *src = "public class P {\n"
+                      "  P() { this(0); }\n"
+                      "  P(int v) { init(v); }\n"
+                      "  void init(int v) {}\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "P.P", "P.P"), 0);
+    ASSERT_GTE(require_resolved(r, "P.P", "init"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_ctor_super_delegation) {
+    const char *src = "class B {\n"
+                      "  B(int v) {}\n"
+                      "}\n"
+                      "class C extends B {\n"
+                      "  C() { super(1); }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "C.C", "B.B"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_ctor_super_no_registered_ctor) {
+    /* No B ctor registered: emit lsp_constructor_synth to the class node —
+     * never a crash, never a bogus method target. */
+    const char *src = "class B {}\n"
+                      "class C extends B {\n"
+                      "  C() { super(); }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    int idx = find_resolved(r, "C.C", "B");
+    ASSERT_GTE(idx, 0);
+    ASSERT(strcmp(r->resolved_calls.items[idx].strategy, "lsp_constructor_synth") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_ctor_delegation_raw_call_row) {
+    /* Extraction join: explicit_constructor_invocation must produce a raw
+     * CALL row whose callee is the enclosing class short name (`this`) /
+     * the superclass leaf (`super`) so the pipeline join has a site. */
+    const char *src = "class B { B(int v) {} }\n"
+                      "class C extends B {\n"
+                      "  C() { super(1); }\n"
+                      "  C(int x) { this(); }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    int saw_super = 0, saw_this = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || !c->enclosing_func_qn) continue;
+        if (strcmp(c->callee_name, "B") == 0 && strstr(c->enclosing_func_qn, "C.C"))
+            saw_super = 1;
+        if (strcmp(c->callee_name, "C") == 0 && strstr(c->enclosing_func_qn, "C.C"))
+            saw_this = 1;
+    }
+    ASSERT_EQ(saw_super, 1);
+    ASSERT_EQ(saw_this, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Record components (fields + synthetic accessors) ────────────── */
+
+TEST(jlsp_record_accessor_chain) {
+    const char *src = "public class Main {\n"
+                      "  record User(String name) {}\n"
+                      "  public int run(User u) {\n"
+                      "    return u.name().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "User.name"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_record_field_access) {
+    /* Direct component read (no parens) types like a field. */
+    const char *src = "public class Main {\n"
+                      "  record Box(String tag) {}\n"
+                      "  public int run(Box b) {\n"
+                      "    return b.tag.length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_record_compact_ctor) {
+    const char *src = "public record R(int v) {\n"
+                      "  R { check(v); }\n"
+                      "  static void check(int v) {}\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "R.R", "check"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_record_canonical_ctor) {
+    const char *src = "public class Main {\n"
+                      "  record User(String name) {}\n"
+                      "  public int run() {\n"
+                      "    var u = new User(\"x\");\n"
+                      "    return u.name().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "User.name"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_record_explicit_accessor_wins) {
+    /* An explicit accessor in the body must not be duplicated by the
+     * synthetic one; the call still resolves. */
+    const char *src = "public class Main {\n"
+                      "  record User(String name) {\n"
+                      "    public String name() { return name; }\n"
+                      "  }\n"
+                      "  public int run(User u) {\n"
+                      "    return u.name().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "User.name"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    /* Exactly ONE Method def named User.name (the explicit one). */
+    int accessor_defs = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Method") == 0 && d->qualified_name &&
+            strstr(d->qualified_name, "User.name"))
+            accessor_defs++;
+    }
+    ASSERT_EQ(accessor_defs, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_record_extraction_defs) {
+    /* Extraction emits per-component Field defs + synthetic accessor Method
+     * defs so records work cross-file (and from Kotlin). */
+    const char *src = "public record Point(int x, int y) {}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    int field_x = 0, method_x = 0, method_y = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->label || !d->name) continue;
+        if (strcmp(d->label, "Field") == 0 && strcmp(d->name, "x") == 0 && d->return_type &&
+            strcmp(d->return_type, "int") == 0)
+            field_x++;
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "x") == 0) method_x++;
+        if (strcmp(d->label, "Method") == 0 && strcmp(d->name, "y") == 0) method_y++;
+    }
+    ASSERT_EQ(field_x, 1);
+    ASSERT_EQ(method_x, 1);
+    ASSERT_EQ(method_y, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Cross-file field types (field_defs fold + registrar consumption) ── */
+
+TEST(jlsp_cross_field_chain) {
+    /* Class A's field type arrives via field_defs (the cross surface), not
+     * from this file's AST: `h.svc.handle()` must resolve through it. */
+    const char *src = "package demo;\n"
+                      "public class App {\n"
+                      "  public void go(Handler h) { h.svc.handle(); }\n"
+                      "}\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "demo.Handler";
+    defs[0].short_name = "Handler";
+    defs[0].label = "Class";
+    defs[0].field_defs = "svc:demo.Service";
+    defs[1].qualified_name = "demo.Service";
+    defs[1].short_name = "Service";
+    defs[1].label = "Class";
+    defs[2].qualified_name = "demo.Service.handle";
+    defs[2].short_name = "handle";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "demo.Service";
+    defs[2].return_types = "void";
+    const char *imp_names[] = {"Handler"};
+    const char *imp_qns[] = {"demo.Handler"};
+    cbm_run_java_lsp_cross(&arena, src, (int)strlen(src), "test.App", defs, 3, imp_names, imp_qns,
+                           1, NULL, &out);
+    int found = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].confidence < 0.5f) continue;
+        if (out.items[i].callee_qn && strstr(out.items[i].callee_qn, "Service.handle")) found = 1;
+    }
+    ASSERT_EQ(found, 1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(jlsp_cross_generic_field) {
+    /* Generic field type text survives the fold: items.get(0).length(). */
+    const char *src = "package demo;\n"
+                      "public class App {\n"
+                      "  public int go(Holder h) { return h.items.get(0).length(); }\n"
+                      "}\n";
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    CBMLSPDef defs[1];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "demo.Holder";
+    defs[0].short_name = "Holder";
+    defs[0].label = "Class";
+    defs[0].field_defs = "items:java.util.List<java.lang.String>";
+    const char *imp_names[] = {"Holder"};
+    const char *imp_qns[] = {"demo.Holder"};
+    cbm_run_java_lsp_cross(&arena, src, (int)strlen(src), "test.App", defs, 1, imp_names, imp_qns,
+                           1, NULL, &out);
+    int found = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].confidence < 0.5f) continue;
+        if (out.items[i].callee_qn && strstr(out.items[i].callee_qn, "String.length")) found = 1;
+    }
+    ASSERT_EQ(found, 1);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(jlsp_cross_tier2_field_chain) {
+    /* Production pair: shared sealed base registry + per-file overlay. Both
+     * the field_defs consumption (Handler.svc from the base) and the newly
+     * wired own-file AST enrichment run in this path. */
+    const char *src = "package demo;\n"
+                      "public class App {\n"
+                      "  Handler h;\n"
+                      "  public void go() { h.svc.handle(); }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java_at(src, "App.java");
+    ASSERT_NOT_NULL(r);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef defs[3];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "demo.Handler";
+    defs[0].short_name = "Handler";
+    defs[0].label = "Class";
+    defs[0].field_defs = "svc:demo.Service";
+    defs[0].lang = CBM_LANG_JAVA;
+    defs[1].qualified_name = "demo.Service";
+    defs[1].short_name = "Service";
+    defs[1].label = "Class";
+    defs[1].lang = CBM_LANG_JAVA;
+    defs[2].qualified_name = "demo.Service.handle";
+    defs[2].short_name = "handle";
+    defs[2].label = "Method";
+    defs[2].receiver_type = "demo.Service";
+    defs[2].return_types = "void";
+    defs[2].lang = CBM_LANG_JAVA;
+    CBMTypeRegistry *base = cbm_java_build_cross_registry(&arena, defs, 3);
+    ASSERT_NOT_NULL(base);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    const char *imp_names[] = {"Handler"};
+    const char *imp_qns[] = {"demo.Handler"};
+    cbm_run_java_lsp_cross_with_registry(&arena, r, src, (int)strlen(src), "test.App", base,
+                                         imp_names, imp_qns, 1, NULL, &out);
+    int found = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].confidence < 0.5f) continue;
+        if (out.items[i].callee_qn && strstr(out.items[i].callee_qn, "Service.handle")) found = 1;
+    }
+    ASSERT_EQ(found, 1);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_cross_tier2_generic_signature) {
+    /* 对拍A (java-cross-file-field-types): the Tier-2 path must re-run
+     * signature patching so generics survive — registry-driven SAM binding
+     * needs Consumer<String>, which extraction strips to Consumer. */
+    const char *src = "package demo;\n"
+                      "import java.util.function.Consumer;\n"
+                      "public class App {\n"
+                      "  void each(Consumer<String> c) {}\n"
+                      "  public void go() { each(s -> s.trim()); }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java_at(src, "App.java");
+    ASSERT_NOT_NULL(r);
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry *base = cbm_java_build_cross_registry(&arena, NULL, 0);
+    ASSERT_NOT_NULL(base);
+    CBMResolvedCallArray out;
+    memset(&out, 0, sizeof(out));
+    cbm_run_java_lsp_cross_with_registry(&arena, r, src, (int)strlen(src), "test.App", base, NULL,
+                                         NULL, 0, NULL, &out);
+    int found = 0;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].confidence < 0.5f) continue;
+        if (out.items[i].callee_qn && strstr(out.items[i].callee_qn, "String.trim")) found = 1;
+    }
+    ASSERT_EQ(found, 1);
+    cbm_arena_destroy(&arena);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Test-annotation detection (JUnit4/5, TestNG) ────────────────── */
+
+TEST(jlsp_junit5_annotated_test) {
+    const char *src = "package com.x;\n"
+                      "import org.junit.jupiter.api.Test;\n"
+                      "public class UserServiceCheck {\n"
+                      "  @Test void returnsUser() {}\n"
+                      "  void helperOnly() {}\n"
+                      "  @ParameterizedTest void eachUser() {}\n"
+                      "}\n";
+    /* Deliberately NOT a conventional test path/suffix. */
+    CBMFileResult *r = extract_java_at(src, "src/main/java/com/x/UserServiceCheck.java");
+    ASSERT_NOT_NULL(r);
+    int annotated = 0, helper_marked = 0, parameterized = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name) continue;
+        if (strcmp(d->name, "returnsUser") == 0 && d->is_test && d->is_test_annotated) annotated = 1;
+        if (strcmp(d->name, "helperOnly") == 0 && (d->is_test || d->is_test_annotated))
+            helper_marked = 1;
+        if (strcmp(d->name, "eachUser") == 0 && d->is_test_annotated) parameterized = 1;
+    }
+    ASSERT_EQ(annotated, 1);
+    ASSERT_EQ(helper_marked, 0);
+    ASSERT_EQ(parameterized, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_spring_boot_test_not_marked) {
+    /* 对拍B: suffix-matching must never fire — @SpringBootTest ends in
+     * "Test" but is a configuration annotation, not a test method marker. */
+    const char *src = "package com.x;\n"
+                      "public class Wiring {\n"
+                      "  @SpringBootTest void configure() {}\n"
+                      "  @WebMvcTest void mvc() {}\n"
+                      "}\n";
+    CBMFileResult *r = extract_java_at(src, "src/main/java/com/x/Wiring.java");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name) continue;
+        if (strcmp(d->name, "configure") == 0 || strcmp(d->name, "mvc") == 0) {
+            ASSERT_EQ(d->is_test_annotated ? 1 : 0, 0);
+            ASSERT_EQ(d->is_test ? 1 : 0, 0);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_testng_class_level_test) {
+    /* TestNG class-level @Test marks methods — but ONLY with an org.testng
+     * import in the file (对拍B gate). */
+    const char *src_testng = "package com.x;\n"
+                             "import org.testng.annotations.Test;\n"
+                             "@Test\n"
+                             "public class AllChecks {\n"
+                             "  public void verifyOne() {}\n"
+                             "}\n";
+    CBMFileResult *r = extract_java_at(src_testng, "src/main/java/com/x/AllChecks.java");
+    ASSERT_NOT_NULL(r);
+    int marked = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "verifyOne") == 0 && d->is_test_annotated) marked = 1;
+    }
+    ASSERT_EQ(marked, 1);
+    cbm_free_result(r);
+
+    /* Same shape WITHOUT the org.testng import: class-level @Test (e.g. a
+     * project's own annotation) must not propagate. */
+    const char *src_plain = "package com.x;\n"
+                            "@Test\n"
+                            "public class AllChecks {\n"
+                            "  public void verifyOne() {}\n"
+                            "}\n";
+    r = extract_java_at(src_plain, "src/main/java/com/x/AllChecks.java");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "verifyOne") == 0) {
+            ASSERT_EQ(d->is_test_annotated ? 1 : 0, 0);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Lombok synthetic members ────────────────────────────────────── */
+
+TEST(jlsp_lombok_getter) {
+    const char *src = "@Getter\n"
+                      "public class User {\n"
+                      "  String name;\n"
+                      "  public int run(User u) {\n"
+                      "    return u.getName().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "User.getName"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_lombok_data_setter) {
+    const char *src = "@Data\n"
+                      "public class User {\n"
+                      "  String name;\n"
+                      "  public void run(User u) {\n"
+                      "    u.setName(\"x\");\n"
+                      "    u.getName().trim();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "User.setName"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.trim"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_lombok_boolean_is_getter) {
+    const char *src = "@Getter\n"
+                      "public class Flag {\n"
+                      "  boolean active;\n"
+                      "  public boolean run(Flag f) {\n"
+                      "    return f.isActive();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Flag.isActive"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_lombok_builder_chain) {
+    const char *src = "@Builder\n"
+                      "@Getter\n"
+                      "public class User {\n"
+                      "  String name;\n"
+                      "  public int run() {\n"
+                      "    return User.builder().name(\"x\").build().getName().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "User.builder"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "UserBuilder.build"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_lombok_slf4j) {
+    const char *src = "@Slf4j\n"
+                      "public class Service {\n"
+                      "  public void run() {\n"
+                      "    log.info(\"hello\");\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Logger.info"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_lombok_negative_no_annotation) {
+    /* No Lombok annotations: no synthetic getName must appear. */
+    const char *src = "public class User {\n"
+                      "  String name;\n"
+                      "  public void run(User u) {\n"
+                      "    u.getName();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_EQ(find_resolved(r, "run", "User.getName"), -1);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Stdlib expansion (Java 21 surface) ──────────────────────────── */
+
+TEST(jlsp_std_bigdecimal_chain) {
+    const char *src = "import java.math.BigDecimal;\n"
+                      "public class Main {\n"
+                      "  public BigDecimal run(BigDecimal a, BigDecimal b) {\n"
+                      "    return a.add(b).setScale(2);\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "BigDecimal.add"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "BigDecimal.setScale"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_httpclient) {
+    const char *src =
+        "import java.net.http.HttpClient;\n"
+        "import java.net.http.HttpRequest;\n"
+        "import java.net.http.HttpResponse;\n"
+        "public class Main {\n"
+        "  public void run(HttpRequest req) throws Exception {\n"
+        "    HttpClient.newHttpClient().send(req, HttpResponse.BodyHandlers.ofString());\n"
+        "  }\n"
+        "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "HttpClient.newHttpClient"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "HttpClient.send"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_virtual_thread) {
+    const char *src = "public class Main {\n"
+                      "  public void run(Runnable r) {\n"
+                      "    Thread.ofVirtual().name(\"w\").start(r);\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "ofVirtual"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "OfVirtual.start"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_countdown_latch) {
+    const char *src = "import java.util.concurrent.CountDownLatch;\n"
+                      "public class Main {\n"
+                      "  public void run(CountDownLatch latch) throws Exception {\n"
+                      "    latch.countDown();\n"
+                      "    latch.await();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "CountDownLatch.countDown"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "CountDownLatch.await"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_blocking_queue) {
+    const char *src = "import java.util.concurrent.BlockingQueue;\n"
+                      "public class Main {\n"
+                      "  public int run(BlockingQueue<String> q) throws Exception {\n"
+                      "    return q.take().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "BlockingQueue.take"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_collectors_tomap) {
+    const char *src = "import java.util.stream.Collectors;\n"
+                      "public class Main {\n"
+                      "  public void run() {\n"
+                      "    Collectors.toMap(null, null);\n"
+                      "    Collectors.joining(\",\");\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Collectors.toMap"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "Collectors.joining"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_string_formatted) {
+    const char *src = "public class Main {\n"
+                      "  public int run(String s) {\n"
+                      "    return s.formatted(1).length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "String.formatted"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_stringjoiner) {
+    const char *src = "import java.util.StringJoiner;\n"
+                      "public class Main {\n"
+                      "  public String run() {\n"
+                      "    StringJoiner j = new StringJoiner(\",\");\n"
+                      "    j.add(\"a\");\n"
+                      "    return j.toString();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "StringJoiner.add"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_sequenced_collection) {
+    /* Java 21 SequencedCollection: reversed()/getFirst on List. */
+    const char *src = "import java.util.List;\n"
+                      "public class Main {\n"
+                      "  public int run(List<String> xs) {\n"
+                      "    return xs.reversed().getFirst().length();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "List.reversed"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "String.length"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(jlsp_std_files_walk) {
+    const char *src = "import java.nio.file.Files;\n"
+                      "import java.nio.file.Path;\n"
+                      "public class Main {\n"
+                      "  public void run(Path p) throws Exception {\n"
+                      "    Files.newBufferedReader(p).readLine();\n"
+                      "  }\n"
+                      "}\n";
+    CBMFileResult *r = extract_java(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "run", "Files.newBufferedReader"), 0);
+    ASSERT_GTE(require_resolved(r, "run", "BufferedReader.readLine"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 void suite_java_lsp(void) {
     /* Strings / java.lang */
     RUN_TEST(jlsp_string_length);
@@ -2032,4 +2840,58 @@ void suite_java_lsp(void) {
     RUN_TEST(jlsp_extends_plus_implements_default);
     RUN_TEST(jlsp_second_interface_method);
     RUN_TEST(jlsp_diamond_interface_method);
+
+    /* Pattern matching (instanceof / switch type + record patterns) */
+    RUN_TEST(jlsp_instanceof_pattern);
+    RUN_TEST(jlsp_switch_type_pattern);
+    RUN_TEST(jlsp_switch_guard_binding);
+    RUN_TEST(jlsp_switch_record_pattern);
+    RUN_TEST(jlsp_switch_record_deconstruction);
+    RUN_TEST(jlsp_switch_record_var_component);
+    RUN_TEST(jlsp_instanceof_pattern_colon_switch);
+
+    /* Constructor delegation (this/super) */
+    RUN_TEST(jlsp_ctor_this_delegation);
+    RUN_TEST(jlsp_ctor_super_delegation);
+    RUN_TEST(jlsp_ctor_super_no_registered_ctor);
+    RUN_TEST(jlsp_ctor_delegation_raw_call_row);
+
+    /* Record components */
+    RUN_TEST(jlsp_record_accessor_chain);
+    RUN_TEST(jlsp_record_field_access);
+    RUN_TEST(jlsp_record_compact_ctor);
+    RUN_TEST(jlsp_record_canonical_ctor);
+    RUN_TEST(jlsp_record_explicit_accessor_wins);
+    RUN_TEST(jlsp_record_extraction_defs);
+
+    /* Cross-file field types */
+    RUN_TEST(jlsp_cross_field_chain);
+    RUN_TEST(jlsp_cross_generic_field);
+    RUN_TEST(jlsp_cross_tier2_field_chain);
+    RUN_TEST(jlsp_cross_tier2_generic_signature);
+
+    /* Test-annotation detection */
+    RUN_TEST(jlsp_junit5_annotated_test);
+    RUN_TEST(jlsp_spring_boot_test_not_marked);
+    RUN_TEST(jlsp_testng_class_level_test);
+
+    /* Lombok synthetic members */
+    RUN_TEST(jlsp_lombok_getter);
+    RUN_TEST(jlsp_lombok_data_setter);
+    RUN_TEST(jlsp_lombok_boolean_is_getter);
+    RUN_TEST(jlsp_lombok_builder_chain);
+    RUN_TEST(jlsp_lombok_slf4j);
+    RUN_TEST(jlsp_lombok_negative_no_annotation);
+
+    /* Stdlib expansion (Java 21 surface) */
+    RUN_TEST(jlsp_std_bigdecimal_chain);
+    RUN_TEST(jlsp_std_httpclient);
+    RUN_TEST(jlsp_std_virtual_thread);
+    RUN_TEST(jlsp_std_countdown_latch);
+    RUN_TEST(jlsp_std_blocking_queue);
+    RUN_TEST(jlsp_std_collectors_tomap);
+    RUN_TEST(jlsp_std_string_formatted);
+    RUN_TEST(jlsp_std_stringjoiner);
+    RUN_TEST(jlsp_std_sequenced_collection);
+    RUN_TEST(jlsp_std_files_walk);
 }

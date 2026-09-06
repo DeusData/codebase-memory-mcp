@@ -428,8 +428,9 @@ bool cbm_is_test_file(const char *rel_path, CBMLanguage lang) {
     case CBM_LANG_KOTLIN:
     case CBM_LANG_SCALA:
         return has_suffix(base, "Test.java") || has_suffix(base, "Tests.java") ||
-               has_suffix(base, "Spec.java") || has_suffix(base, "Test.kt") ||
-               has_suffix(base, "Spec.kt") || has_suffix(base, "Test.scala") ||
+               has_suffix(base, "Spec.java") || has_suffix(base, "IT.java") ||
+               has_suffix(base, "Test.kt") || has_suffix(base, "Spec.kt") ||
+               has_suffix(base, "IT.kt") || has_suffix(base, "Test.scala") ||
                has_suffix(base, "Spec.scala");
     case CBM_LANG_RUST:
         // Rust tests are typically mod tests inside the file, but test files too

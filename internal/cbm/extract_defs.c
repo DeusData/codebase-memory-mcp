@@ -4696,6 +4696,87 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
         }
     }
+
+    // Java records (JLS §8.10.3): each component on the record line
+    // (`record Point(int x, int y)`) is an implicit private final field PLUS a
+    // public zero-arg accessor method. extract_class_fields only walks body
+    // field_declarations and never sees components, so without this a record
+    // is field- and accessor-blind cross-file. Emit (a) one "Field" def per
+    // component — name, parent_class, full generic type text — mirroring the
+    // C# primary-constructor block above, and (b) one synthetic zero-arg
+    // accessor "Method" def per component (return_type = component type),
+    // skipped when the body declares a same-name method explicitly, so
+    // `point.x()` has a real graph Method node and Kotlin→Java record interop
+    // flows through the ordinary Method registrar. The label stays "Class"
+    // (对拍A/B binding corrections: no new label plumbing).
+    if (ctx->language == CBM_LANG_JAVA && strcmp(kind, "record_declaration") == 0) {
+        TSNode rec_params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+        // extract_class_methods above already pushed the body's explicit
+        // Method defs; scan only that def range for accessor overrides.
+        if (!ts_node_is_null(rec_params)) {
+            uint32_t pcount = ts_node_named_child_count(rec_params);
+            for (uint32_t k = 0; k < pcount; k++) {
+                TSNode p = ts_node_named_child(rec_params, k);
+                const char *pkind = ts_node_type(p);
+                if (strcmp(pkind, "formal_parameter") != 0 &&
+                    strcmp(pkind, "spread_parameter") != 0) {
+                    continue;
+                }
+                TSNode pname_node = ts_node_child_by_field_name(p, TS_FIELD("name"));
+                TSNode ptype_node = ts_node_child_by_field_name(p, TS_FIELD("type"));
+                if (ts_node_is_null(pname_node) || ts_node_is_null(ptype_node)) {
+                    continue;
+                }
+                char *pname = cbm_node_text(a, pname_node, ctx->source);
+                char *ptype = cbm_node_text(a, ptype_node, ctx->source);
+                if (!pname || !pname[0] || !ptype || !ptype[0]) {
+                    continue;
+                }
+                CBMDefinition fdef;
+                memset(&fdef, 0, sizeof(fdef));
+                fdef.name = pname;
+                fdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, pname);
+                fdef.label = "Field";
+                fdef.file_path = ctx->rel_path;
+                fdef.parent_class = class_qn;
+                fdef.return_type = ptype;
+                fdef.start_line = ts_node_start_point(p).row + TS_LINE_OFFSET;
+                fdef.end_line = ts_node_end_point(p).row + TS_LINE_OFFSET;
+                fdef.is_exported = false;
+                cbm_defs_push(&ctx->result->defs, a, fdef);
+
+                // (b) synthetic accessor — the body's explicit same-name
+                // method wins (records may override accessors).
+                bool explicit_method = false;
+                for (int di = 0; di < ctx->result->defs.count && !explicit_method; di++) {
+                    const CBMDefinition *md = &ctx->result->defs.items[di];
+                    if (md->label && strcmp(md->label, "Method") == 0 && md->parent_class &&
+                        strcmp(md->parent_class, class_qn) == 0 && md->name &&
+                        strcmp(md->name, pname) == 0) {
+                        explicit_method = true;
+                    }
+                }
+                if (explicit_method) {
+                    continue;
+                }
+                CBMDefinition mdef;
+                memset(&mdef, 0, sizeof(mdef));
+                mdef.name = pname;
+                mdef.qualified_name = fdef.qualified_name;
+                mdef.label = "Method";
+                mdef.file_path = ctx->rel_path;
+                mdef.parent_class = class_qn;
+                mdef.return_type = ptype;
+                mdef.signature = "()";
+                mdef.start_line = fdef.start_line;
+                mdef.end_line = fdef.end_line;
+                mdef.lines = 1;
+                mdef.is_exported = true;
+                mdef.is_test = ctx->result->is_test_file;
+                cbm_defs_push(&ctx->result->defs, a, mdef);
+            }
+        }
+    }
 }
 
 // Find the body/members node inside a class node
@@ -4920,6 +5001,96 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 }
 
 // Push a single method definition
+// JVM test-annotation detection (JUnit4/5, TestNG). The annotation's SIMPLE
+// name (leading '@' and qualifiers dropped, arguments stripped) must match
+// EXACTLY — Spring's @SpringBootTest/@WebMvcTest/@DataJpaTest end in "Test"
+// and must never mark methods (对拍B binding correction).
+static bool jvm_annotation_simple_name_in(const char *deco, const char *const *names) {
+    if (!deco) {
+        return false;
+    }
+    const char *p = deco;
+    while (*p == '@' || *p == ' ' || *p == '\t') {
+        p++;
+    }
+    size_t len = strcspn(p, "(");
+    const char *seg = p;
+    for (const char *q = p; q < p + len; q++) {
+        if (*q == '.') {
+            seg = q + 1;
+        }
+    }
+    size_t seg_len = (size_t)((p + len) - seg);
+    while (seg_len > 0 && (seg[seg_len - 1] == ' ' || seg[seg_len - 1] == '\t' ||
+                           seg[seg_len - 1] == '\n' || seg[seg_len - 1] == '\r')) {
+        seg_len--;
+    }
+    if (seg_len == 0) {
+        return false;
+    }
+    for (int i = 0; names[i]; i++) {
+        if (strlen(names[i]) == seg_len && strncmp(seg, names[i], seg_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool jvm_decorators_mark_test(const char *const *decorators) {
+    static const char *const test_annotations[] = {"Test",        "ParameterizedTest",
+                                                   "RepeatedTest", "TestFactory",
+                                                   "TestTemplate", NULL};
+    if (!decorators) {
+        return false;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        if (jvm_annotation_simple_name_in(decorators[i], test_annotations)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// TestNG class-level @Test marks every public method of the class. Gate it on
+// an org.testng import being present (对拍B): a bare project-defined @Test on
+// a class must not propagate. Definitions are extracted before imports, so
+// scan the root's import_declaration nodes directly.
+static bool jvm_class_testng_test(CBMExtractCtx *ctx, TSNode class_node) {
+    TSNode mods = find_jvm_modifiers(class_node, ctx->language);
+    if (ts_node_is_null(mods)) {
+        return false;
+    }
+    static const char *const just_test[] = {"Test", NULL};
+    bool has_test = false;
+    uint32_t n = ts_node_child_count(mods);
+    for (uint32_t i = 0; i < n && !has_test; i++) {
+        TSNode c = ts_node_child(mods, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "marker_annotation") != 0 && strcmp(k, "annotation") != 0) {
+            continue;
+        }
+        char *txt = cbm_node_text(ctx->arena, c, ctx->source);
+        if (jvm_annotation_simple_name_in(txt, just_test)) {
+            has_test = true;
+        }
+    }
+    if (!has_test) {
+        return false;
+    }
+    uint32_t rn = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < rn; i++) {
+        TSNode c = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(c), "import_declaration") != 0) {
+            continue;
+        }
+        char *txt = cbm_node_text(ctx->arena, c, ctx->source);
+        if (txt && strstr(txt, "org.testng")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
                             const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
@@ -4994,6 +5165,17 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
+    }
+    // JUnit4/5 + TestNG annotation-driven test detection: path/suffix
+    // conventions miss `@Test void returnsUser()` in unconventionally named
+    // files, and pass_tests.c's name gate then refuses the TESTS edge. The
+    // is_test_annotated bit lets that gate accept the method by evidence.
+    if (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN) {
+        if (jvm_decorators_mark_test(def.decorators) ||
+            (!ts_node_is_null(class_node) && jvm_class_testng_test(ctx, class_node))) {
+            def.is_test = true;
+            def.is_test_annotated = true;
+        }
     }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 

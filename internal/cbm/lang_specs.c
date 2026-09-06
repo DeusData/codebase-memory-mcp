@@ -333,14 +333,16 @@ static const char *rust_decorator_types[] = {"attribute_item", NULL};
 
 // ==================== JAVA ====================
 static const char *java_func_types[] = {"method_declaration", "constructor_declaration",
-                                        "lambda_expression", NULL};
+                                        "compact_constructor_declaration", "lambda_expression",
+                                        NULL};
 static const char *java_class_types[] = {"class_declaration",   "interface_declaration",
                                          "enum_declaration",    "annotation_type_declaration",
                                          "record_declaration",  "module_declaration",
                                          "package_declaration", NULL};
 static const char *java_field_types[] = {"field_declaration", NULL};
 static const char *java_module_types[] = {"program", NULL};
-static const char *java_call_types[] = {"method_invocation", "object_creation_expression", NULL};
+static const char *java_call_types[] = {"method_invocation", "object_creation_expression",
+                                        "explicit_constructor_invocation", NULL};
 static const char *java_import_types[] = {"import_declaration", "extends", "import", NULL};
 static const char *java_branch_types[] = {
     "if_statement",    "for_statement",     "enhanced_for_statement",
