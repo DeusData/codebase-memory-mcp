@@ -517,6 +517,7 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "route_handler", def->route_handler);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -689,7 +690,11 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
                              (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
+    /* A def whose label IS "Route" (Django urls.py synthetic rows) already
+     * became the Route node above — minting a second Route + self-HANDLES
+     * from its route_path would be noise. */
+    if (def->route_path && def->route_path[0] != '\0' &&
+        !(def->label && strcmp(def->label, "Route") == 0)) {
         const char *rm = def->route_method ? def->route_method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];

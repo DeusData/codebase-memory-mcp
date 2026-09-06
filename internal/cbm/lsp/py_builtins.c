@@ -61,6 +61,25 @@ static const PyBuiltinNode kPyBuiltinNodes[] = {
     {"builtins.list.pop", "pop", "Method"},
 
     {"builtins.dict.get", "get", "Method"},
+
+    /* Python 2 dialect (py2-stdlib-builtins-compat): the compat registry rows
+     * in py_stdlib_compat.c resolve these calls; the graph nodes here are what
+     * lets pass_calls turn those resolutions into CALLS edges. Aligned with
+     * kPyCompatTypes / kPyCompatFuncs — keep the two tables in sync. */
+    {"builtins.xrange", "xrange", "Class"},
+    {"builtins.unicode", "unicode", "Class"},
+    {"builtins.basestring", "basestring", "Class"},
+    {"builtins.long", "long", "Class"},
+    {"builtins.raw_input", "raw_input", "Function"},
+    {"builtins.unichr", "unichr", "Function"},
+    {"builtins.cmp", "cmp", "Function"},
+    {"builtins.execfile", "execfile", "Function"},
+    {"builtins.reduce", "reduce", "Function"},
+
+    {"builtins.dict.iteritems", "iteritems", "Method"},
+    {"builtins.dict.iterkeys", "iterkeys", "Method"},
+    {"builtins.dict.itervalues", "itervalues", "Method"},
+    {"builtins.dict.has_key", "has_key", "Method"},
 };
 
 /*

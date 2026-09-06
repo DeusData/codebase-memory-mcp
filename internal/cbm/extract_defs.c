@@ -44,6 +44,13 @@ enum {
     FP_SPACE_SEP = 1,    /* one byte for space separator between tokens */
 };
 
+/* Python route surfaces (Django urls.py + router-prefix concat) — defined
+ * near cbm_extract_definitions at the bottom of this file. */
+static void py_prescan_router_prefixes(CBMExtractCtx *ctx);
+static void py_extract_django_urlpatterns(CBMExtractCtx *ctx);
+static void py_apply_router_prefix(CBMExtractCtx *ctx, TSNode func_node, const CBMLangSpec *spec,
+                                   const char **route_path);
+
 /* Hash a span of source text. */
 static uint32_t hash_source_span(const char *source, uint32_t start, int len) {
     uint32_t h = 0;
@@ -3780,6 +3787,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+    // Python: exact APIRouter(prefix=)/Blueprint(url_prefix=) composition —
+    // the decorator recorded the local path; the module-level pre-scan knows
+    // the router object's mount prefix.
+    if (ctx->language == CBM_LANG_PYTHON && def.route_path) {
+        py_apply_router_prefix(ctx, node, spec, &def.route_path);
+    }
 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
@@ -8005,6 +8018,344 @@ static const char *cbm_razor_page_route(CBMArena *a, const char *source, int sou
     return NULL;
 }
 
+/* ── Python route surfaces: Django urls.py + router-prefix concat ─────────
+ *
+ * Django routes are CALL-shaped (`urlpatterns = [path('x/', views.x), ...]`),
+ * so the decorator walk never sees them; FastAPI/Flask decorator routes are
+ * seen but record only the LOCAL path while the mounted path lives on the
+ * module-level router object (`router = APIRouter(prefix="/api/v1")`).
+ * Both walkers below are Python-only, top-level-only, literal-only. */
+
+/* Inner text of a Python string literal node, prefix (r/b/u/f) and quotes
+ * stripped via the string_content child. Returns "" for an empty literal and
+ * NULL for non-string nodes. */
+static const char *py_string_node_content(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "string") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(c), "string_content") == 0) {
+            return cbm_node_text(a, c, source);
+        }
+    }
+    return "";
+}
+
+/* Short callee name of a call: `path(...)` -> "path", `views.x(...)` -> "x".
+ * Optionally hands back the function node. */
+static const char *py_call_callee_short(CBMArena *a, TSNode call, const char *source,
+                                        TSNode *out_fn) {
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    if (out_fn) {
+        *out_fn = fn;
+    }
+    const char *fk = ts_node_type(fn);
+    if (strcmp(fk, "identifier") == 0) {
+        return cbm_node_text(a, fn, source);
+    }
+    if (strcmp(fk, "attribute") == 0) {
+        TSNode attr = ts_node_child_by_field_name(fn, TS_FIELD("attribute"));
+        if (!ts_node_is_null(attr)) {
+            return cbm_node_text(a, attr, source);
+        }
+    }
+    return NULL;
+}
+
+/* Normalize a Django route string: strip re_path/url regex anchors (^ $),
+ * guarantee the leading slash Django omits. */
+static const char *py_django_route_path(CBMArena *a, const char *raw) {
+    if (!raw) {
+        return NULL;
+    }
+    size_t len = strlen(raw);
+    if (len > 0 && raw[0] == '^') {
+        raw++;
+        len--;
+    }
+    if (len > 0 && raw[len - SKIP_CHAR] == '$') {
+        len--;
+    }
+    char *clean = cbm_arena_strndup(a, raw, len);
+    if (!clean) {
+        return NULL;
+    }
+    return clean[0] == '/' ? clean : cbm_arena_sprintf(a, "/%s", clean);
+}
+
+/* Gate: the file names django.urls / django.conf.urls in a top-level import.
+ * Runs on the AST (imports are extracted after defs), statement text match. */
+static bool py_file_imports_django_urls(CBMExtractCtx *ctx) {
+    uint32_t nc = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(ctx->root, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "import_statement") != 0 && strcmp(k, "import_from_statement") != 0) {
+            continue;
+        }
+        char *text = cbm_node_text(ctx->arena, c, ctx->source);
+        if (text && (strstr(text, "django.urls") || strstr(text, "django.conf.urls"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Emit one synthetic Route definition row for a Django urlpattern. The def
+ * node IS the Route (label "Route", QN in __route__ form so the
+ * pass_route_nodes prefix bridge recognizes include() prefixes); the spelled
+ * handler is recorded on route_handler for connect_route_handler_defs. */
+static void py_django_emit_route(CBMExtractCtx *ctx, TSNode call, const char *path,
+                                 const char *method, const char *handler) {
+    CBMArena *a = ctx->arena;
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = path;
+    def.qualified_name = cbm_arena_sprintf(a, "__route__%s__%s", method, path);
+    def.label = "Route";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(call).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(call).row + TS_LINE_OFFSET;
+    def.route_path = path;
+    def.route_method = method;
+    def.route_handler = handler;
+    def.is_exported = true;
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* Walk one urlpatterns list: `path()/re_path()/url()` elements become Route
+ * defs; a nested `include('pkg.urls')` becomes a prefix Route (method ANY)
+ * that the pass_route_nodes bridge connects to the included app's routes. */
+static void py_django_walk_urlpatterns_list(CBMExtractCtx *ctx, TSNode list) {
+    CBMArena *a = ctx->arena;
+    uint32_t nc = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode call = ts_node_named_child(list, i);
+        if (strcmp(ts_node_type(call), "call") != 0) {
+            continue;
+        }
+        const char *callee = py_call_callee_short(a, call, ctx->source, NULL);
+        if (!callee || (strcmp(callee, "path") != 0 && strcmp(callee, "re_path") != 0 &&
+                        strcmp(callee, "url") != 0)) {
+            continue;
+        }
+        TSNode args = find_decorator_args(call);
+        if (ts_node_is_null(args)) {
+            continue;
+        }
+        const char *raw_path = NULL;
+        const char *handler = NULL;
+        bool is_include = false;
+        uint32_t an = ts_node_named_child_count(args);
+        for (uint32_t j = 0; j < an; j++) {
+            TSNode arg = ts_node_named_child(args, j);
+            const char *ak = ts_node_type(arg);
+            if (strcmp(ak, "keyword_argument") == 0) {
+                continue; /* name= / kwargs= — not route surface */
+            }
+            if (!raw_path) {
+                raw_path = py_string_node_content(a, arg, ctx->source);
+                if (raw_path) {
+                    continue;
+                }
+                break; /* first positional arg is not a literal: skip pattern */
+            }
+            if (handler || is_include) {
+                break;
+            }
+            if (strcmp(ak, "identifier") == 0 || strcmp(ak, "attribute") == 0) {
+                handler = cbm_node_text(a, arg, ctx->source); /* detail / views.detail */
+            } else if (strcmp(ak, "call") == 0) {
+                TSNode inner_fn = {0};
+                const char *inner = py_call_callee_short(a, arg, ctx->source, &inner_fn);
+                if (inner && strcmp(inner, "include") == 0) {
+                    is_include = true;
+                } else if (inner && strcmp(inner, "as_view") == 0 &&
+                           strcmp(ts_node_type(inner_fn), "attribute") == 0) {
+                    /* AboutView.as_view() — the class is the handler. */
+                    TSNode obj = ts_node_child_by_field_name(inner_fn, TS_FIELD("object"));
+                    if (!ts_node_is_null(obj)) {
+                        handler = cbm_node_text(a, obj, ctx->source);
+                    }
+                }
+            }
+        }
+        if (!raw_path) {
+            continue;
+        }
+        const char *route_path = py_django_route_path(a, raw_path);
+        if (!route_path) {
+            continue;
+        }
+        /* include() mounts another urlconf: a prefix Route with no handler. */
+        py_django_emit_route(ctx, call, route_path, "ANY", is_include ? NULL : handler);
+    }
+}
+
+/* Django urls.py entry: gated on a top-level `urlpatterns = [...]` assignment
+ * (or `urlpatterns += [...]`) AND a django.urls / django.conf.urls import.
+ * A non-urls file with a local function named path() therefore never mints
+ * a Route (对拍A binding). Top-level lists only — computed urlpatterns stay
+ * with the directory bridge. */
+static void py_extract_django_urlpatterns(CBMExtractCtx *ctx) {
+    if (ctx->language != CBM_LANG_PYTHON) {
+        return;
+    }
+    TSNode lists[4];
+    int list_count = 0;
+    uint32_t nc = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < nc && list_count < (int)(sizeof(lists) / sizeof(lists[0])); i++) {
+        TSNode c = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(c), "expression_statement") != 0 ||
+            ts_node_named_child_count(c) == 0) {
+            continue;
+        }
+        TSNode asg = ts_node_named_child(c, 0);
+        const char *ak = ts_node_type(asg);
+        if (strcmp(ak, "assignment") != 0 && strcmp(ak, "augmented_assignment") != 0) {
+            continue;
+        }
+        TSNode left = ts_node_child_by_field_name(asg, TS_FIELD("left"));
+        TSNode right = ts_node_child_by_field_name(asg, TS_FIELD("right"));
+        if (ts_node_is_null(left) || ts_node_is_null(right) ||
+            strcmp(ts_node_type(left), "identifier") != 0 ||
+            strcmp(ts_node_type(right), "list") != 0) {
+            continue;
+        }
+        char *lname = cbm_node_text(ctx->arena, left, ctx->source);
+        if (lname && strcmp(lname, "urlpatterns") == 0) {
+            lists[list_count++] = right;
+        }
+    }
+    if (list_count == 0 || !py_file_imports_django_urls(ctx)) {
+        return;
+    }
+    for (int i = 0; i < list_count; i++) {
+        py_django_walk_urlpatterns_list(ctx, lists[i]);
+    }
+}
+
+/* ── py-router-prefix-concat ── */
+
+/* Pre-scan module-level `NAME = APIRouter(prefix="/x")` and
+ * `NAME = Blueprint(..., url_prefix="/x")` into ctx->router_prefixes.
+ * Literal keyword strings only; FastAPI(root_path=...) deliberately not
+ * scanned (对拍B binding — root_path is proxy metadata, not a route prefix).
+ * Cross-file router variables and nested blueprints remain with the
+ * pass_route_nodes directory bridge. */
+static void py_prescan_router_prefixes(CBMExtractCtx *ctx) {
+    if (ctx->language != CBM_LANG_PYTHON) {
+        return;
+    }
+    CBMArena *a = ctx->arena;
+    uint32_t nc = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (ctx->router_prefixes.count >= CBM_MAX_ROUTER_PREFIXES) {
+            return;
+        }
+        TSNode c = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(c), "expression_statement") != 0 ||
+            ts_node_named_child_count(c) == 0) {
+            continue;
+        }
+        TSNode asg = ts_node_named_child(c, 0);
+        if (strcmp(ts_node_type(asg), "assignment") != 0) {
+            continue;
+        }
+        TSNode left = ts_node_child_by_field_name(asg, TS_FIELD("left"));
+        TSNode right = ts_node_child_by_field_name(asg, TS_FIELD("right"));
+        if (ts_node_is_null(left) || ts_node_is_null(right) ||
+            strcmp(ts_node_type(left), "identifier") != 0 ||
+            strcmp(ts_node_type(right), "call") != 0) {
+            continue;
+        }
+        const char *ctor = py_call_callee_short(a, right, ctx->source, NULL);
+        const char *kwarg = NULL;
+        if (ctor && strcmp(ctor, "APIRouter") == 0) {
+            kwarg = "prefix";
+        } else if (ctor && strcmp(ctor, "Blueprint") == 0) {
+            kwarg = "url_prefix";
+        } else {
+            continue;
+        }
+        TSNode args = find_decorator_args(right);
+        if (ts_node_is_null(args)) {
+            continue;
+        }
+        TSNode val = find_drf_kwarg_in_args(a, args, kwarg, ctx->source);
+        const char *prefix = py_string_node_content(a, val, ctx->source);
+        if (!prefix || !prefix[0]) {
+            continue;
+        }
+        char *name = cbm_node_text(a, left, ctx->source);
+        if (!name || !name[0]) {
+            continue;
+        }
+        ctx->router_prefixes.names[ctx->router_prefixes.count] = name;
+        ctx->router_prefixes.prefixes[ctx->router_prefixes.count] = prefix;
+        ctx->router_prefixes.count++;
+    }
+}
+
+/* After extract_route_from_decorators recorded a path, find the SAME winning
+ * decorator (first prev-sibling decorator call whose callee maps to a route
+ * method — mirroring try_route_from_decorator_call's pick) and, when its
+ * receiver object carries a recorded prefix, join prefix + path. A router
+ * with no recorded prefix keeps the literal path (unprefixed fallback). */
+static void py_apply_router_prefix(CBMExtractCtx *ctx, TSNode func_node, const CBMLangSpec *spec,
+                                   const char **route_path) {
+    if (!route_path || !*route_path || ctx->router_prefixes.count == 0 ||
+        !spec->decorator_node_types || !spec->decorator_node_types[0]) {
+        return;
+    }
+    CBMArena *a = ctx->arena;
+    TSNode prev = ts_node_prev_sibling(func_node);
+    while (!ts_node_is_null(prev)) {
+        if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
+            return;
+        }
+        uint32_t dc = ts_node_named_child_count(prev);
+        for (uint32_t di = 0; di < dc; di++) {
+            TSNode dchild = ts_node_named_child(prev, di);
+            if (strcmp(ts_node_type(dchild), "call") != 0) {
+                continue;
+            }
+            TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
+            if (ts_node_is_null(fn)) {
+                fn = ts_node_named_child(dchild, 0);
+            }
+            if (ts_node_is_null(fn)) {
+                continue;
+            }
+            char *fn_text = cbm_node_text(a, fn, ctx->source);
+            if (!decorator_method_name(fn_text)) {
+                continue; /* not the route decorator — keep scanning */
+            }
+            /* This is the decorator the route came from. */
+            if (strcmp(ts_node_type(fn), "attribute") == 0) {
+                TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+                if (!ts_node_is_null(obj) && strcmp(ts_node_type(obj), "identifier") == 0) {
+                    char *obj_name = cbm_node_text(a, obj, ctx->source);
+                    for (int r = 0; obj_name && r < ctx->router_prefixes.count; r++) {
+                        if (strcmp(ctx->router_prefixes.names[r], obj_name) == 0) {
+                            *route_path = join_route_paths(
+                                a, ctx->router_prefixes.prefixes[r], *route_path);
+                            return;
+                        }
+                    }
+                }
+            }
+            return; /* first route decorator decides; no prefix recorded */
+        }
+        prev = ts_node_prev_sibling(prev);
+    }
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -8038,6 +8389,14 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
         }
     }
     cbm_defs_push(&ctx->result->defs, a, mod);
+
+    /* Python route surfaces: router-prefix pre-scan must precede the def walk
+     * (decorator routes consult it); the Django urls.py walker emits its own
+     * synthetic Route defs. */
+    if (ctx->language == CBM_LANG_PYTHON) {
+        py_prescan_router_prefixes(ctx);
+        py_extract_django_urlpatterns(ctx);
+    }
 
     cbm_extract_definitions_without_module(ctx);
 }
