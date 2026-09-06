@@ -10018,25 +10018,42 @@ static int vs_build_keyword_vectors(cbm_store_t *s, const char *project, const c
     return actual_kw;
 }
 
+/* L2 norm of every quantized keyword vector, computed once per search
+ * instead of once per (node, keyword) pair inside the scoring loop. */
+static void vs_keyword_norms(const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw, double *kw_norms) {
+    for (int k = 0; k < actual_kw; k++) {
+        int32_t ma = 0;
+        for (int d = 0; d < VS_VEC_DIM; d++) {
+            ma += (int32_t)kw_vecs[k][d] * (int32_t)kw_vecs[k][d];
+        }
+        kw_norms[k] = sqrt((double)ma);
+    }
+}
+
 /* Compute the per-keyword min cosine score between a node's int8 vector and
- * each of the query vectors.  Returns 0.0 if the node vector is unavailable
- * or mis-sized. */
+ * each of the query vectors.  `kw_norms[k]` is the precomputed L2 norm of
+ * kw_vecs[k]; the node norm is computed once per node.  The integer sums are
+ * exact, so factoring the norms out of the pair loop leaves every score
+ * bit-identical to the fused form.  Returns 0.0 if the node vector is
+ * unavailable or mis-sized. */
 static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
-                                  const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
+                                  const int8_t (*kw_vecs)[VS_VEC_DIM], const double *kw_norms,
+                                  int actual_kw) {
     if (!node_vec || node_vec_len != VS_VEC_DIM) {
         return 0.0;
     }
+    int32_t mb = 0;
+    for (int d = 0; d < VS_VEC_DIM; d++) {
+        mb += (int32_t)node_vec[d] * (int32_t)node_vec[d];
+    }
+    double node_norm = sqrt((double)mb);
     double min_score = CBM_STORE_UNIT_POS_D;
     for (int k = 0; k < actual_kw; k++) {
         int32_t dot = 0;
-        int32_t ma = 0;
-        int32_t mb = 0;
         for (int d = 0; d < VS_VEC_DIM; d++) {
             dot += (int32_t)kw_vecs[k][d] * (int32_t)node_vec[d];
-            ma += (int32_t)kw_vecs[k][d] * (int32_t)kw_vecs[k][d];
-            mb += (int32_t)node_vec[d] * (int32_t)node_vec[d];
         }
-        double denom = sqrt((double)ma) * sqrt((double)mb);
+        double denom = kw_norms[k] * node_norm;
         double cos_k = denom > CBM_STORE_DENOM_EPS_D ? (double)dot / denom : 0.0;
         if (cos_k < min_score) {
             min_score = cos_k;
@@ -10045,35 +10062,69 @@ static double vs_min_cosine_score(const int8_t *node_vec, int node_vec_len,
     return min_score;
 }
 
-/* Append one candidate row read from the scan statement into the result
- * vector.  Grows the results array geometrically on demand.  Returns the
- * (possibly grown) results pointer, or NULL on allocation failure. */
-static cbm_vector_result_t *vs_append_result(cbm_vector_result_t *results, int *count, int *cap,
-                                             sqlite3_stmt *stmt,
-                                             const int8_t (*kw_vecs)[VS_VEC_DIM], int actual_kw) {
+/* Append one candidate row read from the scan statement into `*results`,
+ * growing the array geometrically on demand.  Returns CBM_STORE_OK, or
+ * CBM_STORE_ERR on allocation failure — in which case `*results` still owns
+ * exactly `*count` complete rows (a row is only counted once every string
+ * copy succeeded), so the caller's usual free path stays valid. */
+static int vs_append_result(cbm_vector_result_t **results, int *count, int *cap, sqlite3_stmt *stmt,
+                            const int8_t (*kw_vecs)[VS_VEC_DIM], const double *kw_norms,
+                            int actual_kw) {
     if (*count >= *cap) {
         int nc = *cap < CBM_SZ_16 ? CBM_SZ_16 : *cap * ST_COL_2;
-        cbm_vector_result_t *grown = realloc(results, (size_t)nc * sizeof(cbm_vector_result_t));
+        cbm_vector_result_t *grown = realloc(*results, (size_t)nc * sizeof(cbm_vector_result_t));
         if (!grown) {
-            return NULL;
+            return CBM_STORE_ERR;
         }
-        results = grown;
+        *results = grown;
         *cap = nc;
     }
-    int idx = (*count)++;
-    results[idx].node_id = sqlite3_column_int64(stmt, 0);
+    cbm_vector_result_t *row = &(*results)[*count];
+    row->node_id = sqlite3_column_int64(stmt, 0);
     const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
     const char *qn = (const char *)sqlite3_column_text(stmt, ST_COL_2);
     const char *fp = (const char *)sqlite3_column_text(stmt, ST_COL_3);
     const char *label = (const char *)sqlite3_column_text(stmt, ST_COL_4);
-    results[idx].name = name ? strdup(name) : strdup("");
-    results[idx].qualified_name = qn ? strdup(qn) : strdup("");
-    results[idx].file_path = fp ? strdup(fp) : strdup("");
-    results[idx].label = label ? strdup(label) : strdup("");
+    row->name = strdup(name ? name : "");
+    row->qualified_name = strdup(qn ? qn : "");
+    row->file_path = strdup(fp ? fp : "");
+    row->label = strdup(label ? label : "");
+    if (!row->name || !row->qualified_name || !row->file_path || !row->label) {
+        free(row->name);
+        free(row->qualified_name);
+        free(row->file_path);
+        free(row->label);
+        return CBM_STORE_ERR;
+    }
     const int8_t *node_vec = (const int8_t *)sqlite3_column_blob(stmt, ST_COL_6);
     int node_vec_len = sqlite3_column_bytes(stmt, ST_COL_6);
-    results[idx].score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, actual_kw);
-    return results;
+    row->score = vs_min_cosine_score(node_vec, node_vec_len, kw_vecs, kw_norms, actual_kw);
+    (*count)++;
+    return CBM_STORE_OK;
+}
+
+/* A lean index carries no node_vectors table at all.  That is an empty
+ * semantic universe, not a scan failure, and callers must be able to tell
+ * the two apart — so probe the schema before preparing the scan.  Returns
+ * CBM_STORE_OK (present), CBM_STORE_NOT_FOUND (absent) or CBM_STORE_ERR. */
+static int vs_probe_node_vectors_table(cbm_store_t *s) {
+    sqlite3_stmt *probe = NULL;
+    const char *sql =
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='node_vectors' LIMIT 1;";
+    if (sqlite3_prepare_v2(s->db, sql, SQLITE_AUTO_LEN, &probe, NULL) != SQLITE_OK) {
+        (void)fprintf(stderr, "vector_search: %s\n", sqlite3_errmsg(s->db));
+        return CBM_STORE_ERR;
+    }
+    int step_rc = sqlite3_step(probe);
+    sqlite3_finalize(probe);
+    if (step_rc == SQLITE_ROW) {
+        return CBM_STORE_OK;
+    }
+    if (step_rc == SQLITE_DONE) {
+        return CBM_STORE_NOT_FOUND;
+    }
+    (void)fprintf(stderr, "vector_search: %s\n", sqlite3_errmsg(s->db));
+    return CBM_STORE_ERR;
 }
 
 static int vs_ranked_result_cmp(const void *lhs, const void *rhs) {
@@ -10097,11 +10148,18 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         return CBM_STORE_ERR;
     }
 
+    int probe_rc = vs_probe_node_vectors_table(s);
+    if (probe_rc != CBM_STORE_OK) {
+        return probe_rc;
+    }
+
     int8_t kw_vecs[VS_MAX_KW][VS_VEC_DIM];
     int actual_kw = vs_build_keyword_vectors(s, project, keywords, keyword_count, kw_vecs);
     if (actual_kw == 0) {
         return CBM_STORE_OK;
     }
+    double kw_norms[VS_MAX_KW];
+    vs_keyword_norms(kw_vecs, actual_kw, kw_norms);
 
     /* Use the first keyword for a cheap candidate ordering, then score each
      * materialized candidate by min-cosine across every keyword. */
@@ -10141,13 +10199,11 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
         sqlite3_bind_int(stmt, ST_COL_3, fetch_limit);
         while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
             omitted_score_ceiling = sqlite3_column_double(stmt, ST_COL_5);
-            cbm_vector_result_t *grown =
-                vs_append_result(results, &count, &cap, stmt, kw_vecs, actual_kw);
-            if (!grown) {
+            if (vs_append_result(&results, &count, &cap, stmt, kw_vecs, kw_norms, actual_kw) !=
+                CBM_STORE_OK) {
                 step_rc = SQLITE_NOMEM;
                 break;
             }
-            results = grown;
         }
         if (step_rc != SQLITE_DONE) {
             char rc_buf[VS_STR_BUF];
