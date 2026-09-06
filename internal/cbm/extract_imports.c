@@ -2,6 +2,7 @@
 #include "arena.h" // CBMArena, cbm_arena_strdup/strndup/sprintf
 #include "helpers.h"
 #include "lang_specs.h"      // CBMLangSpec, CBMEmbeddedLangSpec, cbm_lang_spec, cbm_ts_language
+#include "lsp/rust_lsp.h"    // cbm_rust_expand_use_decl (shared use-decl AST expansion)
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
@@ -611,11 +612,32 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 }
 
 // --- Rust imports ---
-// use_declaration -> use_list or scoped_use_list
+// use_declaration -> argument (identifier | scoped_identifier | use_list |
+// scoped_use_list | use_as_clause | use_wildcard). Expanded through the same
+// AST walker the Rust LSP's use-map builder uses (cbm_rust_expand_use_decl,
+// lsp/rust_lsp.c) so nested groups `use a::{b, c::d}`, renames and `pub use`
+// re-exports each yield one accurate (local_name, module_path) IMPORTS row —
+// the old whole-text hack stored `pub use foo::Bar` verbatim as a module path
+// and one garbage row for a whole brace group.
+
+static void rust_import_use_sink(void *sink_ctx, const char *alias, const char *path,
+                                 bool is_glob) {
+    CBMExtractCtx *ctx = (CBMExtractCtx *)sink_ctx;
+    CBMImport imp = {0};
+    if (is_glob) {
+        /* Preserve the historical glob shape (`a::b::*` with local `*`). */
+        imp.local_name = "*";
+        imp.module_path = cbm_arena_sprintf(ctx->arena, "%s::*", path);
+    } else {
+        imp.local_name = alias;
+        imp.module_path = path;
+    }
+    if (imp.local_name && imp.module_path) {
+        cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+    }
+}
 
 static void parse_rust_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
-
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -626,22 +648,7 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
         if (strcmp(ts_node_type(node), "use_declaration") != 0) {
             continue;
         }
-
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
-            continue;
-        }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
-
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        cbm_rust_expand_use_decl(ctx->arena, node, ctx->source, rust_import_use_sink, ctx);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }

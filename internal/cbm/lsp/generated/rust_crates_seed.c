@@ -416,6 +416,145 @@ void cbm_rust_crates_register(CBMTypeRegistry* reg, CBMArena* arena) {
     CADD_FUNC(NULL, "spawn",       "rayon.spawn",        t_unit);
     CADD_FUNC(NULL, "join",        "rayon.join",         cbm_type_unknown());
 
+    /* ── anyhow::Context — the `.context("…")?` idiom on Results. ──
+     * Registered as an interface so bound/extension dispatch finds it;
+     * both methods yield anyhow-flavoured Results (left unknown — only
+     * the edge target matters). */
+    CADD_TYPE("anyhow.Context", "Context", true);
+    CADD_FUNC("anyhow.Context", "context",      "anyhow.Context.context",      cbm_type_unknown());
+    CADD_FUNC("anyhow.Context", "with_context", "anyhow.Context.with_context", cbm_type_unknown());
+
+    /* ── tracing — structured logging/instrumentation. Macro surfaces
+     * (info!/warn!/…) register as free fns exactly like the log crate
+     * above; the resolver's crate-provenanced macro fallback emits the
+     * canonical edge when `use tracing::info;` (or `tracing::info!`)
+     * proves the crate. ─────────────────────────────────────── */
+    CADD_TYPE("tracing.Span",  "Span",  false);
+    CADD_TYPE("tracing.Level", "Level", false);
+    CADD_TYPE("tracing.span.Entered", "Entered", false);
+    CADD_FUNC(NULL, "info",       "tracing.info",       t_unit);
+    CADD_FUNC(NULL, "warn",       "tracing.warn",       t_unit);
+    CADD_FUNC(NULL, "error",      "tracing.error",      t_unit);
+    CADD_FUNC(NULL, "debug",      "tracing.debug",      t_unit);
+    CADD_FUNC(NULL, "trace",      "tracing.trace",      t_unit);
+    CADD_FUNC(NULL, "event",      "tracing.event",      t_unit);
+    CADD_FUNC(NULL, "span",       "tracing.span",       cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC(NULL, "info_span",  "tracing.info_span",  cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC(NULL, "debug_span", "tracing.debug_span", cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC(NULL, "error_span", "tracing.error_span", cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC(NULL, "warn_span",  "tracing.warn_span",  cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC(NULL, "trace_span", "tracing.trace_span", cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC(NULL, "instrument", "tracing.instrument", t_unit);
+    CADD_FUNC("tracing.Span", "enter",    "tracing.Span.enter",
+              cbm_type_named(arena, "tracing.span.Entered"));
+    CADD_FUNC("tracing.Span", "record",   "tracing.Span.record",
+              cbm_type_named(arena, "tracing.Span"));
+    CADD_FUNC("tracing.Span", "in_scope", "tracing.Span.in_scope", cbm_type_unknown());
+    CADD_FUNC("tracing.Span", "current",  "tracing.Span.current",
+              cbm_type_named(arena, "tracing.Span"));
+
+    /* ── sqlx — async SQL toolkit. ─────────────────────────── */
+    CADD_TYPE("sqlx.Pool",        "Pool",        false);
+    CADD_TYPE("sqlx.PgPool",      "PgPool",      false);
+    CADD_TYPE("sqlx.Row",         "Row",         true);
+    CADD_TYPE("sqlx.Transaction", "Transaction", false);
+    CADD_TYPE("sqlx.postgres.PgPoolOptions", "PgPoolOptions", false);
+    CADD_FUNC(NULL, "query",        "sqlx.query",        cbm_type_unknown());
+    CADD_FUNC(NULL, "query_as",     "sqlx.query_as",     cbm_type_unknown());
+    CADD_FUNC(NULL, "query_scalar", "sqlx.query_scalar", cbm_type_unknown());
+    CADD_FUNC("sqlx.Pool", "acquire", "sqlx.Pool.acquire", cbm_type_unknown());
+    CADD_FUNC("sqlx.Pool", "begin",   "sqlx.Pool.begin",
+              cbm_type_named(arena, "sqlx.Transaction"));
+    CADD_FUNC("sqlx.Pool", "close",   "sqlx.Pool.close",   t_unit);
+    CADD_FUNC("sqlx.PgPool", "connect", "sqlx.PgPool.connect", cbm_type_unknown());
+    CADD_FUNC("sqlx.Row",  "get",     "sqlx.Row.get",     cbm_type_unknown());
+    CADD_FUNC("sqlx.Row",  "try_get", "sqlx.Row.try_get", cbm_type_unknown());
+    CADD_FUNC("sqlx.Transaction", "commit",   "sqlx.Transaction.commit",   cbm_type_unknown());
+    CADD_FUNC("sqlx.Transaction", "rollback", "sqlx.Transaction.rollback", cbm_type_unknown());
+    CADD_FUNC("sqlx.postgres.PgPoolOptions", "new", "sqlx.postgres.PgPoolOptions.new",
+              cbm_type_named(arena, "sqlx.postgres.PgPoolOptions"));
+    CADD_FUNC("sqlx.postgres.PgPoolOptions", "max_connections",
+              "sqlx.postgres.PgPoolOptions.max_connections",
+              cbm_type_named(arena, "sqlx.postgres.PgPoolOptions"));
+    CADD_FUNC("sqlx.postgres.PgPoolOptions", "connect", "sqlx.postgres.PgPoolOptions.connect",
+              cbm_type_unknown());
+
+    /* ── reqwest one-shot free fn (`reqwest::get(url).await?`). ── */
+    CADD_FUNC(NULL, "get", "reqwest.get", cbm_type_named(arena, "reqwest.Response"));
+
+    /* ── axum — Router/method-router surfaces. Builder returns are typed
+     * to the receiver so `.route(...).layer(...)` chains resolve, and the
+     * routing free fns type as MethodRouter so `get(a).post(b)` chains
+     * keep dispatching. ───────────────────────────────────── */
+    CADD_TYPE("axum.Router",                    "Router",       false);
+    CADD_TYPE("axum.routing.MethodRouter",      "MethodRouter", false);
+    CADD_TYPE("axum.extract.State",             "State",        false);
+    CADD_TYPE("axum.Json",                      "Json",         false);
+    CADD_FUNC("axum.Router", "new",        "axum.Router.new",   cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC("axum.Router", "route",      "axum.Router.route", cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC("axum.Router", "nest",       "axum.Router.nest",  cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC("axum.Router", "merge",      "axum.Router.merge", cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC("axum.Router", "layer",      "axum.Router.layer", cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC("axum.Router", "with_state", "axum.Router.with_state",
+              cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC("axum.Router", "fallback",   "axum.Router.fallback",
+              cbm_type_named(arena, "axum.Router"));
+    CADD_FUNC(NULL, "get",     "axum.routing.get",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "post",    "axum.routing.post",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "put",     "axum.routing.put",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "delete",  "axum.routing.delete",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "patch",   "axum.routing.patch",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "head",    "axum.routing.head",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "options", "axum.routing.options",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC(NULL, "any",     "axum.routing.any",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC("axum.routing.MethodRouter", "get",    "axum.routing.MethodRouter.get",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC("axum.routing.MethodRouter", "post",   "axum.routing.MethodRouter.post",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC("axum.routing.MethodRouter", "put",    "axum.routing.MethodRouter.put",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC("axum.routing.MethodRouter", "delete", "axum.routing.MethodRouter.delete",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+    CADD_FUNC("axum.routing.MethodRouter", "patch",  "axum.routing.MethodRouter.patch",
+              cbm_type_named(arena, "axum.routing.MethodRouter"));
+
+    /* ── actix-web — App/HttpServer/HttpResponse basics. ───── */
+    CADD_TYPE("actix_web.App",          "App",          false);
+    CADD_TYPE("actix_web.HttpServer",   "HttpServer",   false);
+    CADD_TYPE("actix_web.HttpResponse", "HttpResponse", false);
+    CADD_FUNC("actix_web.App", "new",     "actix_web.App.new",
+              cbm_type_named(arena, "actix_web.App"));
+    CADD_FUNC("actix_web.App", "route",   "actix_web.App.route",
+              cbm_type_named(arena, "actix_web.App"));
+    CADD_FUNC("actix_web.App", "service", "actix_web.App.service",
+              cbm_type_named(arena, "actix_web.App"));
+    CADD_FUNC("actix_web.App", "wrap",    "actix_web.App.wrap",
+              cbm_type_named(arena, "actix_web.App"));
+    CADD_FUNC("actix_web.App", "app_data","actix_web.App.app_data",
+              cbm_type_named(arena, "actix_web.App"));
+    CADD_FUNC("actix_web.HttpServer", "new",     "actix_web.HttpServer.new",
+              cbm_type_named(arena, "actix_web.HttpServer"));
+    CADD_FUNC("actix_web.HttpServer", "bind",    "actix_web.HttpServer.bind",
+              cbm_type_unknown());
+    CADD_FUNC("actix_web.HttpServer", "workers", "actix_web.HttpServer.workers",
+              cbm_type_named(arena, "actix_web.HttpServer"));
+    CADD_FUNC("actix_web.HttpServer", "run",     "actix_web.HttpServer.run",
+              cbm_type_unknown());
+    CADD_FUNC("actix_web.HttpResponse", "Ok",                  "actix_web.HttpResponse.Ok",
+              cbm_type_unknown());
+    CADD_FUNC("actix_web.HttpResponse", "NotFound",            "actix_web.HttpResponse.NotFound",
+              cbm_type_unknown());
+    CADD_FUNC("actix_web.HttpResponse", "InternalServerError",
+              "actix_web.HttpResponse.InternalServerError", cbm_type_unknown());
+
     /* ── async-trait / async_trait — typically derive-only. ──
      * Calls to trait methods are resolved through the normal trait
      * dispatch since async_trait emits real Rust impl blocks. No

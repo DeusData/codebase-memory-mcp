@@ -2645,6 +2645,84 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
     return unq;
 }
 
+/* Rust/axum: `.route("/", get(root))` wraps the handler in a method-router
+ * call. Peel `get(root)` / chained `get(a).post(b)` down to the innermost
+ * routing-verb call's first path-shaped argument. For a chain, the OUTERMOST
+ * call's handler wins (the last registered verb) — one HANDLES edge minimum.
+ * Only axum::routing verb names qualify, so `wrap(mw)` never yields a handler. */
+static bool rust_is_axum_routing_verb(const char *name) {
+    static const char *const verbs[] = {"get",  "post",    "put", "delete", "patch",
+                                        "head", "options", "any", "trace",  NULL};
+    if (!name) {
+        return false;
+    }
+    /* Accept a scoped tail too (`routing::get`). */
+    const char *tail = name;
+    for (const char *p = name; p[0]; p++) {
+        if (p[0] == ':' && p[1] == ':' && p[2]) {
+            tail = p + 2;
+        }
+    }
+    for (int i = 0; verbs[i]; i++) {
+        if (strcmp(tail, verbs[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *rust_axum_handler_from_call(CBMExtractCtx *ctx, TSNode call) {
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    const char *fk = ts_node_type(fn);
+    char *verb = NULL;
+    if (strcmp(fk, "identifier") == 0 || strcmp(fk, "scoped_identifier") == 0) {
+        verb = cbm_node_text(ctx->arena, fn, ctx->source);
+    } else if (strcmp(fk, "field_expression") == 0) {
+        /* Chained method router `get(a).post(b)`: the field is the verb. */
+        TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+        if (!ts_node_is_null(field)) {
+            verb = cbm_node_text(ctx->arena, field, ctx->source);
+        }
+    }
+    if (!rust_is_axum_routing_verb(verb)) {
+        return NULL;
+    }
+    TSNode vargs = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(vargs)) {
+        return NULL;
+    }
+    uint32_t vn = ts_node_named_child_count(vargs);
+    for (uint32_t vi = 0; vi < vn; vi++) {
+        TSNode h = ts_node_named_child(vargs, vi);
+        const char *hk = ts_node_type(h);
+        if (strcmp(hk, "identifier") == 0 || strcmp(hk, "field_expression") == 0) {
+            return cbm_node_text(ctx->arena, h, ctx->source);
+        }
+        if (strcmp(hk, "scoped_identifier") == 0) {
+            /* `handlers::create` → dotted form so registry suffix/short-name
+             * resolution sees the same shape other member handlers use. */
+            char *t = cbm_node_text(ctx->arena, h, ctx->source);
+            if (t) {
+                char *w = t;
+                for (char *p = t; *p; p++) {
+                    if (p[0] == ':' && p[1] == ':') {
+                        *w++ = '.';
+                        p++;
+                    } else {
+                        *w++ = *p;
+                    }
+                }
+                *w = '\0';
+            }
+            return t;
+        }
+    }
+    return NULL;
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     /* The LAST eligible argument wins, and every argument is examined.
      * Express, Fastify, gin and Laravel all put middleware between the route
@@ -2685,6 +2763,14 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
                 if (strcmp(iak, "identifier") == 0 || strcmp(iak, "selector_expression") == 0) {
                     handler = cbm_node_text(ctx->arena, inner, ctx->source);
                 }
+            }
+            continue;
+        }
+        /* Rust/axum wraps the handler in a routing-verb call (`get(root)`). */
+        if (ctx->language == CBM_LANG_RUST && strcmp(ak2, "call_expression") == 0) {
+            const char *h = rust_axum_handler_from_call(ctx, arg2);
+            if (h && h[0]) {
+                handler = h;
             }
             continue;
         }
