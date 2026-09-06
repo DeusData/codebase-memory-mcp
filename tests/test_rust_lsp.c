@@ -7977,4 +7977,26 @@ void suite_rust_lsp(void) {
     RUN_TEST(rustlsp_trait_default_body_calls);
     RUN_TEST(rustlsp_nested_inline_mod_walk);
     RUN_TEST(rustlsp_impl_level_bound_dispatch);
+    RUN_TEST(rustlsp_a3_axum_router_chain);
+    RUN_TEST(rustlsp_a3_bare_macro_never_binds_local_fn);
+    RUN_TEST(rustlsp_a3_sqlx_and_reqwest_seeds);
+    RUN_TEST(rustlsp_a3_tracing_macros);
+    RUN_TEST(rustlsp_cargo_hyphen_dep_head);
+    RUN_TEST(rustlsp_cargo_member_manifest_merge);
+    RUN_TEST(rustlsp_cargo_package_name_head_routes_to_src);
+    RUN_TEST(rustlsp_cargo_target_deps_section);
+    RUN_TEST(rustlsp_crate_path_lib_rs_item);
+    RUN_TEST(rustlsp_crate_path_test_target_own_crate);
+    RUN_TEST(rustlsp_crate_path_workspace_member);
+    RUN_TEST(rustlsp_impl_method_return_type_def);
+    RUN_TEST(rustlsp_mod_rs_relative_type_ambiguous_fails_closed);
+    RUN_TEST(rustlsp_mod_rs_relative_type_probe);
+    RUN_TEST(rustlsp_nested_mod_registry_harvest);
+    RUN_TEST(rustlsp_pub_use_alias);
+    RUN_TEST(rustlsp_pub_use_glob_regression);
+    RUN_TEST(rustlsp_use_as_underscore_binds_nothing);
+    RUN_TEST(rustlsp_use_nested_groups);
+    RUN_TEST(rustlsp_xf_derive_clone_cross_file);
+    RUN_TEST(rustlsp_xf_impl_method_return_type_chain);
+    RUN_TEST(rustlsp_xf_impl_method_self_return_chain);
 }
