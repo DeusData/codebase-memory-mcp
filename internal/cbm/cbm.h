@@ -203,6 +203,11 @@ typedef struct {
     const char **return_types;          // NULL-terminated array (NULL if none)
     const char *route_path;   // HTTP route path from decorator (e.g., "/api/users") or NULL
     const char *route_method; // HTTP method from decorator (e.g., "POST") or NULL
+    // Handler reference for call-registered routes (Django urls.py path()):
+    // the spelled handler expression ("views.detail", "AboutView") on a
+    // label=="Route" definition. NULL everywhere else. Resolved to a graph
+    // node by pass_route_nodes (connect_route_handler_defs).
+    const char *route_handler;
     int complexity;           // cyclomatic complexity
     int cognitive;            // cognitive complexity (nesting-weighted)
     int loop_count;           // number of loop constructs in the body
@@ -578,6 +583,19 @@ typedef struct {
     int count;
 } CBMStringConstantMap;
 
+// Router-prefix map (py-router-prefix-concat): module-level
+// `NAME = APIRouter(prefix="/api/v1")` / `NAME = Blueprint(..., url_prefix=...)`
+// assignments, recorded by a Python pre-scan so decorator routes on NAME
+// (`@NAME.get("/items")`) record the exact mounted path. Files rarely define
+// more than a handful of routers; overflow silently falls back to the
+// unprefixed path (the pass_route_nodes directory bridge still applies).
+#define CBM_MAX_ROUTER_PREFIXES 16
+typedef struct {
+    const char *names[CBM_MAX_ROUTER_PREFIXES];
+    const char *prefixes[CBM_MAX_ROUTER_PREFIXES];
+    int count;
+} CBMRouterPrefixMap;
+
 // Forward declaration: ObjectScript macro table (defined in macro_table.h).
 typedef struct CBMMacroTable CBMMacroTable;
 
@@ -616,6 +634,7 @@ typedef struct {
     EFCache ef_cache;                            // enclosing function cache
     const char *enclosing_class_qn;              // for nested class QN computation
     CBMStringConstantMap string_constants;       // module-level NAME = "value" pairs
+    CBMRouterPrefixMap router_prefixes;          // Python NAME = APIRouter(prefix=...) pre-scan
     const CBMMacroTable *macro_table;            // ObjectScript $$$macro table (NULL if none)
     const CBMReturnTypeTable *return_type_table; // ObjectScript method return types (NULL if none)
     /* Set by extract_class_variables around its extract_var_names calls, so a

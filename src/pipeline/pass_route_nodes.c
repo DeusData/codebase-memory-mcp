@@ -510,6 +510,114 @@ static void ensure_decorator_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* Phase 2a-bis: HANDLES edges for call-registered Route defs (Django urls.py).
+ * Extraction records the spelled handler ("views.detail", "AboutView") in the
+ * Route node's route_handler property; resolve it against Function/Method/
+ * Class nodes by boundary-suffix QN match, preferring nodes that share the
+ * route's directory, and fail closed on ambiguity. */
+static bool qn_has_dotted_suffix(const char *qn, const char *suffix) {
+    if (!qn || !suffix || !suffix[0]) {
+        return false;
+    }
+    size_t qlen = strlen(qn);
+    size_t slen = strlen(suffix);
+    if (qlen <= slen) {
+        return qlen == slen && strcmp(qn, suffix) == 0;
+    }
+    return qn[qlen - slen - SKIP_ONE] == '.' && strcmp(qn + qlen - slen, suffix) == 0;
+}
+
+/* Directory prefix length of a path ("app/urls.py" -> 4, "urls.py" -> 0). */
+static int path_dir_len(const char *path) {
+    const char *last_slash = path ? strrchr(path, '/') : NULL;
+    return last_slash ? (int)(last_slash - path) + SKIP_ONE : 0;
+}
+
+static const cbm_gbuf_node_t *resolve_route_handler_node(cbm_gbuf_t *gb, const char *handler,
+                                                         const char *route_file) {
+    static const char *labels[] = {"Function", "Method", "Class"};
+    const cbm_gbuf_node_t *unique = NULL;
+    const cbm_gbuf_node_t *same_dir = NULL;
+    int match_count = 0;
+    int same_dir_count = 0;
+    int dir_len = path_dir_len(route_file);
+    for (int li = 0; li < (int)(sizeof(labels) / sizeof(labels[0])); li++) {
+        const cbm_gbuf_node_t **nodes = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_label(gb, labels[li], &nodes, &count) != 0) {
+            continue;
+        }
+        for (int i = 0; i < count; i++) {
+            if (!qn_has_dotted_suffix(nodes[i]->qualified_name, handler)) {
+                continue;
+            }
+            match_count++;
+            unique = nodes[i];
+            if (dir_len > 0 && nodes[i]->file_path &&
+                strncmp(nodes[i]->file_path, route_file, (size_t)dir_len) == 0) {
+                same_dir_count++;
+                same_dir = nodes[i];
+            }
+        }
+    }
+    if (match_count == 1) {
+        return unique;
+    }
+    if (match_count > 1 && same_dir_count == 1) {
+        return same_dir;
+    }
+    return NULL; /* unresolved or ambiguous: no edge (zero-edge guarantee) */
+}
+
+static void connect_route_handler_defs(cbm_gbuf_t *gb) {
+    const cbm_gbuf_node_t **routes = NULL;
+    int route_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Route", &routes, &route_count) != 0) {
+        return;
+    }
+    int connected = 0;
+    for (int ri = 0; ri < route_count; ri++) {
+        const cbm_gbuf_node_t *route = routes[ri];
+        char handler[CBM_SZ_256];
+        if (!route->properties_json ||
+            !extract_json_prop(route->properties_json, "route_handler", handler,
+                               sizeof(handler)) ||
+            !handler[0]) {
+            continue;
+        }
+        const cbm_gbuf_node_t *h = resolve_route_handler_node(
+            gb, handler, route->file_path ? route->file_path : "");
+        if (!h) {
+            continue;
+        }
+        const cbm_gbuf_edge_t **existing = NULL;
+        int eh_count = 0;
+        bool already = false;
+        cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &existing, &eh_count);
+        for (int eh = 0; eh < eh_count; eh++) {
+            if (existing[eh]->source_id == h->id) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            continue;
+        }
+        char hprops[CBM_SZ_512];
+        char esc_h[CBM_SZ_256];
+        cbm_json_escape(esc_h, sizeof(esc_h), h->qualified_name ? h->qualified_name : "");
+        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"route_handler\"}",
+                 esc_h);
+        cbm_gbuf_insert_edge(gb, h->id, route->id, "HANDLES", hprops);
+        connected++;
+    }
+    if (connected > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", connected);
+        cbm_log_info("pass.route_handler_defs", "connected", buf);
+    }
+}
+
 /* Phase 2b: Connect prefix Routes to decorator handler Functions.
  * For each prefix Route (__route__ANY__/path), find the CALLS edge leading to it
  * (from the registering file), derive the service directory, then find decorator
@@ -566,26 +674,34 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
         const cbm_gbuf_edge_t **calls_in = NULL;
         int calls_count = 0;
         cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
-        if (calls_count == 0) {
+        const char *registrar_path = NULL;
+        if (calls_count > 0) {
+            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
+            if (registrar) {
+                registrar_path = registrar->file_path;
+            }
+        } else if (prefix_route->file_path && prefix_route->file_path[0]) {
+            /* Def-minted prefix Route (Django include() in urls.py): no CALLS
+             * edge exists — the route's OWN file is the registrar. Call-minted
+             * prefix Routes carry an empty file_path, so their behavior is
+             * unchanged. */
+            registrar_path = prefix_route->file_path;
+        }
+        if (!registrar_path) {
             continue;
         }
-
-        const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
-        if (!registrar || !registrar->file_path) {
-            continue;
-        }
-        const char *last_slash = strrchr(registrar->file_path, '/');
+        const char *last_slash = strrchr(registrar_path, '/');
         if (!last_slash) {
             continue;
         }
-        int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
+        int dir_len = (int)(last_slash - registrar_path) + SKIP_ONE;
 
         const char *prefix_path = prefix_route->name;
         const char *prefix_segs =
             (prefix_path && prefix_path[0] == '/') ? prefix_path + SKIP_ONE : prefix_path;
 
         connected +=
-            bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len, prefix_segs);
+            bridge_funcs_to_prefix(gb, prefix_route, registrar_path, dir_len, prefix_segs);
     }
 
     if (connected > 0) {
@@ -1436,6 +1552,10 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     /* Phase 2a: ensure all functions with route_path have Route+HANDLES.
      * Handles incremental mode where unchanged files don't re-extract. */
     ensure_decorator_routes(gb);
+
+    /* Phase 2a-bis: HANDLES for call-registered Route defs (Django urls.py) —
+     * resolve each Route node's route_handler property to its handler node. */
+    connect_route_handler_defs(gb);
 
     /* Phase 2b: connect prefix Routes to decorator handler Functions.
      * Must run BEFORE match_infra_routes so infra matching can find

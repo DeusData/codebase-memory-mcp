@@ -330,6 +330,43 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+/* Module-level imports also live inside compound statements: try/except
+ * shims (`try: import cjson as json / except ImportError: import json`),
+ * `if TYPE_CHECKING:` blocks, platform conditionals, even `with` bodies.
+ * Descend a bounded depth into those wrappers — but NEVER into function /
+ * class / decorated bodies, whose imports are function-local and would
+ * pollute module scope (CBMImport carries no scope). Depth 3 covers
+ * try -> except_clause -> block -> import. */
+#define PY_IMPORT_SCAN_MAX_DEPTH 3
+
+static void parse_python_imports_in(CBMExtractCtx *ctx, TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > PY_IMPORT_SCAN_MAX_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "import_statement") == 0) {
+        process_py_import_stmt(ctx, node);
+        return;
+    }
+    if (strcmp(kind, "import_from_statement") == 0 ||
+        strcmp(kind, "future_import_statement") == 0) {
+        // `from __future__ import annotations` is a distinct node type in
+        // tree-sitter-python but has the same shape (module + name list).
+        process_py_import_from(ctx, node);
+        return;
+    }
+    if (strcmp(kind, "try_statement") != 0 && strcmp(kind, "if_statement") != 0 &&
+        strcmp(kind, "elif_clause") != 0 && strcmp(kind, "else_clause") != 0 &&
+        strcmp(kind, "except_clause") != 0 && strcmp(kind, "finally_clause") != 0 &&
+        strcmp(kind, "with_statement") != 0 && strcmp(kind, "block") != 0) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        parse_python_imports_in(ctx, ts_node_named_child(node, i), depth + 1);
+    }
+}
+
 static void parse_python_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -337,17 +374,7 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
         return;
     }
     do {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *kind = ts_node_type(node);
-
-        if (strcmp(kind, "import_statement") == 0) {
-            process_py_import_stmt(ctx, node);
-        } else if (strcmp(kind, "import_from_statement") == 0 ||
-                   strcmp(kind, "future_import_statement") == 0) {
-            // `from __future__ import annotations` is a distinct node type in
-            // tree-sitter-python but has the same shape (module + name list).
-            process_py_import_from(ctx, node);
-        }
+        parse_python_imports_in(ctx, ts_tree_cursor_current_node(&cursor), 0);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
