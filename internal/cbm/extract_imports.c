@@ -1011,6 +1011,76 @@ static void generic_import_from_text(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+// --- Perl require imports ---
+// `require Foo::Bar;` parses as expression_statement > require_expression with
+// a bareword (or 'Foo/Bar.pm' string) operand — never a use_statement, so the
+// generic top-level use scan cannot see it. The common patterns are
+// CONDITIONAL (`if (...) { require Foo; }`, `eval { require JSON::XS; 1 }`),
+// so walk the WHOLE tree for require_expression (a named node — cheap) and
+// emit rows only for literal barewords and 'Foo/Bar.pm' string operands;
+// variables are skipped. Depth-capped for pathological nesting.
+static void perl_require_import_row(CBMExtractCtx *ctx, const char *module) {
+    if (!module || !module[0]) {
+        return;
+    }
+    CBMImport imp = {.local_name = path_last(ctx->arena, module), .module_path = module};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+static void perl_collect_require_imports(CBMExtractCtx *ctx, TSNode node, int depth) {
+    enum { PERL_REQUIRE_MAX_DEPTH = 200 };
+    if (ts_node_is_null(node) || depth > PERL_REQUIRE_MAX_DEPTH) {
+        return;
+    }
+    if (strcmp(ts_node_type(node), "require_expression") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(c);
+            if (strcmp(ck, "bareword") == 0 || strcmp(ck, "package") == 0) {
+                perl_require_import_row(ctx, cbm_node_text(ctx->arena, c, ctx->source));
+            } else if (strcmp(ck, "string_literal") == 0) {
+                /* require 'Legacy/Helper.pm' → Legacy::Helper */
+                char *raw = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, c, ctx->source));
+                size_t n = raw ? strlen(raw) : 0;
+                if (n > 3 && strcmp(raw + n - 3, ".pm") == 0) {
+                    raw[n - 3] = '\0';
+                    size_t segs = 0;
+                    for (const char *p = raw; *p; p++) {
+                        if (*p == '/') {
+                            segs++;
+                        }
+                    }
+                    char *pkg = (char *)cbm_arena_alloc(ctx->arena, n + segs + 1);
+                    if (pkg) {
+                        size_t w = 0;
+                        for (const char *p = raw; *p; p++) {
+                            if (*p == '/') {
+                                pkg[w++] = ':';
+                                pkg[w++] = ':';
+                            } else {
+                                pkg[w++] = *p;
+                            }
+                        }
+                        pkg[w] = '\0';
+                        perl_require_import_row(ctx, pkg);
+                    }
+                }
+            }
+            /* `require v5.36` / scalar operands: no import row. */
+        }
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        perl_collect_require_imports(ctx, ts_node_named_child(node, i), depth + 1);
+    }
+}
+
+static void parse_perl_require_imports(CBMExtractCtx *ctx) {
+    perl_collect_require_imports(ctx, ctx->root, 0);
+}
+
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
     /* Use TSTreeCursor for O(1)-per-step sibling traversal. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -3058,6 +3128,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_PERL:
         parse_generic_imports(ctx, "use_statement");
+        parse_perl_require_imports(ctx);
         break;
     case CBM_LANG_GROOVY:
         parse_generic_imports(ctx, "groovy_import");

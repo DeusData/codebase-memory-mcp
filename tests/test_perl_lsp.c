@@ -710,6 +710,340 @@ TEST(perllsp_stdlib_dbi_typed_chain) {
     PASS();
 }
 
+/* ── push @ISA inheritance (perl-push-isa) ─────────────────────── */
+
+TEST(perllsp_push_isa_inheritance) {
+    /* Classic pre-parent.pm subclassing: push @ISA, 'Base'; must record the
+     * inheritance edge exactly like an @ISA assignment. */
+    const char *src = "package Base;\n"
+                      "sub speak { return 1; }\n"
+                      "package Legacy;\n"
+                      "push @ISA, 'Base';\n"
+                      "sub run { my $self = shift; $self->speak(); }\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.run", "main.speak") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_unshift_qualified_isa_inheritance) {
+    /* unshift + fully-qualified @Pkg::ISA spellings both count. */
+    const char *src = "package Base;\n"
+                      "sub speak { return 1; }\n"
+                      "package Other;\n"
+                      "sub noop { return 0; }\n"
+                      "package main;\n"
+                      "unshift @Other::ISA, 'Base';\n"
+                      "sub run {\n"
+                      "    my $o = bless {}, 'Other';\n"
+                      "    $o->speak();\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.run", "main.speak") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── qw() word splitting regression ────────────────────────────── */
+
+TEST(perllsp_qw_multiword_import) {
+    /* tree-sitter-perl exposes qw(a b) as ONE string_content "a b"; both
+     * symbols must import (the old per-child assumption silently dropped
+     * every multi-symbol list). */
+    const char *src = "use Scalar::Util qw(blessed reftype);\n"
+                      "sub f {\n"
+                      "    my $x = blessed({});\n"
+                      "    my $y = reftype({});\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.f", "Scalar.Util.blessed") >= 0);
+    ASSERT(require_resolved(r, "main.f", "Scalar.Util.reftype") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Moose/Moo DSL (perl-moose-attrs) ──────────────────────────── */
+
+TEST(perllsp_moose_extends) {
+    const char *src = "package Base;\n"
+                      "sub greet { return 1; }\n"
+                      "package Child;\n"
+                      "use Moose;\n"
+                      "extends 'Base';\n"
+                      "sub run { my $self = shift; $self->greet(); }\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.run", "main.greet") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_moose_attr_chain) {
+    /* has engine => (isa => 'Engine') types $self->engine as Engine so the
+     * CHAINED ->start() dispatches; the accessor call itself emits nothing
+     * (no indexed sub — zero-edge). */
+    const char *src = "package Engine;\n"
+                      "sub start { return 1; }\n"
+                      "package Car;\n"
+                      "use Moo;\n"
+                      "has engine => (is => 'ro', isa => 'Engine');\n"
+                      "sub go { my $self = shift; $self->engine->start(); }\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.go", "main.start") >= 0);
+    ASSERT(find_resolved(r, "main.go", "main.engine") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_moose_with_role) {
+    /* `with 'Role'` composes the role's methods — flattened into the ISA
+     * table (sound approximation for method lookup). */
+    const char *src = "package Role::Fast;\n"
+                      "sub dash { return 1; }\n"
+                      "package Car;\n"
+                      "use Moo;\n"
+                      "with 'Role::Fast';\n"
+                      "sub go { my $self = shift; $self->dash(); }\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.go", "main.dash") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_has_outside_moose_is_inert) {
+    /* Per-package gate: `has` in a package that never imported a Moose-like
+     * module is an ordinary (unresolvable) call — no attr, no typing, no
+     * edges from the chain. */
+    const char *src = "package Engine;\n"
+                      "sub start { return 1; }\n"
+                      "package Plain;\n"
+                      "has engine => (is => 'ro', isa => 'Engine');\n"
+                      "sub go { my $self = shift; $self->engine->start(); }\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(find_resolved(r, "main.go", "main.start") < 0);
+    ASSERT(find_resolved(r, "main.go", "main.engine") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(perllsp_moose_multi_attr_arrayref) {
+    /* has ['a','b'] => (isa => 'Engine') declares BOTH attrs. */
+    const char *src = "package Engine;\n"
+                      "sub start { return 1; }\n"
+                      "package Car;\n"
+                      "use Moo;\n"
+                      "has ['primary', 'backup'] => (is => 'ro', isa => 'Engine');\n"
+                      "sub go { my $self = shift; $self->backup->start(); }\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.go", "main.start") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Cross-file resolution (perl-cross-file-lsp) ───────────────── */
+
+static int find_resolved_arr(const CBMResolvedCallArray *arr, const char *callerSub,
+                             const char *calleeSub) {
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        if (rc->caller_qn && strstr(rc->caller_qn, callerSub) && rc->callee_qn &&
+            strstr(rc->callee_qn, calleeSub))
+            return i;
+    }
+    return -1;
+}
+
+static void dump_resolved_arr(const CBMResolvedCallArray *arr) {
+    printf("  resolved (%d):\n", arr->count);
+    for (int i = 0; i < arr->count; i++) {
+        const CBMResolvedCall *rc = &arr->items[i];
+        printf("    %s -> %s [%s]\n", rc->caller_qn ? rc->caller_qn : "(null)",
+               rc->callee_qn ? rc->callee_qn : "(null)", rc->strategy ? rc->strategy : "(null)");
+    }
+}
+
+TEST(perllsp_cross_imported_function) {
+    /* Explicit caller-supplied symbol map (the pipeline shape when a member
+     * import resolves): use + bare call lands on the cross-file def QN. */
+    const char *source = "use My::Util qw(helper);\n"
+                         "sub run { helper(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.run", .short_name = "run", .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.lib.My.Util.helper", .short_name = "helper",
+         .label = "Function", .def_module_qn = "test.lib.My.Util"},
+    };
+    const char *imp_names[] = {"helper"};
+    const char *imp_qns[] = {"test.lib.My.Util.helper"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, imp_names,
+                           imp_qns, 1, NULL, &out);
+    int idx = find_resolved_arr(&out, "main.run", "lib.My.Util.helper");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_qw_ast_recollection) {
+    /* NO caller import map at all: PASS 1 re-collects `use My::Util
+     * qw(helper)` from the AST and resolves the module against the filtered
+     * defs' module-QN tails (rel path ends My/Util.pm, lib/ root included). */
+    const char *source = "use My::Util qw(helper);\n"
+                         "sub run { helper(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.My.Util.helper", .short_name = "helper",
+         .label = "Function", .def_module_qn = "test.lib.My.Util"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 1, NULL, NULL,
+                           0, NULL, &out);
+    int idx = find_resolved_arr(&out, "main.run", "lib.My.Util.helper");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_package_method_dispatch) {
+    /* Foo::Bar->new types the receiver; both the static-ish ->new and the
+     * typed ->frob dispatch into the mapped module's method table. */
+    const char *source = "use Foo::Bar;\n"
+                         "sub go {\n"
+                         "    my $o = Foo::Bar->new;\n"
+                         "    $o->frob();\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Foo.Bar.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Foo.Bar"},
+        {.qualified_name = "test.lib.Foo.Bar.frob", .short_name = "frob", .label = "Function",
+         .def_module_qn = "test.lib.Foo.Bar"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    int idx_new = find_resolved_arr(&out, "main.go", "lib.Foo.Bar.new");
+    int idx_frob = find_resolved_arr(&out, "main.go", "lib.Foo.Bar.frob");
+    if (idx_new < 0 || idx_frob < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx_new >= 0);
+    ASSERT(idx_frob >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_require_package_dispatch) {
+    /* require-based loading (even conditional) also feeds the package→module
+     * map, so Foo::Bar->new dispatches without a use statement. */
+    const char *source = "sub go {\n"
+                         "    require Foo::Bar;\n"
+                         "    my $o = Foo::Bar->new;\n"
+                         "    $o->frob();\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Foo.Bar.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Foo.Bar"},
+        {.qualified_name = "test.lib.Foo.Bar.frob", .short_name = "frob", .label = "Function",
+         .def_module_qn = "test.lib.Foo.Bar"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    int idx = find_resolved_arr(&out, "main.go", "lib.Foo.Bar.frob");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_default_exports) {
+    /* perl-exports-model: `use My::Util;` with NO list imports the module's
+     * @EXPORT defaults, carried on the EXPORT Variable def's return_types. */
+    const char *source = "use My::Util;\n"
+                         "sub run { helper(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.My.Util.helper", .short_name = "helper",
+         .label = "Function", .def_module_qn = "test.lib.My.Util"},
+        {.qualified_name = "test.lib.My.Util.EXPORT", .short_name = "EXPORT",
+         .label = "Variable", .def_module_qn = "test.lib.My.Util", .return_types = "helper"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    int idx = find_resolved_arr(&out, "main.run", "lib.My.Util.helper");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_export_ok_not_default) {
+    /* @EXPORT_OK names are NOT imported by a bare `use Mod;` — only @EXPORT
+     * is. Zero-edge negative. */
+    const char *source = "use My::Util;\n"
+                         "sub run { helper(); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.My.Util.helper", .short_name = "helper",
+         .label = "Function", .def_module_qn = "test.lib.My.Util"},
+        {.qualified_name = "test.lib.My.Util.EXPORT_OK", .short_name = "EXPORT_OK",
+         .label = "Variable", .def_module_qn = "test.lib.My.Util", .return_types = "helper"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    ASSERT(find_resolved_arr(&out, "main.run", "helper") < 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_unresolvable_module_zero_edges) {
+    /* A use of a module no def/import resolves must emit NOTHING. */
+    const char *source = "use No::Such;\n"
+                         "sub run {\n"
+                         "    my $o = No::Such->new;\n"
+                         "    $o->frob();\n"
+                         "    missing();\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.My.Util.helper", .short_name = "helper",
+         .label = "Function", .def_module_qn = "test.lib.My.Util"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 1, NULL, NULL,
+                           0, NULL, &out);
+    if (out.count != 0)
+        dump_resolved_arr(&out);
+    ASSERT(out.count == 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -734,13 +1068,23 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_list_unpack_self_dispatch);
     RUN_TEST(perllsp_plain_first_param_not_invocant);
     RUN_TEST(perllsp_signature_class_dispatch);
-    /* Corinna dispatch: implementation landed but the vendored grammar's
-     * class-file shape needs pinning first (extract_perl_corinna_probe prints
-     * it) — the whole fixture currently yields zero resolutions, so the tree
-     * differs from the assumed package-like shape. Re-enable with the fix.
-     * Tracked in docs/lsp-uplift/PLAN.md (perl-corinna-class). */
     RUN_TEST(perllsp_corinna_method_dispatch);
     RUN_TEST(perllsp_corinna_constructor_dispatch);
     RUN_TEST(perllsp_stdlib_file_basename);
     RUN_TEST(perllsp_stdlib_dbi_typed_chain);
+    RUN_TEST(perllsp_push_isa_inheritance);
+    RUN_TEST(perllsp_unshift_qualified_isa_inheritance);
+    RUN_TEST(perllsp_qw_multiword_import);
+    RUN_TEST(perllsp_moose_extends);
+    RUN_TEST(perllsp_moose_attr_chain);
+    RUN_TEST(perllsp_moose_with_role);
+    RUN_TEST(perllsp_has_outside_moose_is_inert);
+    RUN_TEST(perllsp_moose_multi_attr_arrayref);
+    RUN_TEST(perllsp_cross_imported_function);
+    RUN_TEST(perllsp_cross_qw_ast_recollection);
+    RUN_TEST(perllsp_cross_package_method_dispatch);
+    RUN_TEST(perllsp_cross_require_package_dispatch);
+    RUN_TEST(perllsp_cross_default_exports);
+    RUN_TEST(perllsp_cross_export_ok_not_default);
+    RUN_TEST(perllsp_cross_unresolvable_module_zero_edges);
 }

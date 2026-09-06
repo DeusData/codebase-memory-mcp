@@ -6762,6 +6762,179 @@ TEST(pipeline_go122_mux_routes) {
     PASS();
 }
 
+/* perl-cross-file-lsp end-to-end: a CPAN-style lib/ layout where main.pl
+ * imports a sub from lib/My/Util.pm. Exercises the whole chain: pkgmap
+ * Perl module resolution (My::Util → lib/My/Util.pm → IMPORTS edge), the
+ * cross-LSP def filter, cbm_run_perl_lsp_cross's package→module mapping and
+ * qw target rewriting, and the pass_calls LSP join into a CALLS edge. */
+TEST(pipeline_perl_cross_file_calls) {
+    const char *files[] = {"lib/My/Util.pm", "main.pl"};
+    const char *contents[] = {"package My::Util;\n"
+                              "use Exporter 'import';\n"
+                              "our @EXPORT_OK = qw(helper);\n"
+                              "sub helper { return 42; }\n"
+                              "1;\n",
+
+                              "use My::Util qw(helper);\n"
+                              "sub run { return helper(); }\n"
+                              "run();\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *callers = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "run", &callers, &cc);
+    ASSERT_GT(cc, 0);
+    cbm_node_t *targets = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "helper", &targets, &tc);
+    ASSERT_GT(tc, 0);
+    int64_t helper_id = -1;
+    for (int i = 0; i < tc; i++) {
+        if (targets[i].qualified_name && strstr(targets[i].qualified_name, "lib.My.Util.helper"))
+            helper_id = targets[i].id;
+    }
+    ASSERT_TRUE(helper_id >= 0);
+
+    bool found = false;
+    for (int i = 0; i < cc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, callers[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            if (edges[j].target_id == helper_id)
+                found = true;
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    if (!found)
+        printf("  no CALLS run->lib.My.Util.helper edge\n");
+    ASSERT_TRUE(found);
+
+    cbm_store_free_nodes(callers, cc);
+    cbm_store_free_nodes(targets, tc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* perl-web-routes: Dancer2/Mojolicious::Lite bare DSL (`get '/users' => sub`)
+ * and Mojolicious method form ($r->get / $r->delete) must mint method-
+ * qualified Route nodes. Bare callees can never match the '.'/'::'-suffix
+ * table, so this covers cbm_service_pattern_perl_route_method end-to-end. */
+TEST(pipeline_perl_web_routes) {
+    const char *files[] = {"app.pl"};
+    const char *contents[] = {"use Dancer2;\n"
+                              "get '/users' => sub { return 'u'; };\n"
+                              "post '/users/:id' => sub { return 1; };\n"
+                              "my $r = app->routes;\n"
+                              "$r->get('/list' => sub { my $c = shift; });\n"
+                              "$r->delete('/gone');\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int rc2 = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc2);
+    bool got_users = false;
+    bool post_users_id = false;
+    bool got_list = false;
+    bool del_gone = false;
+    for (int i = 0; i < rc2; i++) {
+        const char *qn = routes[i].qualified_name;
+        if (!qn)
+            continue;
+        if (strcmp(qn, "__route__GET__/users") == 0)
+            got_users = true;
+        if (strcmp(qn, "__route__POST__/users/{}") == 0)
+            post_users_id = true;
+        if (strcmp(qn, "__route__GET__/list") == 0)
+            got_list = true;
+        if (strcmp(qn, "__route__DELETE__/gone") == 0)
+            del_gone = true;
+    }
+    if (!(got_users && post_users_id && got_list && del_gone)) {
+        printf("  %d Route nodes:\n", rc2);
+        for (int i = 0; i < rc2; i++)
+            printf("    qn=%s\n", routes[i].qualified_name ? routes[i].qualified_name : "-");
+    }
+    ASSERT_TRUE(got_users);
+    ASSERT_TRUE(post_users_id);
+    ASSERT_TRUE(got_list);
+    ASSERT_TRUE(del_gone);
+
+    if (routes)
+        cbm_store_free_nodes(routes, rc2);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* Negative: a RESOLVED local `sub get` outranks route classification — the
+ * Perl matcher runs only on the empty-resolution / suppressed paths, so
+ * `get('/tmp/file')` binding the local sub mints NO Route node. */
+TEST(pipeline_perl_local_get_no_route) {
+    const char *files[] = {"tool.pl"};
+    const char *contents[] = {"sub get { return 1; }\n"
+                              "sub main_entry { return get('/tmp/file'); }\n"
+                              "main_entry();\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int rc2 = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc2);
+    if (rc2 != 0) {
+        for (int i = 0; i < rc2; i++)
+            printf("  unexpected Route qn=%s\n",
+                   routes[i].qualified_name ? routes[i].qualified_name : "-");
+    }
+    ASSERT_EQ(rc2, 0);
+
+    if (routes)
+        cbm_store_free_nodes(routes, rc2);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 /* Shared body for the two interface sole-implementer pipeline cases below.
  * Go method-def QNs do not weave in the receiver (parent_class carries it), so
  * the observable signal of sole-implementer precision is the CALLS edge whose
@@ -13642,6 +13815,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_go122_mux_routes);
+    RUN_TEST(pipeline_perl_cross_file_calls);
+    RUN_TEST(pipeline_perl_web_routes);
+    RUN_TEST(pipeline_perl_local_get_no_route);
     RUN_TEST(pipeline_go_interface_sole_impl_cross_file);
     RUN_TEST(pipeline_go_interface_skips_test_impls);
     RUN_TEST(pipeline_swift_cross_package_import);

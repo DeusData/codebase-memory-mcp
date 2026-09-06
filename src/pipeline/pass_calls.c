@@ -204,11 +204,16 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     }
 }
 
-/* Handle a route registration call: create Route node + HANDLES edge. */
+/* Handle a route registration call: create Route node + HANDLES edge.
+ * method_override names the HTTP method when the callee-suffix table cannot
+ * (Perl's bare-name DSL — see cbm_service_pattern_perl_route_method); NULL
+ * keeps the suffix-table lookup. */
 static void handle_route_registration(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                       const cbm_gbuf_node_t *source_node, const char *module_qn,
-                                      const char **imp_keys, const char **imp_vals, int imp_count) {
-    const char *method = cbm_service_pattern_route_method(call->callee_name);
+                                      const char **imp_keys, const char **imp_vals, int imp_count,
+                                      const char *method_override) {
+    const char *method =
+        method_override ? method_override : cbm_service_pattern_route_method(call->callee_name);
     const char *route_path = call->first_string_arg;
     if (!route_path || !route_path[0]) {
         return;
@@ -466,7 +471,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
                                  bool suppress_plain_calls) {
     cbm_svc_kind_t svc = cbm_service_pattern_match(res->qualified_name);
     if (svc == CBM_SVC_ROUTE_REG && call->first_string_arg && call->first_string_arg[0] == '/') {
-        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+        handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
+                                  imp_count, NULL);
         return;
     }
     /* Go 1.22 ServeMux "METHOD /path" literals: the method+path live in the
@@ -477,7 +483,8 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     if (call->first_string_arg && cbm_service_pattern_route_method(call->callee_name) != NULL) {
         const char *mux_probe = NULL;
         if (cbm_go_split_mux_pattern(call->first_string_arg, &mux_probe)) {
-            handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
+            handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals,
+                                      imp_count, NULL);
             return;
         }
     }
@@ -646,8 +653,22 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
              * external, so resolution is empty) — the split probe keeps them
              * from falling through to the client-pattern checks. */
             handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
-                                      imp_count);
+                                      imp_count, NULL);
             return SKIP_ONE;
+        }
+        /* Perl route DSL (Dancer2 / Mojolicious::Lite / Mojolicious): bare
+         * callee names ("get") that the suffix table can never match. Only on
+         * this empty-resolution path — a resolved local `sub get` wins. Must
+         * stay in lockstep with the parallel resolver's twin branch. */
+        if (lang == CBM_LANG_PERL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            const char *perl_method =
+                cbm_service_pattern_perl_route_method(call->callee_name, call->is_method);
+            if (perl_method != NULL) {
+                handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                          imp_count, perl_method);
+                return SKIP_ONE;
+            }
         }
         cbm_svc_kind_t esvc = cbm_service_pattern_match(call->callee_name);
         if (esvc == CBM_SVC_NONE && cbm_service_pattern_is_global_fetch(call->callee_name)) {
@@ -670,16 +691,30 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* Perl call-graph noise guard (#476). Perl has no LSP resolver, so the
-     * generic registry chain is the only resolver; for builtins (push/shift/
-     * keys/...) and method calls ($obj->m with an unresolved receiver), a *weak*
-     * cross-file short-name match to a project sub sharing the name is almost
-     * always a false positive. Suppress only those weak matches; KEEP the
-     * high-confidence same_module / import_map strategies so a genuine
-     * same-file or imported call to a builtin-named sub still resolves. Gated
-     * to Perl — other languages are unaffected. */
+    /* Perl call-graph noise guard (#476). The Perl LSP resolves typed/exact
+     * calls first (per-file since #476-era, cross-file via pass_lsp_cross);
+     * what reaches the generic registry chain is the residue, and for builtins
+     * (push/shift/keys/...) and method calls ($obj->m with an unresolved
+     * receiver), a *weak* cross-file short-name match to a project sub sharing
+     * the name is almost always a false positive. Suppress only those weak
+     * matches; KEEP the high-confidence same_module / import_map strategies so
+     * a genuine same-file or imported call to a builtin-named sub still
+     * resolves. Gated to Perl — other languages are unaffected. */
     if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method, call->callee_name,
                                         res.strategy)) {
+        /* A weakly-matched `$r->get('/x' => sub)` is still a genuine route
+         * registration — the CALLS edge is noise but the Route node is not.
+         * Emit route-only, mirroring the parallel resolver's twin branch. */
+        if (lang == CBM_LANG_PERL && call->first_string_arg &&
+            call->first_string_arg[0] == '/') {
+            const char *perl_method =
+                cbm_service_pattern_perl_route_method(call->callee_name, call->is_method);
+            if (perl_method != NULL) {
+                handle_route_registration(ctx, call, source_node, module_qn, imp_keys, imp_vals,
+                                          imp_count, perl_method);
+                return SKIP_ONE;
+            }
+        }
         return 0;
     }
 

@@ -615,7 +615,10 @@ static const char *perl_module_types[] = {"source_file", NULL};
 static const char *perl_call_types[] = {"ambiguous_function_call_expression",
                                         "function_call_expression", "func1op_call_expression",
                                         "method_call_expression", NULL};
-static const char *perl_import_types[] = {"use_statement", "require_statement", "require", NULL};
+/* require parses as expression_statement > require_expression (the previously
+ * listed require_statement/require node kinds do not exist in the vendored
+ * grammar — phantom names that never matched). */
+static const char *perl_import_types[] = {"use_statement", "require_expression", NULL};
 static const char *perl_branch_types[] = {"if_statement",      "unless_statement", "for_statement",
                                           "foreach_statement", "while_statement",  NULL};
 static const char *perl_var_types[] = {"variable_declaration", "expression_statement", NULL};

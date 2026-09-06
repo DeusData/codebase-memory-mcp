@@ -305,6 +305,155 @@ static void perl_add_isa(PerlLSPContext *ctx, const char *pkg, const char *paren
     ctx->isa_count++;
 }
 
+/* Grow-and-append for the paired (key, value) string tables added for
+ * cross-file + Moose support. Returns false on OOM (entry dropped — graceful
+ * degradation, the affected lookups just stay unresolved). */
+static bool perl_pair_push(CBMArena *arena, const char ***keys, const char ***vals, int *count,
+                           int *cap, const char *key, const char *val) {
+    if (!arena || !keys || !vals || !key)
+        return false;
+    if (*count >= *cap) {
+        int newcap = *cap ? *cap * 2 : 8;
+        const char **nk = (const char **)cbm_arena_alloc(arena, (size_t)newcap * sizeof(char *));
+        const char **nv = (const char **)cbm_arena_alloc(arena, (size_t)newcap * sizeof(char *));
+        if (!nk || !nv)
+            return false;
+        for (int i = 0; i < *count; i++) {
+            nk[i] = (*keys)[i];
+            nv[i] = (*vals)[i];
+        }
+        *keys = nk;
+        *vals = nv;
+        *cap = newcap;
+    }
+    (*keys)[*count] = cbm_arena_strdup(arena, key);
+    (*vals)[*count] = val ? cbm_arena_strdup(arena, val) : NULL;
+    (*count)++;
+    return true;
+}
+
+/* Cross-file package→module map lookup: "My::Util" → "test.lib.My.Util", or
+ * NULL when the package has no resolved project module. */
+static const char *perl_xmod_lookup(PerlLSPContext *ctx, const char *pkg) {
+    if (!ctx || !pkg)
+        return NULL;
+    for (int i = 0; i < ctx->xmod_count; i++) {
+        if (ctx->xmod_pkgs[i] && strcmp(ctx->xmod_pkgs[i], pkg) == 0)
+            return ctx->xmod_qns[i];
+    }
+    return NULL;
+}
+
+/* Default-export ("@EXPORT") list for a resolved module QN, or NULL. */
+static const char *perl_xexp_lookup(PerlLSPContext *ctx, const char *module_qn) {
+    if (!ctx || !module_qn)
+        return NULL;
+    for (int i = 0; i < ctx->xexp_count; i++) {
+        if (ctx->xexp_module_qns[i] && strcmp(ctx->xexp_module_qns[i], module_qn) == 0)
+            return ctx->xexp_names[i];
+    }
+    return NULL;
+}
+
+/* ── Moose/Moo per-package mode + attribute tables ──────────────── */
+
+static bool perl_pkg_is_moose(PerlLSPContext *ctx, const char *pkg) {
+    if (!ctx || !pkg)
+        return false;
+    for (int i = 0; i < ctx->moose_pkg_count; i++) {
+        if (ctx->moose_pkgs[i] && strcmp(ctx->moose_pkgs[i], pkg) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void perl_mark_moose_pkg(PerlLSPContext *ctx, const char *pkg) {
+    if (!ctx || !pkg || !pkg[0] || perl_pkg_is_moose(ctx, pkg))
+        return;
+    if (ctx->moose_pkg_count >= ctx->moose_pkg_cap) {
+        int newcap = ctx->moose_pkg_cap ? ctx->moose_pkg_cap * 2 : 4;
+        const char **np =
+            (const char **)cbm_arena_alloc(ctx->arena, (size_t)newcap * sizeof(char *));
+        if (!np)
+            return;
+        for (int i = 0; i < ctx->moose_pkg_count; i++)
+            np[i] = ctx->moose_pkgs[i];
+        ctx->moose_pkgs = np;
+        ctx->moose_pkg_cap = newcap;
+    }
+    ctx->moose_pkgs[ctx->moose_pkg_count++] = cbm_arena_strdup(ctx->arena, pkg);
+}
+
+/* Record one Moose attribute (pkg, name, isa-or-NULL). `has '+attr'`
+ * overrides an inherited attr: strip the '+' and do not mint a new name. */
+static void perl_add_attr(PerlLSPContext *ctx, const char *pkg, const char *name,
+                          const char *isa) {
+    if (!ctx || !pkg || !name || !name[0])
+        return;
+    if (name[0] == '+')
+        name++;
+    if (!name[0])
+        return;
+    if (ctx->attr_count >= ctx->attr_cap) {
+        int newcap = ctx->attr_cap ? ctx->attr_cap * 2 : 8;
+        const char **np = (const char **)cbm_arena_alloc(ctx->arena, (size_t)newcap * sizeof(char *));
+        const char **nn = (const char **)cbm_arena_alloc(ctx->arena, (size_t)newcap * sizeof(char *));
+        const char **ni = (const char **)cbm_arena_alloc(ctx->arena, (size_t)newcap * sizeof(char *));
+        if (!np || !nn || !ni)
+            return;
+        for (int i = 0; i < ctx->attr_count; i++) {
+            np[i] = ctx->attr_pkgs[i];
+            nn[i] = ctx->attr_names[i];
+            ni[i] = ctx->attr_isa[i];
+        }
+        ctx->attr_pkgs = np;
+        ctx->attr_names = nn;
+        ctx->attr_isa = ni;
+        ctx->attr_cap = newcap;
+    }
+    ctx->attr_pkgs[ctx->attr_count] = cbm_arena_strdup(ctx->arena, pkg);
+    ctx->attr_names[ctx->attr_count] = cbm_arena_strdup(ctx->arena, name);
+    ctx->attr_isa[ctx->attr_count] = isa && isa[0] ? cbm_arena_strdup(ctx->arena, isa) : NULL;
+    ctx->attr_count++;
+}
+
+/* Attribute lookup on `pkg` and (Moose attrs inherit) its recorded parents.
+ * Returns the isa type name, "" when the attr exists with unknown type, or
+ * NULL when no such attribute is recorded. Bounded parent walk. */
+static const char *perl_lookup_attr_isa(PerlLSPContext *ctx, const char *pkg,
+                                        const char *attr_name) {
+    if (!ctx || !pkg || !attr_name)
+        return NULL;
+    enum { CAP = CBM_LSP_MAX_LOOKUP_DEPTH * 2 };
+    const char *frontier[CAP];
+    int fc = 0;
+    const char *visited[CAP];
+    int vc = 0;
+    frontier[fc++] = pkg;
+    while (fc > 0 && vc < CAP) {
+        const char *cur = frontier[--fc];
+        bool seen = false;
+        for (int v = 0; v < vc; v++) {
+            if (strcmp(visited[v], cur) == 0) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen)
+            continue;
+        visited[vc++] = cur;
+        for (int i = 0; i < ctx->attr_count; i++) {
+            if (strcmp(ctx->attr_pkgs[i], cur) == 0 && strcmp(ctx->attr_names[i], attr_name) == 0)
+                return ctx->attr_isa[i] ? ctx->attr_isa[i] : "";
+        }
+        for (int i = 0; i < ctx->isa_count && fc < CAP; i++) {
+            if (strcmp(ctx->isa_pkg_qns[i], cur) == 0)
+                frontier[fc++] = ctx->isa_parent_qns[i];
+        }
+    }
+    return NULL;
+}
+
 /* ── method lookup over the @ISA chain ──────────────────────────── */
 
 /* Resolve a method on a package, searching the package's own subs first, then
@@ -619,6 +768,16 @@ static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode nod
     if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
         f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
         return f->signature->data.func.return_types[0];
+    }
+    /* Moose/Moo synthetic accessor: `has engine => (isa => 'Engine')` makes
+     * $self->engine return an Engine. TYPING ONLY — perl_resolve_method_call
+     * still emits no edge for the accessor call itself (no indexed sub), but
+     * the returned type lets the CHAINED call ($self->engine->start())
+     * dispatch. Unknown/parameterized isa → unknown (zero-edge). */
+    {
+        const char *isa = perl_lookup_attr_isa(ctx, class_qn, mname);
+        if (isa && isa[0])
+            return cbm_type_named(ctx->arena, perl_resolve_package_name(ctx, isa));
     }
     return cbm_type_unknown();
 }
@@ -1231,35 +1390,76 @@ static void process_package_decl(PerlLSPContext *ctx, TSNode node) {
     }
 }
 
+/* Split a whitespace-separated word blob into arena-owned words, invoking
+ * `fn(ctx, word, user)` for each. tree-sitter-perl exposes `qw(a b c)` as ONE
+ * string_content node with text "a b c" — per-word children were an incorrect
+ * assumption that silently broke every multi-symbol qw() list. */
+typedef void (*perl_word_fn)(PerlLSPContext *ctx, const char *word, void *user);
+static void perl_for_each_word(PerlLSPContext *ctx, const char *blob, perl_word_fn fn,
+                               void *user) {
+    if (!blob)
+        return;
+    const char *p = blob;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p))
+            p++;
+        const char *start = p;
+        while (*p && !isspace((unsigned char)*p))
+            p++;
+        if (p > start) {
+            char *word = cbm_arena_strndup(ctx->arena, start, (size_t)(p - start));
+            if (word && word[0])
+                fn(ctx, word, user);
+        }
+    }
+}
+
+/* One qw-import word: map W → <resolved-or-dotted module>.W. */
+static void perl_qw_import_word(PerlLSPContext *ctx, const char *word, void *user) {
+    const char *module_dot = (const char *)user;
+    const char *fn = perl_strip_sigil(word); /* allow &func imports */
+    if (!fn || !fn[0] || !(isalpha((unsigned char)fn[0]) || fn[0] == '_'))
+        return;
+    /* Import tags (:all, :DEFAULT) are not symbols. */
+    char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", module_dot, fn);
+    perl_lsp_add_use(ctx, fn, target);
+}
+
 /* Parse the `qw(a b c)` list inside a node into the import map for module
- * `module_name`: each word W maps to `module_name::W`. */
+ * `module_name`: each word W maps to `<module>.W`. In cross-file mode the
+ * module portion is the RESOLVED module QN from the package→module map
+ * (test.lib.My.Util.helper); otherwise the naive dotted spelling, which can
+ * only ever match stdlib registry entries (zero-edge safe). */
 static void perl_collect_qw_imports(PerlLSPContext *ctx, TSNode container,
                                     const char *module_name) {
     TSNode qw = perl_first_child_of_type(container, "quoted_word_list");
     if (ts_node_is_null(qw))
         return;
+    /* Registry QNs are fully dotted (e.g. "Scalar.Util.blessed"): the module
+     * portion uses "." not "::". Prefer the cross-file resolved module QN. */
+    const char *module_dot = perl_xmod_lookup(ctx, module_name);
+    if (!module_dot)
+        module_dot = perl_pkg_to_dot(ctx->arena, module_name);
+    if (!module_dot)
+        module_dot = module_name;
     uint32_t nc = ts_node_child_count(qw);
     TSNode *kids = perl_collect_children(qw, nc);
     for (uint32_t i = 0; i < nc; i++) {
         TSNode w = kids ? kids[i] : ts_node_child(qw, i);
         if (ts_node_is_null(w) || !ts_node_is_named(w))
             continue;
-        char *word = perl_node_text(ctx, w);
-        if (!word || !word[0])
-            continue;
-        const char *fn = perl_strip_sigil(word); /* allow &func imports */
-        if (!fn || !fn[0] || !(isalpha((unsigned char)fn[0]) || fn[0] == '_'))
-            continue;
-        /* Registry QNs are fully dotted (e.g. "Scalar.Util.blessed"): the
-         * module portion uses "." not "::". Dot the module so the import
-         * target matches the registry key for exact-match lookup. */
-        const char *module_dot = perl_pkg_to_dot(ctx->arena, module_name);
-        if (!module_dot)
-            module_dot = module_name;
-        char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", module_dot, fn);
-        perl_lsp_add_use(ctx, fn, target);
+        char *blob = perl_node_text(ctx, w);
+        perl_for_each_word(ctx, blob, perl_qw_import_word, (void *)module_dot);
     }
     free(kids);
+}
+
+/* One parent word from a qw() list: `-norequire` is a flag, not a parent. */
+static void perl_parent_word(PerlLSPContext *ctx, const char *word, void *user) {
+    const char *child_pkg = (const char *)user;
+    if (!word || !word[0] || word[0] == '-')
+        return;
+    perl_add_isa(ctx, child_pkg, word);
 }
 
 /* Recursively collect parent package names from a subtree, registering each
@@ -1286,7 +1486,8 @@ static void perl_collect_parents(PerlLSPContext *ctx, TSNode node, const char *c
             perl_add_isa(ctx, child_pkg, bw);
         return;
     }
-    /* quoted_word_list words come through as named string-content children. */
+    /* quoted_word_list: ONE string_content child carries the whole
+     * space-separated word blob ("Base Other") — split it. */
     if (strcmp(k, "quoted_word_list") == 0) {
         uint32_t nc = ts_node_child_count(node);
         TSNode *kids = perl_collect_children(node, nc);
@@ -1294,11 +1495,8 @@ static void perl_collect_parents(PerlLSPContext *ctx, TSNode node, const char *c
             TSNode w = kids ? kids[i] : ts_node_child(node, i);
             if (ts_node_is_null(w) || !ts_node_is_named(w))
                 continue;
-            char *pw = perl_node_text(ctx, w);
-            if (pw && pw[0] && strcmp(pw, "-norequire") == 0)
-                continue;
-            if (pw && pw[0])
-                perl_add_isa(ctx, child_pkg, pw);
+            char *blob = perl_node_text(ctx, w);
+            perl_for_each_word(ctx, blob, perl_parent_word, (void *)child_pkg);
         }
         free(kids);
         return;
@@ -1352,8 +1550,67 @@ static void perl_collect_use_statement(PerlLSPContext *ctx, TSNode node) {
         return;
     }
 
+    /* Moose-family gate: has/extends/with become meaningful DSL keywords only
+     * in packages that import a Moose-like module. Tracked PER PACKAGE so a
+     * multi-package file with one Moose package does not treat a foreign
+     * `has(...)` call as an attribute. Object::Pad is deliberately absent:
+     * its `has $x;`/`field $x` take variables and ride the Corinna path. */
+    if (strcmp(module_name, "Moose") == 0 || strcmp(module_name, "Moo") == 0 ||
+        strcmp(module_name, "Mouse") == 0 || strcmp(module_name, "Moose::Role") == 0 ||
+        strcmp(module_name, "Moo::Role") == 0 || strcmp(module_name, "Class::Accessor") == 0) {
+        const char *pkg = ctx->current_package_qn && ctx->current_package_qn[0]
+                              ? ctx->current_package_qn
+                              : "main";
+        perl_mark_moose_pkg(ctx, pkg);
+        return;
+    }
+
     /* Generic Exporter import: use Module qw(f1 f2). */
     perl_collect_qw_imports(ctx, node, module_name);
+
+    /* `use Module;` with NO import list — the dominant style for internal
+     * modules — imports the module's @EXPORT defaults. Cross-file mode knows
+     * both the resolved module QN (package→module map) and its @EXPORT list
+     * (collected at extraction); seed name → module_qn.name for each. A bare
+     * pragma or unresolved module maps to nothing (zero-edge). "No import
+     * list" means the statement has no named argument child beyond the module
+     * field — `use Mod ();` (import NOTHING) and version/qw forms all carry
+     * extra children and are excluded. */
+    {
+        bool has_args = false;
+        uint32_t nc = ts_node_child_count(node);
+        TSNode *kids = perl_collect_children(node, nc);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = kids ? kids[i] : ts_node_child(node, i);
+            if (ts_node_is_null(c) || !ts_node_is_named(c) || ts_node_eq(c, mod))
+                continue;
+            has_args = true;
+            break;
+        }
+        free(kids);
+        if (!has_args) {
+            const char *resolved = perl_xmod_lookup(ctx, module_name);
+            const char *exports = resolved ? perl_xexp_lookup(ctx, resolved) : NULL;
+            if (exports && exports[0]) {
+                /* '|'-separated names. */
+                const char *p = exports;
+                while (*p) {
+                    const char *start = p;
+                    while (*p && *p != '|')
+                        p++;
+                    if (p > start) {
+                        char *name = cbm_arena_strndup(ctx->arena, start, (size_t)(p - start));
+                        if (name && name[0]) {
+                            char *target = cbm_arena_sprintf(ctx->arena, "%s.%s", resolved, name);
+                            perl_lsp_add_use(ctx, name, target);
+                        }
+                    }
+                    if (*p == '|')
+                        p++;
+                }
+            }
+        }
+    }
 }
 
 /* Detect `our @ISA = (...)` / `@ISA = (...)` assignments, recording parents
@@ -1457,6 +1714,143 @@ static void perl_collect_class_isa(PerlLSPContext *ctx, TSNode class_node) {
     }
 }
 
+/* Collect the Moose attribute name(s) from the FIRST argument of a `has`
+ * call: 'name', bareword name, or ['a','b'] multi-attr arrayref. Strings only
+ * — Object::Pad's `has $x;` takes a variable and is deliberately skipped. */
+static void perl_collect_has_names(PerlLSPContext *ctx, TSNode node, const char *pkg,
+                                   const char *isa, int depth) {
+    if (ts_node_is_null(node) || depth > 3)
+        return;
+    const char *k = ts_node_type(node);
+    if (perl_is_string_node(k)) {
+        char *inner = perl_unquote(ctx->arena, perl_node_text(ctx, node));
+        if (inner)
+            perl_add_attr(ctx, pkg, inner, isa);
+        return;
+    }
+    if (perl_is_bareword_node(k)) {
+        char *bw = perl_node_text(ctx, node);
+        if (bw)
+            perl_add_attr(ctx, pkg, bw, isa);
+        return;
+    }
+    if (strcmp(k, "anonymous_array_expression") == 0 || strcmp(k, "list_expression") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc && i < 16; i++)
+            perl_collect_has_names(ctx, ts_node_named_child(node, i), pkg, isa, depth + 1);
+    }
+    /* scalar/other → variable-form has (Object::Pad) → skip. */
+}
+
+/* Find the `isa => 'Class::Name'` value inside a has() option list: scan the
+ * flat key/value children for a bareword "isa" followed by a string/bareword
+ * value. Parameterized types (ArrayRef[...]) return NULL (unknown). */
+static const char *perl_find_has_isa(PerlLSPContext *ctx, TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > 3)
+        return NULL;
+    uint32_t nc = ts_node_named_child_count(node);
+    bool pending = false;
+    for (uint32_t i = 0; i < nc && i < 64; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        const char *ck = ts_node_type(c);
+        if (perl_is_bareword_node(ck)) {
+            char *t = perl_node_text(ctx, c);
+            if (pending && t && t[0] && !strchr(t, '[')) {
+                return cbm_arena_strdup(ctx->arena, t);
+            }
+            pending = t && strcmp(t, "isa") == 0;
+            continue;
+        }
+        if (perl_is_string_node(ck)) {
+            if (pending) {
+                char *inner = perl_unquote(ctx->arena, perl_node_text(ctx, c));
+                if (inner && inner[0] && !strchr(inner, '['))
+                    return inner;
+                return NULL;
+            }
+            continue;
+        }
+        if (strcmp(ck, "list_expression") == 0 || strcmp(ck, "parenthesized_expression") == 0) {
+            const char *found = perl_find_has_isa(ctx, c, depth + 1);
+            if (found)
+                return found;
+            continue;
+        }
+        pending = false; /* any other value node closes a dangling key */
+    }
+    return NULL;
+}
+
+/* PASS-1 observer for top-level DSL-ish calls:
+ *   push @ISA, 'Base'; / unshift @ISA, ...; / push @Pkg::ISA, ... — the
+ *     classic pre-parent.pm inheritance idiom (function_call with the ISA
+ *     array as first argument).
+ *   extends 'Base'; / with 'Role'; / has attr => (isa => 'T', ...) — Moose
+ *     DSL, honored only in packages gated by perl_mark_moose_pkg. `extends`
+ *     REPLACES @ISA in real Moose; appending is an accepted approximation for
+ *     edge purposes, and `with` mapped to the ISA table is a sound flattening
+ *     of role composition for method lookup. */
+static void perl_pass1_scan_call(PerlLSPContext *ctx, TSNode call) {
+    TSNode fn = ts_node_child_by_field_name(call, "function", 8);
+    if (ts_node_is_null(fn))
+        return;
+    char *name = perl_node_text(ctx, fn);
+    if (!name || !name[0])
+        return;
+    TSNode args = ts_node_child_by_field_name(call, "arguments", 9);
+
+    if (strcmp(name, "push") == 0 || strcmp(name, "unshift") == 0) {
+        if (ts_node_is_null(args))
+            return;
+        /* First named argument must be the @ISA array (bare or Pkg::ISA). */
+        TSNode first = ts_node_named_child(args, 0);
+        if (ts_node_is_null(first) || strcmp(ts_node_type(first), "array") != 0)
+            return;
+        char *atxt = perl_node_text(ctx, first);
+        const char *aname = perl_strip_sigil(atxt);
+        if (!aname)
+            return;
+        const char *child_pkg = NULL;
+        if (strcmp(aname, "ISA") == 0) {
+            child_pkg = ctx->current_package_qn && ctx->current_package_qn[0]
+                            ? ctx->current_package_qn
+                            : "main";
+        } else {
+            size_t alen = strlen(aname);
+            if (alen > 5 && strcmp(aname + alen - 5, "::ISA") == 0)
+                child_pkg = cbm_arena_strndup(ctx->arena, aname, alen - 5);
+        }
+        if (!child_pkg || !child_pkg[0])
+            return;
+        uint32_t nc = ts_node_named_child_count(args);
+        for (uint32_t i = 1; i < nc && i < 32; i++)
+            perl_collect_parents(ctx, ts_node_named_child(args, i), child_pkg, 0);
+        return;
+    }
+
+    /* Moose DSL below — per-package gate. */
+    const char *pkg =
+        ctx->current_package_qn && ctx->current_package_qn[0] ? ctx->current_package_qn : "main";
+    if (!perl_pkg_is_moose(ctx, pkg) || ts_node_is_null(args))
+        return;
+
+    if (strcmp(name, "extends") == 0 || strcmp(name, "with") == 0) {
+        perl_collect_parents(ctx, args, pkg, 0);
+        return;
+    }
+    if (strcmp(name, "has") == 0) {
+        TSNode name_arg = args;
+        if (strcmp(ts_node_type(args), "list_expression") == 0) {
+            name_arg = ts_node_named_child(args, 0);
+            if (ts_node_is_null(name_arg))
+                return;
+        }
+        const char *isa = perl_find_has_isa(ctx, args, 0);
+        perl_collect_has_names(ctx, name_arg, pkg, isa, 0);
+        return;
+    }
+}
+
 /* Recursively scan (PASS 1) for package context, @ISA assignments, and `use`
  * statements. */
 /* Depth-guarded entry (see perl_resolve_calls_in_node for the rationale). */
@@ -1486,6 +1880,10 @@ static void perl_pass1_scan_inner(PerlLSPContext *ctx, TSNode node) {
         return;
     } else if (strcmp(k, "assignment_expression") == 0) {
         perl_collect_isa_assignment(ctx, node);
+    } else if (strcmp(k, "function_call_expression") == 0 ||
+               strcmp(k, "ambiguous_function_call_expression") == 0) {
+        /* push/unshift @ISA and the Moose has/extends/with DSL. */
+        perl_pass1_scan_call(ctx, node);
     }
     uint32_t nc = ts_node_child_count(node);
     TSNode *kids = perl_collect_children(node, nc);
@@ -1508,8 +1906,10 @@ void perl_lsp_process_file(PerlLSPContext *ctx, TSNode root) {
      * (cbm_run_perl_lsp) has already run a pre-pass to build registry types. */
     ctx->current_package_qn = "";
     ctx->enclosing_package_qn = "";
-    ctx->use_count = 0;
+    ctx->use_count = ctx->use_floor; /* keep caller-seeded cross-file imports */
     ctx->isa_count = 0;
+    ctx->moose_pkg_count = 0;
+    ctx->attr_count = 0;
     perl_pass1_scan(ctx, root);
 
     /* PASS 2: walk subs in package order; resolve + emit call edges. */
@@ -1880,4 +2280,306 @@ void cbm_run_perl_lsp(CBMArena *arena, CBMFileResult *result, const char *source
     }
 
     cbm_arena_destroy(&idx_arena);
+}
+
+/* ── cross-file LSP: cbm_run_perl_lsp_cross ─────────────────────── */
+
+extern const TSLanguage *tree_sitter_perl(void);
+
+/* Register the caller-supplied CBMLSPDef[] as callable functions, mirroring
+ * cbm_php_register_lsp_defs (php_lsp.c). Perl defs carry no declared types,
+ * so signatures get an unknown return; receiver_type (when a def has one)
+ * still gets its type auto-registered so perl_lookup_method's chain walk has
+ * somewhere to land. Variable defs are skipped here — the EXPORT ones are
+ * consumed separately for the default-export table. */
+static void cbm_perl_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
+                                       int def_count) {
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->short_name || !d->label)
+            continue;
+        if (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)
+            continue;
+        CBMRegisteredFunc rf;
+        memset(&rf, 0, sizeof(rf));
+        rf.min_params = -1;
+        rf.qualified_name = d->qualified_name;
+        rf.short_name = d->short_name;
+        const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+        if (rets) {
+            rets[0] = cbm_type_unknown();
+            rets[1] = NULL;
+        }
+        rf.signature = cbm_type_func(arena, NULL, NULL, rets);
+        if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
+            rf.receiver_type = d->receiver_type;
+            if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+                CBMRegisteredType auto_t;
+                memset(&auto_t, 0, sizeof(auto_t));
+                auto_t.qualified_name = rf.receiver_type;
+                const char *dot = strrchr(d->receiver_type, '.');
+                auto_t.short_name = dot ? dot + 1 : rf.receiver_type;
+                cbm_registry_add_type(reg, auto_t);
+            }
+        }
+        cbm_registry_add_func(reg, rf);
+    }
+}
+
+/* True when the dotted module QN `qn` ends with the dotted package path
+ * `dotted` on a segment boundary ("test.lib.My.Util" matches "My.Util"). */
+static bool perl_qn_tail_matches(const char *qn, const char *dotted) {
+    if (!qn || !dotted || !dotted[0])
+        return false;
+    size_t ql = strlen(qn);
+    size_t dl = strlen(dotted);
+    if (ql < dl)
+        return false;
+    if (strcmp(qn + ql - dl, dotted) != 0)
+        return false;
+    return ql == dl || qn[ql - dl - 1] == '.';
+}
+
+/* Small collector for module names referenced by `use`/`require` — the
+ * candidates for cross-file package→module mapping. Bounded. */
+enum { PERL_XMOD_SCAN_CAP = 128 };
+typedef struct {
+    const char *names[PERL_XMOD_SCAN_CAP];
+    int count;
+} PerlUsedModules;
+
+static void perl_used_modules_add(PerlLSPContext *ctx, PerlUsedModules *um, const char *name) {
+    if (!name || !name[0] || um->count >= PERL_XMOD_SCAN_CAP)
+        return;
+    /* Pragmas and single lowercase words are never project modules worth a
+     * convention lookup; still cheap to include, but skip the obvious ones. */
+    for (int i = 0; i < um->count; i++) {
+        if (strcmp(um->names[i], name) == 0)
+            return;
+    }
+    um->names[um->count++] = cbm_arena_strdup(ctx->arena, name);
+}
+
+/* Whole-tree scan for use_statement modules and require_expression operands
+ * (bareword `require Foo::Bar;` and string `require 'Foo/Bar.pm';`, wherever
+ * they appear — the common patterns are conditional). Depth-capped. */
+static void perl_scan_used_modules(PerlLSPContext *ctx, TSNode node, PerlUsedModules *um,
+                                   int depth) {
+    if (ts_node_is_null(node) || depth > 128 || um->count >= PERL_XMOD_SCAN_CAP)
+        return;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "use_statement") == 0) {
+        TSNode mod = ts_node_child_by_field_name(node, "module", 6);
+        if (!ts_node_is_null(mod))
+            perl_used_modules_add(ctx, um, perl_node_text(ctx, mod));
+        return;
+    }
+    if (strcmp(k, "require_expression") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(c);
+            if (perl_is_bareword_node(ck)) {
+                perl_used_modules_add(ctx, um, perl_node_text(ctx, c));
+            } else if (perl_is_string_node(ck)) {
+                /* 'Foo/Bar.pm' → Foo::Bar */
+                char *inner = perl_unquote(ctx->arena, perl_node_text(ctx, c));
+                if (inner) {
+                    size_t n = strlen(inner);
+                    if (n > 3 && strcmp(inner + n - 3, ".pm") == 0) {
+                        inner[n - 3] = '\0';
+                        /* '/' → "::" (grow: reuse dotted form later, keep :: here) */
+                        size_t segs = 0;
+                        for (char *p = inner; *p; p++)
+                            if (*p == '/')
+                                segs++;
+                        char *pkg = (char *)cbm_arena_alloc(ctx->arena, n + segs + 1);
+                        if (pkg) {
+                            size_t w = 0;
+                            for (char *p = inner; *p; p++) {
+                                if (*p == '/') {
+                                    pkg[w++] = ':';
+                                    pkg[w++] = ':';
+                                } else {
+                                    pkg[w++] = *p;
+                                }
+                            }
+                            pkg[w] = '\0';
+                            perl_used_modules_add(ctx, um, pkg);
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+    uint32_t nc = ts_node_child_count(node);
+    TSNode *kids = perl_collect_children(node, nc);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = kids ? kids[i] : ts_node_child(node, i);
+        if (!ts_node_is_null(c) && ts_node_is_named(c))
+            perl_scan_used_modules(ctx, c, um, depth + 1);
+    }
+    free(kids);
+}
+
+/* Resolve one used module name against (a) the caller-supplied import map
+ * (values are gbuf-resolved module QNs) and (b) the filtered defs' own
+ * def_module_qn tails (rel path ends Foo/Bar.pm — lib/ and t/lib/ roots fall
+ * out of plain tail matching since "test.lib.My.Util" ends with ".My.Util").
+ * Ambiguity (two DISTINCT module QNs match) → NULL, per the zero-edge
+ * guarantee: no mapping, no edge. */
+static const char *perl_resolve_used_module(PerlLSPContext *ctx, const char *pkg_name,
+                                            CBMLSPDef *defs, int def_count,
+                                            const char **import_names, const char **import_qns,
+                                            int import_count) {
+    const char *dotted = perl_pkg_to_dot(ctx->arena, pkg_name);
+    if (!dotted || !dotted[0])
+        return NULL;
+    const char *found = NULL;
+    /* (a) exact local-name match in the caller import map wins outright. */
+    for (int i = 0; i < import_count; i++) {
+        if (import_names && import_names[i] && import_qns && import_qns[i] &&
+            strcmp(import_names[i], pkg_name) == 0) {
+            return import_qns[i];
+        }
+    }
+    /* (a') tail match over import map values. */
+    for (int i = 0; i < import_count; i++) {
+        const char *qn = import_qns ? import_qns[i] : NULL;
+        if (!qn || !perl_qn_tail_matches(qn, dotted))
+            continue;
+        if (found && strcmp(found, qn) != 0)
+            return NULL; /* ambiguous */
+        found = qn;
+    }
+    if (found)
+        return found;
+    /* (b) tail match over the (filtered) defs' module QNs. */
+    for (int i = 0; i < def_count; i++) {
+        const char *qn = defs[i].def_module_qn;
+        if (!qn || !perl_qn_tail_matches(qn, dotted))
+            continue;
+        if (found && strcmp(found, qn) != 0)
+            return NULL; /* ambiguous */
+        found = qn;
+    }
+    return found;
+}
+
+void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
+                            const char *module_qn, CBMLSPDef *defs, int def_count,
+                            const char **import_names, const char **import_qns, int import_count,
+                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+    if (!arena || !source || source_len <= 0 || !out)
+        return;
+
+    TSParser *parser = NULL;
+    TSTree *tree = cached_tree;
+    bool owns_tree = false;
+    if (!tree) {
+        parser = ts_parser_new();
+        if (!parser)
+            return;
+        ts_parser_set_language(parser, tree_sitter_perl());
+        tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)source_len);
+        owns_tree = true;
+        if (!tree) {
+            ts_parser_delete(parser);
+            return;
+        }
+    }
+    TSNode root = ts_tree_root_node(tree);
+
+    CBMTypeRegistry reg;
+    cbm_registry_init(&reg, arena);
+    cbm_perl_stdlib_register(&reg, arena);
+    cbm_perl_register_lsp_defs(arena, &reg, defs, def_count);
+
+    PerlLSPContext ctx;
+    perl_lsp_init(&ctx, arena, source, source_len, &reg, module_qn, out);
+
+    /* Caller-supplied import map seeds the use map; process_file's PASS-1
+     * reset preserves the first use_floor entries. Module-shaped keys
+     * ("My::Util") are harmless there — bare-call lookups never carry "::" —
+     * and symbol-shaped keys (hand-built maps, future member imports)
+     * resolve directly. */
+    for (int i = 0; i < import_count; i++) {
+        if (import_names && import_qns && import_names[i] && import_qns[i])
+            perl_lsp_add_use(&ctx, import_names[i], import_qns[i]);
+    }
+    ctx.use_floor = ctx.use_count;
+
+    /* Package→module map: every module named by a use/require anywhere in the
+     * file, resolved against the import map + filtered defs (convention: rel
+     * path ends Foo/Bar.pm, lib/ roots included by tail matching). Each
+     * mapped package gets a CBMRegisteredType whose method table is that
+     * module's Function/Method defs, so `Foo::Bar->new`, `$obj->m` chains and
+     * `Foo::Bar::sub()` statics dispatch cross-file. No mapping → no entry →
+     * no edge (zero-edge guarantee). */
+    PerlUsedModules um;
+    um.count = 0;
+    perl_scan_used_modules(&ctx, root, &um, 0);
+    for (int m = 0; m < um.count; m++) {
+        const char *resolved = perl_resolve_used_module(&ctx, um.names[m], defs, def_count,
+                                                        import_names, import_qns, import_count);
+        if (!resolved || !resolved[0])
+            continue;
+        perl_pair_push(ctx.arena, &ctx.xmod_pkgs, &ctx.xmod_qns, &ctx.xmod_count, &ctx.xmod_cap,
+                       um.names[m], resolved);
+        /* Method table: the module's callable defs, keyed by short name. */
+        PerlMethodVec mv;
+        memset(&mv, 0, sizeof(mv));
+        for (int i = 0; i < def_count; i++) {
+            CBMLSPDef *d = &defs[i];
+            if (!d->def_module_qn || strcmp(d->def_module_qn, resolved) != 0)
+                continue;
+            if (!d->label || (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0))
+                continue;
+            if (!d->short_name || !d->qualified_name)
+                continue;
+            perl_mvec_push(&mv, um.names[m], d->short_name, d->qualified_name);
+        }
+        if (mv.cnt > 0 && mv.v)
+            perl_type_set_methods(&ctx, &reg, um.names[m], mv.v, mv.cnt);
+        free(mv.v);
+    }
+
+    /* Default-export table from EXPORT Variable defs (perl-exports-model):
+     * extraction stores the qw() word list on the def's return_type. Only
+     * @EXPORT feeds `use Mod;` — @EXPORT_OK names must be requested via
+     * qw(...), which the qw path already resolves against the module map. */
+    for (int i = 0; i < def_count; i++) {
+        CBMLSPDef *d = &defs[i];
+        if (!d->label || strcmp(d->label, "Variable") != 0 || !d->short_name)
+            continue;
+        if (strcmp(d->short_name, "EXPORT") != 0)
+            continue;
+        if (!d->def_module_qn || !d->return_types || !d->return_types[0])
+            continue;
+        perl_pair_push(ctx.arena, &ctx.xexp_module_qns, &ctx.xexp_names, &ctx.xexp_count,
+                       &ctx.xexp_cap, d->def_module_qn, d->return_types);
+    }
+
+    /* Own-file packages: same Phase B.1 as the per-file entry point, so
+     * same-file dispatch keeps working under the cross entry (results are
+     * site-deduped on append). */
+    ctx.current_package_qn = "";
+    ctx.enclosing_package_qn = "";
+    perl_pass1_scan(&ctx, root);
+    perl_register_packages(&ctx, &reg);
+    perl_attach_methods(&ctx, &reg, root);
+
+    /* Finalize into a per-call scratch index arena (see cbm_run_perl_lsp). */
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    cbm_registry_finalize_into(&reg, &idx_arena);
+
+    perl_lsp_process_file(&ctx, root);
+
+    cbm_arena_destroy(&idx_arena);
+    if (owns_tree && tree)
+        ts_tree_delete(tree);
+    if (parser)
+        ts_parser_delete(parser);
 }

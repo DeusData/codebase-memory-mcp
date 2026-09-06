@@ -6086,6 +6086,70 @@ static bool is_perl_var_type(const char *ck) {
            strcmp(ck, "scalar") == 0 || strcmp(ck, "array") == 0 || strcmp(ck, "hash") == 0;
 }
 
+// Append the words found in a Perl export-list RHS (quoted_word_list blobs —
+// ONE string_content carries the whole space-separated list — plus discrete
+// string literals) into buf as a '|'-joined list. Depth-capped; skips the
+// LHS variable_declaration subtree (it contains no strings anyway).
+static void perl_export_words_walk(CBMExtractCtx *ctx, TSNode node, char *buf, size_t cap,
+                                   size_t *len, int depth) {
+    if (ts_node_is_null(node) || depth > 4) {
+        return;
+    }
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "variable_declaration") == 0) {
+        return;
+    }
+    if (strcmp(k, "quoted_word_list") == 0 || strcmp(k, "string_literal") == 0) {
+        TSNode content = ts_node_child_by_field_name(node, TS_FIELD("content"));
+        if (ts_node_is_null(content)) {
+            uint32_t nc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(c), "string_content") == 0) {
+                    content = c;
+                    break;
+                }
+            }
+        }
+        if (ts_node_is_null(content)) {
+            return;
+        }
+        char *blob = cbm_node_text(ctx->arena, content, ctx->source);
+        if (!blob) {
+            return;
+        }
+        const char *p = blob;
+        while (*p) {
+            while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+                p++;
+            }
+            const char *start = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+                p++;
+            }
+            size_t wl = (size_t)(p - start);
+            if (wl == 0 || start[0] == ':' || start[0] == '$' || start[0] == '@' ||
+                start[0] == '%') {
+                continue; /* tags and variable exports are not callable names */
+            }
+            if (*len + wl + 2 >= cap) {
+                return; /* full — keep what fits (whole words only) */
+            }
+            if (*len > 0) {
+                buf[(*len)++] = '|';
+            }
+            memcpy(buf + *len, start, wl);
+            *len += wl;
+            buf[*len] = '\0';
+        }
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && i < 64; i++) {
+        perl_export_words_walk(ctx, ts_node_named_child(node, i), buf, cap, len, depth + 1);
+    }
+}
+
 // Perl variable extraction: handle direct variable nodes and assignment_expression.
 static void extract_perl_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -6116,7 +6180,27 @@ static void extract_perl_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 }
             }
         }
-        push_var_def(ctx, strip_perl_sigil(cbm_node_text(a, left, ctx->source)), node);
+        char *pv_name = strip_perl_sigil(cbm_node_text(a, left, ctx->source));
+        push_var_def(ctx, pv_name, node);
+        /* perl-exports-model: `our @EXPORT = qw(...)` (and @EXPORT_OK) carry
+         * the module's Exporter surface. Store the '|'-joined word list on the
+         * just-pushed Variable def's return_type so the cross-file LSP can
+         * resolve `use Mod;` (no import list) to Mod's @EXPORT defaults.
+         * Pointer-compare the def's name to confirm push_var_def did not skip
+         * the row (empty/"_" names are dropped there). */
+        if (pv_name &&
+            (strcmp(pv_name, "EXPORT") == 0 || strcmp(pv_name, "EXPORT_OK") == 0) &&
+            ctx->result->defs.count > 0 &&
+            ctx->result->defs.items[ctx->result->defs.count - 1].name == pv_name) {
+            char words[1024];
+            size_t wlen = 0;
+            words[0] = '\0';
+            perl_export_words_walk(ctx, child, words, sizeof(words), &wlen, 0);
+            if (wlen > 0) {
+                ctx->result->defs.items[ctx->result->defs.count - 1].return_type =
+                    cbm_arena_strdup(a, words);
+            }
+        }
         return;
     }
 }

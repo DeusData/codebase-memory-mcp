@@ -5089,6 +5089,82 @@ TEST(extract_perl_t_file_is_test) {
     PASS();
 }
 
+/* perl-require-imports: `require Foo::Bar;` (expression_statement >
+ * require_expression — NOT a use_statement) must produce an import row, even
+ * when conditional (`if (...) { require ... }`, `eval { require X; 1 }`), and
+ * a 'Legacy/Helper.pm' string operand converts back to Legacy::Helper.
+ * Variable operands (`require $mod;`) emit nothing. */
+TEST(extract_perl_require_imports) {
+    const char *src = "use My::Base;\n"
+                      "require My::Loader;\n"
+                      "require 'Legacy/Helper.pm';\n"
+                      "if ($ENV{DEBUG}) { require Cond::Mod; }\n"
+                      "eval { require JSON::XS; 1 } or do { require JSON::PP; };\n"
+                      "my $dyn = 'Foo';\n"
+                      "require $dyn;\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PERL, "t", "loader.pl");
+    ASSERT_NOT_NULL(r);
+    const char *want[] = {"My::Base",  "My::Loader", "Legacy::Helper",
+                          "Cond::Mod", "JSON::XS",   "JSON::PP"};
+    for (size_t w = 0; w < sizeof(want) / sizeof(want[0]); w++) {
+        bool found = false;
+        for (int i = 0; i < r->imports.count && !found; i++) {
+            if (r->imports.items[i].module_path &&
+                strcmp(r->imports.items[i].module_path, want[w]) == 0)
+                found = true;
+        }
+        if (!found) {
+            printf("  missing import %s; have %d:\n", want[w], r->imports.count);
+            for (int i = 0; i < r->imports.count; i++)
+                printf("    %s\n",
+                       r->imports.items[i].module_path ? r->imports.items[i].module_path : "?");
+        }
+        ASSERT_TRUE(found);
+    }
+    /* `require $dyn;` must NOT fabricate a row. */
+    for (int i = 0; i < r->imports.count; i++) {
+        if (r->imports.items[i].module_path)
+            ASSERT_TRUE(strcmp(r->imports.items[i].module_path, "$dyn") != 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* perl-exports-model: `our @EXPORT = qw(...)` word lists ride the EXPORT
+ * Variable def's return_type ('|'-joined) so the cross-file LSP can resolve
+ * `use Mod;` default imports. Tags (:all) are dropped. */
+TEST(extract_perl_export_words_on_variable_def) {
+    const char *src = "package My::Util;\n"
+                      "use Exporter 'import';\n"
+                      "our @EXPORT = qw(helper fmt :tag);\n"
+                      "our @EXPORT_OK = ('extra');\n"
+                      "sub helper { return 1; }\n"
+                      "sub fmt { return 2; }\n"
+                      "sub extra { return 3; }\n"
+                      "1;\n";
+    CBMFileResult *r = extract(src, CBM_LANG_PERL, "t", "lib/My/Util.pm");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *exp = NULL;
+    const CBMDefinition *exp_ok = NULL;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || !d->label || strcmp(d->label, "Variable") != 0)
+            continue;
+        if (strcmp(d->name, "EXPORT") == 0)
+            exp = d;
+        if (strcmp(d->name, "EXPORT_OK") == 0)
+            exp_ok = d;
+    }
+    ASSERT_NOT_NULL(exp);
+    ASSERT_NOT_NULL(exp->return_type);
+    ASSERT_STR_EQ(exp->return_type, "helper|fmt");
+    ASSERT_NOT_NULL(exp_ok);
+    ASSERT_NOT_NULL(exp_ok->return_type);
+    ASSERT_STR_EQ(exp_ok->return_type, "extra");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* INFORMATIONAL probe: print the def table and top-level AST node kinds for a
  * Corinna (5.38 feature 'class') fixture so the perllsp_corinna_* dispatch
  * work can pin the real grammar shape. Always passes; read its output in the
@@ -7180,6 +7256,8 @@ SUITE(extraction) {
     RUN_TEST(extract_perl_method_call_flags_is_method);
     RUN_TEST(extract_perl_t_file_is_test);
     RUN_TEST(extract_perl_corinna_probe);
+    RUN_TEST(extract_perl_require_imports);
+    RUN_TEST(extract_perl_export_words_on_variable_def);
     RUN_TEST(extract_go_interface_method_parent);
     RUN_TEST(extract_go_mux_call_ingredients);
     RUN_TEST(extract_rust_generic_impl_caller_qn);
