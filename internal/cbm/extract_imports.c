@@ -121,6 +121,32 @@ static const char *python_import_root(CBMArena *a, const char *path) {
 // --- Go imports ---
 // import_declaration -> import_spec_list -> import_spec -> (name, path)
 
+/* Go module-major-version suffix: an unaliased `import "math/rand/v2"` (or
+ * "github.com/x/foo/v3") binds the package name of the segment BEFORE the
+ * /vN suffix — the Go modules convention keeps the package name stable across
+ * major versions. Without this the local name would be "v2" and every
+ * `rand.IntN(...)` reference in the file would dangle. */
+static const char *go_import_local_name(CBMArena *a, const char *path) {
+    const char *last_slash = strrchr(path, '/');
+    if (last_slash && last_slash != path && last_slash[1] == 'v' && last_slash[2] >= '0' &&
+        last_slash[2] <= '9') {
+        bool all_digits = true;
+        for (const char *p = last_slash + 2; *p; p++) {
+            if (*p < '0' || *p > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            char *trimmed = cbm_arena_strndup(a, path, (size_t)(last_slash - path));
+            if (trimmed && trimmed[0]) {
+                return path_last(a, trimmed);
+            }
+        }
+    }
+    return path_last(a, path);
+}
+
 // Parse a single Go import_spec node.
 static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
     CBMArena *a = ctx->arena;
@@ -134,8 +160,8 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
     }
 
     TSNode name_node = ts_node_child_by_field_name(spec, TS_FIELD("name"));
-    const char *local_name =
-        !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source) : path_last(a, path);
+    const char *local_name = !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source)
+                                                         : go_import_local_name(a, path);
 
     CBMImport imp = {.local_name = local_name, .module_path = path};
     cbm_imports_push(&ctx->result->imports, a, imp);

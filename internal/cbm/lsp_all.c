@@ -7,6 +7,7 @@
 #include "lsp/type_registry.c"
 #include "lsp/go_lsp.c"
 #include "lsp/generated/go_stdlib_data.c"
+#include "lsp/go_stdlib_modern.c"
 #include "lsp/c_lsp.c"
 #include "lsp/generated/c_stdlib_data.c"
 #include "lsp/generated/cpp_stdlib_data.c"

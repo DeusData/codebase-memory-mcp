@@ -421,6 +421,39 @@ static void emit_http_async_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
     calls_emit_edge(ctx->gbuf, source->id, route_id, edge_type, props, sizeof(props), call);
 }
 
+/* Emit GRPC_CALLS edge via gRPC Route node — the sequential-venue mirror of
+ * pass_parallel.c::emit_grpc_edge (small repos run THIS venue; without it a
+ * two-file gRPC repo produced Route nodes only on the parallel path and the
+ * two pipelines emitted different graphs). */
+static void calls_emit_grpc_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
+                                 const cbm_gbuf_node_t *source, const cbm_resolution_t *res) {
+    char service[CBM_SZ_256];
+    char method[CBM_SZ_256];
+    if (!extract_grpc_service_method(call->callee_name, service, sizeof(service), method,
+                                     sizeof(method))) {
+        /* Go chained form: callee is the bare method, the QN carries
+         * "...CartServiceClient.GetCart". */
+        if (!res->qualified_name ||
+            !extract_grpc_service_method(res->qualified_name, service, sizeof(service), method,
+                                         sizeof(method))) {
+            return;
+        }
+    }
+    char route_qn[CBM_SZ_512];
+    snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", service, method);
+    char route_name[CBM_SZ_256];
+    snprintf(route_name, sizeof(route_name), "%s/%s", service, method);
+    int64_t route_id = cbm_gbuf_upsert_node(ctx->gbuf, "Route", route_name, route_qn, "", 0, 0,
+                                            "{\"source\":\"grpc\"}");
+    char esc_c[CBM_SZ_256];
+    cbm_json_escape(esc_c, sizeof(esc_c), call->callee_name);
+    char props[CBM_SZ_1K];
+    snprintf(props, sizeof(props),
+             "{\"callee\":\"%s\",\"service\":\"%s\",\"method\":\"%s\",\"confidence\":%.2f}", esc_c,
+             service, method, res->confidence);
+    cbm_gbuf_insert_edge(ctx->gbuf, source->id, route_id, "GRPC_CALLS", props);
+}
+
 /* Classify a resolved call and emit the appropriate edge. */
 /* When suppress_plain_calls is true (a TS/JS/TSX weak short-name member-call
  * match, #592/#606), the route/HTTP/ASYNC/CONFIG service classifications below
@@ -447,6 +480,21 @@ static void emit_classified_edge(cbm_pipeline_ctx_t *ctx, const CBMCall *call,
             handle_route_registration(ctx, call, source, module_qn, imp_keys, imp_vals, imp_count);
             return;
         }
+    }
+    /* gRPC stub method calls — mirror of the parallel path's classification:
+     * cbm_service_pattern_match hits grpc.Dial-style QNs directly, and the
+     * generated-stub sniff catches Go's chained
+     * pb.NewCartServiceClient(conn).GetCart(...) whose resolved QN contains
+     * "ServiceClient". */
+    if (svc == CBM_SVC_NONE && res->qualified_name &&
+        (strstr(res->qualified_name, "ServiceClient") != NULL ||
+         strstr(res->qualified_name, "ServiceGrpc") != NULL ||
+         strstr(res->qualified_name, "Servicer") != NULL)) {
+        svc = CBM_SVC_GRPC;
+    }
+    if (svc == CBM_SVC_GRPC) {
+        calls_emit_grpc_edge(ctx, call, source, res);
+        return;
     }
     if (svc == CBM_SVC_HTTP || svc == CBM_SVC_ASYNC) {
         emit_http_async_edge(ctx, call, source, target, res, svc, suppress_plain_calls);

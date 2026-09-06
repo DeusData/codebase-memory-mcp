@@ -2040,8 +2040,10 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
 
-    // Register Go stdlib types/functions
+    // Register Go stdlib types/functions (generated table + modern addendum;
+    // both precede go_mark_stdlib_types so every entry carries is_stdlib).
     cbm_go_stdlib_register(&reg, arena);
+    cbm_go_stdlib_register_modern(&reg, arena);
     go_mark_stdlib_types(&reg);
 
     const char* module_qn = result->module_qn;
@@ -2239,10 +2241,15 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                 if (!type_name || !type_name[0]) continue;
                 const char* type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
 
-                // Interface type: extract method names for satisfaction checking
+                // Interface type: extract method names for satisfaction checking,
+                // plus embedded interface names (bare `io.Reader` / `A` elements)
+                // into embedded_types so the sole-implementer scan can close the
+                // method set over the embedding (type A interface { B; Extra() }).
                 if (strcmp(ts_node_type(type_node), "interface_type") == 0) {
                     const char* iface_methods[64];
                     int iface_method_count = 0;
+                    const char* iface_embeds[16];
+                    int iface_embed_count = 0;
                     uint32_t inl_nc = ts_node_named_child_count(type_node);
                     for (uint32_t k = 0; k < inl_nc && iface_method_count < 63; k++) {
                         TSNode child = ts_node_named_child(type_node, k);
@@ -2258,18 +2265,47 @@ void cbm_run_go_lsp(CBMArena* arena, CBMFileResult* result,
                                 }
                             }
                         }
+                        /* A bare embedded interface parses as a type_elem with
+                         * exactly ONE named child (type_identifier or
+                         * qualified_type). Union elements (`~int | string`) have
+                         * several children / negated_type — skip those. */
+                        if (strcmp(ck, "type_elem") == 0 &&
+                            ts_node_named_child_count(child) == 1 &&
+                            iface_embed_count < 15) {
+                            TSNode et = ts_node_named_child(child, 0);
+                            const char* ek = ts_node_type(et);
+                            if (strcmp(ek, "type_identifier") == 0 ||
+                                strcmp(ek, "qualified_type") == 0) {
+                                char* etext = cbm_node_text(arena, et, source);
+                                if (etext && etext[0]) {
+                                    iface_embeds[iface_embed_count++] = cbm_arena_sprintf(
+                                        arena, "%s.%s", module_qn, etext);
+                                }
+                            }
+                        }
                     }
-                    if (iface_method_count > 0) {
+                    if (iface_method_count > 0 || iface_embed_count > 0) {
                         for (int ti = 0; ti < reg.type_count; ti++) {
                             if (!reg.types[ti].qualified_name ||
                                 strcmp(reg.types[ti].qualified_name, type_qn) != 0) continue;
-                            const char** names = (const char**)cbm_arena_alloc(arena,
-                                (iface_method_count + 1) * sizeof(const char*));
-                            for (int mi = 0; mi < iface_method_count; mi++) {
-                                names[mi] = iface_methods[mi];
+                            if (iface_method_count > 0) {
+                                const char** names = (const char**)cbm_arena_alloc(arena,
+                                    (iface_method_count + 1) * sizeof(const char*));
+                                for (int mi = 0; mi < iface_method_count; mi++) {
+                                    names[mi] = iface_methods[mi];
+                                }
+                                names[iface_method_count] = NULL;
+                                reg.types[ti].method_names = names;
                             }
-                            names[iface_method_count] = NULL;
-                            reg.types[ti].method_names = names;
+                            if (iface_embed_count > 0) {
+                                const char** embs = (const char**)cbm_arena_alloc(arena,
+                                    (iface_embed_count + 1) * sizeof(const char*));
+                                for (int ei = 0; ei < iface_embed_count; ei++) {
+                                    embs[ei] = iface_embeds[ei];
+                                }
+                                embs[iface_embed_count] = NULL;
+                                reg.types[ti].embedded_types = embs;
+                            }
                             break;
                         }
                     }
@@ -2446,6 +2482,39 @@ static const char** split_pipe_strings(CBMArena* a, const char* text) {
     }
     arr[idx] = NULL;
     return idx > 0 ? arr : NULL;
+}
+
+/* split_pipe_strings for Go embedded-type spellings. CBMDefinition.base_classes
+ * carries the SOURCE SPELLING of each embed ("Inner", "*Outer", "io.Reader",
+ * "Base[T]"), joined by pxc_build_lsp_def; the registry keys embedded_types by
+ * QN. Qualify each entry against the defining module exactly like the per-file
+ * Phase 1b AST scan: strip a leading '*', drop a generic-argument suffix, and
+ * prefix the module. Entries already carrying the module prefix pass through
+ * untouched (hand-built defs / surface round-trips stay stable); alias-
+ * qualified spellings ("io.Reader") are blind-qualified the same way Phase 1b
+ * qualifies them — go_requalify_via_imports and go_lookup_embedded_type
+ * recover those at lookup time. */
+static const char** split_pipe_strings_qualified(CBMArena* a, const char* text,
+                                                 const char* def_mod) {
+    const char** arr = split_pipe_strings(a, text);
+    if (!arr || !def_mod || !def_mod[0]) return arr;
+    size_t mod_len = strlen(def_mod);
+    for (int i = 0; arr[i]; i++) {
+        const char* e = arr[i];
+        while (*e == '*') e++;
+        if (!e[0]) continue;
+        if (strncmp(e, def_mod, mod_len) == 0 && e[mod_len] == '.') {
+            arr[i] = e; /* already module-qualified */
+            continue;
+        }
+        const char* br = strchr(e, '[');
+        if (br) {
+            e = cbm_arena_strndup(a, e, (size_t)(br - e));
+            if (!e || !e[0]) continue;
+        }
+        arr[i] = cbm_arena_sprintf(a, "%s.%s", def_mod, e);
+    }
+    return arr;
 }
 
 // Helper: parse "|"-separated "name:type" field definitions and populate a registered type.
@@ -2947,6 +3016,7 @@ void cbm_run_go_lsp_cross(
     CBMTypeRegistry reg;
     cbm_registry_init(&reg, arena);
     cbm_go_stdlib_register(&reg, arena);
+    cbm_go_stdlib_register_modern(&reg, arena);
     go_mark_stdlib_types(&reg);
 
     // Register all defs (file-local + cross-file).
@@ -2969,7 +3039,7 @@ void cbm_run_go_lsp_cross(
             rt.short_name = d->short_name;          // borrowed
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
             rt.from_test_file = d->from_test_file;
-            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
+            rt.embedded_types = split_pipe_strings_qualified(arena, d->embedded_types, def_mod);
 
             // Set method_names for interfaces from "|"-separated string
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
@@ -3210,6 +3280,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
     if (!reg) return NULL;
     cbm_registry_init(reg, arena);
     cbm_go_stdlib_register(reg, arena);
+    cbm_go_stdlib_register_modern(reg, arena);
     go_mark_stdlib_types(reg);
 
     for (int i = 0; i < def_count; i++) {
@@ -3231,7 +3302,7 @@ CBMTypeRegistry* cbm_go_build_cross_registry(
             rt.short_name = d->short_name;
             rt.is_interface = d->is_interface || strcmp(d->label, "Interface") == 0;
             rt.from_test_file = d->from_test_file;
-            rt.embedded_types = split_pipe_strings(arena, d->embedded_types);
+            rt.embedded_types = split_pipe_strings_qualified(arena, d->embedded_types, def_mod);
             if (rt.is_interface && d->method_names_str && d->method_names_str[0]) {
                 rt.method_names = split_pipe_strings(arena, d->method_names_str);
             }
@@ -3324,26 +3395,154 @@ void cbm_run_go_lsp_cross_with_registry(
  * doubles must not shadow or ambiguate the production implementer). Shared by
  * the per-file interface-dispatch branch and the Tier-3 fast resolver so the
  * two paths cannot drift apart again. */
+/* Bounds for the embedded-type closure walks below. Registry-only (no ctx),
+ * so both the per-file dispatch branch and the Tier-3 fast resolver share
+ * them; visited-dedup + fixed caps keep every walk O(1)-bounded per check. */
+enum {
+    GO_EMBED_WALK_MAX_VISITED = 16,
+    GO_IFACE_CLOSURE_MAX_METHODS = 64,
+};
+
+/* Loose registry lookup for an embedded-type QN. Registration blind-qualifies
+ * embed spellings with the defining module (mirroring Phase 1b), so an
+ * import-alias spelling lands as "<module>.io.Reader" while the real entry is
+ * keyed "io.Reader". No import map exists here (shared Tier-2/Tier-3 paths),
+ * so retry the trailing "alias.Type" pair; project cross-package embeds that
+ * miss both forms stay unresolved — fail-closed for satisfaction credit. */
+static const CBMRegisteredType* go_lookup_embedded_type(
+    const CBMTypeRegistry* reg, const char* qn) {
+    if (!qn || !qn[0]) return NULL;
+    const CBMRegisteredType* rt = cbm_registry_lookup_type(reg, qn);
+    if (rt) return rt;
+    const char* last = strrchr(qn, '.');
+    if (!last || last == qn) return NULL;
+    const char* p = last - 1;
+    while (p > qn && *p != '.') p--;
+    if (*p != '.') return NULL;
+    return cbm_registry_lookup_type(reg, p + 1);
+}
+
+/* Collect the interface's TRANSITIVE method-name set: its own method_names
+ * plus those of embedded interfaces, recursively (interface embedding —
+ * `type A interface { B; Extra() }` requires B's methods too). Bounded and
+ * visited-deduped. Unresolvable embeds contribute nothing: the closure can
+ * only under-approximate, which the >=2 gate and per-method checks tolerate
+ * exactly as the pre-embedding scan did. Returns the number filled into out. */
+static int go_iface_collect_method_names(const CBMTypeRegistry* reg,
+                                         const CBMRegisteredType* iface,
+                                         const char** out, int max) {
+    const CBMRegisteredType* work[GO_EMBED_WALK_MAX_VISITED];
+    const CBMRegisteredType* visited[GO_EMBED_WALK_MAX_VISITED];
+    int sp = 0, vcount = 0, n = 0;
+    work[sp++] = iface;
+    while (sp > 0) {
+        const CBMRegisteredType* cur = work[--sp];
+        bool seen = false;
+        for (int i = 0; i < vcount; i++) {
+            if (visited[i] == cur) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (vcount >= GO_EMBED_WALK_MAX_VISITED) break;
+        visited[vcount++] = cur;
+        if (cur->method_names) {
+            for (int i = 0; cur->method_names[i] && n < max; i++) {
+                const char* m = cur->method_names[i];
+                bool dup = false;
+                for (int j = 0; j < n; j++) {
+                    if (strcmp(out[j], m) == 0) { dup = true; break; }
+                }
+                if (!dup) out[n++] = m;
+            }
+        }
+        if (cur->embedded_types) {
+            for (int i = 0; cur->embedded_types[i] && sp < GO_EMBED_WALK_MAX_VISITED; i++) {
+                const CBMRegisteredType* e =
+                    go_lookup_embedded_type(reg, cur->embedded_types[i]);
+                if (e && e->is_interface) work[sp++] = e;
+            }
+        }
+    }
+    return n;
+}
+
+/* Method-SET membership for a concrete candidate, Go-style: the method is on
+ * the type itself, or promoted through embedded types (struct embedding),
+ * including embedded interfaces (whose declared method names join the outer
+ * method set). Returns the concrete CBMRegisteredFunc when one exists;
+ * `*via_iface_only` reports satisfaction that rests solely on an embedded
+ * interface's declared name — real for method-set math, but with no concrete
+ * dispatch target to upgrade to. */
+static const CBMRegisteredFunc* go_type_method_deep(
+    const CBMTypeRegistry* reg, const CBMRegisteredType* type,
+    const char* method, bool* via_iface_only) {
+    const CBMRegisteredType* work[GO_EMBED_WALK_MAX_VISITED];
+    const CBMRegisteredType* visited[GO_EMBED_WALK_MAX_VISITED];
+    int sp = 0, vcount = 0;
+    bool iface_hit = false;
+    work[sp++] = type;
+    while (sp > 0) {
+        const CBMRegisteredType* cur = work[--sp];
+        bool seen = false;
+        for (int i = 0; i < vcount; i++) {
+            if (visited[i] == cur) { seen = true; break; }
+        }
+        if (seen) continue;
+        if (vcount >= GO_EMBED_WALK_MAX_VISITED) break;
+        visited[vcount++] = cur;
+        if (cur->qualified_name) {
+            const CBMRegisteredFunc* f =
+                cbm_registry_lookup_method(reg, cur->qualified_name, method);
+            if (f) {
+                if (via_iface_only) *via_iface_only = false;
+                return f;
+            }
+        }
+        if (cur->is_interface && cur->method_names) {
+            for (int i = 0; cur->method_names[i]; i++) {
+                if (strcmp(cur->method_names[i], method) == 0) { iface_hit = true; break; }
+            }
+        }
+        if (cur->embedded_types) {
+            for (int i = 0; cur->embedded_types[i] && sp < GO_EMBED_WALK_MAX_VISITED; i++) {
+                const CBMRegisteredType* e =
+                    go_lookup_embedded_type(reg, cur->embedded_types[i]);
+                if (e) work[sp++] = e;
+            }
+        }
+    }
+    if (via_iface_only) *via_iface_only = iface_hit;
+    return NULL;
+}
+
 static const CBMRegisteredFunc* go_iface_sole_impl_method(
     const CBMTypeRegistry* reg, const char* iface_qn, const char* method_name) {
     const CBMRegisteredType* iface_rt =
         iface_qn ? cbm_registry_lookup_type(reg, iface_qn) : NULL;
-    if (!iface_rt || !iface_rt->is_interface || !iface_rt->method_names ||
-        !iface_rt->method_names[0] || !method_name)
+    if (!iface_rt || !iface_rt->is_interface || !method_name)
         return NULL;
-    int iface_mcount = 0;
-    while (iface_rt->method_names[iface_mcount]) iface_mcount++;
+    /* Cheap pre-gate before the closure walk: an interface with neither own
+     * methods nor embedded interfaces has an empty method set. */
+    if ((!iface_rt->method_names || !iface_rt->method_names[0]) &&
+        (!iface_rt->embedded_types || !iface_rt->embedded_types[0]))
+        return NULL;
+
+    /* CLOSED method set: own methods plus embedded interfaces' methods,
+     * transitively (interface embedding), so `interface { io.Reader; Close()
+     * error }` requires Read+Close of its implementers. */
+    const char* mnames[GO_IFACE_CLOSURE_MAX_METHODS];
+    int iface_mcount = go_iface_collect_method_names(reg, iface_rt, mnames,
+                                                     GO_IFACE_CLOSURE_MAX_METHODS);
 
     /* Single-method interfaces are structurally satisfied by ANY type carrying
      * a same-named method (a `Client{Ping}` alias is "implemented" by an
      * unrelated Svc.Ping), so a sole-implementer upgrade on them routinely
      * hijacks calls to the wrong concrete type. Require a >=2-method signature
-     * before claiming an unambiguous implementer; io.Reader-alikes keep the
-     * interface-dispatch fallback. */
+     * (over the CLOSED set) before claiming an unambiguous implementer;
+     * io.Reader-alikes keep the interface-dispatch fallback. */
     if (iface_mcount < 2)
         return NULL;
 
-    const char* sole_impl_qn = NULL;
+    const CBMRegisteredType* sole_impl = NULL;
     int impl_count = 0;
     /* For project interfaces, skip stdlib candidates: sync.Pool (Get+Put) and
      * friends must never ambiguate a project interface. The is_stdlib marker
@@ -3359,19 +3558,32 @@ static const CBMRegisteredFunc* go_iface_sole_impl_method(
         if (cand->from_test_file && !iface_rt->from_test_file) continue;
         bool satisfies = true;
         for (int mi = 0; mi < iface_mcount; mi++) {
-            if (!cbm_registry_lookup_method(reg, cand->qualified_name,
-                                            iface_rt->method_names[mi])) {
-                satisfies = false;
-                break;
+            /* Direct O(1) hash lookup first; the bounded embedded walk only
+             * runs on a miss, and only for candidates still in the race —
+             * the vast majority fail on their first missing method. Promoted
+             * methods (struct embedding) count toward satisfaction, matching
+             * real Go method sets (mock embeds, composition-heavy DI). */
+            if (!cbm_registry_lookup_method(reg, cand->qualified_name, mnames[mi])) {
+                bool via_iface = false;
+                if (!go_type_method_deep(reg, cand, mnames[mi], &via_iface) && !via_iface) {
+                    satisfies = false;
+                    break;
+                }
             }
         }
         if (satisfies) {
-            sole_impl_qn = cand->qualified_name;
+            sole_impl = cand;
             impl_count++;
         }
     }
-    if (impl_count != 1 || !sole_impl_qn) return NULL;
-    return cbm_registry_lookup_method(reg, sole_impl_qn, method_name);
+    if (impl_count != 1 || !sole_impl) return NULL;
+    /* The dispatch target may itself be a promoted method living on an
+     * embedded type; when only an embedded INTERFACE declares it there is no
+     * concrete target — fail closed (keep the 0.85 dispatch fallback). */
+    const CBMRegisteredFunc* direct =
+        cbm_registry_lookup_method(reg, sole_impl->qualified_name, method_name);
+    if (direct) return direct;
+    return go_type_method_deep(reg, sole_impl, method_name, NULL);
 }
 
 /* ── Tier 3: AST-walk-free metadata-driven cross-file resolver ────

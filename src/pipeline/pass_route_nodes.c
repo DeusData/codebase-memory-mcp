@@ -1198,6 +1198,227 @@ static void create_sveltekit_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* ── Phase 4b: gRPC SERVER registrations → HANDLES (go-grpc-server-handles) ──
+ *
+ * `pb.RegisterCartServiceServer(g, &server{})` (protoc-gen-go-grpc) and the
+ * grpc-gateway `Register<S>HandlerServer(ctx, mux, server)` bind an impl type
+ * to a service; the client side already mints __grpc__<Service>/<Method>
+ * Route nodes (emit_grpc_edge / calls_emit_grpc_edge), so emitting HANDLES
+ * from each of the impl type's methods onto those same Route QNs completes
+ * the rendezvous — "who serves CartService/GetCart" stops dead-ending.
+ *
+ * Placement (对拍-adjudicated): a post-merge sweep here, NOT in the parallel
+ * resolve worker — the worker cannot see cross-file impl methods. The carrier
+ * is the CALLS edge the register call already produces: its props hold the
+ * callee text and the "args" array (both venues append them), and the edge
+ * SOURCE node's QN yields the registering module for impl resolution.
+ *
+ * Scope gates (binding corrections): only Register<S>Server and
+ * Register<S>HandlerServer callee leaves; the conn-taking gateway variants
+ * (Register<S>Handler / ...FromEndpoint / ...Client) are skipped entirely;
+ * HANDLES is emitted only when the impl argument resolves to a same-module
+ * project type node (natural fail-closed for conn/mux args and for
+ * registrations whose generated pb package is not in the indexed tree). */
+enum { RN_GRPC_REG_MAX = 64 };
+
+typedef struct {
+    char service[CBM_SZ_128];
+    char impl[CBM_SZ_128];
+    int64_t source_id;
+} rn_grpc_reg_t;
+
+typedef struct {
+    rn_grpc_reg_t regs[RN_GRPC_REG_MAX];
+    int count;
+} rn_grpc_ctx_t;
+
+/* Parse "Register<S>Server" / "Register<S>HandlerServer" out of a callee
+ * leaf. Returns false for every other shape (incl. the gateway variants). */
+static bool rn_grpc_service_from_callee(const char *callee, char *out, size_t outsz) {
+    if (!callee) {
+        return false;
+    }
+    const char *leaf = strrchr(callee, '.');
+    leaf = leaf ? leaf + 1 : callee;
+    size_t len = strlen(leaf);
+    if (len <= SLEN("Register") + SLEN("Server") ||
+        strncmp(leaf, "Register", SLEN("Register")) != 0 ||
+        strcmp(leaf + len - SLEN("Server"), "Server") != 0) {
+        return false;
+    }
+    size_t mid_len = len - SLEN("Register") - SLEN("Server");
+    const char *mid = leaf + SLEN("Register");
+    /* grpc-gateway in-process variant: Register<S>HandlerServer. */
+    if (mid_len > SLEN("Handler") &&
+        strncmp(mid + mid_len - SLEN("Handler"), "Handler", SLEN("Handler")) == 0) {
+        mid_len -= SLEN("Handler");
+    }
+    if (mid_len == 0 || mid_len >= outsz) {
+        return false;
+    }
+    memcpy(out, mid, mid_len);
+    out[mid_len] = '\0';
+    return true;
+}
+
+/* Extract the LAST argument expression from a CALLS edge's "args" array and
+ * normalize it to a bare impl type name: "&server{}" → "server",
+ * "srv" → "srv". Composite/pointer sugar is stripped; anything with calls,
+ * dots (cross-package impls — out of the conservative same-module scope) or
+ * remaining punctuation is rejected. */
+static bool rn_grpc_impl_from_props(const char *props, char *out, size_t outsz) {
+    const char *args = props ? strstr(props, "\"args\":[") : NULL;
+    if (!args) {
+        return false;
+    }
+    const char *end = strchr(args, ']');
+    if (!end) {
+        return false;
+    }
+    const char *last_e = NULL;
+    for (const char *p = args; (p = strstr(p, "\"e\":\"")) != NULL && p < end;
+         p += SLEN("\"e\":\"")) {
+        last_e = p;
+    }
+    if (!last_e) {
+        return false;
+    }
+    const char *v = last_e + SLEN("\"e\":\"");
+    char raw[CBM_SZ_128];
+    size_t n = 0;
+    while (*v && *v != '"' && v < end && n + 1 < sizeof(raw)) {
+        if (*v == '\\' && v[1]) {
+            v++; /* unescape one level — arg exprs carry no multi-byte escapes */
+        }
+        raw[n++] = *v++;
+    }
+    raw[n] = '\0';
+    const char *s = raw;
+    while (*s == '&' || *s == '*') {
+        s++;
+    }
+    size_t sl = strlen(s);
+    if (sl > 1 && s[sl - 1] == '}') {
+        const char *brace = strchr(s, '{');
+        if (!brace) {
+            return false;
+        }
+        sl = (size_t)(brace - s);
+    }
+    if (sl == 0 || sl >= outsz) {
+        return false;
+    }
+    for (size_t i = 0; i < sl; i++) {
+        char ch = s[i];
+        bool ident = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                     (ch >= '0' && ch <= '9') || ch == '_';
+        if (!ident) {
+            return false;
+        }
+    }
+    memcpy(out, s, sl);
+    out[sl] = '\0';
+    return true;
+}
+
+static void rn_grpc_reg_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
+    rn_grpc_ctx_t *ctx = (rn_grpc_ctx_t *)userdata;
+    if (ctx->count >= RN_GRPC_REG_MAX || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    char callee[CBM_SZ_256];
+    if (!json_extract(edge->properties_json, "callee", callee, sizeof(callee))) {
+        return;
+    }
+    rn_grpc_reg_t *r = &ctx->regs[ctx->count];
+    if (!rn_grpc_service_from_callee(callee, r->service, sizeof(r->service))) {
+        return;
+    }
+    if (!rn_grpc_impl_from_props(edge->properties_json, r->impl, sizeof(r->impl))) {
+        return;
+    }
+    r->source_id = edge->source_id;
+    ctx->count++;
+}
+
+/* Emit HANDLES from every exported method of one registration's impl type. */
+static int rn_grpc_emit_one(cbm_gbuf_t *gb, const rn_grpc_reg_t *r) {
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, r->source_id);
+    if (!src || !src->qualified_name) {
+        return 0;
+    }
+    /* Registering module = the source function's QN minus its leaf segment. */
+    const char *dot = strrchr(src->qualified_name, '.');
+    if (!dot || dot == src->qualified_name) {
+        return 0;
+    }
+    char impl_qn[CBM_SZ_512];
+    int n = snprintf(impl_qn, sizeof(impl_qn), "%.*s.%s",
+                     (int)(dot - src->qualified_name), src->qualified_name, r->impl);
+    if (n <= 0 || (size_t)n >= sizeof(impl_qn)) {
+        return 0;
+    }
+    const cbm_gbuf_node_t *impl = cbm_gbuf_find_by_qn(gb, impl_qn);
+    if (!impl || !impl->label ||
+        (strcmp(impl->label, "Struct") != 0 && strcmp(impl->label, "Class") != 0 &&
+         strcmp(impl->label, "Type") != 0)) {
+        return 0; /* fail-closed: impl arg did not resolve to a project type */
+    }
+    const cbm_gbuf_edge_t **dm = NULL;
+    int dmc = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, impl->id, "DEFINES_METHOD", &dm, &dmc);
+    int created = 0;
+    for (int i = 0; i < dmc; i++) {
+        const cbm_gbuf_node_t *m = cbm_gbuf_find_by_id(gb, dm[i]->target_id);
+        if (!m || !m->name || m->name[0] < 'A' || m->name[0] > 'Z') {
+            continue; /* gRPC methods are exported */
+        }
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_name[CBM_SZ_256];
+        snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", r->service, m->name);
+        snprintf(route_name, sizeof(route_name), "%s/%s", r->service, m->name);
+        int64_t route_id =
+            cbm_gbuf_upsert_node(gb, "Route", route_name, route_qn, "", 0, 0,
+                                 "{\"source\":\"grpc\"}");
+        /* Idempotent across re-runs: skip when this method already HANDLES
+         * this route (mirrors ensure_one_decorator_route). */
+        const cbm_gbuf_edge_t **eh = NULL;
+        int ehc = 0;
+        cbm_gbuf_find_edges_by_target_type(gb, route_id, "HANDLES", &eh, &ehc);
+        bool exists = false;
+        for (int j = 0; j < ehc; j++) {
+            if (eh[j]->source_id == m->id) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) {
+            continue;
+        }
+        cbm_gbuf_insert_edge(gb, m->id, route_id, "HANDLES",
+                             "{\"via\":\"grpc_server_registration\"}");
+        created++;
+    }
+    return created;
+}
+
+static void create_grpc_server_handles(cbm_gbuf_t *gb) {
+    rn_grpc_ctx_t ctx;
+    ctx.count = 0;
+    /* Collect first, mutate after — inserting edges during edge iteration is
+     * unsafe (same discipline as route_edge_visitor above). */
+    cbm_gbuf_foreach_edge(gb, rn_grpc_reg_visitor, &ctx);
+    int created = 0;
+    for (int i = 0; i < ctx.count; i++) {
+        created += rn_grpc_emit_one(gb, &ctx.regs[i]);
+    }
+    if (created > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", created);
+        cbm_log_info("pass.route_nodes.grpc_server", "handles", buf);
+    }
+}
+
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -1231,6 +1452,11 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
      * Scans Class nodes from .proto files, follows DEFINES_METHOD edges
      * to find rpc methods, creates __grpc__ServiceName/MethodName Route nodes. */
     create_grpc_routes(gb);
+
+    /* Phase 4b: gRPC SERVER side — Register<S>Server(...) impl methods get
+     * HANDLES edges onto the same __grpc__Service/Method Route QNs the
+     * client side mints (see create_grpc_server_handles). */
+    create_grpc_server_handles(gb);
 
     /* Phase 5: filesystem-based SvelteKit routes (+server / +page.server /
      * +layout.server) — no call-site equivalent for pass_calls.c to pick
