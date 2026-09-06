@@ -1029,6 +1029,63 @@ static bool cbm_span_contains_callable_def(const char *src, int src_len, uint32_
     return false;
 }
 
+/* #1989: type-def counterpart of cbm_span_contains_callable_def. A rescued
+ * class/struct/enum definition has its name followed by a base clause (':') or
+ * a body ('{'), not a parameter list, so the callable validator would reject
+ * every type def pulled from the expanded tree. */
+static bool cbm_span_contains_type_def(const char *src, int src_len, uint32_t start_line,
+                                       uint32_t end_line, const char *name) {
+    if (!src || src_len <= 0 || !name || !name[0] || start_line == 0 || end_line < start_line) {
+        return false;
+    }
+    int span_start = 0;
+    uint32_t line = 1;
+    while (span_start < src_len && line < start_line) {
+        if (src[span_start++] == '\n') {
+            line++;
+        }
+    }
+    if (line != start_line) {
+        return false;
+    }
+    int span_end = span_start;
+    while (span_end < src_len && line <= end_line) {
+        if (src[span_end++] == '\n') {
+            line++;
+        }
+    }
+    size_t name_len = strlen(name);
+    for (int pos = span_start; pos + (int)name_len <= span_end; pos++) {
+        if (strncmp(src + pos, name, name_len) != 0 ||
+            (pos > 0 && cbm_identifier_char(src[pos - 1])) ||
+            (pos + (int)name_len < src_len && cbm_identifier_char(src[pos + name_len]))) {
+            continue;
+        }
+        int open = pos + (int)name_len;
+        while (open < span_end && isspace((unsigned char)src[open])) {
+            open++;
+        }
+        // Base clause (": public B"), body ("{"), or template args ("<...").
+        if (open < span_end && (src[open] == ':' || src[open] == '{' || src[open] == '<')) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1989: label buckets for the misparse-correction gates. A raw def extracted
+ * from a broken `class MOD_API Foo` shape lands under a callable label while
+ * the expanded tree yields a proper type label for the same name. */
+static bool cbm_def_label_is_type(const char *label) {
+    return label != NULL && (strcmp(label, "Class") == 0 || strcmp(label, "Enum") == 0 ||
+                             strcmp(label, "Interface") == 0 || strcmp(label, "Type") == 0 ||
+                             strcmp(label, "Struct") == 0 || strcmp(label, "Union") == 0);
+}
+
+static bool cbm_def_label_is_callable(const char *label) {
+    return label != NULL && (strcmp(label, "Function") == 0 || strcmp(label, "Method") == 0);
+}
+
 /* Remap an expanded-source definition back to the original input file. Every
  * line in the definition must be attributable to the main file; generated
  * macro bodies, included headers, and ambiguous spans fail closed. */
@@ -1423,6 +1480,14 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // Defs keep original-source line numbers; only CALLS are extracted from expanded source.
     if (language == CBM_LANG_C || language == CBM_LANG_CPP || language == CBM_LANG_CUDA) {
         uint64_t pp_start = now_ns();
+        /* #1989: collect build-system export-macro candidates from the raw
+         * source. They are predefined empty in the expanded buffer (see
+         * preprocessor.cpp) so `class MOD_API Foo` parses with its real name,
+         * and the rescue loop below can adopt corrected type defs. Bounded:
+         * at most CBM_EXPORT_MACRO_MAX names per file. */
+        char export_cands[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+        int export_cand_count =
+            cbm_export_macro_candidates(source, source_len, export_cands, CBM_EXPORT_MACRO_MAX);
         CBMPreprocessedSource *preprocessed = cbm_preprocess_with_map(
             source, source_len, rel_path, extra_defines, include_paths, language != CBM_LANG_C);
         if (preprocessed && preprocessed->source) {
@@ -1503,17 +1568,51 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                      * recover defs from it — adopting ONLY those that
                      * intersect a raw ERROR region, whose name is visible on
                      * the raw source line, and whose QN the raw pass did not
-                     * already extract. */
-                    if (ts_node_has_error(root)) {
+                     * already extract.
+                     *
+                     * #1989: build-system export macros (<MOD>_API,
+                     * <lib>_EXPORT, ...) are empty on the real compile line but
+                     * opaque to tree-sitter, so `class MOD_API Foo` misparses
+                     * with the macro as the type name — often with NO raw ERROR
+                     * region at all (the class_specifier "succeeds" with the
+                     * wrong name; enums and free functions do error out). When
+                     * export-macro candidates were collected for this file, also
+                     * adopt expanded defs that replace a raw def literally named
+                     * as a candidate, or that correct a raw misparse label (the
+                     * raw pass extracted the same name as Function/Method from
+                     * the broken function_definition shape; the expanded tree
+                     * yields a proper type def). Superseded raw defs are
+                     * dropped so the corrected definition is not shadowed by
+                     * the qualified-name dedup. With no candidates the block
+                     * reduces to the original #961 behavior. */
+                    if (ts_node_has_error(root) || export_cand_count > 0) {
                         cbm_error_regions_t raw_regs = {{0}, {0}, 0};
                         cbm_collect_error_regions(root, &raw_regs, source, source_len);
-                        if (raw_regs.count > 0) {
+                        if (raw_regs.count > 0 || export_cand_count > 0) {
                             int defs_before = result->defs.count;
                             cbm_extract_definitions(&pp_ctx);
                             int w = defs_before;
+                            char *superseded = NULL;
+                            if (export_cand_count > 0 && defs_before > 0) {
+                                superseded = (char *)calloc((size_t)defs_before, 1);
+                            }
+                            /* #1989: spans of defs already adopted from the
+                             * expanded tree. A def nested inside one of these
+                             * (an inline method of a rescued class) was dropped
+                             * by the raw pass — the misparsed
+                             * `class MOD_API Foo {...}` parsed as a
+                             * function_definition, and nested defs in its body
+                             * are never walked. Bounded: one span per adopted
+                             * def, capped at 64. */
+                            struct {
+                                uint32_t start;
+                                uint32_t end;
+                            } rescued_spans[64];
+                            int rescued_count = 0;
                             for (int i = defs_before; i < result->defs.count; i++) {
                                 CBMDefinition *d = &result->defs.items[i];
                                 bool adopt = false;
+                                int supersede_j = -1;
                                 if (cbm_remap_preprocessed_def(d, preprocessed)) {
                                     for (int rj = 0; rj < raw_regs.count && !adopt; rj++) {
                                         if (d->start_line <= raw_regs.ends[rj] &&
@@ -1521,25 +1620,158 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                             adopt = true;
                                         }
                                     }
+                                    if (!adopt && export_cand_count > 0 && d->name) {
+                                        for (int ci = 0; ci < export_cand_count && !adopt; ci++) {
+                                            for (int j = 0; j < defs_before && !adopt; j++) {
+                                                CBMDefinition *r = &result->defs.items[j];
+                                                if (!r->name ||
+                                                    strcmp(r->name, export_cands[ci]) != 0) {
+                                                    continue;
+                                                }
+                                                if (r->start_line <= d->end_line &&
+                                                    d->start_line <= r->end_line &&
+                                                    cbm_span_contains_type_def(
+                                                        source, source_len, d->start_line,
+                                                        d->end_line, d->name)) {
+                                                    adopt = true;
+                                                    supersede_j = j;
+                                                }
+                                            }
+                                        }
+                                        if (!adopt && d->label && cbm_def_label_is_type(d->label)) {
+                                            for (int j = 0; j < defs_before && !adopt; j++) {
+                                                CBMDefinition *r = &result->defs.items[j];
+                                                /* Widened past callables (#1989): the
+                                                 * misparse also mints value-label raw
+                                                 * defs for types (`class X_API FEmpty {}`
+                                                 * -> Variable FEmpty). Same name,
+                                                 * overlapping span, raw label is NOT a
+                                                 * type => raw is the misparse artifact. */
+                                                if (!r->name || !r->label || !d->name ||
+                                                    strcmp(r->name, d->name) != 0 ||
+                                                    cbm_def_label_is_type(r->label)) {
+                                                    continue;
+                                                }
+                                                if (r->start_line <= d->end_line &&
+                                                    d->start_line <= r->end_line) {
+                                                    adopt = true;
+                                                    supersede_j = j;
+                                                }
+                                            }
+                                        }
+                                        /* Nested rescue (#1989): a def nested inside
+                                         * an already-adopted def's span — the inline
+                                         * method of a rescued class, dropped by the
+                                         * raw pass because the class parsed as a
+                                         * function body. The same validation gates
+                                         * (name-on-line, shape, QN dedup) still run
+                                         * below before it lands. */
+                                        if (!adopt && rescued_count > 0) {
+                                            for (int k = 0; k < rescued_count && !adopt; k++) {
+                                                if (d->start_line >= rescued_spans[k].start &&
+                                                    d->end_line <= rescued_spans[k].end) {
+                                                    adopt = true;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
-                                if (adopt && (!d->name ||
-                                              !cbm_line_contains(source, source_len, d->start_line,
-                                                                 d->name) ||
-                                              !cbm_span_contains_callable_def(
-                                                  source, source_len, d->start_line, d->end_line,
-                                                  d->name))) {
+                                if (adopt &&
+                                    (!d->name ||
+                                     !cbm_line_contains(source, source_len, d->start_line,
+                                                        d->name) ||
+                                     (!cbm_span_contains_callable_def(source, source_len,
+                                                                      d->start_line, d->end_line,
+                                                                      d->name) &&
+                                      !cbm_span_contains_type_def(source, source_len, d->start_line,
+                                                                  d->end_line, d->name)))) {
                                     adopt = false;
                                 }
                                 for (int j = 0; j < defs_before && adopt; j++) {
+                                    if (j == supersede_j || (superseded && superseded[j])) {
+                                        continue; // being replaced by this very def
+                                    }
                                     const char *q = result->defs.items[j].qualified_name;
                                     if (q && d->qualified_name &&
                                         strcmp(q, d->qualified_name) == 0) {
+                                        /* #1989: a raw def holding the same QN is
+                                         * usually a reject — unless it is the
+                                         * misparse artifact this very def came to
+                                         * replace (raw "Function FCalc" from the
+                                         * broken `class MOD_API FCalc` shape vs the
+                                         * rescued "Class FCalc"). Same name, same
+                                         * span, raw label is not a type: supersede
+                                         * instead of dropping the correction. */
+                                        CBMDefinition *r = &result->defs.items[j];
+                                        if (d->label && cbm_def_label_is_type(d->label) &&
+                                            r->label && r->name && d->name &&
+                                            strcmp(r->name, d->name) == 0 &&
+                                            !cbm_def_label_is_type(r->label) &&
+                                            r->start_line == d->start_line &&
+                                            r->end_line == d->end_line && superseded) {
+                                            superseded[j] = 1;
+                                            continue;
+                                        }
                                         adopt = false;
                                     }
                                 }
                                 if (adopt) {
+                                    if (supersede_j >= 0 && supersede_j < defs_before &&
+                                        superseded) {
+                                        superseded[supersede_j] = 1;
+                                    }
+                                    /* Phantom-artifact suppression (#1989): on the
+                                     * raw tree `class MOD_API Foo : public Base
+                                     * {...}` parses as a function_definition whose
+                                     * declarator is the BASE-CLASS name, so the raw
+                                     * pass mints a bogus Function def named after
+                                     * the base spanning the whole class. Fingerprint:
+                                     * a raw callable def with an IDENTICAL span to
+                                     * the adopted type def whose name is one of the
+                                     * adopted def's base classes. A real method is
+                                     * a strict subset of the class span and never
+                                     * carries a base-class name. */
+                                    if (d->label && cbm_def_label_is_type(d->label) && superseded &&
+                                        d->base_classes) {
+                                        for (int j = 0; j < defs_before; j++) {
+                                            CBMDefinition *r = &result->defs.items[j];
+                                            if (!r->label || !r->name ||
+                                                !cbm_def_label_is_callable(r->label) ||
+                                                r->start_line != d->start_line ||
+                                                r->end_line != d->end_line) {
+                                                continue;
+                                            }
+                                            for (const char **b = d->base_classes; *b; b++) {
+                                                if (strcmp(*b, r->name) == 0) {
+                                                    superseded[j] = 1;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                    if (rescued_count < 64) {
+                                        rescued_spans[rescued_count].start = d->start_line;
+                                        rescued_spans[rescued_count].end = d->end_line;
+                                        rescued_count++;
+                                    }
                                     result->defs.items[w++] = *d;
                                 }
+                            }
+                            if (superseded) {
+                                int rw = 0;
+                                for (int j = 0; j < defs_before; j++) {
+                                    if (!superseded[j]) {
+                                        result->defs.items[rw++] = result->defs.items[j];
+                                    }
+                                }
+                                int shift = defs_before - rw;
+                                if (shift > 0 && w > defs_before) {
+                                    memmove(&result->defs.items[rw],
+                                            &result->defs.items[defs_before],
+                                            (size_t)(w - defs_before) * sizeof(CBMDefinition));
+                                }
+                                w -= shift;
+                                free(superseded);
                             }
                             result->defs.count = w;
                         }
