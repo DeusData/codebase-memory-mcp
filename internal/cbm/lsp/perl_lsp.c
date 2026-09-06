@@ -1512,9 +1512,56 @@ static void perl_collect_parents(PerlLSPContext *ctx, TSNode node, const char *c
     free(kids);
 }
 
+/* Collect @ISA parents from a `use Mojo::Base ...` argument subtree.
+ * Mojo::Base is the Mojolicious base-class pragma and the single most common
+ * inheritance idiom in real-world Perl — the entire Mojolicious ecosystem is
+ * built on it, so an unquoted-string parent here is worth as much as `use
+ * parent`. Semantics mirror `use parent`:
+ *     use Mojo::Base 'Parent';              → @ISA = ('Parent')
+ *     use Mojo::Base 'Parent', -signatures; → @ISA = ('Parent')
+ *     use Mojo::Base -base;                 → @ISA = ('Mojo::Base')
+ *     use Mojo::Base -role / -strict;       → no @ISA (role compose / pragma)
+ * A quoted string names a parent class; the bare `-base` flag maps to
+ * Mojo::Base itself; every other -flag (-signatures, -async_await, -strict,
+ * -role, -norequire) contributes nothing. Args appear directly or inside a
+ * `list_expression`. Bounded recursion. */
+static void perl_collect_mojo_parents(PerlLSPContext *ctx, TSNode node,
+                                      const char *child_pkg, int depth) {
+    if (ts_node_is_null(node) || depth > 6)
+        return;
+    const char *k = ts_node_type(node);
+    if (perl_is_string_node(k)) {
+        char *raw = perl_node_text(ctx, node);
+        char *inner = perl_unquote(ctx->arena, raw);
+        if (inner && inner[0] && inner[0] != '-')
+            perl_add_isa(ctx, child_pkg, inner);
+        return;
+    }
+    if (perl_is_bareword_node(k)) {
+        char *bw = perl_node_text(ctx, node);
+        /* -base flag: this package IS a base, inheriting from Mojo::Base.
+         * A bare (unquoted) parent class name — rare but legal — is honored. */
+        if (bw && strcmp(bw, "-base") == 0)
+            perl_add_isa(ctx, child_pkg, "Mojo::Base");
+        else if (bw && bw[0] && bw[0] != '-')
+            perl_add_isa(ctx, child_pkg, bw);
+        return;
+    }
+    /* list_expression / parenthesized wrapper: descend. */
+    uint32_t nc = ts_node_child_count(node);
+    TSNode *kids = perl_collect_children(node, nc);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = kids ? kids[i] : ts_node_child(node, i);
+        if (!ts_node_is_null(c) && ts_node_is_named(c))
+            perl_collect_mojo_parents(ctx, c, child_pkg, depth + 1);
+    }
+    free(kids);
+}
+
 /* Process a `use_statement`:
  *   use parent qw(Base);  / use parent 'Base';  → @ISA for current package
  *   use base   qw(Base);  / use base -norequire => 'Base';
+ *   use Mojo::Base 'Base'; / use Mojo::Base -base; → @ISA (Mojolicious idiom)
  *   use Module qw(f1 f2); → Exporter import map (f1→Module::f1) */
 static void perl_collect_use_statement(PerlLSPContext *ctx, TSNode node) {
     TSNode mod = ts_node_child_by_field_name(node, "module", 6);
@@ -1545,6 +1592,26 @@ static void perl_collect_use_statement(PerlLSPContext *ctx, TSNode node) {
             if (ts_node_eq(c, mod))
                 continue;
             perl_collect_parents(ctx, c, child_pkg, 0);
+        }
+        free(kids);
+        return;
+    }
+
+    /* Mojo::Base: Mojolicious base-class pragma (see perl_collect_mojo_parents).
+     * `use Mojo::Base 'Parent'` establishes @ISA exactly like `use parent`, and
+     * `-base` inherits from Mojo::Base itself. Scan every named argument child
+     * except the leading `module` node. */
+    if (strcmp(module_name, "Mojo::Base") == 0) {
+        const char *child_pkg = ctx->current_package_qn && ctx->current_package_qn[0]
+                                    ? ctx->current_package_qn
+                                    : "main";
+        uint32_t nc = ts_node_child_count(node);
+        TSNode *kids = perl_collect_children(node, nc);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = kids ? kids[i] : ts_node_child(node, i);
+            if (ts_node_is_null(c) || !ts_node_is_named(c) || ts_node_eq(c, mod))
+                continue;
+            perl_collect_mojo_parents(ctx, c, child_pkg, 0);
         }
         free(kids);
         return;
@@ -2569,6 +2636,55 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
     perl_pass1_scan(&ctx, root);
     perl_register_packages(&ctx, &reg);
     perl_attach_methods(&ctx, &reg, root);
+
+    /* Cross-file inheritance: a package's @ISA parent (use parent / use base /
+     * use Mojo::Base 'X' / @ISA) usually lives in ANOTHER file, so its methods
+     * were never attached to the parent's (bare) registered type above —
+     * perl_register_packages only mints an empty type for the parent name, and
+     * the parent's subs are indexed only as standalone Functions of another
+     * module. Resolve each recorded ISA parent to a module QN (tail-match over
+     * the project-wide defs, exactly like the use-module map) and attach that
+     * module's Function/Method defs as the parent type's method table, so
+     * `$self->inherited` (self typed to a child package) walks the ISA chain and
+     * dispatches to the parent's cross-file sub. Skip parents that already carry
+     * methods (same-file parent, handled by perl_attach_methods). One level of
+     * cross-file inheritance resolves here; deeper chains need parent-of-parent
+     * seeding (this file's pass1 records only its own packages' @ISA). */
+    for (int i = 0; i < ctx.isa_count; i++) {
+        const char *parent = ctx.isa_parent_qns[i];
+        if (!parent || !parent[0])
+            continue;
+        bool have_methods = false;
+        for (int t = 0; t < reg.type_count; t++) {
+            if (reg.types[t].qualified_name &&
+                strcmp(reg.types[t].qualified_name, parent) == 0) {
+                have_methods = reg.types[t].method_names && reg.types[t].method_names[0];
+                break;
+            }
+        }
+        if (have_methods)
+            continue;
+        const char *resolved = perl_resolve_used_module(&ctx, parent, defs, def_count,
+                                                        import_names, import_qns, import_count);
+        if (!resolved || !resolved[0])
+            continue;
+        PerlMethodVec pmv;
+        memset(&pmv, 0, sizeof(pmv));
+        for (int j = 0; j < def_count; j++) {
+            CBMLSPDef *d = &defs[j];
+            if (!d->def_module_qn || strcmp(d->def_module_qn, resolved) != 0)
+                continue;
+            if (!d->label ||
+                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0))
+                continue;
+            if (!d->short_name || !d->qualified_name)
+                continue;
+            perl_mvec_push(&pmv, parent, d->short_name, d->qualified_name);
+        }
+        if (pmv.cnt > 0 && pmv.v)
+            perl_type_set_methods(&ctx, &reg, parent, pmv.v, pmv.cnt);
+        free(pmv.v);
+    }
 
     /* Finalize into a per-call scratch index arena (see cbm_run_perl_lsp). */
     CBMArena idx_arena;

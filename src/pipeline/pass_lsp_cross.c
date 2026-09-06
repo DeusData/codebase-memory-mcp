@@ -1574,7 +1574,16 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
      * crate — a module that is in neither own_module nor the import map, so
      * the filter starves cross-crate resolution (#56 repro red). Rust
      * therefore always resolves against the FULL def universe: the lazily
-     * built shared registry when available, else a full per-file build. */
+     * built shared registry when available, else a full per-file build.
+     *
+     * PERL keeps the tight filter: a class's @ISA parent (use parent / use base
+     * / use Mojo::Base 'Base') would be starved by an import-only filter, but
+     * the Perl import extraction emits an import row for each such parent (see
+     * perl_collect_inheritance_imports), so the parent module lands in the
+     * import map and the filter keeps its defs. Exempting Perl entirely
+     * (resolving vs the full universe) was measured to REGRESS a real 274-file
+     * Mojolicious index by widening same-name ambiguity — the targeted
+     * parent-as-import path avoids that. */
     CBMLSPDef *filtered = NULL;
     CBMLSPDef *file_defs = all_defs;
     int file_def_count = all_def_count;

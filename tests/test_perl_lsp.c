@@ -245,6 +245,29 @@ TEST(perllsp_use_base_inheritance) {
     PASS();
 }
 
+/* ── 7b. use Mojo::Base 'Base' MRO (Mojolicious idiom) ──────────── */
+
+TEST(perllsp_use_mojo_base_inheritance) {
+    /* Mojo::Base with a quoted parent establishes @ISA exactly like `use
+     * parent`. The trailing -signatures flag must not disturb the parent
+     * collection. This is the dominant real-world Perl inheritance idiom. */
+    const char *src = "package Base;\n"
+                      "sub greet { return 'hi'; }\n"
+                      "package Child;\n"
+                      "use Mojo::Base 'Base', -signatures;\n"
+                      "sub new { my $class = shift; return bless {}, $class; }\n"
+                      "package main;\n"
+                      "sub run {\n"
+                      "    my $c = Child->new;\n"
+                      "    $c->greet;\n"
+                      "}\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "main.run", "main.greet") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 8. Exporter import (use Module qw(func); func()) ──────────── */
 
 TEST(perllsp_exported_function) {
@@ -948,6 +971,37 @@ TEST(perllsp_cross_package_method_dispatch) {
     PASS();
 }
 
+TEST(perllsp_cross_mojo_base_inherited_method) {
+    /* Cross-file inheritance: Dog inherits Animal via `use Mojo::Base 'Animal'`,
+     * and Animal's speak() lives in ANOTHER module (test.lib.Animal). $self
+     * (typed to the enclosing package Dog) must dispatch speak() up the ISA
+     * chain to the parent's cross-file sub. Regression for the gap where the
+     * ISA parent was registered as a bare type with no method table. */
+    const char *source = "package Dog;\n"
+                         "use Mojo::Base 'Animal';\n"
+                         "sub bark {\n"
+                         "    my $self = shift;\n"
+                         "    return $self->speak;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Animal.speak", .short_name = "speak", .label = "Function",
+         .def_module_qn = "test.lib.Animal"},
+        {.qualified_name = "test.lib.Dog.bark", .short_name = "bark", .label = "Function",
+         .def_module_qn = "test.lib.Dog"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Dog", defs, 2, NULL, NULL,
+                           0, NULL, &out);
+    int idx = find_resolved_arr(&out, "Dog.bark", "lib.Animal.speak");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_require_package_dispatch) {
     /* require-based loading (even conditional) also feeds the package→module
      * map, so Foo::Bar->new dispatches without a use statement. */
@@ -1055,6 +1109,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_isa_inheritance);
     RUN_TEST(perllsp_use_parent_inheritance);
     RUN_TEST(perllsp_use_base_inheritance);
+    RUN_TEST(perllsp_use_mojo_base_inheritance);
     RUN_TEST(perllsp_exported_function);
     RUN_TEST(perllsp_cpan_exported_function);
     RUN_TEST(perllsp_require_fallback);
@@ -1083,6 +1138,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_imported_function);
     RUN_TEST(perllsp_cross_qw_ast_recollection);
     RUN_TEST(perllsp_cross_package_method_dispatch);
+    RUN_TEST(perllsp_cross_mojo_base_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);
     RUN_TEST(perllsp_cross_export_ok_not_default);

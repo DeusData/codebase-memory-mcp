@@ -1081,6 +1081,110 @@ static void parse_perl_require_imports(CBMExtractCtx *ctx) {
     perl_collect_require_imports(ctx, ctx->root, 0);
 }
 
+// --- Perl inheritance imports ---
+// `use parent 'Base'` / `use base 'Base'` / `use Mojo::Base 'Base'` establish an
+// @ISA parent that is ALSO a compile-time require of the parent module
+// (parent.pm / base.pm / Mojo::Base each `require` the named class). Emit an
+// import row per parent so (a) the graph carries a correct IMPORTS edge to the
+// parent and (b) the cross-file LSP def filter keeps the parent module's defs,
+// letting `$self->inherited` dispatch up the ISA chain across files (the class
+// hierarchy of the entire Mojolicious ecosystem lives one class per file).
+// Parent names are the use_statement's string / qw / bareword arguments; -flags
+// (-norequire, -signatures, -role, -strict, ...) are skipped — except
+// `Mojo::Base -base`, which requires Mojo::Base itself. Mirrors
+// perl_require_import_row. Bounded recursion.
+static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo, int depth) {
+    if (ts_node_is_null(node) || depth > 6) {
+        return;
+    }
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "string_literal") == 0 || strcmp(k, "interpolated_string_literal") == 0) {
+        char *inner = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, node, ctx->source));
+        if (inner && inner[0] && inner[0] != '-' && strcmp(inner, "-norequire") != 0) {
+            perl_require_import_row(ctx, inner);
+        }
+        return;
+    }
+    if (strcmp(k, "autoquoted_bareword") == 0) {
+        char *bw = cbm_node_text(ctx->arena, node, ctx->source);
+        if (mojo && bw && strcmp(bw, "-base") == 0) {
+            perl_require_import_row(ctx, "Mojo::Base");
+        }
+        return; /* other -flags contribute no parent */
+    }
+    if (strcmp(k, "bareword") == 0 || strcmp(k, "package") == 0) {
+        char *bw = cbm_node_text(ctx->arena, node, ctx->source);
+        if (bw && bw[0] && bw[0] != '-') {
+            perl_require_import_row(ctx, bw);
+        }
+        return;
+    }
+    if (strcmp(k, "quoted_word_list") == 0) {
+        /* qw(A B C): named children carry the space-separated word blob. */
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            char *blob = cbm_node_text(ctx->arena, ts_node_named_child(node, i), ctx->source);
+            if (!blob) {
+                continue;
+            }
+            char *p = blob;
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+                    p++;
+                }
+                char *s = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+                    p++;
+                }
+                if (p > s) {
+                    char save = *p;
+                    *p = '\0';
+                    if (s[0] && s[0] != '-') {
+                        perl_require_import_row(ctx, cbm_arena_strdup(ctx->arena, s));
+                    }
+                    *p = save;
+                }
+            }
+        }
+        return;
+    }
+    /* list_expression / parenthesized wrapper: descend. */
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        perl_inherit_emit_parents(ctx, ts_node_named_child(node, i), mojo, depth + 1);
+    }
+}
+
+static void perl_collect_inheritance_imports(CBMExtractCtx *ctx, TSNode node, int depth) {
+    enum { PERL_INHERIT_MAX_DEPTH = 200 };
+    if (ts_node_is_null(node) || depth > PERL_INHERIT_MAX_DEPTH) {
+        return;
+    }
+    if (strcmp(ts_node_type(node), "use_statement") == 0) {
+        TSNode mod = ts_node_child_by_field_name(node, "module", 6);
+        if (!ts_node_is_null(mod)) {
+            char *mn = cbm_node_text(ctx->arena, mod, ctx->source);
+            bool is_parent = mn && (strcmp(mn, "parent") == 0 || strcmp(mn, "base") == 0);
+            bool is_mojo = mn && strcmp(mn, "Mojo::Base") == 0;
+            if (is_parent || is_mojo) {
+                uint32_t nc = ts_node_named_child_count(node);
+                for (uint32_t i = 0; i < nc; i++) {
+                    TSNode c = ts_node_named_child(node, i);
+                    if (ts_node_eq(c, mod)) {
+                        continue;
+                    }
+                    perl_inherit_emit_parents(ctx, c, is_mojo, 0);
+                }
+            }
+        }
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        perl_collect_inheritance_imports(ctx, ts_node_named_child(node, i), depth + 1);
+    }
+}
+
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
     /* Use TSTreeCursor for O(1)-per-step sibling traversal. */
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -3129,6 +3233,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_PERL:
         parse_generic_imports(ctx, "use_statement");
         parse_perl_require_imports(ctx);
+        perl_collect_inheritance_imports(ctx, ctx->root, 0);
         break;
     case CBM_LANG_GROOVY:
         parse_generic_imports(ctx, "groovy_import");
