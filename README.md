@@ -113,6 +113,8 @@ The `install` command auto-detects installed coding agents and configures their 
 
 CBM automatically shares one per-account coordination daemon across Claude Code, Codex, OpenCode, and every other configured client. There is no opt-in setting for MCP servers or hook clients: the first daemon-backed CBM session starts it, each session registers its own work, and the final session shuts it down. The daemon owns long-lived background services such as watchers, shared indexing jobs, and the optional UI. Closing one session cancels work owned only by that session, while work still needed by another session continues.
 
+The one opt-*out* is `CBM_IN_PROCESS`, for hosts where the daemon cannot be reached at all: a sandbox that permits filesystem access but denies networking makes `AF_UNIX` `bind()` and `connect()` fail with `EPERM`, so the handshake can never complete. Setting it serves that MCP session in-process over stdio against the same `CBM_CACHE_DIR` indexes, at the cost of every cross-session guarantee above. See [Configuration](docs/CONFIGURATION.md).
+
 The detached daemon does not depend on an MCP frontend's stderr. It keeps owner-only durable records under the canonical `${CBM_CACHE_DIR}/logs` directory (default `~/.cache/codebase-memory-mcp/logs`):
 
 | File | Contents |

@@ -2947,6 +2947,52 @@ int main(int argc, char **argv) {
         return result;
     }
 
+    /* In-process MCP: serve the stdio JSON-RPC loop directly, with no
+     * coordination daemon and therefore no AF_UNIX rendezvous at all.
+     *
+     * This exists for hosts whose sandbox denies socket syscalls outright —
+     * e.g. a macOS seatbelt profile that is `(allow default)` for the
+     * filesystem but `(deny network*)`, which covers network-bind and
+     * network-outbound and so makes both bind() and connect() EPERM. There the
+     * daemon handshake can never complete: presence is inferred from a file
+     * lock (permitted), so an EPERM connect is misread as "daemon still
+     * starting" and the whole MAIN_MCP_STARTUP_TIMEOUT_MS budget is spent
+     * retrying it before the client gives up.
+     *
+     * Opt-in via CBM_IN_PROCESS so default behaviour is unchanged. The store is
+     * resolved from CBM_CACHE_DIR exactly as a daemon session does
+     * (cbm_mcp_server_new(NULL), as in daemon/application.c and
+     * ui/http_server.c), so this reads the same index the daemon builds.
+     * Background tasks stay at their standalone default per mcp.h: with no
+     * config store attached, maybe_auto_index() resolves auto_index=false and
+     * returns without doing synchronous work. */
+    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
+        char inproc_buf[MAIN_PATH_CAP];
+        const char *inproc =
+            cbm_safe_getenv("CBM_IN_PROCESS", inproc_buf, sizeof(inproc_buf), NULL);
+        if (inproc && inproc[0] && strcmp(inproc, "0") != 0) {
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+            cbm_mcp_server_t *inproc_srv = cbm_mcp_server_new(NULL);
+            if (!inproc_srv) {
+                (void)fprintf(stderr, "codebase-memory-mcp: cannot create in-process MCP server\n");
+                return EXIT_FAILURE;
+            }
+            cbm_mcp_server_set_tool_profile(inproc_srv, tool_profile);
+            char inproc_root[MAIN_PATH_CAP];
+            char inproc_allowed[MAIN_PATH_CAP];
+            const char *inproc_allowed_ptr = NULL;
+            if (main_session_context(NULL, inproc_root, inproc_allowed, &inproc_allowed_ptr)) {
+                (void)cbm_mcp_server_set_session_context(inproc_srv, inproc_root,
+                                                         inproc_allowed_ptr);
+            }
+            setup_signal_handlers();
+            cbm_log_info("mcp.in_process", "reason", "CBM_IN_PROCESS", "daemon", "bypassed");
+            int inproc_rc = cbm_mcp_server_run(inproc_srv, stdin, stdout);
+            cbm_mcp_server_free(inproc_srv);
+            return inproc_rc < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        }
+    }
+
     cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     if (!endpoint) {
         /* #1582: this is where an ownership/ancestry refusal lands, and it was
