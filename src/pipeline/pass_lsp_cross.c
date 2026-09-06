@@ -419,25 +419,63 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     return 0;
 }
 
-/* Go: fold per-field "Field" definitions into their owning struct's
- * field_defs. extract_defs.c emits one flat CBMDefinition per struct field
- * (label "Field", parent_class = owning struct QN, name = field name,
- * return_type = raw type text). Those rows are dropped by pxc_build_lsp_def
- * (pxc_map_label excludes "Field"), so without this fold every Go struct
- * registers with zero fields and field-chain calls (h.svc.Handle) can
- * never resolve. Fields are always declared in the same file as their struct,
- * so scanning the file's own defs covers every case. Runs inside
+/* Fold per-field "Field" definitions into their owning type's field_defs.
+ * extract_defs.c emits one flat CBMDefinition per class/struct field
+ * (label "Field", parent_class = owning type QN, name = field name,
+ * return_type = raw type text — full generic text for Java). Those rows are
+ * dropped by pxc_build_lsp_def (pxc_map_label excludes "Field"), so without
+ * this fold every Go struct / Java class registers with zero fields and
+ * field-chain calls (h.svc.Handle, handler.service.process()) can never
+ * resolve. Fields are always declared in the same file as their type, so
+ * scanning the file's own defs covers every case. Runs inside
  * cbm_pxc_collect_all_defs — one site covers both the prebuilt-registry path
- * and the per-file fallback, since both consume all_defs. */
-static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
-                                      int start, int end) {
+ * and the per-file fallback, since both consume all_defs.
+ *
+ * Owner labels per language: Go folds into "Struct"; Java folds into
+ * Class/Interface/Enum/Type (records keep label Class; interface constants
+ * and enum fields ride the same shape — 对拍B). For a JVM file with an
+ * inferred namespace the owning def's QN was rebuilt by pxc_jvm_def_qn, so
+ * match the Field row through the same mapping (ns + "." + leaf(parent)),
+ * falling back to the raw QN comparison otherwise (对拍A). */
+static bool pxc_fold_owner_label(CBMLanguage lang, const char *label) {
+    if (lang == CBM_LANG_JAVA) {
+        return strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+               strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0;
+    }
+    return strcmp(label, "Struct") == 0;
+}
+
+static bool pxc_field_parent_matches(const CBMLSPDef *dst, const CBMDefinition *fd,
+                                     CBMLanguage lang) {
+    if (strcmp(fd->parent_class, dst->qualified_name) == 0) {
+        return true;
+    }
+    if (!pxc_is_jvm_lang(lang) || !dst->namespace_name || !dst->namespace_name[0]) {
+        return false;
+    }
+    /* Alloc-free equivalent of
+     *   pxc_jvm_type_qn(arena, ns, fd->parent_class) == dst->qualified_name:
+     * dst QN is ns-built (pxc_jvm_def_qn), so equality holds exactly when the
+     * dst QN is ns + "." + last-component(parent_class). */
+    const char *leaf = pxc_last_component(fd->parent_class);
+    const char *ns = dst->namespace_name;
+    size_t nsl = strlen(ns);
+    const char *dq = dst->qualified_name;
+    return strncmp(dq, ns, nsl) == 0 && dq[nsl] == '.' && strcmp(dq + nsl + 1, leaf) == 0;
+}
+
+static void pxc_fold_class_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                  int start, int end, CBMLanguage lang) {
     if (!arena || !result || !defs || start >= end) {
         return;
     }
     for (int si = start; si < end; si++) {
         CBMLSPDef *dst = &defs[si];
-        if (!dst->label || strcmp(dst->label, "Struct") != 0 || !dst->qualified_name) {
+        if (!dst->label || !dst->qualified_name || !pxc_fold_owner_label(lang, dst->label)) {
             continue;
+        }
+        if (dst->field_defs && dst->field_defs[0]) {
+            continue; /* already carried (e.g. surface round-trip) */
         }
         int count = 0;
         size_t total = 0; /* "name:type" bytes; separators and NUL added below */
@@ -445,7 +483,7 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
             const CBMDefinition *fd = &result->defs.items[di];
             if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
                 !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
-                strcmp(fd->parent_class, dst->qualified_name) != 0) {
+                !pxc_field_parent_matches(dst, fd, lang)) {
                 continue;
             }
             total += strlen(fd->name) + 1 + strlen(fd->return_type);
@@ -466,7 +504,7 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
             const CBMDefinition *fd = &result->defs.items[di];
             if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
                 !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
-                strcmp(fd->parent_class, dst->qualified_name) != 0) {
+                !pxc_field_parent_matches(dst, fd, lang)) {
                 continue;
             }
             size_t n = strlen(fd->name);
@@ -490,7 +528,7 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
  * method_names_str ("Get|Put"). Interface methods exist as flat Method defs
  * (method_elem is in go_func_types) with parent_class = the interface QN and
  * always live in the interface's own file, so the file-local scan mirrors
- * pxc_fold_go_struct_fields above. Without this fold, cross-file registries
+ * pxc_fold_class_fields above. Without this fold, cross-file registries
  * see interfaces with an empty method set and the sole-implementer branch
  * (go_lsp.c lsp_interface_resolve, 0.95) never fires on the production
  * Tier-2/per-file cross paths — only the 0.85 lsp_interface_dispatch
@@ -716,8 +754,15 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult
         }
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
-            pxc_fold_go_struct_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx);
+            pxc_fold_class_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx, CBM_LANG_GO);
             pxc_fold_go_interface_methods(&cache[fi]->arena, cache[fi], defs, file_start, idx);
+        }
+        if (files[fi].language == CBM_LANG_JAVA) {
+            /* Java Field defs (class fields + record components) fold into
+             * field_defs so cross-file field-chain calls resolve — the
+             * dominant Spring shape (@Autowired-field call chains). */
+            pxc_fold_class_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx,
+                                  CBM_LANG_JAVA);
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < cache[fi]->impl_traits.count; ii++) {

@@ -51,6 +51,16 @@ static bool node_is_test(const cbm_gbuf_node_t *n) {
     return strstr(n->properties_json, "\"is_test\":true") != NULL;
 }
 
+/* JVM annotation evidence (@Test/@ParameterizedTest/...): emitted by
+ * extraction only for exact test-annotation matches, so it may bypass the
+ * test-NAME gate below without letting file-located helpers spray edges. */
+static bool node_is_test_annotated(const cbm_gbuf_node_t *n) {
+    if (!n || !n->properties_json) {
+        return false;
+    }
+    return strstr(n->properties_json, "\"is_test_annotated\":true") != NULL;
+}
+
 /* Helper to check suffix. */
 static bool str_ends_with(const char *s, size_t slen, const char *suffix) {
     size_t sflen = strlen(suffix);
@@ -254,7 +264,7 @@ static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        if (!cbm_is_test_func_name(src->name)) {
+        if (!cbm_is_test_func_name(src->name) && !node_is_test_annotated(src)) {
             /* Perl .t files assert at file scope, so the caller is the
              * module-level def whose name never looks like a test function —
              * for them the .t path suffix is the gate instead. */

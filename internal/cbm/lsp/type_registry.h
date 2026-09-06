@@ -23,6 +23,10 @@ typedef enum {
      * Ordinary call resolution keeps its historical language-specific choice,
      * but a function value cannot name one materialized definition exactly. */
     CBM_FUNC_FLAG_AMBIGUOUS_BINDING = 1 << 10,
+    /* Java only: synthesized from a Lombok annotation (@Getter/@Data/...) —
+     * no source declaration exists; resolution emits strategy
+     * "lsp_lombok_synth" so consumers can tell evidence class apart. */
+    CBM_FUNC_FLAG_LOMBOK_SYNTH = 1 << 11,
 } CBMFuncFlags;
 
 // Registered function/method with full type signature.

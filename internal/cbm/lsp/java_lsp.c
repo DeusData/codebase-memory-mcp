@@ -95,6 +95,17 @@ static void resolve_method_reference(JavaLSPContext *ctx, TSNode mref,
                                      const CBMRegisteredFunc *outer_resolved, int arg_index,
                                      const CBMType *recv_type);
 static bool is_map_like(const char *qn);
+static void java_bind_pattern(JavaLSPContext *ctx, TSNode pattern_node);
+static void java_register_record_components(JavaLSPContext *ctx, CBMTypeRegistry *reg,
+                                            TSNode record_node, const char *class_qn);
+static void process_compact_ctor_decl(JavaLSPContext *ctx, TSNode record_node, TSNode node,
+                                      const char *class_qn, const char *super_qn);
+static void append_field_to_class(CBMTypeRegistry *reg, CBMArena *a, const char *class_qn,
+                                  const char *field_name, const CBMType *ftype);
+static void java_apply_field_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *d);
+static void java_register_lombok_synthetics(CBMArena *a, CBMTypeRegistry *reg,
+                                            const char *class_qn, const char *class_short,
+                                            const char *const *decorators);
 
 /* ── Built-in primitive table ─────────────────────────────────────── */
 
@@ -185,6 +196,15 @@ static const char *JAVA_LANG_TYPES[] = {"Object",
                                         "SuppressWarnings",
                                         "FunctionalInterface",
                                         "Void",
+                                        /* Kept in lockstep with the generated stdlib table —
+                                         * a java.lang type registered there but absent here
+                                         * registers yet never resolves from a bare name. */
+                                        "InterruptedException",
+                                        "SecurityException",
+                                        "NoSuchMethodException",
+                                        "NoSuchFieldException",
+                                        "Runtime",
+                                        "ScopedValue",
                                         NULL};
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
@@ -1402,6 +1422,28 @@ void java_process_statement(JavaLSPContext *ctx, TSNode node) {
             }
             cbm_scope_bind(ctx->current_scope, rn, rt ? rt : cbm_type_unknown());
         }
+    } else if (strcmp(kind, "instanceof_expression") == 0) {
+        /* Java 16 pattern matching: `o instanceof String s` binds `s` into
+         * the CURRENT scope (flow-insensitive, same precedent as the catch
+         * binding below — the then-branch sees it; the else-branch only ever
+         * gains a typed binding, never a wrong edge target class).
+         * Grammar (probed): type pattern = right:TYPE + name:identifier;
+         * record deconstruction = pattern:record_pattern. */
+        TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+        if (!ts_node_is_null(name_node)) {
+            char *pn = java_node_text(ctx, name_node);
+            if (pn && pn[0] && strcmp(pn, "_") != 0) {
+                TSNode type_node = ts_node_child_by_field_name(node, "right", 5);
+                const CBMType *pt = ts_node_is_null(type_node)
+                                        ? cbm_type_unknown()
+                                        : java_parse_type_node(ctx, type_node);
+                cbm_scope_bind(ctx->current_scope, pn, pt ? pt : cbm_type_unknown());
+            }
+        } else {
+            TSNode pat = ts_node_child_by_field_name(node, "pattern", 7);
+            if (!ts_node_is_null(pat))
+                java_bind_pattern(ctx, pat);
+        }
     } else if (strcmp(kind, "catch_clause") == 0) {
         /* catch (Type|Type2 var) { body } — bind var into a fresh scope. */
         TSNode formal = ts_node_child_by_field_name(node, "parameter", 9);
@@ -1653,6 +1695,61 @@ static void process_constructor_decl(JavaLSPContext *ctx, TSNode node, const cha
     ctx->enclosing_super_qn = saved_super;
 }
 
+/* Record compact canonical constructor: `record R(int v) { R { check(v); } }`
+ * has NO explicit parameter list — the record's components are the
+ * parameters (JLS §8.10.4.2). Mirror process_constructor_decl but bind the
+ * formals from the record_declaration's `parameters` field. */
+static void process_compact_ctor_decl(JavaLSPContext *ctx, TSNode record_node, TSNode node,
+                                      const char *class_qn, const char *super_qn) {
+    TSNode name_node = ts_node_child_by_field_name(node, "name", 4);
+    char *cname = ts_node_is_null(name_node) ? NULL : java_node_text(ctx, name_node);
+    char *ctor_qn = cname ? cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, cname)
+                          : cbm_arena_sprintf(ctx->arena, "%s.<init>", class_qn);
+
+    const char *saved_method = ctx->enclosing_method_qn;
+    const char *saved_class = ctx->enclosing_class_qn;
+    const char *saved_super = ctx->enclosing_super_qn;
+    CBMScope *saved_scope = ctx->current_scope;
+
+    ctx->enclosing_method_qn = ctor_qn;
+    ctx->enclosing_class_qn = class_qn;
+    ctx->enclosing_super_qn = super_qn;
+    ctx->current_scope = cbm_scope_push(ctx->arena, saved_scope);
+
+    TSNode params = ts_node_child_by_field_name(record_node, "parameters", 10);
+    if (!ts_node_is_null(params)) {
+        uint32_t n = ts_node_named_child_count(params);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode p = ts_node_named_child(params, i);
+            const char *pk = ts_node_type(p);
+            if (strcmp(pk, "formal_parameter") != 0 && strcmp(pk, "spread_parameter") != 0)
+                continue;
+            TSNode pname = ts_node_child_by_field_name(p, "name", 4);
+            TSNode ptype = ts_node_child_by_field_name(p, "type", 4);
+            if (ts_node_is_null(pname))
+                continue;
+            char *pn = java_node_text(ctx, pname);
+            if (!pn)
+                continue;
+            const CBMType *pt =
+                ts_node_is_null(ptype) ? cbm_type_unknown() : java_parse_type_node(ctx, ptype);
+            if (strcmp(pk, "spread_parameter") == 0 && pt) {
+                pt = cbm_type_slice(ctx->arena, pt);
+            }
+            cbm_scope_bind(ctx->current_scope, pn, pt);
+        }
+    }
+
+    TSNode body = ts_node_child_by_field_name(node, "body", 4);
+    if (!ts_node_is_null(body))
+        process_block(ctx, body);
+
+    ctx->current_scope = saved_scope;
+    ctx->enclosing_method_qn = saved_method;
+    ctx->enclosing_class_qn = saved_class;
+    ctx->enclosing_super_qn = saved_super;
+}
+
 /* Determine the class's super QN from the AST node. */
 static const char *class_super_qn(JavaLSPContext *ctx, TSNode class_node) {
     TSNode super_node = ts_node_child_by_field_name(class_node, "superclass", 10);
@@ -1746,6 +1843,10 @@ static void java_process_class_decl(JavaLSPContext *ctx, TSNode node) {
                 process_method_decl(ctx, c, class_qn, super_qn);
             } else if (strcmp(k, "constructor_declaration") == 0) {
                 process_constructor_decl(ctx, c, class_qn, super_qn);
+            } else if (strcmp(k, "compact_constructor_declaration") == 0) {
+                /* Record compact canonical constructor: the record's
+                 * components are its parameters (JLS §8.10.4.2). */
+                process_compact_ctor_decl(ctx, node, c, class_qn, super_qn);
             } else if (strcmp(k, "class_declaration") == 0 ||
                        strcmp(k, "interface_declaration") == 0 ||
                        strcmp(k, "enum_declaration") == 0 || strcmp(k, "record_declaration") == 0 ||
@@ -1755,6 +1856,10 @@ static void java_process_class_decl(JavaLSPContext *ctx, TSNode node) {
                 if (ts_node_named_child_count(c) > 0) {
                     process_block(ctx, ts_node_named_child(c, 0));
                 }
+            } else if (strcmp(k, "block") == 0) {
+                /* Instance initializer `{ ... }` — a direct class_body
+                 * child. Walked like a static initializer body. */
+                process_block(ctx, c);
             }
         }
 
@@ -2028,6 +2133,12 @@ static bool java_emit_interface_resolution(JavaLSPContext *ctx, const char *ifac
     return false; /* impl_count == 0: caller falls back to type_dispatch. */
 }
 
+/* Lombok-synthesized funcs resolve under their own strategy string so
+ * consumers can tell annotation-derived evidence from declared methods. */
+static const char *java_dispatch_strategy(const CBMRegisteredFunc *f, const char *fallback) {
+    return (f && (f->flags & CBM_FUNC_FLAG_LOMBOK_SYNTH)) ? "lsp_lombok_synth" : fallback;
+}
+
 static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
     TSNode obj = ts_node_child_by_field_name(call, "object", 6);
     TSNode name_node = ts_node_child_by_field_name(call, "name", 4);
@@ -2048,7 +2159,8 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
                 if (f->receiver_type && strcmp(f->receiver_type, ctx->enclosing_class_qn) != 0) {
                     strategy = "lsp_inherited_dispatch";
                 }
-                java_emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+                java_emit_resolved(ctx, f->qualified_name, java_dispatch_strategy(f, strategy),
+                                   0.95f);
                 return;
             }
         }
@@ -2131,7 +2243,8 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             const CBMRegisteredFunc *f =
                 java_lookup_method(ctx, ctx->enclosing_class_qn, mname, arity);
             if (f) {
-                java_emit_resolved(ctx, f->qualified_name, "lsp_this_dispatch", 0.95f);
+                java_emit_resolved(ctx, f->qualified_name,
+                                   java_dispatch_strategy(f, "lsp_this_dispatch"), 0.95f);
                 return;
             }
         }
@@ -2147,7 +2260,8 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             if (cls_qn) {
                 const CBMRegisteredFunc *f = java_lookup_method(ctx, cls_qn, mname, arity);
                 if (f) {
-                    java_emit_resolved(ctx, f->qualified_name, "lsp_static_call", 0.95f);
+                    java_emit_resolved(ctx, f->qualified_name,
+                                       java_dispatch_strategy(f, "lsp_static_call"), 0.95f);
                     return;
                 }
             }
@@ -2179,7 +2293,7 @@ static void resolve_method_call(JavaLSPContext *ctx, TSNode call) {
             if (f->receiver_type && strcmp(f->receiver_type, recv_qn) != 0) {
                 strategy = "lsp_inherited_dispatch";
             }
-            java_emit_resolved(ctx, f->qualified_name, strategy, 0.95f);
+            java_emit_resolved(ctx, f->qualified_name, java_dispatch_strategy(f, strategy), 0.95f);
             return;
         }
         /* Interface dispatch with no directly-registered method: resolve to a
@@ -2918,6 +3032,164 @@ static const CBMRegisteredFunc *lookup_method_for_call(JavaLSPContext *ctx, TSNo
  * children with proper scope handling. */
 static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node);
 
+/* ── Pattern-matching bindings (Java 16 instanceof, Java 21 switch) ──
+ *
+ * Grammar shapes (vendored tree-sitter-java, probed against the parser):
+ *   type_pattern:              [TYPE, identifier]
+ *   record_pattern:            [type-name node(s)..., record_pattern_body]
+ *   record_pattern_body:       (record_pattern_component | record_pattern |
+ *                               underscore_pattern)*
+ *   record_pattern_component:  [TYPE, identifier]  — TYPE may spell `var`
+ *   `pattern` is the wrapper node switch_label puts around each of these.
+ */
+
+#define JAVA_LSP_MAX_PATTERN_DEPTH 16
+
+/* Bind one record_pattern's components. Each component identifier gets the
+ * component's own declared type; a `var` (or unparseable) component falls
+ * back to the record's registered field type at the same position — the
+ * record-components pass populates those for both single-file and cross
+ * paths. Nested record_patterns recurse (bounded). */
+static void java_bind_record_pattern(JavaLSPContext *ctx, TSNode rp, int depth) {
+    if (depth >= JAVA_LSP_MAX_PATTERN_DEPTH)
+        return;
+    TSNode body = child_by_kind(rp, "record_pattern_body");
+    if (ts_node_is_null(body))
+        return;
+
+    /* Resolve the record's registered type for the positional fallback. The
+     * type name is spelled by the child(ren) before record_pattern_body —
+     * one identifier, or a scoped node whose text is "Outer.Circle". */
+    const CBMRegisteredType *rec = NULL;
+    {
+        uint32_t n = ts_node_named_child_count(rp);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode c = ts_node_named_child(rp, i);
+            if (strcmp(ts_node_type(c), "record_pattern_body") == 0)
+                break;
+            char *tname = java_node_text(ctx, c);
+            if (!tname || !tname[0])
+                continue;
+            const char *qn = java_resolve_type_name(ctx, tname);
+            if (!qn) {
+                const char *leaf = strrchr(tname, '.');
+                if (leaf)
+                    qn = java_resolve_type_name(ctx, leaf + 1);
+            }
+            if (qn) {
+                rec = cbm_registry_lookup_type(ctx->registry, qn);
+                if (rec)
+                    break;
+            }
+        }
+    }
+    int rec_field_count = 0;
+    if (rec && rec->field_names && rec->field_types) {
+        while (rec->field_names[rec_field_count])
+            rec_field_count++;
+    }
+
+    int pos = 0;
+    uint32_t bn = ts_node_named_child_count(body);
+    for (uint32_t i = 0; i < bn; i++) {
+        TSNode comp = ts_node_named_child(body, i);
+        const char *ck = ts_node_type(comp);
+        if (strcmp(ck, "record_pattern") == 0) {
+            /* Nested deconstruction binds its own leaves. */
+            java_bind_record_pattern(ctx, comp, depth + 1);
+            pos++;
+            continue;
+        }
+        if (strcmp(ck, "underscore_pattern") == 0) {
+            pos++;
+            continue;
+        }
+        if (strcmp(ck, "record_pattern_component") != 0)
+            continue;
+        TSNode type_node = (TSNode){0};
+        TSNode name_node = (TSNode){0};
+        uint32_t cn = ts_node_named_child_count(comp);
+        for (uint32_t j = 0; j < cn; j++) {
+            TSNode cc = ts_node_named_child(comp, j);
+            if (strcmp(ts_node_type(cc), "identifier") == 0) {
+                name_node = cc; /* keep the LAST identifier — the binding */
+            } else if (ts_node_is_null(type_node)) {
+                type_node = cc;
+            }
+        }
+        if (ts_node_is_null(name_node)) {
+            pos++;
+            continue;
+        }
+        char *bname = java_node_text(ctx, name_node);
+        if (!bname || !bname[0] || strcmp(bname, "_") == 0) {
+            pos++;
+            continue;
+        }
+        const CBMType *bt = cbm_type_unknown();
+        bool is_var = false;
+        if (!ts_node_is_null(type_node)) {
+            if (strcmp(ts_node_type(type_node), "type_identifier") == 0) {
+                char *tt = java_node_text(ctx, type_node);
+                if (tt && strcmp(tt, "var") == 0)
+                    is_var = true;
+            }
+            if (!is_var)
+                bt = java_parse_type_node(ctx, type_node);
+        } else {
+            is_var = true; /* `Circle(r)` name-only form: positional type */
+        }
+        if ((is_var || cbm_type_is_unknown(bt)) && pos < rec_field_count) {
+            bt = rec->field_types[pos];
+        }
+        cbm_scope_bind(ctx->current_scope, bname, bt ? bt : cbm_type_unknown());
+        pos++;
+    }
+}
+
+/* Bind whatever a pattern node introduces into the CURRENT scope. Accepts
+ * the switch_label `pattern` wrapper, bare type_pattern / record_pattern,
+ * and ignores underscore/null labels. */
+static void java_bind_pattern(JavaLSPContext *ctx, TSNode pattern_node) {
+    if (ts_node_is_null(pattern_node))
+        return;
+    const char *kind = ts_node_type(pattern_node);
+    if (strcmp(kind, "pattern") == 0) {
+        uint32_t n = ts_node_named_child_count(pattern_node);
+        for (uint32_t i = 0; i < n; i++)
+            java_bind_pattern(ctx, ts_node_named_child(pattern_node, i));
+        return;
+    }
+    if (strcmp(kind, "type_pattern") == 0) {
+        /* [TYPE, identifier] — no fields; the identifier is the binding. */
+        TSNode type_node = (TSNode){0};
+        TSNode name_node = (TSNode){0};
+        uint32_t n = ts_node_named_child_count(pattern_node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode c = ts_node_named_child(pattern_node, i);
+            if (strcmp(ts_node_type(c), "identifier") == 0) {
+                name_node = c;
+            } else if (ts_node_is_null(type_node)) {
+                type_node = c;
+            }
+        }
+        if (ts_node_is_null(name_node))
+            return;
+        char *bname = java_node_text(ctx, name_node);
+        if (!bname || !bname[0] || strcmp(bname, "_") == 0)
+            return;
+        const CBMType *bt = ts_node_is_null(type_node) ? cbm_type_unknown()
+                                                       : java_parse_type_node(ctx, type_node);
+        cbm_scope_bind(ctx->current_scope, bname, bt ? bt : cbm_type_unknown());
+        return;
+    }
+    if (strcmp(kind, "record_pattern") == 0) {
+        java_bind_record_pattern(ctx, pattern_node, 0);
+        return;
+    }
+    /* underscore_pattern / null_literal / guard: nothing to bind here. */
+}
+
 /* Depth-guarded entry: the AST walk recurses per nesting level and crashed
  * with a stack overflow on pathologically nested real-world sources
  * (elasticsearch, SIGSEGV in bind_lambda_args under hundreds of recursive
@@ -3020,6 +3292,69 @@ static void java_resolve_calls_in_node_inner(JavaLSPContext *ctx, TSNode node) {
             }
         }
         java_stamp_resolved_site(ctx, first_resolution, node);
+    } else if (strcmp(kind, "explicit_constructor_invocation") == 0) {
+        /* this(...) / super(...) constructor delegation (JLS §8.8.7.1).
+         * `constructor` field is the literal this/super node; resolve
+         * against the enclosing class / its superclass, arity-first, with
+         * the same class-node synth fallback as `new Foo()` above. */
+        int first_resolution = ctx->resolved_calls ? ctx->resolved_calls->count : -1;
+        TSNode ctor = ts_node_child_by_field_name(node, "constructor", 11);
+        if (!ts_node_is_null(ctor)) {
+            const char *ck = ts_node_type(ctor);
+            const char *target_class = NULL;
+            if (strcmp(ck, "this") == 0) {
+                target_class = ctx->enclosing_class_qn;
+            } else if (strcmp(ck, "super") == 0) {
+                target_class =
+                    ctx->enclosing_super_qn ? ctx->enclosing_super_qn : "java.lang.Object";
+            }
+            if (target_class) {
+                int arity = count_call_args(node);
+                const char *short_name = strrchr(target_class, '.');
+                short_name = short_name ? short_name + 1 : target_class;
+                const CBMRegisteredFunc *cf = cbm_registry_lookup_method_by_args(
+                    ctx->registry, target_class, short_name, arity);
+                if (!cf)
+                    cf = cbm_registry_lookup_method(ctx->registry, target_class, short_name);
+                if (cf) {
+                    java_emit_resolved(ctx, cf->qualified_name, "lsp_constructor", 0.95f);
+                } else {
+                    java_emit_resolved(ctx, target_class, "lsp_constructor_synth", 0.85f);
+                }
+            }
+        }
+        java_stamp_resolved_site(ctx, first_resolution, node);
+        /* Fall through: the generic child walk resolves calls inside the
+         * argument list (`this(compute(x))`). */
+    }
+
+    /* switch_rule / switch_block_statement_group: push a fresh scope, bind
+     * the labels' type/record patterns, then walk guard + arm body in that
+     * scope (the guard is a switch_label child, so the label walk covers
+     * its calls too). Mirrors the catch_clause scope discipline below. */
+    if (strcmp(kind, "switch_rule") == 0 || strcmp(kind, "switch_block_statement_group") == 0) {
+        CBMScope *saved = ctx->current_scope;
+        ctx->current_scope = cbm_scope_push(ctx->arena, saved);
+        uint32_t n = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < n; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            if (strcmp(ts_node_type(c), "switch_label") != 0)
+                continue;
+            uint32_t ln = ts_node_named_child_count(c);
+            for (uint32_t j = 0; j < ln; j++) {
+                TSNode lc = ts_node_named_child(c, j);
+                const char *lk = ts_node_type(lc);
+                if (strcmp(lk, "pattern") == 0 || strcmp(lk, "type_pattern") == 0 ||
+                    strcmp(lk, "record_pattern") == 0) {
+                    java_bind_pattern(ctx, lc);
+                }
+            }
+        }
+        for (uint32_t i = 0; i < n; i++) {
+            java_resolve_calls_in_node(ctx, ts_node_named_child(node, i));
+        }
+        ctx->current_scope = saved;
+        return;
     }
 
     /* catch_clause: push a fresh scope so the bound exception variable is
@@ -3609,18 +3944,31 @@ static void patch_method_signatures_from_ast(JavaLSPContext *ctx, CBMTypeRegistr
 
 /* ── AST-driven field metadata population ─────────────────────────── */
 
+/* Find the MUTABLE slot for `class_qn` in THIS registry level (never the
+ * fallback). Post-finalize the QN lookup is O(1); the linear fallback covers
+ * unfinalized per-file registries. The const-cast is sound: reg->types is a
+ * non-const array owned by this registry. */
+static CBMRegisteredType *java_mutable_type_slot(CBMTypeRegistry *reg, const char *class_qn) {
+    if (!reg || !class_qn)
+        return NULL;
+    const CBMRegisteredType *found = cbm_registry_lookup_type(reg, class_qn);
+    if (found && reg->types && found >= reg->types && found < reg->types + reg->type_count) {
+        return &reg->types[found - reg->types];
+    }
+    for (int ti = 0; ti < reg->type_count; ti++) {
+        if (reg->types[ti].qualified_name && strcmp(reg->types[ti].qualified_name, class_qn) == 0) {
+            return &reg->types[ti];
+        }
+    }
+    return NULL;
+}
+
 /* Append (field_name, field_type) to the registry slot for `class_qn`.
  * Used by populate_class_fields_from_ast so eval_field_access can resolve
  * `obj.field.method()` for arbitrary receivers, not just `this`. */
 static void append_field_to_class(CBMTypeRegistry *reg, CBMArena *a, const char *class_qn,
                                   const char *field_name, const CBMType *ftype) {
-    CBMRegisteredType *slot = NULL;
-    for (int ti = 0; ti < reg->type_count; ti++) {
-        if (reg->types[ti].qualified_name && strcmp(reg->types[ti].qualified_name, class_qn) == 0) {
-            slot = &reg->types[ti];
-            break;
-        }
-    }
+    CBMRegisteredType *slot = java_mutable_type_slot(reg, class_qn);
     if (!slot)
         return;
 
@@ -3645,6 +3993,59 @@ static void append_field_to_class(CBMTypeRegistry *reg, CBMArena *a, const char 
     new_types[existing + 1] = NULL;
     slot->field_names = new_names;
     slot->field_types = new_types;
+}
+
+/* Record components (JLS §8.10.3): each component `T name` contributes an
+ * implicit private final field `name` AND a public zero-arg accessor
+ * `name()` returning T. Register both on the record's type so `p.x`,
+ * `p.x()` and record-pattern positional fallbacks resolve. An explicit
+ * accessor already in the registry wins (extraction registers the body's
+ * explicit methods — and its own synthetic accessor defs — before this
+ * pass runs, so the lookup-first guard also dedups against those). */
+static void java_register_record_components(JavaLSPContext *ctx, CBMTypeRegistry *reg,
+                                            TSNode record_node, const char *class_qn) {
+    TSNode params = ts_node_child_by_field_name(record_node, "parameters", 10);
+    if (ts_node_is_null(params))
+        return;
+    uint32_t n = ts_node_named_child_count(params);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode p = ts_node_named_child(params, i);
+        const char *pk = ts_node_type(p);
+        if (strcmp(pk, "formal_parameter") != 0 && strcmp(pk, "spread_parameter") != 0)
+            continue;
+        TSNode pname = ts_node_child_by_field_name(p, "name", 4);
+        TSNode ptype = ts_node_child_by_field_name(p, "type", 4);
+        if (ts_node_is_null(pname))
+            continue;
+        char *fname = java_node_text(ctx, pname);
+        if (!fname || !fname[0])
+            continue;
+        const CBMType *ft =
+            ts_node_is_null(ptype) ? cbm_type_unknown() : java_parse_type_node(ctx, ptype);
+        if (strcmp(pk, "spread_parameter") == 0 && ft) {
+            ft = cbm_type_slice(ctx->arena, ft);
+        }
+        append_field_to_class(reg, ctx->arena, class_qn, fname, ft);
+        /* Accessor: registered only when absent at THIS registry level and
+         * its fallback (a cross base already carrying the extraction-time
+         * accessor def must not be shadowed by a weaker copy). */
+        if (cbm_registry_lookup_method(reg, class_qn, fname))
+            continue;
+        CBMRegisteredFunc rf;
+        memset(&rf, 0, sizeof(rf));
+        rf.qualified_name = cbm_arena_sprintf(ctx->arena, "%s.%s", class_qn, fname);
+        rf.short_name = fname;
+        rf.receiver_type = class_qn;
+        rf.min_params = -1;
+        rf.flags = 0;
+        const CBMType **rets = (const CBMType **)cbm_arena_alloc(ctx->arena, 2 * sizeof(*rets));
+        if (!rets)
+            continue;
+        rets[0] = ft ? ft : cbm_type_unknown();
+        rets[1] = NULL;
+        rf.signature = cbm_type_func(ctx->arena, NULL, NULL, rets);
+        cbm_registry_add_func(reg, rf);
+    }
 }
 
 /* Walk a class_declaration / interface_declaration / enum_declaration body
@@ -3683,6 +4084,11 @@ static void populate_class_fields_from_ast(JavaLSPContext *ctx, CBMTypeRegistry 
     const char *saved_enc = ctx->enclosing_class_qn;
     ctx->enclosing_class_qn = class_qn;
     push_enclosing_class(ctx, class_qn);
+
+    /* Records: components become fields + zero-arg accessors. */
+    if (strcmp(kind, "record_declaration") == 0) {
+        java_register_record_components(ctx, reg, class_node, class_qn);
+    }
 
     uint32_t n = ts_node_named_child_count(body);
     for (uint32_t i = 0; i < n; i++) {
@@ -3767,6 +4173,17 @@ void cbm_run_java_lsp(CBMArena *arena, CBMFileResult *result, const char *source
             populate_class_fields_from_ast(&ctx, &reg, c, NULL);
             patch_method_signatures_from_ast(&ctx, &reg, c, NULL);
         }
+    }
+
+    /* Lombok synthetics — AFTER field population so getters see field types
+     * (对拍A ordering: java-lombok-synthetic-members). */
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->qualified_name || !d->label || !d->decorators)
+            continue;
+        if (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Enum") != 0)
+            continue;
+        java_register_lombok_synthetics(arena, &reg, d->qualified_name, d->name, d->decorators);
     }
 
     /* Walk the file. */
@@ -3854,6 +4271,272 @@ void cbm_java_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBM
     }
 }
 
+/* Parse a def's "name:type|name:type" field_defs into the registered type's
+ * field_names/field_types (mirrors go_lsp.c parse_field_defs_into_type). The
+ * type texts keep generics — "items:List<String>" — so parse_param_text_full
+ * yields TEMPLATE types the substitution/SAM machinery consumes. Runs as a
+ * sweep AFTER the type finalize in the Tier-2 build so the per-field type
+ * lookups are O(1) (对拍A); the per-file cross path calls it inline after its
+ * own finalize. Qualification prefers namespace_name over def_module_qn —
+ * registered JVM type QNs are namespace-based (对拍B). */
+static void java_apply_field_defs(CBMArena *arena, CBMTypeRegistry *reg, const CBMLSPDef *d) {
+    if (!d || !d->field_defs || !d->field_defs[0] || !d->qualified_name)
+        return;
+    CBMRegisteredType *slot = java_mutable_type_slot(reg, d->qualified_name);
+    if (!slot)
+        return;
+    if (slot->field_names && slot->field_names[0])
+        return; /* already populated (AST pass or an earlier def) */
+
+    const char *module_qn = (d->namespace_name && d->namespace_name[0]) ? d->namespace_name
+                                                                        : d->def_module_qn;
+    int count = 1;
+    for (const char *p = d->field_defs; *p; p++) {
+        if (*p == '|')
+            count++;
+    }
+    if (count > 63)
+        count = 63;
+    const char **names =
+        (const char **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(*names));
+    const CBMType **types =
+        (const CBMType **)cbm_arena_alloc(arena, (size_t)(count + 1) * sizeof(*types));
+    if (!names || !types)
+        return;
+    char *buf = cbm_arena_strdup(arena, d->field_defs);
+    if (!buf)
+        return;
+    int idx = 0;
+    char *start = buf;
+    for (char *p = buf;; p++) {
+        if (*p == '|' || *p == '\0') {
+            char save = *p;
+            *p = '\0';
+            char *colon = strchr(start, ':');
+            if (colon && idx < count) {
+                *colon = '\0';
+                if (start[0] && colon[1]) {
+                    names[idx] = start;
+                    types[idx] = parse_param_text_full(arena, colon + 1, d->qualified_name,
+                                                       module_qn, reg);
+                    idx++;
+                }
+            }
+            if (save == '\0')
+                break;
+            start = p + 1;
+        }
+    }
+    names[idx] = NULL;
+    types[idx] = NULL;
+    if (idx > 0) {
+        slot->field_names = names;
+        slot->field_types = types;
+    }
+}
+
+/* ── Lombok synthetic members ──────────────────────────────────────
+ *
+ * @Getter/@Setter/@Data/@Value/@Builder/ctor annotations/@Slf4j synthesize
+ * members the source never spells, so every user.getName()/User.builder()
+ * otherwise dies as lsp_unresolved(no_method_match). Default annotation
+ * forms only; lookup-first so explicit declarations always win. Synthetic
+ * funcs carry CBM_FUNC_FLAG_LOMBOK_SYNTH and resolve with strategy
+ * "lsp_lombok_synth"; their `<QN>.member` targets follow the
+ * interface_dispatch precedent (short-name join matches; no graph node ⇒
+ * zero-edge guarantee holds), and the DOWNSTREAM type chain is the
+ * deliverable (对拍A binding correction). */
+
+static bool java_deco_simple_name_is(const char *deco, const char *want) {
+    if (!deco)
+        return false;
+    const char *p = deco;
+    while (*p == '@' || *p == ' ' || *p == '\t')
+        p++;
+    size_t len = strcspn(p, "(");
+    const char *seg = p;
+    for (const char *q = p; q < p + len; q++) {
+        if (*q == '.')
+            seg = q + 1;
+    }
+    size_t seg_len = (size_t)((p + len) - seg);
+    while (seg_len > 0 &&
+           (seg[seg_len - 1] == ' ' || seg[seg_len - 1] == '\t' || seg[seg_len - 1] == '\n'))
+        seg_len--;
+    return strlen(want) == seg_len && strncmp(seg, want, seg_len) == 0;
+}
+
+static bool java_decos_have(const char *const *decos, const char *want) {
+    if (!decos)
+        return false;
+    for (int i = 0; decos[i]; i++) {
+        if (java_deco_simple_name_is(decos[i], want))
+            return true;
+    }
+    return false;
+}
+
+static const char *java_capitalize_after(CBMArena *a, const char *prefix, const char *name) {
+    size_t pl = strlen(prefix), nl = strlen(name);
+    char *out = (char *)cbm_arena_alloc(a, pl + nl + 1);
+    if (!out)
+        return NULL;
+    memcpy(out, prefix, pl);
+    memcpy(out + pl, name, nl + 1);
+    if (nl > 0 && out[pl] >= 'a' && out[pl] <= 'z')
+        out[pl] = (char)(out[pl] - 'a' + 'A');
+    return out;
+}
+
+static void java_add_lombok_func(CBMArena *a, CBMTypeRegistry *reg, const char *recv_qn,
+                                 const char *name, const CBMType *ret, int min_params) {
+    if (!name || cbm_registry_lookup_method(reg, recv_qn, name))
+        return; /* explicit declaration (or an earlier synth) wins */
+    CBMRegisteredFunc rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.qualified_name = cbm_arena_sprintf(a, "%s.%s", recv_qn, name);
+    rf.short_name = name;
+    rf.receiver_type = recv_qn;
+    rf.min_params = min_params;
+    rf.flags = CBM_FUNC_FLAG_LOMBOK_SYNTH;
+    const CBMType **rets = (const CBMType **)cbm_arena_alloc(a, 2 * sizeof(*rets));
+    if (!rets)
+        return;
+    rets[0] = ret ? ret : cbm_type_unknown();
+    rets[1] = NULL;
+    rf.signature = cbm_type_func(a, NULL, NULL, rets);
+    cbm_registry_add_func(reg, rf);
+}
+
+static bool java_type_is_boolean_prim(const CBMType *t) {
+    return t && t->kind == CBM_TYPE_BUILTIN && t->data.builtin.name &&
+           strcmp(t->data.builtin.name, "boolean") == 0;
+}
+
+static void java_register_lombok_synthetics(CBMArena *a, CBMTypeRegistry *reg,
+                                            const char *class_qn, const char *class_short,
+                                            const char *const *decorators) {
+    if (!class_qn || !decorators || !decorators[0])
+        return;
+    bool has_data = java_decos_have(decorators, "Data");
+    bool has_value = java_decos_have(decorators, "Value");
+    bool has_getter = java_decos_have(decorators, "Getter") || has_data || has_value;
+    bool has_setter = java_decos_have(decorators, "Setter") || has_data;
+    bool has_builder = java_decos_have(decorators, "Builder");
+    bool has_req_ctor = java_decos_have(decorators, "RequiredArgsConstructor") || has_data;
+    bool has_all_ctor = java_decos_have(decorators, "AllArgsConstructor") || has_value;
+    bool has_no_ctor = java_decos_have(decorators, "NoArgsConstructor");
+    bool has_slf4j = java_decos_have(decorators, "Slf4j") || java_decos_have(decorators, "Log4j2");
+    if (!has_getter && !has_setter && !has_builder && !has_req_ctor && !has_all_ctor &&
+        !has_no_ctor && !has_slf4j) {
+        return;
+    }
+    if (!class_short) {
+        const char *dot = strrchr(class_qn, '.');
+        class_short = dot ? dot + 1 : class_qn;
+    }
+    const CBMRegisteredType *rt = cbm_registry_lookup_type(reg, class_qn);
+    int field_count = 0;
+    if (rt && rt->field_names && rt->field_types) {
+        while (rt->field_names[field_count])
+            field_count++;
+    }
+
+    if ((has_getter || has_setter) && rt) {
+        for (int i = 0; i < field_count; i++) {
+            const char *fname = rt->field_names[i];
+            const CBMType *ftype = rt->field_types[i];
+            if (!fname || !fname[0])
+                continue;
+            if (has_getter) {
+                const char *gname = java_capitalize_after(
+                    a, java_type_is_boolean_prim(ftype) ? "is" : "get", fname);
+                java_add_lombok_func(a, reg, class_qn, gname, ftype, -1);
+            }
+            if (has_setter) {
+                const char *sname = java_capitalize_after(a, "set", fname);
+                java_add_lombok_func(a, reg, class_qn, sname, cbm_type_builtin(a, "void"), -1);
+            }
+        }
+    }
+
+    if (has_builder) {
+        /* static Short.builder() -> <QN>.<Short>Builder with per-field
+         * fluent setters returning itself and build() returning the class. */
+        const char *builder_qn = cbm_arena_sprintf(a, "%s.%sBuilder", class_qn, class_short);
+        const char *builder_short = cbm_arena_sprintf(a, "%sBuilder", class_short);
+        if (!cbm_registry_lookup_type(reg, builder_qn)) {
+            CBMRegisteredType bt;
+            memset(&bt, 0, sizeof(bt));
+            bt.qualified_name = builder_qn;
+            bt.short_name = builder_short;
+            cbm_registry_add_type(reg, bt);
+        }
+        const CBMType *builder_t = cbm_type_named(a, builder_qn);
+        java_add_lombok_func(a, reg, class_qn, "builder", builder_t, -1);
+        if (rt) {
+            for (int i = 0; i < field_count; i++) {
+                if (rt->field_names[i] && rt->field_names[i][0])
+                    java_add_lombok_func(a, reg, builder_qn, rt->field_names[i], builder_t, -1);
+            }
+        }
+        java_add_lombok_func(a, reg, builder_qn, "build", cbm_type_named(a, class_qn), -1);
+    }
+
+    if (has_no_ctor)
+        java_add_lombok_func(a, reg, class_qn, class_short, cbm_type_named(a, class_qn), 0);
+    if (has_all_ctor || has_req_ctor) {
+        /* One ctor entry covers both: min_params 0 range-matches any arity
+         * up to the field count (required-args is a subset of all fields —
+         * finality isn't modeled, so range matching is the honest shape). */
+        java_add_lombok_func(a, reg, class_qn, class_short, cbm_type_named(a, class_qn), 0);
+    }
+
+    if (has_slf4j) {
+        static const char *const kLoggerQN = "org.slf4j.Logger";
+        if (!cbm_registry_lookup_type(reg, kLoggerQN)) {
+            CBMRegisteredType lt;
+            memset(&lt, 0, sizeof(lt));
+            lt.qualified_name = kLoggerQN;
+            lt.short_name = "Logger";
+            lt.is_interface = true;
+            lt.is_stdlib = true;
+            cbm_registry_add_type(reg, lt);
+            static const char *const kLogVoid[] = {"info", "warn",  "error",
+                                                   "debug", "trace", NULL};
+            for (int i = 0; kLogVoid[i]; i++) {
+                java_add_lombok_func(a, reg, kLoggerQN, kLogVoid[i], cbm_type_builtin(a, "void"),
+                                     -1);
+            }
+            static const char *const kLogBool[] = {"isInfoEnabled", "isWarnEnabled",
+                                                   "isErrorEnabled", "isDebugEnabled",
+                                                   "isTraceEnabled", NULL};
+            for (int i = 0; kLogBool[i]; i++) {
+                java_add_lombok_func(a, reg, kLoggerQN, kLogBool[i],
+                                     cbm_type_builtin(a, "boolean"), -1);
+            }
+        }
+        append_field_to_class(reg, a, class_qn, "log", cbm_type_named(a, kLoggerQN));
+    }
+}
+
+/* Sweep helper: run Lombok synthesis for every annotated Class def. */
+static void java_register_lombok_from_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg,
+                                               const CBMLSPDef *defs, int def_count) {
+    for (int i = 0; i < def_count; i++) {
+        const CBMLSPDef *d = &defs[i];
+        if (!d->label || !d->qualified_name || !d->decorators)
+            continue;
+        if (d->lang == CBM_LANG_KOTLIN)
+            continue; /* Lombok is javac-only; Kotlin data classes are the
+                         Kotlin resolver's business */
+        if (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Enum") != 0)
+            continue;
+        java_register_lombok_synthetics(arena, reg, d->qualified_name, d->short_name,
+                                        d->decorators);
+    }
+}
+
 /* ── Tier 2: shared cross-registry + per-file overlay (#1669) ──────────
  *
  * Without this, every Java file rebuilt a whole registry from its filtered def
@@ -3927,8 +4610,28 @@ CBMTypeRegistry *cbm_java_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
     }
     cbm_java_register_lsp_defs(arena, reg, jvm, type_count);
     cbm_registry_finalize(reg);
+    /* Field metadata AFTER the type finalize: parse_param_text_full's type
+     * lookups then hit the built index — O(1) per field instead of a linear
+     * scan per lookup (对拍A: java-cross-file-field-types). */
+    for (int i = 0; i < type_count; i++) {
+        java_apply_field_defs(arena, reg, &jvm[i]);
+    }
     cbm_java_register_lsp_defs(arena, reg, jvm + type_count, total - type_count);
     cbm_registry_finalize(reg);
+    /* Lombok synthetics AFTER the func finalize (the explicit-declaration
+     * guard needs O(1) method lookups over the full project func set), then
+     * one more finalize so the synthetics leave the post-finalize tail —
+     * a Lombok-heavy corpus must not pay a tail scan on every lookup. The
+     * re-finalize is skipped when nothing was synthesized, so a Lombok-free
+     * corpus keeps exactly the two index builds it had before. */
+    {
+        int funcs_before = reg->func_count;
+        int types_before = reg->type_count;
+        java_register_lombok_from_lsp_defs(arena, reg, jvm, type_count);
+        if (reg->func_count != funcs_before || reg->type_count != types_before) {
+            cbm_registry_finalize(reg);
+        }
+    }
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -3963,19 +4666,11 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
     register_local_func_or_type_from_file(&ctx, &overlay, result);
     cbm_pxc_count_perfile_defs((uint64_t)result->defs.count);
 
-    /* Index the overlay only — the base is already finalized. Scratch arena so
-     * per-file bucket allocations do not accumulate in the pipeline-lifetime
-     * arena across a large repo. */
-    CBMArena idx_arena;
-    cbm_arena_init(&idx_arena);
-    cbm_registry_finalize_into(&overlay, &idx_arena);
-
     TSTree *tree = cached_tree;
     bool owns_tree = false;
     if (!tree) {
         TSParser *parser = ts_parser_new();
         if (!parser) {
-            cbm_arena_destroy(&idx_arena);
             return;
         }
         ts_parser_set_language(parser, tree_sitter_java());
@@ -3984,17 +4679,54 @@ void cbm_run_java_lsp_cross_with_registry(CBMArena *arena, CBMFileResult *result
         owns_tree = true;
     }
     if (!tree) {
-        cbm_arena_destroy(&idx_arena);
         return;
     }
     TSNode root = ts_tree_root_node(tree);
 
+    /* Imports before the AST enrichment passes so field/parameter type texts
+     * qualify through them, exactly as the single-file path orders it. */
     for (int i = 0; i < import_count; i++) {
         if (!import_names[i] || !import_qns[i]) {
             continue;
         }
         java_lsp_add_import(&ctx, import_names[i], import_qns[i], CBM_JAVA_IMPORT_TYPE);
     }
+
+    /* Own-file AST enrichment — the passes the single-file path always ran
+     * but Tier-2 silently skipped (对拍A/B: java-cross-file-field-types):
+     * field metadata (+ record components/accessors) and generics-preserving
+     * method signatures, both O(file) and writing only overlay slots. Runs
+     * BEFORE the overlay finalize so added accessor funcs get indexed. */
+    {
+        uint32_t rn = ts_node_named_child_count(root);
+        for (uint32_t i = 0; i < rn; i++) {
+            TSNode c = ts_node_named_child(root, i);
+            const char *ck = ts_node_type(c);
+            if (strcmp(ck, "class_declaration") == 0 || strcmp(ck, "interface_declaration") == 0 ||
+                strcmp(ck, "enum_declaration") == 0 || strcmp(ck, "record_declaration") == 0) {
+                populate_class_fields_from_ast(&ctx, &overlay, c, NULL);
+                patch_method_signatures_from_ast(&ctx, &overlay, c, NULL);
+            }
+        }
+    }
+
+    /* Lombok synthetics for this file's classes (field types are populated
+     * now; the sealed base already carries other files' synthetics). */
+    for (int i = 0; i < result->defs.count; i++) {
+        const CBMDefinition *d = &result->defs.items[i];
+        if (!d->qualified_name || !d->label || !d->decorators)
+            continue;
+        if (strcmp(d->label, "Class") != 0 && strcmp(d->label, "Enum") != 0)
+            continue;
+        java_register_lombok_synthetics(arena, &overlay, d->qualified_name, d->name, d->decorators);
+    }
+
+    /* Index the overlay only — the base is already finalized. Scratch arena so
+     * per-file bucket allocations do not accumulate in the pipeline-lifetime
+     * arena across a large repo. */
+    CBMArena idx_arena;
+    cbm_arena_init(&idx_arena);
+    cbm_registry_finalize_into(&overlay, &idx_arena);
 
     java_lsp_process_file(&ctx, root);
     cbm_arena_destroy(&idx_arena);
@@ -4026,6 +4758,15 @@ void cbm_run_java_lsp_cross(CBMArena *arena, const char *source, int source_len,
     CBMArena idx_arena;
     cbm_arena_init(&idx_arena);
     cbm_registry_finalize_into(&reg, &idx_arena);
+
+    /* Field metadata + Lombok synthetics, post-finalize for O(1) lookups
+     * (对拍A). Additions stay visible via the registry's post-finalize tail
+     * scan; this legacy per-file path carries only one file's synthetics,
+     * so the tail stays small. */
+    for (int i = 0; i < def_count; i++) {
+        java_apply_field_defs(arena, &reg, &defs[i]);
+    }
+    java_register_lombok_from_lsp_defs(arena, &reg, defs, def_count);
 
     /* Parse if needed. */
     TSTree *tree = cached_tree;

@@ -2118,6 +2118,57 @@ static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
            strcmp(ts_node_type(parent), "function_subroutine_call") == 0;
 }
 
+/* Java `this(...)` / `super(...)` constructor delegation: resolve the textual
+ * callee from the enclosing type declaration. `this` -> the enclosing class's
+ * own short name (the ctor short name equals it); `super` -> the leaf of the
+ * `extends` clause (generics and qualifiers stripped), "Object" when the class
+ * has no extends clause. Returns NULL when no enclosing class is found (an
+ * explicit ctor invocation cannot legally appear outside one). */
+static char *java_explicit_ctor_callee(CBMArena *a, TSNode node, const char *source) {
+    TSNode ctor = ts_node_child_by_field_name(node, TS_FIELD("constructor"));
+    if (ts_node_is_null(ctor)) {
+        return NULL;
+    }
+    const char *ck = ts_node_type(ctor);
+    bool is_super = strcmp(ck, "super") == 0;
+    if (!is_super && strcmp(ck, "this") != 0) {
+        return NULL;
+    }
+    /* Walk up to the nearest type declaration that can own a constructor. */
+    TSNode cls = ts_node_parent(node);
+    int hops = 0;
+    while (!ts_node_is_null(cls) && hops++ < 64) {
+        const char *k = ts_node_type(cls);
+        if (strcmp(k, "class_declaration") == 0 || strcmp(k, "enum_declaration") == 0 ||
+            strcmp(k, "record_declaration") == 0) {
+            break;
+        }
+        cls = ts_node_parent(cls);
+    }
+    if (ts_node_is_null(cls)) {
+        return NULL;
+    }
+    if (!is_super) {
+        TSNode name = ts_node_child_by_field_name(cls, TS_FIELD("name"));
+        return ts_node_is_null(name) ? NULL : cbm_node_text(a, name, source);
+    }
+    TSNode sup = ts_node_child_by_field_name(cls, TS_FIELD("superclass"));
+    char *raw = NULL;
+    if (!ts_node_is_null(sup) && ts_node_named_child_count(sup) > 0) {
+        raw = cbm_node_text(a, ts_node_named_child(sup, 0), source);
+    }
+    if (!raw || !raw[0]) {
+        return cbm_arena_strdup(a, "Object");
+    }
+    /* Strip generic args, keep the last dotted segment. */
+    char *lt = strchr(raw, '<');
+    if (lt) {
+        *lt = '\0';
+    }
+    char *dot = strrchr(raw, '.');
+    return dot ? dot + 1 : raw;
+}
+
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang) {
     if (call_node_is_definition_container(lang, node, source)) {
         return NULL;
@@ -2149,6 +2200,16 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         if (g) {
             return g;
         }
+    }
+
+    // Java ctor delegation `this(...)` / `super(...)` (explicit_constructor_invocation):
+    // the syntactic callee is a keyword, so derive the textual callee from the
+    // enclosing class — its own short name for `this`, the superclass leaf for
+    // `super` — matching what the Java LSP resolves the site to, so the
+    // pipeline join has a raw CALL row with an agreeing short name.
+    if (lang == CBM_LANG_JAVA &&
+        strcmp(ts_node_type(node), "explicit_constructor_invocation") == 0) {
+        return java_explicit_ctor_callee(a, node, source);
     }
 
     // Constructor / instantiation nodes (new T(), object_creation, instance_expression):
@@ -4029,6 +4090,14 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             call.enclosing_func_qn = state->enclosing_func_qn;
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
             call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
+            // Java this(...)/super(...): the callee text is DERIVED from the
+            // enclosing class, not spelled at the site. Only the Java LSP may
+            // resolve it — a textual short-name fallback could bind the class
+            // name to an unrelated same-named def.
+            if (ctx->language == CBM_LANG_JAVA &&
+                strcmp(ts_node_type(node), "explicit_constructor_invocation") == 0) {
+                call.requires_lsp_resolution = true;
+            }
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
             call.site_end_byte = ts_node_end_byte(node);
