@@ -2005,9 +2005,21 @@ void perl_lsp_process_file(PerlLSPContext *ctx, TSNode root) {
                    strcmp(k, "method_declaration_statement") == 0) {
             process_subroutine(ctx, c);
         } else {
-            /* Top-level statements: walk for nested subs / block packages.
-             * Edges outside an enclosing sub are suppressed (no caller QN). */
+            /* Top-level statements (Mojolicious::Lite apps, .t scripts, script
+             * bodies): attribute their calls to the FILE MODULE, exactly as the
+             * unified extractor already does for the raw call rows it emits
+             * (extract_unified.c: enclosing_func_qn = module_qn when there is no
+             * enclosing sub). Without this the LSP left the caller NULL and
+             * perl_emit_resolved dropped EVERY typed top-level call — a 109-file
+             * Mojolicious test suite (12k `$var->method` sites: `$t->get_ok` on a
+             * Test::Mojo typed via ->new, top-level `$obj->method` chains) emitted
+             * ~0 edges. Matching the extractor's caller QN lets the LSP resolution
+             * bind to the same source (the module node) so the edge survives. */
+            const char *saved_tl = ctx->enclosing_func_qn;
+            if (ctx->module_qn && ctx->module_qn[0])
+                ctx->enclosing_func_qn = ctx->module_qn;
             perl_resolve_calls_in_node(ctx, c);
+            ctx->enclosing_func_qn = saved_tl;
         }
     }
     free(kids);
