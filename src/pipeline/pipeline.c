@@ -2741,6 +2741,190 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
     return 0;
 }
 
+/* ── Orphan sweep (#1839) ────────────────────────────────────────
+ *
+ * Nothing on the worker-death path ever cleaned a stage up, so the sweep
+ * runs at the start of every run, before this run mints its own stage. It
+ * considers ONLY names of the exact minted shape for THIS database --
+ * "<basename>.stage.<6 alphanumerics>" plus that stage's -wal/-shm/-journal
+ * and .lock sidecars -- never the live database, a quarantined .corrupt, or
+ * another project's files. A stage is removed when its ownership lock can be
+ * taken (its writer is dead, or the stage predates ownership) and kept when
+ * a live writer holds the lock. The pre-ownership case is the one honest
+ * gap: a stage an OLDER binary is still writing against this database has
+ * no lock and is swept; that writer's final rename then fails and it
+ * discards. The live database is never named here on either path. */
+
+static const char *const cbm_stage_sidecar_tails[] = {"", "-wal", "-shm", "-journal", ".lock"};
+
+/* If `name` is "<base>.stage.<6 alphanumerics><known tail>", return the
+ * length of the stage name proper (without the tail); 0 otherwise. */
+static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len) {
+    if (strncmp(name, base, base_len) != 0) {
+        return 0;
+    }
+    const char *at = name + base_len;
+    if (strncmp(at, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
+        return 0;
+    }
+    at += sizeof(cbm_stage_marker) - 1;
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        /* NUL is not alphanumeric, so a short name fails here too. */
+        if (!isalnum((unsigned char)at[i])) {
+            return 0;
+        }
+    }
+    at += CBM_STAGE_SUFFIX_RANDOM_CHARS;
+    for (size_t i = 0; i < sizeof(cbm_stage_sidecar_tails) / sizeof(cbm_stage_sidecar_tails[0]);
+         i++) {
+        if (strcmp(at, cbm_stage_sidecar_tails[i]) == 0) {
+            return (size_t)(at - name);
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    char **names;
+    int count;
+    int cap;
+} stage_name_list_t;
+
+/* Add a stage name once, however many of its files were listed. */
+static void stage_name_list_add(stage_name_list_t *list, const char *name, size_t len) {
+    for (int i = 0; i < list->count; i++) {
+        if (strlen(list->names[i]) == len && strncmp(list->names[i], name, len) == 0) {
+            return;
+        }
+    }
+    if (list->count == list->cap) {
+        int cap = list->cap ? list->cap * 2 : 8;
+        char **grown = (char **)realloc(list->names, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        list->names = grown;
+        list->cap = cap;
+    }
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) {
+        return;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    list->names[list->count++] = copy;
+}
+
+static int64_t stage_bytes_on_disk(const char *stage_path) {
+    static const char *const files[] = {"", "-wal", "-shm", "-journal"};
+    int64_t total = 0;
+    char side[CBM_SZ_4K];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        int n = snprintf(side, sizeof(side), "%s%s", stage_path, files[i]);
+        if (n <= 0 || (size_t)n >= sizeof(side)) {
+            continue;
+        }
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(side, &info) == CBM_PATH_INFO_OK && info.is_regular) {
+            total += info.size;
+        }
+    }
+    return total;
+}
+
+static void sweep_one_stage(const char *stage_path) {
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    if (!sidecar) {
+        return;
+    }
+    errno = 0;
+    int lock_fd = cbm_lockfile_open(sidecar, false);
+    int probe_errno = errno;
+    free(sidecar);
+    if (lock_fd < 0 && probe_errno != ENOENT) {
+        bool live = probe_errno == EAGAIN || probe_errno == EACCES;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        live = live || probe_errno == EWOULDBLOCK;
+#endif
+        if (live) {
+            cbm_log_info("pipeline.stage", "action", "orphan_kept", "reason", "live_writer", "path",
+                         stage_path);
+            return;
+        }
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", probe_errno);
+        cbm_log_warn("pipeline.stage", "action", "orphan_kept", "reason", "lock_probe_failed",
+                     "errno", errno_text, "path", stage_path);
+        return;
+    }
+    /* No owner: absent sidecar (pre-ownership stage, or dropped) or a lock
+     * the kernel released with its writer. Ours now, from the lock down. */
+    int64_t bytes = stage_bytes_on_disk(stage_path);
+    remove_stage_files(stage_path);
+    if (lock_fd >= 0) {
+        cbm_pipeline_stage_lock_drop(stage_path, lock_fd);
+    }
+    char bytes_text[32];
+    (void)snprintf(bytes_text, sizeof(bytes_text), "%lld", (long long)bytes);
+    cbm_log_info("pipeline.stage", "action", "orphan_removed", "bytes", bytes_text, "path",
+                 stage_path);
+}
+
+static void sweep_orphan_stages(const char *final_path) {
+    /* Directory part INCLUDING its trailing separator, so the stage paths
+     * are joined exactly as the final path was spelled. */
+    size_t prefix_len = 0;
+    for (const char *c = final_path; *c; c++) {
+        if (*c == '/'
+#ifdef _WIN32
+            || *c == '\\'
+#endif
+        ) {
+            prefix_len = (size_t)(c - final_path) + 1;
+        }
+    }
+    const char *base = final_path + prefix_len;
+    size_t base_len = strlen(base);
+    if (base_len == 0) {
+        return;
+    }
+    char *dir_path = prefix_len ? (char *)malloc(prefix_len + 1) : strdup(".");
+    if (!dir_path) {
+        return;
+    }
+    if (prefix_len) {
+        memcpy(dir_path, final_path, prefix_len);
+        dir_path[prefix_len] = '\0';
+    }
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        free(dir_path);
+        return;
+    }
+    stage_name_list_t list = {0};
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        size_t stage_len = stage_entry_stage_length(entry->name, base, base_len);
+        if (stage_len) {
+            stage_name_list_add(&list, entry->name, stage_len);
+        }
+    }
+    cbm_closedir(dir);
+    for (int i = 0; i < list.count; i++) {
+        size_t name_len = strlen(list.names[i]);
+        char *stage_path = (char *)malloc(prefix_len + name_len + 1);
+        if (stage_path) {
+            memcpy(stage_path, final_path, prefix_len);
+            memcpy(stage_path + prefix_len, list.names[i], name_len + 1);
+            sweep_one_stage(stage_path);
+            free(stage_path);
+        }
+        free(list.names[i]);
+    }
+    free(list.names);
+    free(dir_path);
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
@@ -2752,6 +2936,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
+    sweep_orphan_stages(final_path);
     char *staging_path = create_staging_path(final_path);
     if (!staging_path) {
         free(final_path);

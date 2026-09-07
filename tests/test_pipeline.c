@@ -3549,6 +3549,164 @@ TEST(pipeline_minted_stage_is_owned_until_released) {
     PASS();
 }
 
+static bool file_has_content(const char *path, const char *expected) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    (void)fclose(f);
+    return n == strlen(expected) && memcmp(buf, expected, n) == 0;
+}
+
+/* #1839 / #1864: a stage a dead writer left beside a VALID database is swept
+ * by the next run and never influences its route. The 0-byte shape is what a
+ * worker killed before its backup wrote a page leaves behind; a stale -shm
+ * beside it is swept with it. */
+TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stale_stage_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    char stale_stage[600];
+    char stale_shm[600];
+    snprintf(stale_stage, sizeof(stale_stage), "%s.stage.deadbe", db_path);
+    snprintf(stale_shm, sizeof(stale_shm), "%s.stage.deadbe-shm", db_path);
+    ASSERT_EQ(th_write_file(stale_stage, ""), 0);
+    ASSERT_EQ(th_write_file(stale_shm, "stale-shm"), 0);
+
+    /* A body-only change: no added names, so the planner may repair. */
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incr);
+    int incr_rc = cbm_pipeline_run(incr);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incr);
+
+    bool stale_stage_gone = !path_exists(stale_stage);
+    bool stale_shm_gone = !path_exists(stale_shm);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    int stable_count = -1;
+    int absent_count = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined", &stable_count,
+                             &absent_count);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(incr_rc, 0);
+    ASSERT_TRUE(route != CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_TRUE(route != CBM_INCREMENTAL_ROUTE_NONE);
+    ASSERT_TRUE(stale_stage_gone);
+    ASSERT_TRUE(stale_shm_gone);
+    ASSERT_EQ(stage_count, 0);
+    ASSERT_EQ(stable_count, 1);
+    ASSERT_EQ(absent_count, 0);
+    PASS();
+}
+
+/* #1839: the sweep removes exactly the stages nobody owns. A dead writer's
+ * stage (main, -wal, and the unlocked .lock sidecar its death left) goes; a
+ * stage whose writer is LIVE -- here the test, holding its lock -- is kept
+ * byte for byte, and goes only once that lock is dropped. No timing: liveness
+ * is the kernel lock, nothing else. */
+TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_sweep_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    char dead_stage[600];
+    char dead_wal[600];
+    char dead_lock[600];
+    char live_stage[600];
+    char live_lock[600];
+    snprintf(dead_stage, sizeof(dead_stage), "%s.stage.aaaaaa", db_path);
+    snprintf(dead_wal, sizeof(dead_wal), "%s.stage.aaaaaa-wal", db_path);
+    snprintf(dead_lock, sizeof(dead_lock), "%s.stage.aaaaaa.lock", db_path);
+    snprintf(live_stage, sizeof(live_stage), "%s.stage.bbbbbb", db_path);
+    snprintf(live_lock, sizeof(live_lock), "%s.stage.bbbbbb.lock", db_path);
+    static const char live_bytes[] = "live-stage-bytes";
+    ASSERT_EQ(th_write_file(dead_stage, "dead-stage-bytes"), 0);
+    ASSERT_EQ(th_write_file(dead_wal, "dead-wal"), 0);
+    ASSERT_EQ(th_write_file(dead_lock, ""), 0);
+    ASSERT_EQ(th_write_file(live_stage, live_bytes), 0);
+    int live_fd = cbm_pipeline_stage_lock_hold(live_stage);
+    ASSERT_TRUE(live_fd >= 0);
+
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    int first_rc = cbm_pipeline_run(first);
+    cbm_pipeline_free(first);
+
+    bool dead_stage_gone = !path_exists(dead_stage);
+    bool dead_wal_gone = !path_exists(dead_wal);
+    bool dead_lock_gone = !path_exists(dead_lock);
+    bool live_kept = file_has_content(live_stage, live_bytes);
+    bool live_lock_kept = path_exists(live_lock);
+    int stable_after_first = -1;
+    int absent_after_first = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined",
+                             &stable_after_first, &absent_after_first);
+
+    cbm_pipeline_stage_lock_drop(live_stage, live_fd);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    int second_rc = cbm_pipeline_run(second);
+    cbm_pipeline_free(second);
+
+    bool live_gone = !path_exists(live_stage);
+    bool live_lock_gone = !path_exists(live_lock);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    int stable_after_second = -1;
+    int absent_after_second = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined",
+                             &stable_after_second, &absent_after_second);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_TRUE(dead_stage_gone);
+    ASSERT_TRUE(dead_wal_gone);
+    ASSERT_TRUE(dead_lock_gone);
+    ASSERT_TRUE(live_kept);
+    ASSERT_TRUE(live_lock_kept);
+    ASSERT_EQ(stable_after_first, 1);
+    ASSERT_EQ(absent_after_first, 0);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_TRUE(live_gone);
+    ASSERT_TRUE(live_lock_gone);
+    ASSERT_EQ(stage_count, 0);
+    ASSERT_EQ(stable_after_second, 1);
+    ASSERT_EQ(absent_after_second, 0);
+    PASS();
+}
+
 /* Discovery and extraction must describe the same immutable generation. A
  * source file created after extraction is not present in the original file
  * list, so merely re-hashing that list cannot detect the race. Publication
@@ -14253,6 +14411,8 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_publication_never_uses_a_predictable_staging_path);
     RUN_TEST(pipeline_stage_names_never_nest);
     RUN_TEST(pipeline_minted_stage_is_owned_until_released);
+    RUN_TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept);
+    RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
