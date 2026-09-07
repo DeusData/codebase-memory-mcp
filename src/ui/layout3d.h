@@ -27,6 +27,7 @@ typedef struct {
     float size;     /* visual size */
     uint32_t color; /* 0xRRGGBB */
     int in_calls;   /* incoming CALLS-family degree (full graph, not sampled) */
+    int out_calls;  /* outgoing CALLS degree (full graph) */
     /* Dead-code classification (string literal, NOT freed):
      * "dead"|"single"|"entry"|"test"|"exported"|"normal"|"structural". */
     const char *status;
@@ -70,5 +71,22 @@ void cbm_layout_free(cbm_layout_result_t *result);
 
 /* Serialize layout result to JSON string. Caller must free(). */
 char *cbm_layout_to_json(const cbm_layout_result_t *result);
+
+/* ── CBM Atlas region level ───────────────────────────────────── */
+
+/* level=regions payload: one body per region (Leiden communities voted per
+ * file, folder groups as fallback), aggregated region→region edge weights,
+ * deterministic positions. Cached per (project, indexed_at). Returns a
+ * heap-allocated JSON document; caller frees. NULL on error. */
+char *cbm_layout_regions_json(cbm_store_t *store, const char *project);
+
+/* scope=region:<id> — full-detail layout restricted to one region's files.
+ * total_nodes in the result is the REGION's node count. NULL on error or an
+ * unknown region id. */
+cbm_layout_result_t *cbm_layout_compute_region(cbm_store_t *store, const char *project,
+                                               int region_id, int max_nodes);
+
+/* Drop the region cache (tests; safe at any time). */
+void cbm_layout_regions_cache_clear(void);
 
 #endif /* CBM_UI_LAYOUT3D_H */

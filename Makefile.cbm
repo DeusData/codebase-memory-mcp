@@ -416,6 +416,12 @@ UI_SRCS = \
     src/ui/config.c \
     src/ui/http_server.c \
     src/ui/layout3d.c \
+    src/ui/layout_regions.c \
+    src/ui/atlas_api.c \
+    src/ui/atlas_flows.c \
+    src/ui/atlas_handout.c \
+    src/ui/atlas_why.c \
+    src/ui/atlas_metrics.c \
     src/ui/httpd.c \
     src/ui/embedded_stub.c
 

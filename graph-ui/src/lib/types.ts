@@ -16,6 +16,7 @@ export interface GraphNode {
   /* Dead-code classification from the backend layout (layout3d.c). */
   status?: NodeStatus;
   in_calls?: number;
+  out_calls?: number;
 }
 
 export type NodeStatus =
@@ -67,10 +68,47 @@ export interface GraphData {
   missed_graph?: MissedGraph;
 }
 
+/* Region level of detail (level=regions): one body per region — Leiden call
+ * communities voted per file, folder groups as fallback (layout_regions.c). */
+export interface Region {
+  id: number;
+  name: string;
+  hub?: string;
+  why?: string;
+  files: number;
+  members: number;
+  cohesion: number;
+  top_nodes: string[];
+  x: number;
+  y: number;
+  z: number;
+  size: number;
+  color: string;
+}
+
+export interface RegionEdge {
+  source: number;
+  target: number;
+  weight: number;
+}
+
+export interface RegionsPayload {
+  level: "regions";
+  method: string;
+  total_nodes: number;
+  unmapped_nodes: number;
+  regions: Region[];
+  edges: RegionEdge[];
+}
+
 export interface Project {
   name: string;
   root_path: string;
   indexed_at: string;
+  /* Totals reported by list_projects — render these immediately; the
+   * per-label schema arrives lazily (a 13 GB index takes ~30 s to scan). */
+  nodes?: number;
+  edges?: number;
 }
 
 export interface SchemaInfo {
@@ -80,7 +118,16 @@ export interface SchemaInfo {
   total_edges: number;
 }
 
-export type TabId = "graph" | "stats" | "control";
+export type TabId =
+  | "overview"
+  | "modules"
+  | "graph"
+  | "flows"
+  | "changes"
+  | "dashboard"
+  | "symbol"
+  | "stats"
+  | "control";
 
 export interface ProcessInfo {
   pid: number;

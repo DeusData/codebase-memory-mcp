@@ -743,10 +743,20 @@ static const tool_def_t TOOLS[] = {
      "\"additionalProperties\":false,"
      "\"required\":[\"project\"]}"},
 
-    {"ingest_traces", "Validate and count traces; graph edge creation is not implemented",
+    {"ingest_traces",
+     "Record observed runtime calls so the graph can distinguish observed from merely possible "
+     "paths. Each trace is a call path (qualified names, adjacent = caller\xe2\x86\x92"
+     "callee) or a bare caller/callee pair. Stored per run label, keyed by qualified name "
+     "(reindex-proof). Only pairs whose both endpoints are indexed symbols are stored; the "
+     "response reports unresolved names (up to 10) so the producer can fix its naming.",
      "{\"type\":\"object\",\"properties\":{\"traces\":{\"type\":\"array\",\"items\":{\"type\":"
-     "\"object\",\"properties\":{\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
-     "\"count\":{\"type\":\"integer\"}},\"additionalProperties\":false}},\"project\":{\"type\":"
+     "\"object\",\"properties\":{\"path\":{\"type\":\"array\",\"items\":{\"type\":\"string\"},"
+     "\"description\":\"Call path of qualified names, caller before callee; 2..256 entries\"},"
+     "\"caller\":{\"type\":\"string\"},\"callee\":{\"type\":\"string\"},"
+     "\"count\":{\"type\":\"integer\",\"description\":\"How often this trace was observed "
+     "(default 1)\"}},\"additionalProperties\":false}},\"label\":{\"type\":\"string\","
+     "\"description\":\"Run identity, e.g. 'pytest 2026-08-27' (default 'unlabeled'); counts "
+     "accumulate per label and whole runs age out together\"},\"project\":{\"type\":"
      "\"string\"}},\"required\":[\"traces\",\"project\"]}"},
 };
 
@@ -11209,6 +11219,25 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_pipeline_had_format_migration(p)) {
             yyjson_mut_obj_add_bool(doc, root, "format_migration", true);
         }
+    } else if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
+        /* The truthful abort message: the old generic "check repo_path" hint
+         * sent people debugging a path that was fine, when the run aborted
+         * pre-publication (semantic inputs changed mid-run, or a discovery/
+         * manifest phase failed transiently) and the previous index is
+         * intact. A 99-test cascade on the Windows leg traced back to
+         * exactly this — the response said error, but not which kind. */
+        yyjson_mut_obj_add_str(doc, root, "status", "aborted_previous_preserved");
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "Indexing aborted before publication; the previous index is "
+                               "intact and still serving. Causes: files changed while the run "
+                               "was in flight, or a discovery/manifest phase failed "
+                               "transiently. Retry; if it repeats, check the run log.");
+    } else if (rc == CBM_PIPELINE_PERSIST_FAILED) {
+        yyjson_mut_obj_add_str(doc, root, "status", "persist_failed");
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "The validated staging database could not be published. Check "
+                               "free disk space and permissions on the cache directory; the "
+                               "previous index may have been rolled back.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -16725,8 +16754,8 @@ static char *adr_read_legacy_file(const char *root_path) {
 /* resolve_store opens file-backed projects query-only. A mutation must release
  * that reader before opening a dedicated writer because atomic publication uses
  * a self-contained DELETE-mode database that switches back to WAL on write. */
-static cbm_store_t *open_adr_store_for_write(cbm_mcp_server_t *srv, cbm_store_t *resolved,
-                                             cbm_store_t **owned_rw) {
+static cbm_store_t *open_store_for_write(cbm_mcp_server_t *srv, cbm_store_t *resolved,
+                                         cbm_store_t **owned_rw) {
     if (!srv || !resolved || !owned_rw) {
         return NULL;
     }
@@ -17000,7 +17029,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     cbm_store_t *store = resolved;
     cbm_store_t *owned_rw = NULL;
     if (write_request) {
-        store = open_adr_store_for_write(srv, resolved, &owned_rw);
+        store = open_store_for_write(srv, resolved, &owned_rw);
         if (!store) {
             if (mutation_held) {
                 mcp_project_mutation_end(srv, project);
@@ -17038,7 +17067,7 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
                     resolved = resolve_store_internal(srv, project, true, false, NULL, true);
                 }
                 if (resolved) {
-                    store = open_adr_store_for_write(srv, resolved, &owned_rw);
+                    store = open_store_for_write(srv, resolved, &owned_rw);
                     if (store) {
                         have_adr = (cbm_store_adr_get(store, project, &adr) == CBM_STORE_OK);
                         if (!have_adr &&
@@ -17172,32 +17201,192 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
 
 /* ── ingest_traces ────────────────────────────────────────────── */
 
-static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
-    (void)srv;
-    /* Parse traces array from JSON args */
-    yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
-    int trace_count = 0;
+enum {
+    INGEST_TRACES_MAX = 10000,    /* trace entries per call */
+    INGEST_PATH_MAX = 256,        /* hops per path */
+    INGEST_PAIR_CAP = 200000,     /* observed pairs per project */
+    INGEST_UNMATCHED_SAMPLE = 10, /* distinct unresolved names reported */
+    INGEST_EVICT_MAX_ROUNDS = 32, /* runaway guard for the eviction loop */
+};
 
-    if (adoc) {
-        yyjson_val *aroot = yyjson_doc_get_root(adoc);
-        yyjson_val *traces = yyjson_obj_get(aroot, "traces");
-        if (traces && yyjson_is_arr(traces)) {
-            trace_count = (int)yyjson_arr_size(traces);
-        }
+/* Observed runtime calls: paths of qualified names (adjacent elements are
+ * caller→callee) or bare {caller, callee} pairs — stored qn-keyed in
+ * observed_calls/observed_paths (reindex-proof), per run label. The
+ * response is honest about resolution: only pairs whose BOTH endpoints
+ * exist as indexed symbols are stored, and up to 10 unresolved names come
+ * back so the producer can fix its naming instead of silently losing data. */
+static char *handle_ingest_traces(cbm_mcp_server_t *srv, const char *args) {
+    char *project = get_project_arg(args);
+    cbm_store_t *store = resolve_store(srv, project);
+    REQUIRE_STORE(store, project);
+
+    yyjson_doc *adoc = yyjson_read(args, strlen(args), 0);
+    yyjson_val *aroot = adoc ? yyjson_doc_get_root(adoc) : NULL;
+    yyjson_val *traces = aroot ? yyjson_obj_get(aroot, "traces") : NULL;
+    size_t trace_count = traces && yyjson_is_arr(traces) ? yyjson_arr_size(traces) : 0U;
+    if (trace_count == 0U || trace_count > INGEST_TRACES_MAX) {
+        if (adoc)
+            yyjson_doc_free(adoc);
+        free(project);
+        return cbm_mcp_text_result(
+            "traces is required: a non-empty array (max 10000) of {path: [qualified_name, ...]} "
+            "or {caller, callee} entries",
+            true);
+    }
+    const char *label = yyjson_get_str(yyjson_obj_get(aroot, "label"));
+    if (!label || !label[0])
+        label = "unlabeled";
+
+    /* resolve_store opens file-backed projects query-only (and skips schema
+     * DDL); observation writes need the dedicated read-write connection —
+     * whose open also creates the observed_* tables in pre-existing DBs. */
+    cbm_store_t *owned_rw = NULL;
+    store = open_store_for_write(srv, store, &owned_rw);
+    if (!store) {
         yyjson_doc_free(adoc);
+        free(project);
+        return cbm_mcp_text_result("could not open the project store for writing", true);
+    }
+
+    struct sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *exists = NULL;
+    if (!db || sqlite3_prepare_v2(db,
+                                  "SELECT 1 FROM nodes WHERE project=?1 AND qualified_name=?2 "
+                                  "LIMIT 1",
+                                  -1, &exists, NULL) != SQLITE_OK) {
+        if (owned_rw)
+            cbm_store_close(owned_rw);
+        yyjson_doc_free(adoc);
+        free(project);
+        return cbm_mcp_text_result("store is not queryable", true);
+    }
+
+    long long pairs_stored = 0, pairs_unmatched = 0, paths_stored = 0, malformed = 0;
+    const char *unmatched_sample[INGEST_UNMATCHED_SAMPLE];
+    int unmatched_sample_count = 0;
+    (void)sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL);
+
+    size_t ti, tmax;
+    yyjson_val *trace;
+    yyjson_arr_foreach(traces, ti, tmax, trace) {
+        const char *hops[INGEST_PATH_MAX];
+        size_t hop_count = 0;
+        long long count = 1;
+        yyjson_val *count_val = yyjson_obj_get(trace, "count");
+        if (yyjson_is_int(count_val) && yyjson_get_int(count_val) > 0)
+            count = yyjson_get_int(count_val);
+
+        yyjson_val *path = yyjson_obj_get(trace, "path");
+        if (path && yyjson_is_arr(path)) {
+            size_t hi, hmax;
+            yyjson_val *hop;
+            bool ok = yyjson_arr_size(path) >= 2 && yyjson_arr_size(path) <= INGEST_PATH_MAX;
+            yyjson_arr_foreach(path, hi, hmax, hop) {
+                const char *qn = yyjson_get_str(hop);
+                if (!qn || !qn[0] || hop_count >= INGEST_PATH_MAX) {
+                    ok = false;
+                    break;
+                }
+                hops[hop_count++] = qn;
+            }
+            if (!ok) {
+                malformed++;
+                continue;
+            }
+        } else {
+            const char *caller = yyjson_get_str(yyjson_obj_get(trace, "caller"));
+            const char *callee = yyjson_get_str(yyjson_obj_get(trace, "callee"));
+            if (!caller || !caller[0] || !callee || !callee[0]) {
+                malformed++;
+                continue;
+            }
+            hops[0] = caller;
+            hops[1] = callee;
+            hop_count = 2;
+        }
+
+        /* Resolve every hop before storing anything from this trace: a
+         * partially-resolved path is not a real journey. */
+        bool all_resolved = true;
+        for (size_t h = 0; h < hop_count; h++) {
+            sqlite3_reset(exists);
+            sqlite3_bind_text(exists, 1, project, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(exists, 2, hops[h], -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(exists) != SQLITE_ROW) {
+                all_resolved = false;
+                bool seen = false;
+                for (int u = 0; u < unmatched_sample_count; u++)
+                    if (strcmp(unmatched_sample[u], hops[h]) == 0) {
+                        seen = true;
+                        break;
+                    }
+                if (!seen && unmatched_sample_count < INGEST_UNMATCHED_SAMPLE)
+                    unmatched_sample[unmatched_sample_count++] = hops[h];
+            }
+        }
+        if (!all_resolved) {
+            pairs_unmatched += (long long)(hop_count - 1);
+            continue;
+        }
+
+        for (size_t h = 0; h + 1 < hop_count; h++) {
+            if (cbm_store_observed_upsert_pair(store, project, hops[h], hops[h + 1], label,
+                                               count) == CBM_STORE_OK)
+                pairs_stored++;
+        }
+        if (path) {
+            char *path_json = yyjson_val_write(path, 0, NULL);
+            if (path_json) {
+                if (cbm_store_observed_upsert_path(store, project, path_json, label, count) ==
+                    CBM_STORE_OK)
+                    paths_stored++;
+                free(path_json);
+            }
+        }
+    }
+    sqlite3_finalize(exists);
+    (void)sqlite3_exec(db, "COMMIT", NULL, NULL, NULL);
+
+    /* Cap: evict whole oldest runs until under budget — a partially-evicted
+     * run could masquerade as a complete recording. */
+    long long evicted_runs = 0;
+    long long pair_total = cbm_store_observed_pair_total(store, project);
+    for (int round = 0; round < INGEST_EVICT_MAX_ROUNDS && pair_total > INGEST_PAIR_CAP; round++) {
+        char *evicted_label = NULL;
+        if (cbm_store_observed_evict_oldest_label(store, project, &evicted_label) != CBM_STORE_OK)
+            break;
+        evicted_runs++;
+        bool evicted_self = evicted_label && strcmp(evicted_label, label) == 0;
+        free(evicted_label);
+        pair_total = cbm_store_observed_pair_total(store, project);
+        if (evicted_self)
+            break; /* the current run alone exceeds the cap; stop here */
     }
 
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
-
-    yyjson_mut_obj_add_str(doc, root, "status", "accepted");
-    yyjson_mut_obj_add_int(doc, root, "traces_received", trace_count);
-    yyjson_mut_obj_add_str(doc, root, "note",
-                           "Runtime edge creation from traces not yet implemented");
+    yyjson_mut_obj_add_str(doc, root, "status", "stored");
+    yyjson_mut_obj_add_strcpy(doc, root, "label", label);
+    yyjson_mut_obj_add_int(doc, root, "pairs_stored", pairs_stored);
+    yyjson_mut_obj_add_int(doc, root, "paths_stored", paths_stored);
+    yyjson_mut_obj_add_int(doc, root, "pairs_unmatched", pairs_unmatched);
+    yyjson_mut_val *sample = yyjson_mut_arr(doc);
+    for (int u = 0; u < unmatched_sample_count; u++)
+        yyjson_mut_arr_add_strcpy(doc, sample, unmatched_sample[u]);
+    yyjson_mut_obj_add_val(doc, root, "unmatched_sample", sample);
+    if (malformed > 0)
+        yyjson_mut_obj_add_int(doc, root, "malformed", malformed);
+    yyjson_mut_obj_add_int(doc, root, "pair_total", pair_total);
+    if (evicted_runs > 0)
+        yyjson_mut_obj_add_int(doc, root, "evicted_runs", evicted_runs);
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    yyjson_doc_free(adoc);
+    if (owned_rw)
+        cbm_store_close(owned_rw);
+    free(project);
 
     char *result = cbm_mcp_text_result(json, false);
     free(json);

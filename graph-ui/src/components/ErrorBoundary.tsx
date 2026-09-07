@@ -34,7 +34,7 @@ export class ErrorBoundary extends Component<Props, State> {
               <p className="text-red-400 text-lg font-medium mb-2">
                 Rendering error
               </p>
-              <p className="text-white/50 text-sm font-mono">
+              <p className="text-foreground/50 text-sm">
                 {this.state.error?.message ?? "Unknown error"}
               </p>
               <button

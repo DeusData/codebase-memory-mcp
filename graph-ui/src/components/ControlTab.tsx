@@ -9,18 +9,34 @@ function Gauge({ label, value, max, unit, color }: {
   label: string; value: number; max: number; unit: string; color: string;
 }) {
   const pct = Math.min(100, (value / max) * 100);
+  /* The bands are stated in the legend and glyphed beside the value, so the
+   * bar's color is redundant, not the only carrier (WCAG 1.4.1). */
+  const band = pct > 80 ? "crit" : pct > 50 ? "warn" : null;
+  const bandColor = band === "crit" ? "#e05252" : "#eab308";
   return (
-    <div className="flex-1 rounded-xl border border-border/30 bg-white/[0.02] p-4">
-      <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-2">{label}</p>
+    <div className="flex-1 rounded-md border border-border/30 bg-card p-4">
+      <p className="text-[12px] text-foreground/40 uppercase tracking-widest mb-2">{label}</p>
       <p className={`text-[20px] font-semibold tabular-nums ${color}`}>
-        {value.toFixed(1)}<span className="text-[11px] text-foreground/30 ml-1">{unit}</span>
+        {value.toFixed(1)}<span className="text-[13px] text-foreground/45 ml-1">{unit}</span>
+        {band && (
+          <span
+            className="text-[12px] ml-1.5 align-middle"
+            style={{ color: bandColor }}
+            title={`above ${(max * (band === "crit" ? 0.8 : 0.5)).toFixed(0)}${unit}`}
+          >
+            {band === "crit" ? "▲▲" : "▲"}
+          </span>
+        )}
       </p>
-      <div className="mt-2 h-1.5 rounded-full bg-white/[0.05] overflow-hidden">
+      <div className="mt-2 h-1.5 rounded-full bg-surface-3 overflow-hidden">
         <div
           className="h-full rounded-full transition-all duration-500"
-          style={{ width: `${pct}%`, backgroundColor: pct > 80 ? "#e05252" : pct > 50 ? "#eab308" : "#1DA27E" }}
+          style={{ width: `${pct}%`, backgroundColor: band === "crit" ? "#e05252" : band === "warn" ? "#eab308" : "#1DA27E" }}
         />
       </div>
+      <p className="mt-1.5 text-[12px] text-foreground/30 tabular-nums">
+        ▲ &gt;{(max * 0.5).toFixed(0)}{unit} · ▲▲ &gt;{(max * 0.8).toFixed(0)}{unit}
+      </p>
     </div>
   );
 }
@@ -35,10 +51,10 @@ function ProcessCard({ proc, selected, onSelect }: {
   return (
     <button
       onClick={onSelect}
-      className={`w-full text-left rounded-xl border p-4 transition-all ${
+      className={`w-full text-left rounded-md border p-4 transition-all ${
         selected
           ? "border-primary/40 bg-primary/5"
-          : "border-border/30 bg-white/[0.02] hover:bg-white/[0.04]"
+          : "border-border/30 bg-card hover:bg-surface-3"
       }`}
     >
       <div className="flex items-start justify-between mb-2">
@@ -48,27 +64,27 @@ function ProcessCard({ proc, selected, onSelect }: {
             PID {proc.pid}
           </span>
           {proc.is_self && (
-            <span className="text-[9px] px-1.5 py-0.5 rounded bg-primary/15 text-primary font-medium">{t.control.thisProcess}</span>
+            <span className="text-[12px] px-1.5 py-0.5 rounded bg-primary/15 text-primary font-medium">{t.control.thisProcess}</span>
           )}
         </div>
       </div>
 
       <div className="grid grid-cols-3 gap-3 mb-2">
         <div>
-          <p className="text-[9px] text-foreground/20 uppercase">CPU</p>
+          <p className="text-[12px] text-foreground/35 uppercase">CPU</p>
           <p className="text-[13px] font-semibold tabular-nums text-foreground/70">{proc.cpu.toFixed(1)}%</p>
         </div>
         <div>
-          <p className="text-[9px] text-foreground/20 uppercase">RAM</p>
+          <p className="text-[12px] text-foreground/35 uppercase">RAM</p>
           <p className="text-[13px] font-semibold tabular-nums text-foreground/70">{proc.rss_mb.toFixed(0)} MB</p>
         </div>
         <div>
-          <p className="text-[9px] text-foreground/20 uppercase">{t.control.uptime}</p>
+          <p className="text-[12px] text-foreground/35 uppercase">{t.control.uptime}</p>
           <p className="text-[13px] font-semibold tabular-nums text-foreground/70">{proc.elapsed}</p>
         </div>
       </div>
 
-      <p className="text-[10px] text-foreground/15 font-mono truncate">{proc.command}</p>
+      <p className="text-[12px] text-foreground/30 font-mono truncate">{proc.command}</p>
     </button>
   );
 }
@@ -93,15 +109,15 @@ function LogViewer() {
   }, []);
 
   return (
-    <div className="rounded-xl border border-border/30 bg-black/30 overflow-hidden">
+    <div className="rounded-md border border-border/30 bg-black/30 overflow-hidden">
       <div className="px-4 py-2 border-b border-border/20">
-        <span className="text-[11px] font-medium text-foreground/40">{t.control.processLogs}</span>
-        <span className="text-[10px] text-foreground/15 ml-2">{lines.length} lines</span>
+        <span className="text-[13px] font-medium text-foreground/40">{t.control.processLogs}</span>
+        <span className="text-[12px] text-foreground/30 ml-2">{lines.length} lines</span>
       </div>
       <ScrollArea className="h-[400px]">
-        <div className="p-3 font-mono text-[10px] leading-relaxed">
+        <div className="p-3 font-mono text-[12px] leading-relaxed">
           {lines.length === 0 ? (
-            <p className="text-foreground/15 text-center py-8">{t.control.noLogs}</p>
+            <p className="text-foreground/30 text-center py-8">{t.control.noLogs}</p>
           ) : (
             lines.map((line, i) => {
               const isErr = line.includes("level=error");
@@ -110,7 +126,7 @@ function LogViewer() {
                 <div
                   key={i}
                   className={`py-[1px] ${
-                    isErr ? "text-red-400/70" : isWarn ? "text-yellow-400/60" : "text-foreground/30"
+                    isErr ? "text-red-400/70" : isWarn ? "text-yellow-400/60" : "text-foreground/45"
                   }`}
                 >
                   {line}
@@ -176,14 +192,14 @@ export function ControlTab() {
             </h3>
             <button
               onClick={fetchProcesses}
-              className="text-[11px] text-primary/60 hover:text-primary transition-colors"
+              className="text-[13px] text-primary/60 hover:text-primary transition-colors"
             >
               {t.common.refresh}
             </button>
           </div>
 
           {processes.length === 0 ? (
-            <p className="text-foreground/20 text-[12px] text-center py-8">{t.control.noProcesses}</p>
+            <p className="text-foreground/35 text-[12px] text-center py-8">{t.control.noProcesses}</p>
           ) : (
             <div className="grid grid-cols-2 gap-3">
               {processes.map((p) => (

@@ -58,9 +58,13 @@ describe("useProjects machine-readable pagination", () => {
     await waitFor(() => expect(result.current.loading).toBe(false));
 
     expect(result.current.projects).toHaveLength(2);
-    expect(result.current.projects[0].schema?.node_labels).toEqual([
-      { label: "Function", count: 3 },
-    ]);
+    /* Schemas arrive after the list has rendered (lazy enrichment), so wait
+     * for the merged pages rather than asserting them at loading=false. */
+    await waitFor(() =>
+      expect(result.current.projects[0].schema?.node_labels).toEqual([
+        { label: "Function", count: 3 },
+      ]),
+    );
     expect(result.current.projects[0].schema?.edge_types).toEqual([
       { type: "CALLS", count: 2 },
     ]);

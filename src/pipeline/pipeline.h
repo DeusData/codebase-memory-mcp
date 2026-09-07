@@ -63,9 +63,9 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * need to know whether the PREVIOUS generation survived can distinguish the
  * failures by value: the run publishes by renaming a fully validated staging
  * database over the destination, so every abort before that rename leaves the
- * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
- * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
- * stages that raise them. */
+ * existing database in place. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2) /* aborted pre-publication; previous DB intact */
+#define CBM_PIPELINE_PERSIST_FAILED (-4)    /* staging/rollback failure during publication */
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */

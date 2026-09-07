@@ -22,7 +22,7 @@ function HealthDot({ name }: { name: string }) {
         setStatus(d.status ?? "corrupt");
         if (d.nodes !== undefined) {
           const sizeMB = ((d.size_bytes ?? 0) / 1024 / 1024).toFixed(1);
-          setInfo(`${d.nodes.toLocaleString()} nodes, ${d.edges.toLocaleString()} edges, ${sizeMB} MB`);
+          setInfo(`${d.nodes.toLocaleString("en-US")} nodes, ${d.edges.toLocaleString("en-US")} edges, ${sizeMB} MB`);
         } else if (d.reason) {
           setInfo(d.reason);
         }
@@ -54,9 +54,9 @@ function HealthDot({ name }: { name: string }) {
       />
       {/* Tooltip */}
       <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 hidden group-hover:block z-20 pointer-events-none">
-        <div className="bg-[#0b1920] border border-border/50 rounded-lg px-3 py-2 text-[11px] whitespace-nowrap shadow-xl">
+        <div className="bg-card border border-border/50 rounded-md px-3 py-2 text-[13px] whitespace-nowrap shadow-xl">
           <p className="font-medium" style={{ color: dotColor }}>{label}</p>
-          {info && <p className="text-foreground/35 text-[10px] mt-0.5">{info}</p>}
+          {info && <p className="text-foreground/50 text-[12px] mt-0.5">{info}</p>}
         </div>
       </div>
     </div>
@@ -105,10 +105,10 @@ function AdrButton({ project }: { project: string }) {
     <>
       <button
         onClick={() => { setOpen(true); fetchAdr(); }}
-        className={`px-2.5 py-1 rounded-lg text-[10px] font-medium transition-all ${
+        className={`px-2.5 py-1 rounded-md text-[12px] font-medium transition-all ${
           hasAdr
             ? "bg-accent/15 text-accent hover:bg-accent/25"
-            : "bg-white/[0.03] text-foreground/25 hover:text-foreground/40 hover:bg-white/[0.06]"
+            : "bg-popover text-foreground/40 hover:text-foreground/40 hover:bg-surface-3"
         }`}
       >
         {hasAdr ? "ADR" : "+ ADR"}
@@ -121,18 +121,18 @@ function AdrButton({ project }: { project: string }) {
             <div className="flex items-center justify-between mb-4">
               <div>
                 <h3 className="text-[15px] font-semibold text-foreground/90">{t.adr.title}</h3>
-                <p className="text-[11px] text-foreground/30 font-mono mt-0.5">{project}</p>
+                <p className="text-[13px] text-foreground/45 font-mono mt-0.5">{project}</p>
               </div>
-              <button onClick={() => setOpen(false)} className="text-foreground/20 hover:text-foreground/50 text-[16px] p-1">×</button>
+              <button onClick={() => setOpen(false)} className="text-foreground/35 hover:text-foreground/50 text-[16px] p-1">×</button>
             </div>
             {updatedAt && (
-              <p className="text-[10px] text-foreground/20 mb-3">{t.adr.lastUpdated}: {updatedAt}</p>
+              <p className="text-[12px] text-foreground/35 mb-3">{t.adr.lastUpdated}: {updatedAt}</p>
             )}
             <textarea
               value={content}
               onChange={(e) => setContent(e.target.value)}
               placeholder={"# Architecture Decision Record\n\n## Context\n...\n\n## Decision\n...\n\n## Consequences\n..."}
-              className="flex-1 min-h-[300px] bg-white/[0.03] border border-white/[0.06] rounded-xl px-4 py-3 text-[12px] text-foreground font-mono placeholder-foreground/15 outline-none focus:border-primary/30 resize-none leading-relaxed"
+              className="flex-1 min-h-[300px] bg-popover border border-border rounded-md px-4 py-3 text-[12px] text-foreground font-mono placeholder-foreground/15 outline-none focus:border-primary/30 resize-none leading-relaxed"
             />
             <div className="flex justify-end gap-2 mt-4">
               {hasAdr && (
@@ -140,13 +140,13 @@ function AdrButton({ project }: { project: string }) {
                   onClick={async () => {
                     setContent(""); await save("");
                   }}
-                  className="px-3 py-2 rounded-lg text-[12px] text-destructive/60 hover:text-destructive hover:bg-destructive/10 font-medium transition-all"
+                  className="px-3 py-2 rounded-md text-[12px] text-destructive/60 hover:text-destructive hover:bg-destructive/10 font-medium transition-all"
                 >
                   {t.common.delete}
                 </button>
               )}
-              <button onClick={() => setOpen(false)} className="px-4 py-2 rounded-lg text-[12px] text-foreground/40 hover:bg-white/[0.04] font-medium transition-all">{t.common.cancel}</button>
-              <button onClick={() => save()} disabled={saving} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
+              <button onClick={() => setOpen(false)} className="px-4 py-2 rounded-md text-[12px] text-foreground/40 hover:bg-surface-3 font-medium transition-all">{t.common.cancel}</button>
+              <button onClick={() => save()} disabled={saving} className="px-4 py-2 rounded-md bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
                 {saving ? t.common.saving : t.common.save}
               </button>
             </div>
@@ -292,30 +292,30 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
         {/* Header */}
         <div className="px-5 pt-5 pb-3 shrink-0">
           <h3 className="text-[15px] font-semibold text-foreground/90 mb-1">{t.index.selectRepositoryFolder}</h3>
-          <p className="text-[12px] text-foreground/30">{t.index.instructions}</p>
+          <p className="text-[12px] text-foreground/45">{t.index.instructions}</p>
         </div>
 
         <div className="px-5 pb-3 grid grid-cols-[1fr_220px] gap-3 shrink-0">
           <label className="block">
-            <span className="block text-[10px] uppercase tracking-widest text-foreground/25 mb-1">{t.index.repositoryPath}</span>
+            <span className="block text-[12px] uppercase tracking-widest text-foreground/40 mb-1">{t.index.repositoryPath}</span>
             <input
               aria-label={t.index.repositoryPath}
               value={currentPath}
               onChange={(e) => setCurrentPath(e.target.value)}
               onKeyDown={(e) => { if (e.key === "Enter" && /^[A-Za-z]:/.test(currentPath.replace(/\\/g, "/"))) { e.preventDefault(); void browse(currentPath); } }}
-              className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground font-mono outline-none focus:border-primary/40"
+              className="w-full bg-popover border border-border rounded-md px-3 py-2 text-[12px] text-foreground font-mono outline-none focus:border-primary/40"
             />
           </label>
           <label className="block">
-            <span className="block text-[10px] uppercase tracking-widest text-foreground/25 mb-1">{t.index.projectName}</span>
+            <span className="block text-[12px] uppercase tracking-widest text-foreground/40 mb-1">{t.index.projectName}</span>
             <input
               aria-label={t.index.projectName}
               value={projectName}
               placeholder={t.index.projectNamePlaceholder}
               onChange={(e) => setProjectName(e.target.value)}
-              className="w-full bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
+              className="w-full bg-popover border border-border rounded-md px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/35"
             />
-            <span className="block text-[10px] text-foreground/25 mt-1">{t.index.projectNameHelp}</span>
+            <span className="block text-[12px] text-foreground/40 mt-1">{t.index.projectNameHelp}</span>
           </label>
         </div>
 
@@ -326,7 +326,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
             placeholder={t.index.filterFolders}
             onChange={(e) => setFilter(e.target.value)}
             onKeyDown={onFilterKeyDown}
-            className="flex-1 bg-white/[0.04] border border-white/[0.06] rounded-lg px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/20"
+            className="flex-1 bg-popover border border-border rounded-md px-3 py-2 text-[12px] text-foreground outline-none focus:border-primary/40 placeholder:text-foreground/35"
           />
           <div className="flex items-center gap-1">
             {displayRoots.map((root) => (
@@ -334,7 +334,7 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 key={root}
                 aria-label={t.index.browseRoot(root)}
                 onClick={() => browse(root)}
-                className="px-2.5 py-2 rounded-lg bg-white/[0.04] hover:bg-white/[0.07] text-[11px] text-foreground/45 font-mono transition-all"
+                className="px-2.5 py-2 rounded-md bg-popover hover:bg-white/[0.07] text-[13px] text-foreground/45 font-mono transition-all"
               >
                 {root}
               </button>
@@ -343,13 +343,13 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
         </div>
 
         {/* Breadcrumb */}
-        <div className="px-5 py-2 border-y border-border/20 flex items-center gap-0.5 overflow-x-auto text-[11px] shrink-0">
+        <div className="px-5 py-2 border-y border-border/20 flex items-center gap-0.5 overflow-x-auto text-[13px] shrink-0">
           {!isWinPath && (
             <button onClick={() => browse("/")} className="text-primary/60 hover:text-primary shrink-0 transition-colors">/</button>
           )}
           {segments.map((seg, i) => (
             <span key={i} className="flex items-center gap-0.5 shrink-0">
-              {(i > 0 || !isWinPath) && <span className="text-foreground/15">/</span>}
+              {(i > 0 || !isWinPath) && <span className="text-foreground/30">/</span>}
               <button
                 onClick={() => browse(crumbPath(i))}
                 className={`transition-colors ${i === segments.length - 1 ? "text-foreground/70 font-medium" : "text-primary/50 hover:text-primary"}`}
@@ -367,22 +367,22 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
             {currentPath !== "/" && (
               <button
                 onClick={() => browse(parentPath)}
-                className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-lg hover:bg-white/[0.04] text-[12px] text-foreground/40 transition-colors"
+                className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-md hover:bg-surface-3 text-[12px] text-foreground/40 transition-colors"
               >
-                <span className="text-foreground/20">↑</span>
+                <span className="text-foreground/35">↑</span>
                 <span>..</span>
               </button>
             )}
             {loading ? (
-              <p className="text-foreground/20 text-[12px] text-center py-8">{t.common.loading}</p>
+              <p className="text-foreground/35 text-[12px] text-center py-8">{t.common.loading}</p>
             ) : filteredDirs.length === 0 ? (
-              <p className="text-foreground/15 text-[12px] text-center py-8">{t.index.noSubdirectories}</p>
+              <p className="text-foreground/30 text-[12px] text-center py-8">{t.index.noSubdirectories}</p>
             ) : (
               filteredDirs.map((d, i) => (
                 <div
                   key={d}
-                  className={`flex items-center gap-2 rounded-lg px-3 py-1.5 text-[12px] transition-colors group ${
-                    i === activeIndex ? "bg-white/[0.05]" : "hover:bg-white/[0.04]"
+                  className={`flex items-center gap-2 rounded-md px-3 py-1.5 text-[12px] transition-colors group ${
+                    i === activeIndex ? "bg-surface-3" : "hover:bg-surface-3"
                   }`}
                 >
                   <button
@@ -390,14 +390,14 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     onClick={() => browse(joinPath(currentPath, d))}
                     className="flex min-w-0 flex-1 items-center gap-2 text-left text-foreground/60"
                   >
-                    <span className="text-foreground/20 group-hover:text-foreground/40">/</span>
+                    <span className="text-foreground/35 group-hover:text-foreground/40">/</span>
                     <span className="truncate">{d}</span>
                   </button>
                   <button
                     aria-label={t.index.indexDirectory(d)}
                     onClick={() => submit(joinPath(currentPath, d))}
                     disabled={submitting}
-                    className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 px-2 py-1 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[10px] font-medium transition-all disabled:opacity-30"
+                    className="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 px-2 py-1 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all disabled:opacity-30"
                   >
                     {t.index.indexThisFolder}
                   </button>
@@ -409,12 +409,12 @@ function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
         {/* Footer */}
         <div className="px-5 py-4 border-t border-border/20 shrink-0">
-          {error && <div className="rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 mb-3"><p className="text-destructive text-[11px]">{error}</p></div>}
+          {error && <div className="rounded-md bg-destructive/10 border border-destructive/20 px-3 py-2 mb-3"><p className="text-destructive text-[13px]">{error}</p></div>}
           <div className="flex items-center justify-between">
-            <p className="text-[11px] text-foreground/25 font-mono truncate max-w-[250px]">{currentPath}</p>
+            <p className="text-[13px] text-foreground/40 font-mono truncate max-w-[250px]">{currentPath}</p>
             <div className="flex gap-2 shrink-0">
-              <button onClick={onClose} className="px-3 py-2 rounded-lg text-[12px] text-foreground/40 hover:bg-white/[0.04] font-medium transition-all">{t.common.cancel}</button>
-              <button onClick={() => submit()} disabled={submitting || !currentPath} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
+              <button onClick={onClose} className="px-3 py-2 rounded-md text-[12px] text-foreground/40 hover:bg-surface-3 font-medium transition-all">{t.common.cancel}</button>
+              <button onClick={() => submit()} disabled={submitting || !currentPath} className="px-4 py-2 rounded-md bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
                 {submitting ? t.index.starting : t.index.indexThisFolder}
               </button>
             </div>
@@ -461,23 +461,23 @@ export function IndexProgress({ onDone }: { onDone: () => void }) {
   if (active.length === 0 && errors.length === 0) return null;
 
   return (
-    <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 mb-6">
+    <div className="rounded-md border border-primary/20 bg-primary/5 p-4 mb-6">
       {active.map((j) => (
         <div key={j.slot} className="flex items-center gap-3">
           <div className="w-4 h-4 border-2 border-primary/30 border-t-primary rounded-full animate-spin shrink-0" />
           <div>
             <p className="text-[12px] text-primary font-medium">{t.projects.indexingInProgress}</p>
-            <p className="text-[11px] text-foreground/30 font-mono">{j.path}</p>
+            <p className="text-[13px] text-foreground/45 font-mono">{j.path}</p>
           </div>
         </div>
       ))}
       {errors.map((j) => (
-        <div key={j.slot} className="flex items-start gap-3 mt-3 first:mt-0 p-3 rounded-lg border border-destructive/20 bg-destructive/5 text-destructive">
+        <div key={j.slot} className="flex items-start gap-3 mt-3 first:mt-0 p-3 rounded-md border border-destructive/20 bg-destructive/5 text-destructive">
           <span className="text-[14px]">⚠️</span>
           <div className="flex-1 min-w-0">
             <p className="text-[12px] font-semibold">{t.projects.indexingFailed}</p>
-            <p className="text-[11px] font-mono truncate">{j.path}</p>
-            {j.error && <p className="text-[10px] opacity-75 mt-1 font-mono">{j.error}</p>}
+            <p className="text-[13px] font-mono truncate">{j.path}</p>
+            {j.error && <p className="text-[12px] opacity-75 mt-1 font-mono">{j.error}</p>}
           </div>
         </div>
       ))}
@@ -485,7 +485,7 @@ export function IndexProgress({ onDone }: { onDone: () => void }) {
         <div className="flex justify-end mt-3">
           <button
             onClick={onDone}
-            className="px-3 py-1 rounded bg-destructive/10 hover:bg-destructive/20 text-destructive text-[11px] font-medium transition-all"
+            className="px-3 py-1 rounded bg-destructive/10 hover:bg-destructive/20 text-destructive text-[13px] font-medium transition-all"
           >
             {t.common.dismiss}
           </button>
@@ -506,8 +506,10 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
   const aggregate = useMemo(() => {
     let totalNodes = 0, totalEdges = 0;
     for (const p of projects) {
-      totalNodes += p.schema?.node_labels?.reduce((s, l) => s + l.count, 0) ?? 0;
-      totalEdges += p.schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
+      totalNodes +=
+        p.project.nodes ?? p.schema?.node_labels?.reduce((s, l) => s + l.count, 0) ?? 0;
+      totalEdges +=
+        p.project.edges ?? p.schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
     }
     return { projects: projects.length, nodes: totalNodes, edges: totalEdges };
   }, [projects]);
@@ -527,9 +529,9 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
               { label: t.projects.nodes, value: aggregate.nodes, color: "text-foreground/80" },
               { label: t.projects.edges, value: aggregate.edges, color: "text-foreground/80" },
             ].map((s) => (
-              <div key={s.label} className="flex-1 rounded-xl border border-border/30 bg-white/[0.02] p-4">
-                <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-1">{s.label}</p>
-                <p className={`text-[22px] font-semibold tabular-nums ${s.color}`}>{s.value.toLocaleString()}</p>
+              <div key={s.label} className="flex-1 rounded-md border border-border/30 bg-card p-4">
+                <p className="text-[12px] text-foreground/40 uppercase tracking-widest mb-1">{s.label}</p>
+                <p className={`text-[22px] font-semibold tabular-nums ${s.color}`}>{s.value.toLocaleString("en-US")}</p>
               </div>
             ))}
           </div>
@@ -540,51 +542,53 @@ export function StatsTab({ onSelectProject }: StatsTabProps) {
         <div className="flex items-center justify-between mb-6">
           <h2 className="text-[15px] font-semibold text-foreground/80">{t.projects.indexedProjects}</h2>
           <div className="flex items-center gap-2">
-            <button onClick={() => setShowModal(true)} className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">+ {t.index.newIndex}</button>
-            <button onClick={refresh} disabled={loading} className="px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.07] text-[12px] text-foreground/40 font-medium transition-all disabled:opacity-30">{loading ? "..." : t.common.refresh}</button>
+            <button onClick={() => setShowModal(true)} className="px-3 py-1.5 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">+ {t.index.newIndex}</button>
+            <button onClick={refresh} disabled={loading} className="px-3 py-1.5 rounded-md bg-popover hover:bg-white/[0.07] text-[12px] text-foreground/40 font-medium transition-all disabled:opacity-30">{loading ? "..." : t.common.refresh}</button>
           </div>
         </div>
 
-        {error && <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-4 mb-6"><p className="text-destructive text-[13px]">{error}</p></div>}
+        {error && <div className="rounded-md border border-destructive/20 bg-destructive/5 p-4 mb-6"><p className="text-destructive text-[13px]">{error}</p></div>}
 
         {!loading && projects.length === 0 && !error && (
           <div className="text-center py-20">
-            <p className="text-foreground/25 text-[13px] mb-2">{t.projects.noIndexedProjects}</p>
-            <button onClick={() => setShowModal(true)} className="px-4 py-2 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">{t.projects.indexFirstRepository}</button>
+            <p className="text-foreground/40 text-[13px] mb-2">{t.projects.noIndexedProjects}</p>
+            <button onClick={() => setShowModal(true)} className="px-4 py-2 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">{t.projects.indexFirstRepository}</button>
           </div>
         )}
 
         <div className="space-y-3">
           {projects.map((p) => {
-            const totalNodes = p.schema?.node_labels?.reduce((s, l) => s + l.count, 0) ?? 0;
-            const totalEdges = p.schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
+            const totalNodes =
+              p.project.nodes ?? p.schema?.node_labels?.reduce((s, l) => s + l.count, 0) ?? 0;
+            const totalEdges =
+              p.project.edges ?? p.schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
             return (
-              <div key={p.project.name} className="rounded-xl border border-border/30 bg-white/[0.02] hover:bg-white/[0.035] transition-all p-5">
+              <div key={p.project.name} className="rounded-md border border-border/30 bg-card hover:bg-white/[0.035] transition-all p-5">
                 <div className="flex items-start justify-between gap-3 mb-3">
                   <div className="min-w-0 flex items-start gap-2.5">
                     <div className="mt-1.5"><HealthDot name={p.project.name} /></div>
                     <div className="min-w-0">
                       <h3 className="text-[14px] font-semibold text-foreground/90 mb-0.5">{p.project.name}</h3>
-                      <p className="text-[11px] text-foreground/20 font-mono truncate">{p.project.root_path}</p>
+                      <p className="text-[13px] text-foreground/35 font-mono truncate">{p.project.root_path}</p>
                     </div>
                   </div>
                   <div className="flex items-center gap-1.5 shrink-0">
                     <AdrButton project={p.project.name} />
-                    <button onClick={() => onSelectProject(p.project.name)} className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">{t.projects.viewGraph}</button>
-                    <button onClick={() => deleteProject(p.project.name)} className="px-2 py-1.5 rounded-lg hover:bg-destructive/10 text-foreground/20 hover:text-destructive text-[12px] transition-all" title={t.projects.deleteTitle}>✕</button>
+                    <button onClick={() => onSelectProject(p.project.name)} className="px-3 py-1.5 rounded-md bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">{t.projects.viewGraph}</button>
+                    <button onClick={() => deleteProject(p.project.name)} className="px-2 py-1.5 rounded-md hover:bg-destructive/10 text-foreground/35 hover:text-destructive text-[12px] transition-all" title={t.projects.deleteTitle}>✕</button>
                   </div>
                 </div>
                 {p.schema && (
                   <>
-                    <div className="flex gap-6 text-[12px] text-foreground/30 mb-3">
-                      <span><strong className="text-foreground/55 tabular-nums">{totalNodes.toLocaleString()}</strong> {t.projects.nodes}</span>
-                      <span><strong className="text-foreground/55 tabular-nums">{totalEdges.toLocaleString()}</strong> {t.projects.edges}</span>
+                    <div className="flex gap-6 text-[12px] text-foreground/45 mb-3">
+                      <span><strong className="text-foreground/55 tabular-nums">{totalNodes.toLocaleString("en-US")}</strong> {t.projects.nodes}</span>
+                      <span><strong className="text-foreground/55 tabular-nums">{totalEdges.toLocaleString("en-US")}</strong> {t.projects.edges}</span>
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {p.schema.node_labels?.map((l) => (
-                        <span key={l.label} className="inline-flex items-center gap-1 px-1.5 py-[2px] rounded-md text-[10px] font-medium" style={{ backgroundColor: colorForLabel(l.label) + "10", color: colorForLabel(l.label) + "bb" }}>
+                        <span key={l.label} className="inline-flex items-center gap-1 px-1.5 py-[2px] rounded-md text-[12px] font-medium" style={{ backgroundColor: colorForLabel(l.label) + "10", color: colorForLabel(l.label) + "bb" }}>
                           <span className="w-[4px] h-[4px] rounded-full" style={{ backgroundColor: colorForLabel(l.label) }} />
-                          {l.label} {l.count.toLocaleString()}
+                          {l.label} {l.count.toLocaleString("en-US")}
                         </span>
                       ))}
                     </div>

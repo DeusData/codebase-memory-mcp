@@ -86,18 +86,22 @@ export interface DisplaySettings {
   nodeGlow: number;
   /** Bloom intensity multiplier (0–2, default 1). */
   bloom: number;
+  /** Hover dwell before wiki help cards appear, ms (150–800, default 350). */
+  tooltipDelayMs: number;
 }
 
 export const DEFAULT_DISPLAY_SETTINGS: DisplaySettings = {
   edgeBrightness: 1,
   nodeGlow: 1,
   bloom: 1,
+  tooltipDelayMs: 350,
 };
 
 export const DISPLAY_LIMITS = {
   edgeBrightness: { min: 0.1, max: 3 },
   nodeGlow: { min: 0, max: 2 },
   bloom: { min: 0, max: 2 },
+  tooltipDelayMs: { min: 150, max: 800 },
 } as const;
 
 const DISPLAY_STORAGE_KEY = "cbm-display";
@@ -116,6 +120,7 @@ export function clampDisplaySettings(
     edgeBrightness: clampSetting("edgeBrightness", raw.edgeBrightness),
     nodeGlow: clampSetting("nodeGlow", raw.nodeGlow),
     bloom: clampSetting("bloom", raw.bloom),
+    tooltipDelayMs: clampSetting("tooltipDelayMs", raw.tooltipDelayMs),
   };
 }
 
@@ -131,4 +136,11 @@ export function saveDisplaySettings(settings: DisplaySettings) {
   try {
     localStorage.setItem(DISPLAY_STORAGE_KEY, JSON.stringify(settings));
   } catch { /* ignore */ }
+}
+
+/* Read lazily at hover-start (WikiHoverCard arms its dwell timer with this),
+ * so a change in the Display menu applies to the very next hover without any
+ * subscription plumbing between the menu and every chip. */
+export function loadTooltipDelayMs(): number {
+  return loadDisplaySettings().tooltipDelayMs;
 }

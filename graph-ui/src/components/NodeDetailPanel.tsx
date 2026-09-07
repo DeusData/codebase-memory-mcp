@@ -1,4 +1,7 @@
 import { useMemo, useState, useEffect } from "react";
+
+/* #1198: connections render in slices the user grows — never a silent cap. */
+export const CONNECTIONS_PAGE_SIZE = 25;
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { colorForLabel } from "../lib/colors";
 import { callTool } from "../api/rpc";
@@ -18,6 +21,9 @@ interface NodeDetailPanelProps {
   repoInfo: RepoInfo | null;
   onClose: () => void;
   onNavigate: (node: GraphNode) => void;
+  /* Honest-scope note, e.g. "+12 callers outside this region" — the loaded
+   * edges are a window, never the whole truth. */
+  scopeNote?: string | null;
 }
 
 interface SnippetResult {
@@ -53,6 +59,7 @@ export function NodeDetailPanel({
   repoInfo,
   onClose,
   onNavigate,
+  scopeNote = null,
 }: NodeDetailPanelProps) {
   const [code, setCode] = useState<string | null>(null);
   const [codeLoading, setCodeLoading] = useState(false);
@@ -114,7 +121,7 @@ export function NodeDetailPanel({
   };
 
   return (
-    <div className="w-full bg-[#0b1920]/95 backdrop-blur-xl flex flex-col h-full min-h-0 overflow-hidden">
+    <div className="w-full bg-card/95 backdrop-blur-xl flex flex-col h-full min-h-0 overflow-hidden">
       {/* Header */}
       <div className="px-4 pt-4 pb-3 border-b border-border/30">
         <div className="flex items-start justify-between gap-2 mb-2">
@@ -124,17 +131,17 @@ export function NodeDetailPanel({
               <h3 className="text-[13px] font-semibold text-foreground truncate">{node.name}</h3>
             </div>
             <span
-              className="inline-block px-2 py-0.5 rounded-md text-[10px] font-medium"
+              className="inline-block px-2 py-0.5 rounded-md text-[12px] font-medium"
               style={{ backgroundColor: colorForLabel(node.label) + "18", color: colorForLabel(node.label) }}
             >
               {node.label}
             </span>
           </div>
-          <button onClick={onClose} className="text-foreground/20 hover:text-foreground/50 transition-colors text-[16px] leading-none p-1">×</button>
+          <button onClick={onClose} className="text-foreground/35 hover:text-foreground/50 transition-colors text-[16px] leading-none p-1">×</button>
         </div>
 
         {node.file_path && (
-          <p className="text-[11px] text-foreground/30 font-mono mt-2 break-all leading-relaxed">
+          <p className="text-[13px] text-foreground/45 font-mono mt-2 break-all leading-relaxed">
             {node.file_path}
             {node.start_line ? (
               <span className="text-foreground/45">
@@ -151,7 +158,7 @@ export function NodeDetailPanel({
             <button
               onClick={code ? () => setCode(null) : loadCode}
               disabled={codeLoading}
-              className="px-2.5 py-1 rounded-md bg-primary/15 text-primary text-[11px] font-medium hover:bg-primary/25 transition-colors disabled:opacity-50"
+              className="px-2.5 py-1 rounded-md bg-primary/15 text-primary text-[13px] font-medium hover:bg-primary/25 transition-colors disabled:opacity-50"
             >
               {codeLoading ? "Loading…" : code ? "Hide code" : "Show code"}
             </button>
@@ -161,16 +168,16 @@ export function NodeDetailPanel({
               href={ghUrl}
               target="_blank"
               rel="noopener noreferrer"
-              className="px-2.5 py-1 rounded-md bg-white/[0.05] text-foreground/60 text-[11px] font-medium hover:bg-white/[0.09] hover:text-foreground/90 transition-colors"
+              className="px-2.5 py-1 rounded-md bg-surface-3 text-foreground/60 text-[13px] font-medium hover:bg-surface-4 hover:text-foreground/90 transition-colors"
             >
               Open on GitHub ↗
             </a>
           )}
         </div>
 
-        {codeError && <p className="text-[11px] text-red-400/80 mt-2">{codeError}</p>}
+        {codeError && <p className="text-[13px] text-red-400/80 mt-2">{codeError}</p>}
         {code && (
-          <pre className="mt-2 max-h-[300px] overflow-auto rounded-md bg-black/40 border border-white/[0.06] p-2.5 text-[10.5px] leading-relaxed font-mono text-foreground/75 whitespace-pre">
+          <pre className="mt-2 max-h-[300px] overflow-auto rounded-md bg-black/40 border border-border p-2.5 text-[12px] leading-relaxed font-mono text-foreground/75 whitespace-pre">
             {code}
           </pre>
         )}
@@ -183,7 +190,7 @@ export function NodeDetailPanel({
             { label: "Total", value: connections.length, color: "text-foreground" },
           ].map((s) => (
             <div key={s.label}>
-              <p className="text-[9px] text-foreground/25 uppercase tracking-widest">{s.label}</p>
+              <p className="text-[12px] text-foreground/40 uppercase tracking-widest">{s.label}</p>
               <p className={`text-[18px] font-semibold tabular-nums ${s.color}`}>{s.value}</p>
             </div>
           ))}
@@ -196,14 +203,55 @@ export function NodeDetailPanel({
           {outbound.length > 0 && (
             <ConnectionSection title="References" count={outbound.length} icon="→" groups={groupByType(outbound)} onNavigate={onNavigate} />
           )}
+          {scopeNote && (
+            <p className="text-[12px] text-warn/80">{scopeNote}</p>
+          )}
           {inbound.length > 0 && (
             <ConnectionSection title="Referenced by" count={inbound.length} icon="←" groups={groupByType(inbound)} onNavigate={onNavigate} />
           )}
           {connections.length === 0 && (
-            <p className="text-[12px] text-foreground/20 text-center py-8">No connections</p>
+            <p className="text-[12px] text-foreground/35 text-center py-8">No connections</p>
           )}
         </div>
       </ScrollArea>
+    </div>
+  );
+}
+
+function ConnectionGroup({ type, conns, icon, onNavigate }: {
+  type: string; conns: Connection[]; icon: string;
+  onNavigate: (n: GraphNode) => void;
+}) {
+  const [visible, setVisible] = useState(CONNECTIONS_PAGE_SIZE);
+  useEffect(() => setVisible(CONNECTIONS_PAGE_SIZE), [type, conns.length]);
+  const remaining = conns.length - visible;
+  return (
+    <div className="mb-2">
+      <p className="text-[12px] text-foreground/35 uppercase tracking-wider mb-1 font-medium">
+        {type.replace(/_/g, " ").toLowerCase()}
+      </p>
+      <div className="space-y-px">
+        {conns.slice(0, visible).map((c, i) => (
+          <button
+            key={`${c.node.id}-${i}`}
+            onClick={() => onNavigate(c.node)}
+            className="flex items-center gap-1.5 w-full text-left px-2 py-[4px] rounded-md hover:bg-surface-3 text-[13px] transition-colors group"
+          >
+            <span className="text-foreground/30 text-[12px] group-hover:text-foreground/45">{icon}</span>
+            <span className="w-[5px] h-[5px] rounded-full shrink-0" style={{ backgroundColor: colorForLabel(c.node.label) }} />
+            <span className="text-foreground/55 group-hover:text-foreground/80 truncate">{c.node.name}</span>
+            <span className="text-foreground/30 ml-auto text-[12px] shrink-0">{c.node.label}</span>
+          </button>
+        ))}
+        {remaining > 0 && (
+          <button
+            onClick={() => setVisible((v) => v + 200)}
+            className="w-full text-left px-2 py-1 text-[12px] text-primary/70 hover:text-primary transition-colors"
+          >
+            Show {Math.min(remaining, 200)} more ({remaining} hidden)
+          </button>
+        )}
+      </div>
     </div>
   );
 }
@@ -215,32 +263,11 @@ function ConnectionSection({ title, count, icon, groups, onNavigate }: {
 }) {
   return (
     <div>
-      <p className="text-[11px] font-medium text-foreground/40 mb-2">
-        {title} <span className="text-foreground/15">({count})</span>
+      <p className="text-[13px] font-medium text-foreground/40 mb-2">
+        {title} <span className="text-foreground/30">({count})</span>
       </p>
       {groups.map(([type, conns]) => (
-        <div key={type} className="mb-2">
-          <p className="text-[9px] text-foreground/20 uppercase tracking-wider mb-1 font-medium">
-            {type.replace(/_/g, " ").toLowerCase()}
-          </p>
-          <div className="space-y-px">
-            {conns.slice(0, 25).map((c, i) => (
-              <button
-                key={`${c.node.id}-${i}`}
-                onClick={() => onNavigate(c.node)}
-                className="flex items-center gap-1.5 w-full text-left px-2 py-[4px] rounded-md hover:bg-white/[0.04] text-[11px] transition-colors group"
-              >
-                <span className="text-foreground/15 text-[10px] group-hover:text-foreground/30">{icon}</span>
-                <span className="w-[5px] h-[5px] rounded-full shrink-0" style={{ backgroundColor: colorForLabel(c.node.label) }} />
-                <span className="text-foreground/55 group-hover:text-foreground/80 truncate">{c.node.name}</span>
-                <span className="text-foreground/10 ml-auto text-[10px] shrink-0">{c.node.label}</span>
-              </button>
-            ))}
-            {conns.length > 25 && (
-              <p className="text-[10px] text-foreground/15 px-2 py-1">+{conns.length - 25} more</p>
-            )}
-          </div>
-        </div>
+        <ConnectionGroup key={type} type={type} conns={conns} icon={icon} onNavigate={onNavigate} />
       ))}
     </div>
   );

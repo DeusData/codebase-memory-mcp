@@ -24,6 +24,20 @@ function mockLayoutFetch(data: GraphData) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.startsWith("/api/layout")) {
+      /* The region probe answers first: a small project — no region scene. */
+      if (url.includes("level=regions")) {
+        return new Response(
+          JSON.stringify({
+            level: "regions",
+            method: "folders",
+            total_nodes: data.total_nodes,
+            unmapped_nodes: 0,
+            regions: [],
+            edges: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify(data), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -48,8 +62,11 @@ describe("GraphTab filters", () => {
     /* Wait for the layout to load — the filter panel header appears. */
     expect(await screen.findByText("Filters")).toBeInTheDocument();
 
-    /* Disable every filter via the "None" shortcut. */
-    fireEvent.click(screen.getByRole("button", { name: "None" }));
+    /* Everything starts enabled — the tri-state master reads checked.
+       One click cycles all-on → all-off. */
+    const master = screen.getByRole("checkbox", { name: "All filters" });
+    expect(master).toHaveAttribute("aria-checked", "true");
+    fireEvent.click(master);
 
     /* The graph area reports that everything is filtered out… */
     expect(screen.getByText("All nodes filtered out")).toBeInTheDocument();
@@ -57,7 +74,9 @@ describe("GraphTab filters", () => {
     /* …but the filter sidebar must stay so the user can re-enable filters
        instead of being forced to reset everything. */
     expect(screen.getByText("Filters")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "All" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "None" })).toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: "All filters" })).toHaveAttribute(
+      "aria-checked",
+      "false",
+    );
   });
 });

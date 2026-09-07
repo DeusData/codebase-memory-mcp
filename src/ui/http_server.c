@@ -17,6 +17,7 @@
 #include "ui/httpd.h"
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
+#include "ui/atlas.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
 #include "watcher/watcher.h"
@@ -53,7 +54,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
-#include <psapi.h> /* GetProcessMemoryInfo */
+#include <psapi.h>    /* GetProcessMemoryInfo */
 #include <tlhelp32.h> /* CreateToolhelp32Snapshot, Process32First/Next */
 #else
 #include <sys/stat.h>
@@ -84,6 +85,7 @@
  * which makes these statics safe. */
 static char g_cors[256];      /* CORS headers only */
 static char g_cors_json[512]; /* CORS + Content-Type: application/json */
+static char g_cors_html[512]; /* CORS + Content-Type: text/html */
 
 static bool origin_is_same_server(const char *origin, int port) {
     char expected[128];
@@ -120,6 +122,8 @@ static void update_cors(const cbm_http_req_t *req, int port) {
                  "Access-Control-Allow-Headers: Content-Type\r\n");
     }
     snprintf(g_cors_json, sizeof(g_cors_json), "%sContent-Type: application/json\r\n", g_cors);
+    snprintf(g_cors_html, sizeof(g_cors_html), "%sContent-Type: text/html; charset=utf-8\r\n",
+             g_cors);
 }
 
 static const char *detect_ui_lang(const char *accept_language) {
@@ -152,9 +156,8 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * targets must come from an auditable backend response, same pattern as
      * the /api/repo-info deep-links). */
     cbm_http_replyf(c, 200, g_cors_json,
-                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, CBM_VERSION,
-                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}", lang_buf,
+                    CBM_VERSION, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -600,9 +603,8 @@ static void handle_processes(cbm_http_conn_t *c) {
         pe.dwSize = sizeof(pe);
         for (BOOL ok = Process32First(hSnap, &pe); ok; ok = Process32Next(hSnap, &pe)) {
             if (_stricmp(pe.szExeFile, "codebase-memory-mcp.exe") == 0) {
-                HANDLE hProc = OpenProcess(
-                    PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                    FALSE, pe.th32ProcessID);
+                HANDLE hProc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE,
+                                           pe.th32ProcessID);
                 if (hProc) {
                     PROCESS_MEMORY_COUNTERS ppmc;
                     FILETIME ftc, fte, ftk, ftu;
@@ -645,13 +647,10 @@ static void handle_processes(cbm_http_conn_t *c) {
                                  "\"command\":\"codebase-memory-mcp\","
                                  "\"is_self\":%s}",
                                  pe.th32ProcessID, cpu_user + cpu_sys,
-                                 (double)proc_rss / (1024.0 * 1024.0),
-                                 elapsed_sec / 86400,
-                                 (elapsed_sec % 86400) / 3600,
-                                 (elapsed_sec % 3600) / 60,
+                                 (double)proc_rss / (1024.0 * 1024.0), elapsed_sec / 86400,
+                                 (elapsed_sec % 86400) / 3600, (elapsed_sec % 3600) / 60,
                                  elapsed_sec % 60,
-                                 pe.th32ProcessID == (DWORD)_getpid()
-                                     ? "true" : "false");
+                                 pe.th32ProcessID == (DWORD)_getpid() ? "true" : "false");
                     if (pos >= (int)sizeof(buf)) {
                         pos = (int)sizeof(buf) - 1;
                     }
@@ -1539,6 +1538,55 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         return;
     }
 
+    /* level=regions (CBM Atlas): the coarsest level of detail — one body per
+     * region instead of one per node. Regions do not mix with the missed
+     * skeleton or cross-repo satellites; the client asks for those at finer
+     * levels. */
+    char level_str[32] = {0};
+    if (cbm_http_query_param(req->query, "level", level_str, (int)sizeof(level_str)) &&
+        strcmp(level_str, "regions") == 0 && !missed_graph) {
+        char *regions_json = cbm_layout_regions_json(store, scoped_project);
+        cbm_store_close(store);
+        if (!regions_json) {
+            cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"region computation failed\"}");
+            return;
+        }
+        cbm_http_replyf(c, 200, g_cors_json, "%s", regions_json);
+        free(regions_json);
+        return;
+    }
+
+    /* scope=region:<id> — full-detail layout of one region's files only. */
+    char scope_str[64] = {0};
+    int scope_region = -1;
+    if (cbm_http_query_param(req->query, "scope", scope_str, (int)sizeof(scope_str)) &&
+        strncmp(scope_str, "region:", 7) == 0) {
+        scope_region = atoi(scope_str + 7);
+        if (scope_region < 0) {
+            cbm_store_close(store);
+            cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid scope\"}");
+            return;
+        }
+    }
+    if (scope_region >= 0 && !missed_graph) {
+        cbm_layout_result_t *scoped =
+            cbm_layout_compute_region(store, scoped_project, scope_region, max_nodes);
+        cbm_store_close(store);
+        if (!scoped) {
+            cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"unknown region\"}");
+            return;
+        }
+        char *scoped_json = cbm_layout_to_json(scoped);
+        cbm_layout_free(scoped);
+        if (!scoped_json) {
+            cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"JSON serialization failed\"}");
+            return;
+        }
+        cbm_http_replyf(c, 200, g_cors_json, "%s", scoped_json);
+        free(scoped_json);
+        return;
+    }
+
     cbm_layout_result_t *layout =
         cbm_layout_compute(store, scoped_project, CBM_LAYOUT_OVERVIEW, NULL, 0, max_nodes);
 
@@ -1745,6 +1793,550 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     }
 }
 
+/* ── CBM Atlas data services (tree, symbol, flows) ────────────── */
+
+/* Open the query store for ?project=... or reply with the right error.
+ * Returns NULL after replying. */
+static cbm_store_t *atlas_open_project(cbm_http_conn_t *c, const cbm_http_req_t *req, char *project,
+                                       size_t project_cap) {
+    if (!cbm_http_query_param(req->query, "project", project, (int)project_cap) ||
+        project[0] == '\0') {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing project parameter\"}");
+        return NULL;
+    }
+    char db_path[1024];
+    db_path_for_project(project, db_path, sizeof(db_path));
+    if (!cbm_file_exists(db_path)) {
+        cbm_http_replyf(c, 404, g_cors_json, "{\"error\":\"project not found\"}");
+        return NULL;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store)
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"cannot open store\"}");
+    return store;
+}
+
+static void atlas_reply_json(cbm_http_conn_t *c, char *json, int missing_status,
+                             const char *missing_body) {
+    if (!json) {
+        cbm_http_replyf(c, missing_status, g_cors_json, "%s", missing_body);
+        return;
+    }
+    cbm_http_replyf(c, 200, g_cors_json, "%s", json);
+    free(json);
+}
+
+/* GET /api/tree?project=X&path=src/foo — Modules aggregates. */
+static void handle_atlas_tree(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char path[512] = {0};
+    cbm_http_query_param(req->query, "path", path, (int)sizeof(path));
+    char *json = cbm_atlas_tree_json(store, project, path);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"tree computation failed\"}");
+}
+
+/* GET /api/symbol?project=X&id=N (or &qn=...) — the symbol bundle. */
+static void handle_atlas_symbol(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char id_str[32] = {0};
+    char qn[1024] = {0};
+    char limit_str[16] = {0};
+    char offset_str[16] = {0};
+    int64_t id = -1;
+    if (cbm_http_query_param(req->query, "id", id_str, (int)sizeof(id_str)) && id_str[0])
+        id = strtoll(id_str, NULL, 10);
+    cbm_http_query_param(req->query, "qn", qn, (int)sizeof(qn));
+    int limit = 0, offset = 0;
+    if (cbm_http_query_param(req->query, "limit", limit_str, (int)sizeof(limit_str)))
+        limit = atoi(limit_str);
+    if (cbm_http_query_param(req->query, "offset", offset_str, (int)sizeof(offset_str)))
+        offset = atoi(offset_str);
+    if (id < 0 && qn[0] == '\0') {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing id or qn parameter\"}");
+        return;
+    }
+    char *json = cbm_atlas_symbol_json(store, project, id, qn[0] ? qn : NULL, limit, offset);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 404, "{\"error\":\"symbol not found\"}");
+}
+
+/* GET /api/metrics?project=X — the Dashboard payload. */
+static void handle_atlas_metrics(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char *json = cbm_atlas_metrics_json(store, project);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"metrics computation failed\"}");
+}
+
+/* Attach per-hop guard chains to a trace JSON (guards=1): for each
+ * consecutive path pair, find the CALLS edge's call-site line and run the
+ * on-demand guard extraction in the caller's file. Best-effort — hops
+ * without a resolvable site simply get no guards array. */
+static char *atlas_trace_attach_guards(cbm_store_t *store, const char *project, char *json) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return json;
+    yyjson_val *path = yyjson_obj_get(yyjson_doc_get_root(doc), "path");
+    size_t hops = path ? yyjson_arr_size(path) : 0;
+    if (hops < 2) {
+        yyjson_doc_free(doc);
+        return json;
+    }
+    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_doc_free(doc);
+    if (!mut)
+        return json;
+    yyjson_mut_val *mpath = yyjson_mut_obj_get(yyjson_mut_doc_get_root(mut), "path");
+    struct sqlite3 *db = cbm_store_get_db(store);
+    for (size_t i = 0; i + 1 < hops && db; i++) {
+        yyjson_mut_val *from = yyjson_mut_arr_get(mpath, i);
+        yyjson_mut_val *to = yyjson_mut_arr_get(mpath, i + 1);
+        int64_t from_id = yyjson_mut_get_int(yyjson_mut_obj_get(from, "id"));
+        int64_t to_id = yyjson_mut_get_int(yyjson_mut_obj_get(to, "id"));
+        const char *from_file = yyjson_mut_get_str(yyjson_mut_obj_get(from, "file_path"));
+        if (!from_file)
+            continue;
+        sqlite3_stmt *st = NULL;
+        int line = -1;
+        if (sqlite3_prepare_v2(db,
+                               "SELECT properties FROM edges WHERE project=?1 AND "
+                               "source_id=?2 AND target_id=?3 AND type='CALLS' LIMIT 1",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 2, from_id);
+            sqlite3_bind_int64(st, 3, to_id);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const char *props = (const char *)sqlite3_column_text(st, 0);
+                if (props) {
+                    yyjson_doc *pd = yyjson_read(props, strlen(props), 0);
+                    if (pd) {
+                        line = (int)yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(pd), "line"));
+                        yyjson_doc_free(pd);
+                    }
+                }
+            }
+            sqlite3_finalize(st);
+        }
+        if (line <= 0)
+            continue;
+        char *gj = cbm_atlas_callsite_guards_json(store, project, from_file, line);
+        if (!gj)
+            continue;
+        yyjson_doc *gd = yyjson_read(gj, strlen(gj), 0);
+        free(gj);
+        if (!gd)
+            continue;
+        yyjson_val *garr = yyjson_obj_get(yyjson_doc_get_root(gd), "guards");
+        if (garr) {
+            yyjson_mut_val *copy = yyjson_val_mut_copy(mut, garr);
+            if (copy)
+                yyjson_mut_obj_add_val(mut, to, "guards", copy);
+        }
+        yyjson_doc_free(gd);
+    }
+    char *out = yyjson_mut_write(mut, 0, NULL);
+    yyjson_mut_doc_free(mut);
+    if (!out)
+        return json;
+    free(json);
+    return out;
+}
+
+/* GET /api/trace?project=X&from=QN|#id&to=QN|#id&mode=calls|data — A→B. */
+static void handle_atlas_trace(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char from_str[1024] = {0};
+    char to_str[1024] = {0};
+    char mode[16] = {0};
+    cbm_http_query_param(req->query, "from", from_str, (int)sizeof(from_str));
+    cbm_http_query_param(req->query, "to", to_str, (int)sizeof(to_str));
+    cbm_http_query_param(req->query, "mode", mode, (int)sizeof(mode));
+    if (!from_str[0] || !to_str[0]) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing from/to parameter\"}");
+        return;
+    }
+    int64_t from_id = from_str[0] == '#' ? strtoll(from_str + 1, NULL, 10) : -1;
+    int64_t to_id = to_str[0] == '#' ? strtoll(to_str + 1, NULL, 10) : -1;
+    char *json = cbm_atlas_trace_json(store, project, from_id, from_id < 0 ? from_str : NULL, to_id,
+                                      to_id < 0 ? to_str : NULL, mode[0] ? mode : "calls");
+    char wantg[8] = {0};
+    cbm_http_query_param(req->query, "guards", wantg, (int)sizeof(wantg));
+    if (json && wantg[0] == '1')
+        json = atlas_trace_attach_guards(store, project, json);
+    json = cbm_atlas_attach_observed(store, project, json);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"trace failed\"}");
+}
+
+/* Attach runtime observation to a trace ("path") or flow-detail ("steps")
+ * JSON: every hop whose (caller, callee) pair appears in observed_calls
+ * gains "observed": {count, label, last_seen}. Observation is qn-keyed
+ * (reindex-proof), so hop ids resolve to qualified names first. Absence
+ * adds nothing — an unobserved hop stays merely possible, never "dead". */
+char *cbm_atlas_attach_observed(cbm_store_t *store, const char *project, char *json) {
+    if (!json)
+        return json;
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return json;
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    bool is_trace = yyjson_obj_get(root, "path") != NULL;
+    bool is_flow = yyjson_obj_get(root, "steps") != NULL;
+    if (!is_trace && !is_flow) {
+        yyjson_doc_free(doc);
+        return json;
+    }
+    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_doc_free(doc);
+    if (!mut)
+        return json;
+    yyjson_mut_val *mroot = yyjson_mut_doc_get_root(mut);
+    yyjson_mut_val *arr = yyjson_mut_obj_get(mroot, is_trace ? "path" : "steps");
+    size_t count = arr ? yyjson_mut_arr_size(arr) : 0;
+    struct sqlite3 *db = cbm_store_get_db(store);
+    sqlite3_stmt *qn_stmt = NULL;
+    if (count >= 2 && db)
+        (void)sqlite3_prepare_v2(db, "SELECT qualified_name FROM nodes WHERE id=?1 LIMIT 1", -1,
+                                 &qn_stmt, NULL);
+    if (qn_stmt) {
+        /* Per-request id→qn memo: flows revisit parents for every child. */
+        enum { OBS_MEMO_MAX = 64 };
+        int64_t memo_id[OBS_MEMO_MAX];
+        char memo_qn[OBS_MEMO_MAX][512];
+        int memo_count = 0;
+        for (size_t i = is_trace ? 1 : 0; i < count; i++) {
+            yyjson_mut_val *step = yyjson_mut_arr_get(arr, i);
+            yyjson_mut_val *parent = NULL;
+            if (is_trace) {
+                parent = yyjson_mut_arr_get(arr, i - 1);
+            } else {
+                int64_t pidx = yyjson_mut_get_int(yyjson_mut_obj_get(step, "parent"));
+                if (pidx < 0 || (size_t)pidx >= count)
+                    continue;
+                parent = yyjson_mut_arr_get(arr, (size_t)pidx);
+            }
+            const int64_t ids[2] = {yyjson_mut_get_int(yyjson_mut_obj_get(parent, "id")),
+                                    yyjson_mut_get_int(yyjson_mut_obj_get(step, "id"))};
+            const char *qns[2] = {NULL, NULL};
+            for (int side = 0; side < 2; side++) {
+                for (int m = 0; m < memo_count; m++)
+                    if (memo_id[m] == ids[side]) {
+                        qns[side] = memo_qn[m];
+                        break;
+                    }
+                if (qns[side])
+                    continue;
+                sqlite3_reset(qn_stmt);
+                sqlite3_bind_int64(qn_stmt, 1, ids[side]);
+                if (sqlite3_step(qn_stmt) == SQLITE_ROW && memo_count < OBS_MEMO_MAX) {
+                    const char *qn = (const char *)sqlite3_column_text(qn_stmt, 0);
+                    if (qn) {
+                        memo_id[memo_count] = ids[side];
+                        snprintf(memo_qn[memo_count], sizeof(memo_qn[0]), "%s", qn);
+                        qns[side] = memo_qn[memo_count];
+                        memo_count++;
+                    }
+                }
+            }
+            if (!qns[0] || !qns[1])
+                continue;
+            long long observed_count = 0;
+            char label[256], last_seen[64];
+            if (cbm_store_observed_lookup(store, project, qns[0], qns[1], &observed_count, label,
+                                          sizeof(label), last_seen,
+                                          sizeof(last_seen)) != CBM_STORE_OK ||
+                observed_count <= 0)
+                continue;
+            yyjson_mut_val *obs = yyjson_mut_obj(mut);
+            yyjson_mut_obj_add_int(mut, obs, "count", observed_count);
+            yyjson_mut_obj_add_strcpy(mut, obs, "label", label);
+            yyjson_mut_obj_add_strcpy(mut, obs, "last_seen", last_seen);
+            yyjson_mut_obj_add_val(mut, step, "observed", obs);
+        }
+        sqlite3_finalize(qn_stmt);
+    }
+    char *out = yyjson_mut_write(mut, 0, NULL);
+    yyjson_mut_doc_free(mut);
+    if (!out)
+        return json;
+    free(json);
+    return out;
+}
+
+/* GET /api/who?project=X&file=PATH — who can help with this file:
+ * authorship as evidence from the cached churn scan. */
+static void handle_atlas_who(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char file[1024] = {0};
+    cbm_http_query_param(req->query, "file", file, (int)sizeof(file));
+    if (!file[0]) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing file parameter\"}");
+        return;
+    }
+    char *json = cbm_atlas_who_json(store, project, file);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"who failed\"}");
+}
+
+/* GET /api/symbol-history?project=X&file=PATH&start=N&end=N — per-symbol
+ * git history (log -L over the symbol's line range), on demand. */
+static void handle_atlas_symbol_history(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char file[1024] = {0};
+    char start_str[32] = {0};
+    char end_str[32] = {0};
+    cbm_http_query_param(req->query, "file", file, (int)sizeof(file));
+    cbm_http_query_param(req->query, "start", start_str, (int)sizeof(start_str));
+    cbm_http_query_param(req->query, "end", end_str, (int)sizeof(end_str));
+    long long start_line = strtoll(start_str, NULL, 10);
+    long long end_line = strtoll(end_str, NULL, 10);
+    if (!file[0] || start_line < 1 || end_line < start_line) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing or invalid file/start/end\"}");
+        return;
+    }
+    char *json = cbm_atlas_symbol_history_json(store, project, file, start_line, end_line);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"symbol history failed\"}");
+}
+
+/* GET /api/impact?project=X&node=QN|#id — reverse reachability: who could
+ * notice a change to this symbol, at what distance, in which regions, and
+ * which test functions reach it. */
+static void handle_atlas_impact(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char node_str[1024] = {0};
+    cbm_http_query_param(req->query, "node", node_str, (int)sizeof(node_str));
+    if (!node_str[0]) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing node parameter\"}");
+        return;
+    }
+    int64_t node_id = node_str[0] == '#' ? strtoll(node_str + 1, NULL, 10) : -1;
+    char *json = cbm_atlas_impact_json(store, project, node_id, node_id < 0 ? node_str : NULL);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"impact failed\"}");
+}
+
+/* Attach guard chains to a flow-detail JSON (guards=1): each step's call
+ * site is (steps[step.parent] → step); the guard chain is extracted in the
+ * parent's file. Best-effort, same contract as the trace variant. */
+static char *atlas_flow_attach_guards(cbm_store_t *store, const char *project, char *json) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc)
+        return json;
+    yyjson_val *steps = yyjson_obj_get(yyjson_doc_get_root(doc), "steps");
+    size_t count = steps ? yyjson_arr_size(steps) : 0;
+    if (count < 2) {
+        yyjson_doc_free(doc);
+        return json;
+    }
+    yyjson_mut_doc *mut = yyjson_doc_mut_copy(doc, NULL);
+    yyjson_doc_free(doc);
+    if (!mut)
+        return json;
+    yyjson_mut_val *msteps = yyjson_mut_obj_get(yyjson_mut_doc_get_root(mut), "steps");
+    struct sqlite3 *db = cbm_store_get_db(store);
+    for (size_t i = 1; i < count && db; i++) {
+        yyjson_mut_val *step = yyjson_mut_arr_get(msteps, i);
+        int64_t parent_index = yyjson_mut_get_int(yyjson_mut_obj_get(step, "parent"));
+        if (parent_index < 0 || (size_t)parent_index >= count)
+            continue;
+        yyjson_mut_val *parent = yyjson_mut_arr_get(msteps, (size_t)parent_index);
+        int64_t from_id = yyjson_mut_get_int(yyjson_mut_obj_get(parent, "id"));
+        int64_t to_id = yyjson_mut_get_int(yyjson_mut_obj_get(step, "id"));
+        const char *from_file = yyjson_mut_get_str(yyjson_mut_obj_get(parent, "file_path"));
+        if (!from_file)
+            continue;
+        sqlite3_stmt *st = NULL;
+        int line = -1;
+        if (sqlite3_prepare_v2(db,
+                               "SELECT properties FROM edges WHERE project=?1 AND "
+                               "source_id=?2 AND target_id=?3 AND type='CALLS' LIMIT 1",
+                               -1, &st, NULL) == SQLITE_OK) {
+            sqlite3_bind_text(st, 1, project, -1, SQLITE_STATIC);
+            sqlite3_bind_int64(st, 2, from_id);
+            sqlite3_bind_int64(st, 3, to_id);
+            if (sqlite3_step(st) == SQLITE_ROW) {
+                const char *props = (const char *)sqlite3_column_text(st, 0);
+                if (props) {
+                    yyjson_doc *pd = yyjson_read(props, strlen(props), 0);
+                    if (pd) {
+                        line = (int)yyjson_get_int(yyjson_obj_get(yyjson_doc_get_root(pd), "line"));
+                        yyjson_doc_free(pd);
+                    }
+                }
+            }
+            sqlite3_finalize(st);
+        }
+        if (line <= 0)
+            continue;
+        char *gj = cbm_atlas_callsite_guards_json(store, project, from_file, line);
+        if (!gj)
+            continue;
+        yyjson_doc *gd = yyjson_read(gj, strlen(gj), 0);
+        free(gj);
+        if (!gd)
+            continue;
+        yyjson_val *garr = yyjson_obj_get(yyjson_doc_get_root(gd), "guards");
+        if (garr && yyjson_arr_size(garr) > 0) {
+            yyjson_mut_val *copy = yyjson_val_mut_copy(mut, garr);
+            if (copy)
+                yyjson_mut_obj_add_val(mut, step, "guards", copy);
+        }
+        yyjson_doc_free(gd);
+    }
+    char *out = yyjson_mut_write(mut, 0, NULL);
+    yyjson_mut_doc_free(mut);
+    if (!out)
+        return json;
+    free(json);
+    return out;
+}
+
+/* GET /api/why?project=X&id=N|qn=Q&dir=up|down — the trigger tree. */
+static void handle_atlas_why(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char idbuf[32] = {0};
+    char qn[1024] = {0};
+    char dir[8] = {0};
+    cbm_http_query_param(req->query, "id", idbuf, (int)sizeof(idbuf));
+    cbm_http_query_param(req->query, "qn", qn, (int)sizeof(qn));
+    cbm_http_query_param(req->query, "dir", dir, (int)sizeof(dir));
+    if (!idbuf[0] && !qn[0]) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing id or qn parameter\"}");
+        return;
+    }
+    int64_t id = idbuf[0] ? strtoll(idbuf, NULL, 10) : -1;
+    bool upward = strcmp(dir, "down") != 0;
+    char *json = cbm_atlas_why_json(store, project, id, qn[0] ? qn : NULL, upward);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 404, "{\"error\":\"symbol not found\"}");
+}
+
+/* GET /api/handout?project=X — the self-contained newcomer document. */
+static void handle_atlas_handout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char *html = cbm_atlas_handout_html(store, project);
+    cbm_store_close(store);
+    if (!html) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"handout generation failed\"}");
+        return;
+    }
+    cbm_http_replyf(c, 200, g_cors_html, "%s", html);
+    free(html);
+}
+
+/* GET /api/blast?project=X&files=a,b,c — bucket a file list by region. */
+static void handle_atlas_blast(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char files[8192] = {0};
+    cbm_http_query_param(req->query, "files", files, (int)sizeof(files));
+    if (!files[0]) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"missing files parameter\"}");
+        return;
+    }
+    char *json = cbm_atlas_blast_json(store, project, files);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"blast failed\"}");
+}
+
+/* GET /api/bridges?project=X — boundary spanners by distinct-region reach. */
+static void handle_atlas_bridges(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char *json = cbm_atlas_bridges_json(store, project);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"bridges failed\"}");
+}
+
+/* GET /api/scent?project=X&q=pattern — per-region search hit counts. */
+static void handle_atlas_scent(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char q[256] = {0};
+    cbm_http_query_param(req->query, "q", q, (int)sizeof(q));
+    if (strlen(q) < 2) {
+        cbm_store_close(store);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"q must be at least 2 characters\"}");
+        return;
+    }
+    char *json = cbm_atlas_scent_json(store, project, q);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"scent failed\"}");
+}
+
+/* GET /api/flows?project=X — ranked entry→terminal flows. */
+static void handle_atlas_flows(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char *json = cbm_atlas_flows_json(store, project);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"flow computation failed\"}");
+}
+
+/* GET /api/flow?project=X&id=N — one flow's steps. */
+static void handle_atlas_flow(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char id_str[16] = {0};
+    int id = -1;
+    if (cbm_http_query_param(req->query, "id", id_str, (int)sizeof(id_str)))
+        id = atoi(id_str);
+    char *json = cbm_atlas_flow_json(store, project, id);
+    char wantg[8] = {0};
+    cbm_http_query_param(req->query, "guards", wantg, (int)sizeof(wantg));
+    if (json && wantg[0] == '1')
+        json = atlas_flow_attach_guards(store, project, json);
+    json = cbm_atlas_attach_observed(store, project, json);
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 404, "{\"error\":\"unknown flow\"}");
+}
+
 /* ── Handle JSON-RPC request ──────────────────────────────────── */
 
 static yyjson_val *json_unique_member(yyjson_val *object, const char *name) {
@@ -1763,6 +2355,50 @@ static yyjson_val *json_unique_member(yyjson_val *object, const char *name) {
     return found;
 }
 
+/* Tools the browser may call through /rpc: the read-only query surface and
+ * nothing that mutates the index. Writes (index_repository, delete_project,
+ * ingest_traces, manage_adr updates) stay on the dedicated /api routes or the
+ * MCP transport, where the daemon's mutation guard applies. CBM Atlas is the
+ * human's window on the graph; this list is what that window may see. */
+static const char *const UI_RPC_READ_TOOLS[] = {
+    "list_projects", "get_code_snippet", "get_graph_schema",     "search_graph",
+    "search_code",   "trace_path",       "trace_call_path",      "get_architecture",
+    "query_graph",   "detect_changes",   "check_index_coverage", "index_status",
+};
+
+static bool rpc_tool_is_read_only(const char *name) {
+    for (size_t i = 0; i < sizeof(UI_RPC_READ_TOOLS) / sizeof(UI_RPC_READ_TOOLS[0]); i++) {
+        if (strcmp(name, UI_RPC_READ_TOOLS[i]) == 0)
+            return true;
+    }
+    return false;
+}
+
+/* manage_adr is read-only only in its "get" (the default) and "sections"
+ * modes; anything else writes the document and is refused here. A duplicated
+ * or non-string "mode" is ambiguous and refused the same way. */
+static bool rpc_manage_adr_is_read(yyjson_val *params) {
+    yyjson_val *arguments = json_unique_member(params, "arguments");
+    if (!arguments)
+        return true; /* no arguments → default mode "get" */
+    if (!yyjson_is_obj(arguments))
+        return false;
+    bool mode_seen = false;
+    size_t index, maximum;
+    yyjson_val *key, *value;
+    yyjson_obj_foreach(arguments, index, maximum, key, value) {
+        if (strcmp(yyjson_get_str(key), "mode") != 0)
+            continue;
+        if (mode_seen || !yyjson_is_str(value))
+            return false;
+        mode_seen = true;
+        const char *mode_text = yyjson_get_str(value);
+        if (strcmp(mode_text, "get") != 0 && strcmp(mode_text, "sections") != 0)
+            return false;
+    }
+    return true;
+}
+
 static bool rpc_is_allowed_for_ui(const char *body, size_t body_len) {
     yyjson_doc *document = yyjson_read(body, body_len, 0);
     if (!document)
@@ -1773,10 +2409,13 @@ static bool rpc_is_allowed_for_ui(const char *body, size_t body_len) {
     yyjson_val *name = json_unique_member(params, "name");
     const char *method_text = yyjson_is_str(method) ? yyjson_get_str(method) : NULL;
     const char *name_text = yyjson_is_str(name) ? yyjson_get_str(name) : NULL;
-    bool allowed =
-        method_text && strcmp(method_text, "tools/call") == 0 && name_text &&
-        (strcmp(name_text, "list_projects") == 0 || strcmp(name_text, "get_graph_schema") == 0 ||
-         strcmp(name_text, "get_code_snippet") == 0);
+    bool allowed = false;
+    if (method_text && strcmp(method_text, "tools/call") == 0 && name_text) {
+        if (rpc_tool_is_read_only(name_text))
+            allowed = true;
+        else if (strcmp(name_text, "manage_adr") == 0)
+            allowed = rpc_manage_adr_is_read(params);
+    }
     yyjson_doc_free(document);
     return allowed;
 }
@@ -1970,6 +2609,91 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* GET /api/layout → 3D graph layout */
     if (is_get && cbm_http_path_match(req->path, "/api/layout*")) {
         handle_layout(c, req);
+        return;
+    }
+
+    /* GET /api/tree → CBM Atlas folder aggregates */
+    if (is_get && cbm_http_path_match(req->path, "/api/tree*")) {
+        handle_atlas_tree(c, req);
+        return;
+    }
+
+    /* GET /api/symbol-history → per-symbol git log -L evidence.
+     * MUST precede /api/symbol*, whose wildcard would swallow it. */
+    if (is_get && cbm_http_path_match(req->path, "/api/symbol-history*")) {
+        handle_atlas_symbol_history(c, req);
+        return;
+    }
+
+    /* GET /api/who → who can help with one file (authorship evidence) */
+    if (is_get && cbm_http_path_match(req->path, "/api/who*")) {
+        handle_atlas_who(c, req);
+        return;
+    }
+
+    /* GET /api/symbol → CBM Atlas symbol bundle */
+    if (is_get && cbm_http_path_match(req->path, "/api/symbol*")) {
+        handle_atlas_symbol(c, req);
+        return;
+    }
+
+    /* GET /api/metrics → CBM Atlas dashboard payload */
+    if (is_get && cbm_http_path_match(req->path, "/api/metrics*")) {
+        handle_atlas_metrics(c, req);
+        return;
+    }
+
+    /* GET /api/why → CBM Atlas trigger tree */
+    if (is_get && cbm_http_path_match(req->path, "/api/why*")) {
+        handle_atlas_why(c, req);
+        return;
+    }
+
+    /* GET /api/handout → CBM Atlas newcomer document */
+    if (is_get && cbm_http_path_match(req->path, "/api/handout*")) {
+        handle_atlas_handout(c, req);
+        return;
+    }
+
+    /* GET /api/blast → CBM Atlas region bucket for a file list */
+    if (is_get && cbm_http_path_match(req->path, "/api/blast*")) {
+        handle_atlas_blast(c, req);
+        return;
+    }
+
+    /* GET /api/bridges → CBM Atlas boundary spanners */
+    if (is_get && cbm_http_path_match(req->path, "/api/bridges*")) {
+        handle_atlas_bridges(c, req);
+        return;
+    }
+
+    /* GET /api/scent → CBM Atlas per-region search counts */
+    if (is_get && cbm_http_path_match(req->path, "/api/scent*")) {
+        handle_atlas_scent(c, req);
+        return;
+    }
+
+    /* GET /api/trace → CBM Atlas A→B reachability */
+    if (is_get && cbm_http_path_match(req->path, "/api/trace*")) {
+        handle_atlas_trace(c, req);
+        return;
+    }
+
+    /* GET /api/impact → CBM Atlas reverse reachability from one symbol */
+    if (is_get && cbm_http_path_match(req->path, "/api/impact*")) {
+        handle_atlas_impact(c, req);
+        return;
+    }
+
+    /* GET /api/flows → CBM Atlas flow list */
+    if (is_get && cbm_http_path_match(req->path, "/api/flows*")) {
+        handle_atlas_flows(c, req);
+        return;
+    }
+
+    /* GET /api/flow → one CBM Atlas flow */
+    if (is_get && cbm_http_path_match(req->path, "/api/flow")) {
+        handle_atlas_flow(c, req);
         return;
     }
 

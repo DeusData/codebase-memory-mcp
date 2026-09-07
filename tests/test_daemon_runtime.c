@@ -930,14 +930,23 @@ static void *runtime_real_application_detect_changes_thread(void *opaque) {
     return NULL;
 }
 
-static bool runtime_real_application_ingest_probe(cbm_daemon_runtime_client_t *client) {
+static bool runtime_real_application_ingest_probe(cbm_daemon_runtime_client_t *client,
+                                                  const char *project) {
+    /* A valid minimal ingest against the seeded project: unresolved names
+     * store nothing, and the response reports them — proof the client's
+     * request path works. (traces:[] was the old stub's probe; it is a
+     * tool error now, and the daemon requires the project explicitly.) */
+    char args[512];
+    (void)snprintf(args, sizeof(args),
+                   "{\"project\":\"%s\",\"traces\":[{\"caller\":\"runtime-probe-a\","
+                   "\"callee\":\"runtime-probe-b\"}]}",
+                   project ? project : "");
     uint8_t *response = NULL;
     uint32_t response_length = 0;
-    cbm_daemon_runtime_application_status_t status =
-        cbm_daemon_application_client_tool(client, "ingest_traces", "{\"traces\":[]}", &response,
-                                           &response_length, RUNTIME_TEST_TIMEOUT_MS);
+    cbm_daemon_runtime_application_status_t status = cbm_daemon_application_client_tool(
+        client, "ingest_traces", args, &response, &response_length, RUNTIME_TEST_TIMEOUT_MS);
     bool usable = status == CBM_DAEMON_RUNTIME_APPLICATION_OK && response && response_length > 0 &&
-                  strstr((const char *)response, "traces_received");
+                  strstr((const char *)response, "pairs_unmatched");
     free(response);
     return usable;
 }
@@ -3671,7 +3680,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
                                                   NULL, NULL, RUNTIME_TEST_TIMEOUT_MS) ==
             CBM_DAEMON_RUNTIME_APPLICATION_OK;
     bool second_usable_before =
-        contexts_set && runtime_real_application_ingest_probe(second) &&
+        contexts_set && runtime_real_application_ingest_probe(second, project) &&
         cbm_daemon_runtime_client_heartbeat(second, RUNTIME_TEST_TIMEOUT_MS);
 
     runtime_real_application_call_t call = {
@@ -3746,7 +3755,7 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     }
 
     bool second_usable_after = second && child_cleanup_complete &&
-                               runtime_real_application_ingest_probe(second) &&
+                               runtime_real_application_ingest_probe(second, project) &&
                                cbm_daemon_runtime_client_heartbeat(second, RUNTIME_TEST_TIMEOUT_MS);
     bool second_closed = false;
     if (second) {

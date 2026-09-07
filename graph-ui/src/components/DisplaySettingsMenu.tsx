@@ -17,29 +17,41 @@ interface SliderRowProps {
   value: number;
   min: number;
   max: number;
+  /* Multiplier rows use the defaults; the ms row overrides both. */
+  step?: number;
+  format?: (value: number) => string;
   onChange: (value: number) => void;
 }
 
-function SliderRow({ label, hint, value, min, max, onChange }: SliderRowProps) {
+function SliderRow({
+  label,
+  hint,
+  value,
+  min,
+  max,
+  step = 0.05,
+  format = (v) => `${v.toFixed(2)}×`,
+  onChange,
+}: SliderRowProps) {
   return (
     <label className="block">
       <div className="flex items-center justify-between mb-1">
-        <span className="text-[11px] text-foreground/70">{label}</span>
-        <span className="text-[10px] font-mono text-cyan-300/70 tabular-nums">
-          {value.toFixed(2)}×
+        <span className="text-[13px] text-foreground/70">{label}</span>
+        <span className="text-[12px] font-mono text-cyan-300/70 tabular-nums">
+          {format(value)}
         </span>
       </div>
       <input
         type="range"
         min={min}
         max={max}
-        step={0.05}
+        step={step}
         value={value}
         onChange={(e) => onChange(parseFloat(e.target.value))}
         className="w-full accent-cyan-400 cursor-pointer"
         aria-label={`${label} (${hint})`}
       />
-      <p className="text-[9px] text-foreground/30 mt-0.5">{hint}</p>
+      <p className="text-[12px] text-foreground/45 mt-0.5">{hint}</p>
     </label>
   );
 }
@@ -79,7 +91,8 @@ export function DisplaySettingsMenu({
   const isDefault =
     settings.edgeBrightness === DEFAULT_DISPLAY_SETTINGS.edgeBrightness &&
     settings.nodeGlow === DEFAULT_DISPLAY_SETTINGS.nodeGlow &&
-    settings.bloom === DEFAULT_DISPLAY_SETTINGS.bloom;
+    settings.bloom === DEFAULT_DISPLAY_SETTINGS.bloom &&
+    settings.tooltipDelayMs === DEFAULT_DISPLAY_SETTINGS.tooltipDelayMs;
 
   return (
     <div ref={rootRef} className="relative">
@@ -98,15 +111,15 @@ export function DisplaySettingsMenu({
         <div
           role="dialog"
           aria-label="Display settings"
-          className="absolute top-10 right-0 w-64 p-4 rounded-lg border border-border/60 bg-[#0b1920]/95 backdrop-blur-md shadow-xl z-20 space-y-3.5"
+          className="absolute top-10 right-0 w-64 p-4 rounded-md border border-border/60 bg-card/95 backdrop-blur-md shadow-xl z-20 space-y-3.5"
         >
           <div className="flex items-center justify-between">
-            <span className="text-[11px] font-medium text-foreground/50 uppercase tracking-widest">
+            <span className="text-[13px] font-medium text-foreground/50 uppercase tracking-widest">
               Contrast
             </span>
             <button
               onClick={() => onChange(DEFAULT_DISPLAY_SETTINGS)}
-              className="text-[10px] text-primary/70 hover:text-primary transition-colors disabled:opacity-30"
+              className="text-[12px] text-primary/70 hover:text-primary transition-colors disabled:opacity-30"
               disabled={isDefault}
             >
               Reset
@@ -137,8 +150,18 @@ export function DisplaySettingsMenu({
             max={DISPLAY_LIMITS.bloom.max}
             onChange={(bloom) => set({ bloom })}
           />
+          <SliderRow
+            label="Tooltip delay"
+            hint="Hover dwell before help cards appear"
+            value={settings.tooltipDelayMs}
+            min={DISPLAY_LIMITS.tooltipDelayMs.min}
+            max={DISPLAY_LIMITS.tooltipDelayMs.max}
+            step={50}
+            format={(v) => `${Math.round(v)} ms`}
+            onChange={(tooltipDelayMs) => set({ tooltipDelayMs })}
+          />
 
-          <p className="text-[9px] text-foreground/30 pt-1 border-t border-border/30">
+          <p className="text-[12px] text-foreground/45 pt-1 border-t border-border/30">
             1.00× follows the automatic density compensation. Lower the
             edge/glow/bloom values when a large graph washes out to white.
           </p>

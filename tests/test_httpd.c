@@ -1172,10 +1172,18 @@ TEST(ui_server_mutations_require_json_content_type) {
 TEST(ui_server_rpc_allows_only_ui_read_tools) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
+    /* CBM Atlas reads the graph through /rpc: every read-only query tool must
+     * pass the allowlist (a 403 on get_graph_schema is #1663). HTTP 200 means
+     * "allowed and dispatched" — tool-level argument errors still ride inside
+     * a 200 JSON-RPC envelope. */
+    static const char *allowed_tools[] = {
+        "list_projects", "get_code_snippet", "get_graph_schema",     "search_graph",
+        "search_code",   "trace_path",       "trace_call_path",      "get_architecture",
+        "query_graph",   "detect_changes",   "check_index_coverage", "index_status",
+    };
     char req[1024];
     char resp[8192];
     int n = 0;
-    static const char *allowed_tools[] = {"list_projects", "get_graph_schema", "get_code_snippet"};
     for (size_t i = 0; i < sizeof(allowed_tools) / sizeof(allowed_tools[0]); i++) {
         char body[512];
         snprintf(body, sizeof(body),
@@ -1193,8 +1201,7 @@ TEST(ui_server_rpc_allows_only_ui_read_tools) {
         ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
     }
 
-    static const char *blocked_tools[] = {"delete_project", "manage_adr", "ingest_traces",
-                                          "index_repository"};
+    static const char *blocked_tools[] = {"delete_project", "ingest_traces", "index_repository"};
     for (size_t i = 0; i < sizeof(blocked_tools) / sizeof(blocked_tools[0]); i++) {
         char blocked_body[512];
         snprintf(blocked_body, sizeof(blocked_body),
@@ -1208,6 +1215,34 @@ TEST(ui_server_rpc_allows_only_ui_read_tools) {
         n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
         ASSERT_GT(n, 0);
         ASSERT_EQ(th_status(resp), 403);
+    }
+
+    /* manage_adr: the read modes pass, everything that writes is refused. */
+    static const struct {
+        const char *arguments;
+        int expected_status;
+    } adr_cases[] = {
+        {"{}", 200},                                     /* no mode → default "get" */
+        {"{\"mode\":\"get\"}", 200},                     /* explicit read */
+        {"{\"mode\":\"sections\"}", 200},                /* header listing */
+        {"{\"mode\":\"update\"}", 403},                  /* write */
+        {"{\"mode\":\"store\"}", 403},                   /* legacy write alias */
+        {"{\"mode\":1}", 403},                           /* non-string mode */
+        {"{\"mode\":\"get\",\"mode\":\"update\"}", 403}, /* smuggled duplicate */
+    };
+    for (size_t i = 0; i < sizeof(adr_cases) / sizeof(adr_cases[0]); i++) {
+        char adr_body[512];
+        snprintf(adr_body, sizeof(adr_body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"manage_adr\",\"arguments\":%s}}",
+                 adr_cases[i].arguments);
+        snprintf(req, sizeof(req),
+                 "POST /rpc HTTP/1.1\r\nContent-Type: application/json\r\n"
+                 "Content-Length: %zu\r\n\r\n%s",
+                 strlen(adr_body), adr_body);
+        n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), adr_cases[i].expected_status);
     }
 
     const char *initialize = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"initialize\","
@@ -1231,6 +1266,28 @@ TEST(ui_server_rpc_allows_only_ui_read_tools) {
     ASSERT_GT(n, 0);
     ASSERT_EQ(th_status(resp), 403);
 
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_atlas_routes_are_wired) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    /* A wired route with a missing ?project answers 400; an unwired path
+     * falls through to the static handler's 404. This pins the /api/flow
+     * (singular) route, which once used a "?*" pattern that never matched
+     * because req->path carries no query string. */
+    static const char *const routes[] = {
+        "/api/tree",  "/api/symbol",  "/api/flows", "/api/flow",    "/api/metrics", "/api/trace",
+        "/api/scent", "/api/bridges", "/api/blast", "/api/handout", "/api/why"};
+    char req[256];
+    char resp[4096];
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        snprintf(req, sizeof(req), "GET %s HTTP/1.1\r\n\r\n", routes[i]);
+        int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
+        ASSERT_GT(n, 0);
+        ASSERT_EQ(th_status(resp), 400);
+    }
     th_server_stop(&ts);
     PASS();
 }
@@ -2409,6 +2466,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);
     RUN_TEST(ui_server_mutations_require_json_content_type);
     RUN_TEST(ui_server_rpc_allows_only_ui_read_tools);
+    RUN_TEST(ui_server_atlas_routes_are_wired);
     RUN_TEST(ui_server_oversized_body_rejected);
     RUN_TEST(ui_server_encoded_slash_not_routed);
     RUN_TEST(ui_server_nul_in_target_rejected);

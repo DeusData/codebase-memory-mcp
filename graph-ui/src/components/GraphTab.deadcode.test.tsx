@@ -30,6 +30,20 @@ function mockLayoutFetch(data: GraphData) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const url = String(input);
     if (url.startsWith("/api/layout")) {
+      /* The region probe answers first: a small project — no region scene. */
+      if (url.includes("level=regions")) {
+        return new Response(
+          JSON.stringify({
+            level: "regions",
+            method: "folders",
+            total_nodes: data.total_nodes,
+            unmapped_nodes: 0,
+            regions: [],
+            edges: [],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
       return new Response(JSON.stringify(data), {
         status: 200,
         headers: { "Content-Type": "application/json" },

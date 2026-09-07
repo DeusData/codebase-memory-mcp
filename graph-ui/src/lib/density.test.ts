@@ -100,9 +100,11 @@ describe("clampDisplaySettings", () => {
     expect(clampDisplaySettings({})).toEqual(DEFAULT_DISPLAY_SETTINGS);
     expect(
       clampDisplaySettings({ edgeBrightness: 99, nodeGlow: -5, bloom: 1.5 }),
-    ).toEqual({ edgeBrightness: 3, nodeGlow: 0, bloom: 1.5 });
+    ).toEqual({ edgeBrightness: 3, nodeGlow: 0, bloom: 1.5, tooltipDelayMs: 350 });
     expect(clampDisplaySettings({ bloom: Number.NaN }).bloom).toBe(
       DEFAULT_DISPLAY_SETTINGS.bloom,
     );
+    expect(clampDisplaySettings({ tooltipDelayMs: 50 }).tooltipDelayMs).toBe(150);
+    expect(clampDisplaySettings({ tooltipDelayMs: 5000 }).tooltipDelayMs).toBe(800);
   });
 });

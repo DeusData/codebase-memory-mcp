@@ -1,12 +1,19 @@
-import { useEffect, useState, useCallback, useMemo } from "react";
+import { useEffect, useState, useCallback, useMemo, useRef } from "react";
 import { Button } from "@/components/ui/button";
 import {
   useGraphData,
+  fetchRegions,
   clampNodeBudget,
   GRAPH_RENDER_NODE_LIMIT,
   GRAPH_NODE_BUDGET_STEP,
   GRAPH_NODE_BUDGET_MAX,
 } from "../hooks/useGraphData";
+import { regionsToGraphData, regionsViewWorthwhile, disambiguateRegionNames, isTestRegion } from "../lib/regions";
+import { fetchScent } from "../lib/atlas";
+import { RegionTooltip } from "./RegionTooltip";
+import { NodeTooltip } from "./NodeTooltip";
+import { Minimap } from "./Minimap";
+import { RegionPanel } from "./RegionPanel";
 import { GraphLoader } from "./GraphLoader";
 import { DisplaySettingsMenu } from "./DisplaySettingsMenu";
 import {
@@ -25,8 +32,42 @@ import { NodeDetailPanel } from "./NodeDetailPanel";
 import { MissedCallout } from "./MissedCallout";
 import { ResizeHandle } from "./ResizeHandle";
 import { ErrorBoundary } from "./ErrorBoundary";
-import type { GraphNode, GraphData, RepoInfo } from "../lib/types";
+import type { GraphNode, GraphData, Region, RegionsPayload, RepoInfo } from "../lib/types";
 import { colorForStatus } from "../lib/colors";
+
+/* One-time in-place orientation hint for the region scene. Dismissing
+ * persists; navigating away without dismissing does not (skip != dismiss). */
+function GalaxyHint() {
+  const [dismissed, setDismissed] = useState(() => {
+    try {
+      return localStorage.getItem("cbm-hint-galaxy") === "1";
+    } catch {
+      return true;
+    }
+  });
+  if (dismissed) return null;
+  return (
+    <div className="absolute bottom-4 left-4 bg-card/90 backdrop-blur border border-border/50 rounded-md px-3 py-2.5 max-w-[300px] shadow-lg">
+      <p className="text-[13px] text-foreground/70 leading-relaxed">
+        Each sphere is a region of related code. Double-click one to enter it,
+        type above to light up matches, and use ⌂ on the map to fit everything.
+      </p>
+      <button
+        onClick={() => {
+          try {
+            localStorage.setItem("cbm-hint-galaxy", "1");
+          } catch {
+            /* ignore */
+          }
+          setDismissed(true);
+        }}
+        className="mt-1.5 text-[12px] text-primary hover:text-primary/80 transition-colors"
+      >
+        Got it
+      </button>
+    </div>
+  );
+}
 
 /* Persist panel widths */
 function loadWidth(key: string, fallback: number): number {
@@ -56,20 +97,47 @@ function saveNodeBudget(project: string, value: number) {
 }
 
 interface GraphTabProps {
+  /* False while the tab is hidden-but-mounted: the render loop pauses. */
+  active?: boolean;
   project: string | null;
+  /* Deep-link state from the URL (?node=&region=) and the reporter back. */
+  routeNode?: string | null;
+  routeRegion?: string | null;
+  onRouteChange?: (node: string | null, region: string | null) => void;
 }
+
+/* The galaxy's level-of-detail state: the region scene (coarsest), one
+ * opened region (full detail, scoped), or the classic full galaxy. */
+type AtlasView =
+  | { kind: "deciding" }
+  | { kind: "regions" }
+  | { kind: "region"; region: Region }
+  | { kind: "full" };
 
 export function formatGraphLimitNotice(data: GraphData | null): string | null {
   if (!data || data.total_nodes <= data.nodes.length) return null;
   return `Showing ${data.nodes.length.toLocaleString("en-US")} of ${data.total_nodes.toLocaleString("en-US")} nodes (${data.edges.length.toLocaleString("en-US")} edges). Raise the node budget or use filters.`;
 }
 
-export function GraphTab({ project }: GraphTabProps) {
+export function GraphTab({
+  active = true,
+  project,
+  routeNode = null,
+  routeRegion = null,
+  onRouteChange,
+}: GraphTabProps) {
   const { data, loading, error, progress, fetchOverview } = useGraphData();
+  const [view, setView] = useState<AtlasView>({ kind: "deciding" });
+  const viewRef = useRef<AtlasView>(view);
+  viewRef.current = view;
+  const [regionsPayload, setRegionsPayload] = useState<RegionsPayload | null>(null);
+  const [regionsError, setRegionsError] = useState<string | null>(null);
+  const [selectedRegion, setSelectedRegion] = useState<Region | null>(null);
   const [highlightedIds, setHighlightedIds] = useState<Set<number> | null>(null);
   const [selectedPath, setSelectedPath] = useState<string | null>(null);
   const [selectedNode, setSelectedNode] = useState<GraphNode | null>(null);
   const [cameraTarget, setCameraTarget] = useState<CameraTarget | null>(null);
+  const [viewTarget, setViewTarget] = useState<{ x: number; y: number } | null>(null);
   const [repoInfo, setRepoInfo] = useState<RepoInfo | null>(null);
   const [showLabels, setShowLabels] = useState(true);
   const [display, setDisplay] = useState<DisplaySettings>(() =>
@@ -188,14 +256,65 @@ export function GraphTab({ project }: GraphTabProps) {
     }
   }, [project]);
 
-  /* …and fetch only once budget and project agree (one fetch per change). */
+  /* …and decide the level of detail once budget and project agree. The
+   * region scene is the default above REGIONS_MIN_TOTAL_NODES; small
+   * projects load the full galaxy directly. An open region survives budget
+   * changes (the ref carries the current view across this effect). */
   useEffect(() => {
-    if (project && budget.project === project) {
-      fetchOverview(project, budget.value);
-      setHighlightedIds(null);
-      setSelectedPath(null);
+    if (!project || budget.project !== project) return;
+    let cancelled = false;
+    setHighlightedIds(null);
+    setSelectedPath(null);
+    const current = viewRef.current;
+    if (current.kind === "region") {
+      fetchOverview(project, budget.value, "code", `region:${current.region.id}`);
+      return;
     }
+    if (current.kind === "full") {
+      fetchOverview(project, budget.value);
+      return;
+    }
+    setView({ kind: "deciding" });
+    setRegionsError(null);
+    (async () => {
+      try {
+        const payload = await fetchRegions(project);
+        if (cancelled) return;
+        setRegionsPayload(payload);
+        const restored = routeRegion
+          ? payload.regions.find((r) => String(r.id) === routeRegion)
+          : null;
+        if (restored) {
+          setView({ kind: "region", region: restored });
+          fetchOverview(project, budget.value, "code", `region:${restored.id}`);
+        } else if (regionsViewWorthwhile(payload)) {
+          setView({ kind: "regions" });
+        } else {
+          setView({ kind: "full" });
+          fetchOverview(project, budget.value);
+        }
+      } catch (e) {
+        if (cancelled) return;
+        /* Older servers have no region level — fall back to the galaxy. */
+        setRegionsError(e instanceof Error ? e.message : "regions unavailable");
+        setView({ kind: "full" });
+        fetchOverview(project, budget.value);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    /* routeRegion is a first-load restore input, not a live dependency. */
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [project, budget, fetchOverview]);
+
+  /* Deep link: once data is loaded, restore the node the URL names. */
+  useEffect(() => {
+    if (!routeNode || !data || selectedNode) return;
+    const target = data.nodes.find((n) => String(n.id) === routeNode);
+    if (target) handleNodeClickRef.current?.(target);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeNode, data]);
 
   /* Missed skeleton: offset into place and paint white — a ghost of the
    * files the graph could not fully cover, sitting beside the galaxy. */
@@ -219,13 +338,15 @@ export function GraphTab({ project }: GraphTabProps) {
     return computeCameraTarget(all, new Set(all.map((n) => n.id)));
   }, [data, missedSkeleton]);
 
-  /* With a skeleton beside the galaxy, auto-frame BOTH clusters on load so
-   * the side-by-side composition is visible without manual zooming. */
+  /* Auto-frame the scene on load (skeleton or not): the fixed default
+   * camera lands inside larger clouds. Deep-linked nodes keep their own
+   * focus fly-to instead. */
   useEffect(() => {
-    if (missedSkeleton && overviewTarget) {
+    if (overviewTarget && !routeNode) {
       setCameraTarget(overviewTarget);
     }
-  }, [missedSkeleton, overviewTarget]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [overviewTarget]);
 
   /* Clicking empty space while the skeleton has focus flies back to the
    * overview (the galaxy may be entirely off-screen at that point, so there
@@ -257,6 +378,44 @@ export function GraphTab({ project }: GraphTabProps) {
     };
   }, [project]);
 
+  /* Search scent: a query is answerable from the coarsest view — matched
+   * regions brighten and carry hit counts before any drill. */
+  const [scentQuery, setScentQuery] = useState("");
+  const [scent, setScent] = useState<{
+    total: number;
+    unmapped: number;
+    counts: Map<number, number>;
+  } | null>(null);
+  useEffect(() => {
+    setScentQuery("");
+    setScent(null);
+  }, [project]);
+  useEffect(() => {
+    const q = scentQuery.trim();
+    if (!project || q.length < 2) {
+      setScent(null);
+      return;
+    }
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        const payload = await fetchScent(project, q);
+        if (cancelled) return;
+        setScent({
+          total: payload.total,
+          unmapped: payload.unmapped,
+          counts: new Map(payload.regions.map((row) => [row.region, row.count])),
+        });
+      } catch {
+        if (!cancelled) setScent(null);
+      }
+    }, 300);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [project, scentQuery]);
+
   const handleNodeClick = useCallback(
     (node: GraphNode) => {
       if (!filteredData) return;
@@ -284,9 +443,55 @@ export function GraphTab({ project }: GraphTabProps) {
       setHighlightedIds(connectedIds);
       setSelectedPath(node.file_path ?? null);
       setCameraTarget(computeCameraTarget(filteredData.nodes, connectedIds));
+      onRouteChange?.(
+        String(node.id),
+        viewRef.current.kind === "region" ? String(viewRef.current.region.id) : null,
+      );
     },
-    [filteredData, missedSkeleton],
+    [filteredData, missedSkeleton, onRouteChange],
   );
+  const handleNodeClickRef = useRef<typeof handleNodeClick | null>(null);
+  handleNodeClickRef.current = handleNodeClick;
+
+  /* Region scene interactions. */
+  const regionGraph = useMemo(
+    () => (regionsPayload ? regionsToGraphData(regionsPayload) : null),
+    [regionsPayload],
+  );
+  const displayRegions = useMemo(
+    () => (regionsPayload ? disambiguateRegionNames(regionsPayload.regions) : []),
+    [regionsPayload],
+  );
+  const openRegion = useCallback(
+    (region: Region) => {
+      if (!project) return;
+      setSelectedRegion(null);
+      setSelectedNode(null);
+      setHighlightedIds(null);
+      setSelectedPath(null);
+      setCameraTarget(null);
+      setView({ kind: "region", region });
+      fetchOverview(project, budget.value, "code", `region:${region.id}`);
+      onRouteChange?.(null, String(region.id));
+    },
+    [project, budget.value, fetchOverview, onRouteChange],
+  );
+  const backToRegions = useCallback(() => {
+    setSelectedRegion(null);
+    setSelectedNode(null);
+    setHighlightedIds(null);
+    setSelectedPath(null);
+    setCameraTarget(null);
+    setView({ kind: "regions" });
+    onRouteChange?.(null, null);
+  }, [onRouteChange]);
+  const loadFullGalaxy = useCallback(() => {
+    if (!project) return;
+    setSelectedRegion(null);
+    setView({ kind: "full" });
+    fetchOverview(project, budget.value);
+    onRouteChange?.(null, null);
+  }, [project, budget.value, fetchOverview, onRouteChange]);
 
   const handleNavigateToNode = useCallback(
     (node: GraphNode) => {
@@ -357,9 +562,198 @@ export function GraphTab({ project }: GraphTabProps) {
   if (!project) {
     return (
       <div className="flex items-center justify-center h-full">
-        <p className="text-white/30 text-sm">
+        <p className="text-foreground/45 text-sm">
           Select a project from the Projects tab
         </p>
+      </div>
+    );
+  }
+
+  if (view.kind === "deciding") {
+    return (
+      <div className="flex items-center justify-center h-full">
+        <p className="text-foreground/45 text-sm">Mapping regions…</p>
+      </div>
+    );
+  }
+
+  /* ── Region scene: the coarsest level of detail ──────────────── */
+  if (view.kind === "regions" && regionGraph) {
+    const selected = selectedRegion;
+    return (
+      <div className="h-full flex">
+        <div
+          className="border-r border-border/30 flex flex-col h-full bg-card/90 backdrop-blur-md shrink-0"
+          style={{ width: leftWidth }}
+        >
+          <div className="px-4 pt-3 pb-2 shrink-0">
+            <span className="text-[13px] font-medium text-foreground/50 uppercase tracking-widest">
+              Regions
+            </span>
+            <p className="text-[12px] text-foreground/40 mt-1">
+              {regionsPayload?.method === "leiden+folders"
+                ? "call communities + folder groups"
+                : "folder groups"}
+            </p>
+            <input
+              type="text"
+              value={scentQuery}
+              onChange={(e) => setScentQuery(e.target.value)}
+              placeholder="find a symbol…"
+              className="mt-2 w-full bg-popover border border-border/50 rounded-md px-2 py-1 text-[13px] text-foreground placeholder-foreground/30 outline-none focus:border-primary/50 transition-all"
+            />
+            {scent && (
+              <p className="text-[12px] text-primary/70 mt-1 tabular-nums">
+                {scent.total.toLocaleString("en-US")} match
+                {scent.total === 1 ? "" : "es"}
+                {scent.unmapped > 0 && ` · ${scent.unmapped} outside regions`}
+              </p>
+            )}
+          </div>
+          <div className="flex-1 min-h-0 overflow-y-auto py-1">
+            {[...displayRegions]
+              .sort((a, b) => Number(isTestRegion(a.name)) - Number(isTestRegion(b.name)))
+              .map((region) => (
+              <button
+                key={region.id}
+                onClick={() => setSelectedRegion(region)}
+                onDoubleClick={() => openRegion(region)}
+                className={`flex items-center gap-2 w-full text-left px-4 py-[5px] text-[12px] transition-colors ${
+                  selected?.id === region.id
+                    ? "bg-primary/10 text-primary"
+                    : "text-foreground/60 hover:text-foreground/80 hover:bg-surface-3"
+                }`}
+              >
+                <span
+                  className="w-[7px] h-[7px] rounded-full shrink-0"
+                  style={{ backgroundColor: region.color }}
+                />
+                <span className="truncate">{region.name}</span>
+                {(scent?.counts.get(region.id) ?? 0) > 0 && (
+                  <span className="text-primary text-[11px] tabular-nums shrink-0 bg-primary/15 rounded-full px-1.5">
+                    {scent?.counts.get(region.id)}
+                  </span>
+                )}
+                <span className="text-foreground/30 ml-auto text-[12px] tabular-nums shrink-0">
+                  {region.members.toLocaleString("en-US")}
+                </span>
+              </button>
+            ))}
+          </div>
+        </div>
+        <ResizeHandle
+          side="left"
+          onResize={(d) => {
+            setLeftWidth((w) => {
+              const nw = Math.max(150, Math.min(500, w + d));
+              saveWidth("cbm-left-w", nw);
+              return nw;
+            });
+          }}
+        />
+
+        <div className="flex-1 relative overflow-hidden">
+          <ErrorBoundary>
+            <GraphScene
+              active={active}
+              data={regionGraph}
+              missed={null}
+              highlightedIds={
+                scent && scent.counts.size > 0
+                  ? new Set(scent.counts.keys())
+                  : selected
+                    ? new Set([selected.id])
+                    : null
+              }
+              cameraTarget={cameraTarget}
+              showLabels={true}
+              display={display}
+              onNodeClick={(node) => {
+                const region = displayRegions.find((r) => r.id === node.id);
+                if (region) {
+                  setSelectedRegion(region);
+                  setCameraTarget(
+                    computeCameraTarget(regionGraph.nodes, new Set([node.id])),
+                  );
+                }
+              }}
+              onBackgroundClick={() => setSelectedRegion(null)}
+              renderTooltip={(node) => {
+                const region = displayRegions.find((r) => r.id === node.id);
+                return region ? (
+                  <RegionTooltip region={region} node={node} />
+                ) : (
+                  <NodeTooltip node={node} />
+                );
+              }}
+              onViewTarget={(x, y) => setViewTarget({ x, y })}
+              onApproachNode={(node) => {
+                const region = displayRegions.find((r) => r.id === node.id);
+                if (region) openRegion(region);
+              }}
+            />
+          </ErrorBoundary>
+
+          <Minimap
+            regions={displayRegions}
+            openRegionId={null}
+            scentCounts={scent?.counts ?? null}
+            viewTarget={viewTarget}
+            onOpen={openRegion}
+            onHome={() =>
+              setCameraTarget(
+                computeCameraTarget(
+                  regionGraph.nodes,
+                  new Set(regionGraph.nodes.map((n) => n.id)),
+                ),
+              )
+            }
+          />
+
+          <div className="absolute top-4 left-4 text-[13px] text-foreground/55 pointer-events-none tabular-nums">
+            <p>
+              {displayRegions.length} regions /{" "}
+              {regionsPayload?.total_nodes.toLocaleString("en-US")} nodes
+            </p>
+            <p className="text-foreground/35 mt-0.5">
+              double-click a region — or just zoom into it — to open it
+            </p>
+          </div>
+
+          <GalaxyHint />
+
+          <div className="absolute top-4 right-4 flex gap-2 items-center">
+            <Button variant="outline" size="sm" onClick={loadFullGalaxy}>
+              Load full galaxy
+            </Button>
+            <DisplaySettingsMenu settings={display} onChange={updateDisplay} />
+          </div>
+        </div>
+
+        {selected && (
+          <>
+            <ResizeHandle
+              side="right"
+              onResize={(d) => {
+                setRightWidth((w) => {
+                  const nw = Math.max(200, Math.min(500, w + d));
+                  saveWidth("cbm-right-w", nw);
+                  return nw;
+                });
+              }}
+            />
+            <div
+              className="border-l border-border shrink-0 h-full overflow-hidden"
+              style={{ width: rightWidth, maxHeight: "100%" }}
+            >
+              <RegionPanel
+                region={selected}
+                onOpen={openRegion}
+                onClose={() => setSelectedRegion(null)}
+              />
+            </div>
+          </>
+        )}
       </div>
     );
   }
@@ -391,7 +785,7 @@ export function GraphTab({ project }: GraphTabProps) {
   if (!data || !filteredData || data.nodes.length === 0) {
     return (
       <div className="flex items-center justify-center h-full">
-        <p className="text-white/30 text-sm">No nodes in this project</p>
+        <p className="text-foreground/45 text-sm">No nodes in this project</p>
       </div>
     );
   }
@@ -400,7 +794,7 @@ export function GraphTab({ project }: GraphTabProps) {
     <div className="h-full flex">
       {/* Left sidebar — resizable */}
       <div
-        className="border-r border-border/30 flex flex-col h-full bg-[#0b1920]/90 backdrop-blur-md shrink-0"
+        className="border-r border-border/30 flex flex-col h-full bg-card/90 backdrop-blur-md shrink-0"
         style={{ width: leftWidth }}
       >
         <FilterPanel
@@ -428,6 +822,7 @@ export function GraphTab({ project }: GraphTabProps) {
         <Sidebar
           nodes={filteredData.nodes}
           onSelectPath={handleSelectPath}
+          onSelectNode={handleNodeClick}
           selectedPath={selectedPath}
         />
       </div>
@@ -447,7 +842,7 @@ export function GraphTab({ project }: GraphTabProps) {
         {filteredData.nodes.length === 0 ? (
           <div className="flex items-center justify-center h-full">
             <div className="text-center">
-              <p className="text-white/30 text-sm mb-3">All nodes filtered out</p>
+              <p className="text-foreground/45 text-sm mb-3">All nodes filtered out</p>
               <Button size="sm" onClick={enableAll}>
                 Reset Filters
               </Button>
@@ -457,6 +852,7 @@ export function GraphTab({ project }: GraphTabProps) {
           <>
             <ErrorBoundary>
               <GraphScene
+                active={active}
                 data={filteredData}
                 missed={showMissedSkeleton ? missedSkeleton : null}
                 highlightedIds={highlightedIds}
@@ -465,18 +861,42 @@ export function GraphTab({ project }: GraphTabProps) {
                 display={display}
                 onNodeClick={handleNodeClick}
                 onBackgroundClick={handleBackgroundClick}
+                landmarks
+                onViewTarget={(x, y) => setViewTarget({ x, y })}
               />
             </ErrorBoundary>
 
+            <Minimap
+              regions={displayRegions}
+              openRegionId={view.kind === "region" ? view.region.id : null}
+              scentCounts={null}
+              viewTarget={viewTarget}
+              onOpen={openRegion}
+              onHome={() =>
+                setCameraTarget(
+                  computeCameraTarget(
+                    filteredData.nodes,
+                    new Set(filteredData.nodes.map((n) => n.id)),
+                  ),
+                )
+              }
+            />
+
             {/* HUD */}
-            <div className="absolute top-4 left-4 text-[11px] text-white/30 pointer-events-none font-mono">
+            <div className="absolute top-4 left-4 text-[13px] text-foreground/55 pointer-events-none tabular-nums">
+              {regionsError && (
+                <p className="text-amber-300/60">regions unavailable: {regionsError}</p>
+              )}
+              {view.kind === "region" && (
+                <p className="text-primary/60">region: {view.region.name}</p>
+              )}
               <p>
-                {filteredData.nodes.length.toLocaleString()} nodes /{" "}
-                {filteredData.edges.length.toLocaleString()} edges
+                {filteredData.nodes.length.toLocaleString("en-US")} nodes /{" "}
+                {filteredData.edges.length.toLocaleString("en-US")} edges
               </p>
               {data.nodes.length > filteredData.nodes.length && (
-                <p className="text-white/25 mt-0.5">
-                  filtered from {data.nodes.length.toLocaleString()}
+                <p className="text-foreground/40 mt-0.5">
+                  filtered from {data.nodes.length.toLocaleString("en-US")}
                 </p>
               )}
               {limitNotice && (
@@ -490,6 +910,11 @@ export function GraphTab({ project }: GraphTabProps) {
             </div>
 
             <div className="absolute top-4 right-4 flex gap-2 items-center">
+              {view.kind === "region" && (
+                <Button variant="outline" size="sm" onClick={backToRegions}>
+                  ‹ Regions
+                </Button>
+              )}
               {highlightedIds && (
                 <Button
                   size="sm"
@@ -503,10 +928,10 @@ export function GraphTab({ project }: GraphTabProps) {
                   Clear selection
                 </Button>
               )}
-              <div className="flex items-center gap-1.5 h-8 px-2 rounded-md border border-border/50 bg-[#0b1920]/80 backdrop-blur-sm">
+              <div className="flex items-center gap-1.5 h-8 px-2 rounded-md border border-border/50 bg-card/80 backdrop-blur-sm">
                 <label
                   htmlFor="node-budget"
-                  className="text-[10px] uppercase tracking-wider text-white/40"
+                  className="text-[12px] uppercase tracking-wider text-foreground/40"
                 >
                   Nodes
                 </label>
@@ -538,7 +963,12 @@ export function GraphTab({ project }: GraphTabProps) {
                   setSelectedPath(null);
                   setSelectedNode(null);
                   setCameraTarget(null);
-                  fetchOverview(project, budget.value);
+                  fetchOverview(
+                    project,
+                    budget.value,
+                    "code",
+                    view.kind === "region" ? `region:${view.region.id}` : undefined,
+                  );
                 }}
               >
                 Refresh
@@ -585,10 +1015,25 @@ export function GraphTab({ project }: GraphTabProps) {
                 allEdges={filteredData.edges}
                 project={project}
                 repoInfo={repoInfo}
+                scopeNote={(() => {
+                  if (view.kind !== "region" || selectedNode.in_calls === undefined)
+                    return null;
+                  const visible = filteredData.edges.filter(
+                    (e) => e.target === selectedNode.id && e.type === "CALLS",
+                  ).length;
+                  const outside = selectedNode.in_calls - visible;
+                  return outside > 0
+                    ? `+${outside.toLocaleString("en-US")} caller${outside === 1 ? "" : "s"} outside this region`
+                    : null;
+                })()}
                 onClose={() => {
                   setSelectedNode(null);
                   setHighlightedIds(null);
                   setSelectedPath(null);
+                  onRouteChange?.(
+                    null,
+                    view.kind === "region" ? String(view.region.id) : null,
+                  );
                 }}
                 onNavigate={handleNavigateToNode}
               />

@@ -4296,36 +4296,29 @@ TEST(cypher_exec_prop_string_with_escaped_quote) {
 }
 
 TEST(cypher_wide_return_projection_bounded) {
-#ifdef _WIN32
-    SKIP_PLATFORM("fork crash-isolation is POSIX-only; the parse-time bound is platform-agnostic");
-#else
+    /* In-process on every platform. This test used a forked child as crash
+     * isolation, but a fork of the sanitized runner that then does real
+     * store setup is byte-fragile on macOS: any growth of the store-open
+     * path (a 1.5KB schema addition crossed it) gets the child killed
+     * before the query ever runs — the guard was failing on harness
+     * fragility, not on the bound. The parse-time bound is the contract;
+     * assert it directly. If it ever regresses, the overflow aborts the
+     * runner loudly — a less graceful report, an equally gating one. And
+     * in-process runs on Windows too, which the fork never did. */
     char query[4096];
     int off = snprintf(query, sizeof(query), "MATCH (f:Function) RETURN ");
     for (int i = 0; i < 48; i++) { /* 48 > CBM_SZ_32 (32) fixed columns */
         off += snprintf(query + off, sizeof(query) - (size_t)off, "%sf.p%d", i ? ", " : "", i);
     }
-    fflush(NULL);
-    pid_t pid = fork();
-    if (pid == 0) {
-        cbm_store_t *s = setup_cypher_store();
-        cbm_cypher_result_t r = {0};
-        (void)cbm_cypher_execute(s, query, "test", 0, &r);
-        cbm_cypher_result_free(&r);
-        cbm_store_close(s);
-        _exit(0); /* reached only when execution did NOT overflow */
-    }
-    ASSERT_TRUE(pid > 0);
-    int status = 0;
-    (void)waitpid(pid, &status, 0);
-    if (WIFSIGNALED(status)) {
-        char msg[96];
-        snprintf(msg, sizeof(msg), "wide RETURN killed by signal %d — projection stack overflow",
-                 WTERMSIG(status));
-        FAIL(msg);
-    }
-    ASSERT_TRUE(WIFEXITED(status));
+    cbm_store_t *s = setup_cypher_store();
+    ASSERT_NOT_NULL(s);
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    ASSERT_TRUE(rc != 0); /* rejected at parse time, never executed */
+    ASSERT_EQ(r.row_count, 0);
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
     PASS();
-#endif
 }
 
 /* #601: an unbounded whole-graph OPTIONAL MATCH / GROUP BY does

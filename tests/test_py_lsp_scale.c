@@ -75,9 +75,25 @@ TEST(pylsp_scale_linear_growth) {
     int c100 = 0, r100 = 0;
     int c500 = 0, r500 = 0;
     int c2000 = 0, r2000 = 0;
+    /* Min-of-N sampling: under a fully-parallel suite run, scheduler noise
+     * only ever ADDS time, and it lands hardest on the tiny denominator —
+     * one preempted slice on t100 multiplies the ratio. The minimum of a
+     * few runs approximates the uncontended cost, so the calibrated bound
+     * below keeps its meaning on a loaded host (this exact assert failed
+     * the mac 18-job leg while passing isolated on the same tree). */
     double t100 = measure(100, &c100, &r100);
+    for (int i = 0; i < 2; i++) {
+        double again = measure(100, &c100, &r100);
+        if (again < t100)
+            t100 = again;
+    }
     double t500 = measure(500, &c500, &r500);
     double t2000 = measure(2000, &c2000, &r2000);
+    {
+        double again = measure(2000, &c2000, &r2000);
+        if (again < t2000)
+            t2000 = again;
+    }
     printf("    scale: 100=%.1fms (calls=%d resolved=%d)  500=%.1fms (calls=%d resolved=%d)  "
            "2000=%.1fms (calls=%d resolved=%d)\n",
            t100, c100, r100, t500, c500, r500, t2000, c2000, r2000);

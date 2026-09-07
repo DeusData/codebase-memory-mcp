@@ -8,7 +8,7 @@ interface ProjectCardProps {
 }
 
 function formatNumber(n: number): string {
-  return n.toLocaleString();
+  return n.toLocaleString("en-US");
 }
 
 export function ProjectCard({ project, schema, onSelect }: ProjectCardProps) {
@@ -16,11 +16,11 @@ export function ProjectCard({ project, schema, onSelect }: ProjectCardProps) {
   const totalEdges = schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
 
   return (
-    <div className="border border-white/10 rounded-lg p-4 hover:border-white/20 transition-colors">
+    <div className="border border-white/10 rounded-md p-4 hover:border-white/20 transition-colors">
       <div className="flex items-start justify-between mb-3">
         <div>
           <h3 className="text-white font-medium">{project.name}</h3>
-          <p className="text-white/40 text-xs font-mono mt-0.5 truncate max-w-[300px]">
+          <p className="text-foreground/40 text-xs font-mono mt-0.5 truncate max-w-[300px]">
             {project.root_path}
           </p>
         </div>
@@ -34,7 +34,7 @@ export function ProjectCard({ project, schema, onSelect }: ProjectCardProps) {
 
       {schema && (
         <>
-          <div className="flex gap-4 text-xs text-white/60 mb-3">
+          <div className="flex gap-4 text-xs text-foreground/60 mb-3">
             <span>{formatNumber(totalNodes)} nodes</span>
             <span>{formatNumber(totalEdges)} edges</span>
           </div>
@@ -54,7 +54,7 @@ export function ProjectCard({ project, schema, onSelect }: ProjectCardProps) {
                   <span style={{ color: colorForLabel(l.label) }}>
                     {l.label}
                   </span>
-                  <span className="text-white/40">{formatNumber(l.count)}</span>
+                  <span className="text-foreground/40">{formatNumber(l.count)}</span>
                 </span>
               ))}
             </div>
@@ -63,7 +63,7 @@ export function ProjectCard({ project, schema, onSelect }: ProjectCardProps) {
       )}
 
       {!schema && (
-        <p className="text-white/30 text-xs italic">Loading schema...</p>
+        <p className="text-foreground/45 text-xs italic">Loading schema...</p>
       )}
     </div>
   );

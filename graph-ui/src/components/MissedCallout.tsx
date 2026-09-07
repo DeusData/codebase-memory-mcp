@@ -96,11 +96,11 @@ export function MissedCallout({ node, project, onClose }: MissedCalloutProps) {
     <div className="h-full flex flex-col p-4 gap-3 overflow-y-auto">
       <div className="flex items-start justify-between">
         <div>
-          <p className="text-[10px] text-foreground/30 uppercase tracking-widest">
+          <p className="text-[12px] text-foreground/45 uppercase tracking-widest">
             Not fully indexed
           </p>
           <p className="text-sm font-medium text-foreground/90 break-all mt-1">{path}</p>
-          <p className="text-[10px] text-foreground/40 mt-0.5">{node.label}</p>
+          <p className="text-[12px] text-foreground/40 mt-0.5">{node.label}</p>
         </div>
         <button
           onClick={onClose}
@@ -127,7 +127,7 @@ export function MissedCallout({ node, project, onClose }: MissedCalloutProps) {
           className={`text-[12px] font-medium rounded-md border px-3 py-1.5 transition-all text-left ${
             copied
               ? "border-primary/60 bg-primary/15 text-primary"
-              : "border-white/10 bg-white/[0.03] text-foreground/80 hover:bg-white/[0.07]"
+              : "border-white/10 bg-popover text-foreground/80 hover:bg-white/[0.07]"
           }`}
         >
           {copied ? "✓ Copied — paste it to your agent" : "Copy agent prompt"}
@@ -137,14 +137,14 @@ export function MissedCallout({ node, project, onClose }: MissedCalloutProps) {
             href={buildIssueUrl(issuesUrl, path, project)}
             target="_blank"
             rel="noreferrer"
-            className="text-[12px] font-medium rounded-md border border-white/10 bg-white/[0.03] text-foreground/80 hover:bg-white/[0.07] px-3 py-1.5 transition-all"
+            className="text-[12px] font-medium rounded-md border border-white/10 bg-popover text-foreground/80 hover:bg-white/[0.07] px-3 py-1.5 transition-all"
           >
             File a GitHub issue (prefilled) ↗
           </a>
         )}
       </div>
 
-      <p className="text-[10px] leading-snug text-foreground/35 mt-1">
+      <p className="text-[12px] leading-snug text-foreground/50 mt-1">
         The prefilled issue contains only the file path and project name — add code
         snippets only if they are shareable.
       </p>

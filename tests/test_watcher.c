@@ -188,6 +188,40 @@ static int index_callback(const char *name, const char *path, void *ud) {
     return 0;
 }
 
+/* Self-diagnosing count check: this suite's flake family blocked two
+ * releases because a bare count assert cannot say WHY — print the
+ * committed/pending dirty signatures on mismatch, so the next occurrence
+ * names its cause (sigs equal = detection miss; different = reindex path).
+ * Use at any index_call_count assertion site. */
+static void wt_diagnose_count(cbm_watcher_t *w, const char *project, int got, int expected) {
+    if (got == expected) {
+        return;
+    }
+    uint64_t last = 0, pending = 0;
+    if (cbm_watcher_test_dirty_sigs(w, project, &last, &pending) == 0) {
+        printf("  watcher diagnose: count=%d expected=%d last_sig=%016llx pending_sig=%016llx "
+               "(%s)\n",
+               got, expected, (unsigned long long)last, (unsigned long long)pending,
+               last == pending ? "sigs EQUAL — the poll saw no new dirty state"
+                               : "sigs differ — detection fired, reindex path suspect");
+    } else {
+        printf("  watcher diagnose: count=%d expected=%d (project not watched?)\n", got, expected);
+    }
+}
+
+/* Wait-for-the-asserted-state (bounded) for REACH assertions only: reaching
+ * a count is safe to wait for, because #937 guarantees an unchanged dirty
+ * tree never increments — extra polls cannot overshoot a correct
+ * implementation. NEVER use this for must-stay-quiet assertions; those are
+ * genuinely about a fixed number of polls. */
+static int wt_poll_until_count(cbm_watcher_t *w, const char *project, int expected, int max_polls) {
+    for (int i = 0; i < max_polls && index_call_count < expected; i++) {
+        cbm_watcher_touch(w, project);
+        cbm_watcher_poll_once(w);
+    }
+    return index_call_count;
+}
+
 TEST(watcher_poll_no_projects) {
     cbm_store_t *store = cbm_store_open_memory();
     cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
@@ -2024,25 +2058,32 @@ TEST(watcher_continued_dirty) {
         th_append_file(_p, "dirty\n");
     }
 
-    /* First detection */
+    /* First detection — a REACH assert: wait for the state, bounded. */
+    {
+        int got = wt_poll_until_count(w, "cont-repo", 1, 5);
+        wt_diagnose_count(w, "cont-repo", got, 1);
+        ASSERT_EQ(got, 1);
+    }
+
+    /* Still dirty but UNCHANGED — must stay quiet (#937): fixed polls. */
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty but UNCHANGED — must stay quiet (#937) */
-    cbm_watcher_touch(w, "cont-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 1);
-
-    /* A further edit is a NEW dirty state — detect again */
+    /* A further edit is a NEW dirty state — detect again. This exact site
+     * failed on the Windows leg (1 vs 2): stat()'s second-granularity
+     * st_mtime made two same-second edits hash identically. The signature
+     * now reads FILETIME precision; the reach-wait covers scheduling. */
     {
         char _p[1024];
         snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
         th_append_file(_p, "dirtier\n");
     }
-    cbm_watcher_touch(w, "cont-repo");
-    cbm_watcher_poll_once(w);
-    ASSERT_EQ(index_call_count, 2);
+    {
+        int got = wt_poll_until_count(w, "cont-repo", 2, 5);
+        wt_diagnose_count(w, "cont-repo", got, 2);
+        ASSERT_EQ(got, 2);
+    }
 
     /* Commit to clean up, then poll — should not trigger */
     wt_git(tmpdir, "add file.txt");

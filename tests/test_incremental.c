@@ -107,7 +107,20 @@ static int reformat_files(const char *subdir, int max_files) {
 static char *index_repo(void) {
     char args[512];
     snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", g_repodir);
-    return cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    char *resp = cbm_mcp_handle_tool(g_srv, "index_repository", args);
+    /* Fail-closed at the source: every caller asserts resp != NULL, but an
+     * error response (e.g. a transient pre-publication abort that preserves
+     * the previous index) used to slip through and cascade into dozens of
+     * mysterious count/query failures downstream — a 99-test pile-up on the
+     * Windows leg traced back to exactly this. Surface the real cause once,
+     * here, and let the existing non-NULL asserts fail loudly. */
+    if (resp && strstr(resp, "\"isError\":true")) {
+        fprintf(stderr, "  index_repo: index_repository returned an error response:\n  %.400s\n",
+                resp);
+        free(resp);
+        return NULL;
+    }
+    return resp;
 }
 
 /* Timed index: returns response, sets *elapsed_ms and *peak_rss_mb */

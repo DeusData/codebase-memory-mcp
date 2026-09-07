@@ -35,7 +35,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search. One graph query replaces dozens of grep/read cycles.
 - **45 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
-- **Built-in graph visualization** — 3D interactive UI at `localhost:9749`, served from the binary itself.
+- **CBM Atlas** — the built-in human interface at `localhost:9749`: overview, modules treemap, region-level 3D galaxy, call flows, change impact, symbol pages and a prompt composer, served from the binary itself.
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
 - **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
@@ -131,15 +131,27 @@ Package-manager setup (npm, PyPI, or Go) verifies and publishes a coherent priva
 
 The ordinary `cli` mode is intentionally separate: it runs one command locally and never starts or connects to the coordination daemon, registers a daemon session, or starts watchers/UI. Its only shared state is the OS admission barrier plus per-project locks for graph mutations. While the command is running, a temporary monitor lets activation cancel that operation and its supervised worker safely; the monitor exits with the command and never becomes a standing daemon. See [CLI Mode](#cli-mode) for details.
 
-### Graph Visualization UI
+### CBM Atlas — the human interface
 
-The graph UI is built into the binary — every install on every channel has it. Then run it:
+The MCP tools are the agent's interface to the code graph; **CBM Atlas** is the human's. It is built into the binary — every install on every channel has it:
 
 ```bash
 codebase-memory-mcp --ui=true --port=9749
 ```
 
 Open `http://localhost:9749` in your browser. The UI is owned by the shared coordination daemon, so concurrent agent sessions do not start duplicate HTTP servers.
+
+Atlas is a code-discovery instrument, not a chart: every insight is deterministic, carries the reason it is shown, and links onward.
+
+- **Overview** — the first read of a project: regions (Leiden call communities voted per file, named with provenance and cohesion), hubs by fan-in, entry points, surprising cross-region couplings with reasons, suggested questions, cross-package boundaries.
+- **Modules** — a treemap of any folder, sized by symbols, colored by region, hatched where indexing was incomplete; drill to files and symbols.
+- **Galaxy** — the 3D view, opening at region level of detail (one body per region, weighted arcs) so any project size renders; open a region for full detail, or load the whole galaxy explicitly.
+- **Flows** — named entry→terminal call journeys as clickable call trees, with truncation stated, exportable as mermaid.
+- **Changes** — `detect_changes` on the working tree: affected symbols grouped by risk before you ask an agent to finish the job.
+- **Symbol pages** — docstring, region, callers/callees with true totals and per-edge confidence (resolved / reference / unproven), tests, co-change partners, near-clones, editor and GitHub links.
+- **⌘K** search across symbol names and code text; a **prompt composer** turns anything you cite into a precise, identifier-exact prompt for your coding agent.
+
+Every screen deep-links (`?tab=…&project=…&sym=…&region=…&flow=…`), so a place in the codebase is a URL you can share.
 
 ### Auto-Index
 

@@ -329,6 +329,34 @@ static int init_schema(cbm_store_t *s) {
         "  detail TEXT DEFAULT '',"
         "  PRIMARY KEY (project, rel_path, kind)"
         ");"
+        /* Observed runtime calls (ingest_traces). Deliberately SEPARATE from
+         * the graph tables (like index_coverage) and keyed by QUALIFIED NAME,
+         * not node id: node ids are reassigned on every reindex, so id-keyed
+         * observation would silently rot — qualified names survive by
+         * construction and join at read time. One row per (caller, callee,
+         * run label); count accumulates across ingests of the same run. */
+        "CREATE TABLE IF NOT EXISTS observed_calls ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  caller_qn TEXT NOT NULL,"
+        "  callee_qn TEXT NOT NULL,"
+        "  label TEXT NOT NULL DEFAULT '',"
+        "  count INTEGER NOT NULL DEFAULT 1,"
+        "  first_seen TEXT NOT NULL,"
+        "  last_seen TEXT NOT NULL,"
+        "  PRIMARY KEY (project, caller_qn, callee_qn, label)"
+        ");"
+        /* Whole observed journeys, kept alongside the pair decomposition so
+         * the Flows view can show "this path actually ran", not only
+         * per-edge markers. path_json is the JSON array of qualified names. */
+        "CREATE TABLE IF NOT EXISTS observed_paths ("
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  label TEXT NOT NULL DEFAULT '',"
+        "  path_json TEXT NOT NULL,"
+        "  count INTEGER NOT NULL DEFAULT 1,"
+        "  first_seen TEXT NOT NULL,"
+        "  last_seen TEXT NOT NULL,"
+        "  PRIMARY KEY (project, label, path_json)"
+        ");"
         /* One row per completed coverage persistence attempt. Kept separate
          * from projects so existing graph/artifact schema stays compatible and
          * a missing row unambiguously means coverage metadata is unavailable. */
@@ -10273,5 +10301,180 @@ int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **ke
 
     *out = results;
     *out_count = count;
+    return CBM_STORE_OK;
+}
+
+/* ── Observed runtime calls (ingest_traces) ─────────────────────────
+ *
+ * Qualified-name keyed on purpose: ids are reassigned on reindex, names
+ * survive. Low-frequency writes (one ingest per test run), so these use
+ * one-shot statements rather than the cached slots. */
+
+static int observed_upsert(cbm_store_t *s, const char *sql, const char *project, const char *a,
+                           const char *b, const char *label, long long count) {
+    if (!s || !s->db || !project || !a)
+        return CBM_STORE_ERR;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "observed_upsert prepare");
+        return CBM_STORE_ERR;
+    }
+    char ts[CBM_SZ_64];
+    iso_now(ts, sizeof(ts));
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, a, -1, SQLITE_TRANSIENT);
+    if (b)
+        sqlite3_bind_text(stmt, 3, b, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, b ? 4 : 3, label ? label : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, b ? 5 : 4, count > 0 ? count : 1);
+    sqlite3_bind_text(stmt, b ? 6 : 5, ts, -1, SQLITE_TRANSIENT);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "observed_upsert");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_observed_upsert_pair(cbm_store_t *s, const char *project, const char *caller_qn,
+                                   const char *callee_qn, const char *label, long long count) {
+    if (!caller_qn || !callee_qn)
+        return CBM_STORE_ERR;
+    return observed_upsert(
+        s,
+        "INSERT INTO observed_calls (project, caller_qn, callee_qn, label, count, first_seen,"
+        " last_seen) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6) "
+        "ON CONFLICT(project, caller_qn, callee_qn, label) DO UPDATE SET"
+        " count = count + excluded.count, last_seen = excluded.last_seen;",
+        project, caller_qn, callee_qn, label, count);
+}
+
+int cbm_store_observed_upsert_path(cbm_store_t *s, const char *project, const char *path_json,
+                                   const char *label, long long count) {
+    if (!path_json)
+        return CBM_STORE_ERR;
+    return observed_upsert(
+        s,
+        "INSERT INTO observed_paths (project, label, path_json, count, first_seen, last_seen)"
+        " VALUES (?1, ?3, ?2, ?4, ?5, ?5) "
+        "ON CONFLICT(project, label, path_json) DO UPDATE SET"
+        " count = count + excluded.count, last_seen = excluded.last_seen;",
+        project, path_json, NULL, label, count);
+}
+
+long long cbm_store_observed_pair_total(cbm_store_t *s, const char *project) {
+    if (!s || !s->db || !project)
+        return -1;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "SELECT COUNT(*) FROM observed_calls WHERE project=?1", -1, &stmt,
+                           NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    long long total = -1;
+    if (sqlite3_step(stmt) == SQLITE_ROW)
+        total = sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return total;
+}
+
+/* Evict the run label whose newest observation is oldest — whole runs at a
+ * time, so a partially-evicted run can never masquerade as complete.
+ * evicted_label_out (optional) receives a heap copy the caller frees. */
+int cbm_store_observed_evict_oldest_label(cbm_store_t *s, const char *project,
+                                          char **evicted_label_out) {
+    if (evicted_label_out)
+        *evicted_label_out = NULL;
+    if (!s || !s->db || !project)
+        return CBM_STORE_ERR;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           /* rowid tiebreak: last_seen has second resolution,
+                            * and eviction order must never be a timing lottery —
+                            * on a tie the earliest-inserted run is the oldest. */
+                           "SELECT label FROM observed_calls WHERE project=?1 GROUP BY label"
+                           " ORDER BY MAX(last_seen) ASC, MIN(rowid) ASC LIMIT 1",
+                           -1, &stmt, NULL) != SQLITE_OK)
+        return CBM_STORE_ERR;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    char label[CBM_SZ_256] = {0};
+    bool found = false;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *l = (const char *)sqlite3_column_text(stmt, 0);
+        snprintf(label, sizeof(label), "%s", l ? l : "");
+        found = true;
+    }
+    sqlite3_finalize(stmt);
+    if (!found)
+        return CBM_STORE_ERR;
+    static const char *const wipes[] = {
+        "DELETE FROM observed_calls WHERE project=?1 AND label=?2",
+        "DELETE FROM observed_paths WHERE project=?1 AND label=?2",
+    };
+    for (size_t i = 0; i < sizeof(wipes) / sizeof(wipes[0]); i++) {
+        if (sqlite3_prepare_v2(s->db, wipes[i], -1, &stmt, NULL) != SQLITE_OK)
+            return CBM_STORE_ERR;
+        sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, label, -1, SQLITE_TRANSIENT);
+        int rc = sqlite3_step(stmt);
+        sqlite3_finalize(stmt);
+        if (rc != SQLITE_DONE) {
+            store_set_error_sqlite(s, "observed_evict");
+            return CBM_STORE_ERR;
+        }
+    }
+    if (evicted_label_out) {
+        size_t len = strlen(label) + 1;
+        char *copy = malloc(len);
+        if (copy)
+            memcpy(copy, label, len);
+        *evicted_label_out = copy;
+    }
+    return CBM_STORE_OK;
+}
+
+/* Aggregate observation for one call edge: total count across runs, the
+ * newest run's label and timestamp. Returns CBM_STORE_OK with *count_out=0
+ * when the pair was never observed (absence is data, not an error). */
+int cbm_store_observed_lookup(cbm_store_t *s, const char *project, const char *caller_qn,
+                              const char *callee_qn, long long *count_out, char *label_buf,
+                              size_t label_cap, char *last_seen_buf, size_t last_seen_cap) {
+    if (count_out)
+        *count_out = 0;
+    if (label_buf && label_cap)
+        label_buf[0] = '\0';
+    if (last_seen_buf && last_seen_cap)
+        last_seen_buf[0] = '\0';
+    if (!s || !s->db || !project || !caller_qn || !callee_qn)
+        return CBM_STORE_ERR;
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           /* rowid tiebreak: last_seen has second resolution;
+                            * on a tie the later-inserted run is the newer one. */
+                           "SELECT count, label, last_seen FROM observed_calls WHERE project=?1"
+                           " AND caller_qn=?2 AND callee_qn=?3"
+                           " ORDER BY last_seen DESC, rowid DESC",
+                           -1, &stmt, NULL) != SQLITE_OK)
+        return CBM_STORE_ERR;
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, caller_qn, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, callee_qn, -1, SQLITE_TRANSIENT);
+    long long total = 0;
+    bool first = true;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        total += sqlite3_column_int64(stmt, 0);
+        if (first) {
+            const char *l = (const char *)sqlite3_column_text(stmt, 1);
+            const char *seen = (const char *)sqlite3_column_text(stmt, 2);
+            if (label_buf && label_cap)
+                snprintf(label_buf, label_cap, "%s", l ? l : "");
+            if (last_seen_buf && last_seen_cap)
+                snprintf(last_seen_buf, last_seen_cap, "%s", seen ? seen : "");
+            first = false;
+        }
+    }
+    sqlite3_finalize(stmt);
+    if (count_out)
+        *count_out = total;
     return CBM_STORE_OK;
 }

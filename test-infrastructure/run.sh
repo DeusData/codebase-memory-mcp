@@ -98,6 +98,24 @@ trap ci_cleanup EXIT
 
 COMPOSE="docker compose -f $ROOT/test-infrastructure/docker-compose.yml"
 
+# Worktree checkouts: /src/.git is a pointer file into the primary repo's
+# .git directory, which lives OUTSIDE the ..:/src mount — git inside the
+# container then fails and every git-based contract (e.g. the line-ending
+# guard) dies with "matched no files". Mount the primary .git at the same
+# absolute path, read-only, so the pointer resolves. Plain checkouts leave
+# the variable at its compose-file default (a harmless no-op mount), and
+# container git must also trust the differently-owned mount.
+export CBM_GIT_COMMON_DIR="${CBM_GIT_COMMON_DIR:-}"
+if [ -f "$ROOT/.git" ]; then
+    _git_common="$(git -C "$ROOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -n "$_git_common" ] && [ -d "$_git_common" ]; then
+        export CBM_GIT_COMMON_DIR="$_git_common"
+    fi
+fi
+if [ -z "$CBM_GIT_COMMON_DIR" ]; then
+    unset CBM_GIT_COMMON_DIR
+fi
+
 usage() {
     cat <<'EOF'
 Usage: test-infrastructure/run.sh [leg]

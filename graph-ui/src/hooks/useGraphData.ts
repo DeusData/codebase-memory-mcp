@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import type { GraphData } from "../lib/types";
+import type { GraphData, RegionsPayload } from "../lib/types";
 
 export interface LoadProgress {
   receivedBytes: number;
@@ -15,6 +15,7 @@ interface UseGraphDataResult {
     project: string,
     maxNodes?: number,
     graph?: "code" | "missed",
+    scope?: string,
   ) => void;
   fetchDetail: (project: string, centerNode: string) => void;
 }
@@ -45,9 +46,11 @@ export async function fetchLayout(
   maxNodes = GRAPH_RENDER_NODE_LIMIT,
   onProgress?: (progress: LoadProgress) => void,
   graph: GraphVariant = "code",
+  scope?: string,
 ): Promise<GraphData> {
   const params = new URLSearchParams({ project, max_nodes: String(maxNodes) });
   if (graph === "missed") params.set("graph", "missed");
+  if (scope) params.set("scope", scope);
   const res = await fetch(`/api/layout?${params}`);
 
   if (!res.ok) {
@@ -93,12 +96,17 @@ export function useGraphData(): UseGraphDataResult {
   const [progress, setProgress] = useState<LoadProgress>(NO_PROGRESS);
 
   const fetchOverview = useCallback(
-    async (project: string, maxNodes?: number, graph: GraphVariant = "code") => {
+    async (
+      project: string,
+      maxNodes?: number,
+      graph: GraphVariant = "code",
+      scope?: string,
+    ) => {
       setLoading(true);
       setError(null);
       setProgress(NO_PROGRESS);
       try {
-        const result = await fetchLayout(project, maxNodes, setProgress, graph);
+        const result = await fetchLayout(project, maxNodes, setProgress, graph, scope);
         setData(result);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to fetch layout");
@@ -128,4 +136,15 @@ export function useGraphData(): UseGraphDataResult {
   );
 
   return { data, loading, error, progress, fetchOverview, fetchDetail };
+}
+
+/* Region level of detail: the coarsest scene — one body per region. */
+export async function fetchRegions(project: string): Promise<RegionsPayload> {
+  const params = new URLSearchParams({ project, level: "regions" });
+  const res = await fetch(`/api/layout?${params}`);
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error(body.error ?? `HTTP ${res.status}`);
+  }
+  return res.json();
 }

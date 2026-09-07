@@ -68,7 +68,7 @@ export function GraphLoader({ nodeBudget, progress }: GraphLoaderProps) {
           />
         ))}
       </svg>
-      <p className="text-white/50 text-sm mt-4">
+      <p className="text-foreground/50 text-sm mt-4">
         {receiving ? "Receiving graph" : "Computing layout"} — up to{" "}
         {nodeBudget.toLocaleString("en-US")} nodes
       </p>
