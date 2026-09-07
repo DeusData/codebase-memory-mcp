@@ -186,14 +186,31 @@ idiomatic framework objects with predictable types: `$c`→Mojolicious::Controll
 `signature->return_types[0]`, and chained calls (`$self->engine->start`) already
 type off that. The missing input is **accessor return types**: Perl subs declare
 no return type syntactically, so `sub headers {...}` has no signature the registry
-can propagate. Two tractable fills, in axis order:
-- *symbol-table*: a curated Mojo-ecosystem accessor→return-type table
-  (`Mojo::Message::headers → Mojo::Headers`, `Mojo::UserAgent::build_tx →
-  Mojo::Transaction`, …) — like the Mojo::Base idiom fix, high value on the whole
-  ecosystem, and it feeds the existing assignment/return-propagation path so
-  `my $headers = $msg->headers; $headers->add(...)` resolves.
-- *engine*: return-type inference from accessor bodies (`return $self->{x}` /
-  `has x => ...`) for a repo's *own* classes, generalising beyond curated tables.
+can propagate.
+
+**A curated stdlib accessor table does NOT work — verified, not assumed.** A
+focused Mojo-ecosystem table (`Mojo.UserAgent.get → Mojo.Transaction`,
+`Mojo.Transaction.res → Mojo.Message.Response`, …) was added to
+`perl_stdlib_data.c`, built, and measured. It produced **zero** new CALLS on both
+a downstream Mojo app probe and Mojolicious itself. Root cause: **Perl
+external/stdlib method calls are zero-edge in the pipeline** — the existing,
+unit-tested DBI/LWP typed chains *also* emit no CALLS edges on a real index
+(`DBI->connect->prepare->execute` → 0 edges). Registry types are `is_stdlib`, so
+their method targets never materialise as graph edges; the table only helps a
+*chained* call whose eventual target is an **in-repo** sub. On Mojolicious's own
+source the Mojo classes ARE in-repo, but a stdlib table types the receiver as the
+*external* `Mojo.Message.Response` rather than the repo's own class, so the final
+in-repo hop still isn't reached. The table was reverted.
+
+**The one lever that moves real-repo CALLS is in-repo return-type inference**
+(engine axis): infer an accessor's return type from its own definition —
+`has res => sub { Mojo::Message::Response->new }` (the Mojo::Base default-sub
+idiom) or `sub res { ...; return Class->new }` — typing the receiver to the
+repo's OWN class so the chained call resolves to an in-repo sub and emits an
+edge. This is a substantial feature (default-sub / body return inference +
+constructor-rooted propagation), not a symbol-table fill, and it is the precise
+next step for Perl real-repo call resolution. It also needs the route-detection
+pattern to stop classifying HTTP-client `$ua->get('/')` as a route.
 
 ---
 
