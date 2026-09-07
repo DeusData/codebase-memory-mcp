@@ -792,6 +792,17 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
  * executor; the dump path uses it internally). malloc'd, caller frees. */
 char *cbm_pipeline_create_staging_path(const char *final_path);
 
+/* Stage ownership (#1839). Every stage minted by cbm_pipeline_create_staging_path
+ * is owned through an exclusive kernel lock on the sidecar "<stage>.lock" for
+ * as long as the stage exists; the lock -- and the sidecar -- go away when the
+ * stage is discarded or renamed into place, and the kernel drops the lock
+ * when the writer dies. Hold/drop are the same primitive, exposed so a test
+ * can stand in for a live writer. hold returns a descriptor >= 0, or -1 when
+ * another holder is live or the sidecar cannot be created. drop releases the
+ * lock and unlinks the sidecar. */
+int cbm_pipeline_stage_lock_hold(const char *stage_path);
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd);
+
 /* ── Delta-repair staging primitives (pipeline_delta.c) ──────────
  * Closure-route-only subsystem: clone the live generation, patch exactly
  * the repaired node/edge set, publish through the shared finalize leg. */

@@ -2278,7 +2278,7 @@ TEST(pipeline_complexity_props_independent_of_worker_order) {
     ASSERT_EQ(sequential_rc, 0);
     ASSERT_NOT_NULL(sequential_sig);
     ASSERT_GTE(sequential_funcs, copied); /* at least the one function per fixture file */
-    ASSERT_TRUE(cycles_detected);        /* the cycles must reach the pass at all */
+    ASSERT_TRUE(cycles_detected);         /* the cycles must reach the pass at all */
     if (mismatch_run >= 0) {
         printf("\n    parallel run %d diverges from sequential: %s\n", mismatch_run, diff);
         FAIL("complexity props depend on worker id order");
@@ -3493,6 +3493,59 @@ TEST(pipeline_stage_names_never_nest) {
     ASSERT_TRUE(odd_keeps_basename);
     ASSERT_EQ(nested_entries, 0);
     ASSERT_EQ(leftover_entries, 0);
+    PASS();
+}
+
+static bool path_exists(const char *path) {
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK;
+}
+
+/* #1839: a minted stage is OWNED through an exclusive kernel lock on its
+ * "<stage>.lock" sidecar for exactly as long as the stage exists. A second
+ * holder cannot take it while the writer is live; discarding the stage frees
+ * the name and removes the sidecar, so nothing stays behind. */
+TEST(pipeline_minted_stage_is_owned_until_released) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_owner_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    char *stage = cbm_pipeline_create_staging_path(db_path);
+    ASSERT_NOT_NULL(stage);
+    char lock_path[600];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", stage);
+    bool lock_present_while_live = path_exists(lock_path);
+    int hold_while_live = cbm_pipeline_stage_lock_hold(stage);
+    if (hold_while_live >= 0) {
+        cbm_pipeline_stage_lock_drop(stage, hold_while_live);
+    }
+
+    cbm_pipeline_discard_stage(stage);
+    bool stage_gone = !path_exists(stage);
+    bool lock_gone = !path_exists(lock_path);
+
+    int hold_after_discard = cbm_pipeline_stage_lock_hold(stage);
+    int second_holder = cbm_pipeline_stage_lock_hold(stage);
+    if (second_holder >= 0) {
+        cbm_pipeline_stage_lock_drop(stage, second_holder);
+    }
+    cbm_pipeline_stage_lock_drop(stage, hold_after_discard);
+    int hold_after_drop = cbm_pipeline_stage_lock_hold(stage);
+    cbm_pipeline_stage_lock_drop(stage, hold_after_drop);
+    int leftovers = count_generation_stage_artifacts(tmp, "generation.db");
+    free(stage);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(lock_present_while_live);
+    ASSERT_EQ(hold_while_live, -1);
+    ASSERT_TRUE(stage_gone);
+    ASSERT_TRUE(lock_gone);
+    ASSERT_TRUE(hold_after_discard >= 0);
+    ASSERT_EQ(second_holder, -1);
+    ASSERT_TRUE(hold_after_drop >= 0);
+    ASSERT_EQ(leftovers, 0);
     PASS();
 }
 
@@ -7217,19 +7270,18 @@ TEST(pipeline_python_cross_module_call) {
  * unique_name (candidates==1) is #1572 and is not this claim. */
 TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
-    const char *contents[] = {
-        "class Store:\n"
-        "    def commit(self):\n"
-        "        return True\n",
+    const char *contents[] = {"class Store:\n"
+                              "    def commit(self):\n"
+                              "        return True\n",
 
-        "from store import Store\n"
-        "\n"
-        "def save():\n"
-        "    return Store().commit()\n",
+                              "from store import Store\n"
+                              "\n"
+                              "def save():\n"
+                              "    return Store().commit()\n",
 
-        "export function commit() {\n"
-        "  return 1;\n"
-        "}\n"};
+                              "export function commit() {\n"
+                              "  return 1;\n"
+                              "}\n"};
 
     if (setup_lang_repo(files, contents, 3) != 0)
         FAIL("tmpdir");
@@ -13644,7 +13696,6 @@ TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
     PASS();
 }
 
-
 /* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
  * `body` → findable. Each layer has its own test; this one proves they connect.
  * It is also the guard on the size budget: build_def_props drops an oversized
@@ -14201,6 +14252,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_global_extension_config_change_forces_full);
     RUN_TEST(pipeline_publication_never_uses_a_predictable_staging_path);
     RUN_TEST(pipeline_stage_names_never_nest);
+    RUN_TEST(pipeline_minted_stage_is_owned_until_released);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);

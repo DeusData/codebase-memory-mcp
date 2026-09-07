@@ -1531,12 +1531,148 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
 /* Defined below, next to the other publication helpers. */
 static char *create_staging_path(const char *final_path);
 
+/* ── Stage ownership (#1839) ─────────────────────────────────────
+ *
+ * A stage used to be recognisable only by its name: the mkstemp descriptor
+ * was closed at once and nothing marked who was writing it. A worker killed
+ * mid-run (the daemon cancels with SIGTERM then SIGKILL after one second of
+ * grace, which a gigabyte backup or clone never finishes inside) left its
+ * full-size stage behind forever, and no later run could tell a dead stage
+ * from a live one -- so none tried.
+ *
+ * Ownership is now an exclusive kernel lock on the sidecar "<stage>.lock",
+ * held from minting until the stage is discarded or renamed into place. The
+ * kernel releases it on any death, so "can I take this lock?" is exactly
+ * "is this stage dead?" -- no pid, no mtime, no grace period. The lock lives
+ * on a sidecar rather than the stage itself because on macOS an flock on a
+ * file conflicts with SQLite's fcntl byte locks on that same file.
+ *
+ * The stage path is passed around as a plain string through publish and
+ * finalize, so the descriptor is kept in this per-process registry keyed by
+ * path, and released by the same helpers that remove the file. */
+typedef struct stage_owner {
+    char *stage_path;
+    int lock_fd;
+    struct stage_owner *next;
+} stage_owner_t;
+
+static stage_owner_t *g_stage_owners = NULL;
+static atomic_flag g_stage_owners_spin = ATOMIC_FLAG_INIT;
+
+static void stage_owners_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_stage_owners_spin, memory_order_acquire)) {}
+}
+
+static void stage_owners_unlock(void) {
+    atomic_flag_clear_explicit(&g_stage_owners_spin, memory_order_release);
+}
+
+static char *stage_lock_sidecar_path(const char *stage_path) {
+    static const char suffix[] = ".lock";
+    size_t len = strlen(stage_path);
+    if (len > SIZE_MAX - sizeof(suffix)) {
+        return NULL;
+    }
+    char *sidecar = (char *)malloc(len + sizeof(suffix));
+    if (!sidecar) {
+        return NULL;
+    }
+    memcpy(sidecar, stage_path, len);
+    memcpy(sidecar + len, suffix, sizeof(suffix));
+    return sidecar;
+}
+
+int cbm_pipeline_stage_lock_hold(const char *stage_path) {
+    if (!stage_path) {
+        return -1;
+    }
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    if (!sidecar) {
+        return -1;
+    }
+    int fd = cbm_lockfile_open(sidecar, true);
+    free(sidecar);
+    return fd;
+}
+
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd) {
+    if (!stage_path || lock_fd < 0) {
+        return;
+    }
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    /* Close before unlinking: Windows refuses to delete an open file. The
+     * sidecar exists unlocked for that instant, but by every drop the stage
+     * itself is already gone (discarded or renamed), so there is nothing a
+     * sweeper could take from us. */
+    cbm_lockfile_close(lock_fd);
+    if (sidecar) {
+        (void)cbm_unlink(sidecar);
+        free(sidecar);
+    }
+}
+
+static bool stage_owner_register(const char *stage_path) {
+    int fd = cbm_pipeline_stage_lock_hold(stage_path);
+    if (fd < 0) {
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+        cbm_log_warn("pipeline.stage", "action", "lock_failed", "errno", errno_text, "path",
+                     stage_path);
+        return false;
+    }
+    stage_owner_t *owner = (stage_owner_t *)malloc(sizeof(*owner));
+    char *path_copy = strdup(stage_path);
+    if (!owner || !path_copy) {
+        free(owner);
+        free(path_copy);
+        cbm_pipeline_stage_lock_drop(stage_path, fd);
+        return false;
+    }
+    owner->stage_path = path_copy;
+    owner->lock_fd = fd;
+    stage_owners_lock();
+    owner->next = g_stage_owners;
+    g_stage_owners = owner;
+    stage_owners_unlock();
+    return true;
+}
+
+/* Release ownership of a stage that no longer exists under this name. A path
+ * this process never registered is a no-op. */
+static void stage_owner_release(const char *stage_path) {
+    if (!stage_path) {
+        return;
+    }
+    stage_owner_t *found = NULL;
+    stage_owners_lock();
+    for (stage_owner_t **link = &g_stage_owners; *link; link = &(*link)->next) {
+        if (strcmp((*link)->stage_path, stage_path) == 0) {
+            found = *link;
+            *link = found->next;
+            break;
+        }
+    }
+    stage_owners_unlock();
+    if (!found) {
+        return;
+    }
+    cbm_pipeline_stage_lock_drop(found->stage_path, found->lock_fd);
+    free(found->stage_path);
+    free(found);
+}
+
+/* Remove a stage's main file and SQLite sidecars, keeping ownership. */
+static void remove_stage_files(const char *stage_path) {
+    (void)cbm_unlink(stage_path);
+    (void)cbm_remove_db_sidecars(stage_path);
+}
+
 static void discard_generation_stage(const char *stage_path) {
     if (!stage_path) {
         return;
     }
-    cbm_unlink(stage_path);
-    cbm_remove_db_sidecars(stage_path);
+    remove_stage_files(stage_path);
+    stage_owner_release(stage_path);
 }
 
 typedef struct {
@@ -1930,6 +2066,7 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
         discard_generation_stage(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
+    stage_owner_release(stage_path);
     cbm_log_info("finalize.timing", "block", "rename", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_fin)));
     return 0;
@@ -2387,8 +2524,8 @@ static void cleanup_staging_db(const char *path) {
     if (!path) {
         return;
     }
-    (void)cbm_unlink(path);
-    (void)cbm_remove_db_sidecars(path);
+    remove_stage_files(path);
+    stage_owner_release(path);
 }
 
 static bool ensure_db_parent(const char *path) {
@@ -2495,6 +2632,11 @@ static char *create_staging_path(const char *final_path) {
 #else
     close(fd);
 #endif
+    if (!stage_owner_register(path)) {
+        (void)cbm_unlink(path);
+        free(path);
+        return NULL;
+    }
     return path;
 }
 
@@ -2622,7 +2764,10 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         if (!backup_succeeded) {
             cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
                          final_path);
-            cleanup_staging_db(staging_path);
+            /* The copy is gone but the NAME stays ours: the rebuilt
+             * generation is renamed over it by the inner finalize and then
+             * published from it below, so its lock is held to the end. */
+            remove_stage_files(staging_path);
         }
     }
 
@@ -2705,6 +2850,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
+    stage_owner_release(staging_path);
     rc = export_after_publish(p, final_path);
     free(staging_path);
     free(final_path);

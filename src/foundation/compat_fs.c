@@ -23,11 +23,13 @@
 #include <windows.h>
 
 #include <aclapi.h>
-#include <direct.h> /* _wmkdir */
-#include <errno.h>  /* errno for spawn-failure logging */
-#include <fcntl.h>  /* _O_RDONLY */
-#include <io.h>     /* _wunlink, _open_osfhandle, _close */
-#include <stdint.h> /* intptr_t */
+#include <direct.h>   /* _wmkdir */
+#include <errno.h>    /* errno for spawn-failure logging */
+#include <fcntl.h>    /* _O_RDONLY */
+#include <io.h>       /* _wunlink, _open_osfhandle, _close */
+#include <share.h>    /* _SH_DENYRW */
+#include <sys/stat.h> /* _S_IREAD */
+#include <stdint.h>   /* intptr_t */
 #include "foundation/log.h"
 #include "foundation/win_utf8.h"
 
@@ -581,6 +583,26 @@ int cbm_rmdir(const char *path) {
     return ret;
 }
 
+int cbm_lockfile_open(const char *path, bool create) {
+    wchar_t *wpath = cbm_path_to_wide(path);
+    if (!wpath) {
+        errno = EINVAL;
+        return -1;
+    }
+    int flags = _O_RDWR | _O_BINARY | _O_NOINHERIT | (create ? _O_CREAT : 0);
+    /* _SH_DENYRW: every other open of this file, from any process, fails
+     * with EACCES until this descriptor closes -- including at death. */
+    int fd = _wsopen(wpath, flags, _SH_DENYRW, _S_IREAD | _S_IWRITE);
+    free(wpath);
+    return fd;
+}
+
+void cbm_lockfile_close(int fd) {
+    if (fd >= 0) {
+        (void)_close(fd);
+    }
+}
+
 /* Build a properly-quoted Windows command line from an argv array.
  * Returns a heap-allocated wide string, or NULL on allocation failure.
  * Quoting follows the MSVC CRT convention: arguments containing spaces,
@@ -730,6 +752,7 @@ int cbm_exec_no_shell(const char *const *argv) {
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -927,6 +950,34 @@ int cbm_unlink(const char *path) {
 
 int cbm_rmdir(const char *path) {
     return rmdir(path);
+}
+
+int cbm_lockfile_open(const char *path, bool create) {
+    int flags = O_RDWR | O_CLOEXEC | O_NOFOLLOW | (create ? O_CREAT : 0);
+    int fd;
+    do {
+        fd = open(path, flags, S_IRUSR | S_IWUSR);
+    } while (fd < 0 && errno == EINTR);
+    if (fd < 0) {
+        return -1;
+    }
+    int rc;
+    do {
+        rc = flock(fd, LOCK_EX | LOCK_NB);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+        int saved = errno;
+        (void)close(fd);
+        errno = saved;
+        return -1;
+    }
+    return fd;
+}
+
+void cbm_lockfile_close(int fd) {
+    if (fd >= 0) {
+        (void)close(fd);
+    }
 }
 
 int cbm_exec_no_shell(const char *const *argv) {
