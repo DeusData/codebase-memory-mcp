@@ -164,9 +164,36 @@ class is never inferred (`$c->render`, `$tx->res`, …), so they don't resolve a
 *any* depth — and the ones that do are mostly same-package or immediate-parent.
 Chain depth was a real correctness gap (grandparent calls previously *could not*
 resolve); closing it is necessary but not sufficient. **The next Perl real-repo
-lever is receiver typing**: infer the class of `$c`/`$obj`/`$tx` parameters (from
-signatures, `$app->build_controller`-style factories, and typed accessors) so the
-now-complete inheritance walk has a typed receiver to walk from.
+lever is receiver typing.**
+
+Receiver census over Mojolicious `lib/*.pm` (6782 method-call sites):
+
+| receiver kind                     | sites | share |
+|-----------------------------------|-------|-------|
+| untyped `$var` (`$c`,`$tx`,`$ua`…)| 4611  | 68%   |
+| `$self` (invocant-typed)          | 1333  | 20%   |
+| `Class::` (static)                | 838   | 12%   |
+
+Resolved CALLS (~2216) ≈ the `$self` + static calls; the 68% untyped-receiver
+calls don't resolve at *any* inheritance depth. Top untyped receivers are
+idiomatic framework objects with predictable types: `$c`→Mojolicious::Controller
+(458), `$tx`→Mojo::Transaction (287), `$ua`→Mojo::UserAgent (180),
+`$headers`→Mojo::Headers (220), `$app`→Mojolicious (225), `$dom`→Mojo::DOM (179).
+
+**The type-inference infrastructure already exists** and is not the blocker:
+`perl_process_assignment` (perl_lsp.c) binds `my $x = RHS` to
+`perl_eval_expr_type(RHS)`, which for a method call returns the callee's
+`signature->return_types[0]`, and chained calls (`$self->engine->start`) already
+type off that. The missing input is **accessor return types**: Perl subs declare
+no return type syntactically, so `sub headers {...}` has no signature the registry
+can propagate. Two tractable fills, in axis order:
+- *symbol-table*: a curated Mojo-ecosystem accessor→return-type table
+  (`Mojo::Message::headers → Mojo::Headers`, `Mojo::UserAgent::build_tx →
+  Mojo::Transaction`, …) — like the Mojo::Base idiom fix, high value on the whole
+  ecosystem, and it feeds the existing assignment/return-propagation path so
+  `my $headers = $msg->headers; $headers->add(...)` resolves.
+- *engine*: return-type inference from accessor bodies (`return $self->{x}` /
+  `has x => ...`) for a repo's *own* classes, generalising beyond curated tables.
 
 ---
 
