@@ -9045,7 +9045,50 @@ static void py_apply_router_prefix(CBMExtractCtx *ctx, TSNode func_node, const C
  * `$c->stash`, `$c->app`, `$c->tx` are all has-accessors). QN follows the Perl
  * sub convention (module_qn.name, package not woven in); def_module_qn = the
  * file module so the cross-file registrars attach it to the package's type. */
-static void perl_emit_has_accessor(CBMExtractCtx *ctx, const char *name, TSNode at) {
+/* `Class->new` → "Class" (bareword invocant + `new` method), else NULL. */
+static const char *perl_new_invocant_class(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "method_call_expression") != 0)
+        return NULL;
+    TSNode m = ts_node_child_by_field_name(node, TS_FIELD("method"));
+    char *mn = ts_node_is_null(m) ? NULL : cbm_node_text(ctx->arena, m, ctx->source);
+    if (!mn || strcmp(mn, "new") != 0)
+        return NULL;
+    TSNode inv = ts_node_child_by_field_name(node, TS_FIELD("invocant"));
+    if (ts_node_is_null(inv))
+        return NULL;
+    const char *ik = ts_node_type(inv);
+    if (strcmp(ik, "bareword") != 0 && strcmp(ik, "package") != 0)
+        return NULL;
+    char *cls = cbm_node_text(ctx->arena, inv, ctx->source);
+    return (cls && cls[0] && cls[0] != '$' && cls[0] != '-') ? cls : NULL;
+}
+
+/* Infer an accessor's return type from its `has` default: the very common
+ * Mojo::Base idiom `has x => sub { Some::Class->new }` (and the direct
+ * `has x => Some::Class->new`) means `$obj->x` returns Some::Class — which
+ * unlocks chained calls `$obj->x->method`. Only the tail expression (the sub's
+ * return value) is examined; anything else yields no type (zero-edge). */
+static const char *perl_has_default_class(CBMExtractCtx *ctx, TSNode def_node) {
+    if (ts_node_is_null(def_node))
+        return NULL;
+    if (strcmp(ts_node_type(def_node), "anonymous_subroutine_expression") == 0) {
+        TSNode body = ts_node_child_by_field_name(def_node, TS_FIELD("body"));
+        if (ts_node_is_null(body))
+            return NULL;
+        uint32_t bn = ts_node_named_child_count(body);
+        for (int i = (int)bn - 1; i >= 0; i--) {
+            TSNode st = ts_node_named_child(body, (uint32_t)i);
+            if (strcmp(ts_node_type(st), "expression_statement") != 0)
+                continue;
+            return perl_new_invocant_class(ctx, ts_node_named_child(st, 0));
+        }
+        return NULL;
+    }
+    return perl_new_invocant_class(ctx, def_node);
+}
+
+static void perl_emit_has_accessor(CBMExtractCtx *ctx, const char *name, const char *ret_type,
+                                   TSNode at) {
     if (!name || !name[0])
         return;
     CBMArena *a = ctx->arena;
@@ -9062,13 +9105,16 @@ static void perl_emit_has_accessor(CBMExtractCtx *ctx, const char *name, TSNode 
     def.end_line = def.start_line;
     def.lines = 1;
     def.is_test = ctx->result->is_test_file;
+    /* `has x => sub { Class->new }` types $obj->x as Class (flows to the
+     * CBMLSPDef surface via return_type -> return_types), enabling $obj->x->m. */
+    def.return_type = ret_type;
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
 /* Collect accessor NAME(s) from the FIRST argument of a `has` call: 'name',
  * bareword name, or ['a','b'] arrayref. Strings only (Object::Pad `has $x` is a
  * variable and is skipped). Mirrors the LSP's perl_collect_has_names. */
-static void perl_emit_has_names(CBMExtractCtx *ctx, TSNode node, int depth) {
+static void perl_emit_has_names(CBMExtractCtx *ctx, TSNode node, const char *ret_type, int depth) {
     if (ts_node_is_null(node) || depth > 3)
         return;
     const char *k = ts_node_type(node);
@@ -9077,19 +9123,24 @@ static void perl_emit_has_names(CBMExtractCtx *ctx, TSNode node, int depth) {
         TSNode content = cbm_find_child_by_kind(node, "string_content");
         char *inner = ts_node_is_null(content) ? NULL : cbm_node_text(ctx->arena, content, ctx->source);
         if (inner && inner[0] && inner[0] != '$')
-            perl_emit_has_accessor(ctx, inner, node);
+            perl_emit_has_accessor(ctx, inner, ret_type, node);
         return;
     }
     if (strcmp(k, "bareword") == 0 || strcmp(k, "autoquoted_bareword") == 0) {
         char *bw = cbm_node_text(ctx->arena, node, ctx->source);
         if (bw && bw[0] && bw[0] != '-')
-            perl_emit_has_accessor(ctx, bw, node);
+            perl_emit_has_accessor(ctx, bw, ret_type, node);
         return;
     }
     if (strcmp(k, "anonymous_array_expression") == 0 || strcmp(k, "list_expression") == 0) {
+        /* `has [qw(a b)] => sub {...}`: the arrayref is the NAME list; the shared
+         * default (2nd element of an enclosing list) already gave ret_type. But a
+         * list_expression here is ALSO the `has` argument wrapper carrying
+         * [name, default] — the default (a sub / Class->new) is not a name, so
+         * perl_emit_has_names skips it; only the name element(s) emit. */
         uint32_t nc = ts_node_named_child_count(node);
         for (uint32_t i = 0; i < nc && i < 16; i++)
-            perl_emit_has_names(ctx, ts_node_named_child(node, i), depth + 1);
+            perl_emit_has_names(ctx, ts_node_named_child(node, i), ret_type, depth + 1);
     }
 }
 
@@ -9124,8 +9175,14 @@ static void perl_scan_has_accessors(CBMExtractCtx *ctx, TSNode node, bool *gated
                 TSNode c = ts_node_named_child(node, i);
                 if (ts_node_eq(c, fn))
                     continue;
-                /* First non-function arg carries the name(s). */
-                perl_emit_has_names(ctx, c, 0);
+                /* c is the argument wrapper: [name(s), default, ...]. Infer the
+                 * accessor's return type from the default (2nd element) so
+                 * `$obj->accessor->method` chains resolve; the name element(s)
+                 * then emit carrying that type. */
+                const char *ret = NULL;
+                if (strcmp(ts_node_type(c), "list_expression") == 0)
+                    ret = perl_has_default_class(ctx, ts_node_named_child(c, 1));
+                perl_emit_has_names(ctx, c, ret, 0);
                 break;
             }
         }
