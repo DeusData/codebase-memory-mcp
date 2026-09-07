@@ -151,6 +151,23 @@ multi-package file (`package A; use parent 'X'; package B; use parent 'Y';`)
 over-approximates (A may see Y). Perl is ~one package per file in practice
 (all of Mojolicious), so this is acceptable; per-package tagging is a follow-up.
 
+### Honest real-repo aggregate: no CALLS delta on Mojolicious — receiver typing is the next lever
+
+Multi-level resolves grandparent calls on constructed cross-file chains
+(`probe3lvl`), but on the real Mojolicious checkout it adds **0 net CALLS**
+(2216 → 2216). The mechanism is correct; the aggregate is flat because the
+**dominant limiter on this repo is receiver typing, not chain depth**. A grand-
+parent method call only resolves when the receiver is typed to a concrete class
+(`my $self = shift`), the full ancestor chain is in-repo, and each hop resolves
+unambiguously. In practice most Mojolicious method calls are on parameters whose
+class is never inferred (`$c->render`, `$tx->res`, …), so they don't resolve at
+*any* depth — and the ones that do are mostly same-package or immediate-parent.
+Chain depth was a real correctness gap (grandparent calls previously *could not*
+resolve); closing it is necessary but not sufficient. **The next Perl real-repo
+lever is receiver typing**: infer the class of `$c`/`$obj`/`$tx` parameters (from
+signatures, `$app->build_controller`-style factories, and typed accessors) so the
+now-complete inheritance walk has a typed receiver to walk from.
+
 ---
 
 ## 4. Measurement harness (reusable)
