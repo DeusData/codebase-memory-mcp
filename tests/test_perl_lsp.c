@@ -1109,6 +1109,60 @@ TEST(perllsp_cross_parent_only_in_all_defs) {
     PASS();
 }
 
+TEST(perllsp_cross_toplevel_module_caller) {
+    /* Top-level statements (Mojolicious::Lite apps, .t scripts) attribute their
+     * calls to the FILE MODULE (matching the unified extractor), so a typed
+     * top-level call resolves instead of being dropped for a NULL caller. $t is
+     * typed via Test::Mojo->new; $t->get_ok then binds with caller = the file
+     * module. Regression for the 12k-site test-suite gap (0 edges before). */
+    const char *source = "use Test::Mojo;\n"
+                         "my $t = Test::Mojo->new;\n"
+                         "$t->get_ok('/');\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Test.Mojo.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Test.Mojo", .return_types = "Test::Mojo"},
+        {.qualified_name = "test.lib.Test.Mojo.get_ok", .short_name = "get_ok", .label = "Function",
+         .def_module_qn = "test.lib.Test.Mojo"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.t.app", defs, 2, NULL, NULL, 0,
+                           NULL, &out, NULL, defs, 2);
+    int idx = find_resolved_arr(&out, "t.app", "Test.Mojo.get_ok");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_mojo_routing_c_param) {
+    /* Mojolicious routing callback: `get '/x' => sub ($c) { $c->render }` — the
+     * `$c` param is typed to Mojolicious::Controller (double-gated on the routing
+     * DSL name AND the `$c` convention) and the class is seeded into the
+     * chain-walk so render dispatches. Top-level attribution supplies the caller
+     * QN (the file module) so the edge survives. */
+    const char *source = "get '/x' => sub ($c) {\n"
+                         "    $c->render(text => 'hi');\n"
+                         "};\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Mojolicious.Controller.render", .short_name = "render",
+         .label = "Function", .def_module_qn = "test.lib.Mojolicious.Controller"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.myapp", defs, 1, NULL, NULL, 0,
+                           NULL, &out, NULL, defs, 1);
+    int idx = find_resolved_arr(&out, "myapp", "Mojolicious.Controller.render");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_return_type_chain) {
     /* Return-type inference: extraction infers make_widget's return type (Widget)
      * from a `return Widget->new` body (perl_infer_return_types) and carries it on
@@ -1330,6 +1384,8 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_deep_qn_inherited_sub);
     RUN_TEST(perllsp_cross_deep_qn_inherited_accessor);
     RUN_TEST(perllsp_cross_parent_only_in_all_defs);
+    RUN_TEST(perllsp_cross_toplevel_module_caller);
+    RUN_TEST(perllsp_cross_mojo_routing_c_param);
     RUN_TEST(perllsp_cross_return_type_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);

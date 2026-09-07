@@ -1321,6 +1321,105 @@ static void perl_bind_signature_invocant(PerlLSPContext *ctx, TSNode sub_node) {
         cbm_scope_bind(ctx->current_scope, bare, cbm_type_named(ctx->arena, pkg));
 }
 
+/* Mojolicious routing / hook DSL methods whose handler callback receives a
+ * Mojolicious::Controller as `$c`. Both the function form (Mojolicious::Lite:
+ * `get '/x' => sub ($c) {...}`) and the method form (`$r->under(...)->to(cb =>
+ * sub ($c) {...})`, `$app->hook(before_dispatch => sub ($c) {...})`) route here. */
+static bool perl_is_mojo_routing_method(const char *name) {
+    if (!name || !name[0])
+        return false;
+    static const char *const kRoutes[] = {"get",   "post",      "put",  "del",   "delete",
+                                          "patch", "options",   "any",  "under", "to",
+                                          "websocket", "hook",   "group", "route", NULL};
+    for (int i = 0; kRoutes[i]; i++)
+        if (strcmp(name, kRoutes[i]) == 0)
+            return true;
+    return false;
+}
+
+/* True when `sub_node` (an anonymous sub) is the callback argument of a
+ * Mojolicious routing/hook call — its `$c` param is then a controller. Walks up
+ * at most a couple of wrapper levels (the sub sits inside the call's argument
+ * list, possibly under a `=>` pair). Only a call to one of the DSL names
+ * qualifies (zero-heuristic). */
+static bool perl_sub_is_routing_callback(PerlLSPContext *ctx, TSNode sub_node) {
+    TSNode n = sub_node;
+    for (int up = 0; up < 4; up++) {
+        TSNode parent = ts_node_parent(n);
+        if (ts_node_is_null(parent))
+            return false;
+        const char *pk = ts_node_type(parent);
+        if (strcmp(pk, "function_call_expression") == 0 ||
+            strcmp(pk, "ambiguous_function_call_expression") == 0) {
+            TSNode fn = ts_node_child_by_field_name(parent, "function", 8);
+            char *fname = ts_node_is_null(fn) ? NULL : perl_node_text(ctx, fn);
+            return perl_is_mojo_routing_method(fname);
+        }
+        if (strcmp(pk, "method_call_expression") == 0) {
+            TSNode m = ts_node_child_by_field_name(parent, "method", 6);
+            char *mname = ts_node_is_null(m) ? NULL : perl_node_text(ctx, m);
+            return perl_is_mojo_routing_method(mname);
+        }
+        if (strcmp(pk, "list_expression") != 0 && strcmp(pk, "parenthesized_expression") != 0 &&
+            strcmp(pk, "binary_expression") != 0 && strcmp(pk, "arguments") != 0)
+            return false;
+        n = parent;
+    }
+    return false;
+}
+
+/* In a Mojolicious routing/hook callback, bind a signature param named `$c` (the
+ * framework convention for the invocant controller) to Mojolicious::Controller
+ * so `$c->render/stash/param/...` dispatches through the controller's @ISA.
+ * Double-gated (routing-call context AND the `$c` name) to stay
+ * zero-false-positive. Mojolicious::Controller's method table is registered by
+ * the cross pass's chain-walk (seeded when the file has such a callback). */
+static void perl_bind_routing_controller_param(PerlLSPContext *ctx, TSNode sub_node) {
+    if (!perl_sub_is_routing_callback(ctx, sub_node))
+        return;
+    TSNode sig = perl_first_child_of_type(sub_node, "signature");
+    if (ts_node_is_null(sig))
+        return;
+    uint32_t nc = ts_node_named_child_count(sig);
+    for (uint32_t i = 0; i < nc && i < 8; i++) {
+        TSNode sc = perl_first_scalar_desc(ts_node_named_child(sig, i), 0);
+        char *ptxt = ts_node_is_null(sc) ? NULL : perl_node_text(ctx, sc);
+        const char *bare = ptxt ? perl_strip_sigil(ptxt) : NULL;
+        if (bare && strcmp(bare, "c") == 0) {
+            cbm_scope_bind(ctx->current_scope, "c",
+                           cbm_type_named(ctx->arena, "Mojolicious::Controller"));
+            return;
+        }
+    }
+}
+
+/* True if the file contains any Mojolicious routing/hook callback with a `$c`
+ * controller param — the cross pass then seeds Mojolicious::Controller into the
+ * inheritance chain-walk so its method table is attached from all_defs. */
+static bool perl_scan_has_mojo_routing_cb(PerlLSPContext *ctx, TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > 200)
+        return false;
+    if (strcmp(ts_node_type(node), "anonymous_subroutine_expression") == 0 &&
+        perl_sub_is_routing_callback(ctx, node)) {
+        TSNode sig = perl_first_child_of_type(node, "signature");
+        if (!ts_node_is_null(sig)) {
+            uint32_t sn = ts_node_named_child_count(sig);
+            for (uint32_t i = 0; i < sn && i < 8; i++) {
+                TSNode sc = perl_first_scalar_desc(ts_node_named_child(sig, i), 0);
+                char *ptxt = ts_node_is_null(sc) ? NULL : perl_node_text(ctx, sc);
+                const char *bare = ptxt ? perl_strip_sigil(ptxt) : NULL;
+                if (bare && strcmp(bare, "c") == 0)
+                    return true;
+            }
+        }
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++)
+        if (perl_scan_has_mojo_routing_cb(ctx, ts_node_named_child(node, i), depth + 1))
+            return true;
+    return false;
+}
+
 static void process_subroutine(PerlLSPContext *ctx, TSNode node) {
     CBMScope *saved_scope = ctx->current_scope;
     const char *saved_func = ctx->enclosing_func_qn;
@@ -1337,6 +1436,10 @@ static void process_subroutine(PerlLSPContext *ctx, TSNode node) {
     }
 
     perl_bind_signature_invocant(ctx, node);
+
+    /* Mojolicious routing/hook callback: type its `$c` param to the controller. */
+    if (strcmp(ts_node_type(node), "anonymous_subroutine_expression") == 0)
+        perl_bind_routing_controller_param(ctx, node);
 
     /* Corinna methods (5.38 feature 'class') carry an implicit $self bound to
      * the enclosing class — no `= shift` or signature needed. */
@@ -2714,6 +2817,13 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
             if (p && p[0])
                 worklist[wl_tail++] = p;
         }
+        /* Mojolicious routing/hook callbacks type their `$c` param to
+         * Mojolicious::Controller (perl_bind_routing_controller_param); seed that
+         * class into the chain-walk so its method table (render/stash/param/...)
+         * plus its own @ISA (Mojo::Base) get attached from all_defs. Only when the
+         * file actually has such a callback — no callback, no seed, no edge. */
+        if (wl_tail < PERL_CHAIN_CAP && perl_scan_has_mojo_routing_cb(&ctx, root, 0))
+            worklist[wl_tail++] = "Mojolicious::Controller";
         while (wl_head < wl_tail) {
             const char *parent = worklist[wl_head++];
             if (!parent || !parent[0])
