@@ -3031,6 +3031,9 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_MAGMA:
         parse_generic_imports(ctx, "load_statement");
         break;
+    case CBM_LANG_VB6: // `Implements IFoo` is the only cross-module reference syntax
+        parse_generic_imports(ctx, "implements_statement");
+        break;
     case CBM_LANG_WOLFRAM:
         parse_wolfram_imports(ctx);
         break;

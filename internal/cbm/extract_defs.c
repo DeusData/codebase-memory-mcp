@@ -4730,6 +4730,11 @@ static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
     if (lang == CBM_LANG_SMALI) {
         return class_node;
     }
+    // VB6: `Type ... End Type` / `Enum ... End Enum` hold their type_member /
+    // enum_member children directly (no body node) — iterate the node itself.
+    if (lang == CBM_LANG_VB6) {
+        return class_node;
+    }
     // GraphQL: object/interface fields live in a fields_definition child.
     if (lang == CBM_LANG_GRAPHQL) {
         TSNode b = cbm_find_child_by_kind(class_node, "fields_definition");
@@ -6262,6 +6267,25 @@ static void extract_var_names(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             }
         }
         return;
+    /* VB6/VBA: `Dim a As Long, b As String` / `Public Const X = 1` is a
+     * variable_declaration / const_declaration holding one variable_declarator /
+     * const_declarator per name (each with a `name` field). The declaration
+     * node itself has no name, so the default fallback would miss every one. */
+    case CBM_LANG_VB6: {
+        uint32_t dc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < dc; i++) {
+            TSNode decl = ts_node_named_child(node, i);
+            const char *dk = ts_node_type(decl);
+            if (strcmp(dk, "variable_declarator") != 0 && strcmp(dk, "const_declarator") != 0) {
+                continue;
+            }
+            TSNode nm = ts_node_child_by_field_name(decl, TS_FIELD("name"));
+            if (!ts_node_is_null(nm)) {
+                push_var_def(ctx, cbm_node_text(a, nm, ctx->source), decl);
+            }
+        }
+        return;
+    }
     default:
         break;
     }
@@ -6644,6 +6668,17 @@ static bool extract_schema_field(CBMExtractCtx *ctx, TSNode child, const char *c
     } else if (ctx->language == CBM_LANG_SMALI) {
         name_node = cbm_find_child_by_kind(child, "field_identifier");
         type_node = cbm_find_child_by_kind(child, "field_type");
+    } else if (ctx->language == CBM_LANG_VB6) {
+        /* type_member: (name: identifier) (type: as_type_clause (type: type_expression)).
+         * Unwrap the `As` clause so the Field type is `Long`, not `As Long`. */
+        name_node = ts_node_child_by_field_name(child, TS_FIELD("name"));
+        type_node = ts_node_child_by_field_name(child, TS_FIELD("type"));
+        if (!ts_node_is_null(type_node) && strcmp(ts_node_type(type_node), "as_type_clause") == 0) {
+            TSNode inner = ts_node_child_by_field_name(type_node, TS_FIELD("type"));
+            if (!ts_node_is_null(inner)) {
+                type_node = inner;
+            }
+        }
     } else {
         return false;
     }

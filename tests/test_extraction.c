@@ -1514,6 +1514,112 @@ TEST(chialisp_dialect_sigil_is_not_a_file_import) {
     PASS();
 }
 
+/* --- Visual Basic 6 / VBA ---
+ *
+ * harumiWeb/tree-sitter-vba. Every procedure kind carries a `name` field, so
+ * the generic def extractor covers Sub/Function/Property/Declare; the
+ * VB6-specific branches pinned here are `Type` members (no body node, `As`
+ * clause unwrapped), `Dim`/`Const` declarator lists (one Variable per name,
+ * module level only), and the call_statement / call_expression callee fields
+ * (`Helper 2`, `Call Helper(3)` and `v = Helper(1)` are all calls). */
+TEST(vb6_module_defs_calls_and_fields) {
+    const char *src = "Attribute VB_Name = \"ModA\"\n"
+                      "Option Explicit\n"
+                      "\n"
+                      "Private Declare Sub Sleep Lib \"kernel32\" (ByVal ms As Long)\n"
+                      "\n"
+                      "Public Type Point\n"
+                      "    X As Long\n"
+                      "    Y As Double\n"
+                      "End Type\n"
+                      "\n"
+                      "Public Enum Color\n"
+                      "    Red = 1\n"
+                      "    Green\n"
+                      "End Enum\n"
+                      "\n"
+                      "Public gCount As Long\n"
+                      "Private Const MAX_ITEMS As Long = 10\n"
+                      "Dim a As Long, b As String\n"
+                      "\n"
+                      "Public Property Get Count() As Long\n"
+                      "    Count = gCount\n"
+                      "End Property\n"
+                      "\n"
+                      "Private Function Helper(ByVal x As Long) As Long\n"
+                      "    Helper = x + 1\n"
+                      "End Function\n"
+                      "\n"
+                      "Public Sub Run()\n"
+                      "    Dim v As Long\n"
+                      "    v = Helper(1)\n"
+                      "    Helper 2\n"
+                      "    Call Helper(3)\n"
+                      "    Sleep 10\n"
+                      "End Sub\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VB6, "t", "src/ModA.bas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_defs_with_label(r, "Module"), 1);
+    /* Procedures: Sub, Function, Property Get and a Declare (DLL entry point). */
+    ASSERT(has_def(r, "Function", "Run"));
+    ASSERT(has_def(r, "Function", "Helper"));
+    ASSERT(has_def(r, "Function", "Count"));
+    ASSERT(has_def(r, "Function", "Sleep"));
+    /* Type -> Class with typed Fields (the `As` clause is unwrapped). */
+    ASSERT(has_def(r, "Class", "Point"));
+    ASSERT(has_def(r, "Field", "X"));
+    ASSERT(has_def(r, "Field", "Y"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->label, "Field") == 0 && strcmp(d->name, "Y") == 0) {
+            ASSERT_NOT_NULL(d->return_type);
+            ASSERT_STR_EQ(d->return_type, "Double");
+        }
+    }
+    /* Enum -> Enum with its members. */
+    ASSERT(has_def(r, "Enum", "Color"));
+    ASSERT(has_def(r, "Variable", "Red"));
+    ASSERT(has_def(r, "Variable", "Green"));
+    /* Module-level Public/Const/Dim (one Variable per declarator)... */
+    ASSERT(has_def(r, "Variable", "gCount"));
+    ASSERT(has_def(r, "Variable", "MAX_ITEMS"));
+    ASSERT(has_def(r, "Variable", "a"));
+    ASSERT(has_def(r, "Variable", "b"));
+    /* ...but a procedure-local Dim is not a module Variable. */
+    ASSERT(!has_def(r, "Variable", "v"));
+    /* Calls: implicit statement call, `Call` keyword, and expression call. */
+    ASSERT_EQ(count_calls_named(r, "Helper"), 3);
+    ASSERT(has_call(r, "Sleep"));
+    ASSERT(!has_call(r, "Dim"));
+    ASSERT(!has_call(r, "Call"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* `Implements IFoo` is VB6's only cross-module reference syntax; a class
+ * module's header block must parse cleanly around it. */
+TEST(vb6_implements_is_an_import) {
+    const char *src = "VERSION 1.0 CLASS\n"
+                      "BEGIN\n"
+                      "  MultiUse = -1  'True\n"
+                      "END\n"
+                      "Attribute VB_Name = \"Widget\"\n"
+                      "Option Explicit\n"
+                      "\n"
+                      "Implements IShape\n"
+                      "\n"
+                      "Public Sub Go()\n"
+                      "End Sub\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VB6, "t", "Widget.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "IShape"));
+    ASSERT(has_def(r, "Function", "Go"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Wolfram --- */
 TEST(wolfram_function) {
     CBMFileResult *r =
@@ -7269,6 +7375,8 @@ SUITE(extraction) {
     RUN_TEST(chialisp_export_names_do_not_duplicate_defs);
     RUN_TEST(chialisp_comment_before_def_head_keeps_the_name);
     RUN_TEST(chialisp_dialect_sigil_is_not_a_file_import);
+    RUN_TEST(vb6_module_defs_calls_and_fields);
+    RUN_TEST(vb6_implements_is_an_import);
     RUN_TEST(wolfram_function);
     RUN_TEST(magma_function);
 

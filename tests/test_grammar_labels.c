@@ -243,6 +243,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"templ", "Class:1,Module:1"},
     {"typst", "Module:1"},
     {"mermaid", "Module:1"},
+    {"vb6", "Function:2,Module:1"},
     {NULL, NULL},
 };
 

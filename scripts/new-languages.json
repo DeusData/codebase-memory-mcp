@@ -1291,5 +1291,22 @@
     "filenames": [],
     "has_scanner": true,
     "module_root": "source_file"
+  },
+  {
+    "name": "vba",
+    "enum": "VB6",
+    "display": "Visual Basic 6",
+    "ts_func": "tree_sitter_vba",
+    "repo": "https://github.com/harumiWeb/tree-sitter-vba",
+    "subdir": "",
+    "extensions": [
+      ".bas",
+      ".ctl",
+      ".dsr",
+      ".pag"
+    ],
+    "filenames": [],
+    "has_scanner": false,
+    "module_root": "source_file"
   }
 ]

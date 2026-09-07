@@ -158,6 +158,29 @@ static const char *puppet_keywords[] = {"true",   "false",  "undef",    "if",   
                                         "unless", "case",   "and",      "or",      "in",     "node",
                                         "class",  "define", "inherits", "default", "return", NULL};
 
+/* VB6/VBA reserved words + intrinsic type names. The VB6 IDE canonicalises
+ * keyword casing on save, so the PascalCase spellings below are what exported
+ * source contains (strcmp is exact). `Me` is a keyword, not a resolvable
+ * receiver; `Debug` is the Debug object (`Debug.Print`). */
+static const char *vb6_keywords[] = {
+    "If",         "Then",      "Else",     "ElseIf",     "End",        "Sub",       "Function",
+    "Property",   "Get",       "Let",      "Set",        "Dim",        "As",        "New",
+    "Nothing",    "True",      "False",    "Not",        "And",        "Or",        "Xor",
+    "Eqv",        "Imp",       "Mod",      "Is",         "Like",       "For",       "Next",
+    "To",         "Step",      "Each",     "In",         "Do",         "Loop",      "While",
+    "Wend",       "Until",     "Select",   "Case",       "With",       "Exit",      "GoTo",
+    "GoSub",      "Return",    "On",       "Error",      "Resume",     "Call",      "Const",
+    "Static",     "Public",    "Private",  "Friend",     "Global",     "Option",    "Explicit",
+    "Base",       "Compare",   "Type",     "Enum",       "Declare",    "Lib",       "Alias",
+    "ByVal",      "ByRef",     "Optional", "ParamArray", "Implements", "Event",     "RaiseEvent",
+    "WithEvents", "Me",        "Null",     "Empty",      "ReDim",      "Preserve",  "Erase",
+    "Integer",    "Long",      "Single",   "Double",     "String",     "Boolean",   "Byte",
+    "Currency",   "Date",      "Object",   "Variant",    "Any",        "Print",     "Debug",
+    "Stop",       "Beep",      "Open",     "Close",      "Input",      "Output",    "Append",
+    "Write",      "Attribute", "Version",  "Begin",      "TypeOf",     "AddressOf", "Len",
+    "LenB",       "Seek",      "Lock",     "Unlock",     "Load",       "Unload",    "Name",
+    "Line",       "Rem",       NULL};
+
 // True when `label` names a type-like container definition (see cbm.h). Single
 // source of truth for the type-resolution / registry / IMPLEMENTS / LSP-type
 // consumers — adding a label here updates them all.
@@ -297,6 +320,9 @@ bool cbm_is_keyword(const char *name, CBMLanguage lang) {
         break;
     case CBM_LANG_PUPPET:
         keywords = puppet_keywords;
+        break;
+    case CBM_LANG_VB6:
+        keywords = vb6_keywords;
         break;
     default:
         keywords = generic_keywords;
@@ -1376,6 +1402,8 @@ static const char **get_module_parents(CBMLanguage lang) {
     case CBM_LANG_PROPERTIES:
         return module_parents_properties;
     case CBM_LANG_GOMOD: // require_directive lives at source_file top level
+        return module_parents_zig;
+    case CBM_LANG_VB6: // module-level Dim/Const/Type/Enum are children of source_file
         return module_parents_zig;
     default:
         return NULL;
