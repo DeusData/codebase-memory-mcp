@@ -9,6 +9,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/macos_acl.h"
+#include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
@@ -51,6 +52,53 @@ void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail) {
 
 const char *cbm_daemon_ipc_validation_detail(void) {
     return ipc_validation_detail_buffer;
+}
+
+static cbm_daemon_ipc_listen_failure_t ipc_listen_failure;
+
+static void ipc_listen_failure_reset(void) {
+    memset(&ipc_listen_failure, 0, sizeof(ipc_listen_failure));
+}
+
+/* Record and log one listener failure. `name` is an artifact inside the
+ * endpoint's runtime directory, "" for the directory itself, or NULL when
+ * the stage has no path. The log line names the errno symbolically and the
+ * full path, so `daemon.ipc.listen_failed stage=pending_publication` alone
+ * (the whole trace #1828's reporter had) can no longer happen. */
+static void ipc_listen_failed(const char *runtime_dir, const char *stage, int errno_value,
+                              const char *name) {
+    ipc_listen_failure_reset();
+    (void)snprintf(ipc_listen_failure.stage, sizeof(ipc_listen_failure.stage), "%s",
+                   stage ? stage : "");
+    ipc_listen_failure.errno_value = errno_value;
+    if (runtime_dir && name) {
+        int written = name[0] ? snprintf(ipc_listen_failure.path, sizeof(ipc_listen_failure.path),
+                                         "%s/%s", runtime_dir, name)
+                              : snprintf(ipc_listen_failure.path, sizeof(ipc_listen_failure.path),
+                                         "%s", runtime_dir);
+        if (written <= 0 || written >= (int)sizeof(ipc_listen_failure.path)) {
+            ipc_listen_failure.path[0] = '\0';
+        }
+    }
+    const char *errno_name = errno_value != 0 ? cbm_errno_name(errno_value) : NULL;
+    if (errno_name && ipc_listen_failure.path[0]) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage, "errno", errno_name, "path",
+                      ipc_listen_failure.path);
+    } else if (errno_name) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage, "errno", errno_name);
+    } else if (ipc_listen_failure.path[0]) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage, "path", ipc_listen_failure.path);
+    } else {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage);
+    }
+}
+
+bool cbm_daemon_ipc_listen_failure_detail(cbm_daemon_ipc_listen_failure_t *out) {
+    if (!out) {
+        return false;
+    }
+    *out = ipc_listen_failure;
+    return ipc_listen_failure.stage[0] != '\0';
 }
 
 static bool instance_key_valid(const char *key) {
@@ -120,6 +168,19 @@ void cbm_daemon_ipc_posix_publication_hook_set_for_test(
 void cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(unsigned int count) {
     atomic_store_explicit(&g_windows_legacy_guard_release_failures_for_test, count,
                           memory_order_release);
+}
+
+#ifndef _WIN32
+static atomic_int g_posix_record_write_failure_errno_for_test;
+#endif
+
+void cbm_daemon_ipc_posix_record_write_failure_set_for_test(int errno_value) {
+#ifndef _WIN32
+    atomic_store_explicit(&g_posix_record_write_failure_errno_for_test, errno_value,
+                          memory_order_release);
+#else
+    (void)errno_value;
+#endif
 }
 
 #ifdef _WIN32
@@ -1815,6 +1876,29 @@ static bool posix_fd_write_all(int fd, const uint8_t *buffer, size_t length) {
     return true;
 }
 
+/* The failing step of the most recent record publication in this process:
+ * its errno (0 when a validation predicate, not a syscall, refused) and the
+ * artifact name it was operating on. Read by the listener right after a
+ * publish returns false. */
+static int posix_publish_failure_errno;
+static char posix_publish_failure_name[NAME_MAX + 1];
+
+static void posix_publish_failure_note(int errno_value, const char *name) {
+    posix_publish_failure_errno = errno_value;
+    (void)snprintf(posix_publish_failure_name, sizeof(posix_publish_failure_name), "%s",
+                   name ? name : "");
+}
+
+static bool posix_record_fd_write(int fd, const uint8_t *buffer, size_t length) {
+    int injected =
+        atomic_load_explicit(&g_posix_record_write_failure_errno_for_test, memory_order_acquire);
+    if (injected != 0) {
+        errno = injected;
+        return false;
+    }
+    return posix_fd_write_all(fd, buffer, length);
+}
+
 static bool posix_fd_pread_all(int fd, uint8_t *buffer, size_t length) {
     size_t offset = 0;
     while (offset < length) {
@@ -2169,50 +2253,75 @@ static bool posix_socket_record_publish(const cbm_daemon_ipc_endpoint_t *endpoin
         return false;
     }
     struct stat existing;
+    errno = 0;
     if (fstatat(endpoint->dir_fd, record_name, &existing, AT_SYMLINK_NOFOLLOW) == 0 ||
         errno != ENOENT) {
+        posix_publish_failure_note(errno == 0 ? EEXIST : errno, record_name);
         return false;
     }
     uint8_t record[POSIX_SOCKET_RECORD_SIZE];
     if (!posix_socket_record_encode(magic, source, record)) {
+        posix_publish_failure_note(0, record_name);
         return false;
     }
 
     char temp_name[NAME_MAX + 1];
     if (!posix_socket_record_temp_name(record_name, temp_name)) {
+        posix_publish_failure_note(ENAMETOOLONG, record_name);
         return false;
     }
     int fd = openat(endpoint->dir_fd, temp_name,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (fd < 0) {
+        posix_publish_failure_note(errno, temp_name);
         return false;
     }
 
     struct stat created = {0};
     bool temp_exists = true;
     bool stable_linked = false;
+    errno = 0;
     bool ok = fd_set_cloexec(fd) && fchmod(fd, 0600) == 0 &&
               private_regular_file_snapshot(endpoint->dir_fd, temp_name, fd, 1, &created) &&
-              posix_fd_write_all(fd, record, sizeof(record)) && fsync(fd) == 0 &&
+              posix_record_fd_write(fd, record, sizeof(record)) && fsync(fd) == 0 &&
               private_regular_file_snapshot(endpoint->dir_fd, temp_name, fd, 1, &created) &&
               created.st_size == (off_t)POSIX_SOCKET_RECORD_SIZE &&
               endpoint_runtime_still_valid(endpoint);
+    if (!ok) {
+        posix_publish_failure_note(errno, temp_name);
+    }
     if (ok) {
         posix_record_publication_stage_reached(magic, false);
+        errno = 0;
         ok =
             posix_linkat_no_follow(endpoint->dir_fd, temp_name, endpoint->dir_fd, record_name) == 0;
         stable_linked = ok;
+        if (!ok) {
+            posix_publish_failure_note(errno, record_name);
+        }
     }
     if (ok) {
         posix_record_publication_stage_reached(magic, true);
+        errno = 0;
         ok = posix_path_unlink_regular_if_matches(endpoint->dir_fd, temp_name, created.st_dev,
                                                   created.st_ino, 2);
         temp_exists = !ok;
+        if (!ok) {
+            posix_publish_failure_note(errno, temp_name);
+        }
     }
     if (ok) {
+        errno = 0;
         ok = posix_directory_sync(endpoint->dir_fd);
+        if (!ok) {
+            posix_publish_failure_note(errno, "");
+        }
     }
+    errno = 0;
     if (close(fd) != 0) {
+        if (ok) {
+            posix_publish_failure_note(errno, temp_name);
+        }
         ok = false;
     }
 
@@ -2224,6 +2333,9 @@ static bool posix_socket_record_publish(const cbm_daemon_ipc_endpoint_t *endpoin
              posix_socket_identity_equal(&published_record.identity, &source->identity) &&
              strcmp(published_record.anchor_name, source->anchor_name) == 0 &&
              published_status.st_dev == created.st_dev && published_status.st_ino == created.st_ino;
+        if (!ok) {
+            posix_publish_failure_note(0, record_name);
+        }
     }
     if (!ok) {
         if (stable_linked) {
@@ -2539,8 +2651,11 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io) {
     cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation =
         reservation_io ? *reservation_io : NULL;
+    ipc_listen_failure_reset();
+    posix_publish_failure_note(0, NULL);
+    const char *runtime_dir = endpoint ? endpoint->runtime_dir : NULL;
     if (!lifetime_reservation_matches_endpoint(endpoint, lifetime_reservation)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "reservation_validation");
+        ipc_listen_failed(runtime_dir, "reservation_validation", 0, NULL);
         return NULL;
     }
     /* Stale removal happens only under the startup lock, before a daemon host
@@ -2550,7 +2665,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     char pending_temp_name[NAME_MAX + 1];
     if (!posix_socket_record_temp_name(endpoint->socket_identity_name, identity_temp_name) ||
         !posix_socket_record_temp_name(endpoint->socket_pending_name, pending_temp_name)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "temp_names");
+        ipc_listen_failed(runtime_dir, "temp_names", ENAMETOOLONG, endpoint->socket_pending_name);
         return NULL;
     }
     struct stat existing;
@@ -2559,27 +2674,32 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         endpoint->socket_pending_name, identity_temp_name,           pending_temp_name,
     };
     bool namespace_absent = true;
+    const char *occupied_name = "";
+    int occupied_errno = 0;
     for (size_t index = 0; index < sizeof(required_absent) / sizeof(required_absent[0]); index++) {
+        errno = 0;
         if (fstatat(endpoint->dir_fd, required_absent[index], &existing, AT_SYMLINK_NOFOLLOW) ==
                 0 ||
             errno != ENOENT) {
             namespace_absent = false;
+            occupied_name = required_absent[index];
+            occupied_errno = errno == 0 ? EEXIST : errno;
             break;
         }
     }
     if (!endpoint_runtime_still_valid(endpoint) || !namespace_absent) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "namespace_validation");
+        ipc_listen_failed(runtime_dir, "namespace_validation", occupied_errno, occupied_name);
         return NULL;
     }
 
     int fd = local_socket_new();
     if (fd < 0) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "socket_creation");
+        ipc_listen_failed(runtime_dir, "socket_creation", errno, NULL);
         return NULL;
     }
     cbm_daemon_ipc_listener_t *listener = calloc(1, sizeof(*listener));
     if (!listener) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "listener_allocation");
+        ipc_listen_failed(runtime_dir, "listener_allocation", ENOMEM, NULL);
         (void)close(fd);
         return NULL;
     }
@@ -2597,7 +2717,8 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     if (listener->dir_fd < 0 || !fd_set_cloexec(listener->dir_fd) || !listener->runtime_dir ||
         !listener->address || !listener->socket_name || !listener->socket_anchor_name ||
         !listener->socket_identity_name || !listener->socket_pending_name) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "listener_initialization");
+        ipc_listen_failed(runtime_dir, "listener_initialization",
+                          listener->dir_fd < 0 ? errno : ENOMEM, NULL);
         if (listener->dir_fd >= 0) {
             (void)close(listener->dir_fd);
         }
@@ -2615,20 +2736,19 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     struct sockaddr_un address;
     socklen_t address_length;
     if (!unix_address_set(&address, endpoint->socket_anchor_address, &address_length)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "socket_address");
+        ipc_listen_failed(runtime_dir, "socket_address", ENAMETOOLONG,
+                          endpoint->socket_anchor_name);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
     if (bind(fd, (const struct sockaddr *)&address, address_length) != 0) {
-        int bind_error = errno;
-        char error_text[32];
-        (void)snprintf(error_text, sizeof(error_text), "%d", bind_error);
-        cbm_log_error("daemon.ipc.listen_failed", "bind_errno", error_text);
+        ipc_listen_failed(runtime_dir, "socket_bind", errno, endpoint->socket_anchor_name);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
 
     struct stat bound_status;
+    errno = 0;
     bool bound_path_ok = fstatat(endpoint->dir_fd, endpoint->socket_anchor_name, &bound_status,
                                  AT_SYMLINK_NOFOLLOW) == 0 &&
                          S_ISSOCK(bound_status.st_mode) && bound_status.st_uid == geteuid();
@@ -2648,11 +2768,13 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         anchor_status.st_ino != bound_status.st_ino ||
         !posix_socket_identity_from_stat(&anchor_status, &anchor_identity) ||
         !posix_directory_sync(endpoint->dir_fd)) {
+        int security_errno = errno;
         if (bound_path_ok) {
             posix_bound_socket_unlink_if_matches(endpoint->dir_fd, endpoint->socket_anchor_name,
                                                  bound_status.st_dev, bound_status.st_ino);
         }
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "socket_security");
+        ipc_listen_failed(runtime_dir, "socket_security", security_errno,
+                          endpoint->socket_anchor_name);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
@@ -2669,16 +2791,19 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         endpoint, endpoint->socket_pending_name, POSIX_SOCKET_PENDING_MAGIC, &pending,
         &pending_status.st_dev, &pending_status.st_ino);
     if (!pending_published) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "pending_publication");
+        ipc_listen_failed(runtime_dir, "pending_publication", posix_publish_failure_errno,
+                          posix_publish_failure_name);
         posix_publication_abort(endpoint, &anchor_identity, false, NULL, false, NULL);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
     posix_publication_stage_reached(CBM_DAEMON_IPC_POSIX_PUBLICATION_PENDING_DURABLE);
 
+    errno = 0;
     bool stable_linked = posix_linkat_no_follow(endpoint->dir_fd, endpoint->socket_anchor_name,
                                                 endpoint->dir_fd, endpoint->socket_name) == 0 &&
                          posix_directory_sync(endpoint->dir_fd);
+    int stable_errno = stable_linked ? 0 : errno;
     posix_socket_identity_t stable_identity = {0};
     posix_socket_identity_t committed_identity = {0};
     struct stat stable_status = {0};
@@ -2693,7 +2818,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         posix_socket_identity_equal(&stable_identity, &committed_identity) &&
         posix_socket_inode_equal(&anchor_identity, &committed_identity);
     if (!stable_valid) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "stable_publication");
+        ipc_listen_failed(runtime_dir, "stable_publication", stable_errno, endpoint->socket_name);
         posix_publication_abort(endpoint, &anchor_identity, pending_published, &pending_status,
                                 false, NULL);
         cbm_daemon_ipc_listener_close(listener);
@@ -2712,7 +2837,8 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         endpoint, endpoint->socket_identity_name, POSIX_SOCKET_MARKER_MAGIC, &marker,
         &marker_status.st_dev, &marker_status.st_ino);
     if (!marker_published) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "marker_publication");
+        ipc_listen_failed(runtime_dir, "marker_publication", posix_publish_failure_errno,
+                          posix_publish_failure_name);
         posix_publication_abort(endpoint, &committed_identity, pending_published, &pending_status,
                                 false, NULL);
         cbm_daemon_ipc_listener_close(listener);
@@ -2722,10 +2848,11 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     listener->identity_inode = marker_status.st_ino;
     posix_publication_stage_reached(CBM_DAEMON_IPC_POSIX_PUBLICATION_MARKER_DURABLE);
 
+    errno = 0;
     if (!posix_path_unlink_regular_if_matches(endpoint->dir_fd, endpoint->socket_pending_name,
                                               pending_status.st_dev, pending_status.st_ino, 1) ||
         !posix_directory_sync(endpoint->dir_fd)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "pending_removal");
+        ipc_listen_failed(runtime_dir, "pending_removal", errno, endpoint->socket_pending_name);
         posix_publication_abort(endpoint, &committed_identity, true, &pending_status,
                                 marker_published, &marker_status);
         cbm_daemon_ipc_listener_close(listener);

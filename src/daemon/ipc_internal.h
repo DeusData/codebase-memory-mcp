@@ -95,6 +95,11 @@ typedef void (*cbm_daemon_ipc_posix_publication_hook_fn)(
 void cbm_daemon_ipc_posix_publication_hook_set_for_test(
     cbm_daemon_ipc_posix_publication_hook_fn hook, void *context);
 void cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(unsigned int count);
+/* #1828: while non-zero, every POSIX socket-record publication write fails
+ * with this errno. This is the deterministic stand-in for a full runtime
+ * filesystem (tmpfs ENOSPC): the socket binds, the record file is created,
+ * and only its data write is refused -- exactly the reporter's failure shape. */
+void cbm_daemon_ipc_posix_record_write_failure_set_for_test(int errno_value);
 
 /* Deterministic-interleaving seam: fires on the Windows startup path once the
  * startup lock is held, before the rendezvous handoff. A test parks here to

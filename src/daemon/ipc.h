@@ -91,6 +91,25 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
  * validation refusal (empty string when none). Diagnostic only — callers
  * append it to their error messages; policy decisions never read it. */
 const char *cbm_daemon_ipc_validation_detail(void);
+
+/* This process's most recent listener-publication failure: the stage that
+ * refused, the errno the failing step reported (0 when the step reported
+ * none), and the artifact path it was operating on ("" when no path applies).
+ * Every `daemon.ipc.listen_failed` log line carries the same three fields.
+ * Reset at the start of each listen attempt. Returns false while no failure
+ * has been recorded. Diagnostic only: the daemon host copies it into its
+ * durable start-failure record so a waiting client can name the cause instead
+ * of burning its full startup deadline (#1828). */
+enum {
+    CBM_DAEMON_IPC_LISTEN_FAILURE_STAGE_CAP = 32,
+    CBM_DAEMON_IPC_LISTEN_FAILURE_PATH_CAP = 4096
+};
+typedef struct {
+    char stage[CBM_DAEMON_IPC_LISTEN_FAILURE_STAGE_CAP];
+    int errno_value;
+    char path[CBM_DAEMON_IPC_LISTEN_FAILURE_PATH_CAP];
+} cbm_daemon_ipc_listen_failure_t;
+bool cbm_daemon_ipc_listen_failure_detail(cbm_daemon_ipc_listen_failure_t *out);
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* #1537: seed the detail so a test can prove the CLI refusal surfaces it. */
 void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail);

@@ -543,6 +543,60 @@ const char *cbm_app_local_dir(void) {
 
 /* ── Cache directory ────────────────────────── */
 
+const char *cbm_errno_name(int error) {
+    static const struct {
+        int value;
+        const char *name;
+    } names[] = {
+        {EACCES, "EACCES"},
+        {EAGAIN, "EAGAIN"},
+        {EBUSY, "EBUSY"},
+        {EEXIST, "EEXIST"},
+        {EFBIG, "EFBIG"},
+        {EINTR, "EINTR"},
+        {EINVAL, "EINVAL"},
+        {EIO, "EIO"},
+        {EISDIR, "EISDIR"},
+        {ELOOP, "ELOOP"},
+        {EMFILE, "EMFILE"},
+        {EMLINK, "EMLINK"},
+        {ENAMETOOLONG, "ENAMETOOLONG"},
+        {ENFILE, "ENFILE"},
+        {ENOENT, "ENOENT"},
+        {ENOMEM, "ENOMEM"},
+        {ENOSPC, "ENOSPC"},
+        {ENOTDIR, "ENOTDIR"},
+        {ENOTEMPTY, "ENOTEMPTY"},
+        {ENXIO, "ENXIO"},
+        {EPERM, "EPERM"},
+        {EROFS, "EROFS"},
+        {ETXTBSY, "ETXTBSY"},
+        {EXDEV, "EXDEV"},
+        {ETIMEDOUT, "ETIMEDOUT"},
+        {ECONNREFUSED, "ECONNREFUSED"},
+        {EADDRINUSE, "EADDRINUSE"},
+        {ENOTSOCK, "ENOTSOCK"},
+        {EPIPE, "EPIPE"},
+#ifdef EDQUOT
+        {EDQUOT, "EDQUOT"},
+#endif
+#ifdef EOVERFLOW
+        {EOVERFLOW, "EOVERFLOW"},
+#endif
+#ifdef ENOTSUP
+        {ENOTSUP, "ENOTSUP"},
+#endif
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (names[i].value == error) {
+            return names[i].name;
+        }
+    }
+    static CBM_TLS char fallback[16];
+    (void)snprintf(fallback, sizeof(fallback), "%d", error);
+    return fallback;
+}
+
 const char *cbm_resolve_cache_dir(void) {
     static CBM_TLS char buf[CBM_SZ_4K];
     static const char missing[] = "\x1f"
