@@ -1003,6 +1003,42 @@ TEST(perllsp_cross_mojo_base_inherited_method) {
     PASS();
 }
 
+TEST(perllsp_cross_return_type_chain) {
+    /* Return-type inference: extraction infers make_widget's return type (Widget)
+     * from a `return Widget->new` body (perl_infer_return_types) and carries it on
+     * CBMLSPDef.return_types; perl_register_lsp_func consumes it so `my $w =
+     * $f->make_widget` types $w, and the chained `$w->name` resolves to the
+     * cross-file Widget::name (which a bare/unknown return type would drop). */
+    const char *source = "package App;\n"
+                         "use Factory;\n"
+                         "use Widget;\n"
+                         "sub run {\n"
+                         "    my $self = shift;\n"
+                         "    my $f = Factory->new;\n"
+                         "    my $w = $f->make_widget;\n"
+                         "    $w->name;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Factory.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Factory", .return_types = "Factory"},
+        {.qualified_name = "test.lib.Factory.make_widget", .short_name = "make_widget",
+         .label = "Function", .def_module_qn = "test.lib.Factory", .return_types = "Widget"},
+        {.qualified_name = "test.lib.Widget.name", .short_name = "name", .label = "Function",
+         .def_module_qn = "test.lib.Widget"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.App", defs, 3, NULL, NULL,
+                           0, NULL, &out, NULL, NULL, 0);
+    int idx = find_resolved_arr(&out, "App.run", "lib.Widget.name");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_multilevel_inherited_method) {
     /* MULTI-LEVEL cross-file inheritance: Dog -> Animal -> Base, one class per
      * file. Dog->bark calls $self->speak (immediate parent Animal, one level)
@@ -1185,6 +1221,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_qw_ast_recollection);
     RUN_TEST(perllsp_cross_package_method_dispatch);
     RUN_TEST(perllsp_cross_mojo_base_inherited_method);
+    RUN_TEST(perllsp_cross_return_type_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);

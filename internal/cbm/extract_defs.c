@@ -3894,6 +3894,87 @@ static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode 
     return NULL;
 }
 
+/* Perl subs carry no syntactic return type, so `my $x = $obj->accessor`
+ * chains lose their receiver class and stop resolving. Infer a return type
+ * when the sub's return VALUE is a `Class->new(...)` constructor — the dominant
+ * factory / accessor-default idiom (`sub build_tx { ...; return
+ * Mojo::Transaction->new }`, `sub ua { Mojo::UserAgent->new }`). Only the `new`
+ * constructor is inferred: it reliably returns the invoked class; a general
+ * method could return anything, so it stays unknown (zero-edge, unchanged).
+ * The returned value is the LAST statement (trailing implicit return) or the
+ * value of an explicit `return EXPR`. The class spelling is dotted (Foo::Bar ->
+ * Foo.Bar) to match the resolver's package-QN convention. NULL when not
+ * inferable. */
+static const char **perl_infer_return_types(CBMArena *a, TSNode func_node, const char *source) {
+    TSNode block = cbm_find_child_by_kind(func_node, "block");
+    if (ts_node_is_null(block)) {
+        return NULL;
+    }
+    TSNode ret_expr;
+    memset(&ret_expr, 0, sizeof(ret_expr));
+    uint32_t nc = ts_node_named_child_count(block);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode st = ts_node_named_child(block, i);
+        if (strcmp(ts_node_type(st), "expression_statement") != 0) {
+            continue;
+        }
+        TSNode inner = ts_node_named_child(st, 0);
+        if (ts_node_is_null(inner)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(inner), "return_expression") == 0) {
+            uint32_t rc = ts_node_named_child_count(inner);
+            if (rc > 0) {
+                ret_expr = ts_node_named_child(inner, rc - 1);
+            }
+        } else {
+            /* Trailing expression = implicit return; last one wins. */
+            ret_expr = inner;
+        }
+    }
+    if (ts_node_is_null(ret_expr) ||
+        strcmp(ts_node_type(ret_expr), "method_call_expression") != 0) {
+        return NULL;
+    }
+    TSNode method = ts_node_child_by_field_name(ret_expr, "method", 6);
+    TSNode inv = ts_node_child_by_field_name(ret_expr, "invocant", 8);
+    if (ts_node_is_null(method) || ts_node_is_null(inv) ||
+        strcmp(ts_node_type(inv), "bareword") != 0) {
+        return NULL;
+    }
+    char *mname = cbm_node_text(a, method, source);
+    if (!mname || strcmp(mname, "new") != 0) {
+        return NULL;
+    }
+    char *cls = cbm_node_text(a, inv, source);
+    if (!cls || !cls[0] ||
+        !((cls[0] >= 'A' && cls[0] <= 'Z') || (cls[0] >= 'a' && cls[0] <= 'z') || cls[0] == '_')) {
+        return NULL;
+    }
+    size_t n = strlen(cls);
+    char *dotted = (char *)cbm_arena_alloc(a, n + 1);
+    if (!dotted) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (size_t r = 0; r < n; r++) {
+        if (cls[r] == ':' && r + 1 < n && cls[r + 1] == ':') {
+            dotted[w++] = '.';
+            r++;
+        } else {
+            dotted[w++] = cls[r];
+        }
+    }
+    dotted[w] = '\0';
+    const char **rt = (const char **)cbm_arena_alloc(a, 2 * sizeof(char *));
+    if (!rt) {
+        return NULL;
+    }
+    rt[0] = dotted;
+    rt[1] = NULL;
+    return rt;
+}
+
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
 
@@ -4014,6 +4095,18 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     if (def.return_type && strcmp(def.return_type, "auto") == 0 &&
         (ctx->language == CBM_LANG_CPP || ctx->language == CBM_LANG_CUDA)) {
         resolve_cpp_trailing_return(a, func_node, ctx->source, &def);
+    }
+
+    // Perl: no syntactic return type — infer one from a `Class->new` return so
+    // accessor/factory chains ($obj->build_tx->res->headers) keep a typed
+    // receiver (see perl_infer_return_types). Set BOTH the array and the
+    // singular `return_type` — the cross-file surface (pass_lsp_cross.c) carries
+    // the singular field into CBMLSPDef.return_types, which the resolver reads.
+    if (ctx->language == CBM_LANG_PERL && !def.return_types) {
+        def.return_types = perl_infer_return_types(a, func_node, ctx->source);
+        if (def.return_types && def.return_types[0] && !def.return_type) {
+            def.return_type = def.return_types[0];
+        }
     }
 
     // Receiver (Go methods)

@@ -2381,7 +2381,25 @@ static void perl_register_lsp_func(CBMArena *arena, CBMTypeRegistry *reg, CBMLSP
     rf.short_name = d->short_name;
     const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
     if (rets) {
-        rets[0] = cbm_type_unknown();
+        /* Use the extraction-inferred return type when present (dotted package
+         * spelling, e.g. "Mojo.Transaction", from perl_infer_return_types) so
+         * `my $x = $obj->accessor` types $x and the chained call resolves; else
+         * unknown (zero-edge, unchanged). d->return_types is a "|"-separated
+         * text list — take the first entry. */
+        const CBMType *ret = cbm_type_unknown();
+        if (d->return_types && d->return_types[0]) {
+            const char *bar = strchr(d->return_types, '|');
+            size_t len = bar ? (size_t)(bar - d->return_types) : strlen(d->return_types);
+            if (len > 0) {
+                char *first = (char *)cbm_arena_alloc(arena, len + 1);
+                if (first) {
+                    memcpy(first, d->return_types, len);
+                    first[len] = '\0';
+                    ret = cbm_type_named(arena, first);
+                }
+            }
+        }
+        rets[0] = ret;
         rets[1] = NULL;
     }
     rf.signature = cbm_type_func(arena, NULL, NULL, rets);
