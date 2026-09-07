@@ -2353,44 +2353,56 @@ void cbm_run_perl_lsp(CBMArena *arena, CBMFileResult *result, const char *source
 
 extern const TSLanguage *tree_sitter_perl(void);
 
+/* Project-wide multi-level @ISA index lookup (defined in pass_lsp_cross.c):
+ * a module QN → its own tagged parent spellings, or NULL. */
+const char *const *cbm_perl_inherit_lookup(const struct CBMPerlInheritIndex *idx,
+                                           const char *module_qn);
+
 /* Register the caller-supplied CBMLSPDef[] as callable functions, mirroring
  * cbm_php_register_lsp_defs (php_lsp.c). Perl defs carry no declared types,
  * so signatures get an unknown return; receiver_type (when a def has one)
  * still gets its type auto-registered so perl_lookup_method's chain walk has
  * somewhere to land. Variable defs are skipped here — the EXPORT ones are
  * consumed separately for the default-export table. */
+/* Register ONE Function/Method def as a callable func (unknown return). Skips
+ * non-callable defs. Shared by the bulk registrar and the cross-file inheritance
+ * chain-walk (which registers ancestor funcs pulled from the full def universe
+ * so perl_lookup_method's cbm_registry_lookup_func succeeds on inherited
+ * methods that the per-file def filter dropped). */
+static void perl_register_lsp_func(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *d) {
+    if (!d || !d->qualified_name || !d->short_name || !d->label)
+        return;
+    if (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)
+        return;
+    CBMRegisteredFunc rf;
+    memset(&rf, 0, sizeof(rf));
+    rf.min_params = -1;
+    rf.qualified_name = d->qualified_name;
+    rf.short_name = d->short_name;
+    const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+    if (rets) {
+        rets[0] = cbm_type_unknown();
+        rets[1] = NULL;
+    }
+    rf.signature = cbm_type_func(arena, NULL, NULL, rets);
+    if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
+        rf.receiver_type = d->receiver_type;
+        if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
+            CBMRegisteredType auto_t;
+            memset(&auto_t, 0, sizeof(auto_t));
+            auto_t.qualified_name = rf.receiver_type;
+            const char *dot = strrchr(d->receiver_type, '.');
+            auto_t.short_name = dot ? dot + 1 : rf.receiver_type;
+            cbm_registry_add_type(reg, auto_t);
+        }
+    }
+    cbm_registry_add_func(reg, rf);
+}
+
 static void cbm_perl_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDef *defs,
                                        int def_count) {
-    for (int i = 0; i < def_count; i++) {
-        CBMLSPDef *d = &defs[i];
-        if (!d->qualified_name || !d->short_name || !d->label)
-            continue;
-        if (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0)
-            continue;
-        CBMRegisteredFunc rf;
-        memset(&rf, 0, sizeof(rf));
-        rf.min_params = -1;
-        rf.qualified_name = d->qualified_name;
-        rf.short_name = d->short_name;
-        const CBMType **rets = (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-        if (rets) {
-            rets[0] = cbm_type_unknown();
-            rets[1] = NULL;
-        }
-        rf.signature = cbm_type_func(arena, NULL, NULL, rets);
-        if (strcmp(d->label, "Method") == 0 && d->receiver_type && d->receiver_type[0]) {
-            rf.receiver_type = d->receiver_type;
-            if (!cbm_registry_lookup_type(reg, rf.receiver_type)) {
-                CBMRegisteredType auto_t;
-                memset(&auto_t, 0, sizeof(auto_t));
-                auto_t.qualified_name = rf.receiver_type;
-                const char *dot = strrchr(d->receiver_type, '.');
-                auto_t.short_name = dot ? dot + 1 : rf.receiver_type;
-                cbm_registry_add_type(reg, auto_t);
-            }
-        }
-        cbm_registry_add_func(reg, rf);
-    }
+    for (int i = 0; i < def_count; i++)
+        perl_register_lsp_func(arena, reg, &defs[i]);
 }
 
 /* True when the dotted module QN `qn` ends with the dotted package path
@@ -2537,9 +2549,18 @@ static const char *perl_resolve_used_module(PerlLSPContext *ctx, const char *pkg
 void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
-                            TSTree *cached_tree, CBMResolvedCallArray *out) {
+                            TSTree *cached_tree, CBMResolvedCallArray *out,
+                            const struct CBMPerlInheritIndex *inherit_idx, CBMLSPDef *all_defs,
+                            int all_def_count) {
     if (!arena || !source || source_len <= 0 || !out)
         return;
+    /* The chain-walk resolves ANCESTOR modules (grandparent+), whose defs the
+     * per-file filter drops; fall back to the filtered set when the caller has
+     * no separate full universe (e.g. unit tests pass the same array). */
+    if (!all_defs || all_def_count <= 0) {
+        all_defs = defs;
+        all_def_count = def_count;
+    }
 
     TSParser *parser = NULL;
     TSTree *tree = cached_tree;
@@ -2637,53 +2658,122 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
     perl_register_packages(&ctx, &reg);
     perl_attach_methods(&ctx, &reg, root);
 
-    /* Cross-file inheritance: a package's @ISA parent (use parent / use base /
-     * use Mojo::Base 'X' / @ISA) usually lives in ANOTHER file, so its methods
-     * were never attached to the parent's (bare) registered type above —
-     * perl_register_packages only mints an empty type for the parent name, and
-     * the parent's subs are indexed only as standalone Functions of another
-     * module. Resolve each recorded ISA parent to a module QN (tail-match over
-     * the project-wide defs, exactly like the use-module map) and attach that
-     * module's Function/Method defs as the parent type's method table, so
-     * `$self->inherited` (self typed to a child package) walks the ISA chain and
-     * dispatches to the parent's cross-file sub. Skip parents that already carry
-     * methods (same-file parent, handled by perl_attach_methods). One level of
-     * cross-file inheritance resolves here; deeper chains need parent-of-parent
-     * seeding (this file's pass1 records only its own packages' @ISA). */
-    for (int i = 0; i < ctx.isa_count; i++) {
-        const char *parent = ctx.isa_parent_qns[i];
-        if (!parent || !parent[0])
-            continue;
-        bool have_methods = false;
-        for (int t = 0; t < reg.type_count; t++) {
-            if (reg.types[t].qualified_name &&
-                strcmp(reg.types[t].qualified_name, parent) == 0) {
-                have_methods = reg.types[t].method_names && reg.types[t].method_names[0];
-                break;
+    /* Cross-file MULTI-LEVEL inheritance: a class's @ISA parent (use parent /
+     * use base / use Mojo::Base 'X') usually lives in ANOTHER file, so its
+     * method table was never attached to the parent's (bare) registered type,
+     * and its OWN parent (the grandparent) is invisible to this file's pass1
+     * (which records only this file's packages' @ISA). Walk the ancestor chain:
+     * seed with this file's direct parents; for each ancestor resolve it to a
+     * module QN, attach that module's cross-file Function/Method defs to the
+     * ancestor type, look up the ancestor's OWN parents in the project-wide
+     * inherit index, set the ancestor type's embedded_types to them (so
+     * perl_lookup_method's frontier walk recurses the rest of the chain), and
+     * enqueue those grandparents. `$self->grandparent_method` then dispatches
+     * across arbitrarily many files. Bounded by a seen-set + hard cap; diamonds
+     * and cycles visit each ancestor once. inherit_idx == NULL degrades to the
+     * one-level behaviour (direct parents only). REALLOC-SAFE: perl_type_set_
+     * methods may grow reg.types, so no CBMRegisteredType* is held across it —
+     * the type is always re-found by name. */
+    {
+        enum { PERL_CHAIN_CAP = 256 };
+        const char *worklist[PERL_CHAIN_CAP];
+        const char *seen[PERL_CHAIN_CAP];
+        int wl_head = 0, wl_tail = 0, seen_count = 0;
+        for (int i = 0; i < ctx.isa_count && wl_tail < PERL_CHAIN_CAP; i++) {
+            const char *p = ctx.isa_parent_qns[i];
+            if (p && p[0])
+                worklist[wl_tail++] = p;
+        }
+        while (wl_head < wl_tail) {
+            const char *parent = worklist[wl_head++];
+            if (!parent || !parent[0])
+                continue;
+            bool already = false;
+            for (int s = 0; s < seen_count; s++) {
+                if (strcmp(seen[s], parent) == 0) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already)
+                continue;
+            if (seen_count < PERL_CHAIN_CAP)
+                seen[seen_count++] = parent;
+
+            /* Resolve + collect over the FULL def universe: a grandparent+ is not
+             * in the current file's import map, so its module and methods are
+             * absent from the per-file filtered `defs`. */
+            const char *resolved = perl_resolve_used_module(&ctx, parent, all_defs, all_def_count,
+                                                            import_names, import_qns, import_count);
+            if (!resolved || !resolved[0])
+                continue; /* external / unindexed ancestor: chain terminates here */
+
+            /* Attach the ancestor module's methods to type[parent] unless it
+             * already has them (same-file parent handled by perl_attach_methods).
+             * Also REGISTER each ancestor sub as a func — otherwise
+             * perl_lookup_method finds the name in the method table but
+             * cbm_registry_lookup_func fails (the func was filtered out). */
+            bool have_methods = false;
+            for (int t = 0; t < reg.type_count; t++) {
+                if (reg.types[t].qualified_name &&
+                    strcmp(reg.types[t].qualified_name, parent) == 0) {
+                    have_methods = reg.types[t].method_names && reg.types[t].method_names[0];
+                    break;
+                }
+            }
+            if (!have_methods) {
+                PerlMethodVec pmv;
+                memset(&pmv, 0, sizeof(pmv));
+                for (int j = 0; j < all_def_count; j++) {
+                    CBMLSPDef *d = &all_defs[j];
+                    if (!d->def_module_qn || strcmp(d->def_module_qn, resolved) != 0)
+                        continue;
+                    if (!d->label ||
+                        (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0))
+                        continue;
+                    if (!d->short_name || !d->qualified_name)
+                        continue;
+                    perl_register_lsp_func(ctx.arena, &reg, d);
+                    perl_mvec_push(&pmv, parent, d->short_name, d->qualified_name);
+                }
+                if (pmv.cnt > 0 && pmv.v)
+                    perl_type_set_methods(&ctx, &reg, parent, pmv.v, pmv.cnt); /* may realloc */
+                free(pmv.v);
+            }
+
+            /* Grandparents: the ancestor module's OWN tagged @ISA parents. */
+            const char *const *gps = cbm_perl_inherit_lookup(inherit_idx, resolved);
+            if (!gps || !gps[0])
+                continue;
+            int gc = 0;
+            while (gps[gc])
+                gc++;
+            /* Re-find type[parent] AFTER any set_methods realloc, then seed its
+             * embedded_types (unless already set by perl_register_packages for a
+             * same-file parent) so the frontier walk continues up the chain. */
+            CBMRegisteredType *rt = NULL;
+            for (int t = 0; t < reg.type_count; t++) {
+                if (reg.types[t].qualified_name &&
+                    strcmp(reg.types[t].qualified_name, parent) == 0) {
+                    rt = &reg.types[t];
+                    break;
+                }
+            }
+            if (rt && !(rt->embedded_types && rt->embedded_types[0])) {
+                const char **emb =
+                    (const char **)cbm_arena_alloc(ctx.arena, (size_t)(gc + 1) * sizeof(char *));
+                if (emb) {
+                    for (int g = 0; g < gc; g++)
+                        emb[g] = cbm_arena_strdup(ctx.arena, gps[g]);
+                    emb[gc] = NULL;
+                    rt->embedded_types = emb;
+                }
+            }
+            for (int g = 0; g < gc && wl_tail < PERL_CHAIN_CAP; g++) {
+                if (gps[g] && gps[g][0])
+                    worklist[wl_tail++] = gps[g];
             }
         }
-        if (have_methods)
-            continue;
-        const char *resolved = perl_resolve_used_module(&ctx, parent, defs, def_count,
-                                                        import_names, import_qns, import_count);
-        if (!resolved || !resolved[0])
-            continue;
-        PerlMethodVec pmv;
-        memset(&pmv, 0, sizeof(pmv));
-        for (int j = 0; j < def_count; j++) {
-            CBMLSPDef *d = &defs[j];
-            if (!d->def_module_qn || strcmp(d->def_module_qn, resolved) != 0)
-                continue;
-            if (!d->label ||
-                (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0))
-                continue;
-            if (!d->short_name || !d->qualified_name)
-                continue;
-            perl_mvec_push(&pmv, parent, d->short_name, d->qualified_name);
-        }
-        if (pmv.cnt > 0 && pmv.v)
-            perl_type_set_methods(&ctx, &reg, parent, pmv.v, pmv.cnt);
-        free(pmv.v);
     }
 
     /* Finalize into a per-call scratch index arena (see cbm_run_perl_lsp). */

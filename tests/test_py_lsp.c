@@ -1246,7 +1246,7 @@ TEST(pylsp_scratch_cross_dunder_carrier_survives_copy) {
     memset(&result, 0, sizeof(result));
     cbm_arena_init(&result.arena);
     cbm_pxc_run_one(CBM_LANG_PYTHON, &result, source, (int)strlen(source), "scratch", defs, 3, NULL,
-                    NULL, 0);
+                    NULL, 0, NULL, NULL, 0);
 
     const CBMCall *carrier = NULL;
     int carrier_count = 0;

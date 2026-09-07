@@ -150,10 +150,19 @@ void cbm_perl_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
  * a later plan (Phase 23, cross-file) can implement it without touching the
  * wiring. Caller supplies the combined CBMLSPDef[] (file-local + cross-file)
  * and a resolved import map (use → target QN). */
+/* Multi-level cross-file @ISA index (defined in pass_lsp_cross.h); NULL disables
+ * grandparent+ resolution and falls back to one-level. Forward-declared to keep
+ * this low-level header free of the pipeline header. */
+struct CBMPerlInheritIndex;
+
 void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, /* NULL = parse internally */
-                            CBMResolvedCallArray *out);
+                            CBMResolvedCallArray *out,
+                            const struct CBMPerlInheritIndex *inherit_idx,
+                            /* Full project def universe for ancestor (grandparent+)
+                             * resolution; NULL/0 falls back to `defs`. */
+                            CBMLSPDef *all_defs, int all_def_count);
 
 #endif /* CBM_LSP_PERL_LSP_H */

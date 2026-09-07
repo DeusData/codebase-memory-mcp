@@ -28,6 +28,7 @@
 #include "cbm.h"
 #include "../src/pipeline/lsp_resolve.h"
 #include "lsp/perl_lsp.h"
+#include "../src/pipeline/pass_lsp_cross.h"
 #include <string.h>
 
 /* ── Helpers (mirror test_php_lsp.c) ───────────────────────────── */
@@ -910,7 +911,7 @@ TEST(perllsp_cross_imported_function) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, imp_names,
-                           imp_qns, 1, NULL, &out);
+                           imp_qns, 1, NULL, &out, NULL, NULL, 0);
     int idx = find_resolved_arr(&out, "main.run", "lib.My.Util.helper");
     if (idx < 0)
         dump_resolved_arr(&out);
@@ -933,7 +934,7 @@ TEST(perllsp_cross_qw_ast_recollection) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 1, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     int idx = find_resolved_arr(&out, "main.run", "lib.My.Util.helper");
     if (idx < 0)
         dump_resolved_arr(&out);
@@ -960,7 +961,7 @@ TEST(perllsp_cross_package_method_dispatch) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     int idx_new = find_resolved_arr(&out, "main.go", "lib.Foo.Bar.new");
     int idx_frob = find_resolved_arr(&out, "main.go", "lib.Foo.Bar.frob");
     if (idx_new < 0 || idx_frob < 0)
@@ -993,11 +994,56 @@ TEST(perllsp_cross_mojo_base_inherited_method) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Dog", defs, 2, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     int idx = find_resolved_arr(&out, "Dog.bark", "lib.Animal.speak");
     if (idx < 0)
         dump_resolved_arr(&out);
     ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_multilevel_inherited_method) {
+    /* MULTI-LEVEL cross-file inheritance: Dog -> Animal -> Base, one class per
+     * file. Dog->bark calls $self->speak (immediate parent Animal, one level)
+     * AND $self->root_method (GRANDPARENT Base, two levels). The project-wide
+     * inherit index supplies Animal's own parent (Base), which this file's pass1
+     * cannot see, so the chain-walk must dispatch root_method to Base. */
+    const char *source = "package Dog;\n"
+                         "use Mojo::Base 'Animal';\n"
+                         "sub bark {\n"
+                         "    my $self = shift;\n"
+                         "    my $a = $self->speak;\n"
+                         "    my $b = $self->root_method;\n"
+                         "    return \"$a $b\";\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Base.root_method", .short_name = "root_method",
+         .label = "Function", .def_module_qn = "test.lib.Base"},
+        {.qualified_name = "test.lib.Animal.speak", .short_name = "speak", .label = "Function",
+         .def_module_qn = "test.lib.Animal"},
+        {.qualified_name = "test.lib.Dog.bark", .short_name = "bark", .label = "Function",
+         .def_module_qn = "test.lib.Dog"},
+    };
+    /* module_qn -> tagged parent spellings (as the pipeline assembles it). */
+    const char *animal_parents[] = {"Base", NULL};
+    const char *dog_parents[] = {"Animal", NULL};
+    const char *idx_modules[] = {"test.lib.Animal", "test.lib.Dog"};
+    const char *const *idx_lists[] = {animal_parents, dog_parents};
+    CBMPerlInheritIndex inherit = {
+        .module_qns = idx_modules, .parent_lists = idx_lists, .count = 2};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Dog", defs, 3, NULL, NULL,
+                           0, NULL, &out, &inherit, defs, 3);
+    int idx_speak = find_resolved_arr(&out, "Dog.bark", "lib.Animal.speak");
+    int idx_root = find_resolved_arr(&out, "Dog.bark", "lib.Base.root_method");
+    if (idx_speak < 0 || idx_root < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx_speak >= 0); /* one level (immediate parent) */
+    ASSERT(idx_root >= 0);  /* two levels (grandparent via inherit index) */
     cbm_arena_destroy(&arena);
     PASS();
 }
@@ -1020,7 +1066,7 @@ TEST(perllsp_cross_require_package_dispatch) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     int idx = find_resolved_arr(&out, "main.go", "lib.Foo.Bar.frob");
     if (idx < 0)
         dump_resolved_arr(&out);
@@ -1044,7 +1090,7 @@ TEST(perllsp_cross_default_exports) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     int idx = find_resolved_arr(&out, "main.run", "lib.My.Util.helper");
     if (idx < 0)
         dump_resolved_arr(&out);
@@ -1068,7 +1114,7 @@ TEST(perllsp_cross_export_ok_not_default) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     ASSERT(find_resolved_arr(&out, "main.run", "helper") < 0);
     cbm_arena_destroy(&arena);
     PASS();
@@ -1090,7 +1136,7 @@ TEST(perllsp_cross_unresolvable_module_zero_edges) {
     cbm_arena_init(&arena);
     CBMResolvedCallArray out = {0};
     cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 1, NULL, NULL,
-                           0, NULL, &out);
+                           0, NULL, &out, NULL, NULL, 0);
     if (out.count != 0)
         dump_resolved_arr(&out);
     ASSERT(out.count == 0);
@@ -1139,6 +1185,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_qw_ast_recollection);
     RUN_TEST(perllsp_cross_package_method_dispatch);
     RUN_TEST(perllsp_cross_mojo_base_inherited_method);
+    RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);
     RUN_TEST(perllsp_cross_export_ok_not_default);

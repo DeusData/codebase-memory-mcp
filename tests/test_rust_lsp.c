@@ -883,7 +883,7 @@ TEST(rustlsp_scratch_cross_macro_carrier_survives_copy) {
     const char *imp_names[] = {"lib"};
     const char *imp_qns[] = {"test::lib"};
     cbm_pxc_run_one(CBM_LANG_RUST, &result, caller, (int)strlen(caller), "test.main", defs, 1,
-                    imp_names, imp_qns, 1);
+                    imp_names, imp_qns, 1, NULL, NULL, 0);
 
     const CBMCall *carrier = NULL;
     for (int i = 0; i < result.calls.count; i++) {

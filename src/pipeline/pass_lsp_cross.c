@@ -1328,7 +1328,8 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * arena and merged into result->resolved_calls. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
-                     const char **imp_qns, int imp_count) {
+                     const char **imp_qns, int imp_count, const CBMPerlInheritIndex *perl_inherit,
+                     CBMLSPDef *all_defs, int all_def_count) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -1365,7 +1366,9 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
         break;
     case CBM_LANG_PERL:
         cbm_run_perl_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
-                               imp_qns, imp_count, tree, &out);
+                               imp_qns, imp_count, tree, &out,
+                               (const struct CBMPerlInheritIndex *)perl_inherit, all_defs,
+                               all_def_count);
         break;
     case CBM_LANG_JAVA:
         cbm_run_java_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
@@ -1623,7 +1626,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_arena_destroy(&scratch);
         } else {
             cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+                            imp_keys, imp_vals, imp_count,
+                            cross_registries ? cross_registries->perl_inherit : NULL, all_defs,
+                            all_def_count);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -1634,9 +1639,74 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
         cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                        imp_keys, imp_vals, imp_count);
+                        imp_keys, imp_vals, imp_count,
+                        cross_registries ? cross_registries->perl_inherit : NULL, all_defs,
+                        all_def_count);
     }
     free(filtered);
+}
+
+/* ── Perl multi-level @ISA inheritance index ─────────────────────── */
+
+const char *const *cbm_perl_inherit_lookup(const CBMPerlInheritIndex *idx, const char *module_qn) {
+    if (!idx || !idx->module_qns || !idx->parent_lists || !module_qn) {
+        return NULL;
+    }
+    for (int i = 0; i < idx->count; i++) {
+        if (idx->module_qns[i] && strcmp(idx->module_qns[i], module_qn) == 0) {
+            return idx->parent_lists[i];
+        }
+    }
+    return NULL;
+}
+
+void cbm_perl_build_inherit_index(CBMFileResult **cache, const cbm_file_info_t *files,
+                                  int file_count, char *const *def_modules,
+                                  CBMPerlInheritIndex *out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!cache || !files || !def_modules || file_count <= 0) {
+        return;
+    }
+    int pc = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (cache[i] && files[i].language == CBM_LANG_PERL && cache[i]->perl_isa_parents &&
+            cache[i]->perl_isa_parents[0] && def_modules[i]) {
+            pc++;
+        }
+    }
+    if (pc == 0) {
+        return;
+    }
+    out->module_qns = (const char **)calloc((size_t)pc, sizeof(char *));
+    out->parent_lists = (const char *const **)calloc((size_t)pc, sizeof(char **));
+    if (!out->module_qns || !out->parent_lists) {
+        cbm_perl_free_inherit_index(out);
+        return;
+    }
+    int w = 0;
+    for (int i = 0; i < file_count && w < pc; i++) {
+        if (cache[i] && files[i].language == CBM_LANG_PERL && cache[i]->perl_isa_parents &&
+            cache[i]->perl_isa_parents[0] && def_modules[i]) {
+            out->module_qns[w] = def_modules[i];
+            out->parent_lists[w] = cache[i]->perl_isa_parents;
+            w++;
+        }
+    }
+    out->count = w;
+}
+
+void cbm_perl_free_inherit_index(CBMPerlInheritIndex *idx) {
+    if (!idx) {
+        return;
+    }
+    free((void *)idx->module_qns);
+    free((void *)idx->parent_lists);
+    idx->module_qns = NULL;
+    idx->parent_lists = NULL;
+    idx->count = 0;
 }
 
 /* Expand a trailing slash-star workspace-member glob (members = ["crates" +
@@ -1807,6 +1877,11 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
     }
+    /* Perl multi-level @ISA index (borrows def_modules[] + cache perl_isa_parents;
+     * both outlive this pass). Freed after the per-file loop. */
+    CBMPerlInheritIndex perl_inherit;
+    cbm_perl_build_inherit_index(cache, files, file_count, def_modules, &perl_inherit);
+    cross_registries.perl_inherit = &perl_inherit;
 
     int processed = 0;
     int skipped_no_lsp = 0;
@@ -1856,6 +1931,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         free(source);
     }
 
+    cbm_perl_free_inherit_index(&perl_inherit);
     cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
     /* The module-QN strings are borrowed by the shared cross registries in

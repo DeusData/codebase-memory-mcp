@@ -524,6 +524,11 @@ typedef struct CBMFileResult {
     const char **constants;     // NULL-terminated (NULL if none)
     const char **global_vars;   // NULL-terminated (NULL if none)
     const char **macros;        // NULL-terminated, C/C++ only (NULL if none)
+    const char **perl_isa_parents; // Perl: TAGGED @ISA parent spellings from use
+                                   // parent/base/Mojo::Base (NULL-terminated, NULL
+                                   // if none). Distinct from `imports` — only these
+                                   // feed cross-file inheritance chain resolution;
+                                   // an ordinary `use Foo` never appears here.
 
     bool has_error;
     const char *error_msg;

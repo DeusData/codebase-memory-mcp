@@ -1093,7 +1093,33 @@ static void parse_perl_require_imports(CBMExtractCtx *ctx) {
 // (-norequire, -signatures, -role, -strict, ...) are skipped — except
 // `Mojo::Base -base`, which requires Mojo::Base itself. Mirrors
 // perl_require_import_row. Bounded recursion.
-static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo, int depth) {
+//
+// `isa` is an optional TAGGED-parent collector: every parent spelling routed
+// here (which is ONLY reached from inheritance `use` statements) is appended,
+// so the cross-file LSP can later walk the multi-level @ISA chain. It is kept
+// separate from the import rows because an ordinary `use Foo` must never be
+// treated as a parent (zero-edge guarantee).
+enum { PERL_ISA_PARENTS_CAP = 256 };
+typedef struct {
+    const char *items[PERL_ISA_PARENTS_CAP];
+    int count;
+} PerlIsaParents;
+
+static void perl_isa_parents_add(PerlIsaParents *isa, CBMArena *arena, const char *sp) {
+    if (!isa || !sp || !sp[0] || isa->count >= PERL_ISA_PARENTS_CAP) {
+        return;
+    }
+    /* De-dup within the file (many classes share a base). */
+    for (int i = 0; i < isa->count; i++) {
+        if (strcmp(isa->items[i], sp) == 0) {
+            return;
+        }
+    }
+    isa->items[isa->count++] = cbm_arena_strdup(arena, sp);
+}
+
+static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo, int depth,
+                                      PerlIsaParents *isa) {
     if (ts_node_is_null(node) || depth > 6) {
         return;
     }
@@ -1102,6 +1128,7 @@ static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo
         char *inner = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, node, ctx->source));
         if (inner && inner[0] && inner[0] != '-' && strcmp(inner, "-norequire") != 0) {
             perl_require_import_row(ctx, inner);
+            perl_isa_parents_add(isa, ctx->arena, inner);
         }
         return;
     }
@@ -1109,6 +1136,7 @@ static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo
         char *bw = cbm_node_text(ctx->arena, node, ctx->source);
         if (mojo && bw && strcmp(bw, "-base") == 0) {
             perl_require_import_row(ctx, "Mojo::Base");
+            perl_isa_parents_add(isa, ctx->arena, "Mojo::Base");
         }
         return; /* other -flags contribute no parent */
     }
@@ -1116,6 +1144,7 @@ static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo
         char *bw = cbm_node_text(ctx->arena, node, ctx->source);
         if (bw && bw[0] && bw[0] != '-') {
             perl_require_import_row(ctx, bw);
+            perl_isa_parents_add(isa, ctx->arena, bw);
         }
         return;
     }
@@ -1140,7 +1169,9 @@ static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo
                     char save = *p;
                     *p = '\0';
                     if (s[0] && s[0] != '-') {
-                        perl_require_import_row(ctx, cbm_arena_strdup(ctx->arena, s));
+                        char *w = cbm_arena_strdup(ctx->arena, s);
+                        perl_require_import_row(ctx, w);
+                        perl_isa_parents_add(isa, ctx->arena, w);
                     }
                     *p = save;
                 }
@@ -1151,11 +1182,12 @@ static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo
     /* list_expression / parenthesized wrapper: descend. */
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
-        perl_inherit_emit_parents(ctx, ts_node_named_child(node, i), mojo, depth + 1);
+        perl_inherit_emit_parents(ctx, ts_node_named_child(node, i), mojo, depth + 1, isa);
     }
 }
 
-static void perl_collect_inheritance_imports(CBMExtractCtx *ctx, TSNode node, int depth) {
+static void perl_collect_inheritance_imports(CBMExtractCtx *ctx, TSNode node, int depth,
+                                             PerlIsaParents *isa) {
     enum { PERL_INHERIT_MAX_DEPTH = 200 };
     if (ts_node_is_null(node) || depth > PERL_INHERIT_MAX_DEPTH) {
         return;
@@ -1173,7 +1205,7 @@ static void perl_collect_inheritance_imports(CBMExtractCtx *ctx, TSNode node, in
                     if (ts_node_eq(c, mod)) {
                         continue;
                     }
-                    perl_inherit_emit_parents(ctx, c, is_mojo, 0);
+                    perl_inherit_emit_parents(ctx, c, is_mojo, 0, isa);
                 }
             }
         }
@@ -1181,8 +1213,30 @@ static void perl_collect_inheritance_imports(CBMExtractCtx *ctx, TSNode node, in
     }
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc; i++) {
-        perl_collect_inheritance_imports(ctx, ts_node_named_child(node, i), depth + 1);
+        perl_collect_inheritance_imports(ctx, ts_node_named_child(node, i), depth + 1, isa);
     }
+}
+
+/* Entry point: scan tagged inheritance `use` statements, emitting import rows
+ * AND recording the file's @ISA parent spellings on the result (result-owned,
+ * NULL-terminated) for cross-file multi-level chain resolution. */
+static void parse_perl_inheritance_imports(CBMExtractCtx *ctx) {
+    PerlIsaParents isa;
+    isa.count = 0;
+    perl_collect_inheritance_imports(ctx, ctx->root, 0, &isa);
+    if (isa.count <= 0) {
+        return;
+    }
+    const char **arr =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)(isa.count + 1) * sizeof(char *));
+    if (!arr) {
+        return;
+    }
+    for (int i = 0; i < isa.count; i++) {
+        arr[i] = isa.items[i];
+    }
+    arr[isa.count] = NULL;
+    ctx->result->perl_isa_parents = arr;
 }
 
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
@@ -3233,7 +3287,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_PERL:
         parse_generic_imports(ctx, "use_statement");
         parse_perl_require_imports(ctx);
-        perl_collect_inheritance_imports(ctx, ctx->root, 0);
+        parse_perl_inheritance_imports(ctx);
         break;
     case CBM_LANG_GROOVY:
         parse_generic_imports(ctx, "groovy_import");
