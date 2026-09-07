@@ -7729,6 +7729,75 @@ static cbm_install_plan_t *g_install_plan = NULL;
 static int g_agent_install_errors = 0;
 static int g_agent_uninstall_errors = 0;
 
+/* Every agent configuration uninstall could not clean, kept for the closing
+ * summary. A cleanup failure no longer stops executable and index removal
+ * (#1954: one symlinked ~/.cursor/mcp.json left a 300 MB binary plus the whole
+ * cache behind), so the user needs ONE list of what is still theirs to fix,
+ * with the observed reason next to each file. */
+typedef struct {
+    char agent[64];
+    char operation[48];
+    char path[CLI_BUF_1K];
+    char reason[160];
+    char detail[160];
+} cbm_agent_config_failure_t;
+
+static cbm_agent_config_failure_t *g_agent_uninstall_failures = NULL;
+static int g_agent_uninstall_failure_count = 0;
+static int g_agent_uninstall_failure_cap = 0;
+
+static void agent_uninstall_failures_reset(void) {
+    free(g_agent_uninstall_failures);
+    g_agent_uninstall_failures = NULL;
+    g_agent_uninstall_failure_count = 0;
+    g_agent_uninstall_failure_cap = 0;
+}
+
+static void agent_uninstall_failure_record(const char *agent, const char *operation,
+                                           const char *path, const char *reason,
+                                           const char *detail) {
+    if (g_agent_uninstall_failure_count >= g_agent_uninstall_failure_cap) {
+        int ncap = g_agent_uninstall_failure_cap ? g_agent_uninstall_failure_cap * 2 : CLI_BUF_16;
+        cbm_agent_config_failure_t *grown =
+            realloc(g_agent_uninstall_failures, (size_t)ncap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        g_agent_uninstall_failures = grown;
+        g_agent_uninstall_failure_cap = ncap;
+    }
+    cbm_agent_config_failure_t *entry =
+        &g_agent_uninstall_failures[g_agent_uninstall_failure_count++];
+    (void)snprintf(entry->agent, sizeof(entry->agent), "%s", agent ? agent : "unknown");
+    (void)snprintf(entry->operation, sizeof(entry->operation), "%s",
+                   operation ? operation : "unknown");
+    (void)snprintf(entry->path, sizeof(entry->path), "%s", path ? path : "unknown");
+    (void)snprintf(entry->reason, sizeof(entry->reason), "%s", reason ? reason : "");
+    (void)snprintf(entry->detail, sizeof(entry->detail), "%s", detail ? detail : "");
+}
+
+/* The closing list of what uninstall could not clean. Printed AFTER the
+ * executable and the indexes are gone, so nothing in it is a reason to keep
+ * the installation around — each line is one file the user removes an entry
+ * from by hand. */
+static void agent_uninstall_failures_report(bool dry_run) {
+    if (g_agent_uninstall_failure_count == 0) {
+        return;
+    }
+    (void)fprintf(stderr, "\nerror: uninstall %s with %d agent configuration(s) left uncleaned:\n",
+                  dry_run ? "dry-run finished" : "finished", g_agent_uninstall_failure_count);
+    for (int i = 0; i < g_agent_uninstall_failure_count; i++) {
+        const cbm_agent_config_failure_t *entry = &g_agent_uninstall_failures[i];
+        (void)fprintf(stderr, "  %s (%s): %s", entry->agent, entry->operation, entry->path);
+        if (entry->reason[0]) {
+            (void)fprintf(stderr, " reason=%s", entry->reason);
+        }
+        (void)fputs(entry->detail, stderr);
+        (void)fputc('\n', stderr);
+    }
+    (void)fputs("Remove the codebase-memory-mcp entries from these files by hand.\n", stderr);
+}
+
 static void plan_record(const char *agent, const char *kind, const char *path) {
     if (!g_install_plan || !path || !path[0]) {
         return;
@@ -7801,6 +7870,9 @@ static void record_agent_config_error_with_reason(bool uninstalling, const char 
     }
     (void)fputs(detail, stderr);
     (void)fputc('\n', stderr);
+    if (uninstalling) {
+        agent_uninstall_failure_record(agent, operation, path, reason, detail);
+    }
 }
 
 static void record_agent_config_error(bool uninstalling, const char *agent, const char *operation,
@@ -12044,13 +12116,12 @@ static int cli_uninstall_activate(void *opaque) {
     uninstall_additional_agents(&activation->agents, activation->home, activation->dry_run);
     uninstall_agent_client_registry(activation->home, activation->dry_run);
 
-    if (g_agent_uninstall_errors != 0) {
-        cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction,
-                                                      "uninstall_transaction_config_cleanup_abort");
-        (void)fprintf(stderr, "error: one or more agent cleanup operations failed; executable "
-                              "and index removal were not started\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
+    /* Agent-config failures are collected, never a gate: an entry the editors
+     * refuse to touch (a symlinked config, a foreign file, a malformed
+     * document) is the user's to fix by hand, and leaving a 300 MB executable
+     * plus every index behind because of it is the data-loss shape of #1954.
+     * The indexes and the executable go now; the failures are listed at the
+     * end and decide the exit code. */
 
     if (activation->delete_indexes && !activation->dry_run) {
         int expected = count_db_indexes(activation->home);
@@ -12151,6 +12222,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     printf("codebase-memory-mcp uninstall\n\n");
 
     g_agent_uninstall_errors = 0;
+    agent_uninstall_failures_reset();
     cbm_detected_agents_t agents = cbm_detect_agents(home);
 
     /* Confirm index removal outside the startup lock, but defer the mutation
@@ -12220,6 +12292,19 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         (void)cli_activation_transaction_abort(&activation.binary_transaction);
     }
     if (activation_rc != CLI_OK) {
+        agent_uninstall_failures_reset();
+        return CLI_TRUE;
+    }
+
+    if (g_agent_uninstall_errors != 0) {
+        agent_uninstall_failures_report(dry_run);
+        agent_uninstall_failures_reset();
+        printf("\nUninstall finished with errors; the files listed above still hold "
+               "codebase-memory-mcp entries. Please restart your coding-agent sessions "
+               "to properly take this into account.\n");
+        if (dry_run) {
+            printf("(dry-run — no files were modified)\n");
+        }
         return CLI_TRUE;
     }
 
@@ -12228,7 +12313,7 @@ int cbm_cmd_uninstall(int argc, char **argv) {
     if (dry_run) {
         printf("(dry-run — no files were modified)\n");
     }
-    return g_agent_uninstall_errors == 0 ? 0 : CLI_TRUE;
+    return 0;
 }
 
 /* ── Subcommand: update ───────────────────────────────────────── */
