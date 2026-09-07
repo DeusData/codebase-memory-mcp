@@ -1615,7 +1615,10 @@ TEST(vb6_implements_is_an_import) {
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT(has_import(r, "IShape"));
-    ASSERT(has_def(r, "Function", "Go"));
+    /* A .cls IS a class: its procedures are Methods of the synthesised
+     * Class (see cbm_extract_definitions), never free Functions. */
+    ASSERT(has_def(r, "Method", "Go"));
+    ASSERT(!has_def(r, "Function", "Go"));
     cbm_free_result(r);
     PASS();
 }
