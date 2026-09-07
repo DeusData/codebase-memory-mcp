@@ -40,4 +40,7 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
  * different codec version — callers route that to a full rebuild. */
 int cbm_lsp_surface_defs_from_json(CBMArena *arena, const char *defs_json, CBMLSPDef **out_defs);
 
+/* Owned minimal extraction surface for bounded two-pass indexing. */
+CBMFileResult *cbm_lsp_surface_copy_result(const CBMFileResult *src);
+
 #endif /* CBM_PIPELINE_LSP_SURFACE_H */

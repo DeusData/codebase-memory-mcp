@@ -12,6 +12,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
+#include "pipeline/lsp_surface.h"
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
@@ -12814,6 +12815,60 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+TEST(pipeline_streaming_surface_survives_extraction_release) {
+    const CBMLanguage languages[] = {CBM_LANG_GO, CBM_LANG_PYTHON, CBM_LANG_JAVA, CBM_LANG_RUST};
+    const char *paths[] = {"types.go", "types.py", "Types.java", "types.rs"};
+    const char *sources[] = {
+        "package types\ntype Service struct { Name string }\nfunc (s *Service) Work(x int) string "
+        "{ return s.Name }\n",
+        "from other import Parent\n@decorate\nclass Child(Parent):\n    def work(self, x: int) -> "
+        "str:\n        return str(x)\n",
+        "package types; public interface Types { String work(int x); }\n",
+        "trait Work { fn work(&self); }\nstruct Service;\nimpl Work for Service { fn work(&self) "
+        "{} }\n",
+    };
+    for (int i = 0; i < 4; i++) {
+        CBMFileResult *original = cbm_extract_file(sources[i], strlen(sources[i]), languages[i],
+                                                   "surface", paths[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(original);
+        CBMFileResult *copy = cbm_lsp_surface_copy_result(original);
+        ASSERT_NOT_NULL(copy);
+        cbm_file_info_t file = {.rel_path = (char *)paths[i], .language = languages[i]};
+        char *modules[1] = {NULL};
+        int starts[2] = {0};
+        int count = 0;
+        CBMLSPDef *defs =
+            cbm_pxc_collect_all_defs(NULL, &original, &file, 1, "surface", modules, &count, starts);
+        cbm_lsp_surface_row_t *before = NULL;
+        int before_count = 0;
+        int before_rc = cbm_lsp_surface_build_rows("surface", &original, &file, 1, defs, starts,
+                                                   &before, &before_count);
+        free(defs);
+        free(modules[0]);
+        modules[0] = NULL;
+        cbm_free_result(original);
+        /* All original strings and arrays are now dead. ASan checks the copy's
+         * transitive ownership, and codec equality checks the complete surface. */
+        defs = cbm_pxc_collect_all_defs(NULL, &copy, &file, 1, "surface", modules, &count, starts);
+        cbm_lsp_surface_row_t *after = NULL;
+        int after_count = 0;
+        int after_rc = cbm_lsp_surface_build_rows("surface", &copy, &file, 1, defs, starts, &after,
+                                                  &after_count);
+        bool same = before_rc == 0 && after_rc == 0 && before_count == 1 && after_count == 1 &&
+                    strcmp(before[0].defs_json, after[0].defs_json) == 0;
+        bool no_body = copy->calls.count == 0 && copy->usages.count == 0 &&
+                       copy->cached_tree == NULL && copy->defs.items[0].body_tokens == NULL;
+        cbm_store_free_lsp_surfaces(before, before_count);
+        cbm_store_free_lsp_surfaces(after, after_count);
+        free(defs);
+        free(modules[0]);
+        cbm_free_result(copy);
+        ASSERT_TRUE(same);
+        ASSERT_TRUE(no_body);
+    }
+    PASS();
+}
+
 /* The closure-repair route lives and dies by two properties of the persisted
  * per-file LSP surface: a BODY edit must leave the surface_sha unchanged (the
  * early cutoff -- no dependent recomputation owed), while a SIGNATURE edit
@@ -13491,6 +13546,7 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_streaming_surface_survives_extraction_release);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);

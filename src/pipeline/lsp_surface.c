@@ -16,6 +16,7 @@
  *     serialization therefore IS surface equality, and the sha over the
  *     bytes is the early-cutoff key: a body edit reserializes identically.
  */
+#include "foundation/arena.h"
 #include "pipeline/lsp_surface.h"
 
 #include <stdlib.h>
@@ -36,6 +37,97 @@ enum { SURFACE_CODEC_VERSION = 1 };
  * edges from dependent SQL files. KEEP IN SYNC with pxc_map_label
  * (pass_lsp_cross.c) and incr_label_is_registry_symbol
  * (pipeline_incremental.c); the codec unit test cross-checks the three. */
+/* Keep only the definition/import surface needed after pass A. In particular,
+ * no call sites, usage arrays, ASTs, source bytes or body fingerprints survive.
+ * collect_all_defs must run after ALL files have entered the name registry and
+ * IMPORTS graph, so serializing already-resolved defs inside a batch is lossy. */
+static const char **surface_copy_strings(CBMArena *arena, const char *const *src, int count) {
+    if (!src) {
+        return NULL;
+    }
+    if (count < 0) {
+        count = 0;
+        while (src[count]) {
+            count++;
+        }
+    }
+    const char **dst = cbm_arena_alloc(arena, ((size_t)count + 1) * sizeof(*dst));
+    if (!dst) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        dst[i] = src[i] ? cbm_arena_strdup(arena, src[i]) : NULL;
+        if (src[i] && !dst[i]) {
+            return NULL;
+        }
+    }
+    dst[count] = NULL;
+    return dst;
+}
+
+CBMFileResult *cbm_lsp_surface_copy_result(const CBMFileResult *src) {
+    CBMFileResult *dst = calloc(1, sizeof(*dst));
+    if (!dst) {
+        return NULL;
+    }
+    cbm_arena_init_sized(&dst->arena, 1024);
+#define COPY_STR(to, from, field)                                                          \
+    do {                                                                                   \
+        (to)->field = (from)->field ? cbm_arena_strdup(&dst->arena, (from)->field) : NULL; \
+        if ((from)->field && !(to)->field) {                                               \
+            goto fail;                                                                     \
+        }                                                                                  \
+    } while (0)
+#define COPY_ARRAY(field)                                                                        \
+    do {                                                                                         \
+        dst->field.count = src->field.count;                                                     \
+        dst->field.items =                                                                       \
+            cbm_arena_calloc(&dst->arena, (size_t)src->field.count * sizeof(*dst->field.items)); \
+        if (src->field.count && !dst->field.items) {                                             \
+            goto fail;                                                                           \
+        }                                                                                        \
+    } while (0)
+    COPY_STR(dst, src, namespace_name);
+    COPY_ARRAY(defs);
+    COPY_ARRAY(imports);
+    COPY_ARRAY(impl_traits);
+    for (int i = 0; i < src->defs.count; i++) {
+        const CBMDefinition *from = &src->defs.items[i];
+        CBMDefinition *to = &dst->defs.items[i];
+        COPY_STR(to, from, name);
+        COPY_STR(to, from, qualified_name);
+        COPY_STR(to, from, label);
+        COPY_STR(to, from, parent_class);
+        COPY_STR(to, from, return_type);
+        COPY_STR(to, from, impl_trait);
+        to->is_abstract = from->is_abstract;
+        to->signature_param_count = from->signature_param_count;
+        to->signature_param_types = surface_copy_strings(&dst->arena, from->signature_param_types,
+                                                         from->signature_param_count);
+        to->base_classes = surface_copy_strings(&dst->arena, from->base_classes, -1);
+        to->decorators = surface_copy_strings(&dst->arena, from->decorators, -1);
+        if ((from->signature_param_types && !to->signature_param_types) ||
+            (from->base_classes && !to->base_classes) || (from->decorators && !to->decorators)) {
+            goto fail;
+        }
+    }
+    for (int i = 0; i < src->imports.count; i++) {
+        COPY_STR(&dst->imports.items[i], &src->imports.items[i], local_name);
+        COPY_STR(&dst->imports.items[i], &src->imports.items[i], module_path);
+    }
+    for (int i = 0; i < src->impl_traits.count; i++) {
+        COPY_STR(&dst->impl_traits.items[i], &src->impl_traits.items[i], trait_name);
+        COPY_STR(&dst->impl_traits.items[i], &src->impl_traits.items[i], struct_name);
+        COPY_STR(&dst->impl_traits.items[i], &src->impl_traits.items[i], struct_qn);
+    }
+#undef COPY_STR
+#undef COPY_ARRAY
+    return dst;
+fail:
+    cbm_free_result(dst);
+    return NULL;
+}
+
 static bool surface_reg_only_label(const char *label) {
     return label && (strcmp(label, "Field") == 0 || cbm_label_is_relation(label));
 }

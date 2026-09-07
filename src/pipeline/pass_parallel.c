@@ -210,6 +210,9 @@ static cbm_parallel_extract_opts_t cbm_parallel_extract_resolve_opts(
         if (opts->retain_per_file_max_bytes > 0) {
             resolved.retain_per_file_max_bytes = opts->retain_per_file_max_bytes;
         }
+        resolved.backpressure_futile = opts->backpressure_futile;
+        resolved.replay = opts->replay;
+        resolved.skip_pkgmap = opts->skip_pkgmap;
     }
 
     /* Correctness invariant: a single file can never exceed the total budget. */
@@ -666,7 +669,9 @@ typedef struct {
      * in-flight transients, holds the memory, so napping cannot reclaim it.
      * While set, pulls skip the nap (the designed soft overshoot); the cheap
      * over-budget probe re-arms the gate once RSS drains under budget. */
-    _Atomic int bp_futile;
+    _Atomic int *bp_futile;
+    bool replay;
+    bool skip_pkgmap;
 
     const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
     const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
@@ -760,7 +765,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * the gate as soon as RSS drains under budget. */
         if (cbm_mem_budget() > 0) {
             bool over = cbm_mem_over_budget();
-            bool futile = atomic_load_explicit(&ec->bp_futile, memory_order_relaxed) != 0;
+            bool futile = atomic_load_explicit(ec->bp_futile, memory_order_relaxed) != 0;
             if (over && !futile) {
                 cbm_mem_collect();
                 atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
@@ -775,12 +780,12 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                     /* Log only the 0→1 transition: all workers race into the
                      * gate before anyone latches, so a plain store would WARN
                      * once per worker (12 lines per latch event). */
-                    if (atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
+                    if (atomic_exchange_explicit(ec->bp_futile, 1, memory_order_relaxed) == 0) {
                         cbm_log_warn("mem.backpressure.futile", "action", "soft_overshoot");
                     }
                 }
             } else if (!over && futile) {
-                atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
+                atomic_store_explicit(ec->bp_futile, 0, memory_order_relaxed);
             }
         }
 
@@ -898,7 +903,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         }
 
         /* Create definition nodes in local gbuf */
-        for (int d = 0; d < result->defs.count; d++) {
+        for (int d = 0; !ec->replay && d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];
             if (def->qualified_name && def->name) {
                 insert_def_into_gbuf(ws, fi, def);
@@ -911,7 +916,7 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         cbm_free_tree(result);
 
         /* Detect and parse manifest files for package map */
-        {
+        if (!ec->skip_pkgmap) {
             const char *bn = strrchr(fi->rel_path, '/');
             cbm_pkgmap_try_parse(bn ? bn + SKIP_ONE : fi->rel_path, fi->rel_path, source,
                                  source_len, &ec->pkg_entries[worker_id]);
@@ -1028,6 +1033,10 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                             CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
                             int worker_count, const cbm_parallel_extract_opts_t *opts) {
     cbm_parallel_extract_opts_t resolved_opts = cbm_parallel_extract_resolve_opts(opts);
+    _Atomic int local_bp_futile;
+    atomic_init(&local_bp_futile, 0);
+    _Atomic int *bp_futile =
+        resolved_opts.backpressure_futile ? resolved_opts.backpressure_futile : &local_bp_futile;
 
     if (file_count == 0) {
         return 0;
@@ -1102,7 +1111,8 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
 
     /* ObjectScript macro table (NULL when no .inc include files present). */
     CBMMacroTable *pp_macro_table =
-        cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
+        ctx->macro_table ? NULL
+                         : cbm_build_macro_table_from_files(files, file_count, ctx->repo_path);
 
     extract_ctx_t ec = {
         .files = files,
@@ -1120,15 +1130,17 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .retain_sources = resolved_opts.retain_sources,
         .retain_total_budget_bytes = resolved_opts.retain_total_budget_bytes,
         .retain_per_file_max_bytes = resolved_opts.retain_per_file_max_bytes,
-        .macro_table = pp_macro_table,
+        .macro_table = ctx->macro_table ? ctx->macro_table : pp_macro_table,
         .return_type_table = ctx->return_type_table,
+        .bp_futile = bp_futile,
+        .replay = resolved_opts.replay,
+        .skip_pkgmap = resolved_opts.skip_pkgmap,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);
     atomic_init(&ec.retained_bytes, 0);
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
-    atomic_init(&ec.bp_futile, 0);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
@@ -1158,9 +1170,28 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     if (err_lists) {
         for (int i = 0; i < worker_count; i++) {
             for (int j = 0; j < err_lists[i].count; j++) {
-                cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
-                                            err_lists[i].items[j].reason,
-                                            err_lists[i].items[j].phase);
+                /* A second parse must not double parse_partial/skipped counts.
+                 * Preserve a new failure if the replay sees something different. */
+                cbm_file_error_t *prior = NULL;
+                int prior_count = 0;
+                bool duplicate = false;
+                if (resolved_opts.replay) {
+                    cbm_pipeline_get_file_errors(ctx->pipeline, &prior, &prior_count);
+                    for (int k = 0; k < prior_count; k++) {
+                        if (prior[k].path && prior[k].reason && prior[k].phase &&
+                            strcmp(prior[k].path, err_lists[i].items[j].path) == 0 &&
+                            strcmp(prior[k].reason, err_lists[i].items[j].reason) == 0 &&
+                            strcmp(prior[k].phase, err_lists[i].items[j].phase) == 0) {
+                            duplicate = true;
+                            break;
+                        }
+                    }
+                }
+                if (!duplicate) {
+                    cbm_pipeline_add_file_error(ctx->pipeline, err_lists[i].items[j].path,
+                                                err_lists[i].items[j].reason,
+                                                err_lists[i].items[j].phase);
+                }
                 free(err_lists[i].items[j].path);
                 free(err_lists[i].items[j].reason);
                 free(err_lists[i].items[j].phase);
@@ -1170,7 +1201,11 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         free(err_lists);
     }
 
-    merge_pkg_entries(ctx, pkg_entries, worker_count);
+    if (resolved_opts.skip_pkgmap) {
+        free(pkg_entries); /* no entries were collected */
+    } else {
+        merge_pkg_entries(ctx, pkg_entries, worker_count);
+    }
 
     cbm_aligned_free(workers);
     free(sorted);
@@ -1300,17 +1335,54 @@ static void create_channel_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *r
     }
 }
 
+int cbm_register_definitions_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                        int file_count, CBMFileResult **result_cache) {
+    int reg_entries = 0;
+    int defines_edges = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (cbm_pipeline_check_cancel(ctx)) {
+            return CBM_NOT_FOUND;
+        }
+        CBMFileResult *result = result_cache[i];
+        if (!result) {
+            continue;
+        }
+        const char *rel = files[i].rel_path;
+        for (int d = 0; d < result->defs.count; d++) {
+            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
+        }
+    }
+    cbm_log_info("parallel.registry.definitions", "entries", itoa_log(reg_entries), "defines",
+                 itoa_log(defines_edges));
+    return 0;
+}
+
+int cbm_create_relationship_carriers_from_cache(cbm_pipeline_ctx_t *ctx,
+                                                const cbm_file_info_t *files, int file_count,
+                                                CBMFileResult **result_cache,
+                                                CBMHashTable *namespace_map) {
+    int imports_edges = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (cbm_pipeline_check_cancel(ctx)) {
+            return CBM_NOT_FOUND;
+        }
+        CBMFileResult *result = result_cache[i];
+        if (!result) {
+            continue;
+        }
+        const char *rel = files[i].rel_path;
+        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        create_channel_edges(ctx, result, rel);
+        cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
+    }
+    cbm_log_info("parallel.registry.relationship_carriers", "imports", itoa_log(imports_edges));
+    return 0;
+}
+
 int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                   int file_count, CBMFileResult **result_cache) {
     cbm_log_info("parallel.registry.start", "files", itoa_log(file_count));
 
-    int reg_entries = 0;
-    int defines_edges = 0;
-    int imports_edges = 0;
-
-    /* Namespace/package → File-QN map for namespace imports (C# `using`,
-     * Java/Kotlin `import`, PHP `use`). Built from the full result cache so
-     * every declaring file is visible regardless of loop order. */
     const char **rels = (const char **)calloc((size_t)file_count, sizeof(char *));
     if (rels) {
         for (int i = 0; i < file_count; i++) {
@@ -1321,34 +1393,15 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels, file_count);
     free(rels);
 
-    for (int i = 0; i < file_count; i++) {
-        if (cbm_pipeline_check_cancel(ctx)) {
-            cbm_pipeline_namespace_map_free(namespace_map);
-            return CBM_NOT_FOUND;
-        }
-
-        CBMFileResult *result = result_cache[i];
-        if (!result) {
-            continue;
-        }
-
-        const char *rel = files[i].rel_path;
-
-        /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
-        for (int d = 0; d < result->defs.count; d++) {
-            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
-        }
-
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
-        create_channel_edges(ctx, result, rel);
-        cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
+    int rc = cbm_register_definitions_from_cache(ctx, files, file_count, result_cache);
+    if (rc == 0) {
+        rc = cbm_create_relationship_carriers_from_cache(ctx, files, file_count, result_cache,
+                                                         namespace_map);
     }
 
     cbm_pipeline_namespace_map_free(namespace_map);
-
-    cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
-                 itoa_log(defines_edges), "imports", itoa_log(imports_edges));
-    return 0;
+    cbm_log_info("parallel.registry.done", "status", rc == 0 ? "ok" : "failed");
+    return rc;
 }
 
 /* ── Phase 4: Parallel Resolution ────────────────────────────────── */
@@ -3249,11 +3302,11 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_service_pattern_cache_end();
 }
 
-int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
-                         CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
-                         int worker_count, CBMLSPDef *all_defs, int def_count,
-                         char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
-                         void *cross_registries_v) {
+int cbm_parallel_resolve_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                            CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
+                            int worker_count, CBMLSPDef *all_defs, int def_count,
+                            char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
+                            void *cross_registries_v, bool finalize_graph) {
     /* See header: typed as void* across the TU boundary; cast back here. */
     CBMCrossLspRegistries *cross_registries = (CBMCrossLspRegistries *)cross_registries_v;
     if (file_count == 0) {
@@ -3357,12 +3410,13 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 
     cbm_aligned_free(workers);
 
-    /* Go-style implicit interface satisfaction (needs full graph, serial) */
-    int go_impl = cbm_pipeline_implements_go(ctx);
-
-    /* Explicit-language override detection (same serial full-graph tail the
-     * sequential pipeline runs — the two venues must emit identical graphs). */
-    total_lsp_overrides += cbm_pipeline_override_explicit(ctx);
+    int go_impl = 0;
+    if (finalize_graph) {
+        /* These scans require the complete graph and therefore run once after
+         * the final batch in the bounded large-repository path. */
+        go_impl = cbm_pipeline_implements_go(ctx);
+        total_lsp_overrides += cbm_pipeline_override_explicit(ctx);
+    }
 
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;
@@ -3529,4 +3583,22 @@ int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
     cbm_log_info("parallel.resolve.scan_cost", "tail_lookups", tl_buf, "tail_candidates", tc_buf,
                  "per_lookup", tp_buf, "fallback_rows", fb_buf);
     return 0;
+}
+
+int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,
+                         CBMFileResult **result_cache, _Atomic int64_t *shared_ids,
+                         int worker_count, CBMLSPDef *all_defs, int def_count,
+                         char *const *def_modules, struct CBMModuleDefIndex *module_def_index,
+                         void *cross_registries_v) {
+    return cbm_parallel_resolve_ex(ctx, files, file_count, result_cache, shared_ids, worker_count,
+                                   all_defs, def_count, def_modules, module_def_index,
+                                   cross_registries_v, true);
+}
+
+int cbm_parallel_resolve_finalize(cbm_pipeline_ctx_t *ctx) {
+    int go_impl = cbm_pipeline_implements_go(ctx);
+    int overrides = cbm_pipeline_override_explicit(ctx);
+    cbm_log_info("parallel.resolve.finalize", "go_implements", itoa_log(go_impl), "overrides",
+                 itoa_log(overrides));
+    return cbm_pipeline_check_cancel(ctx) ? CBM_NOT_FOUND : 0;
 }
