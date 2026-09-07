@@ -1048,7 +1048,11 @@ typedef struct {
 /* Search for nodes similar to the given query keywords using stored RI vectors.
  * Builds a merged query vector from the keywords, then does cosine scan via
  * the cbm_cosine_i8 SQL function joined with the nodes table.
- * Returns results sorted by score DESC. Caller must free with cbm_store_free_vector_results. */
+ * Returns CBM_STORE_OK with results sorted by score DESC (possibly zero),
+ * CBM_STORE_NOT_FOUND when the store carries no node_vectors table (lean
+ * index — an empty universe, not a fault), or CBM_STORE_ERR when the scan
+ * itself failed; callers must not render CBM_STORE_ERR as zero matches.
+ * Caller must free with cbm_store_free_vector_results. */
 int cbm_store_vector_search(cbm_store_t *s, const char *project, const char **keywords,
                             int keyword_count, int limit, cbm_vector_result_t **out,
                             int *out_count);

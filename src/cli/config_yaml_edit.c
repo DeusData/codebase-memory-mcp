@@ -3601,8 +3601,49 @@ int cbm_yaml_upsert_mapping_entry(const char *file_path, const char *section_key
     return result == 0 && release_result == 0 ? 0 : YAML_ERROR;
 }
 
+/* Removal is idempotent: a config that does not exist has nothing to remove.
+ * The JSON removers already answer OK here (cbm_json_like_read_document's
+ * "missing" result); the YAML removers instead took the lock first, and the
+ * lock directory is created beside the target — so with the parent directory
+ * absent (`~/.hermes/` never created because Hermes was detected by its
+ * binary on PATH, not by its home) every uninstall reported
+ * "does not exist or cannot be inspected" and refused to remove the
+ * executable. Only a true ENOENT short-circuits: a dangling symlink still
+ * reaches the reader and its byte-identical rejection. */
+static bool yaml_remove_target_absent(const char *path) {
+    if (!path) {
+        return false;
+    }
+#ifdef _WIN32
+    /* FILE_FLAG_OPEN_REPARSE_POINT, as in toml_read_file: opens the link
+     * itself rather than following it, so a dangling symlink does NOT count as
+     * absent and still reaches the reader — matching the POSIX branch, where
+     * lstat does not follow either. */
+    wchar_t *wide = cbm_utf8_to_wide(path);
+    if (!wide) {
+        return false;
+    }
+    HANDLE handle = CreateFileW(
+        wide, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    DWORD error = handle == INVALID_HANDLE_VALUE ? GetLastError() : 0;
+    free(wide);
+    if (handle != INVALID_HANDLE_VALUE) {
+        CloseHandle(handle);
+        return false;
+    }
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+#else
+    struct stat path_state;
+    return lstat(path, &path_state) != 0 && errno == ENOENT;
+#endif
+}
+
 int cbm_yaml_remove_mapping_entry(const char *file_path, const char *section_key,
                                   const char *entry_key) {
+    if (yaml_remove_target_absent(file_path)) {
+        return 0;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return YAML_ERROR;
@@ -3626,6 +3667,9 @@ int cbm_yaml_upsert_owned_mapping_entry(const char *file_path, const char *secti
 
 int cbm_yaml_remove_owned_mapping_entry(const char *file_path, const char *section_key,
                                         const char *entry_key, const char *canonical_entry_block) {
+    if (yaml_remove_target_absent(file_path)) {
+        return CBM_YAML_IDENTITY_EDIT_OK;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return CBM_YAML_IDENTITY_EDIT_ERROR;
@@ -3653,6 +3697,9 @@ int cbm_yaml_upsert_mapping_sequence_item(const char *file_path, const char *con
 int cbm_yaml_remove_mapping_sequence_item(const char *file_path, const char *const *sequence_path,
                                           size_t sequence_path_len, const char *identity_key,
                                           const char *identity_scalar, const char *canonical_item) {
+    if (yaml_remove_target_absent(file_path)) {
+        return CBM_YAML_IDENTITY_EDIT_OK;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return CBM_YAML_IDENTITY_EDIT_ERROR;
@@ -3675,6 +3722,9 @@ int cbm_yaml_upsert_string_list_item(const char *file_path, const char *key, con
 }
 
 int cbm_yaml_remove_string_list_item(const char *file_path, const char *key, const char *item) {
+    if (yaml_remove_target_absent(file_path)) {
+        return 0;
+    }
     yaml_config_lock_t lock;
     if (yaml_lock_acquire(file_path, &lock) != 0) {
         return YAML_ERROR;

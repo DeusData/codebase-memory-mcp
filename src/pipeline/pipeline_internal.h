@@ -864,6 +864,12 @@ void cbm_pp_bp_nap_cycles_reset(void);
 uint64_t cbm_pp_lsp_linear_fallback_rows(void);
 void cbm_pp_lsp_linear_fallback_rows_reset(void);
 
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test-only view of the Studio Export range join, so the ",+<N>" truncation
+ * marker rules can be checked without building a 256-region export file. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part);
+#endif
+
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
 /* Deterministic test-only operation count for the shared semantic-reference
  * matcher used by both sequential and fused-parallel usage materialization. */

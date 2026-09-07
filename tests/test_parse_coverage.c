@@ -20,7 +20,7 @@
  *   GREEN (fixed):  cbm_extract_file sets parse_incomplete=true iff the tree
  *                   contains ERROR/MISSING nodes, records the 1-based line
  *                   ranges of the TOP-MOST error regions ("start-end,..."),
- *                   bounded by the 64-region cap, and clean files stay
+ *                   bounded by the 256-region cap, and clean files stay
  *                   completely unflagged (no false positives).
  *
  * BEST-EFFORT framing (must never be weakened the other way): a flag means
@@ -33,6 +33,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 
 /* Convenience extract wrapper (same shape as test_extraction_imports.c). */
 static CBMFileResult *do_extract(const char *src, CBMLanguage lang, const char *path) {
@@ -103,6 +104,29 @@ static const char *PY_CLEAN = "def ok():\n"
                               "\n"
                               "def ok2():\n"
                               "    return 2\n";
+
+/* #1610 fixtures follow. Refinement fixtures live here so they sit beside the
+ * split-brace fixture they build on. */
+
+/* Same split-brace shape as C_IFDEF_SPLIT, plus real garbage further down.
+ * Guards against over-suppression: the preprocessor explains the guarded
+ * region but explains nothing about the garbage, so BOTH must stay flagged
+ * and they must be reported as two separate ranges, not one big one. */
+static const char *C_IFDEF_SPLIT_PLUS_GARBAGE = "#include <stdio.h>\n"           /* 1 */
+                                                "\n"                            /* 2 */
+                                                "void ok_before(void) { }\n"    /* 3 */
+                                                "\n"                            /* 4 */
+                                                "#ifdef FEATURE_A\n"            /* 5 */
+                                                "static int guarded(int x) {\n" /* 6 */
+                                                "#else\n"                       /* 7 */
+                                                "static int guarded_alt(int x) {\n" /* 8 */
+                                                "#endif\n"                      /* 9 */
+                                                "    return x + 1;\n"           /* 10 */
+                                                "}\n"                           /* 11 */
+                                                "\n"                            /* 12 */
+                                                "%%% ((( &&& ))) %%%\n"         /* 13 */
+                                                "\n"                            /* 14 */
+                                                "void ok_after(void) { }\n";    /* 15 */
 
 /* Perl formats have a line-oriented body terminated by a lone dot.  The
  * following named sub pins the important recovery boundary: a grammar must
@@ -214,12 +238,22 @@ TEST(py_clean_file_not_flagged) {
     PASS();
 }
 
+/* Read the trailing "+<N>" truncation marker off a range string. Returns N, or
+ * 0 when the string carries no marker. */
+static int ranges_dropped_marker(const char *ranges) {
+    const char *plus = ranges ? strrchr(ranges, '+') : NULL;
+    if (!plus || !isdigit((unsigned char)plus[1])) {
+        return 0;
+    }
+    return atoi(plus + 1);
+}
+
 TEST(error_region_cap_is_honored) {
     /* Pathological input: many separate unrecoverable garbage blocks
      * interleaved with valid defs. The collector must stay bounded by its
-     * 64-region cap (matches CBM_MAX_ERROR_REGIONS in cbm.c) — pathological
+     * 256-region cap (matches CBM_MAX_ERROR_REGIONS in cbm.c) — pathological
      * input can't blow up the report, and the flag itself still fires. */
-    enum { GARBAGE_BLOCKS = 200, LINE_CAP = 64 };
+    enum { GARBAGE_BLOCKS = 400, LINE_CAP = 256 };
     char *src = (char *)malloc(GARBAGE_BLOCKS * 96 + 1);
     ASSERT_NOT_NULL(src);
     size_t off = 0;
@@ -234,6 +268,55 @@ TEST(error_region_cap_is_honored) {
     ASSERT_GTE(r->error_region_count, 1);
     ASSERT_LTE(r->error_region_count, LINE_CAP);
     ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A clipped range list must say so. 400 garbage blocks overrun the 256-region
+ * cap, so the report keeps 256 ranges and ends with a "+<N>" marker naming the
+ * number thrown away. Without the marker the short list reads as a complete
+ * one, which is the whole defect this guards. */
+TEST(error_region_cap_reports_what_it_dropped) {
+    enum { GARBAGE_BLOCKS = 400, LINE_CAP = 256 };
+    char *src = (char *)malloc(GARBAGE_BLOCKS * 96 + 1);
+    ASSERT_NOT_NULL(src);
+    size_t off = 0;
+    for (int i = 0; i < GARBAGE_BLOCKS; i++) {
+        off += (size_t)snprintf(
+            src + off, 96, "def ok%d():\n    return %d\n%%%%%% garbage%d ((( %%%%%%\n", i, i, i);
+    }
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "cap_marker.py");
+    free(src);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->error_ranges);
+    /* The cap bound, so the kept list is full and the marker is present. */
+    ASSERT_EQ(r->error_region_count, LINE_CAP);
+    int dropped = ranges_dropped_marker(r->error_ranges);
+    ASSERT_GTE(dropped, 1);
+    /* Every block produces at most one region, so the total cannot exceed the
+     * number of blocks — a marker that overcounts would fail here. */
+    ASSERT_LTE(r->error_region_count + dropped, GARBAGE_BLOCKS);
+    /* The marker is a SUFFIX: nothing follows it, or a reader stops early and
+     * silently loses every range after it. */
+    const char *plus = strrchr(r->error_ranges, '+');
+    ASSERT_NOT_NULL(plus);
+    for (const char *c = plus + 1; *c; c++) {
+        ASSERT_TRUE(isdigit((unsigned char)*c));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Inverse guard: a file that stays under the cap must carry NO marker, or
+ * every ordinary report would look clipped. */
+TEST(uncapped_ranges_carry_no_marker) {
+    const char *src = "def ok():\n    return 1\n%%% garbage (((\ndef ok2():\n    return 2\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "small.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_EQ(ranges_dropped_marker(r->error_ranges), 0);
+    ASSERT_NULL(strchr(r->error_ranges, '+'));
     cbm_free_result(r);
     PASS();
 }
@@ -541,6 +624,216 @@ TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746) {
     PASS();
 }
 
+/* ── Phase 2: refine raw ranges with the preprocessed tree ──────────────────
+ *
+ * The raw parse sees both #ifdef branches at once, so its ERROR node covers
+ * the whole guarded construct (lines 5-11). The PREPROCESSED parse sees only
+ * the branch the preprocessor picked, and parses it clean. Every original
+ * line that shows up clean in that second parse is therefore accounted for,
+ * and reporting it as unparsed is false.
+ *
+ * What is left is the branch the preprocessor threw away — line 6 here. That
+ * one really is missing from the graph, so it stays flagged. Directive lines
+ * (#ifdef / #else / #endif) hold no construct, so a range never starts or
+ * ends on one.
+ */
+
+/* Return 1 if the "a-b,c-d" range string covers 1-based `line`. */
+static int ranges_cover_line(const char *ranges, unsigned int line) {
+    const char *p = ranges;
+    while (p && *p) {
+        unsigned int s = 0, e = 0;
+        if (sscanf(p, "%u-%u", &s, &e) == 2 && line >= s && line <= e) {
+            return 1;
+        }
+        p = strchr(p, ',');
+        if (p) {
+            p++;
+        }
+    }
+    return 0;
+}
+
+/* Total lines covered by every range in the string. */
+static unsigned int ranges_total_span(const char *ranges) {
+    const char *p = ranges;
+    unsigned int total = 0;
+    while (p && *p) {
+        unsigned int s = 0, e = 0;
+        if (sscanf(p, "%u-%u", &s, &e) == 2 && e >= s) {
+            total += e - s + 1;
+        }
+        p = strchr(p, ',');
+        if (p) {
+            p++;
+        }
+    }
+    return total;
+}
+
+TEST(c_ifdef_split_range_narrows_to_dropped_branch) {
+    /* RED before the refinement: the raw range covers the whole 5-11
+     * construct. GREEN after: only line 6, the branch the preprocessor did
+     * not pick, is still reported. */
+    CBMFileResult *r = do_extract(C_IFDEF_SPLIT, CBM_LANG_C, "split.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_TRUE(ranges_cover_line(r->error_ranges, 6u)); /* dropped branch */
+    ASSERT_LTE(ranges_total_span(r->error_ranges), 3u);  /* was 7 lines */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_ifdef_split_range_excludes_lines_the_preprocessor_explained) {
+    /* Lines 10 and 11 are the shared body and closing brace. They parse
+     * clean once a branch is chosen, so pointing an agent at them is wrong. */
+    CBMFileResult *r = do_extract(C_IFDEF_SPLIT, CBM_LANG_C, "split.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 10u));
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 11u));
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 3u)); /* ok_before */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_ifdef_split_range_never_starts_on_a_directive) {
+    /* Lines 5, 7 and 9 are bare #ifdef / #else / #endif. No construct can
+     * live on them, so they must not appear in a range. */
+    CBMFileResult *r = do_extract(C_IFDEF_SPLIT, CBM_LANG_C, "split.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 5u));
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 7u));
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 9u));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_refinement_does_not_suppress_real_garbage) {
+    /* Anti-over-suppression. The preprocessor cannot explain line 13, so it
+     * stays flagged even though the guarded region above it narrowed. */
+    CBMFileResult *r = do_extract(C_IFDEF_SPLIT_PLUS_GARBAGE, CBM_LANG_C, "both.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    ASSERT_TRUE(ranges_cover_line(r->error_ranges, 13u)); /* the garbage */
+    ASSERT_FALSE(ranges_cover_line(r->error_ranges, 3u)); /* ok_before */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(c_clean_file_stays_unflagged_after_refinement) {
+    /* The refinement must never invent a range on a file that parses. */
+    CBMFileResult *r = do_extract(C_CLEAN, CBM_LANG_C, "clean.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+
+/* The whole-file class, and the reason the parse_unusable kind exists.
+ *
+ * The Phase 2 refinement that narrows a whole-file range using the
+ * preprocessed parse only runs for C, C++ and CUDA. A Python file whose root
+ * node is ERROR gets no such help, so it still reports one range covering
+ * every line — and one range over 80% of a file is not advice worth printing. */
+TEST(python_whole_file_error_is_unusable) {
+    const char *src = ")))\n((( \n]]] [[[\ndef x(:\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "unparseable.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_TRUE(r->parse_unusable);
+    ASSERT_EQ(r->error_region_count, 1);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Inverse guard, and the one that keeps the kind meaningful: a file with a
+ * real but LOCAL parse failure must stay parse_partial. If this flipped, every
+ * flagged file would say "read the source" and the ranges would stop earning
+ * their keep. */
+TEST(local_error_stays_partial_not_unusable) {
+    const char *src = "def ok():\n    return 1\n%%% garbage (((\ndef ok2():\n    return 2\n"
+                      "def ok3():\n    return 3\ndef ok4():\n    return 4\n"
+                      "def ok5():\n    return 5\ndef ok6():\n    return 6\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_PYTHON, "local_error.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_FALSE(r->parse_unusable);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A clean file is neither. */
+TEST(clean_file_is_neither_partial_nor_unusable) {
+    CBMFileResult *r = do_extract(C_CLEAN, CBM_LANG_C, "clean_kinds.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_FALSE(r->parse_unusable);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The C file that started this work must NOT land in the unusable class. Its
+ * whole-file range is exactly what Phase 2 broke up, so if this ever flips
+ * back to true the refinement has stopped working. */
+TEST(c_ifdef_split_is_partial_never_unusable) {
+    CBMFileResult *r = do_extract(C_IFDEF_SPLIT, CBM_LANG_C, "split_kind.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_FALSE(r->parse_unusable);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Phase 0 finding 2, pinned so a tree-sitter bump cannot change it quietly.
+ *
+ * The C grammar handles `_Thread_local` unevenly, and these are the three
+ * forms measured on the grammar shipped today:
+ *
+ *   static _Thread_local int x = 0;   parses clean
+ *   static _Thread_local int *p;      parses clean
+ *   static _Thread_local char b[8];   fails — flagged as range 1-1
+ *
+ * The array line really is missing from the graph, so flagging it is the
+ * honest answer, not a false positive. This test exists to make a grammar
+ * bump visible: if a newer grammar fixes the array form, this goes red and
+ * says so, instead of leaving a wrong note in the plan. (The plan's Phase 0
+ * also listed the pointer form as failing. It does not fail today.) */
+TEST(c_thread_local_grammar_limit_is_pinned_issue963) {
+    CBMFileResult *ok = do_extract("static _Thread_local int x = 0;\n"
+                                   "void f(void) { x = 1; }\n",
+                                   CBM_LANG_C, "tls_init.c");
+    ASSERT_NOT_NULL(ok);
+    ASSERT_FALSE(ok->parse_incomplete);
+    cbm_free_result(ok);
+
+    CBMFileResult *ptr = do_extract("static _Thread_local int *p;\n"
+                                    "void f(void) { p = 0; }\n",
+                                    CBM_LANG_C, "tls_ptr.c");
+    ASSERT_NOT_NULL(ptr);
+    ASSERT_FALSE(ptr->parse_incomplete);
+    cbm_free_result(ptr);
+
+    CBMFileResult *arr = do_extract("static _Thread_local char b[8];\n"
+                                    "void f(void) { b[0] = 0; }\n",
+                                    CBM_LANG_C, "tls_arr.c");
+    ASSERT_NOT_NULL(arr);
+    ASSERT_TRUE(arr->parse_incomplete);
+    ASSERT_NOT_NULL(arr->error_ranges);
+    /* The range names the one broken line, not the whole file. */
+    ASSERT_STR_EQ("1-1", arr->error_ranges);
+    /* The clean function below it still reaches the graph. */
+    ASSERT_TRUE(has_def(arr, "f"));
+    cbm_free_result(arr);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -550,6 +843,12 @@ SUITE(parse_coverage) {
     RUN_TEST(py_recovered_def_not_flagged);
     RUN_TEST(py_clean_file_not_flagged);
     RUN_TEST(error_region_cap_is_honored);
+    RUN_TEST(error_region_cap_reports_what_it_dropped);
+    RUN_TEST(uncapped_ranges_carry_no_marker);
+    RUN_TEST(python_whole_file_error_is_unusable);
+    RUN_TEST(local_error_stays_partial_not_unusable);
+    RUN_TEST(clean_file_is_neither_partial_nor_unusable);
+    RUN_TEST(c_ifdef_split_is_partial_never_unusable);
     RUN_TEST(c_trailing_recovered_defs_keep_flag);
     RUN_TEST(dockerfile_missing_final_newline_not_flagged_issue1610);
     RUN_TEST(dockerfile_with_final_newline_still_clean_issue1610);
@@ -560,9 +859,15 @@ SUITE(parse_coverage) {
     RUN_TEST(missing_final_newline_not_flagged_across_grammars_issue1610);
     RUN_TEST(real_error_before_eof_still_flagged_without_final_newline_issue1610);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_issue1610);
+    RUN_TEST(c_ifdef_split_range_narrows_to_dropped_branch);
+    RUN_TEST(c_ifdef_split_range_excludes_lines_the_preprocessor_explained);
+    RUN_TEST(c_ifdef_split_range_never_starts_on_a_directive);
+    RUN_TEST(c_refinement_does_not_suppress_real_garbage);
+    RUN_TEST(c_clean_file_stays_unflagged_after_refinement);
     RUN_TEST(perl_format_followed_by_named_sub_is_complete_issue1838);
     RUN_TEST(perl_malformed_source_remains_partial_issue1838);
     RUN_TEST(dockerfile_trailing_blank_at_eof_not_flagged_issue1746);
     RUN_TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
+    RUN_TEST(c_thread_local_grammar_limit_is_pinned_issue963);
 }
