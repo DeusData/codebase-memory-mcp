@@ -156,7 +156,6 @@ import { CbmRpcProvider, symbolKindOf } from './provider/cbm-rpc-provider';
 import MonacoReader from './reader/MonacoReader';
 import type { ReaderStatus } from './reader/MonacoReader';
 import { FileNotReadableError, loadFileDocument, READER_RPC_TOOL } from './reader/file-source';
-import { reportError } from './provider/error-observer';
 import type { ReaderDocument } from './reader/file-source';
 import { badgesForLines } from './core/step-badge-decorator';
 import type { SymbolRef } from './core/focus-protocol';
@@ -1760,12 +1759,6 @@ export default function App(): JSX.Element {
                     setDocument(undefined);
                     setReaderStatus(error instanceof FileNotReadableError ? 'unavailable' : 'failed');
                     setReaderMessage(error instanceof Error ? error.message : String(error));
-                    // The reader shows the sentence; the frontend log keeps it
-                    // (the /rpc failures underneath announce themselves, a file
-                    // the index does not know does not).
-                    if (error instanceof FileNotReadableError) {
-                        reportError({ source: 'reader', level: 'warn', message: error.message });
-                    }
                 });
         },
         [client, project],
