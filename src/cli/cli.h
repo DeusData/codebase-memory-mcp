@@ -430,6 +430,7 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
 #define CBM_CONFIG_UI_PORT "ui_port"
+#define CBM_CONFIG_WINDOWS_DACL_HARDENING "windows-dacl-hardening"
 
 /* Whether the background watcher subsystem should run at all (default true).
  * When false, the daemon host skips building and starting the watcher entirely:
