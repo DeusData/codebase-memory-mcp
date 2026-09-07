@@ -12916,7 +12916,8 @@ TEST(pipeline_streaming_surface_survives_extraction_release) {
 }
 
 TEST(pipeline_streaming_cross_batch_graph_and_diagnostics) {
-    char tmp[] = "/tmp/cbm_streaming_XXXXXX";
+    /* Windows expands /tmp/ to the per-user TEMP path in place. */
+    char tmp[CBM_SZ_512] = "/tmp/cbm_streaming_XXXXXX";
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     write_temp_file(tmp, "Base.java",
                     "package batch; public class Base { "
