@@ -1003,6 +1003,112 @@ TEST(perllsp_cross_mojo_base_inherited_method) {
     PASS();
 }
 
+TEST(perllsp_cross_deep_qn_inherited_sub) {
+    /* REAL-MOJOLICIOUS SHAPE (sub): deep path-based module QNs + a `::`-containing
+     * parent (use Mojo::Base 'Mojo::Message'). Isolates whether the deep QN /
+     * dotted-parent resolution regresses vs the flat-QN mojo_base test. */
+    const char *source = "package Mojo::Message::Request;\n"
+                         "use Mojo::Base 'Mojo::Message';\n"
+                         "sub clone {\n"
+                         "    my $self = shift;\n"
+                         "    return $self->extract_start_line;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "proj.lib.Mojo.Message.extract_start_line",
+         .short_name = "extract_start_line", .label = "Function",
+         .def_module_qn = "proj.lib.Mojo.Message"},
+        {.qualified_name = "proj.lib.Mojo.Message.Request.clone", .short_name = "clone",
+         .label = "Function", .def_module_qn = "proj.lib.Mojo.Message.Request"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "proj.lib.Mojo.Message.Request",
+                           defs, 2, NULL, NULL, 0, NULL, &out, NULL, defs, 2);
+    int idx = find_resolved_arr(&out, "Request.clone", "Message.extract_start_line");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_deep_qn_inherited_accessor) {
+    /* REAL-MOJOLICIOUS SHAPE (has-accessor): identical to the sub case but the
+     * inherited target is a synthetic has-accessor def (label "Method", the
+     * shape emitted by perl_scan_has_accessors). $self->content in a subclass
+     * must dispatch up ISA to the parent module's accessor node. */
+    const char *source = "package Mojo::Message::Request;\n"
+                         "use Mojo::Base 'Mojo::Message';\n"
+                         "sub clone {\n"
+                         "    my $self = shift;\n"
+                         "    return $self->content;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "proj.lib.Mojo.Message.content", .short_name = "content",
+         .label = "Method", .def_module_qn = "proj.lib.Mojo.Message"},
+        {.qualified_name = "proj.lib.Mojo.Message.Request.clone", .short_name = "clone",
+         .label = "Function", .def_module_qn = "proj.lib.Mojo.Message.Request"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "proj.lib.Mojo.Message.Request",
+                           defs, 2, NULL, NULL, 0, NULL, &out, NULL, defs, 2);
+    int idx = find_resolved_arr(&out, "Request.clone", "Message.content");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+TEST(perllsp_cross_parent_only_in_all_defs) {
+    /* SCALE REPRO: at scale the def filter (cbm_pxc_filter_defs_for_file) narrows
+     * the per-file `defs` to own-module + import-map modules. When the parent
+     * import row is MISSING (the folder/module QN collision — lib/Mojo/Message.pm
+     * beside lib/Mojo/Message/ — drops the `use Mojo::Base 'Mojo::Message'` parent
+     * import), the parent's defs land ONLY in all_defs, never in the filtered
+     * `defs`. The multi-level chain-walk must still attach the parent's methods
+     * from all_defs so $self->content resolves. Regression for the real-repo gap
+     * where 274-file Mojolicious produced 0 perl_method_inherited while the same
+     * two files in isolation produced 27. */
+    const char *source = "package Mojo::Message::Request;\n"
+                         "use Mojo::Base 'Mojo::Message';\n"
+                         "sub clone {\n"
+                         "    my $self = shift;\n"
+                         "    return $self->content;\n"
+                         "}\n";
+    /* FILTERED defs: only this file's own def (parent filtered out — no import). */
+    CBMLSPDef defs[] = {
+        {.qualified_name = "proj.lib.Mojo.Message.Request.clone", .short_name = "clone",
+         .label = "Function", .def_module_qn = "proj.lib.Mojo.Message.Request"},
+    };
+    /* FULL universe: includes the parent module's has-accessor. */
+    CBMLSPDef all_defs[] = {
+        {.qualified_name = "proj.lib.Mojo.Message.Request.clone", .short_name = "clone",
+         .label = "Function", .def_module_qn = "proj.lib.Mojo.Message.Request"},
+        {.qualified_name = "proj.lib.Mojo.Message.content", .short_name = "content",
+         .label = "Method", .def_module_qn = "proj.lib.Mojo.Message"},
+    };
+    const char *req_parents[] = {"Mojo::Message", NULL};
+    const char *idx_modules[] = {"proj.lib.Mojo.Message.Request"};
+    const char *const *idx_lists[] = {req_parents};
+    CBMPerlInheritIndex inherit = {
+        .module_qns = idx_modules, .parent_lists = idx_lists, .count = 1};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "proj.lib.Mojo.Message.Request",
+                           defs, 1, NULL, NULL, 0, NULL, &out, &inherit, all_defs, 2);
+    int idx = find_resolved_arr(&out, "Request.clone", "Message.content");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_return_type_chain) {
     /* Return-type inference: extraction infers make_widget's return type (Widget)
      * from a `return Widget->new` body (perl_infer_return_types) and carries it on
@@ -1221,6 +1327,9 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_qw_ast_recollection);
     RUN_TEST(perllsp_cross_package_method_dispatch);
     RUN_TEST(perllsp_cross_mojo_base_inherited_method);
+    RUN_TEST(perllsp_cross_deep_qn_inherited_sub);
+    RUN_TEST(perllsp_cross_deep_qn_inherited_accessor);
+    RUN_TEST(perllsp_cross_parent_only_in_all_defs);
     RUN_TEST(perllsp_cross_return_type_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);

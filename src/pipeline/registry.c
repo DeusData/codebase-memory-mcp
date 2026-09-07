@@ -426,6 +426,19 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
         strcmp(strategy, "import_map_suffix") == 0) {
         return false; /* high-confidence import/same-module match — keep the genuine edge */
     }
+    /* The Perl LSP's own strategies (perl_method_typed/inherited/static/super,
+     * perl_function_local, perl_imported_function, perl_static_call, perl_coderef)
+     * are all confident, receiver-typed/exact resolutions under the zero-edge
+     * guarantee — never the registry's weak short-name guesses (which spell
+     * suffix_match / unique_name / qualified_suffix). The sequential resolver
+     * emits these and returns before this guard; the parallel resolver falls
+     * THROUGH to it, so without this the parallel path silently dropped every
+     * LSP-resolved Perl method edge — 0 perl_method_* on any repo large enough to
+     * take the parallel resolver (real Mojolicious), while small repos on the
+     * sequential path kept them. Keep them on both paths (seq/parallel parity). */
+    if (strncmp(strategy, "perl_", 5) == 0) {
+        return false;
+    }
     return true; /* weak short-name match (suffix_match / unique_name / …) → drop */
 }
 

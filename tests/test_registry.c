@@ -772,6 +772,19 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
      * short-name guess — a '::'-qualified call resolved this way must be kept. */
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "Foo::Bar::m", "import_map_suffix"));
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "commit", "same_module"));
+    /* The Perl LSP's OWN strategies are confident receiver-typed/exact
+     * resolutions under the zero-edge guarantee — never the registry's weak
+     * short-name guesses — so they must be kept on BOTH resolver paths. The
+     * sequential resolver emits and returns before this guard; the parallel
+     * resolver (real Mojolicious scale) falls through to it. Regression for the
+     * gap where every perl_method_* edge was silently dropped at scale (0
+     * perl_method_inherited on a 274-file Mojolicious index vs 104 on the same
+     * files split small enough to take the sequential path). */
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "render", "perl_method_inherited"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "stash", "perl_method_typed"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "new", "perl_method_static"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, true, "parse", "perl_method_super"));
+    ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "url_escape", "perl_static_call"));
     /* A genuine non-builtin function call is never suppressed (edge survives). */
     ASSERT_FALSE(cbm_perl_suppress_generic_match(true, false, "helper", "suffix_match"));
     /* Non-Perl languages are never affected. */
