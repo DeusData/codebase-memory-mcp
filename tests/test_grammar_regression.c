@@ -408,6 +408,90 @@ TEST(grammar_regression_all) {
     PASS();
 }
 
+/* VB6 class module: the file itself is the class. The extractor must
+ * synthesise a Class def named from `Attribute VB_Name`, carry `Implements`
+ * as a base, emit the file's procedures as Methods of that class, and the
+ * call-scope walker must attribute in-body calls to those Methods. */
+TEST(vb6_class_module_synthesised) {
+    const char *src = "VERSION 1.0 CLASS\nBEGIN\n  MultiUse = -1  'True\nEND\n"
+                      "Attribute VB_Name = \"Widget\"\nOption Explicit\n\n"
+                      "Implements IShape\n\nPrivate mCount As Long\n\n"
+                      "Public Sub Go()\n    Helper\nEnd Sub\n\n"
+                      "Private Function Helper() As Long\n    Helper = mCount\nEnd Function\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VB6, "reg", "Widget.cls");
+    ASSERT_NOT_NULL(r);
+    int classes = 0;
+    int methods = 0;
+    int functions = 0;
+    const char *class_qn = NULL;
+    bool has_ishape_base = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Class") == 0) {
+            classes++;
+            ASSERT_STR_EQ(d->name, "Widget");
+            class_qn = d->qualified_name;
+            for (int b = 0; d->base_classes && d->base_classes[b]; b++) {
+                if (strcmp(d->base_classes[b], "IShape") == 0) {
+                    has_ishape_base = true;
+                }
+            }
+        } else if (d->label && strcmp(d->label, "Method") == 0) {
+            methods++;
+            ASSERT_NOT_NULL(d->parent_class);
+        } else if (d->label && strcmp(d->label, "Function") == 0) {
+            functions++;
+        }
+    }
+    ASSERT_EQ(classes, 1);
+    ASSERT_EQ(methods, 2);
+    ASSERT_EQ(functions, 0);
+    ASSERT_TRUE(has_ishape_base);
+    ASSERT_NOT_NULL(class_qn);
+    /* Methods are QN-nested under the class so the call-scope QN matches. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Method") == 0) {
+            ASSERT_STR_EQ(d->parent_class, class_qn);
+            ASSERT_TRUE(strncmp(d->qualified_name, class_qn, strlen(class_qn)) == 0);
+        }
+    }
+    /* The call inside Go must source to the Method (class.Go), never to the
+     * Module: the unified walker seeds enclosing_class_qn with the class QN. */
+    char go_qn[256];
+    snprintf(go_qn, sizeof(go_qn), "%s.Go", class_qn);
+    int saw_helper_call = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (c->callee_name && strcmp(c->callee_name, "Helper") == 0) {
+            saw_helper_call = 1;
+            ASSERT_NOT_NULL(c->enclosing_func_qn);
+            ASSERT_STR_EQ(c->enclosing_func_qn, go_qn);
+        }
+    }
+    ASSERT_TRUE(saw_helper_call);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A .bas standard module is NOT a class: no synthesised Class, plain Functions. */
+TEST(vb6_standard_module_not_class) {
+    const char *src = "Attribute VB_Name = \"ModA\"\nOption Explicit\n\n"
+                      "Public Sub Foo()\nEnd Sub\n";
+    CBMFileResult *r = extract(src, CBM_LANG_VB6, "reg", "ModA.bas");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        ASSERT_TRUE(!d->label || strcmp(d->label, "Class") != 0);
+        ASSERT_TRUE(!d->label || strcmp(d->label, "Method") != 0);
+    }
+    ASSERT_TRUE(reg_has_def_any(r, "Foo"));
+    cbm_free_result(r);
+    PASS();
+}
+
 void suite_grammar_regression(void) {
     RUN_TEST(grammar_regression_all);
+    RUN_TEST(vb6_class_module_synthesised);
+    RUN_TEST(vb6_standard_module_not_class);
 }
