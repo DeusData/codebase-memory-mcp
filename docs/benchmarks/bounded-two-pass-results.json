@@ -1,0 +1,310 @@
+{
+  "platform": "macOS 26.6.2 arm64, 24 GiB RAM",
+  "compiler": "Apple clang 21.0.0",
+  "base_commit": "aa44c28ea5ea82a5f811f0bace4f7857a68cac80",
+  "baseline_binary_sha256": "6856b8ffb475ce0f23b9b343ca8265092b53e1b5733809e8cfb4b6b3831194a9",
+  "feature_binary_sha256": "d449a572586a8921cdd95b8dd2e3249ebb2a18df9204a628b8f527eb675d13a9",
+  "workers": 4,
+  "runs": [
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "baseline",
+      "run": 1,
+      "worker_peak_rss_bytes": 679870464,
+      "worker_wall_s": 2.691,
+      "pipeline_ms": 1448,
+      "phase_peak_mb": 481,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "baseline",
+      "run": 2,
+      "worker_peak_rss_bytes": 680443904,
+      "worker_wall_s": 2.638,
+      "pipeline_ms": 1410,
+      "phase_peak_mb": 481,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "baseline",
+      "run": 3,
+      "worker_peak_rss_bytes": 680329216,
+      "worker_wall_s": 2.644,
+      "pipeline_ms": 1423,
+      "phase_peak_mb": 482,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "feature-off",
+      "run": 1,
+      "worker_peak_rss_bytes": 681820160,
+      "worker_wall_s": 2.651,
+      "pipeline_ms": 1418,
+      "phase_peak_mb": 481,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "feature-off",
+      "run": 2,
+      "worker_peak_rss_bytes": 681574400,
+      "worker_wall_s": 2.669,
+      "pipeline_ms": 1450,
+      "phase_peak_mb": 482,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "feature-off",
+      "run": 3,
+      "worker_peak_rss_bytes": 679428096,
+      "worker_wall_s": 2.663,
+      "pipeline_ms": 1445,
+      "phase_peak_mb": 482,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "batch-128",
+      "run": 1,
+      "worker_peak_rss_bytes": 315408384,
+      "worker_wall_s": 3.227,
+      "pipeline_ms": 2002,
+      "phase_peak_mb": 141,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "batch-128",
+      "run": 2,
+      "worker_peak_rss_bytes": 315473920,
+      "worker_wall_s": 3.231,
+      "pipeline_ms": 2024,
+      "phase_peak_mb": 141,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "synthetic-typescript",
+      "variant": "batch-128",
+      "run": 3,
+      "worker_peak_rss_bytes": 315654144,
+      "worker_wall_s": 3.242,
+      "pipeline_ms": 2026,
+      "phase_peak_mb": 141,
+      "persisted_nodes": 22533,
+      "persisted_edges": 57348,
+      "surfaces": 2049,
+      "parse_partial_count": 0,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "repomix-e3b15a4",
+      "variant": "baseline",
+      "run": 1,
+      "worker_peak_rss_bytes": 288817152,
+      "worker_wall_s": 2.055,
+      "pipeline_ms": 834,
+      "phase_peak_mb": 197,
+      "persisted_nodes": 12051,
+      "persisted_edges": 19154,
+      "surfaces": 1073,
+      "parse_partial_count": 4,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "repomix-e3b15a4",
+      "variant": "baseline",
+      "run": 2,
+      "worker_peak_rss_bytes": 284131328,
+      "worker_wall_s": 2.082,
+      "pipeline_ms": 835,
+      "phase_peak_mb": 195,
+      "persisted_nodes": 12051,
+      "persisted_edges": 19154,
+      "surfaces": 1073,
+      "parse_partial_count": 4,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "repomix-e3b15a4",
+      "variant": "baseline",
+      "run": 3,
+      "worker_peak_rss_bytes": 285491200,
+      "worker_wall_s": 2.053,
+      "pipeline_ms": 828,
+      "phase_peak_mb": 195,
+      "persisted_nodes": 12051,
+      "persisted_edges": 19154,
+      "surfaces": 1073,
+      "parse_partial_count": 4,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "repomix-e3b15a4",
+      "variant": "batch-128",
+      "run": 1,
+      "worker_peak_rss_bytes": 207077376,
+      "worker_wall_s": 2.405,
+      "pipeline_ms": 1193,
+      "phase_peak_mb": 126,
+      "persisted_nodes": 12051,
+      "persisted_edges": 19154,
+      "surfaces": 1073,
+      "parse_partial_count": 4,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "repomix-e3b15a4",
+      "variant": "batch-128",
+      "run": 2,
+      "worker_peak_rss_bytes": 203046912,
+      "worker_wall_s": 2.453,
+      "pipeline_ms": 1233,
+      "phase_peak_mb": 125,
+      "persisted_nodes": 12051,
+      "persisted_edges": 19154,
+      "surfaces": 1073,
+      "parse_partial_count": 4,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    },
+    {
+      "corpus": "repomix-e3b15a4",
+      "variant": "batch-128",
+      "run": 3,
+      "worker_peak_rss_bytes": 203800576,
+      "worker_wall_s": 2.417,
+      "pipeline_ms": 1200,
+      "phase_peak_mb": 124,
+      "persisted_nodes": 12051,
+      "persisted_edges": 19154,
+      "surfaces": 1073,
+      "parse_partial_count": 4,
+      "integrity": "ok",
+      "equals_baseline": {
+        "nodes": true,
+        "node_properties": true,
+        "edges": true,
+        "surfaces": true
+      }
+    }
+  ]
+}
