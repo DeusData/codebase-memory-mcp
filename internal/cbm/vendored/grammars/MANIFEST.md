@@ -9,8 +9,10 @@ The grammars were originally vendored as bare `parser.c`+`scanner.c` with **no r
 
 ## Summary
 
-- Grammars: **162** — vendored-from-upstream: **141**, first-party/self-maintained: **16**, registry-disagreement: **5** (nim removed 2026-06-12; objectscript_udl + objectscript_routine added 2026-06-24; mojo added 2026-07-01; arkts added 2026-08-26; plsql added 2026-08-27; chialisp added 2026-08-28; javascript + tsx became self-maintained forks 2026-09-25 — see notes below)
-- ABI distribution: **9×** ABI-13 **78×** ABI-14 **75×** ABI-15 (runtime ceiling is ABI 15; never vendor ABI 16 without a runtime upgrade)
+- Grammars: **163** — vendored-from-upstream: **142**, first-party/self-maintained: **16**, registry-disagreement: **5** (nim removed 2026-06-12; objectscript_udl + objectscript_routine added 2026-06-24; mojo added 2026-07-01; arkts added 2026-08-26; plsql added 2026-08-27; chialisp added 2026-08-28; vba added 2026-09-07; javascript + tsx became self-maintained forks 2026-09-25 — see notes below)
+- ABI distribution: **9×** ABI-13 **78×** ABI-14 **76×** ABI-15 (runtime ceiling is ABI 15; never vendor ABI 16 without a runtime upgrade)
+  — recounted from the tree 2026-10-07 after vba (ABI 15, harumiWeb/tree-sitter-vba) was added (was `9×/78×/75×`). Regenerate, never increment:
+  `grep -h '#define LANGUAGE_VERSION' internal/cbm/vendored/grammars/*/parser.c | sort | uniq -c`
   — recounted from the tree 2026-09-25 after the tsx fork was regenerated with tree-sitter-cli 0.25.10, moving `tsx` from ABI 14 to ABI 15 (was `9×/79×/74×`).
   — recounted from the tree 2026-08-30 after the perl v1.2.1 refresh moved `perl` from ABI 14 to ABI 15 (was `9×/80×/73×`). Neither side of the rebase had this right: main's line was correct for main, and this branch still carried the pre-2026-08-28 `7×/84×/65×`. Regenerate, never increment.
   — recounted from the tree 2026-08-28. This line had drifted: it read `7×/86×/65×`, which sums to 158 against 161 vendored grammars, so it was wrong before Chialisp was added and incrementing it would have carried the error forward. Regenerate with:
@@ -58,6 +60,8 @@ The grammars were originally vendored as bare `parser.c`+`scanner.c` with **no r
 
 - **chialisp** (added 2026-08-28): **first-party** — authored in this repository, not vendored from anywhere. Grammar source + corpus tests live in `tools/tree-sitter-chialisp/`; regenerate with `npx tree-sitter-cli@0.25.10 generate --abi 14` and copy `src/parser.c` + `src/tree_sitter/*.h` here. ABI 14, **no external scanner** (`EXTERNAL_TOKEN_COUNT 0`), 0 non-ASCII bytes. It is a deliberately GENERIC s-expression grammar (`source_file`/`list`/`symbol`/`string`/`number`/`hex`/`dot`/`comment`) modelling the clvm_tools reader rather than the Chialisp form vocabulary: `mod`/`defun`/`defconstant`/`include` are ordinary head symbols, and which lists are definitions is decided in `internal/cbm/extract_defs.c`, so a dialect that adds a form does not need a regenerated parser. Written because the only public grammar (`Quexington/tree-sitter-chialisp`) cannot parse the language: it required CRLF to terminate a comment (`/;.*\r\n/`) while real files are LF, rejected the `.` in `(include foo.clib)`, and accepted only a primitive after `(defconstant NAME …)` — each of which desynchronised the rest of the file. Acceptance gate: all five `chia-blockchain@main` reference files parse with **zero ERROR and zero MISSING nodes**. **LICENSE:** the project's own LICENSE, byte-identical to the repository root — no third-party copyright is carried, because there is no third party.
 
+- **vba** (added 2026-09-07, drives `CBM_LANG_VB6` — Visual Basic 6 / VBA `.bas`/`.cls`/`.frm`/`.ctl`/`.dsr`/`.pag`, #721): vendored from [harumiWeb/tree-sitter-vba](https://github.com/harumiWeb/tree-sitter-vba) @ `63b2f8d0d65c` (v0.13.0, MIT, ABI 15). Not tracked by nvim-treesitter or Helix. **Re-vendor note:** upstream gitignores `src/parser.c`; the vendored `parser.c` was generated locally from the pinned `grammar.js` with `tree-sitter-cli 0.26.9` (`tree-sitter generate --abi 15`, upstream's own `pnpm generate` command), so byte-identity with an upstream artefact cannot be claimed — regenerate the same way when re-vendoring. Lexer-only (no `scanner.c`, `EXTERNAL_TOKEN_COUNT 0`); case-insensitive keywords are expanded per keyword in the grammar, hence the 46 MB `parser.c`. Chosen over the GPL-3.0 arrmee-wt grammar (blocked by `scripts/license-policy.json`) and the unlicensed joannefan/tree-sitter-vb6. `.cls` (Apex/ObjectScript) and `.frm` (FORM) collide with VB6 — `src/discover/language.c` sniffs file content (`cbm_disambiguate_cls` / `cbm_disambiguate_frm`) to pick the owner. Security review covered only the vendored C surface (`parser.c`, `tree_sitter/*.h`) plus upstream license/provenance metadata; no package manager hooks, workflow files, prompt/agent instruction files, or generated lockfiles were vendored.
+
 > ⚠️ **Pinned commit = the revision nvim-treesitter/Helix vendor** (battle-tested, canonical source), not bleeding-edge HEAD. When re-vendoring, update the pinned commit here.
 
 ## Custom extraction handling (definition extraction)
@@ -94,6 +98,7 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | scheme   | `extract_lisp_def`: `(define …)` head-symbol forms in `list` |
 | slang    | added to the C-family declarator-name gate (tree-sitter-cpp/hlsl fork) |
 | squirrel | `resolve_func_name`: `function_declaration` → `identifier` child |
+| vba      | `find_class_body`: `type_declaration`/`enum_declaration` hold `type_member`/`enum_member` directly (no body node); `extract_var_names`: `variable_declaration`/`const_declaration` → one Variable per `variable_declarator`/`const_declarator` `name`; `extract_schema_field`: `type_member` → `name` + `as_type_clause`'s `type` (so a Field is typed `Long`, not `As Long`); `extract_vb6_callee` (extract_calls.c): `call_statement` → `callee`, `call_expression` → `function`, `raise_event_statement` → `event`, unwrapping `qualified_member_expression` / `implicit_member_expression` / nested `call_expression` |
 
 ## Local source patches (applied atop pinned upstream)
 
@@ -249,6 +254,7 @@ row instead.
 | toml | 14 | tree-sitter-grammars/tree-sitter-toml | `64b56832c2cf` | MISMATCH | ✅ |
 | typescript | 14 | tree-sitter/tree-sitter-typescript | `75b3874edb2d` | VERIFIED-BOTH | ✅ |
 | typst | 14 | uben0/tree-sitter-typst | `46cf4ded12ee` | VERIFIED-BOTH | ✅ |
+| vba | 15 | harumiWeb/tree-sitter-vba | `63b2f8d0d65c` | NOT-IN-REGISTRIES (see note) | ✅ |
 | verilog | 14 | tree-sitter/tree-sitter-verilog | `4457145e795b` | VERIFIED-HELIX | ✅ |
 | vhdl | 15 | jpt13653903/tree-sitter-vhdl | `c2d9be3d5ab7` | MISMATCH | ✅ |
 | vim | 15 | tree-sitter-grammars/tree-sitter-vim | `3092fcd99eb8` | VERIFIED-BOTH | ✅ |

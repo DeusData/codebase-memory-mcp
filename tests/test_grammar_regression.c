@@ -128,6 +128,13 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
     {"ada", CBM_LANG_ADA, "a.adb", "procedure Foo is\nbegin\n   null;\nend Foo;\n", 1, {NULL}},
     {"agda", CBM_LANG_AGDA, "a.agda", "module M where\nfoo : Set\nfoo = Set\n", 0, {NULL}},
     {"apex", CBM_LANG_APEX, "A.cls", "public class A {\n  void foo() {}\n}\n", 1, {NULL}},
+    {"vb6",
+     CBM_LANG_VB6,
+     "a.bas",
+     "Attribute VB_Name = \"ModA\"\nOption Explicit\n\nPublic Sub Foo()\n    Bar 1\nEnd Sub\n\n"
+     "Private Function Bar(x As Long) As Long\n    Bar = x + 1\nEnd Function\n",
+     2,
+     {"Foo", "Bar", NULL}},
     {"awk",
      CBM_LANG_AWK,
      "a.awk",

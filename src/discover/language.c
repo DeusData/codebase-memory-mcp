@@ -118,7 +118,8 @@ static const ext_entry_t EXT_TABLE[] = {
     {".fsi", CBM_LANG_FSHARP},
     {".fsx", CBM_LANG_FSHARP},
 
-    /* FORM */
+    /* FORM (.frm collides with VB6 forms — content-disambiguated in
+     * cbm_disambiguate_frm()) */
     {".frm", CBM_LANG_FORM},
     {".prc", CBM_LANG_FORM},
 
@@ -398,8 +399,15 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Cap'n Proto */
     {".capnp", CBM_LANG_CAPNP},
 
-    /* Apex */
+    /* Apex (.cls collides with VB6 class modules — content-disambiguated in
+     * cbm_disambiguate_cls()) */
     {".cls", CBM_LANG_APEX},
+
+    /* Visual Basic 6 / VBA — unambiguous extensions. .cls/.frm are sniffed. */
+    {".bas", CBM_LANG_VB6},
+    {".ctl", CBM_LANG_VB6},
+    {".dsr", CBM_LANG_VB6},
+    {".pag", CBM_LANG_VB6},
 
     /* Crystal */
     {".cr", CBM_LANG_CRYSTAL},
@@ -918,6 +926,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
     [CBM_LANG_ARKTS] = "ArkTS",
     [CBM_LANG_PLSQL] = "PL/SQL",
+    [CBM_LANG_VB6] = "Visual Basic 6",
 
 };
 
@@ -1328,17 +1337,16 @@ static bool has_vb6_markers(const char *buf) {
 }
 
 /* Disambiguate .frm files: shared by the FORM symbolic-manipulation language
- * and Visual Basic 6 forms (#721). There is no Visual Basic language yet, so a
- * VB6 form is reported as unsupported (CBM_LANG_COUNT) rather than handed to
- * the FORM grammar, which yields no defs and stray junk nodes. Defaults to
- * FORM on any doubt (preserves existing behaviour). */
+ * and Visual Basic 6 forms (#721). A VB6 form routes to the tree-sitter-vba
+ * grammar (CBM_LANG_VB6) rather than to FORM, which yields no defs and stray
+ * junk nodes. Defaults to FORM on any doubt (preserves existing behaviour). */
 static CBMLanguage lang_frm_text(const char *buf) {
     /* VB6 form files open with "VERSION x.yy" on line 1. */
     if (strncmp(buf, "VERSION ", SLEN("VERSION ")) == 0 &&
         isdigit((unsigned char)buf[SLEN("VERSION ")])) {
-        return CBM_LANG_COUNT;
+        return CBM_LANG_VB6;
     }
-    return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
+    return has_vb6_markers(buf) ? CBM_LANG_VB6 : CBM_LANG_FORM;
 }
 
 CBMLanguage cbm_disambiguate_frm(const char *path) {
@@ -1374,11 +1382,11 @@ CBMLanguage cbm_disambiguate_res(const char *path) {
 /* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
  * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
  * with a line of the form "Class <UppercasePackage>..."; VB6 class modules
- * carry the VB6 header markers and are reported as unsupported (CBM_LANG_COUNT)
- * until a Visual Basic grammar exists. Defaults to Apex on any doubt. */
+ * carry the VB6 header markers and route to CBM_LANG_VB6. Defaults to Apex
+ * on any doubt. */
 static CBMLanguage lang_cls_text(const char *buf) {
     if (has_vb6_markers(buf)) {
-        return CBM_LANG_COUNT;
+        return CBM_LANG_VB6;
     }
 
     const char *line = buf;
