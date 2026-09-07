@@ -4802,7 +4802,7 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
  * path and both must consult the guard. */
 static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
     write_temp_file(tmp, "go.mod", "module example.com/fxguard\n\ngo 1.22\n");
-    /* Both C targets must be indexed: block-local C variables are not emitted,
+    /* C targets must be indexed: block-local C variables are not emitted,
      * so keep event at file scope for the cross-language reference guard. */
     write_temp_file(tmp, "probe/probe.c",
                     "static int total_events = 0;\n"
@@ -4813,8 +4813,8 @@ static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
                     "    total_events += event;\n"
                     "    return event;\n"
                     "}\n");
-    /* Go: a local write named like the C local, and a value use named like
-     * the C function. Neither can touch anything in a C translation unit. */
+    /* Go local writes and value uses must not bind to the C variables or
+     * functions in this fixture. */
     write_temp_file(tmp, "app/app.go",
                     "package app\n"
                     "\n"
