@@ -20,6 +20,8 @@ import {
     readIndexStarted,
     readLogs,
     readProcesses,
+    readUiLogTail,
+    uiLogLineText,
 } from './projects-model';
 
 describe('readIndexJobs', () => {
@@ -137,6 +139,24 @@ describe('readAdr', () => {
 
     it('reads the absence of a record as empty, not as an error', () => {
         expect(readAdr({ has_adr: false })).toEqual({ hasAdr: false, content: '', updatedAt: '' });
+    });
+});
+
+describe('readUiLogTail and uiLogLineText', () => {
+    it('reads the tail with defaults for what the server did not send', () => {
+        expect(readUiLogTail({ path: '/c/ui.log', lines: ['a'], size_bytes: 9, partial: false }))
+            .toEqual({ path: '/c/ui.log', previousPath: '', sizeBytes: 9, partial: false, lines: ['a'], total: 1 });
+        expect(readUiLogTail('nonsense'))
+            .toEqual({ path: '', previousPath: '', sizeBytes: 0, partial: false, lines: [], total: 0 });
+    });
+
+    it('turns a JSON line into a sentence and leaves anything else alone', () => {
+        expect(uiLogLineText('{"received":"2026-09-08T10:00:00Z","level":"warn","source":"api","message":"/api/tree: HTTP 423","detail":"busy"}'))
+            .toBe('2026-09-08T10:00:00Z warn api: /api/tree: HTTP 423 (busy)');
+        expect(uiLogLineText('{"ts":"2026-09-08T10:00:01.000Z","received":"later","level":"log","source":"console","message":"ready"}'))
+            .toBe('2026-09-08T10:00:01.000Z log console: ready');
+        expect(uiLogLineText('plain text')).toBe('plain text');
+        expect(uiLogLineText('[1,2]')).toBe('[1,2]');
     });
 });
 

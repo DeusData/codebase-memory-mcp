@@ -1081,6 +1081,15 @@ export const messages = {
         logsSource: (shown: number, total: number): string => `read from GET /api/logs: ${shown} of ${total} lines`,
         logsEmpty: 'the log ring is empty',
         logsError: (detail: string): string => `the log did not arrive: ${detail}`,
+        uiLogTitle: 'Frontend log',
+        uiLogSource: (shown: number, total: number, path: string): string =>
+            `read from GET /api/ui-log: ${shown} of ${total} lines of ${path}`,
+        uiLogPrevious: (path: string): string => `rotated once; the lines before these are in ${path}`,
+        uiLogAbout:
+            'This page sends its console output, uncaught errors and failed requests to that file as '
+            + 'they happen. Attach the file to a bug report; an agent can read it with the same route.',
+        uiLogEmpty: 'nothing recorded yet',
+        uiLogError: (detail: string): string => `the frontend log did not arrive: ${detail}`,
         reload: 'reload',
     },
 

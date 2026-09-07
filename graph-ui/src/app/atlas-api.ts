@@ -13,6 +13,7 @@
  * `base` ist darum nur fuer Node-Aufrufer da, die keinen Origin senden.
  */
 
+import { hasErrorObservers, reportError } from '../provider/error-observer';
 import { readTreeLevel } from './tree-model';
 import type { TreeLevel } from './tree-model';
 import {
@@ -29,6 +30,7 @@ import {
     readIndexStarted,
     readLogs,
     readProcesses,
+    readUiLogTail,
 } from '../projects/projects-model';
 import type {
     AdrRecord,
@@ -38,6 +40,7 @@ import type {
     LogTail,
     ProcessReport,
     ProjectHealth,
+    UiLogTail,
 } from '../projects/projects-model';
 
 export interface AtlasApiOptions {
@@ -70,6 +73,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
     return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+/**
+ * Announce a failed /api call before it is thrown (provider/error-observer.ts),
+ * so the frontend log holds it even though the panel catches it and shows a
+ * sentence instead. A 4xx is the server saying no to this request (warn);
+ * no answer, a 5xx or an unreadable body is a failure (error).
+ */
+function announce(error: AtlasApiError, detail?: string): AtlasApiError {
+    if (hasErrorObservers()) {
+        const refused = error.status >= 400 && error.status < 500;
+        reportError({
+            source: 'api',
+            level: refused ? 'warn' : 'error',
+            message: error.message,
+            detail,
+        });
+    }
+    return error;
+}
+
 const text = (value: unknown): string => (typeof value === 'string' ? value : '');
 
 export class AtlasApi {
@@ -99,16 +121,22 @@ export class AtlasApi {
             response = await doFetch(url, init);
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error);
-            throw new AtlasApiError(route, 0, `${route} war nicht erreichbar: ${message}`);
+            throw announce(new AtlasApiError(route, 0, `${route} war nicht erreichbar: ${message}`));
         }
         const body = await response.text();
         if (!response.ok) {
-            throw new AtlasApiError(route, response.status, `${route} antwortete mit HTTP ${response.status}: ${body.slice(0, 200)}`);
+            throw announce(
+                new AtlasApiError(route, response.status, `${route} antwortete mit HTTP ${response.status}: ${body.slice(0, 200)}`),
+                body.slice(0, 400),
+            );
         }
         try {
             return JSON.parse(body) as unknown;
         } catch {
-            throw new AtlasApiError(route, response.status, `${route} lieferte kein JSON: ${body.slice(0, 200)}`);
+            throw announce(
+                new AtlasApiError(route, response.status, `${route} lieferte kein JSON: ${body.slice(0, 200)}`),
+                body.slice(0, 400),
+            );
         }
     }
 
@@ -204,6 +232,15 @@ export class AtlasApi {
     /** The codebase-memory-mcp processes on this machine, as the server sees them. */
     async processes(): Promise<ProcessReport> {
         return readProcesses(await this.getJson('/api/processes'));
+    }
+
+    /**
+     * The tail of the frontend's own log file on the server, the one this
+     * page writes through POST /api/ui-log (app/ui-log.ts). The answer names
+     * the file, so the panel can tell a reader what to attach to a report.
+     */
+    async uiLogTail(lines: number): Promise<UiLogTail> {
+        return readUiLogTail(await this.getJson(`/api/ui-log?${new URLSearchParams({ lines: String(lines) }).toString()}`));
     }
 
     /** Wurzelpfad, Branch und Remote eines Projekts. Leere Felder bleiben leer. */

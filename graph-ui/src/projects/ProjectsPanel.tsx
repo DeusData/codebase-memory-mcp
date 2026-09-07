@@ -12,7 +12,8 @@
  * Three rules shape it, and they are the rules of the rest of this surface:
  *
  *  1. **Every block names its source.** The list says it comes from
- *     list_projects, the jobs say they come from /api/index-status, and a
+ *     list_projects, the jobs say they come from /api/index-status, the
+ *     frontend log names the file it is read from (GET /api/ui-log), and a
  *     number the server did not send is shown as not sent, never as zero.
  *  2. **A control that cannot act is not on the screen.** The index button
  *     appears once a path and a name are there; a project whose root the
@@ -34,7 +35,7 @@ import type { JSX, ReactNode } from 'react';
 import { AtlasApiError } from '../app/atlas-api';
 import { messages } from '../i18n/messages';
 import type { ProjectEntry } from '../provider/rpc-schemas';
-import { anyIndexing, childPath, finishedSince, megabytes, projectNameFor } from './projects-model';
+import { anyIndexing, childPath, finishedSince, megabytes, projectNameFor, uiLogLineText } from './projects-model';
 import type {
     AdrRecord,
     BrowseLevel,
@@ -43,6 +44,7 @@ import type {
     LogTail,
     ProcessReport,
     ProjectHealth,
+    UiLogTail,
 } from './projects-model';
 
 const text = messages.projects;
@@ -69,6 +71,7 @@ export interface ProjectsSource {
     saveAdr(project: string, content: string): Promise<void>;
     logs(lines: number): Promise<LogTail>;
     processes(): Promise<ProcessReport>;
+    uiLogTail(lines: number): Promise<UiLogTail>;
 }
 
 export interface ProjectsPanelProps {
@@ -170,6 +173,8 @@ export default function ProjectsPanel(props: ProjectsPanelProps): JSX.Element {
     const [processesError, setProcessesError] = useState('');
     const [logs, setLogs] = useState<LogTail | undefined>(undefined);
     const [logsError, setLogsError] = useState('');
+    const [uiLog, setUiLog] = useState<UiLogTail | undefined>(undefined);
+    const [uiLogError, setUiLogError] = useState('');
 
     useEffect(() => {
         mounted.current = true;
@@ -254,6 +259,17 @@ export default function ProjectsPanel(props: ProjectsPanelProps): JSX.Element {
         } catch (error) {
             if (mounted.current) {
                 setLogsError(text.logsError(describeError(error)));
+            }
+        }
+        try {
+            const tail = await source.uiLogTail(LOG_LINES);
+            if (mounted.current) {
+                setUiLog(tail);
+                setUiLogError('');
+            }
+        } catch (error) {
+            if (mounted.current) {
+                setUiLogError(text.uiLogError(describeError(error)));
             }
         }
     }, [source]);
@@ -795,6 +811,26 @@ export default function ProjectsPanel(props: ProjectsPanelProps): JSX.Element {
                         ) : (
                             <pre className="atlas-projects-logs" data-testid="atlas-projects-logs">
                                 {logs.lines.join('\n')}
+                            </pre>
+                        )}
+                    </>
+                )}
+                <h4 className="atlas-projects-subtitle-inline">{text.uiLogTitle}</h4>
+                <p className="atlas-projects-note">{text.uiLogAbout}</p>
+                {uiLogError.length > 0 && <p className="atlas-projects-notice">{uiLogError}</p>}
+                {uiLog !== undefined && (
+                    <>
+                        <p className="atlas-projects-source" data-testid="atlas-projects-ui-log-source">
+                            {text.uiLogSource(uiLog.lines.length, uiLog.total, uiLog.path)}
+                        </p>
+                        {uiLog.previousPath.length > 0 && (
+                            <p className="atlas-projects-note">{text.uiLogPrevious(uiLog.previousPath)}</p>
+                        )}
+                        {uiLog.lines.length === 0 ? (
+                            <p className="atlas-projects-note">{text.uiLogEmpty}</p>
+                        ) : (
+                            <pre className="atlas-projects-logs" data-testid="atlas-projects-ui-log">
+                                {uiLog.lines.map(uiLogLineText).join('\n')}
                             </pre>
                         )}
                     </>

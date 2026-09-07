@@ -19,6 +19,7 @@
  *   GET    /api/adr?project=         {has_adr, content?, updated_at?}
  *   POST   /api/adr                  {saved: true}
  *   GET    /api/logs?lines=          {lines[], total}
+ *   GET    /api/ui-log?lines=        {path, previous_path?, size_bytes, partial, lines[], total}
  *   GET    /api/processes            {self_pid, self_rss_mb, ..., processes[]}
  */
 
@@ -192,6 +193,58 @@ export interface ServerProcess {
     elapsed: string;
     command: string;
     isSelf: boolean;
+}
+
+/** The tail of the frontend log file the server keeps (POST /api/ui-log). */
+export interface UiLogTail {
+    /** The file on the server; what a bug report attaches. */
+    path: string;
+    /** The rotated file before it, when there is one. Empty otherwise. */
+    previousPath: string;
+    sizeBytes: number;
+    /** True when the lines do not start at the first line of the file. */
+    partial: boolean;
+    /** One JSON object per line, as written by the server. */
+    lines: string[];
+    total: number;
+}
+
+export function readUiLogTail(raw: unknown): UiLogTail {
+    const record = isRecord(raw) ? raw : {};
+    const lines = strings(record['lines']);
+    return {
+        path: text(record['path']),
+        previousPath: text(record['previous_path']),
+        sizeBytes: optionalNumber(record['size_bytes']) ?? 0,
+        partial: record['partial'] === true,
+        lines,
+        total: optionalNumber(record['total']) ?? lines.length,
+    };
+}
+
+/**
+ * One line of the frontend log as the panel shows it: time, level, source
+ * and message, with the detail in brackets. The file keeps the JSON; a
+ * reader scanning the panel wants the sentence. A line that is not JSON is
+ * shown as it is.
+ */
+export function uiLogLineText(line: string): string {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(line);
+    } catch {
+        return line;
+    }
+    if (!isRecord(parsed)) {
+        return line;
+    }
+    const when = text(parsed['ts']).length > 0 ? text(parsed['ts']) : text(parsed['received']);
+    const level = text(parsed['level']);
+    const source = text(parsed['source']);
+    const message = text(parsed['message']);
+    const detail = text(parsed['detail']);
+    const head = [when, level, source.length > 0 ? `${source}:` : ''].filter((part) => part.length > 0).join(' ');
+    return `${head} ${message}${detail.length > 0 ? ` (${detail})` : ''}`.trim();
 }
 
 export interface ProcessReport {

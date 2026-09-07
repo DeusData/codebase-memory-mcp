@@ -1048,6 +1048,215 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     PASS();
 }
 
+/* ── Frontend log file (POST/GET /api/ui-log) ─────────────────── */
+
+static int ui_log_read_file(const char *path, char *out, size_t outsz) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f)
+        return -1;
+    size_t n = fread(out, 1, outsz - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    return (int)n;
+}
+
+static int ui_log_count_char(const char *s, char ch) {
+    int n = 0;
+    for (; *s; s++) {
+        if (*s == ch)
+            n++;
+    }
+    return n;
+}
+
+static int ui_log_post(int port, const char *body, char *resp, size_t respsz) {
+    size_t cap = strlen(body) + 512;
+    char *req = malloc(cap);
+    if (!req)
+        return 0;
+    snprintf(req, cap,
+             "POST /api/ui-log HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+             port, strlen(body), body);
+    int n = th_http(port, req, resp, respsz);
+    free(req);
+    return n;
+}
+
+/* One post, two entries: both land as JSON lines in <cache>/logs/ui.log with
+ * the fields the frontend sent, GET /api/ui-log tails the file back, and the
+ * error (not the plain log line) is mirrored into the ring GET /api/logs
+ * serves. */
+TEST(ui_log_post_writes_jsonl_and_tail_reads_it) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    const char *body =
+        "{\"page\":\"/?project=demo\",\"session\":\"s1\",\"entries\":["
+        "{\"ts\":\"2026-09-08T10:00:00.000Z\",\"seq\":1,\"level\":\"error\",\"source\":\"rpc\","
+        "\"message\":\"get_code_snippet returned no source\",\"detail\":\"HTTP 200\","
+        "\"stack\":\"Error: x\\n    at y\"},"
+        "{\"ts\":\"2026-09-08T10:00:01.000Z\",\"seq\":2,\"level\":\"log\",\"source\":\"console\","
+        "\"message\":\"galaxy \\\"ready\\\"\"}]}";
+    char resp[16384];
+    ASSERT_TRUE(ui_log_post(port, body, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"accepted\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "\"dropped\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "\"file_error\":false"));
+    ASSERT_NOT_NULL(strstr(resp, "/logs/ui.log\""));
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    char content[8192];
+    ASSERT_TRUE(ui_log_read_file(path, content, sizeof(content)) > 0);
+    ASSERT_EQ(ui_log_count_char(content, '\n'), 2);
+    ASSERT_TRUE(strncmp(content, "{\"received\":\"", 13) == 0);
+    ASSERT_NOT_NULL(strstr(content, "\"page\":\"/?project=demo\",\"session\":\"s1\",\"seq\":1"));
+    ASSERT_NOT_NULL(strstr(content, "\"level\":\"error\",\"source\":\"rpc\","
+                                    "\"message\":\"get_code_snippet returned no source\","
+                                    "\"detail\":\"HTTP 200\",\"stack\":\"Error: x\\n    at y\"}"));
+    ASSERT_NOT_NULL(strstr(content,
+                           "\"seq\":2,\"ts\":\"2026-09-08T10:00:01.000Z\",\"level\":\"log\","
+                           "\"source\":\"console\",\"message\":\"galaxy \\\"ready\\\"\"}"));
+
+    /* The tail, asked for one line: the newest, and it says it is partial. */
+    char req[256];
+    snprintf(req, sizeof(req), "GET /api/ui-log?lines=1 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"partial\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"total\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "galaxy"));
+    ASSERT_TRUE(strstr(resp, "get_code_snippet") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "\"size_bytes\":"));
+    ASSERT_TRUE(strstr(resp, "previous_path") == NULL);
+
+    /* Asked for more than there is: both, complete. */
+    snprintf(req, sizeof(req), "GET /api/ui-log?lines=10 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"partial\":false"));
+    ASSERT_NOT_NULL(strstr(resp, "get_code_snippet"));
+    ASSERT_NOT_NULL(strstr(resp, "galaxy"));
+
+    /* The ring carries the error, not the log line. */
+    snprintf(req, sizeof(req), "GET /api/logs?lines=50 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "ui.error rpc: get_code_snippet returned no source"));
+    ASSERT_TRUE(strstr(resp, "ui.log console") == NULL);
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* Refused bodies never create the file: empty, not JSON, no entries[], and a
+ * post above the 64 KiB cap. Entries that are not objects are counted as
+ * dropped rather than refused, so one bad entry does not cost the rest. */
+TEST(ui_log_post_refuses_bad_bodies) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[4096];
+    char req[512];
+
+    snprintf(req, sizeof(req),
+             "POST /api/ui-log HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    ASSERT_TRUE(ui_log_post(port, "not json", resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    ASSERT_TRUE(ui_log_post(port, "{\"page\":\"/\"}", resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    size_t big_len = 70000;
+    char *big = malloc(big_len + 64);
+    ASSERT_NOT_NULL(big);
+    strcpy(big, "{\"entries\":[{\"message\":\"");
+    size_t at = strlen(big);
+    memset(big + at, 'a', big_len);
+    strcpy(big + at + big_len, "\"}]}");
+    ASSERT_TRUE(ui_log_post(port, big, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 413);
+    free(big);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    ASSERT_TRUE(!cbm_file_exists(path));
+
+    ASSERT_TRUE(ui_log_post(port, "{\"entries\":[42,{\"message\":\"kept\"}]}", resp, sizeof(resp)) >
+                0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"accepted\":1,\"dropped\":1"));
+    ASSERT_TRUE(cbm_file_exists(path));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* The file rotates once to ui.log.1 when it has reached the configured size
+ * at the time of a post; the tail names the previous file. */
+TEST(ui_log_rotates_at_configured_size) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_setenv("CBM_UI_LOG_ROTATE_BYTES", "300", 1);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[8192];
+
+    const char *names[] = {"first", "second", "third"};
+    for (int i = 0; i < 3; i++) {
+        char body[1024];
+        char pad[320];
+        memset(pad, 'p', sizeof(pad) - 1);
+        pad[sizeof(pad) - 1] = '\0';
+        snprintf(body, sizeof(body), "{\"entries\":[{\"level\":\"info\",\"message\":\"%s %s\"}]}",
+                 names[i], pad);
+        ASSERT_TRUE(ui_log_post(port, body, resp, sizeof(resp)) > 0);
+        ASSERT_EQ(th_status(resp), 200);
+    }
+
+    char path[1024], previous[1040];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    snprintf(previous, sizeof(previous), "%s.1", path);
+    char content[4096];
+    ASSERT_TRUE(ui_log_read_file(path, content, sizeof(content)) > 0);
+    ASSERT_NOT_NULL(strstr(content, "\"message\":\"third "));
+    ASSERT_TRUE(strstr(content, "second") == NULL);
+    ASSERT_TRUE(ui_log_read_file(previous, content, sizeof(content)) > 0);
+    ASSERT_NOT_NULL(strstr(content, "\"message\":\"second "));
+    ASSERT_TRUE(strstr(content, "first") == NULL);
+
+    char req[256];
+    snprintf(req, sizeof(req), "GET /api/ui-log HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"previous_path\":\""));
+    ASSERT_NOT_NULL(strstr(resp, "ui.log.1\""));
+    ASSERT_NOT_NULL(strstr(resp, "third "));
+
+    th_server_stop(&ts);
+    cbm_unsetenv("CBM_UI_LOG_ROTATE_BYTES");
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
 /* The UI's CSP stays loopback-only: the served page may reach the server
  * itself and the two loopback services the reader can start (the local-model
  * sidecar on 4141, the agent bridge on 4142), and nothing else. Every host
@@ -2486,6 +2695,9 @@ SUITE(httpd) {
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
     RUN_TEST(ui_csp_connect_src_is_loopback_only);
+    RUN_TEST(ui_log_post_writes_jsonl_and_tail_reads_it);
+    RUN_TEST(ui_log_post_refuses_bad_bodies);
+    RUN_TEST(ui_log_rotates_at_configured_size);
     RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);

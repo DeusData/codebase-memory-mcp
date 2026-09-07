@@ -94,6 +94,21 @@ describe('AtlasApi, the projects routes', () => {
         expect(processes.calls[0]?.url).toBe('http://127.0.0.1:9749/api/processes');
     });
 
+    it('reads the frontend log tail with its file', async () => {
+        const { api: client, calls } = api({
+            body: '{"path":"/c/logs/ui.log","previous_path":"/c/logs/ui.log.1","size_bytes":77,"partial":true,"lines":["{}"],"total":3}',
+        });
+        expect(await client.uiLogTail(50)).toEqual({
+            path: '/c/logs/ui.log',
+            previousPath: '/c/logs/ui.log.1',
+            sizeBytes: 77,
+            partial: true,
+            lines: ['{}'],
+            total: 3,
+        });
+        expect(calls[0]?.url).toBe('http://127.0.0.1:9749/api/ui-log?lines=50');
+    });
+
     it('carries the status of a refusal, so busy can be told from forbidden', async () => {
         const { api: client } = api({ ok: false, status: 423, body: '{"error":"project is busy; retry after indexing"}' });
         await expect(client.saveAdr('p', 'x')).rejects.toSatisfy((error: unknown) =>
