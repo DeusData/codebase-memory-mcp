@@ -199,6 +199,18 @@ bool cbm_is_module_level_p(TSNode parent, CBMLanguage lang);
 
 // --- FQN computation ---
 
+// VB6/VBA: a .cls/.frm/.ctl/.dsr/.pag file IS a class (one COM class per file)
+// but the grammar has no class node. These resolve the class's name (from the
+// IDE-written `Attribute VB_Name = "..."` header, else the file stem) and its
+// QN. Both return NULL for .bas standard modules and for non-VB6 contexts.
+// Shared by the def extractor (which synthesises the Class node and labels the
+// file's procedures as its Methods) and the unified call-scope walker (which
+// seeds the same QN as its enclosing_class_qn baseline so in-body calls source
+// to those Methods).
+bool cbm_vb6_is_class_module_path(const char *rel_path);
+const char *cbm_vb6_file_class_name(CBMExtractCtx *ctx);
+const char *cbm_vb6_file_class_qn(CBMExtractCtx *ctx);
+
 // Compute qualified name: project.rel_path_parts.name
 char *cbm_fqn_compute(CBMArena *a, const char *project, const char *rel_path, const char *name);
 

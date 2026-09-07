@@ -3777,6 +3777,20 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         }
     }
 
+    // VB6: a .cls/.frm/.ctl/.dsr/.pag file IS a class, but the grammar has no
+    // class node — cbm_extract_definitions synthesises the Class def and sets
+    // enclosing_class_qn to its QN before the def walk. Every procedure in such
+    // a file is a Method of that class (QN class.name, parent_class set so
+    // DEFINES_METHOD links). The unified walker seeds the same QN as its
+    // enclosing_class_qn baseline (cbm_extract_unified), so in-body calls
+    // source to this Method rather than to a phantom Function.
+    if (ctx->language == CBM_LANG_VB6 && ctx->enclosing_class_qn && def.label &&
+        strcmp(def.label, "Function") == 0) {
+        def.label = "Method";
+        def.parent_class = ctx->enclosing_class_qn;
+        def.qualified_name = cbm_arena_sprintf(a, "%s.%s", ctx->enclosing_class_qn, name);
+    }
+
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
@@ -8040,6 +8054,64 @@ static const char *cbm_razor_page_route(CBMArena *a, const char *source, int sou
     return NULL;
 }
 
+/* VB6 class module bases: the designer base type of a form/control
+ * (`Begin VB.Form MainWindow` -> "VB.Form") plus every `Implements IFoo`.
+ * Returns a NULL-terminated arena array, or NULL when the file declares
+ * neither. */
+static const char **vb6_file_base_classes(CBMExtractCtx *ctx) {
+    enum { VB6_MAX_BASES = 16, VB6_HEADER_SCAN_MAX = 256 };
+    CBMArena *a = ctx->arena;
+    const char *bases[VB6_MAX_BASES];
+    int nb = 0;
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        int seen = 0;
+        do {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(node) || nb >= VB6_MAX_BASES) {
+                continue;
+            }
+            const char *k = ts_node_type(node);
+            TSNode ref = {0};
+            if (strcmp(k, "frm_begin_block") == 0) {
+                if (++seen > VB6_HEADER_SCAN_MAX) {
+                    break;
+                }
+                ref = ts_node_child_by_field_name(node, TS_FIELD("type"));
+                // Only the outermost designer block names the class's base;
+                // nested blocks are child controls. Skip GUID-typed blocks.
+                if (!ts_node_is_null(ref) && strcmp(ts_node_type(ref), "guid_literal") == 0) {
+                    continue;
+                }
+            } else if (strcmp(k, "implements_statement") == 0) {
+                ref = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            } else {
+                continue;
+            }
+            if (ts_node_is_null(ref)) {
+                continue;
+            }
+            char *t = cbm_node_text(a, ref, ctx->source);
+            if (t && t[0]) {
+                bases[nb++] = t;
+            }
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (nb == 0) {
+        return NULL;
+    }
+    const char **out = cbm_arena_alloc(a, (size_t)(nb + 1) * sizeof(*out));
+    if (!out) {
+        return NULL;
+    }
+    for (int i = 0; i < nb; i++) {
+        out[i] = bases[i];
+    }
+    out[nb] = NULL;
+    return out;
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -8074,5 +8146,34 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     }
     cbm_defs_push(&ctx->result->defs, a, mod);
 
+    // VB6: a .cls/.frm/.ctl/.dsr/.pag file is one class with no AST node of its
+    // own. Synthesise the Class def (named from `Attribute VB_Name`) and run the
+    // def walk inside its scope so extract_func_def emits the file's procedures
+    // as Methods and nested Type/Enum defs are QN-nested under it. The unified
+    // call-scope walker seeds the same QN (cbm_vb6_file_class_qn composes it the
+    // same way), so Method QNs agree on both sides.
+    const char *saved_enclosing = ctx->enclosing_class_qn;
+    if (ctx->language == CBM_LANG_VB6) {
+        const char *cname = cbm_vb6_file_class_name(ctx);
+        if (cname) {
+            CBMDefinition cls;
+            memset(&cls, 0, sizeof(cls));
+            cls.name = cname;
+            cls.qualified_name =
+                cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, cname, ctx->language);
+            cls.label = "Class";
+            cls.file_path = ctx->rel_path;
+            cls.start_line = FIRST_LINE;
+            cls.end_line = mod.end_line;
+            cls.lines = (int)(cls.end_line - cls.start_line + TS_LINE_OFFSET);
+            cls.is_exported = true;
+            cls.is_test = mod.is_test;
+            cls.base_classes = vb6_file_base_classes(ctx);
+            cbm_defs_push(&ctx->result->defs, a, cls);
+            ctx->enclosing_class_qn = cls.qualified_name;
+        }
+    }
+
     cbm_extract_definitions_without_module(ctx);
+    ctx->enclosing_class_qn = saved_enclosing;
 }

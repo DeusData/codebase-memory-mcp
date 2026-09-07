@@ -1794,3 +1794,104 @@ const char *cbm_template_string_text(CBMArena *a, TSNode node, const char *sourc
     }
     return cbm_arena_strndup(a, buf, pos);
 }
+
+// --- VB6 class-module identity ---
+
+/* Case-insensitive ASCII compare of a file extension (VB6 projects on Windows
+ * mix `.CLS`/`.cls`). Avoids strcasecmp (POSIX-only header on MinGW). */
+static bool ext_equals_ci(const char *ext, const char *want) {
+    for (; *ext && *want; ext++, want++) {
+        if (tolower((unsigned char)*ext) != tolower((unsigned char)*want)) {
+            return false;
+        }
+    }
+    return *ext == '\0' && *want == '\0';
+}
+
+bool cbm_vb6_is_class_module_path(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    const char *dot = strrchr(rel_path, '.');
+    if (!dot) {
+        return false;
+    }
+    /* Class module, form, user control, designer, property page — each file is
+     * one COM class. `.bas` (standard module) is deliberately absent. */
+    static const char *class_exts[] = {".cls", ".frm", ".ctl", ".dsr", ".pag", NULL};
+    for (const char **e = class_exts; *e; e++) {
+        if (ext_equals_ci(dot, *e)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+const char *cbm_vb6_file_class_name(CBMExtractCtx *ctx) {
+    if (!ctx || ctx->language != CBM_LANG_VB6 || !cbm_vb6_is_class_module_path(ctx->rel_path)) {
+        return NULL;
+    }
+    CBMArena *a = ctx->arena;
+
+    /* `Attribute VB_Name = "Widget"` is written by the IDE and is the class's
+     * COM identity — prefer it over the file stem (files get renamed; the
+     * attribute is what other modules reference). The header block precedes all
+     * code, so a bounded scan of the leading top-level items suffices. */
+    enum { VB6_HEADER_SCAN_MAX = 256 };
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    const char *found = NULL;
+    if (ts_tree_cursor_goto_first_child(&cursor)) {
+        int seen = 0;
+        do {
+            TSNode node = ts_tree_cursor_current_node(&cursor);
+            if (!ts_node_is_named(node)) {
+                continue;
+            }
+            if (++seen > VB6_HEADER_SCAN_MAX) {
+                break;
+            }
+            if (strcmp(ts_node_type(node), "attribute_statement") != 0) {
+                continue;
+            }
+            TSNode nm = ts_node_child_by_field_name(node, TS_FIELD("name"));
+            TSNode val = ts_node_child_by_field_name(node, TS_FIELD("value"));
+            if (ts_node_is_null(nm) || ts_node_is_null(val)) {
+                continue;
+            }
+            char *nt = cbm_node_text(a, nm, ctx->source);
+            if (!nt || strcmp(nt, "VB_Name") != 0) {
+                continue;
+            }
+            char *vt = cbm_node_text(a, val, ctx->source);
+            size_t vl = vt ? strlen(vt) : 0;
+            if (vl >= CBM_QUOTE_PAIR && vt[0] == '"' && vt[vl - CBM_QUOTE_OFFSET] == '"') {
+                vt = cbm_arena_strndup(a, vt + CBM_QUOTE_OFFSET, vl - CBM_QUOTE_PAIR);
+                vl -= CBM_QUOTE_PAIR;
+            }
+            if (vt && vl > 0) {
+                found = vt;
+            }
+            break;
+        } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    }
+    ts_tree_cursor_delete(&cursor);
+    if (found) {
+        return found;
+    }
+
+    /* Fallback: file stem (`Forms/MainWindow.frm` -> `MainWindow`). */
+    const char *base = strrchr(ctx->rel_path, '/');
+    base = base ? base + 1 : ctx->rel_path;
+    const char *dot = strrchr(base, '.');
+    size_t len = dot ? (size_t)(dot - base) : strlen(base);
+    return len > 0 ? cbm_arena_strndup(a, base, len) : NULL;
+}
+
+const char *cbm_vb6_file_class_qn(CBMExtractCtx *ctx) {
+    const char *name = cbm_vb6_file_class_name(ctx);
+    if (!name) {
+        return NULL;
+    }
+    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
+                                       ctx->language);
+}
