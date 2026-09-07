@@ -119,6 +119,7 @@ static atomic_bool frontend_test_monitor_is_waiting = ATOMIC_VAR_INIT(false);
 static atomic_uint_fast64_t frontend_test_monitor_observation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_worker_observation_count = ATOMIC_VAR_INIT(0);
 static atomic_uint_fast64_t frontend_test_worker_idle_count = ATOMIC_VAR_INIT(0);
+static atomic_uint_fast64_t frontend_test_routed_cancellation_count = ATOMIC_VAR_INIT(0);
 
 void cbm_daemon_frontend_test_observer_reset(bool hold_monitor) {
     atomic_store_explicit(&frontend_test_monitor_observation_count, 0, memory_order_release);
@@ -146,6 +147,10 @@ uint64_t cbm_daemon_frontend_test_worker_observations(void) {
 
 uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void) {
     return atomic_load_explicit(&frontend_test_worker_idle_count, memory_order_acquire);
+}
+
+uint64_t cbm_daemon_frontend_test_routed_cancellations(void) {
+    return atomic_load_explicit(&frontend_test_routed_cancellation_count, memory_order_acquire);
 }
 #endif
 
@@ -478,6 +483,12 @@ static frontend_cancellation_route_t frontend_route_cancellation(frontend_state_
     }
     cbm_mutex_unlock(&state->mutex);
     cbm_jsonrpc_request_free(&request);
+#if defined(CBM_ENABLE_TEST_SEAMS) && CBM_ENABLE_TEST_SEAMS
+    if (route == FRONTEND_CANCELLATION_ACTIVE || route == FRONTEND_CANCELLATION_QUEUED) {
+        atomic_fetch_add_explicit(&frontend_test_routed_cancellation_count, 1,
+                                  memory_order_release);
+    }
+#endif
     return route;
 }
 
@@ -531,6 +542,11 @@ static bool frontend_recover_client(frontend_state_t *state, frontend_item_t *it
     }
 
     cbm_daemon_bootstrap_result_t bootstrap = {0};
+    /* Bootstrap can report launch failures on stderr from this worker.
+     * Keep that diagnostic
+     * to explain failed recovery. It never writes MCP
+     * stdout, but blocked stderr can delay
+     * exit. Do not add more logging here. */
     cbm_daemon_bootstrap_status_t bootstrap_status =
         cbm_daemon_bootstrap_execute(&state->session->bootstrap, &bootstrap);
     cbm_daemon_runtime_client_t *replacement =

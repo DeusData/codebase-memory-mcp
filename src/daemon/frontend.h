@@ -14,9 +14,11 @@
 
 typedef struct cbm_daemon_maintenance_monitor cbm_daemon_maintenance_monitor_t;
 
-/* Everything the stdio frontend must replay when its authenticated daemon
- * connection is replaced. Pointer fields are borrowed for the complete
- * frontend call. */
+/* Connection settings replayed when the authenticated daemon is replaced.
+ * Background activation
+ * from initialize is not restored here.
+ * Pointer fields are borrowed for the complete frontend
+ * call. */
 typedef struct {
     cbm_daemon_bootstrap_config_t bootstrap;
     const char *session_root;
@@ -67,6 +69,10 @@ bool cbm_daemon_frontend_test_monitor_waiting(void);
 uint64_t cbm_daemon_frontend_test_monitor_observations(void);
 uint64_t cbm_daemon_frontend_test_worker_observations(void);
 uint64_t cbm_daemon_frontend_test_worker_idle_cycles(void);
+/* Counts matching cancellations marked under the frontend mutex.
+ * Tests snapshot this monotonic
+ * count before sending a notification. */
+uint64_t cbm_daemon_frontend_test_routed_cancellations(void);
 #endif
 
 /* Takes ownership of client and borrows cohort_manager for the complete call.
