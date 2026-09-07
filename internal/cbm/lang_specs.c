@@ -890,8 +890,9 @@ static const char *graphql_field_types[] = {"field_definition", "input_value_def
 // ==================== Embedded sub-languages ====================
 // Host grammars (Svelte/Vue/HTML/Astro) treat <script> bodies as raw_text and
 // do not recurse into them. Declaring the host's script-content node here lets
-// the generic embedded-imports walker re-parse that slice with the JS grammar
-// so the existing ES import extractor sees real import_statement nodes.
+// the generic embedded walker re-parse that slice with the declared grammar so
+// its definitions, imports and calls extract in host-file coordinates. The
+// declared language is the default; a <script lang=> attribute overrides it.
 // Terminator: an entry whose script_node_type is NULL.
 static const CBMEmbeddedLangSpec cfml_embedded_imports[] = {
     /* Tag-dialect CFML keeps <cfscript> bodies as opaque cf_script_content;
@@ -915,10 +916,12 @@ static const CBMEmbeddedLangSpec html_embedded_imports[] = {
 };
 static const CBMEmbeddedLangSpec astro_embedded_imports[] = {
     /* Astro component scripts live in the `---` frontmatter fence, which the
-     * grammar keeps as an unparsed frontmatter_js_block. Re-parse that slice
-     * with the JS grammar so `import X from './X.astro'` becomes a real edge. */
-    {"frontmatter", "frontmatter_js_block", CBM_LANG_JAVASCRIPT},
-    {"script_element", "raw_text", CBM_LANG_JAVASCRIPT},
+     * grammar keeps as an unparsed frontmatter_js_block. Astro type-checks the
+     * fence and its <script> bodies as TypeScript without any lang= attribute
+     * saying so (the fence cannot carry one), so TypeScript is the deliberate
+     * default for both; it parses untyped JavaScript unchanged. */
+    {"frontmatter", "frontmatter_js_block", CBM_LANG_TYPESCRIPT},
+    {"script_element", "raw_text", CBM_LANG_TYPESCRIPT},
     {NULL, NULL, 0},
 };
 
