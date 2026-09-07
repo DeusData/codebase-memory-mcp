@@ -38,6 +38,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/profile.h"
 #include "foundation/mem.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -2415,12 +2416,56 @@ static bool ensure_db_parent(const char *path) {
     return ok;
 }
 
+/* Length of the path a stage was minted for: the input itself unless its
+ * basename has exactly the minted shape "<name>.stage.<6 alphanumerics>", in
+ * which case the root is <name>. The outer run rewrites the pipeline's db_path
+ * to its stage, so the inner publication (dump and delta clone) used to mint
+ * ITS stage from that stage: <db>.stage.A.stage.B, with -wal/-shm beside it
+ * (#1839). Minting from the root keeps every generation's stage a sibling of
+ * the live database. Only the exact minted shape is recognised: a database
+ * named "x.stage.y.db" is not a stage and keeps its full name. */
+enum { CBM_STAGE_SUFFIX_RANDOM_CHARS = 6 };
+static const char cbm_stage_marker[] = ".stage.";
+
+static bool stage_suffix_at(const char *tail) {
+    if (strncmp(tail, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
+        return false;
+    }
+    const char *random = tail + sizeof(cbm_stage_marker) - 1;
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        if (!isalnum((unsigned char)random[i])) {
+            return false;
+        }
+    }
+    return random[CBM_STAGE_SUFFIX_RANDOM_CHARS] == '\0';
+}
+
+static size_t stage_root_length(const char *path) {
+    size_t len = strlen(path);
+    const size_t suffix_len = sizeof(cbm_stage_marker) - 1 + CBM_STAGE_SUFFIX_RANDOM_CHARS;
+    if (len <= suffix_len) {
+        return len;
+    }
+    size_t root_len = len - suffix_len;
+    /* The marker must sit inside the basename, never span a separator. */
+    for (size_t i = root_len; i < len; i++) {
+        if (path[i] == '/'
+#ifdef _WIN32
+            || path[i] == '\\'
+#endif
+        ) {
+            return len;
+        }
+    }
+    return stage_suffix_at(path + root_len) ? root_len : len;
+}
+
 static char *create_staging_path(const char *final_path) {
     if (!final_path) {
         return NULL;
     }
     static const char suffix[] = ".stage.XXXXXX";
-    size_t final_len = strlen(final_path);
+    size_t final_len = stage_root_length(final_path);
     if (final_len > SIZE_MAX - sizeof(suffix)) {
         return NULL;
     }

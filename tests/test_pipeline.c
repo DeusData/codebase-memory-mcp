@@ -3416,6 +3416,86 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
     PASS();
 }
 
+static int count_substring(const char *haystack, const char *needle) {
+    int count = 0;
+    size_t needle_len = strlen(needle);
+    for (const char *at = strstr(haystack, needle); at; at = strstr(at + needle_len, needle)) {
+        count++;
+    }
+    return count;
+}
+
+static int count_nested_stage_entries(const char *dir_path, const char *db_basename) {
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return -1;
+    }
+    size_t base_len = strlen(db_basename);
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, db_basename, base_len) == 0 &&
+            count_substring(entry->name + base_len, ".stage.") >= 2) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+/* #1839: the outer run rewrites the pipeline's db_path to its stage, so the
+ * inner publication (dump or delta clone) minted ITS stage from a stage:
+ * <db>.stage.A.stage.B, plus -wal/-shm under WAL. A generation's stage is a
+ * sibling of the live database, whichever path it is minted from; a database
+ * whose own basename merely contains ".stage." is not a stage and keeps its
+ * full name. */
+TEST(pipeline_stage_names_never_nest) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_nesting_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    char odd_db[512];
+    snprintf(odd_db, sizeof(odd_db), "%s/x.stage.y.db", tmp);
+
+    char *outer = cbm_pipeline_create_staging_path(db_path);
+    ASSERT_NOT_NULL(outer);
+    char *inner = cbm_pipeline_create_staging_path(outer);
+    ASSERT_NOT_NULL(inner);
+    char *odd_stage = cbm_pipeline_create_staging_path(odd_db);
+    ASSERT_NOT_NULL(odd_stage);
+
+    size_t db_len = strlen(db_path);
+    size_t odd_len = strlen(odd_db);
+    int outer_tokens = count_substring(outer, ".stage.");
+    int inner_tokens = count_substring(inner, ".stage.");
+    bool inner_is_sibling =
+        strncmp(inner, db_path, db_len) == 0 && strncmp(inner + db_len, ".stage.", 7) == 0;
+    bool inner_distinct = strcmp(inner, outer) != 0;
+    bool odd_keeps_basename =
+        strncmp(odd_stage, odd_db, odd_len) == 0 && strncmp(odd_stage + odd_len, ".stage.", 7) == 0;
+    int nested_entries = count_nested_stage_entries(tmp, "generation.db");
+
+    cbm_pipeline_discard_stage(inner);
+    cbm_pipeline_discard_stage(outer);
+    cbm_pipeline_discard_stage(odd_stage);
+    int leftover_entries = count_generation_stage_artifacts(tmp, "generation.db") +
+                           count_generation_stage_artifacts(tmp, "x.stage.y.db");
+    free(inner);
+    free(outer);
+    free(odd_stage);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(outer_tokens, 1);
+    ASSERT_EQ(inner_tokens, 1);
+    ASSERT_TRUE(inner_is_sibling);
+    ASSERT_TRUE(inner_distinct);
+    ASSERT_TRUE(odd_keeps_basename);
+    ASSERT_EQ(nested_entries, 0);
+    ASSERT_EQ(leftover_entries, 0);
+    PASS();
+}
+
 /* Discovery and extraction must describe the same immutable generation. A
  * source file created after extraction is not present in the original file
  * list, so merely re-hashing that list cannot detect the race. Publication
@@ -14120,6 +14200,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_git_context_change_forces_full_and_refreshes_branch);
     RUN_TEST(pipeline_global_extension_config_change_forces_full);
     RUN_TEST(pipeline_publication_never_uses_a_predictable_staging_path);
+    RUN_TEST(pipeline_stage_names_never_nest);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);
