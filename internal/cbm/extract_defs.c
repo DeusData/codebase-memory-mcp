@@ -9039,6 +9039,102 @@ static void py_apply_router_prefix(CBMExtractCtx *ctx, TSNode func_node, const C
     }
 }
 
+/* Emit one synthetic Function def for a Mojo::Base / Moose `has X` accessor so
+ * `$obj->X` resolves to a real node (the generated read/write accessor is not a
+ * `sub`, so it has no def otherwise — the #1 reason typed receivers still fail:
+ * `$c->stash`, `$c->app`, `$c->tx` are all has-accessors). QN follows the Perl
+ * sub convention (module_qn.name, package not woven in); def_module_qn = the
+ * file module so the cross-file registrars attach it to the package's type. */
+static void perl_emit_has_accessor(CBMExtractCtx *ctx, const char *name, TSNode at) {
+    if (!name || !name[0])
+        return;
+    CBMArena *a = ctx->arena;
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name =
+        ctx->module_qn ? cbm_arena_sprintf(a, "%s.%s", ctx->module_qn, name) : name;
+    /* short_name and def_module_qn are derived on the CBMLSPDef surface (from
+     * name and the file module); only name/qualified_name/label are set here. */
+    def.label = "Method";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(at).row + TS_LINE_OFFSET;
+    def.end_line = def.start_line;
+    def.lines = 1;
+    def.is_test = ctx->result->is_test_file;
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* Collect accessor NAME(s) from the FIRST argument of a `has` call: 'name',
+ * bareword name, or ['a','b'] arrayref. Strings only (Object::Pad `has $x` is a
+ * variable and is skipped). Mirrors the LSP's perl_collect_has_names. */
+static void perl_emit_has_names(CBMExtractCtx *ctx, TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > 3)
+        return;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "string_literal") == 0 || strcmp(k, "interpolated_string_literal") == 0) {
+        /* The unquoted value is the `string_content` child. */
+        TSNode content = cbm_find_child_by_kind(node, "string_content");
+        char *inner = ts_node_is_null(content) ? NULL : cbm_node_text(ctx->arena, content, ctx->source);
+        if (inner && inner[0] && inner[0] != '$')
+            perl_emit_has_accessor(ctx, inner, node);
+        return;
+    }
+    if (strcmp(k, "bareword") == 0 || strcmp(k, "autoquoted_bareword") == 0) {
+        char *bw = cbm_node_text(ctx->arena, node, ctx->source);
+        if (bw && bw[0] && bw[0] != '-')
+            perl_emit_has_accessor(ctx, bw, node);
+        return;
+    }
+    if (strcmp(k, "anonymous_array_expression") == 0 || strcmp(k, "list_expression") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc && i < 16; i++)
+            perl_emit_has_names(ctx, ts_node_named_child(node, i), depth + 1);
+    }
+}
+
+/* Walk the file emitting has-accessor defs. A `has` call is an accessor only in
+ * a package that imports Mojo::Base / Moose / Moo / Mouse (tracked forward: the
+ * `use` precedes the `has` in that package), so a foreign `has(...)` is never
+ * treated as an accessor (zero-edge). */
+static void perl_scan_has_accessors(CBMExtractCtx *ctx, TSNode node, bool *gated, int depth) {
+    if (ts_node_is_null(node) || depth > 200)
+        return;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "package_statement") == 0 || strcmp(k, "class_statement") == 0) {
+        *gated = false; /* new package: re-gate on its own use-statements */
+    } else if (strcmp(k, "use_statement") == 0) {
+        TSNode mod = ts_node_child_by_field_name(node, "module", 6);
+        if (!ts_node_is_null(mod)) {
+            char *mn = cbm_node_text(ctx->arena, mod, ctx->source);
+            if (mn && (strcmp(mn, "Mojo::Base") == 0 || strcmp(mn, "Moose") == 0 ||
+                       strcmp(mn, "Moo") == 0 || strcmp(mn, "Mouse") == 0 ||
+                       strcmp(mn, "Moose::Role") == 0 || strcmp(mn, "Moo::Role") == 0))
+                *gated = true;
+        }
+    } else if (*gated && (strcmp(k, "function_call_expression") == 0 ||
+                          strcmp(k, "ambiguous_function_call_expression") == 0)) {
+        TSNode fn = ts_node_child_by_field_name(node, "function", 8);
+        if (ts_node_is_null(fn))
+            fn = ts_node_named_child(node, 0);
+        char *fname = ts_node_is_null(fn) ? NULL : cbm_node_text(ctx->arena, fn, ctx->source);
+        if (fname && strcmp(fname, "has") == 0) {
+            uint32_t nc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                if (ts_node_eq(c, fn))
+                    continue;
+                /* First non-function arg carries the name(s). */
+                perl_emit_has_names(ctx, c, 0);
+                break;
+            }
+        }
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++)
+        perl_scan_has_accessors(ctx, ts_node_named_child(node, i), gated, depth + 1);
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -9082,4 +9178,11 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     }
 
     cbm_extract_definitions_without_module(ctx);
+
+    /* Perl: emit synthetic defs for Mojo::Base/Moose `has X` accessors so
+     * `$obj->X` resolves (see perl_scan_has_accessors). */
+    if (ctx->language == CBM_LANG_PERL) {
+        bool has_gated = false;
+        perl_scan_has_accessors(ctx, ctx->root, &has_gated, 0);
+    }
 }
