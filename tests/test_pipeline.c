@@ -2066,6 +2066,226 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
     PASS();
 }
 
+/* Reproduce-first for the multi-worker determinism gap distilled from #1925:
+ * the complexity pass walked Function/Method nodes and their CALLS targets in
+ * temp-id order. Extract workers draw ids from one shared counter, so that
+ * order is worker-scheduling order, and the cycle guard flags whichever member
+ * of a mutual-recursion cycle the DFS enters first. Run to run, `recursive`
+ * therefore flipped between the members of a cycle while the CALLS edge set
+ * stayed identical -- a violation of the MT-byte-identical invariant. The
+ * fixture holds 24 two-member and 6 three-member cycles, one function per
+ * file, whose members are equal-sized (adjacent in the size-ordered work
+ * queue), which is what makes the flip likely. The
+ * fixture exceeds MIN_FILES_FOR_PARALLEL; CBM_INDEX_SINGLE_THREAD forces the
+ * reference run through the sequential path and CBM_WORKERS forces the
+ * repeated runs through pass_parallel.c, exactly like the parity test above.
+ * Every multi-worker run must match the sequential one byte for byte. */
+enum { CX_ORDER_MT_RUNS = 6, CX_ORDER_LINE_MAX = 512 };
+
+static const char *cx_order_fixture_dir(void) {
+    return "tests/fixtures/complexity_pass_cycle_order";
+}
+
+/* Copy the regular files of a flat fixture directory into dst_dir. Returns the
+ * number of files copied, or -1 when one could not be read whole. */
+static int cx_order_copy_fixture(const char *src_dir, const char *dst_dir) {
+    cbm_dir_t *d = cbm_opendir(src_dir);
+    if (!d) {
+        return -1;
+    }
+    int copied = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (entry->name[0] == '.' || entry->is_dir) {
+            continue;
+        }
+        char src[CBM_SZ_1K];
+        snprintf(src, sizeof(src), "%s/%s", src_dir, entry->name);
+        FILE *in = cbm_fopen(src, "rb");
+        if (!in) {
+            copied = -1;
+            break;
+        }
+        char buf[CBM_SZ_4K];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, in);
+        fclose(in);
+        if (n == sizeof(buf) - 1) {
+            copied = -1; /* fixture files are tiny; a full buffer means truncation */
+            break;
+        }
+        buf[n] = '\0';
+        write_temp_file(dst_dir, entry->name, buf);
+        copied++;
+    }
+    cbm_closedir(d);
+    return copied;
+}
+
+static int cx_order_cmp_node_qn(const void *pa, const void *pb) {
+    const cbm_node_t *a = *(const cbm_node_t *const *)pa;
+    const cbm_node_t *b = *(const cbm_node_t *const *)pb;
+    return strcmp(a->qualified_name ? a->qualified_name : "",
+                  b->qualified_name ? b->qualified_name : "");
+}
+
+/* One line per Function in qualified-name order: "<qn> <tld> <recursive>".
+ * Sorting by name keeps DB ids and row order out of the comparison. Returns a
+ * heap string, or NULL when the store cannot be read. */
+static char *cx_order_signature(const char *db_path, const char *project, int *func_count) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return NULL;
+    }
+    cbm_node_t *funcs = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &count) != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    const cbm_node_t **sorted = calloc((size_t)count + 1, sizeof(*sorted));
+    char *sig = calloc((size_t)count + 1, CX_ORDER_LINE_MAX);
+    if (sorted && sig) {
+        for (int i = 0; i < count; i++) {
+            sorted[i] = &funcs[i];
+        }
+        qsort(sorted, (size_t)count, sizeof(*sorted), cx_order_cmp_node_qn);
+        size_t used = 0;
+        for (int i = 0; i < count; i++) {
+            const char *props = sorted[i]->properties_json ? sorted[i]->properties_json : "{}";
+            const char *tld = strstr(props, "\"transitive_loop_depth\":");
+            const char *rec = strstr(props, "\"recursive\":");
+            int w = snprintf(sig + used, CX_ORDER_LINE_MAX, "%s %.*s %.*s\n",
+                             sorted[i]->qualified_name ? sorted[i]->qualified_name : "",
+                             tld ? (int)strcspn(tld, ",}") : 0, tld ? tld : "",
+                             rec ? (int)strcspn(rec, ",}") : 0, rec ? rec : "");
+            if (w < 0) {
+                w = 0;
+            } else if (w >= CX_ORDER_LINE_MAX) {
+                w = CX_ORDER_LINE_MAX - 1;
+            }
+            used += (size_t)w;
+        }
+    } else {
+        free(sig);
+        sig = NULL;
+    }
+    free(sorted);
+    cbm_store_free_nodes(funcs, count);
+    cbm_store_close(s);
+    *func_count = count;
+    return sig;
+}
+
+/* First line of `got` that differs from `want`, copied into out (for the
+ * failure diagnostic). Returns false when the strings are identical. */
+static bool cx_order_first_diff(const char *want, const char *got, char *out, size_t cap) {
+    if (strcmp(want, got) == 0) {
+        return false;
+    }
+    while (*want && *got) {
+        size_t lw = strcspn(want, "\n");
+        size_t lg = strcspn(got, "\n");
+        if (lw != lg || memcmp(want, got, lw) != 0) {
+            snprintf(out, cap, "want '%.*s' got '%.*s'", (int)lw, want, (int)lg, got);
+            return true;
+        }
+        want += lw + (want[lw] == '\n');
+        got += lg + (got[lg] == '\n');
+    }
+    snprintf(out, cap, "line count differs");
+    return true;
+}
+
+TEST(pipeline_complexity_props_independent_of_worker_order) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cx_order_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    int copied = cx_order_copy_fixture(cx_order_fixture_dir(), tmp);
+    if (copied <= 0) {
+        th_rmtree(tmp);
+        FAIL("fixture copy");
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cx_sequential.db", tmp);
+    cbm_pipeline_t *sequential = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int sequential_rc = sequential ? cbm_pipeline_run(sequential) : -1;
+    int sequential_funcs = 0;
+    char *sequential_sig = NULL;
+    if (sequential && sequential_rc == 0) {
+        sequential_sig =
+            cx_order_signature(db_path, cbm_pipeline_project_name(sequential), &sequential_funcs);
+    }
+    cbm_pipeline_free(sequential);
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel_rc[CX_ORDER_MT_RUNS];
+    char *parallel_sig[CX_ORDER_MT_RUNS];
+    for (int r = 0; r < CX_ORDER_MT_RUNS; r++) {
+        snprintf(db_path, sizeof(db_path), "%s/cx_parallel_%d.db", tmp, r);
+        cbm_pipeline_t *parallel = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        parallel_rc[r] = parallel ? cbm_pipeline_run(parallel) : -1;
+        parallel_sig[r] = NULL;
+        if (parallel && parallel_rc[r] == 0) {
+            int funcs = 0;
+            parallel_sig[r] =
+                cx_order_signature(db_path, cbm_pipeline_project_name(parallel), &funcs);
+        }
+        cbm_pipeline_free(parallel);
+    }
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    /* Verdicts first, then release, then assert: the assertions must not leak. */
+    bool cycles_detected = sequential_sig && strstr(sequential_sig, "\"recursive\":true") != NULL;
+    int mismatch_run = -1;
+    char diff[CBM_SZ_1K] = "";
+    for (int r = 0; r < CX_ORDER_MT_RUNS && mismatch_run < 0; r++) {
+        if (parallel_rc[r] != 0 || !parallel_sig[r]) {
+            mismatch_run = r;
+            snprintf(diff, sizeof(diff), "run %d rc=%d", r, parallel_rc[r]);
+        } else if (sequential_sig &&
+                   cx_order_first_diff(sequential_sig, parallel_sig[r], diff, sizeof(diff))) {
+            mismatch_run = r;
+        }
+    }
+    free(sequential_sig);
+    for (int r = 0; r < CX_ORDER_MT_RUNS; r++) {
+        free(parallel_sig[r]);
+    }
+
+    ASSERT_EQ(sequential_rc, 0);
+    ASSERT_NOT_NULL(sequential_sig);
+    ASSERT_GTE(sequential_funcs, copied); /* at least the one function per fixture file */
+    ASSERT_TRUE(cycles_detected);        /* the cycles must reach the pass at all */
+    if (mismatch_run >= 0) {
+        printf("\n    parallel run %d diverges from sequential: %s\n", mismatch_run, diff);
+        FAIL("complexity props depend on worker id order");
+    }
+    PASS();
+}
+
 #ifdef _WIN32
 /* utimensat/AT_FDCWD do not exist on Windows. Set the same instant through
  * SetFileTime: FILETIME is 100ns ticks since 1601, the same representation
@@ -13409,6 +13629,54 @@ TEST(pipeline_markdown_and_config_prose_reaches_fts_body) {
     PASS();
 }
 
+/* A graph with no Function or Method nodes at all -- a struct-only or
+ * config-only project -- must run pass_semantic_edges cleanly. Its phase-1
+ * scan used to hand qsort() a NULL base with count 0, before the func_count
+ * early-out in phase 1b could run. glibc declares qsort's base nonnull, so
+ * UBSan on the Linux leg reports that call; the macOS SDK carries no such
+ * attribute, so the sanitizer is silent there. The label counts pin the
+ * fixture to what it claims: at least one Struct and zero Function/Method,
+ * i.e. the scan genuinely finds nothing to sort. */
+TEST(pipeline_semantic_edges_no_functions) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nofunc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512];
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/nofunc.db", tmp);
+
+    snprintf(path, sizeof(path), "%s/main.go", tmp);
+    ASSERT_EQ(th_write_file(path, "package main\n\ntype Widget struct{}\n"), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT COUNT(*) FROM nodes WHERE label = ?1",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    const char *labels[] = {"Struct", "Function", "Method"};
+    int counts[3] = {0, 0, 0};
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, labels[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+        counts[i] = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    ASSERT_GT(counts[0], 0);
+    ASSERT_EQ(counts[1], 0);
+    ASSERT_EQ(counts[2], 0);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
 #if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
 /* Join two Studio Export range strings and hand back the result. The caller
  * owns nothing: the string lives in the aggregate's arena, so copy it out
@@ -13539,6 +13807,7 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_env_access_configures_sequential_parallel_parity);
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
+    RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
@@ -13827,6 +14096,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);
     RUN_TEST(pipeline_delta_patch_indexes_docstring_into_fts_body);
     RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
+    RUN_TEST(pipeline_semantic_edges_no_functions);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
