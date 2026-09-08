@@ -2318,8 +2318,8 @@ static char *cbm_build_openhands_mcp_entry(const char *binary_path) {
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     bool ok = root && yyjson_mut_obj_add_strcpy(doc, root, "transport", "stdio") &&
-             yyjson_mut_obj_add_strcpy(doc, root, "command", binary_path) &&
-             yyjson_mut_obj_add_bool(doc, root, "enabled", true);
+              yyjson_mut_obj_add_strcpy(doc, root, "command", binary_path) &&
+              yyjson_mut_obj_add_bool(doc, root, "enabled", true);
     char *json = NULL;
     if (ok) {
         yyjson_mut_doc_set_root(doc, root);
@@ -2349,10 +2349,9 @@ static int cbm_upsert_openhands_settings_mcp(const char *binary_path, const char
         cbm_json_like_object_field_t fields[3];
         size_t field_count = cbm_openhands_ownership_fields(fields);
         char *command = NULL;
-        int ownership =
-            cbm_json_like_match_object_entry(document, document_length, path, 1U,
-                                             CBM_DEFAULT_MCP_SERVER_NAME, fields, field_count,
-                                             &command);
+        int ownership = cbm_json_like_match_object_entry(document, document_length, path, 1U,
+                                                         CBM_DEFAULT_MCP_SERVER_NAME, fields,
+                                                         field_count, &command);
         free(command);
         if (ownership == CBM_JSON_LIKE_OBJECT_MATCH ||
             ownership == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) {
@@ -2400,8 +2399,8 @@ static int cbm_remove_openhands_settings_mcp(const char *settings_path) {
     size_t field_count = cbm_openhands_ownership_fields(fields);
     char *command = NULL;
     int ownership = cbm_json_like_match_object_entry(document, document_length, path, 1U,
-                                                      CBM_DEFAULT_MCP_SERVER_NAME, fields,
-                                                      field_count, &command);
+                                                     CBM_DEFAULT_MCP_SERVER_NAME, fields,
+                                                     field_count, &command);
     free(command);
     if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH) {
         free(document);
@@ -9374,8 +9373,7 @@ static bool cbm_filename_has_suffix(const char *name, const char *suffix) {
  * directory is a silent no-op in both directions — install must never invent
  * it, and uninstall has nothing to undo there. Only *.json entries are
  * touched; a profile directory may hold arbitrary notes alongside profiles. */
-static void openhands_update_profile_refs(const char *profiles_dir, bool installing,
-                                          bool dry_run) {
+static void openhands_update_profile_refs(const char *profiles_dir, bool installing, bool dry_run) {
     cbm_dir_t *d = cbm_opendir(profiles_dir);
     if (!d) {
         return;
@@ -9392,15 +9390,14 @@ static void openhands_update_profile_refs(const char *profiles_dir, bool install
         if (stat(profile_path, &state) != 0 || !S_ISREG(state.st_mode) || dry_run) {
             continue;
         }
-        int result = installing ? cbm_json_like_add_unique_string(
-                                      profile_path, "mcp_server_refs", CBM_DEFAULT_MCP_SERVER_NAME)
+        int result = installing ? cbm_json_like_add_unique_string(profile_path, "mcp_server_refs",
+                                                                  CBM_DEFAULT_MCP_SERVER_NAME)
                                 : cbm_json_like_remove_string(profile_path, "mcp_server_refs",
                                                               CBM_DEFAULT_MCP_SERVER_NAME);
         if (result != CLI_OK) {
-            record_agent_config_error(!installing, "OpenHands",
-                                      installing ? "profile_refs_install"
-                                                 : "profile_refs_uninstall",
-                                      profile_path);
+            record_agent_config_error(
+                !installing, "OpenHands",
+                installing ? "profile_refs_install" : "profile_refs_uninstall", profile_path);
         }
     }
     cbm_closedir(d);
