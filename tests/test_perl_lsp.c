@@ -1163,6 +1163,37 @@ TEST(perllsp_cross_mojo_routing_c_param) {
     PASS();
 }
 
+TEST(perllsp_cross_mojo_listunpack_c_param) {
+    /* Mojolicious framework convention: inside a Mojolicious::* module, the 2nd
+     * positional of `my ($self, $c) = @_` is the controller (dispatch/render/
+     * route methods receive it), so `$c->render/stash/...` dispatches through
+     * Mojolicious::Controller. Gated to the framework module path
+     * (module_qn contains "Mojolicious"). */
+    const char *source = "package Mojolicious::Foo;\n"
+                         "use Mojo::Base -base;\n"
+                         "sub bar {\n"
+                         "    my ($self, $c) = @_;\n"
+                         "    return $c->render;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Mojolicious.Controller.render", .short_name = "render",
+         .label = "Function", .def_module_qn = "test.lib.Mojolicious.Controller"},
+        {.qualified_name = "test.lib.Mojolicious.Foo.bar", .short_name = "bar", .label = "Function",
+         .def_module_qn = "test.lib.Mojolicious.Foo"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Mojolicious.Foo", defs, 2,
+                           NULL, NULL, 0, NULL, &out, NULL, defs, 2);
+    int idx = find_resolved_arr(&out, "Foo.bar", "Mojolicious.Controller.render");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_return_type_chain) {
     /* Return-type inference: extraction infers make_widget's return type (Widget)
      * from a `return Widget->new` body (perl_infer_return_types) and carries it on
@@ -1386,6 +1417,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_parent_only_in_all_defs);
     RUN_TEST(perllsp_cross_toplevel_module_caller);
     RUN_TEST(perllsp_cross_mojo_routing_c_param);
+    RUN_TEST(perllsp_cross_mojo_listunpack_c_param);
     RUN_TEST(perllsp_cross_return_type_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);

@@ -1265,6 +1265,28 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
                     if (lbare && lbare[0]) {
                         cbm_scope_bind(ctx->current_scope, lbare,
                                        cbm_type_named(ctx->arena, pkg));
+                        /* Mojolicious framework convention: inside a Mojolicious::*
+                         * module the 2nd positional of `my ($self, $c) = @_` is the
+                         * controller passed to a dispatch/render/route method, so
+                         * `$c->render/stash/param/...` dispatches through
+                         * Mojolicious::Controller (seeded into the chain-walk).
+                         * Gated to the framework path — user code uses the
+                         * signature form (perl_bind_routing_controller_param). */
+                        if (ctx->module_qn && strstr(ctx->module_qn, "Mojolicious")) {
+                            uint32_t pn = ts_node_named_child_count(lhs_var);
+                            for (uint32_t j = 0; j < pn && j < 8; j++) {
+                                TSNode pv =
+                                    perl_first_scalar_desc(ts_node_named_child(lhs_var, j), 0);
+                                char *pt = ts_node_is_null(pv) ? NULL : perl_node_text(ctx, pv);
+                                const char *pb = pt ? perl_strip_sigil(pt) : NULL;
+                                if (pb && strcmp(pb, "c") == 0) {
+                                    cbm_scope_bind(
+                                        ctx->current_scope, "c",
+                                        cbm_type_named(ctx->arena, "Mojolicious::Controller"));
+                                    break;
+                                }
+                            }
+                        }
                         free(kids);
                         return; /* only the first invocant binding */
                     }
@@ -2822,7 +2844,9 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
          * class into the chain-walk so its method table (render/stash/param/...)
          * plus its own @ISA (Mojo::Base) get attached from all_defs. Only when the
          * file actually has such a callback — no callback, no seed, no edge. */
-        if (wl_tail < PERL_CHAIN_CAP && perl_scan_has_mojo_routing_cb(&ctx, root, 0))
+        if (wl_tail < PERL_CHAIN_CAP &&
+            (perl_scan_has_mojo_routing_cb(&ctx, root, 0) ||
+             (module_qn && strstr(module_qn, "Mojolicious"))))
             worklist[wl_tail++] = "Mojolicious::Controller";
         while (wl_head < wl_tail) {
             const char *parent = worklist[wl_head++];
