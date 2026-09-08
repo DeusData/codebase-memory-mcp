@@ -42,6 +42,7 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <poll.h>
+#include <signal.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -1510,6 +1511,16 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
  * install under test and asks the daemon itself afterwards. */
 #define CLI_SCOPE_HOST_DRAINED 3
 #define CLI_SCOPE_TIMEOUT_MS 5000U
+/* Generous, BOUNDED waits so a wedged host child (a fork-time sanitizer
+ * allocator stall is the classic cause — see the posix_spawn fix history)
+ * fails the test cleanly instead of hanging the whole suite to the CI
+ * wall-clock kill. Each comfortably exceeds the child's own 45 s cohort
+ * admission deadline plus a multi-second service start/teardown, so none trips
+ * for a merely slow-but-healthy runner; they only convert an otherwise
+ * unbounded hang into a deterministic pass/fail. */
+#define CLI_SCOPE_READY_TIMEOUT_MS 90000U
+#define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
+#define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
 
 typedef struct {
     char tmpdir[256];
@@ -1598,6 +1609,68 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     _exit(!ready_ok ? 1 : drained ? CLI_SCOPE_HOST_DRAINED : 0);
 }
 
+/* Bounded read of the host child's one-byte readiness signal. A child that
+ * deadlocks before it can write (a fork-time allocator stall under a sanitizer
+ * is the classic cause) must never hang the whole suite on an unbounded read:
+ * poll to a generous deadline, then let the caller's ASSERT_TRUE(ready) fail
+ * cleanly. Returns the byte, or 0 when the child died, closed the pipe, or
+ * never answered in time. */
+static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    for (;;) {
+        int64_t remaining = (int64_t)deadline - (int64_t)cbm_now_ms();
+        if (remaining <= 0) {
+            return 0;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int r = poll(&pfd, 1, (int)remaining);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return 0;
+        }
+        if (r == 0) {
+            return 0; /* deadline reached with no signal */
+        }
+        char ready = 0;
+        ssize_t got = read(fd, &ready, 1);
+        if (got == 1) {
+            return ready;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        return 0; /* EOF (child gone) or error */
+    }
+}
+
+/* Reap the host child within a bound: the release signal makes a healthy child
+ * break within ~50 ms and finish teardown in a few seconds, so a child still
+ * alive past the deadline is wedged — SIGKILL it and reap so the suite always
+ * makes progress. Returns the child's exit code, or -1 when it had to be
+ * killed or did not exit cleanly; a -1 fails the caller's host_exit assertion
+ * cleanly rather than hanging. */
+static int cli_scope_reap_host(pid_t host, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    int status = 0;
+    for (;;) {
+        pid_t reaped = waitpid(host, &status, WNOHANG);
+        if (reaped == host) {
+            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (reaped < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (cbm_now_ms() >= deadline) {
+            (void)kill(host, SIGKILL);
+            (void)waitpid(host, &status, 0);
+            return -1;
+        }
+        cbm_usleep(2000);
+    }
+}
+
 static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *tag) {
     memset(fixture, 0, sizeof(*fixture));
     fixture->host = -1;
@@ -1657,8 +1730,8 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     }
     close(ready_pipe[1]);
     close(release_pipe[0]);
-    char ready = 0;
-    bool host_ready = child > 0 && read(ready_pipe[0], &ready, 1) == 1 && ready == 'R';
+    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0], CLI_SCOPE_READY_TIMEOUT_MS) : 0;
+    bool host_ready = ready == 'R';
     close(ready_pipe[0]);
     fixture->host = child;
     fixture->release_fd = release_pipe[1];
@@ -1682,9 +1755,14 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
  * committed client still admitted. */
 static bool cli_scope_host_serving(const cli_scope_fixture_t *fixture) {
     cbm_daemon_runtime_status_t status = {0};
+    /* A generous, bounded status deadline: a foreign-namespace install leaves
+     * this daemon serving, so a slow response on a loaded runner must not be
+     * misread as "drained" (the flaky failure this fixture showed). The call
+     * still fails cleanly — a genuinely drained daemon is unreachable or
+     * reports stopping — it just no longer decides survival on a 5 s budget. */
     return fixture->endpoint &&
            cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity,
-                                             CLI_SCOPE_TIMEOUT_MS, &status) &&
+                                             CLI_SCOPE_HOST_SERVING_TIMEOUT_MS, &status) &&
            !status.stopping && status.committed_clients == 1;
 }
 
@@ -1718,10 +1796,7 @@ static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
     }
     int host_exit = -1;
     if (fixture->host > 0) {
-        int status = 0;
-        if (waitpid(fixture->host, &status, 0) == fixture->host && WIFEXITED(status)) {
-            host_exit = WEXITSTATUS(status);
-        }
+        host_exit = cli_scope_reap_host(fixture->host, CLI_SCOPE_HOST_REAP_TIMEOUT_MS);
         fixture->host = -1;
     }
     cbm_daemon_ipc_endpoint_free(fixture->endpoint);
