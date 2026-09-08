@@ -84,6 +84,8 @@ static void perl_pass1_scan_inner(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_function_call_type(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode node);
 static const CBMType *perl_eval_new_type(PerlLSPContext *ctx, TSNode node);
+static const char *perl_func_return_class_qn(PerlLSPContext *ctx, const CBMRegisteredFunc *impf,
+                                             const char *rtn);
 static void perl_emit_resolved(PerlLSPContext *ctx, const char *callee_qn, const char *strategy,
                                float confidence, TSNode site);
 static void perl_resolve_direct_coderef_arguments(PerlLSPContext *ctx, TSNode call);
@@ -758,7 +760,18 @@ static const CBMType *perl_eval_function_call_type(PerlLSPContext *ctx, TSNode n
     }
     if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
         f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
-        return f->signature->data.func.return_types[0];
+        const CBMType *rt = f->signature->data.func.return_types[0];
+        /* `func(...)->method` where func is a `__PACKAGE__->new` factory
+         * (Mojo::File's `sub path { __PACKAGE__->new(@_) }`, curfile): resolve
+         * the literal "__PACKAGE__" to func's own package so the chained method
+         * dispatches — mirrors the bareword `func->method` path. */
+        if (rt->kind == CBM_TYPE_NAMED) {
+            const char *cq = perl_func_return_class_qn(ctx, f, rt->data.named.qualified_name);
+            if (cq)
+                return cbm_type_named(ctx->arena, cq);
+            return cbm_type_unknown();
+        }
+        return rt;
     }
     return cbm_type_unknown();
 }
