@@ -149,6 +149,16 @@ const char *cbm_index_supervisor_build_fingerprint(void) {
     return g_build_fingerprint[0] ? g_build_fingerprint : NULL;
 }
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+void cbm_index_supervisor_set_build_fingerprint_for_test(const char *fingerprint) {
+    if (!fingerprint || !worker_fingerprint_valid(fingerprint)) {
+        return;
+    }
+    g_build_fingerprint_capture_attempted = true;
+    (void)snprintf(g_build_fingerprint, sizeof(g_build_fingerprint), "%s", fingerprint);
+}
+#endif
+
 static bool worker_fingerprint_valid(const char *fingerprint) {
     if (!fingerprint || strlen(fingerprint) != CBM_INDEX_WORKER_BUILD_FINGERPRINT_LENGTH) {
         return false;
