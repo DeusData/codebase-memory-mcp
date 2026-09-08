@@ -722,6 +722,7 @@ static void test_rmdir_r(const char *path) {
     th_rmtree(path);
 }
 
+#ifndef _WIN32
 /* Capture everything a command writes to one fd (stdout or stderr) so a test
  * can assert on the transcript. Restores the fd on end and returns the text. */
 typedef struct {
@@ -774,6 +775,7 @@ static char *cli_fd_capture_end(cli_fd_capture_t *capture) {
     }
     return text;
 }
+#endif /* !_WIN32 -- POSIX-only fd-capture helpers (#2110) */
 
 /* Mandatory-daemon activation guard fixture. The production path uses the
  * stable per-account endpoint directly; these callbacks make every race
