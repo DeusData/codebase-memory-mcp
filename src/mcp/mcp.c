@@ -11668,6 +11668,17 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     cbm_node_t *alternatives, int alt_count, const char *args) {
     char *root_path = get_project_root(srv, node->project);
 
+    bool outside = false;
+    const char *freshness = coverage_path_freshness(srv->store, node->project, root_path,
+                                                    node->file_path, &outside);
+    if (strcmp(freshness, "metadata_match") != 0 && strcmp(freshness, "not_tracked") != 0) {
+        free(root_path);
+        return cbm_mcp_text_result(
+            "source changed since indexing; re-index the project before requesting this "
+            "snippet",
+            true);
+    }
+
     int original_start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     /* A one-line symbol legitimately has end == start. Treat only missing or
      * inverted end metadata as unknown; expanding a valid one-line node by 50
@@ -13828,8 +13839,14 @@ static bool scan_and_classify_grep_matches(
                 break;
             }
             if (store) {
-                (void)cbm_store_find_nodes_by_file(store, project, file, &file_nodes,
-                                                   &file_node_count);
+                bool outside = false;
+                const char *freshness =
+                    coverage_path_freshness(store, project, root_path, file, &outside);
+                if (strcmp(freshness, "metadata_match") == 0 ||
+                    strcmp(freshness, "not_tracked") == 0) {
+                    (void)cbm_store_find_nodes_by_file(store, project, file, &file_nodes,
+                                                       &file_node_count);
+                }
             }
         }
 
