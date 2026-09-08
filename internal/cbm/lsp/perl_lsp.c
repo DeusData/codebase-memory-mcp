@@ -277,6 +277,36 @@ const char *perl_resolve_package_name(PerlLSPContext *ctx, const char *name) {
     return name;
 }
 
+/* Return-type inference stores multi-segment class spellings DOTTED
+ * ("Mojo.File", perl_infer_return_types converts `::`→`.`), but the cross-file
+ * used-module type table is keyed by the module name AS WRITTEN in the `use`
+ * statement (colons, "Mojo::File"; perl_scan_used_modules) and
+ * cbm_registry_lookup_type is exact-match. So a dotted multi-segment return
+ * type never finds its colon-keyed method table — every `$obj->accessor->method`
+ * chain whose accessor returns a multi-segment class silently fails (single-
+ * segment "Widget" is dot==colon and masked the bug in fixtures). This yields
+ * the colon variant of a dotted class QN so the typed-receiver lookup can retry.
+ * NULL when there is no '.' to convert. */
+static char *perl_class_qn_colon_variant(CBMArena *arena, const char *qn) {
+    if (!qn || !strchr(qn, '.'))
+        return NULL;
+    size_t n = strlen(qn);
+    char *out = (char *)cbm_arena_alloc(arena, n * 2 + 1);
+    if (!out)
+        return NULL;
+    size_t w = 0;
+    for (size_t i = 0; i < n; i++) {
+        if (qn[i] == '.') {
+            out[w++] = ':';
+            out[w++] = ':';
+        } else {
+            out[w++] = qn[i];
+        }
+    }
+    out[w] = '\0';
+    return out;
+}
+
 /* ── @ISA registry helpers ──────────────────────────────────────── */
 
 /* Record `pkg inherits from parent` in the ctx ISA table. Both are package
@@ -733,6 +763,37 @@ static const CBMType *perl_eval_function_call_type(PerlLSPContext *ctx, TSNode n
     return cbm_type_unknown();
 }
 
+/* Resolve a resolved-function's stored return-type spelling into a receiver
+ * class QN usable by perl_lookup_method. A literal "__PACKAGE__" (from the
+ * `sub f { __PACKAGE__->new(...) }` factory idiom — e.g. Mojo::File's curfile)
+ * means the function returns its OWN package: map impf's package QN (its QN
+ * minus the last segment) back through the xmod map to the colon-spelled module
+ * name the cross-file used-module type table is keyed by, so the chained method
+ * dispatches. Any other spelling passes through unchanged. NULL when a
+ * __PACKAGE__ return can't be mapped (per-file mode has no xmod — the function
+ * CALL edge is still emitted; only the chain is skipped). */
+static const char *perl_func_return_class_qn(PerlLSPContext *ctx, const CBMRegisteredFunc *impf,
+                                             const char *rtn) {
+    if (!rtn)
+        return NULL;
+    if (strcmp(rtn, "__PACKAGE__") != 0)
+        return rtn;
+    if (!impf || !impf->qualified_name)
+        return NULL;
+    const char *dot = strrchr(impf->qualified_name, '.');
+    if (!dot || dot == impf->qualified_name)
+        return NULL;
+    char *pkgqn =
+        cbm_arena_strndup(ctx->arena, impf->qualified_name, (size_t)(dot - impf->qualified_name));
+    if (!pkgqn)
+        return NULL;
+    for (int i = 0; i < ctx->xmod_count; i++) {
+        if (ctx->xmod_qns[i] && strcmp(ctx->xmod_qns[i], pkgqn) == 0)
+            return ctx->xmod_pkgs[i]; /* colon-spelled module name = used-module type key */
+    }
+    return NULL;
+}
+
 /* $obj->m / Class->m / $self->m — returns the method's return type. */
 static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode node) {
     /* ClassName->new returns ClassName (constructor). */
@@ -768,8 +829,8 @@ static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode nod
                     ? impf->signature->data.func.return_types[0]
                     : NULL;
             if (rt && rt->kind == CBM_TYPE_NAMED)
-                class_qn = rt->data.named.qualified_name;
-            else if (cls && cls[0])
+                class_qn = perl_func_return_class_qn(ctx, impf, rt->data.named.qualified_name);
+            if (!class_qn && cls && cls[0])
                 class_qn = perl_resolve_package_name(ctx, cls);
         } else {
             const CBMType *recv = perl_eval_expr_type(ctx, inv);
@@ -781,6 +842,11 @@ static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode nod
         return cbm_type_unknown();
 
     const CBMRegisteredFunc *f = perl_lookup_method(ctx, class_qn, mname);
+    if (!f) {
+        char *cv = perl_class_qn_colon_variant(ctx->arena, class_qn);
+        if (cv)
+            f = perl_lookup_method(ctx, cv, mname);
+    }
     if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
         f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
         return f->signature->data.func.return_types[0];
@@ -1074,7 +1140,7 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
                         ? impf->signature->data.func.return_types[0]
                         : NULL;
                 if (rt && rt->kind == CBM_TYPE_NAMED)
-                    class_qn = rt->data.named.qualified_name;
+                    class_qn = perl_func_return_class_qn(ctx, impf, rt->data.named.qualified_name);
                 strategy = "perl_method_typed";
             } else {
                 if (cls && cls[0])
@@ -1093,6 +1159,14 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
         return; /* unknown receiver — zero-edge guarantee (call edge, if any, already emitted) */
 
     const CBMRegisteredFunc *f = perl_lookup_method(ctx, class_qn, mname);
+    if (!f) {
+        char *cv = perl_class_qn_colon_variant(ctx->arena, class_qn);
+        if (cv) {
+            f = perl_lookup_method(ctx, cv, mname);
+            if (f)
+                class_qn = cv; /* the spelling that actually matched */
+        }
+    }
     if (f) {
         const char *strat = (f->receiver_type && strcmp(f->receiver_type, class_qn) == 0)
                                 ? strategy

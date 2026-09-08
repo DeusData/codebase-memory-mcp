@@ -1430,6 +1430,47 @@ TEST(perllsp_cross_unresolvable_module_zero_edges) {
     PASS();
 }
 
+/* ── multi-segment return-type chain (colon/dot reconciliation) ──── */
+
+TEST(perllsp_cross_return_type_chain_multiseg) {
+    /* make_widget returns a MULTI-segment class My::Widget. Its inferred return
+     * type is stored DOTTED ("My.Widget", perl_infer_return_types), but the
+     * cross-file used-module type table is keyed by the module name as written
+     * in `use My::Widget` (colons). The typed-receiver lookup must reconcile the
+     * two spellings so `$w->name` dispatches to My::Widget::name. A single-
+     * segment class (perllsp_cross_return_type_chain, "Widget") is dot==colon and
+     * cannot exercise this — every real multi-segment accessor chain (Mojo::*)
+     * silently failed before the fix. */
+    const char *source = "package App;\n"
+                         "use Factory;\n"
+                         "use My::Widget;\n"
+                         "sub run {\n"
+                         "    my $self = shift;\n"
+                         "    my $f = Factory->new;\n"
+                         "    my $w = $f->make_widget;\n"
+                         "    $w->name;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Factory.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Factory", .return_types = "Factory"},
+        {.qualified_name = "test.lib.Factory.make_widget", .short_name = "make_widget",
+         .label = "Function", .def_module_qn = "test.lib.Factory", .return_types = "My.Widget"},
+        {.qualified_name = "test.lib.My.Widget.name", .short_name = "name", .label = "Function",
+         .def_module_qn = "test.lib.My.Widget"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.App", defs, 3, NULL, NULL,
+                           0, NULL, &out, NULL, NULL, 0);
+    int idx = find_resolved_arr(&out, "App.run", "lib.My.Widget.name");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── imported nullary function used as `func->method` (Mojo::File curfile) ── */
 
 TEST(perllsp_cross_imported_func_arrow_method) {
@@ -1506,6 +1547,37 @@ TEST(perllsp_cross_imported_func_arrow_method_passone) {
     PASS();
 }
 
+/* curfile's real return type is the literal __PACKAGE__ (Mojo::File's
+ * `sub curfile { __PACKAGE__->new }`). The chained `curfile->sibling` must still
+ * dispatch: __PACKAGE__ resolves to curfile's own package, reverse-mapped
+ * through the used-module (xmod) table to the colon-spelled type key. */
+TEST(perllsp_cross_imported_func_arrow_package_chain) {
+    const char *source = "package App;\n"
+                         "use Mojo::File qw(curfile);\n"
+                         "sub run { curfile->sibling; }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.App.run", .short_name = "run", .label = "Function",
+         .def_module_qn = "test.lib.App"},
+        {.qualified_name = "test.lib.Mojo.File.curfile", .short_name = "curfile",
+         .label = "Function", .def_module_qn = "test.lib.Mojo.File", .return_types = "__PACKAGE__"},
+        {.qualified_name = "test.lib.Mojo.File.sibling", .short_name = "sibling",
+         .label = "Function", .def_module_qn = "test.lib.Mojo.File"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.App", defs, 3, NULL, NULL,
+                           0, NULL, &out, NULL, NULL, 0);
+    int call_idx = find_resolved_arr(&out, "App.run", "lib.Mojo.File.curfile");
+    int chain_idx = find_resolved_arr(&out, "App.run", "lib.Mojo.File.sibling");
+    if (call_idx < 0 || chain_idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(call_idx >= 0);
+    ASSERT(chain_idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -1556,8 +1628,10 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_mojo_listunpack_c_param);
     RUN_TEST(perllsp_cross_mojo_c_shift_param);
     RUN_TEST(perllsp_cross_return_type_chain);
+    RUN_TEST(perllsp_cross_return_type_chain_multiseg);
     RUN_TEST(perllsp_cross_imported_func_arrow_method);
     RUN_TEST(perllsp_cross_imported_func_arrow_method_passone);
+    RUN_TEST(perllsp_cross_imported_func_arrow_package_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);

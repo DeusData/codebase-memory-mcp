@@ -3938,8 +3938,18 @@ static const char **perl_infer_return_types(CBMArena *a, TSNode func_node, const
     }
     TSNode method = ts_node_child_by_field_name(ret_expr, "method", 6);
     TSNode inv = ts_node_child_by_field_name(ret_expr, "invocant", 8);
-    if (ts_node_is_null(method) || ts_node_is_null(inv) ||
-        strcmp(ts_node_type(inv), "bareword") != 0) {
+    /* Invocant is normally a `bareword` (Foo::Bar->new). tree-sitter-perl parses
+     * the `__PACKAGE__` compile-time macro as a `func0op_call_expression` (a
+     * zero-arg builtin op), not a bareword — the `sub curfile { __PACKAGE__->new }`
+     * factory idiom (Mojo::File) would otherwise infer no return type. Accept it:
+     * its text is the literal "__PACKAGE__", which the resolver maps to the
+     * function's own package. */
+    if (ts_node_is_null(method) || ts_node_is_null(inv)) {
+        return NULL;
+    }
+    const char *invk = ts_node_type(inv);
+    bool inv_is_package_macro = strcmp(invk, "func0op_call_expression") == 0;
+    if (strcmp(invk, "bareword") != 0 && !inv_is_package_macro) {
         return NULL;
     }
     char *mname = cbm_node_text(a, method, source);
@@ -3947,6 +3957,9 @@ static const char **perl_infer_return_types(CBMArena *a, TSNode func_node, const
         return NULL;
     }
     char *cls = cbm_node_text(a, inv, source);
+    if (inv_is_package_macro && (!cls || strcmp(cls, "__PACKAGE__") != 0)) {
+        return NULL; /* only __PACKAGE__ among the zero-arg builtin ops */
+    }
     if (!cls || !cls[0] ||
         !((cls[0] >= 'A' && cls[0] <= 'Z') || (cls[0] >= 'a' && cls[0] <= 'z') || cls[0] == '_')) {
         return NULL;
