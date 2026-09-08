@@ -1222,6 +1222,35 @@ TEST(perllsp_cross_mojo_listunpack_c_param) {
     PASS();
 }
 
+/* `$c` at a NON-first list position (`my ($next, $c) = @_`, the around_action /
+ * before_dispatch hook-callback form where the first positional is the
+ * continuation) must also type $c to the controller. */
+TEST(perllsp_cross_mojo_around_c_param) {
+    const char *source = "package Mojolicious::Foo;\n"
+                         "use Mojo::Base -base;\n"
+                         "sub wrap {\n"
+                         "    my ($next, $c) = @_;\n"
+                         "    $c->render;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Mojolicious.Controller.render", .short_name = "render",
+         .label = "Function", .def_module_qn = "test.lib.Mojolicious.Controller"},
+        {.qualified_name = "test.lib.Mojolicious.Foo.wrap", .short_name = "wrap",
+         .label = "Function", .def_module_qn = "test.lib.Mojolicious.Foo"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Mojolicious.Foo", defs, 2,
+                           NULL, NULL, 0, NULL, &out, NULL, defs, 2);
+    int wrap_idx = find_resolved_arr(&out, "Foo.wrap", "Mojolicious.Controller.render");
+    if (wrap_idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(wrap_idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_mojo_c_shift_param) {
     /* `my $c = shift` in a Mojolicious module is the controller — NOT the
      * enclosing package (here the plugin). Helper/hook callbacks
@@ -1656,6 +1685,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_toplevel_module_caller);
     RUN_TEST(perllsp_cross_mojo_routing_c_param);
     RUN_TEST(perllsp_cross_mojo_listunpack_c_param);
+    RUN_TEST(perllsp_cross_mojo_around_c_param);
     RUN_TEST(perllsp_cross_mojo_c_shift_param);
     RUN_TEST(perllsp_cross_return_type_chain);
     RUN_TEST(perllsp_cross_return_type_chain_multiseg);

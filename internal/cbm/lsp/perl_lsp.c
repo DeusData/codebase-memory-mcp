@@ -1384,42 +1384,48 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
         TSNode lhs_var = perl_decl_target(left);
         const char *lvk = ts_node_type(lhs_var);
         if (strcmp(lvk, "scalar") != 0 && strcmp(lvk, "scalar_variable") != 0) {
-            /* Classic list unpack `my ($self, $x) = @_;`: the invocant is the
-             * FIRST scalar of the paren list when the whole RHS is @_. */
+            /* List unpack `my ($self, $x) = @_;`: the invocant is the FIRST
+             * scalar of the paren list when the whole RHS is @_. */
             char *lrtxt = perl_node_text(ctx, right);
             if (lrtxt && strcmp(lrtxt, "@_") == 0) {
+                bool bound = false;
                 TSNode sc = perl_first_scalar_desc(lhs_var, 0);
                 char *vtxt = ts_node_is_null(sc) ? NULL : perl_node_text(ctx, sc);
                 if (perl_is_invocant_name(vtxt)) {
                     const char *lbare = perl_strip_sigil(vtxt);
                     if (lbare && lbare[0]) {
-                        cbm_scope_bind(ctx->current_scope, lbare,
-                                       cbm_type_named(ctx->arena, pkg));
-                        /* Mojolicious framework convention: inside a Mojolicious::*
-                         * module the 2nd positional of `my ($self, $c) = @_` is the
-                         * controller passed to a dispatch/render/route method, so
-                         * `$c->render/stash/param/...` dispatches through
-                         * Mojolicious::Controller (seeded into the chain-walk).
-                         * Gated to the framework path — user code uses the
-                         * signature form (perl_bind_routing_controller_param). */
-                        if (ctx->module_qn && strstr(ctx->module_qn, "Mojolicious")) {
-                            uint32_t pn = ts_node_named_child_count(lhs_var);
-                            for (uint32_t j = 0; j < pn && j < 8; j++) {
-                                TSNode pv =
-                                    perl_first_scalar_desc(ts_node_named_child(lhs_var, j), 0);
-                                char *pt = ts_node_is_null(pv) ? NULL : perl_node_text(ctx, pv);
-                                const char *pb = pt ? perl_strip_sigil(pt) : NULL;
-                                if (pb && strcmp(pb, "c") == 0) {
-                                    cbm_scope_bind(
-                                        ctx->current_scope, "c",
-                                        cbm_type_named(ctx->arena, "Mojolicious::Controller"));
-                                    break;
-                                }
-                            }
-                        }
-                        free(kids);
-                        return; /* only the first invocant binding */
+                        cbm_scope_bind(ctx->current_scope, lbare, cbm_type_named(ctx->arena, pkg));
+                        bound = true;
                     }
+                }
+                /* Mojolicious framework convention: inside a Mojolicious::* module
+                 * a positional `$c` (ANY position, not just the 2nd) is the
+                 * controller passed to a dispatch/render/route method or an
+                 * around/hook callback, so `$c->render/stash/param/...` dispatches
+                 * through Mojolicious::Controller (seeded into the chain-walk).
+                 * Handles both `my ($self, $c) = @_` and `my ($next, $c) = @_`
+                 * (around_action / before_dispatch, first positional is the
+                 * continuation). Gated to the framework path — user code uses the
+                 * signature form (perl_bind_routing_controller_param). The exact
+                 * name `$c` is the strong Mojolicious convention keeping this
+                 * zero-noise. */
+                if (ctx->module_qn && strstr(ctx->module_qn, "Mojolicious")) {
+                    uint32_t pn = ts_node_named_child_count(lhs_var);
+                    for (uint32_t j = 0; j < pn && j < 8; j++) {
+                        TSNode pv = perl_first_scalar_desc(ts_node_named_child(lhs_var, j), 0);
+                        char *pt = ts_node_is_null(pv) ? NULL : perl_node_text(ctx, pv);
+                        const char *pb = pt ? perl_strip_sigil(pt) : NULL;
+                        if (pb && strcmp(pb, "c") == 0) {
+                            cbm_scope_bind(ctx->current_scope, "c",
+                                           cbm_type_named(ctx->arena, "Mojolicious::Controller"));
+                            bound = true;
+                            break;
+                        }
+                    }
+                }
+                if (bound) {
+                    free(kids);
+                    return; /* invocant / controller binding done */
                 }
             }
             continue;
