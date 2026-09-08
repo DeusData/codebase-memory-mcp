@@ -35,11 +35,16 @@ static void edit_path_target_reset(cbm_config_edit_target_t *target) {
     target->path[0] = '\0';
 }
 
+#ifndef _WIN32
+/* Only the POSIX symlink-follow resolver records a refusal reason; the Windows
+ * build never follows, so guard this with the same condition as its callers to
+ * avoid -Werror,-Wunused-function (#2110 CI). */
 static void edit_path_note(char *reason, size_t reason_size, const char *text) {
     if (reason && reason_size > 0U) {
         (void)snprintf(reason, reason_size, "%s", text);
     }
 }
+#endif /* !_WIN32 */
 
 void cbm_config_edit_target_close(cbm_config_edit_target_t *target) {
     if (!target) {
