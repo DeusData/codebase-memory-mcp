@@ -1,6 +1,7 @@
 """Regression guard for clean Windows MCP stdio startup."""
 
 import os
+import subprocess
 import sys
 import tempfile
 
@@ -18,11 +19,26 @@ def main():
         return 2
 
     with tempfile.TemporaryDirectory(prefix="cbm-mcp-stdio-") as cache:
-        with McpServer(binary, cache_dir=cache) as server:
-            server.initialize(timeout=30)
-            server.tools_list(timeout=30)
-            server.close()
+        runtime = os.path.join(os.path.dirname(cache), "cbm-mcp-stdio-runtime")
+        os.makedirs(runtime)
+        server = McpServer(binary, cache_dir=cache,
+                           extra_env={"CBM_RUNTIME_DIR": runtime})
+        try:
+            with server:
+                server.initialize(timeout=30)
+                server.tools_list(timeout=30)
             stderr = server.stderr_text()
+        finally:
+            stop = subprocess.run(
+                [binary, "daemon", "stop"],
+                env=server.env,
+                capture_output=True,
+                timeout=30,
+            )
+            if stop.returncode != 0:
+                detail = (stop.stdout + stop.stderr).decode("utf-8", "replace")
+                raise RuntimeError("daemon cleanup failed (%d): %s" %
+                                   (stop.returncode, detail.strip()))
 
     forbidden = (
         "The system cannot find the path specified.",
