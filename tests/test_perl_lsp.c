@@ -1637,6 +1637,34 @@ TEST(perllsp_cross_imported_func_call_arrow_package_chain) {
     PASS();
 }
 
+/* `my $dir = tempdir; $dir->child(...)` — an imported __PACKAGE__ factory called
+ * with NO parens parses as a bare word (not a function_call); the bound scalar
+ * must still type to Mojo::File so the chained `$dir->child` dispatches. */
+TEST(perllsp_cross_bareword_func_assign_chain) {
+    const char *source = "package App;\n"
+                         "use Mojo::File qw(tempdir);\n"
+                         "sub run { my $dir = tempdir; $dir->child('x'); }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.App.run", .short_name = "run", .label = "Function",
+         .def_module_qn = "test.lib.App"},
+        {.qualified_name = "test.lib.Mojo.File.tempdir", .short_name = "tempdir",
+         .label = "Function", .def_module_qn = "test.lib.Mojo.File", .return_types = "__PACKAGE__"},
+        {.qualified_name = "test.lib.Mojo.File.child", .short_name = "child", .label = "Function",
+         .def_module_qn = "test.lib.Mojo.File"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.App", defs, 3, NULL, NULL,
+                           0, NULL, &out, NULL, NULL, 0);
+    int idx = find_resolved_arr(&out, "App.run", "lib.Mojo.File.child");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -1693,6 +1721,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_imported_func_arrow_method_passone);
     RUN_TEST(perllsp_cross_imported_func_arrow_package_chain);
     RUN_TEST(perllsp_cross_imported_func_call_arrow_package_chain);
+    RUN_TEST(perllsp_cross_bareword_func_assign_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);

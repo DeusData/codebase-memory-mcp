@@ -670,6 +670,31 @@ const CBMType *perl_eval_expr_type(PerlLSPContext *ctx, TSNode node) {
             result = blessed;
         else
             result = perl_eval_function_call_type(ctx, node);
+    } else if (strcmp(k, "bareword") == 0) {
+        /* A lowercase bareword that is an Exporter-imported function called with
+         * NO parens/args — `my $dir = tempdir;` (tempdir/curfile/path factory).
+         * tree-sitter parses the arg-less call as a plain bareword, so it never
+         * reached perl_eval_function_call_type; type it from the function's
+         * return type (resolving a `__PACKAGE__` factory return to its package)
+         * so the bound var chains (`$dir->child`). Lowercase + import-map hit
+         * distinguishes a function from a class name (zero-edge otherwise). */
+        char *txt = perl_node_text(ctx, node);
+        if (txt && txt[0] >= 'a' && txt[0] <= 'z') {
+            const char *imp = perl_find_import(ctx, txt);
+            const CBMRegisteredFunc *f = imp ? cbm_registry_lookup_func(ctx->registry, imp) : NULL;
+            if (f && f->signature && f->signature->kind == CBM_TYPE_FUNC &&
+                f->signature->data.func.return_types && f->signature->data.func.return_types[0]) {
+                const CBMType *rt = f->signature->data.func.return_types[0];
+                if (rt->kind == CBM_TYPE_NAMED) {
+                    const char *cq =
+                        perl_func_return_class_qn(ctx, f, rt->data.named.qualified_name);
+                    if (cq)
+                        result = cbm_type_named(ctx->arena, cq);
+                } else {
+                    result = rt;
+                }
+            }
+        }
     } else if (strcmp(k, "assignment_expression") == 0) {
         TSNode right = ts_node_child_by_field_name(node, "right", 5);
         if (!ts_node_is_null(right))
