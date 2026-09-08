@@ -3012,6 +3012,21 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
             if (p && p[0])
                 worklist[wl_tail++] = p;
         }
+        /* Also seed the USED-MODULE types (the packages named by `use`/
+         * constructor: Mojo::IOLoop::Stream, Mojo::UserAgent, ...). The
+         * used-module scan above attached each module's OWN methods, but NOT its
+         * @ISA chain — so a constructor/return-typed receiver
+         * `my $s = Mojo::IOLoop::Stream->new; $s->on(...)` could not reach an
+         * INHERITED method (EventEmitter::on). Enqueuing the used-module packages
+         * makes the walk set their embedded_types from the project inherit index
+         * and attach ancestor methods, so inherited-method calls on any
+         * constructor/used-module-typed receiver dispatch across files. Bounded
+         * by PERL_CHAIN_CAP + the seen-set (each ancestor visited once). */
+        for (int i = 0; i < ctx.xmod_count && wl_tail < PERL_CHAIN_CAP; i++) {
+            const char *p = ctx.xmod_pkgs[i];
+            if (p && p[0])
+                worklist[wl_tail++] = p;
+        }
         /* Mojolicious routing/hook callbacks type their `$c` param to
          * Mojolicious::Controller (perl_bind_routing_controller_param); seed that
          * class into the chain-walk so its method table (render/stash/param/...)

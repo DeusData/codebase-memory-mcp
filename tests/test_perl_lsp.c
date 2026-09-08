@@ -1665,6 +1665,41 @@ TEST(perllsp_cross_bareword_func_assign_chain) {
     PASS();
 }
 
+/* Inherited method on a CONSTRUCTOR/used-module-typed receiver:
+ * `my $s = Child->new; $s->base_method` where Child ISA Base. The used-module
+ * type Child must carry its @ISA chain (seeded into the cross chain-walk) so the
+ * inherited base_method dispatches — the `$stream = Stream->new; $stream->on`
+ * (EventEmitter) real-repo pattern. */
+TEST(perllsp_cross_constructor_typed_inherited_method) {
+    const char *source = "package App;\n"
+                         "use Child;\n"
+                         "sub run { my $s = Child->new; $s->base_method; }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.App.run", .short_name = "run", .label = "Function",
+         .def_module_qn = "test.lib.App"},
+        {.qualified_name = "test.lib.Base.base_method", .short_name = "base_method",
+         .label = "Function", .def_module_qn = "test.lib.Base"},
+        {.qualified_name = "test.lib.Child.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Child"},
+    };
+    const char *child_parents[] = {"Base", NULL};
+    const char *idx_modules[] = {"test.lib.Child"};
+    const char *const *idx_lists[] = {child_parents};
+    CBMPerlInheritIndex inherit = {
+        .module_qns = idx_modules, .parent_lists = idx_lists, .count = 1};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.App", defs, 3, NULL, NULL,
+                           0, NULL, &out, &inherit, defs, 3);
+    int idx = find_resolved_arr(&out, "App.run", "lib.Base.base_method");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -1723,6 +1758,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_imported_func_call_arrow_package_chain);
     RUN_TEST(perllsp_cross_bareword_func_assign_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
+    RUN_TEST(perllsp_cross_constructor_typed_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);
     RUN_TEST(perllsp_cross_export_ok_not_default);
