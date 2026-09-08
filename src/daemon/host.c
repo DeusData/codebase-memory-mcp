@@ -5,6 +5,7 @@
 #include "daemon/host_internal.h"
 
 #include "daemon/application.h"
+#include "daemon/bootstrap.h"
 #include "daemon/runtime.h"
 #include "daemon/project_lock.h"
 #include "daemon/version_cohort.h"
@@ -144,6 +145,18 @@ static bool host_log_open(char conflict_log_out[HOST_PATH_CAP]) {
     g_host_log_mutex_initialized = true;
     cbm_log_set_sink(host_log_sink);
     return true;
+}
+
+/* #1828: a detached daemon has no stderr; its start failure must reach the
+ * client that is waiting for it, or that client burns its whole deadline and
+ * reports the opposite of the truth. */
+static void host_start_failure_record(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                      const char *component) {
+    char logs[HOST_PATH_CAP];
+    if (!cbm_daemon_bootstrap_log_directory(logs, sizeof(logs)) ||
+        !cbm_daemon_bootstrap_start_failure_record(logs, endpoint, component)) {
+        cbm_log_error("daemon.start_failure_record_failed", "component", component);
+    }
 }
 
 static void host_log_close(void) {
@@ -1051,10 +1064,16 @@ int cbm_daemon_host_run(const cbm_daemon_host_config_t *config) {
     };
     cbm_daemon_runtime_service_t *service =
         cbm_daemon_runtime_service_start_reserved(&runtime_config, &lifetime_reservation);
+    if (!service) {
+        cbm_log_error("daemon.start_failed", "component", "runtime");
+        /* Recorded while the lifetime reservation is still held: a client
+         * that watches this generation vanish finds the cause already there
+         * and never launches a doomed replacement. */
+        host_start_failure_record(config->endpoint, "runtime");
+    }
     cbm_daemon_ipc_lifetime_reservation_release(lifetime_reservation);
     lifetime_reservation = NULL;
     if (!service) {
-        cbm_log_error("daemon.start_failed", "component", "runtime");
         host_state_free(&host);
         host_log_close();
         host_participant_guard_close(&participant_guard);
