@@ -6306,7 +6306,18 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
     if (rc != CBM_STORE_OK) {
         return "unavailable";
     }
-    bool matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+    bool matches;
+#ifdef _WIN32
+    cbm_path_info_t path_info = {0};
+    matches = cbm_path_info_utf8(abs_path, &path_info) == CBM_PATH_INFO_OK &&
+              hash.mtime_ns == path_info.mtime_ns && hash.size == path_info.size;
+    /* Imported artifacts may have been restamped from Windows stat() values. */
+    if (!matches && hash.mtime_ns >= 0 && hash.mtime_ns % CBM_NSEC_PER_SEC == 0) {
+        matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+    }
+#else
+    matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+#endif
     cbm_store_clear_file_hash(&hash);
     return matches ? "metadata_match" : "metadata_changed";
 }
@@ -11669,8 +11680,8 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
     char *root_path = get_project_root(srv, node->project);
 
     bool outside = false;
-    const char *freshness = coverage_path_freshness(srv->store, node->project, root_path,
-                                                    node->file_path, &outside);
+    const char *freshness =
+        coverage_path_freshness(srv->store, node->project, root_path, node->file_path, &outside);
     if (strcmp(freshness, "metadata_match") != 0 && strcmp(freshness, "not_tracked") != 0) {
         free(root_path);
         return cbm_mcp_text_result(
