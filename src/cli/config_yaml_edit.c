@@ -2675,8 +2675,18 @@ static int yaml_sequence_line_has_unsupported(const yaml_doc_t *doc, const yaml_
         if (value == '#' && (i == start || doc->data[i - YAML_UNIT] == ' ')) {
             break;
         }
+        /* Block-scalar (`|`, `>`) and flow-sequence (`[`, `]`) indicators
+         * count only where a NODE begins, the same positional rule
+         * yaml_range_has_unsupported_ex applies to `&`/`*`. Interior ones are
+         * text: `probe: kaomoji face >w< here` is a plain scalar, and a real
+         * Hermes config carried two such personas (#1924). `probe: >`,
+         * `probe: |` and `probe: [a, b]` still begin a value and stay
+         * unsupported here. */
         if (value == '[' || value == ']' || value == '|' || value == '>') {
-            return YAML_MATCH;
+            bool begins_node = previous == '\0' || previous == ':' || previous == '-';
+            if (begins_node) {
+                return YAML_MATCH;
+            }
         }
         if (value != ' ' && value != '\t') {
             previous = value;
