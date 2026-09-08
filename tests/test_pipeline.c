@@ -3707,6 +3707,66 @@ TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage) {
     PASS();
 }
 
+static char g_route_log_capture[8192];
+static atomic_flag g_route_log_spin = ATOMIC_FLAG_INIT;
+
+/* Keeps only the route decisions; worker threads log too, and only the
+ * appends need serialising. */
+static void capture_route_log_sink(const char *line) {
+    if (!line || !strstr(line, "pipeline.route")) {
+        return;
+    }
+    while (atomic_flag_test_and_set_explicit(&g_route_log_spin, memory_order_acquire)) {}
+    size_t used = strlen(g_route_log_capture);
+    size_t avail = sizeof(g_route_log_capture) - used;
+    if (avail > 1) {
+        int n = snprintf(g_route_log_capture + used, avail, "%s\n", line);
+        if (n < 0 || (size_t)n >= avail) {
+            g_route_log_capture[sizeof(g_route_log_capture) - 1] = '\0';
+        }
+    }
+    atomic_flag_clear_explicit(&g_route_log_spin, memory_order_release);
+}
+
+/* #1864: a first index has no previous generation. The route probe used to
+ * open the run's own EMPTY stage placeholder, fail its integrity check, and
+ * warn "reason=invalid_existing_db" on every first index of every project,
+ * which the report read as a corrupted database and a crash loop. A fresh
+ * index says what it is. */
+TEST(pipeline_fresh_index_never_reports_invalid_existing_db) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fresh_route_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    g_route_log_capture[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(capture_route_log_sink);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *fresh = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int fresh_rc = fresh ? cbm_pipeline_run(fresh) : -1;
+    cbm_pipeline_free(fresh);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    bool invalid_reported = strstr(g_route_log_capture, "invalid_existing_db") != NULL;
+    bool fresh_reported = strstr(g_route_log_capture, "reason=no_existing_db") != NULL;
+    bool db_present = path_exists(db_path);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(fresh_rc, 0);
+    ASSERT_TRUE(!invalid_reported);
+    ASSERT_TRUE(fresh_reported);
+    ASSERT_TRUE(db_present);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
 /* Discovery and extraction must describe the same immutable generation. A
  * source file created after extraction is not present in the original file
  * list, so merely re-hashing that list cannot detect the race. Publication
@@ -14413,6 +14473,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_minted_stage_is_owned_until_released);
     RUN_TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept);
     RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
+    RUN_TEST(pipeline_fresh_index_never_reports_invalid_existing_db);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);

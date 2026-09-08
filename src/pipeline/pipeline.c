@@ -196,6 +196,15 @@ struct cbm_pipeline {
      * full rebuild, so the MCP response can surface the migration. */
     bool format_migration;
 
+    /* Recorded by cbm_pipeline_run for the staged run beneath it: whether
+     * the destination existed, and whether it was copied into the stage so
+     * that an incremental route has a real previous generation to work
+     * from. Without a copy the stage is the run's empty placeholder, and
+     * probing THAT for integrity is what reported every first index as
+     * "invalid_existing_db" (#1864). */
+    bool final_existed;
+    bool existing_generation;
+
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
     char *saved_adr;
@@ -1403,6 +1412,16 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
                                         int baseline_count, bool force_full_on_mismatch) {
+    if (!p->existing_generation) {
+        /* Nothing to be incremental against: a first index, or a
+         * destination that could not be copied (already reported as
+         * backup_failed_full_rebuild). The stage is an empty placeholder,
+         * not a database, so it is not probed -- "invalid_existing_db"
+         * stays reserved for a real copy that fails its integrity check. */
+        cbm_log_info("pipeline.route", "path", "full", "reason",
+                     p->final_existed ? "existing_db_backup_failed" : "no_existing_db");
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
@@ -2956,6 +2975,8 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         }
     }
 
+    p->final_existed = final_existed;
+    p->existing_generation = final_existed && backup_succeeded;
     char *configured_db_path = p->db_path;
     p->db_path = strdup(staging_path);
     if (!p->db_path) {
