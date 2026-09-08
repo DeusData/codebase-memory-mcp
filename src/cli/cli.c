@@ -10802,6 +10802,30 @@ int cbm_cmd_install(int argc, char **argv) {
 
 /* ── Subcommand: uninstall ────────────────────────────────────── */
 
+/* One wording for every line the uninstall report prints.
+ *
+ * The report used to be written in the past tense whatever happened: a
+ * --dry-run said "removed" for files it never opened, and a step that had just
+ * recorded an error said "removed" on the next line (#1954). A reader could
+ * only conclude that a dozen configuration files had been rewritten.
+ *
+ * Every report line now goes through this verb, and the caller prints the line
+ * only when the step really ran and worked. A failed step prints nothing here
+ * because record_agent_config_error has already named the agent, the operation
+ * and the path on stderr. The shape copies the Qoder and Devin blocks below,
+ * which already said "planned" for a dry run and "failed" for a failure. */
+static const char *uninstall_verb(bool dry_run) {
+    return dry_run ? "would remove" : "removed";
+}
+
+/* True when nothing has recorded a failure since `errors_before` was read from
+ * g_agent_uninstall_errors. Several report lines below cover a run of steps at
+ * once ("removed MCP config + hooks + instructions"), and this ties such a line
+ * to whether every one of those steps worked. */
+static bool uninstall_steps_succeeded(int errors_before) {
+    return g_agent_uninstall_errors == errors_before;
+}
+
 /* Remove Claude Code agent configs. */
 static void uninstall_claude_code(const char *home, const char *installed_binary, bool dry_run) {
     char config_dir[CLI_BUF_1K];
@@ -10812,7 +10836,7 @@ static void uninstall_claude_code(const char *home, const char *installed_binary
     char skills_dir[CLI_BUF_1K];
     snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
     int removed = cbm_remove_skills(skills_dir, dry_run);
-    printf("Claude Code: removed %d skill(s)\n", removed);
+    printf("Claude Code: %s %d skill(s)\n", uninstall_verb(dry_run), removed);
     char agent_path[CLI_BUF_1K];
     snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.md", config_dir);
     uninstall_tiered_agent_profiles(
@@ -10827,10 +10851,14 @@ static void uninstall_claude_code(const char *home, const char *installed_binary
 
     char mcp_path[CLI_BUF_1K];
     snprintf(mcp_path, sizeof(mcp_path), "%s/.mcp.json", config_dir);
+    bool legacy_mcp_removed = true;
     if (!dry_run && cbm_remove_editor_mcp_owned(installed_binary, mcp_path) != CLI_OK) {
         record_agent_config_error(true, "Claude Code", "legacy_mcp_uninstall", mcp_path);
+        legacy_mcp_removed = false;
     }
-    printf("  removed MCP config entry\n");
+    if (legacy_mcp_removed) {
+        printf("  %s MCP config entry\n", uninstall_verb(dry_run));
+    }
 
     char mcp_path2[CLI_BUF_1K];
     snprintf(mcp_path2, sizeof(mcp_path2), "%s/.claude.json", user_root);
@@ -10840,6 +10868,7 @@ static void uninstall_claude_code(const char *home, const char *installed_binary
 
     char settings_path[CLI_BUF_1K];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
+    int hook_errors_before = g_agent_uninstall_errors;
     if (!dry_run) {
         if (cbm_remove_claude_hooks_with_binary(settings_path, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Claude Code", "pretool_hook_uninstall", settings_path);
@@ -10933,7 +10962,9 @@ static void uninstall_claude_code(const char *home, const char *installed_binary
 #endif
         }
     }
-    printf("  removed PreToolUse + SessionStart + SubagentStart hooks\n");
+    if (uninstall_steps_succeeded(hook_errors_before)) {
+        printf("  %s PreToolUse + SessionStart + SubagentStart hooks\n", uninstall_verb(dry_run));
+    }
 }
 
 /* Remove MCP + instructions for a generic agent. */
@@ -10943,28 +10974,41 @@ typedef struct {
     const char *config_path;
     const char *instr_path;
 } mcp_uninstall_args_t;
+/* Remove MCP + instructions for a generic agent, and report only what the run
+ * really did. Both lines below used to print every time: a config entry that
+ * was preserved because it had been modified said "preserved" and "removed" one
+ * after the other, a config the run had just failed to edit still said
+ * "removed", and a --dry-run said "removed" for files it never opened
+ * (#1954). */
 static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, bool dry_run,
                                       int (*remove_fn)(const char *, const char *)) {
     const char *name = paths.name;
     const char *instr_path = paths.instr_path;
+    bool mcp_removed = true;
     if (!dry_run) {
         char binary_path[CLI_BUF_1K];
         cbm_agent_installed_binary_path(cbm_get_home_dir(), binary_path, sizeof(binary_path));
         int remove_result = remove_fn(binary_path, paths.config_path);
         if (remove_result < CLI_OK) {
             record_agent_config_error(true, name, "mcp_uninstall", paths.config_path);
+            mcp_removed = false;
         } else if (remove_result > CLI_OK) {
             printf("%s: preserved modified or foreign MCP entry\n", name);
+            mcp_removed = false;
         }
     }
-    printf("%s: removed MCP config entry\n", name);
+    if (mcp_removed) {
+        printf("%s: %s MCP config entry\n", name, uninstall_verb(dry_run));
+    }
     if (instr_path) {
-        if (!dry_run) {
-            if (cbm_remove_instructions(instr_path) != CLI_OK) {
-                record_agent_config_error(true, name, "instructions_uninstall", instr_path);
-            }
+        bool instructions_removed = true;
+        if (!dry_run && cbm_remove_instructions(instr_path) != CLI_OK) {
+            record_agent_config_error(true, name, "instructions_uninstall", instr_path);
+            instructions_removed = false;
         }
-        printf("  removed instructions\n");
+        if (instructions_removed) {
+            printf("  %s instructions\n", uninstall_verb(dry_run));
+        }
     }
 }
 
@@ -10972,16 +11016,18 @@ static bool uninstall_codex_activation_pointer(const char *path, bool dry_run) {
     return path && (dry_run || cbm_remove_instructions(path) == CLI_OK);
 }
 
-static void report_codex_activation_pointer_uninstall(const char *path, bool removed) {
-    printf("  instructions: removed managed activation pointer\n");
-    if (!removed) {
+static void report_codex_activation_pointer_uninstall(const char *path, bool removed,
+                                                      bool dry_run) {
+    if (removed) {
+        printf("  instructions: %s managed activation pointer\n", uninstall_verb(dry_run));
+    } else {
         record_agent_config_error(true, "Codex CLI", "instructions_uninstall", path);
     }
 }
 
 static void uninstall_agent_skill(const char *label, const char *skills_dir, bool dry_run) {
     int removed = cbm_remove_skills(skills_dir, dry_run);
-    printf("  %s skill: %d removed\n", label, removed);
+    printf("  %s skill: %d %s\n", label, removed, dry_run ? "would be removed" : "removed");
 }
 
 static void uninstall_copilot_durable_context(const char *home, bool dry_run) {
@@ -10995,8 +11041,10 @@ static void uninstall_copilot_durable_context(const char *home, bool dry_run) {
     snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
     snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.agent.md", config_dir);
     cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
+    bool copilot_hooks_removed = true;
     if (!dry_run && cbm_remove_copilot_hooks(hook_path, binary_path) != CLI_OK) {
         record_agent_config_error(true, "Copilot", "lifecycle_hook_uninstall", hook_path);
+        copilot_hooks_removed = false;
     }
     uninstall_agent_skill("Copilot", skills_dir, dry_run);
     uninstall_tiered_agent_profiles(
@@ -11008,7 +11056,9 @@ static void uninstall_copilot_durable_context(const char *home, bool dry_run) {
             .dialect = CBM_GRAPH_DIALECT_COPILOT,
         },
         dry_run);
-    printf("  removed SessionStart + SubagentStart hooks\n");
+    if (copilot_hooks_removed) {
+        printf("  %s SessionStart + SubagentStart hooks\n", uninstall_verb(dry_run));
+    }
 }
 
 static int cbm_remove_managed_instructions(const char *instructions_path) {
@@ -11072,8 +11122,9 @@ static void uninstall_gitlab_durable_context(const cbm_agent_registry_context_t 
     }
     if (!dry_run && cbm_remove_gitlab_session_hook(hooks_path, binary_path) != CLI_OK) {
         record_agent_config_error(true, "GitLab Duo CLI", "session_hook_uninstall", hooks_path);
+    } else {
+        printf("  hook: %s canonical SessionStart entry\n", uninstall_verb(dry_run));
     }
-    printf("  hook: removed canonical SessionStart entry\n");
 }
 
 static void uninstall_devin_durable_context(const cbm_agent_registry_context_t *registry,
@@ -11113,8 +11164,9 @@ static void uninstall_pi_durable_context(const char *home, bool dry_run) {
     snprintf(skills_dir, sizeof(skills_dir), "%s/.pi/agent/skills", home);
     if (!dry_run && cbm_remove_managed_instructions(instructions_path) != CLI_OK) {
         record_agent_config_error(true, "Pi", "instructions_uninstall", instructions_path);
+    } else {
+        printf("  instructions: %s managed context\n", uninstall_verb(dry_run));
     }
-    printf("  instructions: removed managed context\n");
     uninstall_agent_skill("Pi", skills_dir, dry_run);
     char extension_path[CLI_BUF_1K];
     snprintf(extension_path, sizeof(extension_path), "%s/.pi/agent/extensions/cbmem.ts", home);
@@ -11125,8 +11177,9 @@ static void uninstall_managed_agent_instructions(const char *label, const char *
                                                  bool dry_run) {
     if (!dry_run && cbm_remove_managed_instructions(instructions_path) != CLI_OK) {
         record_agent_config_error(true, label, "instructions_uninstall", instructions_path);
+    } else {
+        printf("  instructions: %s managed context\n", uninstall_verb(dry_run));
     }
-    printf("  instructions: removed managed context\n");
 }
 
 static bool remove_cline_context_hooks(const char *cline_root, const char *binary_path,
@@ -11178,8 +11231,9 @@ static void uninstall_kimi_durable_context(const cbm_agent_registry_context_t *r
     snprintf(config_path, sizeof(config_path), "%s/config.toml", kimi_home);
     if (!dry_run && cbm_remove_kimi_context_hook(config_path) != CLI_OK) {
         record_agent_config_error(true, "Kimi Code CLI", "prompt_hook_uninstall", config_path);
+    } else {
+        printf("  hook: %s managed UserPromptSubmit entry\n", uninstall_verb(dry_run));
     }
-    printf("  hook: removed managed UserPromptSubmit entry\n");
     uninstall_managed_agent_instructions("Kimi Code CLI", instructions_path, dry_run);
     uninstall_agent_skill("Kimi Code CLI", skills_dir, dry_run);
 }
@@ -11318,11 +11372,18 @@ static void uninstall_agent_client_registry(const char *home, bool dry_run) {
                                       : profile->remove_mcp(profile->id, config_path, binary_path);
                 if (edit_result == CBM_AGENT_EDIT_FOREIGN) {
                     printf("  mcp: preserved modified or foreign entry in %s\n", config_path);
+                } else if (edit_result == CBM_AGENT_EDIT_NOT_APPLICABLE) {
+                    /* The client has no MCP editor for this config shape, so
+                     * there was never an entry of ours to take out. Counting
+                     * that as a failure is what made a whole uninstall refuse
+                     * over a file it had never written to (#1954). */
+                    printf("  mcp: no managed entry to remove in %s\n", config_path);
                 } else if (edit_result != CBM_AGENT_EDIT_OK) {
                     record_agent_config_error(true, profile->display_name, "mcp_uninstall",
                                               config_path);
                 } else {
-                    printf("  mcp: removed canonical entry from %s\n", config_path);
+                    printf("  mcp: %s canonical entry from %s\n", uninstall_verb(dry_run),
+                           config_path);
                 }
             }
         }
@@ -11368,6 +11429,7 @@ static void uninstall_gemini_config(const char *home, bool dry_run) {
     snprintf(cp, sizeof(cp), "%s/.gemini/settings.json", home);
     snprintf(ip, sizeof(ip), "%s/.gemini/GEMINI.md", home);
     snprintf(ap, sizeof(ap), "%s/.gemini/agents/codebase-memory.md", home);
+    int gemini_errors_before = g_agent_uninstall_errors;
     if (!dry_run) {
         if (cbm_remove_editor_mcp_owned(installed_binary, cp) != CLI_OK) {
             record_agent_config_error(true, "Gemini CLI", "mcp_uninstall", cp);
@@ -11396,7 +11458,10 @@ static void uninstall_gemini_config(const char *home, bool dry_run) {
             .dialect = CBM_GRAPH_DIALECT_GEMINI,
         },
         dry_run);
-    printf("Gemini CLI: removed MCP config + hooks + instructions + tiered subagents\n");
+    if (uninstall_steps_succeeded(gemini_errors_before)) {
+        printf("Gemini CLI: %s MCP config + hooks + instructions + tiered subagents\n",
+               uninstall_verb(dry_run));
+    }
 }
 
 static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char *home,
@@ -11434,12 +11499,12 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                                      ? NULL
                                      : cbm_toml_codex_hook_failure_name(preflight_failure);
             record_agent_config_error_with_reason(true, "Codex CLI", "hook_preflight", cp, reason);
-            report_codex_activation_pointer_uninstall(ip, pointer_removed);
+            report_codex_activation_pointer_uninstall(ip, pointer_removed, dry_run);
             goto codex_toml_done;
         }
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, NULL}, dry_run,
                                   cbm_remove_codex_mcp_owned);
-        report_codex_activation_pointer_uninstall(ip, pointer_removed);
+        report_codex_activation_pointer_uninstall(ip, pointer_removed, dry_run);
         if (!dry_run &&
             cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
                                               CBM_TOML_CODEX_HOOK_REMOVE, false) != CLI_OK) {
@@ -11514,6 +11579,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         char ip[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.aider.conf.yml", home);
         snprintf(ip, sizeof(ip), "%s/CONVENTIONS.md", home);
+        int aider_errors_before = g_agent_uninstall_errors;
         if (!dry_run) {
             if (cbm_yaml_remove_string_list_item(cp, "read", ip) != CLI_OK) {
                 record_agent_config_error(true, "Aider", "loader_uninstall", cp);
@@ -11522,7 +11588,9 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                 record_agent_config_error(true, "Aider", "instructions_uninstall", ip);
             }
         }
-        printf("Aider: removed instructions + loader reference\n");
+        if (uninstall_steps_succeeded(aider_errors_before)) {
+            printf("Aider: %s instructions + loader reference\n", uninstall_verb(dry_run));
+        }
     }
 }
 
@@ -11551,6 +11619,7 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
         snprintf(cp, sizeof(cp), "%s/.config/kilo/kilo.jsonc", home);
         snprintf(ip, sizeof(ip), "%s/.config/kilo/rules/codebase-memory-mcp.md", home);
         snprintf(ap, sizeof(ap), "%s/.config/kilo/agents/codebase-memory.md", home);
+        int kilo_errors_before = g_agent_uninstall_errors;
         if (!dry_run) {
             if (cbm_remove_kilo_mcp_owned(installed_binary, cp) != CLI_OK) {
                 record_agent_config_error(true, "KiloCode", "mcp_uninstall", cp);
@@ -11598,7 +11667,9 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
                 .dialect = CBM_GRAPH_DIALECT_KILO,
             },
             dry_run);
-        printf("KiloCode: removed MCP config + instruction reference\n");
+        if (uninstall_steps_succeeded(kilo_errors_before)) {
+            printf("KiloCode: %s MCP config + instruction reference\n", uninstall_verb(dry_run));
+        }
     }
     if (agents->vscode) {
         char code_user[CLI_BUF_1K];
@@ -11647,6 +11718,7 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
             bool workspace_ok = cbm_openclaw_workspace_path(home, cp, workspace, sizeof(workspace));
             uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenClaw", cp, NULL}, dry_run,
                                       cbm_remove_openclaw_mcp_owned);
+            int openclaw_errors_before = g_agent_uninstall_errors;
             if (!dry_run && cbm_remove_openclaw_compaction(cp) != CLI_OK) {
                 record_agent_config_error(true, "OpenClaw", "compaction_uninstall", cp);
             }
@@ -11665,9 +11737,13 @@ static void uninstall_editor_agents(const cbm_detected_agents_t *agents, const c
                                                   tools_path);
                     }
                 }
-                printf("  removed workspace instructions + compaction augmentation\n");
-            } else {
-                printf("  removed compaction augmentation; workspace instructions unresolved\n");
+                if (uninstall_steps_succeeded(openclaw_errors_before)) {
+                    printf("  %s workspace instructions + compaction augmentation\n",
+                           uninstall_verb(dry_run));
+                }
+            } else if (uninstall_steps_succeeded(openclaw_errors_before)) {
+                printf("  %s compaction augmentation; workspace instructions unresolved\n",
+                       uninstall_verb(dry_run));
             }
         }
     }
@@ -11741,7 +11817,7 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         } else if (hook_result != CBM_YAML_IDENTITY_EDIT_OK) {
             record_agent_config_error(true, "Hermes", "pre_llm_hook_uninstall", cp);
         } else {
-            printf("  hook: removed canonical pre_llm_call entry\n");
+            printf("  hook: %s canonical pre_llm_call entry\n", uninstall_verb(dry_run));
         }
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Hermes", cp, NULL}, dry_run,
                                   cbm_remove_hermes_mcp_owned);
@@ -11754,7 +11830,8 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenHands", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp_owned);
-        printf("  removed %d skill(s)\n", cbm_remove_skills(skills_dir, dry_run));
+        printf("  %d skill(s) %s\n", cbm_remove_skills(skills_dir, dry_run),
+               dry_run ? "would be removed" : "removed");
     }
     if (agents->augment) {
         char cp[CLI_BUF_1K];
@@ -11776,6 +11853,7 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         cbm_agent_installed_binary_path(home, binary_path, sizeof(binary_path));
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Augment/Auggie", cp, ip}, dry_run,
                                   cbm_remove_editor_mcp_owned);
+        int augment_errors_before = g_agent_uninstall_errors;
         uninstall_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
                 .label = "Augment/Auggie",
@@ -11817,7 +11895,10 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
                 }
             }
         }
-        printf("  removed SessionStart + PostToolUse hooks + dedicated subagent\n");
+        if (uninstall_steps_succeeded(augment_errors_before)) {
+            printf("  %s SessionStart + PostToolUse hooks + dedicated subagent\n",
+                   uninstall_verb(dry_run));
+        }
     }
     if (agents->cline) {
         char cline_root[CLI_BUF_1K];
@@ -11903,6 +11984,7 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
         snprintf(skills_dir, sizeof(skills_dir), "%s/.factory/skills", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Factory Droid", cp, ip}, dry_run,
                                   cbm_remove_factory_mcp_owned);
+        int factory_errors_before = g_agent_uninstall_errors;
         if (!dry_run && cbm_remove_factory_hooks(hp, installed_binary) != CLI_OK) {
             record_agent_config_error(true, "Factory Droid", "context_hook_uninstall", hp);
         }
@@ -11915,7 +11997,9 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
                 .dialect = CBM_GRAPH_DIALECT_FACTORY,
             },
             dry_run);
-        printf("  removed SessionStart + PostToolUse hooks\n");
+        if (uninstall_steps_succeeded(factory_errors_before)) {
+            printf("  %s SessionStart + PostToolUse hooks\n", uninstall_verb(dry_run));
+        }
     }
     if (agents->crush) {
         char cp[CLI_BUF_1K];
@@ -12073,13 +12157,18 @@ static int cli_uninstall_activate(void *opaque) {
     uninstall_additional_agents(&activation->agents, activation->home, activation->dry_run);
     uninstall_agent_client_registry(activation->home, activation->dry_run);
 
-    if (g_agent_uninstall_errors != 0) {
-        cli_activation_transaction_abort_or_fail_stop(&activation->binary_transaction,
-                                                      "uninstall_transaction_config_cleanup_abort");
-        (void)fprintf(stderr, "error: one or more agent cleanup operations failed; executable "
-                              "and index removal were not started\n");
-        return CLI_ACTIVATION_PARTIAL;
-    }
+    /* An agent configuration that could not be cleaned up used to stop the run
+     * right here, before the executable and the indexes were touched. One
+     * unwritable file — a Cursor config symlinked into a dotfiles repository,
+     * or an agent detected by its binary on PATH whose config this HOME never
+     * had — then left a 282 MB executable and a 104 MB index cache behind after
+     * a run that printed "Uninstall complete" (#1954).
+     *
+     * Cleaning up an agent's configuration and removing this tool's own files
+     * are separate jobs. A failure in the first no longer cancels the second.
+     * Every failure is still named on stderr as it happens, counted, summarised
+     * at the end of the run, and still makes the exit code non-zero, so nothing
+     * about the failure becomes quieter — only the blast radius shrinks. */
 
     if (activation->delete_indexes && !activation->dry_run) {
         int expected = count_db_indexes(activation->home);
@@ -12252,8 +12341,21 @@ int cbm_cmd_uninstall(int argc, char **argv) {
         return CLI_TRUE;
     }
 
-    printf("\nUninstall complete. Please restart your coding-agent sessions "
-           "to properly take this into account.\n");
+    if (g_agent_uninstall_errors == 0) {
+        printf("\nUninstall complete. Please restart your coding-agent sessions "
+               "to properly take this into account.\n");
+    } else {
+        /* Say the count out loud. The per-failure lines are on stderr, which a
+         * reader who only watches stdout never sees, and the run is no longer
+         * stopped by them — so this is the one place that tells the reader some
+         * configuration files still hold entries of ours. */
+        printf("\nUninstall finished, and %d agent configuration cleanup step(s) failed.\n"
+               "Look for the \"error: agent_config\" lines above: those files still need an\n"
+               "edit by hand. Removal of the executable and the indexes went ahead anyway.\n"
+               "Please restart your coding-agent sessions to properly take this into "
+               "account.\n",
+               g_agent_uninstall_errors);
+    }
     if (dry_run) {
         printf("(dry-run — no files were modified)\n");
     }
