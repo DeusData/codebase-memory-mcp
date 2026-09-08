@@ -10,6 +10,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#ifdef __linux__
+#include <sys/types.h>
+#endif
+
 /* Windows daemon rendezvous addresses are generation-specific and
  * unguessable. These platform-neutral seams keep the SID/nonce derivation and
  * fixed record parser covered on every CI host; the Windows endpoint
@@ -104,5 +108,21 @@ void cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(unsigned 
  * the observation window has no lower bound. */
 typedef void (*cbm_daemon_ipc_startup_gate_fn)(void *context);
 void cbm_daemon_ipc_startup_gate_set_for_test(cbm_daemon_ipc_startup_gate_fn gate, void *context);
+
+#ifdef __linux__
+/* The kernel uid a single-uid userns-remap container renders an unmapped host
+ * owner as (default 65534, configurable via sysctl). Exposed so tests can
+ * assert against the real value instead of hardcoding it. */
+uid_t cbm_daemon_ipc_posix_kernel_overflow_uid(void);
+
+/* True when this process's own user namespace has no mapping for uid 0, i.e.
+ * we are inside a restricted userns-remap where the overflow uid stands in
+ * for an unmapped real owner rather than naming an ordinary account. */
+bool cbm_daemon_ipc_posix_uid_zero_unmapped(void);
+
+/* Test seam: -1 restores the real /proc/self/uid_map read, 0/1 pin the
+ * result without needing CAP_SYS_ADMIN to build an actual user namespace. */
+void cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(int override);
+#endif
 
 #endif /* CBM_DAEMON_IPC_INTERNAL_H */

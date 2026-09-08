@@ -4950,6 +4950,123 @@ TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
     ASSERT_TRUE(refused);
     PASS();
 }
+
+#ifdef __linux__
+/* #1830: inside a single-uid Docker userns-remap (some WSL2 devcontainers hit
+ * this too), uid 0 has no entry in the container's uid map, so the kernel
+ * renders every unmapped host owner, real root included, as the overflow uid.
+ * "/", "/home" and "/tmp" are root-owned, so the old owner==0-or-euid check
+ * refused every ancestor and the daemon could not start. */
+TEST(daemon_ipc_posix_kernel_overflow_uid_matches_proc_sys_kernel) {
+    FILE *overflow_file = fopen("/proc/sys/kernel/overflowuid", "r");
+    unsigned long expected = 65534;
+    bool proc_readable = overflow_file != NULL;
+    if (overflow_file) {
+        proc_readable = fscanf(overflow_file, "%lu", &expected) == 1;
+        (void)fclose(overflow_file);
+    }
+
+    uid_t actual = cbm_daemon_ipc_posix_kernel_overflow_uid();
+
+    ASSERT_TRUE(proc_readable);
+    ASSERT_EQ(actual, (uid_t)expected);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_uid_zero_unmapped_reflects_real_process_by_default) {
+    /* The test binary itself is not built inside a restricted userns-remap
+     * (CI runners and dev machines map uid 0 identically), so the real
+     * /proc/self/uid_map read must report "mapped", the safe default that
+     * keeps posix_directory_owner_trusted() strict outside a real container. */
+    cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(-1);
+    bool unmapped = cbm_daemon_ipc_posix_uid_zero_unmapped();
+    ASSERT_TRUE(!unmapped);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_private_directory_admits_overflow_uid_ancestor_inside_restricted_userns) {
+    char parent[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    bool paths_ok = false;
+    bool is_root = geteuid() == 0;
+    bool ancestor_ready = !is_root;
+    bool secured = !is_root;
+    bool leaf_owner_private = !is_root;
+
+    if (ipc_test_parent_new(parent, "posix-overflow-uid-ancestor")) {
+        int c = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok && is_root) {
+        /* Only root can fabricate an ancestor owned by a uid other than our
+         * own or 0; this is the one condition under test, so a non-root run
+         * cannot exercise it and is left passing on the checks it can do.
+         * Building an actual restricted userns needs CAP_SYS_ADMIN that CI
+         * runners do not grant, so the namespace state itself is pinned via
+         * the test seam rather than constructed with unshare(1). */
+        cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(1);
+        ancestor_ready = chown(parent, cbm_daemon_ipc_posix_kernel_overflow_uid(),
+                               cbm_daemon_ipc_posix_kernel_overflow_uid()) == 0;
+    }
+    if (ancestor_ready && is_root) {
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+        struct stat leaf;
+        leaf_owner_private = secured && stat(cache, &leaf) == 0 && S_ISDIR(leaf.st_mode) &&
+                             leaf.st_uid == geteuid() && (leaf.st_mode & 07777) == 0700;
+    }
+
+    (void)rmdir(cache);
+    if (is_root) {
+        (void)chown(parent, geteuid(), (gid_t)-1);
+    }
+    ipc_test_remove_flat_dir(parent);
+    cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(-1);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(leaf_owner_private);
+    PASS();
+}
+
+TEST(daemon_ipc_posix_private_directory_refuses_overflow_uid_ancestor_outside_restricted_userns) {
+    /* The security case #1830's fix must not regress: on an ORDINARY host
+     * (uid 0 mapped, the common case), an ancestor owned by the overflow
+     * uid is an unrelated, sometimes-real account (services dropped to
+     * "nobody"), not a stand-in for unmapped root, so it must stay refused. */
+    char parent[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    bool paths_ok = false;
+    bool is_root = geteuid() == 0;
+    bool ancestor_ready = !is_root;
+    bool refused = !is_root;
+
+    if (ipc_test_parent_new(parent, "posix-overflow-uid-mapped-ancestor")) {
+        int c = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok && is_root) {
+        cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(0);
+        ancestor_ready = chown(parent, cbm_daemon_ipc_posix_kernel_overflow_uid(),
+                               cbm_daemon_ipc_posix_kernel_overflow_uid()) == 0;
+    }
+    if (ancestor_ready && is_root) {
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+    }
+
+    (void)rmdir(cache);
+    if (is_root) {
+        (void)chown(parent, geteuid(), (gid_t)-1);
+    }
+    ipc_test_remove_flat_dir(parent);
+    cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(-1);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(refused);
+    PASS();
+}
+#endif /* __linux__ */
 #endif /* !_WIN32 */
 
 SUITE(daemon_ipc) {
@@ -5019,5 +5136,13 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
+#ifdef __linux__
+    RUN_TEST(daemon_ipc_posix_kernel_overflow_uid_matches_proc_sys_kernel);
+    RUN_TEST(daemon_ipc_posix_uid_zero_unmapped_reflects_real_process_by_default);
+    RUN_TEST(
+        daemon_ipc_posix_private_directory_admits_overflow_uid_ancestor_inside_restricted_userns);
+    RUN_TEST(
+        daemon_ipc_posix_private_directory_refuses_overflow_uid_ancestor_outside_restricted_userns);
+#endif
 #endif
 }

@@ -1385,7 +1385,71 @@ static char *private_log_directory_path_copy(const char *directory_path) {
     return string_copy(directory_path);
 }
 
+#ifdef __linux__
+/* Inside a single-uid Docker userns-remap (or some WSL2 devcontainer) setups,
+ * uid 0 has no entry in the container's uid map, so the kernel renders any
+ * host-owned path whose real owner is unmapped (including real root, which
+ * owns "/", "/home", "/tmp") as the overflow uid instead. 65534 is the
+ * kernel default but is configurable, so read it rather than assume it. */
+uid_t cbm_daemon_ipc_posix_kernel_overflow_uid(void) {
+    FILE *overflow_file = fopen("/proc/sys/kernel/overflowuid", "r");
+    if (!overflow_file) {
+        return (uid_t)65534;
+    }
+    unsigned long parsed = 0;
+    int scanned = fscanf(overflow_file, "%lu", &parsed);
+    (void)fclose(overflow_file);
+    return scanned == 1 ? (uid_t)parsed : (uid_t)65534;
+}
+
+/* -1 = no override (read /proc/self/uid_map for real), 0 = force "mapped"
+ * (ordinary namespace), 1 = force "unmapped" (restricted userns). A real
+ * restricted userns needs CAP_SYS_ADMIN to construct, which CI runners do
+ * not grant, so tests pin this instead of shelling out to unshare(1). */
+static atomic_int g_posix_uid_zero_unmapped_override_for_test = ATOMIC_VAR_INIT(-1);
+
+void cbm_daemon_ipc_posix_uid_zero_unmapped_override_set_for_test(int override) {
+    atomic_store_explicit(&g_posix_uid_zero_unmapped_override_for_test, override,
+                          memory_order_release);
+}
+
+/* The overflow uid is only a stand-in for "unmapped root" inside a restricted
+ * user namespace. Outside one, uid 0 is mapped to itself and the overflow uid
+ * is an ordinary, sometimes-real account (services that drop privileges to
+ * "nobody"); trusting it unconditionally would let any ancestor a compromised
+ * nobody-owned service can write into pass this check. So only relax the
+ * check when our own namespace genuinely has no mapping for uid 0, read from
+ * /proc/self/uid_map (one line per contiguous range: "inner outer count"). */
+bool cbm_daemon_ipc_posix_uid_zero_unmapped(void) {
+    int override =
+        atomic_load_explicit(&g_posix_uid_zero_unmapped_override_for_test, memory_order_acquire);
+    if (override >= 0) {
+        return override != 0;
+    }
+    FILE *uid_map_file = fopen("/proc/self/uid_map", "r");
+    if (!uid_map_file) {
+        return false;
+    }
+    unsigned long inner = 0, outer = 0, count = 0;
+    bool zero_mapped = false;
+    while (fscanf(uid_map_file, "%lu %lu %lu", &inner, &outer, &count) == 3) {
+        if (inner == 0) {
+            zero_mapped = true;
+            break;
+        }
+    }
+    (void)fclose(uid_map_file);
+    return !zero_mapped;
+}
+#endif
+
 static bool posix_directory_owner_trusted(uid_t owner) {
+#ifdef __linux__
+    if (owner == cbm_daemon_ipc_posix_kernel_overflow_uid() &&
+        cbm_daemon_ipc_posix_uid_zero_unmapped()) {
+        return true;
+    }
+#endif
     return owner == (uid_t)0 || owner == geteuid();
 }
 
