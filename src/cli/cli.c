@@ -2282,6 +2282,141 @@ static int cbm_remove_openclaw_compaction(const char *config_path) {
                : CLI_ERR;
 }
 
+/* ── OpenHands settings.json mcp_config (#1826) ───────────────
+ * The mcpServers-style config installed above (cbm_install_editor_mcp into
+ * ~/.openhands/mcp.json) is not enough: OpenHands only loads a global MCP
+ * server it finds registered under settings.json -> mcp_config, in its own
+ * shape ({transport, command, enabled} — no args array). Agent profiles then
+ * opt in individually via mcp_server_refs (below). */
+
+static size_t cbm_openhands_ownership_fields(cbm_json_like_object_field_t fields[3]) {
+    fields[0] = (cbm_json_like_object_field_t){
+        .key = "transport",
+        .shape = CBM_JSON_LIKE_VALUE_STRING,
+        .expected_string = "stdio",
+        .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+    };
+    fields[1] = (cbm_json_like_object_field_t){
+        .key = "command",
+        .shape = CBM_JSON_LIKE_VALUE_STRING,
+        .expected_string = NULL,
+        .flags = CBM_JSON_LIKE_FIELD_REQUIRED | CBM_JSON_LIKE_FIELD_CAPTURE_STRING,
+    };
+    fields[2] = (cbm_json_like_object_field_t){
+        .key = "enabled",
+        .shape = CBM_JSON_LIKE_VALUE_LITERAL,
+        .expected_string = "true",
+        .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+    };
+    return 3U;
+}
+
+static char *cbm_build_openhands_mcp_entry(const char *binary_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    bool ok = root && yyjson_mut_obj_add_strcpy(doc, root, "transport", "stdio") &&
+             yyjson_mut_obj_add_strcpy(doc, root, "command", binary_path) &&
+             yyjson_mut_obj_add_bool(doc, root, "enabled", true);
+    char *json = NULL;
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, root);
+        json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+/* Insert or leave alone: an already-owned entry (exact match, or annotated
+ * with extra keys the client added) needs no write. A same-named entry that
+ * does not match our shape is left untouched and reported as an error rather
+ * than overwritten, matching cbm_upsert_json_named_mcp's fail-closed rule for
+ * every other editor client. */
+static int cbm_upsert_openhands_settings_mcp(const char *binary_path, const char *settings_path) {
+    if (!binary_path || !settings_path) {
+        return CLI_ERR;
+    }
+    static const char *const path[] = {"mcp_config"};
+    char *document = NULL;
+    size_t document_length = 0U;
+    int read_result = cbm_json_like_read_document(settings_path, &document, &document_length);
+    if (read_result < 0) {
+        return CLI_ERR;
+    }
+    if (read_result == 0) {
+        cbm_json_like_object_field_t fields[3];
+        size_t field_count = cbm_openhands_ownership_fields(fields);
+        char *command = NULL;
+        int ownership =
+            cbm_json_like_match_object_entry(document, document_length, path, 1U,
+                                             CBM_DEFAULT_MCP_SERVER_NAME, fields, field_count,
+                                             &command);
+        free(command);
+        if (ownership == CBM_JSON_LIKE_OBJECT_MATCH ||
+            ownership == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) {
+            free(document);
+            return CLI_OK;
+        }
+        if (ownership != CBM_JSON_LIKE_OBJECT_MISSING) {
+            free(document);
+            return CLI_ERR;
+        }
+    }
+    char *entry = cbm_build_openhands_mcp_entry(binary_path);
+    if (!entry) {
+        free(document);
+        return CLI_ERR;
+    }
+    int edit_result = cbm_json_like_upsert_entry_if_unchanged(
+        settings_path, path, 1U, CBM_DEFAULT_MCP_SERVER_NAME, entry,
+        read_result == 1 ? NULL : document, document_length);
+    free(entry);
+    free(document);
+    return edit_result == 0 ? CLI_OK : CLI_ERR;
+}
+
+/* Remove only an entry that is still recognisably ours (an annotated entry is
+ * left in place and reported, same rule as insertion above); a missing file,
+ * path, or entry is a successful no-op. */
+static int cbm_remove_openhands_settings_mcp(const char *settings_path) {
+    if (!settings_path) {
+        return CLI_ERR;
+    }
+    static const char *const path[] = {"mcp_config"};
+    char *document = NULL;
+    size_t document_length = 0U;
+    int read_result = cbm_json_like_read_document(settings_path, &document, &document_length);
+    if (read_result == 1) {
+        free(document);
+        return CLI_OK;
+    }
+    if (read_result < 0) {
+        free(document);
+        return CLI_ERR;
+    }
+    cbm_json_like_object_field_t fields[3];
+    size_t field_count = cbm_openhands_ownership_fields(fields);
+    char *command = NULL;
+    int ownership = cbm_json_like_match_object_entry(document, document_length, path, 1U,
+                                                      CBM_DEFAULT_MCP_SERVER_NAME, fields,
+                                                      field_count, &command);
+    free(command);
+    if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH) {
+        free(document);
+        return CLI_OK;
+    }
+    if (ownership != CBM_JSON_LIKE_OBJECT_MATCH) {
+        free(document);
+        return CLI_ERR;
+    }
+    int edit_result = cbm_json_like_remove_entry_if_unchanged(
+        settings_path, path, 1U, CBM_DEFAULT_MCP_SERVER_NAME, document, document_length);
+    free(document);
+    return edit_result == 0 ? CLI_OK : CLI_ERR;
+}
+
 /* ── VS Code MCP (servers key with type:stdio) ────────────────── */
 
 int cbm_install_vscode_mcp(const char *binary_path, const char *config_path) {
@@ -9228,6 +9363,49 @@ static void uninstall_vscode_profile_configs(const char *code_user, const char *
     cbm_closedir(directory);
 }
 
+static bool cbm_filename_has_suffix(const char *name, const char *suffix) {
+    size_t name_len = strlen(name);
+    size_t suffix_len = strlen(suffix);
+    return name_len >= suffix_len && strcmp(name + (name_len - suffix_len), suffix) == 0;
+}
+
+/* Register or unregister our server against every existing OpenHands agent
+ * profile's mcp_server_refs array (#1826). A missing agent-profiles/
+ * directory is a silent no-op in both directions — install must never invent
+ * it, and uninstall has nothing to undo there. Only *.json entries are
+ * touched; a profile directory may hold arbitrary notes alongside profiles. */
+static void openhands_update_profile_refs(const char *profiles_dir, bool installing,
+                                          bool dry_run) {
+    cbm_dir_t *d = cbm_opendir(profiles_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0 ||
+            !cbm_filename_has_suffix(ent->name, ".json")) {
+            continue;
+        }
+        char profile_path[CLI_BUF_1K];
+        snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
+        struct stat state;
+        if (stat(profile_path, &state) != 0 || !S_ISREG(state.st_mode) || dry_run) {
+            continue;
+        }
+        int result = installing ? cbm_json_like_add_unique_string(
+                                      profile_path, "mcp_server_refs", CBM_DEFAULT_MCP_SERVER_NAME)
+                                : cbm_json_like_remove_string(profile_path, "mcp_server_refs",
+                                                              CBM_DEFAULT_MCP_SERVER_NAME);
+        if (result != CLI_OK) {
+            record_agent_config_error(!installing, "OpenHands",
+                                      installing ? "profile_refs_install"
+                                                 : "profile_refs_uninstall",
+                                      profile_path);
+        }
+    }
+    cbm_closedir(d);
+}
+
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
 static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
                                          const char *binary_path, bool force, bool dry_run) {
@@ -9490,11 +9668,32 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     if (agents->openhands) {
         char cp[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
+        char settings_path[CLI_BUF_1K];
+        char profiles_dir[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openhands/mcp.json", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
+        snprintf(settings_path, sizeof(settings_path), "%s/.openhands/settings.json", home);
+        snprintf(profiles_dir, sizeof(profiles_dir), "%s/.openhands/agent-profiles", home);
         install_generic_agent_config("OpenHands", binary_path, cp, NULL, dry_run,
                                      cbm_install_editor_mcp);
         install_agent_skill("OpenHands", skills_dir, force, dry_run);
+        /* #1826: the mcpServers-shaped mcp.json above is not enough — OpenHands
+         * only loads a server registered under settings.json -> mcp_config, and
+         * only for agent profiles that reference it. agent-profiles/ is never
+         * invented; a missing directory means nothing to register into yet. */
+        if (g_install_plan) {
+            plan_record("OpenHands", "mcp_config", settings_path);
+        } else {
+            if (!dry_run) {
+                if (!prepare_config_parent(settings_path) ||
+                    cbm_upsert_openhands_settings_mcp(binary_path, settings_path) != CLI_OK) {
+                    record_agent_config_error(false, "OpenHands", "settings_mcp_install",
+                                              settings_path);
+                }
+            }
+            printf("  settings mcp_config: %s\n", settings_path);
+            openhands_update_profile_refs(profiles_dir, true, dry_run);
+        }
     }
     if (agents->augment) {
         char cp[CLI_BUF_1K];
@@ -11750,11 +11949,21 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
     if (agents->openhands) {
         char cp[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
+        char settings_path[CLI_BUF_1K];
+        char profiles_dir[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openhands/mcp.json", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
+        snprintf(settings_path, sizeof(settings_path), "%s/.openhands/settings.json", home);
+        snprintf(profiles_dir, sizeof(profiles_dir), "%s/.openhands/agent-profiles", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenHands", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp_owned);
         printf("  removed %d skill(s)\n", cbm_remove_skills(skills_dir, dry_run));
+        /* #1826 counterpart: undo the settings.json registration and every
+         * agent profile's mcp_server_refs entry the install above added. */
+        if (!dry_run && cbm_remove_openhands_settings_mcp(settings_path) != CLI_OK) {
+            record_agent_config_error(true, "OpenHands", "settings_mcp_uninstall", settings_path);
+        }
+        openhands_update_profile_refs(profiles_dir, false, dry_run);
     }
     if (agents->augment) {
         char cp[CLI_BUF_1K];
