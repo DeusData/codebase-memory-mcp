@@ -3027,6 +3027,46 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
             if (p && p[0])
                 worklist[wl_tail++] = p;
         }
+        /* Also seed classes that appear as function/accessor RETURN TYPES
+         * (`has res => sub { Mojo::Message::Response->new }` etc.). A receiver
+         * typed via a return type ($tx->res->dom) may reach a class that this
+         * file never `use`s, so it is absent from xmod and would carry no @ISA —
+         * blocking the further-inherited method (Response inherits dom from
+         * Mojo::Message). Return types are stored DOTTED ("Mojo.Message.Response",
+         * first of a "|"-list); convert to the colon spelling the walk resolves.
+         * Deduped against the worklist to respect the cap. */
+        for (int i = 0; i < all_def_count && wl_tail < PERL_CHAIN_CAP; i++) {
+            const char *rts = all_defs[i].return_types;
+            if (!rts || !rts[0] || rts[0] == '_') /* skip empty + literal __PACKAGE__ */
+                continue;
+            size_t rlen = 0;
+            while (rts[rlen] && rts[rlen] != '|')
+                rlen++;
+            if (rlen == 0 || !strchr(rts, '.')) /* single-segment/no-dot: xmod/own handles it */
+                continue;
+            char *colon = (char *)cbm_arena_alloc(ctx.arena, rlen * 2 + 1);
+            if (!colon)
+                continue;
+            size_t w = 0;
+            for (size_t r = 0; r < rlen; r++) {
+                if (rts[r] == '.') {
+                    colon[w++] = ':';
+                    colon[w++] = ':';
+                } else {
+                    colon[w++] = rts[r];
+                }
+            }
+            colon[w] = '\0';
+            bool dup = false;
+            for (int q = 0; q < wl_tail; q++) {
+                if (worklist[q] && strcmp(worklist[q], colon) == 0) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup)
+                worklist[wl_tail++] = colon;
+        }
         /* Mojolicious routing/hook callbacks type their `$c` param to
          * Mojolicious::Controller (perl_bind_routing_controller_param); seed that
          * class into the chain-walk so its method table (render/stash/param/...)

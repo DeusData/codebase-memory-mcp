@@ -1700,6 +1700,45 @@ TEST(perllsp_cross_constructor_typed_inherited_method) {
     PASS();
 }
 
+/* Inherited method on a RETURN-TYPE-derived receiver whose class is never
+ * `use`d: `$f->make->base_method` where make returns My::Widget (multi-segment)
+ * and My::Widget ISA Base. My::Widget is reached only through make's return type
+ * (not a `use`), so its @ISA must still be seeded into the chain-walk (the
+ * return-type-class seed) for the inherited base_method to dispatch. */
+TEST(perllsp_cross_return_type_class_inherited_method) {
+    const char *source = "package App;\n"
+                         "use Factory;\n"
+                         "sub run { my $f = Factory->new; $f->make->base_method; }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.App.run", .short_name = "run", .label = "Function",
+         .def_module_qn = "test.lib.App"},
+        {.qualified_name = "test.lib.Factory.new", .short_name = "new", .label = "Function",
+         .def_module_qn = "test.lib.Factory", .return_types = "Factory"},
+        {.qualified_name = "test.lib.Factory.make", .short_name = "make", .label = "Function",
+         .def_module_qn = "test.lib.Factory", .return_types = "My.Widget"},
+        {.qualified_name = "test.lib.My.Widget.own", .short_name = "own", .label = "Function",
+         .def_module_qn = "test.lib.My.Widget"},
+        {.qualified_name = "test.lib.Base.base_method", .short_name = "base_method",
+         .label = "Function", .def_module_qn = "test.lib.Base"},
+    };
+    const char *widget_parents[] = {"Base", NULL};
+    const char *idx_modules[] = {"test.lib.My.Widget"};
+    const char *const *idx_lists[] = {widget_parents};
+    CBMPerlInheritIndex inherit = {
+        .module_qns = idx_modules, .parent_lists = idx_lists, .count = 1};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.App", defs, 5, NULL, NULL,
+                           0, NULL, &out, &inherit, defs, 5);
+    int idx = find_resolved_arr(&out, "App.run", "lib.Base.base_method");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -1759,6 +1798,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_bareword_func_assign_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_constructor_typed_inherited_method);
+    RUN_TEST(perllsp_cross_return_type_class_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);
     RUN_TEST(perllsp_cross_export_ok_not_default);
