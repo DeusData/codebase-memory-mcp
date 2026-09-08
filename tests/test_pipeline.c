@@ -3707,6 +3707,130 @@ TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage) {
     PASS();
 }
 
+/* #2111 create->register TOCTOU guard. The bug this pins: create_staging_path()
+ * used to make the stage's main file visible (via mkstemp) BEFORE taking its
+ * sidecar lock, and sweep_orphan_stages() treats an absent lock sidecar
+ * (ENOENT) as a confirmed-dead writer (kernel released the lock on death). So a
+ * second, concurrent cbm_pipeline_run() against the SAME final_path, landing
+ * its own sweep in that narrow unlocked window, removed the first run's
+ * in-flight stage out from under it: every extraction pass still completed
+ * (none touch the stage file on disk), but the publish that followed found its
+ * own stage gone. Two writers racing the same project is a real scenario this
+ * PR's own sweep exists to clean up after (auto_index; the recently-fixed
+ * stale-rendezvous-recovery retry path) -- not hypothetical, and exactly the
+ * shape of #2111's windows-guards red (every pass logged success, nothing was
+ * ever committed, "Pipeline failed" surfaced generic; on Windows the sidecar
+ * collision surfaced as EACCES/errno=13).
+ *
+ * The fix takes the sidecar lock BEFORE the main file becomes visible, so this
+ * hook -- fired the instant the main file exists -- finds the stage already
+ * lock-protected and the racing sweep keeps it. The hook fires at the same
+ * point under the old ordering, where the lock was NOT yet held, so this test
+ * goes RED if that ordering ever regresses.
+ *
+ * The racing run is cancelled immediately so it never reaches ITS OWN
+ * publish -- isolating the sweep's effect on the first run's stage from the
+ * separate question of two full runs both completing for the same project. */
+typedef struct {
+    const char *tmp_dir;
+    const char *db_path;
+    bool stage_survived;
+} racing_sweep_arg_t;
+
+static bool find_sole_stage_path(const char *dir, const char *db_basename, char *out,
+                                 size_t out_sz) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return false;
+    }
+    char prefix[256];
+    snprintf(prefix, sizeof(prefix), "%s.stage.", db_basename);
+    size_t prefix_len = strlen(prefix);
+    bool found = false;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        size_t name_len = strlen(entry->name);
+        enum { STAGE_SUFFIX_RANDOM_CHARS = 6 }; /* mirrors CBM_STAGE_SUFFIX_RANDOM_CHARS */
+        if (strncmp(entry->name, prefix, prefix_len) == 0 &&
+            name_len == prefix_len + STAGE_SUFFIX_RANDOM_CHARS) {
+            snprintf(out, out_sz, "%s/%s", dir, entry->name);
+            found = true;
+            break;
+        }
+    }
+    cbm_closedir(d);
+    return found;
+}
+
+static void *racing_sweep_thread(void *arg) {
+    racing_sweep_arg_t *a = (racing_sweep_arg_t *)arg;
+    cbm_pipeline_t *p = cbm_pipeline_new(a->tmp_dir, a->db_path, CBM_MODE_FULL);
+    if (p) {
+        /* Its own sweep_orphan_stages() runs at the very start, before this
+         * run mints its own stage -- exactly like the first run's. Cancel
+         * immediately: this run must reach the sweep and nothing past it. */
+        cbm_pipeline_cancel(p);
+        (void)cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    return NULL;
+}
+
+/* Fired from inside the FIRST run's create_staging_path(), the instant its
+ * stage main file exists (under the fix, with its sidecar lock already held;
+ * under the old create-then-lock ordering, before the lock was taken): run a
+ * second, cancelled cbm_pipeline_run() for the same project synchronously on
+ * another thread, so its sweep has every chance to reach the stage before
+ * control returns to the first run. */
+static void racing_sweep_hook(void *userdata) {
+    racing_sweep_arg_t *a = (racing_sweep_arg_t *)userdata;
+    char stage_path[600] = {0};
+    bool had_stage =
+        find_sole_stage_path(a->tmp_dir, "generation.db", stage_path, sizeof(stage_path));
+    cbm_thread_t tid;
+    if (cbm_thread_create(&tid, 0, racing_sweep_thread, a) == 0) {
+        cbm_thread_join(&tid);
+    }
+    a->stage_survived = had_stage && path_exists(stage_path);
+}
+
+TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_race_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    racing_sweep_arg_t race_arg = {.tmp_dir = tmp, .db_path = db_path, .stage_survived = false};
+    cbm_pipeline_incremental_test_after_stage_created_once(racing_sweep_hook, &race_arg);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    bool db_exists = path_exists(db_path);
+    int defined_count = -1;
+    int absent_count = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined", &defined_count,
+                             &absent_count);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(race_arg.stage_survived);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(db_exists);
+    ASSERT_EQ(defined_count, 1);
+    ASSERT_EQ(absent_count, 0);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
 static char g_route_log_capture[8192];
 static atomic_flag g_route_log_spin = ATOMIC_FLAG_INIT;
 
@@ -14473,6 +14597,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_minted_stage_is_owned_until_released);
     RUN_TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept);
     RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
+    RUN_TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage);
     RUN_TEST(pipeline_fresh_index_never_reports_invalid_existing_db);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);

@@ -908,6 +908,15 @@ void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);
+/* Fires from create_staging_path(), right after the stage's main file is
+ * created with O_EXCL. In the current lock-before-visible ordering its sidecar
+ * lock is already held at this point, so a test hook installed here can run a
+ * concurrent sweep (via another cbm_pipeline_run() against the same
+ * final_path) and confirm the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked window, so the hook also
+ * binds RED if that ordering regresses. */
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata);
 cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
 void cbm_pipeline_incremental_test_reset_faults(void);
 
@@ -917,6 +926,7 @@ bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_predump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_destination_prepare(void);
 void cbm_pipeline_persist_test_run_before_final_manifest(void);
+void cbm_pipeline_persist_test_run_after_stage_created(void);
 void cbm_pipeline_persist_test_reset_faults(void);
 #endif
 

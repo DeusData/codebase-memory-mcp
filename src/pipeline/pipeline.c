@@ -37,6 +37,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/secure_random.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -73,6 +74,8 @@ static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
 static atomic_bool g_persist_test_fail_adr_capture = false;
 static cbm_pipeline_test_hook_fn g_persist_test_before_final_manifest = NULL;
 static void *g_persist_test_before_final_manifest_userdata = NULL;
+static cbm_pipeline_test_hook_fn g_persist_test_after_stage_created = NULL;
+static void *g_persist_test_after_stage_created_userdata = NULL;
 
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void) {
     atomic_store(&g_persist_test_fail_after_stage_dump, true);
@@ -106,6 +109,29 @@ void cbm_pipeline_persist_test_run_before_final_manifest(void) {
     }
 }
 
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata) {
+    g_persist_test_after_stage_created = hook;
+    g_persist_test_after_stage_created_userdata = userdata;
+}
+
+/* Fired by create_staging_path() right after the stage's main file is created
+ * with O_EXCL -- and, in the current lock-before-visible ordering, after its
+ * sidecar lock is already held. A test hook installed here can run a
+ * concurrent sweep (another cbm_pipeline_run() against the same final_path) at
+ * this instant to prove the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked TOCTOU window, so the same
+ * hook binds RED if that ordering ever regresses. */
+void cbm_pipeline_persist_test_run_after_stage_created(void) {
+    cbm_pipeline_test_hook_fn hook = g_persist_test_after_stage_created;
+    void *userdata = g_persist_test_after_stage_created_userdata;
+    g_persist_test_after_stage_created = NULL;
+    g_persist_test_after_stage_created_userdata = NULL;
+    if (hook) {
+        hook(userdata);
+    }
+}
+
 bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void) {
     return atomic_exchange(&g_persist_test_fail_after_stage_dump, false);
 }
@@ -125,6 +151,8 @@ void cbm_pipeline_persist_test_reset_faults(void) {
     atomic_store(&g_persist_test_fail_adr_capture, false);
     g_persist_test_before_final_manifest = NULL;
     g_persist_test_before_final_manifest_userdata = NULL;
+    g_persist_test_after_stage_created = NULL;
+    g_persist_test_after_stage_created_userdata = NULL;
 }
 #endif
 
@@ -1630,25 +1658,25 @@ void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd) {
     }
 }
 
-static bool stage_owner_register(const char *stage_path) {
-    int fd = cbm_pipeline_stage_lock_hold(stage_path);
-    if (fd < 0) {
-        char errno_text[16];
-        (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
-        cbm_log_warn("pipeline.stage", "action", "lock_failed", "errno", errno_text, "path",
-                     stage_path);
-        return false;
-    }
+/* Record an already-held stage lock in the per-process owner table, keyed by
+ * path so publish/finalize/discard can release it later. On success the table
+ * owns lock_fd; on failure the caller still does and must drop it.
+ *
+ * The lock must ALREADY be held: create_staging_path() takes it before the
+ * stage's main file is created (so the file is never visible on disk without
+ * its lock), then hands the descriptor here. Re-taking the lock in this helper
+ * would self-conflict -- both flock() and Windows _SH_DENYRW deny a second
+ * acquire of the same sidecar even from this same process. */
+static bool stage_owner_adopt(const char *stage_path, int lock_fd) {
     stage_owner_t *owner = (stage_owner_t *)malloc(sizeof(*owner));
     char *path_copy = strdup(stage_path);
     if (!owner || !path_copy) {
         free(owner);
         free(path_copy);
-        cbm_pipeline_stage_lock_drop(stage_path, fd);
         return false;
     }
     owner->stage_path = path_copy;
-    owner->lock_fd = fd;
+    owner->lock_fd = lock_fd;
     stage_owners_lock();
     owner->next = g_stage_owners;
     g_stage_owners = owner;
@@ -2641,22 +2669,79 @@ static char *create_staging_path(const char *final_path) {
     }
     memcpy(path, final_path, final_len);
     memcpy(path + final_len, suffix, sizeof(suffix));
-    int fd = cbm_mkstemp(path);
-    if (fd < 0) {
-        free(path);
-        return NULL;
-    }
-#ifdef _WIN32
-    _close(fd);
-#else
-    close(fd);
+    /* The six random chars sit directly after the ".stage." marker; each
+     * attempt overwrites the "XXXXXX" template in place. Alphanumerics only,
+     * matching stage_suffix_at()/stage_entry_stage_length() so the sweep
+     * recognises the minted name and its sidecars. */
+    char *random_at = path + final_len + (sizeof(cbm_stage_marker) - 1);
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    /* Lock BEFORE the stage becomes visible: take the sidecar lock first, then
+     * create the stage's main file with O_EXCL. The main file is therefore
+     * never present on disk without its lock already held, so a concurrent
+     * run's sweep_orphan_stages() against the same final_path can only ever
+     * find this stage lock-held -- it reaches the stage through the .lock
+     * sidecar too (stage_entry_stage_length() matches it), probes the lock,
+     * sees a live holder, and keeps it. That closes the old create->register
+     * window that let a racing sweep delete a live-but-unlocked stage (POSIX)
+     * or collide on the sidecar with EACCES (Windows) -- #2111's windows-guards
+     * red. A pre-lock-era orphan minted by an OLDER binary still carries no
+     * lock, so the sweep's ENOENT path still removes it (#1839 preserved).
+     *
+     * A minted suffix collides with an existing stage only about 1 in 62^6;
+     * retry a bounded number of times, the way mkstemp/mkdtemp do, then fail. */
+    for (int attempt = 0; attempt < 128; attempt++) {
+        unsigned char rnd[CBM_STAGE_SUFFIX_RANDOM_CHARS];
+        if (!cbm_secure_random(rnd, sizeof(rnd))) {
+            free(path);
+            errno = EIO;
+            return NULL;
+        }
+        for (size_t i = 0; i < sizeof(rnd); i++) {
+            random_at[i] = alphabet[rnd[i] % (sizeof(alphabet) - 1)];
+        }
+        errno = 0;
+        int lock_fd = cbm_pipeline_stage_lock_hold(path);
+        if (lock_fd < 0) {
+            /* A live twin already owns this exact suffix's sidecar (EAGAIN /
+             * EACCES), or the sidecar could not be created. Mint a fresh suffix
+             * and try again rather than contend for this one. */
+            continue;
+        }
+        FILE *main_file = cbm_fopen(path, "wbx");
+        if (!main_file) {
+            /* The suffix collided with a lock-less orphan's main file -- its
+             * sidecar was takeable, so it is not a live writer. Never inherit a
+             * stranger's bytes: drop the lock, remove the sidecar we just took,
+             * and mint a fresh suffix. The orphan's main file is left for a
+             * later sweep, which removes it as a pre-lock-era orphan. */
+            cbm_pipeline_stage_lock_drop(path, lock_fd);
+            continue;
+        }
+        (void)fclose(main_file);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        /* Main file now exists and its lock is already held. Under the OLD
+         * create-then-lock ordering this was the unlocked window; the
+         * concurrent-sweep test fires here to prove the stage now survives a
+         * racing sweep, and to bind RED if that ordering ever regresses. */
+        cbm_pipeline_persist_test_run_after_stage_created();
 #endif
-    if (!stage_owner_register(path)) {
-        (void)cbm_unlink(path);
-        free(path);
-        return NULL;
+        if (!stage_owner_adopt(path, lock_fd)) {
+            cbm_pipeline_stage_lock_drop(path, lock_fd);
+            (void)cbm_unlink(path);
+            free(path);
+            return NULL;
+        }
+        return path;
     }
-    return path;
+    /* Every attempt failed to take a lock -- keep the observability the old
+     * stage_owner_register() emitted for a lock failure. */
+    char errno_text[16];
+    (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+    cbm_log_warn("pipeline.stage", "action", "lock_failed", "errno", errno_text, "path", path);
+    free(path);
+    errno = EEXIST;
+    return NULL;
 }
 
 /* A backup-failed destination may still have the only recoverable WAL or
@@ -2876,8 +2961,18 @@ static void sweep_one_stage(const char *stage_path) {
                      "errno", errno_text, "path", stage_path);
         return;
     }
-    /* No owner: absent sidecar (pre-ownership stage, or dropped) or a lock
-     * the kernel released with its writer. Ours now, from the lock down. */
+    /* No owner: absent sidecar (an ENOENT probe) or a lock the kernel released
+     * with its writer. Ours now, from the lock down.
+     *
+     * The absent-sidecar (ENOENT) case is exactly a pre-lock-era orphan: a
+     * stage an OLDER binary minted with no sidecar at all (#1839 pins that
+     * these ARE swept). It is NOT an in-flight stage of a current run: since
+     * create_staging_path() now takes the sidecar lock BEFORE the stage's main
+     * file becomes visible on disk, a live stage always has its sidecar, so a
+     * concurrent sweep landing here for one would instead find the lock held
+     * above and keep it. Removing on ENOENT therefore reclaims genuine orphans
+     * without ever deleting a live stage (the create->register race behind
+     * #2111's windows-guards red is closed at the source). */
     int64_t bytes = stage_bytes_on_disk(stage_path);
     remove_stage_files(stage_path);
     if (lock_fd >= 0) {
