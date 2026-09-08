@@ -8,6 +8,7 @@
 #include "cli/agent_profiles.h"
 #include "cli/cli.h"
 #include "cli/activation_transaction.h"
+#include "cli/config_edit_path.h"
 #include "cli/config_json_like.h"
 #include "cli/config_text_edit.h"
 #include "cli/config_toml_edit.h"
@@ -7776,6 +7777,21 @@ static void agent_uninstall_failure_record(const char *agent, const char *operat
     (void)snprintf(entry->detail, sizeof(entry->detail), "%s", detail ? detail : "");
 }
 
+/* The agent-configuration writers opt in to following user-owned symlinked
+ * config files under the user's configuration roots (#1954, decision C);
+ * every other caller of the config editors keeps refusing links. Cleared by
+ * the same command when its configuration work is done. */
+static void cli_config_follow_begin(const char *home) {
+    cbm_config_edit_path_follow_clear();
+    if (home && home[0]) {
+        (void)cbm_config_edit_path_follow_add_root(home);
+    }
+    const char *xdg_config = getenv("XDG_CONFIG_HOME");
+    if (xdg_config && xdg_config[0]) {
+        (void)cbm_config_edit_path_follow_add_root(xdg_config);
+    }
+}
+
 /* The closing list of what uninstall could not clean. Printed AFTER the
  * executable and the indexes are gone, so nothing in it is a reason to keep
  * the installation around — each line is one file the user removes an entry
@@ -7853,6 +7869,14 @@ static void describe_agent_config_target(const char *path, char *out, size_t out
                        : info.is_directory ? "directory"
                        : info.is_regular   ? "regular file"
                                            : "special file";
+    /* A refused symlink names the rule that refused it (#1954): the user
+     * then knows whether to fix ownership, the target, or the parent. */
+    char refusal[160];
+    if (info.is_symlink && cbm_config_edit_path_refusal(path, refusal, sizeof(refusal))) {
+        (void)snprintf(out, out_size, " (target: symlink, %lld bytes; not followed: %s)",
+                       (long long)info.size, refusal);
+        return;
+    }
     (void)snprintf(out, out_size, " (target: %s, %lld bytes)", kind, (long long)info.size);
 }
 
@@ -9817,12 +9841,24 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     }
 }
 
+static int cbm_install_agent_configs_in_scope(const char *home, const char *binary_path, bool force,
+                                              bool dry_run, cbm_detected_agents_t *agents_in);
+
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (g_client_selection && !cli_clients_apply_selection(g_client_selection, &agents)) {
         return CLI_ERR;
     }
+    cli_config_follow_begin(home);
+    int result = cbm_install_agent_configs_in_scope(home, binary_path, force, dry_run, &agents);
+    cbm_config_edit_path_follow_clear();
+    return result;
+}
+
+static int cbm_install_agent_configs_in_scope(const char *home, const char *binary_path, bool force,
+                                              bool dry_run, cbm_detected_agents_t *agents_in) {
+    cbm_detected_agents_t agents = *agents_in;
     if (!g_install_plan) {
         print_detected_agents(&agents, home);
     }
@@ -12108,6 +12144,7 @@ static int cli_uninstall_activate(void *opaque) {
         return CLI_TRUE;
     }
 
+    cli_config_follow_begin(activation->home);
     if (activation->agents.claude_code) {
         uninstall_claude_code(activation->home, activation->bin_path, activation->dry_run);
     }
@@ -12115,6 +12152,7 @@ static int cli_uninstall_activate(void *opaque) {
     uninstall_editor_agents(&activation->agents, activation->home, activation->dry_run);
     uninstall_additional_agents(&activation->agents, activation->home, activation->dry_run);
     uninstall_agent_client_registry(activation->home, activation->dry_run);
+    cbm_config_edit_path_follow_clear();
 
     /* Agent-config failures are collected, never a gate: an entry the editors
      * refuse to touch (a symlinked config, a foreign file, a malformed

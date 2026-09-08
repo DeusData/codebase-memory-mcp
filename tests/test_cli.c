@@ -2402,6 +2402,99 @@ TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails) {
     ASSERT_TRUE(failure_named);
     PASS();
 }
+
+/* #1954 end to end: ~/.cursor/mcp.json is a user-owned symlink into a
+ * dotfiles checkout. The uninstall command opts in to following it, removes
+ * our entry THROUGH the link, leaves the link pointing where it did, and
+ * exits 0 with the binary and the index gone. */
+TEST(cli_uninstall_cleans_user_owned_symlinked_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-symlinked-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index goes with the uninstall");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(bin_target, "binary goes with the uninstall");
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    char dotfiles_dir[512];
+    char dotfiles_config[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    snprintf(dotfiles_dir, sizeof(dotfiles_dir), "%s/.dotfiles/cursor", tmpdir);
+    snprintf(dotfiles_config, sizeof(dotfiles_config), "%s/mcp.json", dotfiles_dir);
+    test_mkdirp(cursor_dir);
+    test_mkdirp(dotfiles_dir);
+    write_test_file(dotfiles_config,
+                    "{\n  \"mcpServers\": {\n    \"keep\": {\"command\": \"x\"}\n  }\n}\n");
+    int installed = cbm_install_editor_mcp(bin_target, dotfiles_config);
+    if (symlink(dotfiles_config, cursor_config) != 0) {
+        FAIL("symlink failed");
+    }
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cli_fd_capture_t out_capture;
+    cli_fd_capture_t err_capture;
+    cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
+    cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    char *err_text = cli_fd_capture_end(&err_capture);
+    char *out_text = cli_fd_capture_end(&out_capture);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat state;
+    bool binary_gone = lstat(bin_target, &state) != 0 && errno == ENOENT;
+    bool index_gone = lstat(index_path, &state) != 0 && errno == ENOENT;
+    bool link_intact = lstat(cursor_config, &state) == 0 && S_ISLNK(state.st_mode);
+    char link_value[640] = {0};
+    ssize_t link_length = readlink(cursor_config, link_value, sizeof(link_value) - 1U);
+    bool link_same = link_length > 0 && strcmp(link_value, dotfiles_config) == 0;
+    char *after = read_test_file_alloc(dotfiles_config);
+    bool entry_removed =
+        after && !strstr(after, "codebase-memory-mcp") && strstr(after, "\"keep\"");
+    bool no_error = err_text && !strstr(err_text, "error:");
+
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+    free(after);
+    free(err_text);
+    free(out_text);
+
+    ASSERT_EQ(installed, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(index_gone);
+    ASSERT_TRUE(link_intact);
+    ASSERT_TRUE(link_same);
+    ASSERT_TRUE(entry_removed);
+    ASSERT_TRUE(no_error);
+    PASS();
+}
 #endif
 
 TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
@@ -14680,6 +14773,7 @@ SUITE(cli) {
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
 #ifndef _WIN32
     RUN_TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails);
+    RUN_TEST(cli_uninstall_cleans_user_owned_symlinked_config);
 #endif
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
