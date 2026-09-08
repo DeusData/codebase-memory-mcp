@@ -2878,8 +2878,8 @@ static int64_t project_cache_bytes(const char *dir_path, const mcp_project_recor
 }
 
 static const char *prune_project_cache(cbm_mcp_server_t *srv, const char *dir_path,
-                                        const mcp_project_record_t *record, bool dry_run,
-                                        int64_t *reclaimed_bytes) {
+                                       const mcp_project_record_t *record, bool dry_run,
+                                       int64_t *reclaimed_bytes) {
     int root_status = project_root_status(record->root_path);
     if (root_status == 0) {
         return "root_present";
@@ -3073,8 +3073,8 @@ static char *handle_prune_projects(cbm_mcp_server_t *srv, const char *args) {
         }
         candidate_count++;
         int64_t candidate_bytes = project_cache_bytes(dir_path, &records[i]);
-        const char *status = prune_project_cache(srv, dir_path, &records[i], dry_run,
-                                                 &reclaimed_bytes);
+        const char *status =
+            prune_project_cache(srv, dir_path, &records[i], dry_run, &reclaimed_bytes);
         if (strcmp(status, "deleted") == 0 || strcmp(status, "already_deleted") == 0) {
             deleted_count++;
         }
@@ -3088,8 +3088,7 @@ static char *handle_prune_projects(cbm_mcp_server_t *srv, const char *args) {
             break;
         }
     }
-    if (response_error ||
-        !yyjson_mut_obj_add_bool(doc, root, "dry_run", dry_run) ||
+    if (response_error || !yyjson_mut_obj_add_bool(doc, root, "dry_run", dry_run) ||
         !yyjson_mut_obj_add_int(doc, root, "candidate_count", candidate_count) ||
         !yyjson_mut_obj_add_int(doc, root, "deleted_count", deleted_count) ||
         !yyjson_mut_obj_add_int(doc, root, "reclaimable_bytes", reclaimed_bytes) ||
