@@ -1222,6 +1222,37 @@ TEST(perllsp_cross_mojo_listunpack_c_param) {
     PASS();
 }
 
+TEST(perllsp_cross_mojo_c_shift_param) {
+    /* `my $c = shift` in a Mojolicious module is the controller — NOT the
+     * enclosing package (here the plugin). Helper/hook callbacks
+     * (`$app->helper(x => sub { my $c = shift; $c->render })`) are the dominant
+     * `$c` form and were mis-typed to the plugin before this. */
+    const char *source = "package Mojolicious::Plugin::Foo;\n"
+                         "use Mojo::Base 'Mojolicious::Plugin';\n"
+                         "sub helper_body {\n"
+                         "    my $c = shift;\n"
+                         "    return $c->render;\n"
+                         "}\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Mojolicious.Controller.render", .short_name = "render",
+         .label = "Function", .def_module_qn = "test.lib.Mojolicious.Controller"},
+        {.qualified_name = "test.lib.Mojolicious.Plugin.Foo.helper_body",
+         .short_name = "helper_body", .label = "Function",
+         .def_module_qn = "test.lib.Mojolicious.Plugin.Foo"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Mojolicious.Plugin.Foo",
+                           defs, 2, NULL, NULL, 0, NULL, &out, NULL, defs, 2);
+    int idx = find_resolved_arr(&out, "Foo.helper_body", "Mojolicious.Controller.render");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(perllsp_cross_return_type_chain) {
     /* Return-type inference: extraction infers make_widget's return type (Widget)
      * from a `return Widget->new` body (perl_infer_return_types) and carries it on
@@ -1447,6 +1478,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_toplevel_module_caller);
     RUN_TEST(perllsp_cross_mojo_routing_c_param);
     RUN_TEST(perllsp_cross_mojo_listunpack_c_param);
+    RUN_TEST(perllsp_cross_mojo_c_shift_param);
     RUN_TEST(perllsp_cross_return_type_chain);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);

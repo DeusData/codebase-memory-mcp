@@ -1304,8 +1304,20 @@ static void perl_infer_self_type(PerlLSPContext *ctx, TSNode body) {
         if (!vtxt)
             continue;
         const char *bare = perl_strip_sigil(vtxt);
-        if (bare && bare[0])
-            cbm_scope_bind(ctx->current_scope, bare, cbm_type_named(ctx->arena, pkg));
+        if (bare && bare[0]) {
+            /* Mojolicious `$c` convention: `my $c = shift` in a helper/hook
+             * callback or controller action is the controller — NOT the
+             * enclosing package, which for a helper callback (`$app->helper(x =>
+             * sub { my $c = shift })`) is the plugin. Bind $c to
+             * Mojolicious::Controller (chain-walk-seeded only in Mojo files, so
+             * inert elsewhere — no false edges); every other invocant name binds
+             * to the enclosing package as usual. */
+            if (strcmp(bare, "c") == 0)
+                cbm_scope_bind(ctx->current_scope, "c",
+                               cbm_type_named(ctx->arena, "Mojolicious::Controller"));
+            else
+                cbm_scope_bind(ctx->current_scope, bare, cbm_type_named(ctx->arena, pkg));
+        }
         free(kids);
         return; /* only the first invocant binding */
     }
