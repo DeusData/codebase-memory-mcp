@@ -221,7 +221,9 @@ jobs:
         run: python3 scripts/ci/generate-sbom.py "${{ inputs.version }}"
 
       - name: Attest SBOM
-        uses: actions/attest-sbom@c604332985a26aa8cf1bdc465b92731239ec6b9e # v4.1.0
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        env:
+          NODE_OPTIONS: '--max-http-header-size=32768'
         with:
           subject-path: '*.tar.gz'
           sbom-path: 'sbom.json'
