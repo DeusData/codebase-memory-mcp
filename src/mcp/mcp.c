@@ -17523,7 +17523,7 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         (void)snprintf(limit, sizeof(limit), "%d", file_limit);
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", limit);
+                     files, "limit", limit, "root", srv->session_root);
         return;
     }
 
