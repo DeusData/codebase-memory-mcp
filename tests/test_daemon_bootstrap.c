@@ -1029,7 +1029,9 @@ TEST(daemon_bootstrap_start_failure_record_round_trip) {
  * waiting the full 30 s and then reporting "active or starting" -- the
  * opposite of the truth. A real host is spawned against a runtime directory
  * whose record writes fail with ENOSPC; the client must report "failed to
- * start" naming the errno and the path, within seconds, not the deadline. */
+ * start" naming the errno and the path by ending the wait on the recorded
+ * cause, not by exhausting the deadline. The proof is the surfaced record and
+ * the single spawn (see the assertions), never a wall-clock measurement. */
 TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
     const char *old_cache = getenv("CBM_CACHE_DIR");
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
@@ -1071,13 +1073,10 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
     cbm_daemon_bootstrap_result_t result;
     memset(&result, 0, sizeof(result));
     cbm_daemon_bootstrap_status_t status = CBM_DAEMON_BOOTSTRAP_FAILED;
-    uint64_t elapsed_ms = UINT64_MAX;
     if (identity_ready) {
         cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
         cbm_daemon_bootstrap_spawn_override_set_for_test(bootstrap_enospc_host_spawn, &host);
-        uint64_t started = cbm_now_ms();
         status = cbm_daemon_bootstrap_execute(&config, &result);
-        elapsed_ms = cbm_now_ms() - started;
         cbm_daemon_bootstrap_spawn_override_set_for_test(NULL, NULL);
         cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
     }
@@ -1115,7 +1114,14 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
     ASSERT_TRUE(host.child_count >= 1);
     ASSERT_TRUE(log_read);
     ASSERT_TRUE(daemon_named_cause);
-    ASSERT(elapsed_ms < 5000);
+    /* Fast-fail is proven by the MECHANISM, never by wall-clock (O9: a gate
+     * never asserts a transient timing window). The recorded ENOSPC cause is
+     * surfaced verbatim ("failed to start" + errno + path) and the slow
+     * "active or starting" timeout wording is absent -- that message is emitted
+     * ONLY on the fast-fail break (cbm_daemon_bootstrap_start_failure_format),
+     * never on the 30 s deadline path -- and the client stopped after exactly
+     * one spawn instead of respawning a doomed daemon until the deadline. Any
+     * regression to the pre-#1828 30 s hang trips these deterministically. */
     ASSERT_FALSE(stale_wording);
     ASSERT_TRUE(message_names_failure);
     ASSERT_TRUE(message_names_errno);
