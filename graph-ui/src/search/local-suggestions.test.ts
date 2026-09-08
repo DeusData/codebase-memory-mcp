@@ -17,6 +17,7 @@ import {
     fileStem,
     localCandidates,
     localSuggestions,
+    settledSearchHits,
 } from './local-suggestions';
 import { rankHits } from './semantic-search';
 
@@ -29,6 +30,25 @@ const SYMBOLS: SymbolSearchHit[] = [
 const FILES = ['src/services/userService.ts', 'src/repo/db.ts', 'src/routes/users.ts'];
 
 const index = { symbols: SYMBOLS, files: FILES };
+
+describe('settledSearchHits', () => {
+    it('keeps an exact loaded symbol navigable after an empty index reply', () => {
+        const symbol: SymbolSearchHit = {
+            name: 'cbm_arena_alloc', qualifiedName: 'cbm.arena.cbm_arena_alloc',
+            kind: 'function', filePath: 'src/arena.c', line: 42,
+        };
+        const loaded = rankHits([symbol], 'cbm_arena_alloc');
+        const result = settledSearchHits([], loaded);
+        expect(result.source).toBe('loaded');
+        expect(result.hits[0]?.hit).toEqual(symbol);
+    });
+
+    it('uses nonempty index replies and leaves no invented matches when both are empty', () => {
+        const indexed = rankHits(SYMBOLS, 'validateUser');
+        expect(settledSearchHits(indexed, [])).toEqual({ hits: indexed, source: 'index' });
+        expect(settledSearchHits([], [])).toEqual({ hits: [], source: 'index' });
+    });
+});
 
 describe('fileStem', () => {
 

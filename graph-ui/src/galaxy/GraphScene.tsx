@@ -14,10 +14,9 @@
  *  2. sceneRadius lief als IIFE bei jedem Render ueber alle Knoten. Jetzt in
  *     useMemo([data.nodes]): das Layout kommt fertig vom Server, der Radius
  *     aendert sich also genau dann, wenn die Knoten sich aendern.
- *  3. Der Satelliten-Zweig fuer data.linked_projects und der Geister-Zweig
- *     fuer `missed` sind gestrichen, samt der Props `missed`. Dieses Projekt
- *     zeigt eine Galaxie und laedt keine Fremdprojekte dazu; ein Zweig, den
- *     niemand einschaltet, waere toter Code mit eigenen Typen im Schlepptau.
+ *  3. Der Satelliten-Zweig fuer data.linked_projects ist gestrichen. Die
+ *     Coverage-Ebene ist getrennt wiederhergestellt, mit eigenen Render-IDs,
+ *     Auswahl-Callbacks und Kamera-Grenzen fuer beide Wolken.
  *  4. ApproachWatcher (Semantic Zoom) und ViewTargetReporter (Minimap-Feed)
  *     sind gestrichen, samt der Props onApproachNode und onViewTarget. Beide
  *     bedienen Panels, die dieses Projekt nicht uebernimmt.
@@ -104,6 +103,8 @@ import type { CameraFit, FrameBox } from './camera-frame';
 import { FRAME_WINDOW_MS, recordFrameWindow, recordSceneFacts } from './frame-rate';
 import { springStep } from '../agents/agent-motion';
 import type { GraphData, GraphNode } from './types';
+import { COVERAGE_SHADOW_COLOR, coverageShadowPositions, resolveCoverageShadowNode } from './coverage-shadow';
+import type { CoverageShadow, CoverageShadowNode } from './coverage-shadow';
 import {
     DEFAULT_DISPLAY_SETTINGS,
     bloomIntensityScale,
@@ -653,6 +654,9 @@ interface GraphSceneProps {
     /* False pauses the render loop (hidden-but-mounted panel). */
     active?: boolean;
     data: GraphData;
+    coverageShadow?: CoverageShadow | null;
+    onShadowNodeClick?: (node: CoverageShadowNode) => void;
+    renderShadowTooltip?: (node: CoverageShadowNode) => ReactNode;
     highlightedIds: Set<number> | null;
     cameraTarget: CameraTarget | null;
     showLabels: boolean;
@@ -689,9 +693,20 @@ interface GraphSceneProps {
 
 export type { CameraTarget };
 
+function CoverageShadowEdges({ shadow, brightness }: { shadow: CoverageShadow; brightness: number }) {
+    const positions = useMemo(() => coverageShadowPositions(shadow), [shadow]);
+    return <lineSegments>
+        <bufferGeometry><bufferAttribute attach="attributes-position" args={[positions, 3]} /></bufferGeometry>
+        <lineBasicMaterial color={COVERAGE_SHADOW_COLOR} transparent opacity={Math.min(0.6, Math.max(0, brightness) * 0.28)} depthWrite={false} toneMapped={false} />
+    </lineSegments>;
+}
+
 export function GraphScene({
     active = true,
     data,
+    coverageShadow = null,
+    onShadowNodeClick,
+    renderShadowTooltip,
     highlightedIds,
     cameraTarget,
     showLabels,
@@ -710,8 +725,23 @@ export function GraphScene({
     frameCap = 0,
 }: GraphSceneProps) {
     const [hovered, setHovered] = useState<GraphNode | null>(null);
+    const [hoveredShadow, setHoveredShadow] = useState<CoverageShadowNode | null>(null);
     const controlsRef = useRef<OrbitControlsImpl | null>(null);
     const flat = projection === 'flat';
+    const sceneNodes = useMemo(() => coverageShadow ? [...data.nodes, ...coverageShadow.nodes] : data.nodes, [data.nodes, coverageShadow]);
+    const onCodeHover = useCallback((node: GraphNode | null) => {
+        setHovered(node);
+        if (node) setHoveredShadow(null);
+    }, []);
+    const onShadowHover = useCallback((node: GraphNode | null) => {
+        const selected = resolveCoverageShadowNode(coverageShadow, node);
+        setHoveredShadow(selected);
+        if (selected) setHovered(null);
+    }, [coverageShadow]);
+    const onShadowClick = useCallback((node: GraphNode) => {
+        const selected = resolveCoverageShadowNode(coverageShadow, node);
+        if (selected) onShadowNodeClick?.(selected);
+    }, [coverageShadow, onShadowNodeClick]);
 
     /* Adaptive density defaults x user multipliers. The automatic scale keeps
      * contrast roughly constant as the graph grows; the sliders nudge it.
@@ -723,16 +753,16 @@ export function GraphScene({
     /* Aenderung 2: gemerkt statt bei jedem Render neu gerechnet. */
     const sceneRadius = useMemo(() => {
         let max = 100;
-        for (const node of data.nodes) {
+        for (const node of sceneNodes) {
             const r = Math.sqrt(node.x * node.x + node.y * node.y + node.z * node.z);
             if (r > max) max = r;
         }
         return max;
-    }, [data.nodes]);
+    }, [sceneNodes]);
 
     /* Das Rechteck der flachen Ansicht, gemerkt wie der Radius und aus
      * demselben Grund: es haengt nur an den Knoten. */
-    const flatBox = useMemo(() => flatBounds(data.nodes), [data.nodes]);
+    const flatBox = useMemo(() => flatBounds(sceneNodes), [sceneNodes]);
 
     /*
      * Wie weit die Steuerung herauslassen muss (W10b).
@@ -753,7 +783,7 @@ export function GraphScene({
         let maxY = -Infinity;
         let minZ = Infinity;
         let maxZ = -Infinity;
-        for (const node of data.nodes) {
+        for (const node of sceneNodes) {
             minX = Math.min(minX, node.x);
             maxX = Math.max(maxX, node.x);
             minY = Math.min(minY, node.y);
@@ -765,7 +795,7 @@ export function GraphScene({
             return 0;
         }
         return Math.sqrt((maxX - minX) ** 2 + (maxY - minY) ** 2 + (maxZ - minZ) ** 2);
-    }, [data.nodes]);
+    }, [sceneNodes]);
 
     /* Aus dem Vielfachen wird hier eine Entfernung, weil hier der Radius steht. */
     const labelMaxDistance = labelDistanceFactor > 0 ? labelDistanceFactor * sceneRadius : 0;
@@ -820,7 +850,7 @@ export function GraphScene({
             <NodeCloud
                 nodes={data.nodes}
                 highlightedIds={highlightedIds}
-                onHover={setHovered}
+                onHover={onCodeHover}
                 onClick={onNodeClick}
                 boost={nodeBoost}
             />
@@ -836,13 +866,20 @@ export function GraphScene({
             )}
             {landmarks && <HaloLayer nodes={data.nodes} />}
 
+            {coverageShadow && coverageShadow.nodes.length > 0 && <group>
+                {drawEdges && <CoverageShadowEdges shadow={coverageShadow} brightness={display.edgeBrightness} />}
+                <NodeCloud nodes={coverageShadow.nodes} highlightedIds={null} onHover={onShadowHover} onClick={onShadowClick} opacity={0.6} boost={nodeBoost * 0.75} />
+                {showLabels && <NodeLabels nodes={coverageShadow.nodes} highlightedIds={null} worldFontSize={labelWorldFontSize} maxTextWidth={labelMaxTextWidth} maxDistance={labelMaxDistance} />}
+            </group>}
+
             {overlay}
             {hovered && renderTooltip !== undefined && renderTooltip(hovered)}
+            {resolveCoverageShadowNode(coverageShadow, hoveredShadow) && hoveredShadow && renderShadowTooltip?.(hoveredShadow)}
 
             <CameraAnimator target={cameraTarget} controlsRef={controlsRef} flat={flat} />
-            <FitProbe nodes={data.nodes} />
+            <FitProbe nodes={sceneNodes} />
             <IdleAutoRotate controlsRef={controlsRef} enabled={!flat} />
-            <FrameRateMeter nodes={data.nodes.length} edges={data.edges.length} cap={frameCap} />
+            <FrameRateMeter nodes={sceneNodes.length} edges={data.edges.length + (coverageShadow?.edges.length ?? 0)} cap={frameCap} />
             <FrameCapDriver cap={frameCap} active={active} />
 
             <EffectComposer multisampling={GRAPH_COMPOSER_MULTISAMPLING}>

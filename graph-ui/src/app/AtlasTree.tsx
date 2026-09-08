@@ -44,6 +44,7 @@ import { useEffect, useRef } from 'react';
 import { COVERAGE_ORDER } from './tree-model';
 import type { CoverageState, TreeRow } from './tree-model';
 import { messages } from '../i18n/messages';
+import { workspaceStrings } from './workspace-strings';
 import Hint from '../ui/tooltip/Hint';
 import {
     COVERAGE_DESCRIPTIONS,
@@ -56,6 +57,7 @@ import {
 } from './coverage-strings';
 
 export interface AtlasTreeProps {
+    explained?: boolean;
     /** Der Projektname als Wurzelzeile, so wie das Vorbild ihn zeigt. */
     projectName: string;
     rows: TreeRow[];
@@ -248,16 +250,19 @@ export default function AtlasTree(props: AtlasTreeProps): JSX.Element {
                 })}
             </ul>
             {props.note.length > 0 && (
+                <details className="atlas-evidence-details" open={props.explained || props.noteIsAbsence}>
+                <summary>{workspaceStrings.coverage}</summary>
                 <p className="atlas-tree-note" data-state={props.noteIsAbsence === true ? 'absent' : 'present'}>
                     {props.note}
                 </p>
+                </details>
             )}
             {(props.truncations ?? []).map((line) => (
                 <p className="atlas-tree-note" data-state="absent" data-testid="atlas-tree-truncation" key={line}>
                     {line}
                 </p>
             ))}
-            <div className="atlas-tree-legend" data-testid="atlas-tree-legend">
+            <div className="atlas-tree-legend atlas-guidance-note" data-testid="atlas-tree-legend">
                 {/*
                   * Die Legende erklaert auch den Gutfall.
                   *

@@ -6,6 +6,7 @@ import App from './App';
 // still auf ihren Initialwert zurueck.
 import './styles/tokens.css';
 import './styles/terminal.css';
+import './styles/workspace.css';
 
 const container = document.getElementById('root');
 if (container === null) {

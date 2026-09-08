@@ -971,6 +971,29 @@ TEST(ui_server_process_kill_route_is_unavailable) {
     PASS();
 }
 
+TEST(ui_server_process_measurements_declare_platform_semantics) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/processes HTTP/1.1\r\n\r\n",
+                    resp, sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+#ifdef _WIN32
+    ASSERT_NOT_NULL(strstr(resp, "\"cpu_unit\":\"seconds\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"memory_kind\":\"working_set\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_memory_kind\":\"working_set\""));
+#else
+    ASSERT_NOT_NULL(strstr(resp, "\"cpu_unit\":\"percent\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"memory_kind\":\"resident\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_memory_kind\":\"peak_resident\""));
+#endif
+    ASSERT_NOT_NULL(strstr(resp, "\"self_memory_available\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_pid\":"));
+    th_server_stop(&ts);
+    PASS();
+}
+
 TEST(ui_server_routes_indexing_through_joinable_daemon_executor) {
     char *root = th_mktempdir("cbm_httpd_daemon_index");
     ASSERT_NOT_NULL(root);
@@ -1048,14 +1071,18 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     PASS();
 }
 
-/* The UI's CSP stays loopback-only: the served page may reach the server
- * itself and the two loopback services the reader can start (the local-model
- * sidecar on 4141, the agent bridge on 4142), and nothing else. Every host
- * named in the policy is 127.0.0.1 on one of those two ports. */
-TEST(ui_csp_connect_src_is_loopback_only) {
+/* The UI's connections have a fixed allowlist: two local services and the
+ * model host plus its verified download CDN. Browser consent controls model
+ * downloads; script sources remain local, with no unrestricted CDN or eval
+ * allowance. */
+TEST(ui_csp_connect_src_has_explicit_download_hosts) {
     const char *csp = CBM_UI_CSP_VALUE;
-    ASSERT_NOT_NULL(strstr(csp, "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142;"));
-    ASSERT_TRUE(strstr(csp, "https://") == NULL);
+    ASSERT_NOT_NULL(strstr(csp, "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142 "
+                                "https://huggingface.co https://us.aws.cdn.hf.co;"));
+    ASSERT_NOT_NULL(strstr(csp, "script-src 'self' 'wasm-unsafe-eval';"));
+    ASSERT_NOT_NULL(strstr(csp, "worker-src 'self' blob:;"));
+    ASSERT_TRUE(strstr(csp, "*") == NULL);
+    ASSERT_TRUE(strstr(csp, "'unsafe-eval'") == NULL);
     ASSERT_TRUE(strstr(csp, "ws://") == NULL);
     ASSERT_TRUE(strstr(csp, "wss://") == NULL);
     int hosts = 0;
@@ -1067,6 +1094,13 @@ TEST(ui_csp_connect_src_is_loopback_only) {
         p += 7;
     }
     ASSERT_EQ(hosts, 2);
+    int secure_hosts = 0;
+    p = csp;
+    while ((p = strstr(p, "https://")) != NULL) {
+        secure_hosts++;
+        p += 8;
+    }
+    ASSERT_EQ(secure_hosts, 2);
     ASSERT_NOT_NULL(strstr(csp, "frame-ancestors 'none'"));
     ASSERT_NOT_NULL(strstr(csp, "object-src 'none'"));
     PASS();
@@ -2483,9 +2517,10 @@ SUITE(httpd) {
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
+    RUN_TEST(ui_server_process_measurements_declare_platform_semantics);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
-    RUN_TEST(ui_csp_connect_src_is_loopback_only);
+    RUN_TEST(ui_csp_connect_src_has_explicit_download_hosts);
     RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);

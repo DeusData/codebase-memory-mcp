@@ -157,6 +157,6 @@ describe('die Saetze, die das Panel sagt', () => {
     });
 
     it('haelt einen Satz fuer die Lage bereit, in der nichts im Fokus steht', () => {
-        expect(GALAXY_NO_FOCUS_NOTE).toContain('follows the twin');
+        expect(GALAXY_NO_FOCUS_NOTE).toBe('Open a file or select a symbol to focus the graph.');
     });
 });

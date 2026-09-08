@@ -117,7 +117,18 @@
 import type { JSX, KeyboardEvent } from 'react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import AtlasChrome, { COMMAND_PLACEHOLDER } from './app/AtlasChrome';
+import AtlasChrome, { CLOSE_COMMAND_SEARCH_EVENT, OPEN_COMMAND_SEARCH_EVENT } from './app/AtlasChrome';
+import ArchitecturePanel from './architecture/ArchitecturePanel';
+import ActivityPanel from './agents/ActivityPanel';
+import WelcomePanel from './app/WelcomePanel';
+import BrowserChatDock from './browser-ai/BrowserChatDock';
+import type { BrowserChatAttachment } from './browser-ai/BrowserChatDock';
+import { browserGraphContext } from './browser-ai/graph-context';
+import type { BrowserChatContext } from './browser-ai/chat-model';
+import { selectedGraphContext } from './galaxy/selected-node';
+import SystemWorkspace from './system/SystemWorkspace';
+import type { Workspace, Guidance } from './app/workspace-strings';
+import { workspaceStrings as workspaceText } from './app/workspace-strings';
 import type { Chip, MenuExtra, MenuWiring, TabDescriptor } from './app/AtlasChrome';
 import { AtlasApi, TREE_ROUTE } from './app/atlas-api';
 import { ATLAS_BUILD_SUFFIX, ATLAS_VERSION } from './app/build-info';
@@ -154,7 +165,7 @@ import {
 import { RpcIntelligenceClient } from './provider/rpc-client';
 import { CbmRpcProvider, symbolKindOf } from './provider/cbm-rpc-provider';
 import MonacoReader from './reader/MonacoReader';
-import type { ReaderStatus } from './reader/MonacoReader';
+import type { ReaderStatus, ReaderSelection } from './reader/MonacoReader';
 import { FileNotReadableError, loadFileDocument, READER_RPC_TOOL } from './reader/file-source';
 import type { ReaderDocument } from './reader/file-source';
 import { badgesForLines } from './core/step-badge-decorator';
@@ -167,6 +178,8 @@ import { IrCache } from './twin/ir-cache';
 import { ATLAS_WORKSPACE_ROOT, twinLocationOf, twinTargetOf, workspacePathOf } from './twin/twin-target';
 import GalaxyPanel from './galaxy/GalaxyPanel';
 import { targetRefOfNode } from './galaxy/galaxy-model';
+import { hierarchySymbolOf, useSelectionHierarchy } from './galaxy/selection-hierarchy';
+import { symbolMatchesReader } from './galaxy/reader-graph-focus';
 import type { GraphData, GraphNode } from './galaxy/types';
 import SearchOverlay from './search/SearchOverlay';
 import type { SearchOverlayStatus } from './search/SearchOverlay';
@@ -180,10 +193,9 @@ import type { RankedHit } from './search/semantic-search';
 import { rankHits } from './search/semantic-search';
 import {
     commandExamplesFor,
-    commandPlaceholderFor,
     exampleSymbolOf,
 } from './search/command-examples';
-import { EMPTY_LOCAL_INDEX, localCandidates } from './search/local-suggestions';
+import { EMPTY_LOCAL_INDEX, localCandidates, settledSearchHits } from './search/local-suggestions';
 import type { LocalIndex } from './search/local-suggestions';
 import {
     isSearchable,
@@ -734,6 +746,38 @@ declare global {
 }
 
 export default function App(): JSX.Element {
+    const [workspace, setWorkspace] = useState<Workspace>(() => {
+        try {
+            const saved = localStorage.getItem('cbm.workspace');
+            return saved === 'explore' || saved === 'galaxy' || saved === 'agents' || saved === 'system' ? saved : 'architecture';
+        } catch { return 'architecture'; }
+    });
+    const changeWorkspace = (value: Workspace): void => {
+        setWorkspace(value);
+        try { localStorage.setItem('cbm.workspace', value); } catch { /* Session-only preference. */ }
+    };
+    const [welcomeOpen, setWelcomeOpen] = useState(() => {
+        try { return localStorage.getItem('cbm.workspace.setup') !== 'done'; } catch { return false; }
+    });
+    const [browserAiOpen, setBrowserAiOpen] = useState(false);
+    const [readerSelection, setReaderSelection] = useState<ReaderSelection>();
+    const [chatAttachment, setChatAttachment] = useState<BrowserChatAttachment>();
+    const [chatGraphSelection, setChatGraphSelection] = useState<BrowserChatContext>();
+    const [galaxySelection, setGalaxySelection] = useState<GraphNode>();
+    const [galaxySelectionProject, setGalaxySelectionProject] = useState('');
+    const finishSetup = (): void => {
+        setWelcomeOpen(false);
+        setWhyDismissed(true);
+        try { localStorage.setItem('cbm.workspace.setup', 'done'); } catch { /* Session-only preference. */ }
+    };
+    const [guidance, setGuidance] = useState<Guidance>(() => {
+        try { return localStorage.getItem('cbm.explanation-depth') === 'explained' ? 'explained' : 'brief'; }
+        catch { return 'brief'; }
+    });
+    const changeGuidance = (value: Guidance): void => {
+        setGuidance(value);
+        try { localStorage.setItem('cbm.explanation-depth', value); } catch { /* Session-only preference. */ }
+    };
     const client = useMemo(() => new RpcIntelligenceClient({}), []);
     const api = useMemo(() => new AtlasApi({}), []);
 
@@ -1277,7 +1321,10 @@ export default function App(): JSX.Element {
      * nicht im Speicher des Browsers: was er dauerhaft beantwortet, beantwortet
      * er mit einer der vier Karten oder mit dem Knopf darunter.
      */
-    const [whyDismissed, setWhyDismissed] = useState(false);
+    const [whyDismissed, setWhyDismissed] = useState(() => {
+        try { return localStorage.getItem('cbm.workspace.setup') === 'done'; }
+        catch { return true; }
+    });
 
     const [tour, setTour] = useState<ActiveTour | undefined>(undefined);
     const [tourStep, setTourStep] = useState(0);
@@ -1299,6 +1346,9 @@ export default function App(): JSX.Element {
 
     const [entryOpen, setEntryOpen] = useState(false);
     const [overview, setOverview] = useState<ArchitectureOverviewDto | undefined>(undefined);
+    const [overviewLoading, setOverviewLoading] = useState(false);
+    const [overviewError, setOverviewError] = useState<string | undefined>();
+    const [overviewRevision, setOverviewRevision] = useState(0);
     const [entryQuery, setEntryQuery] = useState('');
     const [entryHits, setEntryHits] = useState<RankedHit[]>(noHits);
     const [entryStatus, setEntryStatus] = useState<EntrySearchStatus>('idle');
@@ -1458,39 +1508,17 @@ export default function App(): JSX.Element {
      *     moeglich, mehr nicht; die Vorgabe bleibt die Galaxie (Entscheidung 17
      *     im Kopf von GalaxyPanel.tsx).
      */
-    const [focusWalk, setFocusWalk] = useState<ClosureResult | undefined>(undefined);
-    useEffect(() => {
-        if (walk !== undefined || twinSymbol === undefined || project.length === 0) {
-            setFocusWalk(undefined);
-            return;
-        }
-        let cancelled = false;
-        getClosure(provider, ATLAS_WORKSPACE_ROOT, twinSymbol, {
-            projectName: project,
-            generation: 1,
-            ...(closureBounds.depth === undefined ? {} : { depth: closureBounds.depth }),
-            ...(closureBounds.cap === undefined ? {} : { cap: closureBounds.cap }),
-        })
-            .then((closure) => {
-                if (!cancelled) {
-                    setFocusWalk(closure);
-                }
-            })
-            .catch(() => {
-                /*
-                 * Ein misslungener Closure ist hier keine Meldung wert: niemand
-                 * hat ihn bestellt. Der Knopf bleibt dann grau und sagt, was
-                 * fehlt, statt eine Fehlermeldung ueber eine Frage zu zeigen,
-                 * die der Leser nicht gestellt hat.
-                 */
-                if (!cancelled) {
-                    setFocusWalk(undefined);
-                }
-            });
-        return () => {
-            cancelled = true;
-        };
-    }, [walk, twinSymbol, provider, project, closureBounds]);
+    const readerFocusRange = useMemo(() => readerSelection?.path === activePath
+        ? { startLine: readerSelection.startLine, endLine: readerSelection.endLine > readerSelection.startLine && readerSelection.endColumn === 1 ? readerSelection.endLine - 1 : readerSelection.endLine }
+        : caretLine !== undefined && caretLine > 0 ? { startLine: caretLine, endLine: caretLine } : undefined, [readerSelection, activePath, caretLine]);
+    const activeGalaxySelection = galaxySelectionProject === project ? galaxySelection : undefined;
+    const selectedGraphSymbol = useMemo(() => hierarchySymbolOf(activeGalaxySelection, project), [activeGalaxySelection, project]);
+    const readerFocusSymbol = (twinSymbol?.projectName === undefined || twinSymbol.projectName === project) && symbolMatchesReader(twinSymbol, activePath, readerFocusRange)
+        ? twinSymbol : symbolMatchesReader(selectedGraphSymbol, activePath, readerFocusRange) ? selectedGraphSymbol : undefined;
+    const hierarchyRoot = workspace === 'galaxy' ? selectedGraphSymbol : readerFocusSymbol;
+    const focusHierarchy = useSelectionHierarchy(provider, ATLAS_WORKSPACE_ROOT, project, hierarchyRoot, closureBounds,
+        workspace === 'galaxy' || (workspace === 'explore' && walk === undefined));
+    const focusWalk = focusHierarchy.walk;
 
     // ------------------------------------------------------- Projekt -------
 
@@ -1718,6 +1746,7 @@ export default function App(): JSX.Element {
      */
     const openFile = useCallback(
         (path: string) => {
+            setWorkspace('explore');
             /*
              * Wer eine Datei oeffnet, hat die Frage beantwortet, indem er
              * anfing zu lesen (Nutzerbefund 2026-08-29, AC6f). Hier und nicht
@@ -1967,6 +1996,7 @@ export default function App(): JSX.Element {
 
     const followTarget = useCallback(
         (target: SymbolRef) => {
+            setWorkspace('explore');
             markFollowed(target);
             const location = twinLocationOf(target);
             const keepReadyTwin = location.path.length > 0
@@ -2264,13 +2294,15 @@ export default function App(): JSX.Element {
      */
     const openGalaxyNode = useCallback(
         (node: GraphNode) => {
+            setGalaxySelection(node);
+            setGalaxySelectionProject(project);
             const target = targetRefOfNode(node);
             if (target === undefined) {
                 return;
             }
             followTarget(target);
         },
-        [followTarget],
+        [followTarget, project],
     );
 
     // ------------------------------------------------- Bedeutungssuche -----
@@ -2408,8 +2440,8 @@ export default function App(): JSX.Element {
      *     Wort nur verlaengert wurde, sonst aus Baum und Galaxie. Sie tragen
      *     ihre Marke, damit niemand sie fuer die Antwort haelt.
      *  2. **Nach der Entprellung** geht die Frage an den Index, mit einem
-     *     Abbruch am Hals. Ihre Antwort ersetzt die vorlaeufigen Zeilen an Ort
-     *     und Stelle; der Kasten hat feste Hoehe, also springt dabei nichts.
+     *     Abbruch am Hals. Liefert die Antwort keine Treffer, bleiben die
+     *     geladenen Vorschlaege erhalten und als geladen gekennzeichnet.
      *
      * Die Ticketpruefung bleibt und ist die eigentliche Zusicherung: eine
      * Antwort, die zu spaet kommt, wird verworfen und nicht angezeigt. Der
@@ -2481,10 +2513,11 @@ export default function App(): JSX.Element {
                         candidates: answer.candidates,
                         complete: answer.complete,
                     };
-                    setHits(answer.hits);
+                    const settled = settledSearchHits(answer.hits, instant);
+                    setHits(settled.hits);
                     setSelectedHit(0);
                     setAnsweredQuery(query);
-                    setHitSource('index');
+                    setHitSource(settled.source);
                     setSearchStatus('ready');
                     setSearchMessage('');
                 })
@@ -2510,6 +2543,7 @@ export default function App(): JSX.Element {
     }, [command, project, provider, fanInOf]);
 
     const closeSearch = useCallback(() => {
+        window.dispatchEvent(new Event(CLOSE_COMMAND_SEARCH_EVENT));
         searchAbort.current?.abort();
         searchAbort.current = undefined;
         setCommand('');
@@ -2801,19 +2835,24 @@ export default function App(): JSX.Element {
 
     /** Die Zusammenfassung, sobald der Einstiegsdialog sie braucht. */
     useEffect(() => {
-        if (!entryOpen || project.length === 0 || overview !== undefined) {
+        if ((!entryOpen && workspace !== 'architecture') || project.length === 0) {
             return;
         }
         let cancelled = false;
+        setOverviewLoading(true);
+        setOverviewError(undefined);
         provider
             .architectureOverview(ATLAS_WORKSPACE_ROOT, { projectName: project, generation: 1 })
             .then((loaded) => {
                 if (!cancelled) {
                     setOverview(loaded);
+                    setOverviewLoading(false);
                 }
             })
             .catch((error: unknown) => {
                 if (!cancelled) {
+                    setOverviewLoading(false);
+                    setOverviewError(error instanceof Error ? error.message : String(error));
                     setEntryMessage(messages.entry.overviewFailed(
                         error instanceof Error ? error.message : String(error),
                     ));
@@ -2822,7 +2861,7 @@ export default function App(): JSX.Element {
         return () => {
             cancelled = true;
         };
-    }, [entryOpen, overview, project, provider]);
+    }, [entryOpen, workspace, project, provider, overviewRevision]);
 
     // Die Suche des Dialogs ist dieselbe Suche wie in der Kommandozeile, mit
     // derselben Entprellung. Zwei Rangfolgen fuer dasselbe Wort waeren zwei
@@ -3839,7 +3878,7 @@ export default function App(): JSX.Element {
             // Abbestellt, damit das Zeichen nicht zweimal ankommt: einmal von
             // hier und einmal von der Vorgabe, sobald das Feld den Fokus hat.
             event.preventDefault();
-            commandInputRef.current?.focus();
+            window.dispatchEvent(new Event(OPEN_COMMAND_SEARCH_EVENT));
             if (intent.kind === 'type') {
                 setCommand((current) => current + intent.text);
             }
@@ -4525,6 +4564,7 @@ export default function App(): JSX.Element {
      * soll keine Behauptung sein, sondern eine Eigenschaft der Verdrahtung.
      */
     const menuAct = (letter: string, act: () => void) => () => {
+        setWorkspace('explore');
         activatedMenus.current = [...activatedMenus.current, letter];
         act();
     };
@@ -4571,9 +4611,11 @@ export default function App(): JSX.Element {
              */
             headline={
                 hitSource === 'loaded'
-                    ? hitRows.length === 0
-                        ? messages.search.provisionalEmpty(answeredQuery)
-                        : messages.search.provisionalHeadline(answeredQuery, hitRows.length)
+                    ? searchStatus === 'ready'
+                        ? workspaceText.loadedSearchHeadline(answeredQuery, hitRows.length)
+                        : hitRows.length === 0
+                            ? messages.search.provisionalEmpty(answeredQuery)
+                            : messages.search.provisionalHeadline(answeredQuery, hitRows.length)
                     : searchStatus === 'searching' && answeredQuery !== command.trim()
                         ? messages.search.searching(command.trim())
                         : searchHeadline(answeredQuery, hits.length, hitRows.length)
@@ -4621,13 +4663,34 @@ export default function App(): JSX.Element {
     const galaxy = (
         <GalaxyPanel
             project={project}
-            visible={galaxyOn}
-            focusQualifiedName={twinSymbol?.qualifiedName}
-            focusName={twinSymbol?.name}
+            visible={workspace === 'galaxy' || (workspace === 'explore' && galaxyOn)}
+            workspaceExpanded={workspace === 'galaxy'}
+            focusQualifiedName={workspace === 'galaxy' ? activeGalaxySelection?.qualified_name : readerFocusSymbol?.qualifiedName}
+            focusName={workspace === 'galaxy' ? activeGalaxySelection?.name : readerFocusSymbol?.name}
+            focusFilePath={workspace === 'explore' ? activePath : undefined}
+            focusSourceRange={workspace === 'explore' ? readerFocusRange : undefined}
+            selectedNode={activeGalaxySelection}
             onOpenNode={openGalaxyNode}
+            onSelectNode={workspace === 'galaxy' ? (node) => {
+                setGalaxySelection(node);
+                setGalaxySelectionProject(project);
+                setChatGraphSelection(selectedGraphContext(layout, node, project, crypto.randomUUID()));
+                setBrowserAiOpen(true);
+            } : undefined}
+            onSelectShadowNode={(node) => {
+                setGalaxySelection(undefined);
+                setChatGraphSelection({ id: crypto.randomUUID(), label: workspaceText.coverageShadowSelection(node.name),
+                    text: JSON.stringify({ project, source: '/api/layout missed_graph', layer: 'coverage-shadow',
+                        selected: { id: node.sourceId, name: node.name, path: node.file_path, kind: node.label },
+                        coverage: 'Not fully indexed. Detailed reasons, source ranges, and freshness are unavailable in this layout.',
+                        limitation: 'This is coverage metadata, not a code symbol or proof that code is absent.' }, null, 2) });
+                setBrowserAiOpen(true);
+            }}
             onLayout={onLayout}
-            walk={walk}
+            walk={workspace === 'galaxy' ? undefined : walk}
             focusWalk={focusWalk}
+            focusWalkStatus={focusHierarchy.status}
+            focusWalkMessage={focusHierarchy.message}
             refit={graphRefit}
             stepQualifiedName={walkStepQualifiedName}
             onToggleVisible={() => setGalaxyOn((current) => !current)}
@@ -4652,6 +4715,7 @@ export default function App(): JSX.Element {
 
     const llm = (
         <SidecarPanel
+            explained={guidance === 'explained'}
             state={llmState}
             facts={llmFacts}
             project={project}
@@ -4815,7 +4879,7 @@ export default function App(): JSX.Element {
                     // Derselbe Weg wie jede andere Suche dieser Oberflaeche.
                     // Der Assistent bleibt offen und uebernimmt das neue
                     // Subjekt, sobald der Twin es hat.
-                    commandInputRef.current?.focus();
+                    window.dispatchEvent(new Event(OPEN_COMMAND_SEARCH_EVENT));
                 }}
                 onClose={collapseExplain}
             />
@@ -4864,8 +4928,73 @@ export default function App(): JSX.Element {
         );
     };
 
+    const attachSelection = (selection: ReaderSelection): void => {
+        setChatAttachment({ ...selection, project, id: crypto.randomUUID() });
+        setBrowserAiOpen(true);
+    };
+    const clearAttachment = (id: string): void => {
+        setChatAttachment(current => current?.id === id ? undefined : current);
+    };
+    const clearGraphSelection = (id: string): void => {
+        setChatGraphSelection(current => current?.id === id ? undefined : current);
+    };
+
     return (
         <AtlasChrome
+            workspace={workspace}
+            onWorkspaceChange={changeWorkspace}
+            onOpenBrowserAi={() => setBrowserAiOpen(open => !open)}
+            onOpenSystem={() => changeWorkspace('system')}
+            daemonState={serverOk === undefined ? 'checking' : serverOk ? 'connected' : 'disconnected'}
+            chatOpen={browserAiOpen}
+            chatDock={<BrowserChatDock open={browserAiOpen} onClose={() => setBrowserAiOpen(false)}
+                pendingContext={chatGraphSelection} onContextConsumed={clearGraphSelection} onContextRemoved={clearGraphSelection}
+                context={browserGraphContext(twinIr, project, activePath, twinPath)}
+                attachment={chatAttachment} onAttachmentConsumed={clearAttachment} onAttachmentRemoved={clearAttachment} />}
+            readerActions={<>
+                {browserAiOpen && <button type="button" onClick={() => setBrowserAiOpen(false)}>{workspaceText.graphContext}</button>}
+                <button type="button" disabled={!readerSelection} aria-keyshortcuts="Control+Shift+L Meta+Shift+L"
+                    onClick={() => { if (readerSelection) attachSelection(readerSelection); }}>{workspaceText.askSelection}</button>
+            </>}
+            globalOverlay={<>{welcomeOpen && <WelcomePanel workspace={workspace} guidance={guidance}
+                onWorkspace={changeWorkspace} onGuidance={changeGuidance} onContinue={finishSetup}
+                onLocalAi={() => { finishSetup(); setBrowserAiOpen(true); }} />}
+                {projectsOpen && <ProjectsPanel project={project} source={projectsSource}
+                    onOpenProject={openProject} onClose={() => setProjectsOpen(false)} />}
+                {helpOpen && <HelpOverlay onClose={() => setHelpOpen(false)} />}
+                {settingsOpen && <SettingsPanel project={project} state={llmState} facts={llmFacts}
+                    router={llmRouter} models={llmModels} selectedModel={selectedModel}
+                    onSelectModel={chooseModel}
+                    onRefresh={llmMode === 'on' ? () => askSidecarRef.current?.() : undefined}
+                    display={display} onDisplay={changeDisplay}
+                    onMeasurement={(measurement) => setMeasurements((current) => ({
+                        ...current, [measurement.setting]: measurement,
+                    }))}
+                    onClose={() => setSettingsOpen(false)} />}
+            </>}
+            guidance={guidance}
+            onGuidanceChange={changeGuidance}
+            workspacePanel={<>
+                <div hidden={workspace !== 'architecture'}>
+                <ArchitecturePanel projectName={project} overview={overview}
+                    loading={overviewLoading} error={overviewError}
+                    onRefresh={() => setOverviewRevision((value) => value + 1)}
+                    onNavigate={(filePath, line, name) => {
+                        setWorkspace('explore');
+                        const target = twinTargetOf({ filePath, startLine: line, name: name ?? filePath, kind: 'unknown' });
+                        if (target !== undefined) followTarget(target);
+                    }} />
+                </div>
+                <div hidden={workspace !== 'agents'}>
+                <ActivityPanel state={agents.state} status={agents.status} on={liveAgentsOn} port={bridgePort}
+                    graph={layout} onToggle={() => setLiveAgentsOn((value) => !value)}
+                    onOpenNode={(node) => { setWorkspace('explore'); openGalaxyNode(node); }} />
+                </div>
+                <div hidden={workspace !== 'system'}>
+                    <SystemWorkspace api={api} active={workspace === 'system'} version={ATLAS_VERSION}
+                        onOpenProjects={() => setProjectsOpen(true)} />
+                </div>
+            </>}
             version={ATLAS_VERSION}
             buildSuffix={ATLAS_BUILD_SUFFIX}
             chips={chips}
@@ -4873,6 +5002,7 @@ export default function App(): JSX.Element {
             onSelectTab={openFile}
             onCloseTab={closeTab}
             tree={{
+                explained: guidance === 'explained',
                 projectName: project.length > 0 ? project : messages.app.noProject,
                 rows,
                 cursor,
@@ -4893,7 +5023,7 @@ export default function App(): JSX.Element {
             onCommandKeyDown={onCommandKeyDown}
             commandInputRef={commandInputRef}
             commandOverlay={commandOverlay}
-            commandPlaceholder={commandPlaceholderFor(exampleSymbol, COMMAND_PLACEHOLDER)}
+            commandPlaceholder={workspaceText.searchPlaceholder}
             commandExamples={commandExamples}
             /*
              * Ein Beispiel wird in die Zeile GESCHRIEBEN und nicht
@@ -4904,7 +5034,7 @@ export default function App(): JSX.Element {
              */
             onCommandExample={(text) => {
                 setCommand(text);
-                commandInputRef.current?.focus();
+                window.dispatchEvent(new Event(OPEN_COMMAND_SEARCH_EVENT));
             }}
             commandHint={
                 enterIntent === 'ask'
@@ -5000,67 +5130,11 @@ export default function App(): JSX.Element {
                 pulseLine={caretLine}
                 highlightLine={pointedLine}
                 onCursorLine={setCaretLine}
+                onSelectionChange={setReaderSelection}
+                onAskSelection={attachSelection}
                 revealLine={reveal?.line}
                 revealNonce={reveal?.nonce}
             />
-            {/*
-              * Die Hilfe liegt als letztes Kind ueber allem anderen dieser
-              * Flaeche, aus demselben Grund wie der Erklaerer: bei gleicher
-              * Ebene entscheidet die Reihenfolge im DOM. Sie ist die einzige
-              * Flaeche, die der Leser aufschlaegt, WEIL er nicht weiterweiss;
-              * sie darf nicht hinter dem stehen, was ihn ratlos gemacht hat.
-              */}
-            {helpOpen && <HelpOverlay onClose={() => setHelpOpen(false)} />}
-            {/*
-              * Das Einstellungen-Panel liegt neben der Hilfe auf derselben
-              * Ebene und aus demselben Grund: es ist eine Flaeche, die jemand
-              * aufschlaegt, WEIL etwas nicht stimmt (das Modell antwortet nicht,
-              * die Maschine kommt nicht mit). Sie hinter das zu legen, was ihn
-              * hergefuehrt hat, waere die falsche Reihenfolge.
-              */}
-            {settingsOpen && (
-                <SettingsPanel
-                    project={project}
-                    state={llmState}
-                    facts={llmFacts}
-                    router={llmRouter}
-                    models={llmModels}
-                    selectedModel={selectedModel}
-                    onSelectModel={chooseModel}
-                    /*
-                     * Der Aktualisieren-Knopf gibt es nur, solange das lokale
-                     * Modell an ist. Ohne den Griff steht er nicht da: ein Knopf,
-                     * der nichts tut, existiert in dieser Oberflaeche nicht, und
-                     * ein Knopf, der bei ausgeschaltetem Modell doch etwas taete,
-                     * waere der Bruch der Aus-heisst-aus-Regel.
-                     */
-                    onRefresh={
-                        llmMode === 'on' ? () => askSidecarRef.current?.() : undefined
-                    }
-                    display={display}
-                    onDisplay={changeDisplay}
-                    onMeasurement={(measurement) =>
-                        setMeasurements((current) => ({
-                            ...current,
-                            [measurement.setting]: measurement,
-                        }))}
-                    onClose={() => setSettingsOpen(false)}
-                />
-            )}
-            {/*
-              * The projects panel sits on the same level as the settings and
-              * for the same reason: a reader opens it BECAUSE something is
-              * missing (no project, a stale index), and it must not sit
-              * behind what sent them there.
-              */}
-            {projectsOpen && (
-                <ProjectsPanel
-                    project={project}
-                    source={projectsSource}
-                    onOpenProject={openProject}
-                    onClose={() => setProjectsOpen(false)}
-                />
-            )}
         </AtlasChrome>
     );
 }

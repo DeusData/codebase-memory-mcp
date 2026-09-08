@@ -113,3 +113,116 @@ Understand-Anything (MIT). Uebernommen ist der Gedanke, kein Quelltext: der
 Kahn-Lauf, die Rollenworte, die Saetze und der Zyklusbruch sind eigener Code.
 Die Angabe steht hier, weil eine Konzept-Anleihe nichts ist, was man erst dann
 nennt, wenn jemand fragt.
+
+## 5. Optionale lokale Quelltext-Erklaerung
+
+Die Browser-Laufzeit wird lokal mit dem Frontend ausgeliefert; Modellgewichte
+sind nicht enthalten. Ein Download erfolgt erst nach ausdruecklicher
+Aktivierung im Browser. Der Quelltext bleibt fuer die Erklaerung im Browser.
+
+| Bestandteil | Fassung | Lizenz | Verwendung |
+|---|---|---|---|
+| `@huggingface/transformers` | 4.2.0 | Apache-2.0 | Textgenerierung und Chat-Tokenizer im Web Worker |
+| `onnxruntime-web` | 1.26.0-dev.20260416-b7804b056c | MIT | WebGPU-Laufzeit; MJS und WASM werden als lokale Assets gepackt |
+| `sharp` | 0.35.0 | Apache-2.0 | Transitive Node-Abhaengigkeit mit gezieltem Override; nicht Teil der Browser-Laufzeit |
+
+Das optionale Modell ist
+[`onnx-community/Qwen2.5-Coder-0.5B-Instruct`](https://huggingface.co/onnx-community/Qwen2.5-Coder-0.5B-Instruct),
+festgelegt auf Revision `f0292f665fd307846ff3c318a91a1bc29d091492`
+und Variante `q4f16`. Die gewaehlte ONNX-Datei umfasst 554.935.833 Byte;
+mit Konfiguration und Tokenizer sind es 566.366.194 Byte. Der in den
+Hugging-Face-Metadaten angegebene SHA-256 der Gewichte ist
+`60c076ac0d3910881fe0cad75997e803459a5f71bb74bcbcd82407ef83db7ba0`;
+die Laufzeit berechnet diesen Hash nicht erneut.
+
+Die Modellkarte der ONNX-Konvertierung nennt keine eigene Lizenz.
+Das offizielle Basismodell
+[`Qwen/Qwen2.5-Coder-0.5B-Instruct`](https://huggingface.co/Qwen/Qwen2.5-Coder-0.5B-Instruct)
+ist unter Apache-2.0 veroeffentlicht. Der Download verwendet ausschliesslich
+`huggingface.co` und dessen fuer diese Revision geprueften Weiterleitungs-Host
+`us.aws.cdn.hf.co`. Remote-Skripte werden nicht geladen.
+
+Weitere Browser-Modelle (Metadaten und Download-Hosts am 2026-09-08 geprueft):
+
+| Modell | Feste Revision | Download inkl. Tokenizer/Konfiguration | Lizenz |
+|---|---|---|---|
+| `onnx-community/Qwen3-0.6B-ONNX` | `da1453100cf3ff33ef56d17983fc7a8648706db6` | 578.917.626 Byte | Apache-2.0 |
+| `LiquidAI/LFM2.5-1.2B-Instruct-ONNX` | `10f72e70abf67ac0fd7ebf15bc5854726891d864` | 763.763.755 Byte | Liquid AI License; kommerzielle Bedingungen oberhalb 10 Mio. USD Jahresumsatz pruefen |
+| `onnx-community/Qwen3.5-2B-ONNX-OPT` | `2ea7886f48b926aca97de8b0e041ffca7e3ebaa9` | 1.402.850.762 Byte | Apache-2.0 |
+
+Alle Varianten verwenden `q4f16`. Fuer Qwen3.5 werden nur Decoder und
+Text-Embeddings geladen; Vision-Dateien sind nicht in der Download-Freigabe.
+Die vollstaendigen Dateilisten und veroeffentlichten LFS-Hashes stehen in
+`src/browser-ai/model-policy.ts`. Hashes werden nicht erneut berechnet.
+Die angegebenen Bytes sind keine Aussage ueber GPU-Speicherbedarf.
+
+Die Modellarchitekturen werden von Transformers.js 4.2.0 unterstuetzt. Das
+ist kein Benchmark oder Kompatibilitaetsnachweis fuer jedes Browser/GPU-Paar.
+Es wurden fuer diese Aenderung keine Modellgewichte heruntergeladen und
+keine Inferenz-Benchmarks ausgefuehrt. Der Browser begrenzt den gesamten
+Kontext auf 8192 Token inklusive 512 reservierter Antwort-Token; gezaehlt
+wird mit dem gewaehlten Chat-Template und Tokenizer. Eingaben werden nicht
+abgeschnitten. Qwen3 und Qwen3.5 laufen standardmaessig ohne Thinking.
+
+## 6. Markdown-Darstellung im lokalen Chat
+
+Die Chat-Darstellung verwendet die folgenden unveraenderten npm-Pakete.
+Die Lizenztexte stammen aus der jeweiligen installierten Datei `license`.
+
+| Paket | Version | Lizenz | Copyright |
+| --- | --- | --- | --- |
+| react-markdown | 10.1.0 | MIT | Espen Hovlandsdal |
+| remark-gfm | 4.0.1 | MIT | Titus Wormer |
+
+### react-markdown
+
+```text
+The MIT License (MIT)
+
+Copyright (c) Espen Hovlandsdal
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+### remark-gfm
+
+```text
+(The MIT License)
+
+Copyright (c) Titus Wormer <tituswormer@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining
+a copy of this software and associated documentation files (the
+'Software'), to deal in the Software without restriction, including
+without limitation the rights to use, copy, modify, merge, publish,
+distribute, sublicense, and/or sell copies of the Software, and to
+permit persons to whom the Software is furnished to do so, subject to
+the following conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED 'AS IS', WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT,
+TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```

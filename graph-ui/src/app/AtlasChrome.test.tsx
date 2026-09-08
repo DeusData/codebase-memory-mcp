@@ -271,25 +271,18 @@ describe('AtlasChrome', () => {
         expect(testId('atlas-command')?.getAttribute('data-focused')).toBe('false');
     });
 
-    it('reicht Tasten der Kommandozeile nach aussen und laesst Escape nur los, wenn niemand sie braucht', async () => {
-        const handled = vi.fn((event: { preventDefault: () => void }) => event.preventDefault());
-        await render(props({ onCommandKeyDown: handled as never }));
+    it('forwards command keys while Escape closes search and restores its trigger', async () => {
+        const handled = vi.fn();
+        await render(props({ onCommandKeyDown: handled }));
+        const trigger = container.querySelector<HTMLButtonElement>('[aria-label="Open search and commands"]')!;
+        await act(async () => { trigger.focus(); trigger.click(); });
         const input = testId('atlas-command-input') as HTMLInputElement;
-        input.focus();
-        await act(async () => {
-            input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        });
-        expect(handled).toHaveBeenCalled();
-        // Der Aufrufer hat Escape verbraucht, also bleibt der Fokus stehen.
-        expect(document.activeElement).toBe(input);
-
-        await render(props());
-        const plain = testId('atlas-command-input') as HTMLInputElement;
-        plain.focus();
-        await act(async () => {
-            plain.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
-        });
-        expect(document.activeElement).not.toBe(plain);
+        await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', bubbles: true })));
+        expect(handled).toHaveBeenCalledOnce();
+        await act(async () => input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true, cancelable: true })));
+        expect(handled).toHaveBeenCalledOnce();
+        expect(container.querySelector<HTMLDialogElement>('dialog')?.open).toBe(false);
+        expect(document.activeElement).toBe(trigger);
     });
 
     it('zeigt das Suchfenster in der Kommandozeile und die Galaxie neben dem Twin', async () => {

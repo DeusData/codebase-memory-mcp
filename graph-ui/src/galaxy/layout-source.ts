@@ -19,7 +19,7 @@
  */
 
 import { layoutUrl, LAYOUT_NODE_BUDGET, LAYOUT_ROUTE } from './galaxy-model';
-import type { GraphData, GraphEdge, GraphNode, NodeStatus } from './types';
+import type { GraphData, GraphEdge, GraphNode, MissedGraph, NodeStatus } from './types';
 
 export interface LayoutSourceOptions {
     /** Ursprung des Servers, ohne Schraegstrich am Ende. Leer heisst same-origin. */
@@ -121,7 +121,19 @@ export function readGraphData(value: unknown): GraphData {
         edges.push({ source, target, type: text(entry['type']) ?? '' });
     }
 
-    return { nodes, edges, total_nodes: num(raw['total_nodes']) ?? nodes.length };
+    let missedGraph: MissedGraph | undefined;
+    const missed = raw['missed_graph'];
+    if (isRecord(missed) && isRecord(missed['offset'])) {
+        const x = num(missed['offset']['x']);
+        const y = num(missed['offset']['y']);
+        const z = num(missed['offset']['z']);
+        if (x !== undefined && y !== undefined && z !== undefined) {
+            // Pass only these arrays, so a nested missed_graph cannot recurse.
+            const skeleton = readGraphData({ nodes: missed['nodes'], edges: missed['edges'] });
+            missedGraph = { nodes: skeleton.nodes, edges: skeleton.edges, offset: { x, y, z } };
+        }
+    }
+    return { nodes, edges, total_nodes: num(raw['total_nodes']) ?? nodes.length, ...(missedGraph ? { missed_graph: missedGraph } : {}) };
 }
 
 /**

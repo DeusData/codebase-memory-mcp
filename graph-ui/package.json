@@ -65,13 +65,24 @@
     "vite": "6.4.3",
     "vitest": "4.1.11"
   },
+  "overrides": {
+    "@huggingface/transformers": {
+      "sharp": "0.35.0"
+    },
+    "onnxruntime-node@1.24.3": {
+      "adm-zip": "0.6.0"
+    }
+  },
   "dependencies": {
+    "@huggingface/transformers": "4.2.0",
     "@react-three/drei": "10.7.7",
     "@react-three/fiber": "9.5.0",
     "@react-three/postprocessing": "3.0.4",
     "postprocessing": "6.38.3",
     "react": "19.2.8",
     "react-dom": "19.2.8",
+    "react-markdown": "10.1.0",
+    "remark-gfm": "4.0.1",
     "three": "0.183.2"
   }
 }

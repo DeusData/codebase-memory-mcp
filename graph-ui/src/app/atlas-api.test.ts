@@ -90,7 +90,10 @@ describe('AtlasApi, the projects routes', () => {
         expect(await client.logs(200)).toEqual({ lines: ['a'], total: 9 });
         expect(calls[0]?.url).toBe('http://127.0.0.1:9749/api/logs?lines=200');
         const processes = api({ body: '{"self_pid":7,"self_rss_mb":1.5,"processes":[]}' });
-        expect(await processes.api.processes()).toEqual({ selfPid: 7, selfRssMb: 1.5, processes: [] });
+        expect(await processes.api.processes()).toEqual({
+            selfPid: 7, selfRssMb: 1.5, processes: [],
+            telemetry: { cpuUnit: 'unknown', memoryKind: 'unknown', selfMemoryKind: 'unknown', selfMemoryMb: 1.5 },
+        });
         expect(processes.calls[0]?.url).toBe('http://127.0.0.1:9749/api/processes');
     });
 

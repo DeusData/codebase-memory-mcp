@@ -17,6 +17,7 @@
 
 import type { JSX } from 'react';
 import { messages } from '../i18n/messages';
+import { workspaceStrings } from '../app/workspace-strings';
 import Hint from '../ui/tooltip/Hint';
 import type { SidecarFacts, SidecarState } from './sidecar';
 import { humanBytes, SIDECAR_PORT } from './sidecar';
@@ -34,6 +35,7 @@ import {
 } from './strings';
 
 export interface SidecarPanelProps {
+    explained?: boolean;
     state: SidecarState;
     /** Was der Prozess ueber sich gesagt hat. Fehlt, solange keiner antwortet. */
     facts?: SidecarFacts | undefined;
@@ -131,6 +133,8 @@ export default function SidecarPanel(props: SidecarPanelProps): JSX.Element {
                 </Hint>
             </div>
 
+            <details className="atlas-evidence-details" open={props.explained || (props.state !== 'off' && props.state !== 'ready')}>
+            <summary>{workspaceStrings.model}</summary>
             <p className="atlas-llm-message" data-testid="atlas-llm-message" data-state={props.state}>
                 {message}
                 {props.state === 'ready' && facts !== undefined && (
@@ -198,6 +202,7 @@ export default function SidecarPanel(props: SidecarPanelProps): JSX.Element {
                     )}
                 </dl>
             )}
+            </details>
         </section>
     );
 }

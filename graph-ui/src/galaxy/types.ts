@@ -10,10 +10,8 @@
  *    GraphData. Region, RegionEdge, RegionsPayload, Project, SchemaInfo,
  *    TabId, ProcessInfo und RepoInfo gehoeren zu Panels, die dieses Projekt
  *    nicht uebernimmt.
- *  - LinkedProject und MissedGraph entfernt, samt der beiden Felder in
- *    GraphData. Die Szene hier zeigt eine Galaxie und keine Satelliten; die
- *    Zweige, die sie zeichnen wuerden, sind in GraphScene.tsx ebenfalls
- *    gestrichen.
+ *  - LinkedProject entfernt. MissedGraph ist als getrennte Coverage-Ebene
+ *    wieder verfuegbar, mit eigenen Render-IDs und Auswahl-Callbacks.
  *  - GraphEdge hat seit W9 ein optionales Feld `offset`. Begruendung an dem
  *    Feld selbst und im Kopf von EdgeLines.tsx.
  */
@@ -67,4 +65,12 @@ export interface GraphData {
     nodes: GraphNode[];
     edges: GraphEdge[];
     total_nodes: number;
+    missed_graph?: MissedGraph;
+}
+
+/** File skeleton for recorded coverage gaps; reasons and ranges are not part of this layout. */
+export interface MissedGraph {
+    nodes: GraphNode[];
+    edges: GraphEdge[];
+    offset: { x: number; y: number; z: number };
 }

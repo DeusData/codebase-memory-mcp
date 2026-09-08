@@ -17,8 +17,8 @@
 #include <stddef.h>
 
 /* Content-Security-Policy directives for the served UI (the value only; the
- * server prepends the header name). No external host appears anywhere, which
- * enforces the airgap against a future dependency or injected content.
+ * server prepends the header name). External connections are limited to the
+ * pinned opt-in browser model on Hugging Face and its verified download host.
  * connect-src admits the server itself plus the two loopback services the UI
  * may talk to when the reader starts them: the local-model sidecar on
  * 127.0.0.1:4141 (graph-ui/llm/start.sh) and the agent-event bridge on
@@ -28,7 +28,8 @@
  * textures, Monaco workers, WASM). */
 #define CBM_UI_CSP_VALUE                                                 \
     "default-src 'self'; "                                               \
-    "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142; "   \
+    "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142 "    \
+    "https://huggingface.co https://us.aws.cdn.hf.co; "                  \
     "img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; " \
     "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
     "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; "      \

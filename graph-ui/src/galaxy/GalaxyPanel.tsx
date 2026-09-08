@@ -134,6 +134,10 @@ import { GraphScene, computeCameraTarget, computeFitTarget, computeFrameTarget }
 import type { CameraTarget } from './GraphScene';
 import type { LabelBox } from './NodeLabels';
 import { NodeTooltipCard } from './NodeTooltipCard';
+import GalaxyNavigator from './GalaxyNavigator';
+import { layoutNodeForSelection } from './selected-node';
+import { buildCoverageShadow } from './coverage-shadow';
+import type { CoverageShadowNode } from './coverage-shadow';
 import {
     GALAXY_NO_FOCUS_NOTE,
     LAYOUT_NODE_BUDGET,
@@ -168,6 +172,8 @@ import {
 } from './hierarchy-layout';
 import type { HierarchyRootOrigin } from './hierarchy-layout';
 import type { ClosureResult } from '../provider/closure';
+import type { HierarchyStatus } from './selection-hierarchy';
+import { readerGraphFocus, type SourceFocusRange } from './reader-graph-focus';
 import Hint from '../ui/tooltip/Hint';
 import type { GraphData, GraphNode } from './types';
 import {
@@ -579,6 +585,12 @@ declare global {
 }
 
 export interface GalaxyPanelProps {
+    /** Fill the workspace while leaving navigation and local chat interactive. */
+    workspaceExpanded?: boolean;
+    /** Select graph evidence, including nodes without a source file. */
+    onSelectNode?: ((node: GraphNode) => void) | undefined;
+    onSelectShadowNode?: ((node: CoverageShadowNode) => void) | undefined;
+    selectedNode?: GraphNode | undefined;
     /** Das Projekt, dessen Layout gezeigt wird. Leer heisst: nichts laden. */
     project: string;
     /** Ob das Panel im Layout sichtbar ist. */
@@ -587,6 +599,8 @@ export interface GalaxyPanelProps {
     focusQualifiedName?: string | undefined;
     /** Der Anzeigename desselben Subjekts, fuer die ehrliche Fehlanzeige. */
     focusName?: string | undefined;
+    focusFilePath?: string;
+    focusSourceRange?: SourceFocusRange;
     /** Ein angeklickter Knoten mit Datei. Die App oeffnet ihn und folgt ihm. */
     onOpenNode: (node: GraphNode) => void;
     /** Was geladen wurde, fuer die Aufrufer, die es brauchen. */
@@ -612,6 +626,8 @@ export interface GalaxyPanelProps {
      * Ort, an dem er zufaellig steht.
      */
     focusWalk?: ClosureResult | undefined;
+    focusWalkStatus?: HierarchyStatus;
+    focusWalkMessage?: string;
     /**
      * Der Zaehler, mit dem die App eine Einpassung anfordert (W10b, AC5).
      *
@@ -1021,9 +1037,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * bestellt hat, und der Leser haette den Ueberblick verloren, ohne etwas
      * dafuer zu tun.
      */
-    const mode: GraphMode = projection === undefined
-        ? 'galaxy'
-        : chosenMode ?? (walk === undefined ? 'galaxy' : 'hierarchy');
+    const mode: GraphMode = chosenMode ?? (walk === undefined ? 'galaxy' : 'hierarchy');
 
     /*
      * Was der Index ausser den Aufrufen zwischen den gezeigten Symbolen kennt.
@@ -1046,9 +1060,10 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
      * Fassung, und nur sie.
      */
     const picture = useMemo(() => {
-        if (mode !== 'hierarchy' || projection === undefined) {
+        if (mode !== 'hierarchy') {
             return data;
         }
+        if (projection === undefined) return undefined;
         return indexEdges.length === 0
             ? projection.data
             : { ...projection.data, edges: [...projection.data.edges, ...indexEdges] };
@@ -1243,7 +1258,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         && sceneWidth >= TIMELINE_MIN_WIDTH;
 
     /** Ob der Graph gerade das ganze Fenster fuellt. */
-    const fullscreen = liveOn && agentPreference.fullscreen;
+    const fullscreen = visible && !props.workspaceExpanded && liveOn && agentPreference.fullscreen;
 
     /*
      * Der Rahmen wechselt, das Bild bleibt (W11b AC5).
@@ -1331,16 +1346,24 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     const requestedFit = props.refit ?? 0;
     const [ownFit, setOwnFit] = useState(0);
     const refitNow = useCallback(() => setOwnFit((count) => count + 1), []);
+    const coverageShadow = useMemo(() => props.workspaceExpanded && mode === 'galaxy' && data
+        ? buildCoverageShadow(data) : null, [data, props.workspaceExpanded, mode]);
+    const fitRequest = useMemo(() => ({ picture, mode, projection, requestedFit, ownFit, coverageShadow }),
+        [picture, mode, projection, requestedFit, ownFit, coverageShadow]);
+    const lastFitRequest = useRef<typeof fitRequest | undefined>(undefined);
 
     useEffect(() => {
         if (!visible) {
             return;
         }
+        // Chat resizing changes the viewport, not the selected graph neighborhood.
+        if (props.workspaceExpanded && lastFitRequest.current === fitRequest) return;
         /* Der Rahmenwechsel des Vollbilds passt nicht ein. Siehe `skipNextFit`. */
         if (skipNextFit.current) {
             skipNextFit.current = false;
             return;
         }
+        lastFitRequest.current = fitRequest;
         if (mode === 'hierarchy' && projection !== undefined) {
             const box = hierarchyFrame(projection);
             const target = computeFrameTarget(box, aspect);
@@ -1362,7 +1385,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             };
             return;
         }
-        const nodes = picture?.nodes ?? [];
+        const nodes = [...(picture?.nodes ?? []), ...(coverageShadow?.nodes ?? [])];
         if (nodes.length === 0) {
             return;
         }
@@ -1386,18 +1409,29 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             normal: [fit.normal.x, fit.normal.y, fit.normal.z],
             up: [fit.up.x, fit.up.y, fit.up.z],
         };
-    }, [visible, mode, projection, picture, aspect, requestedFit, ownFit]);
+    }, [visible, mode, projection, picture, aspect, requestedFit, ownFit, coverageShadow, fitRequest, props.workspaceExpanded]);
 
     // Hin-Richtung in der Galaxie: das Twin-Subjekt zieht die Kamera nach.
     useEffect(() => {
         if (mode !== 'galaxy' || data === undefined) {
             return;
         }
-        if (focusQualifiedName === undefined || focusQualifiedName.length === 0) {
+        const node = focusQualifiedName ? index.get(focusQualifiedName) : undefined;
+        if (props.focusFilePath === '') {
+            setHighlighted(null);
+            setNote(GALAXY_NO_FOCUS_NOTE);
             return;
         }
-        const node = index.get(focusQualifiedName);
+        if (props.focusFilePath && (!node || readerGraphFocus([node], props.focusFilePath).ids.size === 0)) {
+            const focus = readerGraphFocus(data.nodes, props.focusFilePath, props.focusSourceRange);
+            setHighlighted(focus.ids);
+            setNote(focus.message);
+            if (focus.ids.size > 0) flyTo(data.nodes, focus.ids, props.focusFilePath);
+            return;
+        }
+        if (!focusQualifiedName) return;
         if (node === undefined) {
+            setHighlighted(null);
             setNote(missingNodeNote(focusName ?? focusQualifiedName));
             return;
         }
@@ -1408,7 +1442,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         // `focusName` steht bewusst nicht in der Liste: er begleitet den
         // qualifizierten Namen und darf keine zweite Kamerafahrt ausloesen.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [mode, data, index, focusQualifiedName, flyTo]);
+    }, [mode, data, index, focusQualifiedName, flyTo, props.focusFilePath, props.focusSourceRange, aspect, visible]);
 
     /*
      * FOLLOW: die Kamera geht dorthin, wo sich zuletzt etwas bewegt hat.
@@ -1499,7 +1533,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         return isolateFullscreenBackground(node);
     }, [fullscreen, escapeTaken]);
     useEffect(() => {
-        if (!agentPreference.fullscreen || !liveOn || escapeTaken) {
+        if (!fullscreen || escapeTaken) {
             return;
         }
         const onKey = (event: globalThis.KeyboardEvent): void => {
@@ -1511,7 +1545,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         };
         window.addEventListener('keydown', onKey);
         return () => window.removeEventListener('keydown', onKey);
-    }, [agentPreference.fullscreen, liveOn, escapeTaken, changeAgentPreference]);
+    }, [fullscreen, escapeTaken, changeAgentPreference]);
 
     /**
      * Der Knoten, um den der Ring laeuft.
@@ -1558,26 +1592,29 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     // Rueck-Richtung: ein Klick in die Szene oeffnet die Datei.
     const handleNodeClick = useCallback(
         (node: GraphNode) => {
-            if (picture === undefined) {
-                return;
-            }
             // In der Hierarchie bleibt die Kamera stehen und alles hell: sie
             // rahmt den ganzen Subgraphen, und auf eine Spalte zu zoomen waere
             // wieder die Nachbarschaftsansicht, gegen die dieses Bild gebaut
             // ist. Der Ring wandert, sobald das Symbol vor dem Leser wechselt.
-            if (mode === 'galaxy') {
+            if (mode === 'galaxy' && picture !== undefined) {
                 const ids = neighbourIds(node.id, picture.edges);
                 setHighlighted(ids);
                 flyTo(picture.nodes, ids, node.qualified_name ?? node.name);
+            }
+            const selected = layoutNodeForSelection(data, node) ?? node;
+            props.onSelectNode?.(selected);
+            if (props.workspaceExpanded) {
+                setNote('Graph selection attached to the next chat message.');
+                return;
             }
             if (node.file_path === undefined || node.file_path.length === 0) {
                 setNote(unopenableNodeNote(node));
                 return;
             }
             setNote('');
-            onOpenNode(node);
+            onOpenNode(selected);
         },
-        [picture, mode, flyTo, onOpenNode],
+        [data, picture, mode, flyTo, onOpenNode, props.onSelectNode, props.workspaceExpanded],
     );
 
     const handleBackgroundClick = useCallback(() => {
@@ -1601,10 +1638,10 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
     const layoutState = error.length > 0 ? 'failed' : data === undefined ? 'loading' : 'ready';
     // Die Hierarchie braucht das Layout nicht: sie faerbt sich damit, sie lebt
     // nicht davon. Ein Walk, dessen Bild dasteht, ist fertig.
-    const state = mode === 'hierarchy' ? 'ready' : layoutState;
+    const state = mode === 'hierarchy' ? projection ? 'ready' : props.focusWalkStatus === 'loading' ? 'loading' : props.focusWalkStatus === 'unavailable' ? 'failed' : 'empty' : layoutState;
     const headline =
-        mode === 'hierarchy' && projection !== undefined
-            ? hierarchyHeadline(projection, hierarchyOrigin)
+        mode === 'hierarchy'
+            ? projection ? hierarchyHeadline(projection, hierarchyOrigin) : props.focusWalkMessage || 'Choose a symbol to see its outgoing call hierarchy.'
             : layoutState === 'failed'
                 ? `layout unavailable: ${error}`
                 : layoutState === 'loading'
@@ -1628,6 +1665,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
         mode === 'hierarchy' && projection !== undefined
             ? hierarchyEdgeNote(projection.data.edges.length, indexEdges.length)
             : '',
+        mode === 'hierarchy' && walk === undefined && projection ? props.focusWalkMessage ?? '' : '',
         kindNote,
     ].filter((part) => part.length > 0).join('; ');
 
@@ -1926,22 +1964,20 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                         aria-label="which picture the panel shows"
                     >
                         {GRAPH_MODES.map((candidate) => {
-                            const available = candidate === 'galaxy' || projection !== undefined;
-                            const action = !available
-                                ? 'none'
-                                : !visible
+                            const available = true;
+                            const action = !visible
                                     ? 'open'
-                                    : mode === candidate ? 'collapse' : 'switch';
+                                    : mode === candidate && candidate === 'galaxy' && !props.workspaceExpanded ? 'collapse' : 'switch';
                             return (
                                 <Hint
                                     key={candidate}
                                     name={`graph-mode-${candidate}`}
                                     text={
-                                        !available
+                                        candidate === 'hierarchy' && projection === undefined
                                             ? HIERARCHY_UNAVAILABLE_TITLE
                                             : !visible
                                                 ? graphModeCollapsedTitle(candidate)
-                                                : mode === candidate
+                                                : mode === candidate && candidate === 'galaxy' && !props.workspaceExpanded
                                                     ? graphModeActiveTitle(candidate)
                                                     : candidate === 'galaxy'
                                                         ? 'galaxy: the whole project, laid out by the server'
@@ -1957,23 +1993,10 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                                         data-action={action}
                                         data-available={available}
                                         aria-pressed={mode === candidate}
-                                        /*
-                                         * `aria-disabled` und nicht `disabled`:
-                                         * ein Knopf, den der Browser sperrt,
-                                         * bekommt keine Zeigerereignisse mehr,
-                                         * also oeffnet auch sein Tooltip nicht.
-                                         * Er waere stumm, und AC3 verlangt das
-                                         * Gegenteil: deaktiviert UND sagt warum.
-                                         * Der Klick antwortet deshalb mit
-                                         * demselben Satz in der Notizzeile.
-                                         */
+                                        /* Hierarchy stays actionable while its root is missing or loading. */
                                         aria-disabled={!available}
                                         onClick={() => {
-                                            if (!available) {
-                                                setNote(HIERARCHY_UNAVAILABLE_TITLE);
-                                                return;
-                                            }
-                                            if (visible && mode === candidate) {
+                                            if (visible && mode === candidate && candidate === 'galaxy' && !props.workspaceExpanded) {
                                                 props.onToggleVisible?.();
                                                 return;
                                             }
@@ -2021,7 +2044,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                       * Bildes, das gerade dasteht. Warum, steht an
                       * {@link graphFoldLabel}.
                       */}
-                    {props.onToggleVisible !== undefined && (
+                    {props.onToggleVisible !== undefined && !props.workspaceExpanded && (
                         <Hint
                             name="galaxy-collapse"
                             text={visible ? GALAXY_COLLAPSE_TITLE : GALAXY_EXPAND_TITLE}
@@ -2040,12 +2063,24 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                         </Hint>
                     )}
                 </div>
+                {props.workspaceExpanded && <GalaxyNavigator nodes={data?.nodes ?? []} onSelect={handleNodeClick} />}
+                {props.workspaceExpanded && props.selectedNode && <div className="atlas-galaxy-selected">
+                    <span>{props.selectedNode.name}</span>
+                    {props.selectedNode.file_path && <button type="button" onClick={() => props.onOpenNode(props.selectedNode!)}>Open source</button>}
+                </div>}
+                {props.workspaceExpanded && <span className="atlas-galaxy-coverage-key">
+                    <i aria-hidden="true" />{mode === 'hierarchy' ? 'Coverage shadow is shown in galaxy view' : coverageShadow
+                        ? `Coverage shadow: ${coverageShadow.counts.files} files, ${coverageShadow.counts.folders} folders with index gaps`
+                        : data?.missed_graph ? 'No coverage-shadow nodes reported' : 'Coverage shadow unavailable in this layout'}
+                </span>}
                 <span
                     className="atlas-galaxy-headline"
                     data-testid="atlas-galaxy-headline"
                     data-state={state}
                 >
-                    {headline}
+                    {props.workspaceExpanded && mode === 'galaxy' && state === 'ready' && data
+                        ? `${data.nodes.length.toLocaleString()} of ${data.total_nodes.toLocaleString()} nodes · ${data.edges.length.toLocaleString()} relationships loaded`
+                        : headline}
                 </span>
                 {edgeNote.length > 0 && (
                     <span
@@ -2256,6 +2291,15 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                         labelDistanceFactor={choice.labelDistanceFactor}
                         frameCap={choice.frameCap}
                         onNodeClick={handleNodeClick}
+                        coverageShadow={coverageShadow}
+                        onShadowNodeClick={(node) => {
+                            if (coverageShadow) flyTo(coverageShadow.nodes, coverageShadow.ids, node.qualified_name ?? node.name);
+                            props.onSelectShadowNode?.(node);
+                            setNote(`${node.file_path ?? node.name}: coverage shadow. Detailed indexing reasons are not included in this layout.`);
+                        }}
+                        renderShadowTooltip={(node) => <Html position={[node.x, node.y, node.z]} center style={{ pointerEvents: 'none' }}>
+                            <div className="atlas-coverage-tooltip"><b>{node.file_path ?? node.name}</b><p>Coverage shadow: not fully indexed.</p></div>
+                        </Html>}
                         onBackgroundClick={handleBackgroundClick}
                         renderTooltip={(node) => <NodeTooltipCard node={node} />}
                         overlay={overlay}
@@ -2264,6 +2308,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                 {state !== 'ready' && (
                     <p className="atlas-galaxy-placeholder" data-state={state}>
                         {headline}
+                        {mode === 'hierarchy' && state !== 'loading' && <><br /><button type="button" data-testid="atlas-hierarchy-choose-root" onClick={() => setChosenMode('galaxy')}>Choose a symbol in the galaxy</button></>}
                     </p>
                 )}
                 {/*
@@ -2359,7 +2404,8 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
             </div>
             {note.length > 0 && (
                 <p className="atlas-galaxy-note" data-testid="atlas-galaxy-note">
-                    {note}
+                    {props.workspaceExpanded && note === GALAXY_NO_FOCUS_NOTE
+                        ? 'Select a node or entry point to attach graph context to chat.' : note}
                 </p>
             )}
         </section>

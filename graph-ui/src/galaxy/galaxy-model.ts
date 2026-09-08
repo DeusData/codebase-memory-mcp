@@ -136,4 +136,4 @@ export function unopenableNodeNote(node: GraphNode): string {
 }
 
 /** Was das Panel sagt, solange kein Symbol im Fokus steht. */
-export const GALAXY_NO_FOCUS_NOTE = 'no symbol in focus: the galaxy follows the twin';
+export const GALAXY_NO_FOCUS_NOTE = 'Open a file or select a symbol to focus the graph.';

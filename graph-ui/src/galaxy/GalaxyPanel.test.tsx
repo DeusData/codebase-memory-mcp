@@ -204,6 +204,34 @@ describe('GalaxyPanel', () => {
     });
 });
 
+describe('dedicated Galaxy selection', () => {
+    it('keeps source-backed selections in Galaxy until Open source is requested', async () => {
+        const onSelectNode = vi.fn();
+        const onOpenNode = vi.fn();
+        await render(props({ workspaceExpanded: true, onSelectNode, onOpenNode, selectedNode: LAYOUT.nodes[0] }));
+        await act(async () => { seam().clickNode('atlas.src.services.userService.createUser'); });
+        expect(onSelectNode).toHaveBeenCalledWith(expect.objectContaining({ id: 51 }));
+        expect(onOpenNode).not.toHaveBeenCalled();
+        const open = [...container.querySelectorAll('button')].find(button => button.textContent === 'Open source');
+        await act(async () => open!.click());
+        expect(onOpenNode).toHaveBeenCalledWith(LAYOUT.nodes[0]);
+    });
+    it('attaches graph-only selections without pretending they have a source file', async () => {
+        const onSelectNode = vi.fn();
+        const onOpenNode = vi.fn();
+        await render(props({ workspaceExpanded: true, onSelectNode, onOpenNode }));
+        await act(async () => { seam().clickNode('__env__DB_URL'); });
+        expect(onSelectNode).toHaveBeenCalledWith(expect.objectContaining({ id: 74, name: 'DB_URL' }));
+        expect(onOpenNode).not.toHaveBeenCalled();
+    });
+
+    it('offers node lookup and keeps collapse out of the dedicated workspace', async () => {
+        await render(props({ workspaceExpanded: true, onToggleVisible: vi.fn() }));
+        expect(container.querySelector('[aria-label="Find a graph node"]')).not.toBeNull();
+        expect(container.querySelector('[data-testid="atlas-galaxy-collapse"]')).toBeNull();
+    });
+});
+
 /*
  * Die Legende unter dem Kopf (W4d).
  *
@@ -454,13 +482,8 @@ describe('GalaxyPanel und die Hierarchie', () => {
         expect(seam().mode).toBe('galaxy');
         expect(seam().hierarchyAvailable).toBe(false);
         expect(seam().hierarchy).toBeUndefined();
-        /*
-         * Seit W10b `aria-disabled` statt `disabled`: ein vom Browser
-         * gesperrter Knopf bekommt keine Zeigerereignisse und kann seinen
-         * Tooltip darum nicht oeffnen. AC3 verlangt aber beides, deaktiviert UND
-         * sagt warum.
-         */
-        expect(modeChip('hierarchy')?.getAttribute('aria-disabled')).toBe('true');
+        // The initial view stays unchanged, but hierarchy can open its root chooser.
+        expect(modeChip('hierarchy')?.getAttribute('aria-disabled')).toBe('false');
         expect(modeChip('hierarchy')?.getAttribute('data-hint')).toContain('open a symbol');
         expect(headlineText()).toContain('3 nodes, 2 edges from /api/layout');
     });
@@ -697,6 +720,107 @@ const withScene = (): void => {
     (globalThis as unknown as Record<string, unknown>).ResizeObserver ??= SilentResizeObserver;
 };
 
+describe('hierarchy selection regression', () => {
+    beforeEach(withScene);
+
+    it('resolves a hierarchy render ID collision to the canonical selected symbol', async () => {
+        const unrelated = { ...LAYOUT.nodes[2]!, id: 0 };
+        const fetchLayout = vi.fn(async () => new Response(JSON.stringify({
+            ...LAYOUT, nodes: [unrelated, ...LAYOUT.nodes],
+        }), { status: 200 }));
+        const onSelectNode = vi.fn();
+        await render(props({ workspaceExpanded: true, focusWalk: walkOf(), onSelectNode,
+            fetch: fetchLayout as unknown as typeof fetch }));
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        await act(async () => { seam().clickNode(WALK_QN.createUser); });
+        expect(onSelectNode).toHaveBeenCalledWith(expect.objectContaining({
+            id: 51, qualified_name: WALK_QN.createUser,
+        }));
+    });
+
+    it('selects a root from the node picker after entering hierarchy in the mini graph', async () => {
+        const onSelectNode = vi.fn();
+        await render(props());
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        await render(props({ workspaceExpanded: true, onSelectNode }));
+        expect(seam().mode).toBe('hierarchy');
+        expect(seam().hierarchy).toBeUndefined();
+        await act(async () => {
+            container.querySelector<HTMLInputElement>('.atlas-galaxy-node-picker input[type="checkbox"]')!.click();
+        });
+        const result = [...container.querySelectorAll<HTMLButtonElement>('.atlas-galaxy-node-picker button')]
+            .find(button => button.textContent?.includes('createUser'));
+        expect(result).toBeDefined();
+        await act(async () => { result!.click(); });
+        expect(onSelectNode).toHaveBeenCalledWith(expect.objectContaining({
+            id: 51, qualified_name: LAYOUT.nodes[0]!.qualified_name,
+        }));
+        expect(seam().mode).toBe('hierarchy');
+    });
+
+    it('lets the user enter hierarchy before choosing a root and gives a next action', async () => {
+        await render(props({ visible: true, workspaceExpanded: true }));
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        expect(seam().mode).toBe('hierarchy');
+        expect(container.querySelector('[data-testid="atlas-hierarchy-choose-root"]')).not.toBeNull();
+    });
+
+    it('keeps hierarchy selected when the selected root changes and its walk is loading', async () => {
+        await render(props({ visible: true, focusWalk: walkOf() }));
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        expect(seam().mode).toBe('hierarchy');
+        await render(props({ visible: true, focusQualifiedName: 'atlas.nextRoot', focusWalkStatus: 'loading', focusWalkMessage: 'Loading nextRoot…' }));
+        expect(seam().mode).toBe('hierarchy');
+        expect(seam().hierarchy).toBeUndefined();
+        expect(headlineText()).toBe('Loading nextRoot…');
+    });
+
+    it('does not collapse hierarchy when its active mode button is clicked again', async () => {
+        const onToggleVisible = vi.fn();
+        await render(props({ visible: true, focusWalk: walkOf(), onToggleVisible }));
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        expect(seam().mode).toBe('hierarchy');
+        expect(onToggleVisible).not.toHaveBeenCalled();
+    });
+});
+
+describe('mini galaxy follows the code reader', () => {
+    it('frames the active file even when no twin symbol is available', async () => {
+        await render(props({ focusFilePath: 'src/services/userService.ts' }));
+        expect(seam().highlightedCount).toBe(1);
+        expect(seam().lastTargetQn).toBe('src/services/userService.ts');
+        expect(noteText()).toBe('');
+    });
+
+    it('uses the selected source range and clears highlights for an absent file', async () => {
+        await render(props({ focusFilePath: 'src/util/validate.ts', focusSourceRange: { startLine: 20, endLine: 21 } }));
+        expect(seam().highlightedCount).toBe(1);
+        expect(seam().lastTargetQn).toBe('src/util/validate.ts');
+        await render(props({ focusFilePath: 'src/missing.ts' }));
+        expect(seam().highlightedCount).toBe(0);
+        expect(noteText()).toContain('src/missing.ts is not in the loaded graph layout');
+    });
+
+    it('falls back to file context when its focused symbol is outside the layout budget', async () => {
+        await render(props({ focusFilePath: 'src/util/validate.ts', focusQualifiedName: 'atlas.notLoaded' }));
+        expect(seam().highlightedCount).toBe(1);
+        expect(seam().lastTargetQn).toBe('src/util/validate.ts');
+        await render(props({ focusFilePath: '' }));
+        expect(seam().highlightedCount).toBe(0);
+    });
+
+    it('shows a single leaf root and its honest outgoing-call note', async () => {
+        const walk = walkOf();
+        const leaf: ClosureResult = { ...walk, nodes: [walk.nodes[0]!], edges: [], truncated: false, visited: 1 };
+        await render(props({ focusWalk: leaf, focusWalkStatus: 'ready', focusWalkMessage: 'No outgoing calls are recorded for this symbol.' }));
+        await act(async () => { modeChip('hierarchy')?.click(); });
+        expect(seam().hierarchy?.nodes).toBe(1);
+        expect(seam().drawnEdges).toBe(0);
+        expect(edgeNoteText()).toContain('No outgoing calls are recorded');
+    });
+});
+
 describe('GalaxyPanel: der Ansichts-Schalter klappt auch', () => {
 
     beforeEach(withScene);
@@ -753,16 +877,16 @@ describe('GalaxyPanel: der Ansichts-Schalter klappt auch', () => {
         expect(onToggleVisible.mock.calls.length).toBe(viaLabel + 1);
     });
 
-    it('sagt am grauen Knopf, was fehlt, statt stumm zu sein', async () => {
+    it('offers a root chooser instead of disabling hierarchy', async () => {
         await render(props({ visible: true }));
         const chip = modeChip('hierarchy');
-        expect(chip?.getAttribute('aria-disabled')).toBe('true');
-        expect(chip?.getAttribute('data-action')).toBe('none');
+        expect(chip?.getAttribute('aria-disabled')).toBe('false');
+        expect(chip?.getAttribute('data-action')).toBe('switch');
         await act(async () => {
             chip?.click();
         });
-        expect(seam().mode).toBe('galaxy');
-        expect(noteText()).toContain('open a symbol or pick a way in');
+        expect(seam().mode).toBe('hierarchy');
+        expect(headlineText()).toContain('Choose a symbol');
     });
 });
 

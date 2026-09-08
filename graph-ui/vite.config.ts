@@ -74,6 +74,7 @@ const uiBackendProxy = (): ProxyOptions => ({
 
 export default defineConfig({
   plugins: [react()],
+  worker: { format: 'es' },
   define: {
     __ATLAS_VERSION__: JSON.stringify(atlasVersion()),
   },

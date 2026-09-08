@@ -15,12 +15,6 @@
   "attributionPatternMatches": [],
   "documentedAttributionExceptions": [
     {
-      "file": "CLAUDE.md",
-      "line": 46,
-      "text": "keine Claude/AI-Attribution in Repo, Commits oder Dateien.",
-      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
-    },
-    {
       "file": "PLAN.md",
       "line": 304,
       "text": "- Deutsch antworten, keine em/en-Dashes, keine Claude/AI-Attribution im",
@@ -40,7 +34,7 @@
     },
     {
       "file": "README.md",
-      "line": 6,
+      "line": 38,
       "text": "Projektregeln in `CLAUDE.md`, der aufgenommene Fremdcode in `THIRD_PARTY.md`.",
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
     },
@@ -104,9 +98,7 @@
     "anthropic"
   ],
   "selfReportExcluded": "verification/w6/stylegate.json",
-  "ruleFileNames": [
-    "CLAUDE.md"
-  ],
+  "ruleFileNames": [],
   "hardcodedChromeStrings": 0,
   "hardcodedChromeMatches": [],
   "chromeFilesScanned": [
@@ -115,6 +107,7 @@
     "src/app/AtlasTree.tsx",
     "src/help/HelpOverlay.tsx",
     "src/settings/SettingsPanel.tsx",
+    "src/projects/ProjectsPanel.tsx",
     "src/why/WhyPanel.tsx",
     "src/tours/TourCard.tsx",
     "src/search/SearchOverlay.tsx",
@@ -146,8 +139,8 @@
       "reason": "Docblocks und Zeilenkommentare sind kein Bildschirmtext. Der Parser sieht den Unterschied, ein regulaerer Ausdruck koennte ihn nicht sehen."
     }
   ],
-  "filesConsidered": 586,
-  "textFiles": 462,
-  "binaryFiles": 124,
-  "generatedAt": "2026-08-30T18:51:16.137Z"
+  "filesConsidered": 714,
+  "textFiles": 559,
+  "binaryFiles": 155,
+  "generatedAt": "2026-09-08T21:53:20.695Z"
 }

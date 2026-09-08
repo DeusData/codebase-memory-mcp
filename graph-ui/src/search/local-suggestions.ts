@@ -61,6 +61,17 @@ export interface LocalIndex {
 /** Nichts geladen. Als benannte Konstante, damit sie eine stabile Referenz ist. */
 export const EMPTY_LOCAL_INDEX: LocalIndex = { symbols: [], files: [] };
 
+/** Settle an index reply while retaining the provenance of displayed rows. */
+export function settledSearchHits(indexed: RankedHit[], loaded: RankedHit[]): {
+    hits: RankedHit[];
+    source: 'index' | 'loaded';
+} {
+    if (indexed.length === 0 && loaded.length > 0) {
+        return { hits: loaded, source: 'loaded' };
+    }
+    return { hits: indexed, source: 'index' };
+}
+
 /** Die Art, die eine Datei aus dem Baum bekommt. Siehe Kopf, letzter Abschnitt. */
 export const FILE_CANDIDATE_KIND: CodeAtlasSymbolKind = 'unknown';
 

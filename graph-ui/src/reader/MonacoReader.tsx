@@ -31,6 +31,17 @@ import { badgeDecorations, highlightDecorations } from './step-badges';
  */
 export type ReaderStatus = 'idle' | 'loading' | 'ready' | 'failed' | 'unavailable';
 
+export interface ReaderSelection {
+    text: string;
+    path: string;
+    startLine: number;
+    startColumn: number;
+    endLine: number;
+    endColumn: number;
+    /** Session-local editor model and revision that supplied this snapshot. */
+    sourceVersion: string;
+}
+
 export interface MonacoReaderProps {
     status: ReaderStatus;
     /** Was gerade zu lesen ist. Fehlt, solange nichts offen ist. */
@@ -48,6 +59,8 @@ export interface MonacoReaderProps {
     highlightLine?: number | undefined;
     /** Die Zeile, in der der Caret jetzt steht, 1-basiert. Ungedaempft. */
     onCursorLine?: ((line: number) => void) | undefined;
+    onSelectionChange?: ((selection: ReaderSelection | undefined) => void) | undefined;
+    onAskSelection?: ((selection: ReaderSelection) => void) | undefined;
     /** 1-basierte Zeile, zu der gesprungen werden soll. */
     revealLine?: number | undefined;
     /**
@@ -100,6 +113,26 @@ export default function MonacoReader(props: MonacoReaderProps): JSX.Element {
     // waere ein Leck, das man erst nach einer Stunde Lesen bemerkt.
     const cursorRef = useRef(props.onCursorLine);
     cursorRef.current = props.onCursorLine;
+    const selectionProps = useRef(props);
+    selectionProps.current = props;
+
+    function readSelection(): ReaderSelection | undefined {
+        const editor = editorRef.current;
+        const model = editor?.getModel();
+        const range = editor?.getSelection();
+        const document = selectionProps.current.document;
+        if (!model || !range || range.isEmpty() || !document || selectionProps.current.status !== 'ready') return;
+        const text = model.getValueInRange(range);
+        if (text.length === 0) return;
+        return {
+            text, path: document.path,
+            startLine: document.firstLine + range.startLineNumber - 1,
+            startColumn: range.startColumn,
+            endLine: document.firstLine + range.endLineNumber - 1,
+            endColumn: range.endColumn,
+            sourceVersion: `editor:${model.id}:${model.getVersionId()}`,
+        };
+    }
 
     function createEditor(host: HTMLDivElement) {
         const monaco = prepareMonaco();
@@ -142,8 +175,22 @@ export default function MonacoReader(props: MonacoReaderProps): JSX.Element {
             // positions.ts.
             cursorRef.current?.(event.position.lineNumber);
         });
+        const selection = editor.onDidChangeCursorSelection(() => {
+            selectionProps.current.onSelectionChange?.(readSelection());
+        });
+        const monaco = prepareMonaco();
+        const ask = editor.addAction({
+            id: 'atlas.ask-about-selection', label: 'Ask about selection',
+            keybindings: [monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyL],
+            run: () => {
+                const snapshot = readSelection();
+                if (snapshot) selectionProps.current.onAskSelection?.(snapshot);
+            },
+        });
         return () => {
             cursor.dispose();
+            selection.dispose();
+            ask.dispose();
             const model = editor.getModel();
             editor.dispose();
             model?.dispose();
@@ -165,6 +212,7 @@ export default function MonacoReader(props: MonacoReaderProps): JSX.Element {
         }
         const monaco = prepareMonaco();
         const previous = editor.getModel();
+        selectionProps.current.onSelectionChange?.(undefined);
         if (props.document === undefined) {
             editor.setModel(null);
             previous?.dispose();
@@ -180,6 +228,10 @@ export default function MonacoReader(props: MonacoReaderProps): JSX.Element {
             previous.dispose();
         }
     }, [props.document]);
+
+    useEffect(() => {
+        if (props.status !== 'ready') selectionProps.current.onSelectionChange?.(undefined);
+    }, [props.status]);
 
     // Die Badges im Rand. Sie haengen an den Schritten UND am Dokument: ein
     // Dateiwechsel tauscht das Modell aus, und eine Menge, die nicht neu gesetzt

@@ -138,6 +138,7 @@ import {
     rewriteMap,
 } from './reader-rewrite';
 import { browserStore, readReaderLevel, writeReaderLevel } from './reader-level-store';
+import { workspaceStrings } from '../app/workspace-strings';
 
 /** Wie das Panel gerade dasteht. Nie einfach leer. */
 export type TwinStatus = 'empty' | 'loading' | 'ready' | 'not-indexed' | 'failed';
@@ -1816,7 +1817,10 @@ export default function TwinPanel(props: TwinPanelProps): JSX.Element {
             </header>
 
             <div className="atlas-twin-toolbar" data-hint-keep="twin toolbar">
-                <ReaderSlider depth={props.presentation.depth} onDepth={setLevel} />
+                <details className="atlas-reading-preferences">
+                    <summary>{workspaceStrings.perspective}</summary>
+                    <ReaderSlider depth={props.presentation.depth} onDepth={setLevel} />
+                </details>
                 <FacetChips
                     facets={props.presentation.facets}
                     onToggle={props.onToggleFacet}

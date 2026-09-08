@@ -570,7 +570,8 @@ static void handle_processes(cbm_http_conn_t *c) {
     FILETIME ft_create, ft_exit, ft_kernel, ft_user;
     double user_s = 0, sys_s = 0;
     size_t rss_bytes = 0;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+    BOOL self_memory_available = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    if (self_memory_available)
         rss_bytes = pmc.WorkingSetSize;
     if (GetProcessTimes(GetCurrentProcess(), &ft_create, &ft_exit, &ft_kernel, &ft_user)) {
         ULARGE_INTEGER u, k;
@@ -583,8 +584,11 @@ static void handle_processes(cbm_http_conn_t *c) {
     }
     http_appendf(buf, sizeof(buf), &pos,
                  "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
-                 (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
+                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,"
+                 "\"cpu_unit\":\"seconds\",\"memory_kind\":\"working_set\","
+                 "\"self_memory_kind\":\"working_set\",\"self_memory_available\":%s,\"processes\":[",
+                 (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s,
+                 self_memory_available ? "true" : "false");
 
     /* Enumerate all codebase-memory-mcp.exe processes via toolhelp snapshot */
     int proc_count = 0;
@@ -603,10 +607,12 @@ static void handle_processes(cbm_http_conn_t *c) {
                     size_t proc_rss = 0;
                     DWORD elapsed_sec = 0;
 
-                    if (GetProcessMemoryInfo(hProc, &ppmc, sizeof(ppmc)))
+                    BOOL memory_available = GetProcessMemoryInfo(hProc, &ppmc, sizeof(ppmc));
+                    BOOL cpu_available = GetProcessTimes(hProc, &ftc, &fte, &ftk, &ftu);
+                    if (memory_available)
                         proc_rss = ppmc.WorkingSetSize;
 
-                    if (GetProcessTimes(hProc, &ftc, &fte, &ftk, &ftu)) {
+                    if (cpu_available) {
                         ULARGE_INTEGER pu, pk;
                         pu.LowPart = ftu.dwLowDateTime;
                         pu.HighPart = ftu.dwHighDateTime;
@@ -636,12 +642,13 @@ static void handle_processes(cbm_http_conn_t *c) {
                                  "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
                                  "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
                                  "\"command\":\"codebase-memory-mcp\","
-                                 "\"is_self\":%s}",
+                                 "\"is_self\":%s,\"cpu_available\":%s,\"memory_available\":%s}",
                                  pe.th32ProcessID, cpu_user + cpu_sys,
                                  (double)proc_rss / (1024.0 * 1024.0), elapsed_sec / 86400,
                                  (elapsed_sec % 86400) / 3600, (elapsed_sec % 3600) / 60,
                                  elapsed_sec % 60,
-                                 pe.th32ProcessID == (DWORD)_getpid() ? "true" : "false");
+                                 pe.th32ProcessID == (DWORD)_getpid() ? "true" : "false",
+                                 cpu_available ? "true" : "false", memory_available ? "true" : "false");
                     if (pos >= (int)sizeof(buf)) {
                         pos = (int)sizeof(buf) - 1;
                     }
@@ -655,18 +662,21 @@ static void handle_processes(cbm_http_conn_t *c) {
 
     http_appendf(buf, sizeof(buf), &pos, "]}");
 #else
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
+    struct rusage ru = {0};
+    bool self_memory_available = getrusage(RUSAGE_SELF, &ru) == 0;
     long rss_kb = ru.ru_maxrss;
 #ifdef __APPLE__
     rss_kb /= 1024;
 #endif
     http_appendf(buf, sizeof(buf), &pos,
                  "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
+                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,"
+                 "\"cpu_unit\":\"percent\",\"memory_kind\":\"resident\","
+                 "\"self_memory_kind\":\"peak_resident\",\"self_memory_available\":%s,\"processes\":[",
                  (int)getpid(), (double)rss_kb / 1024.0,
                  (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
-                 (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6);
+                 (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6,
+                 self_memory_available ? "true" : "false");
 
     FILE *fp = popen("LC_ALL=C ps -eo pid,pcpu,rss,etime,comm 2>/dev/null"
                      " | grep '[c]odebase-memory-mcp'",

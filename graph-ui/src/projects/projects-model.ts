@@ -192,12 +192,32 @@ export interface ServerProcess {
     elapsed: string;
     command: string;
     isSelf: boolean;
+    /** Unit-aware measurements; legacy numeric fields above remain compatible. */
+    telemetry?: { cpu: number | null; memoryMb: number | null };
 }
+
+export type ProcessCpuUnit = 'percent' | 'seconds' | 'unknown';
+export type ProcessMemoryKind = 'resident' | 'working_set' | 'peak_resident' | 'unknown';
 
 export interface ProcessReport {
     selfPid: number;
     selfRssMb: number;
     processes: ServerProcess[];
+    telemetry?: {
+        cpuUnit: ProcessCpuUnit;
+        memoryKind: ProcessMemoryKind;
+        selfMemoryKind: ProcessMemoryKind;
+        selfMemoryMb: number | null;
+    };
+}
+
+function measurement(value: unknown, available: unknown): number | null {
+    const number = optionalNumber(value);
+    return available !== false && number !== undefined && number >= 0 ? number : null;
+}
+
+function memoryKind(value: unknown): ProcessMemoryKind {
+    return value === 'resident' || value === 'working_set' || value === 'peak_resident' ? value : 'unknown';
 }
 
 export function readProcesses(raw: unknown): ProcessReport {
@@ -206,13 +226,23 @@ export function readProcesses(raw: unknown): ProcessReport {
     return {
         selfPid: optionalNumber(record['self_pid']) ?? -1,
         selfRssMb: optionalNumber(record['self_rss_mb']) ?? 0,
+        telemetry: {
+            cpuUnit: record['cpu_unit'] === 'percent' || record['cpu_unit'] === 'seconds' ? record['cpu_unit'] : 'unknown',
+            memoryKind: memoryKind(record['memory_kind']),
+            selfMemoryKind: memoryKind(record['self_memory_kind']),
+            selfMemoryMb: measurement(record['self_rss_mb'], record['self_memory_available']),
+        },
         processes: list.map((entry) => ({
             pid: optionalNumber(entry['pid']) ?? -1,
             cpu: optionalNumber(entry['cpu']) ?? 0,
             rssMb: optionalNumber(entry['rss_mb']) ?? 0,
-            elapsed: text(entry['elapsed']),
+            elapsed: entry['cpu_available'] === false ? '' : text(entry['elapsed']),
             command: text(entry['command']),
             isSelf: entry['is_self'] === true,
+            telemetry: {
+                cpu: measurement(entry['cpu'], entry['cpu_available']),
+                memoryMb: measurement(entry['rss_mb'], entry['memory_available']),
+            },
         })),
     };
 }
