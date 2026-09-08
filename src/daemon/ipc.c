@@ -56,6 +56,12 @@ const char *cbm_daemon_ipc_validation_detail(void) {
 
 static cbm_daemon_ipc_listen_failure_t ipc_listen_failure;
 
+/* The failure recorder and its reset are only reached from the POSIX socket
+ * listener (all callers live in the `#ifndef _WIN32` block below); the Windows
+ * named-pipe listener does its own reporting. Guarding them keeps the always-
+ * compiled struct + accessor cross-platform while avoiding -Werror,
+ * -Wunused-function on the Windows build (#1828 CI). */
+#ifndef _WIN32
 static void ipc_listen_failure_reset(void) {
     memset(&ipc_listen_failure, 0, sizeof(ipc_listen_failure));
 }
@@ -92,6 +98,7 @@ static void ipc_listen_failed(const char *runtime_dir, const char *stage, int er
         cbm_log_error("daemon.ipc.listen_failed", "stage", stage);
     }
 }
+#endif /* !_WIN32 */
 
 bool cbm_daemon_ipc_listen_failure_detail(cbm_daemon_ipc_listen_failure_t *out) {
     if (!out) {
