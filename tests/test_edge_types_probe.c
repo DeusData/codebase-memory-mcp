@@ -416,6 +416,30 @@ TEST(handles_spring_java) {
     PASS();
 }
 
+/* Spring (Java) — the path attribute may sit anywhere in the annotation.
+ * Java puts no order on annotation attributes, so `path` after `name`,
+ * `produces` and `consumes` is ordinary source. The argument scan stopped
+ * after the third attribute, so the path was never read and no Route node
+ * formed. A HANDLES count alone cannot catch that, because the class-level
+ * @RequestMapping still produces one route on its own. */
+TEST(handles_spring_java_path_attribute_fourth) {
+    static const char *routes[] = {"/api/orders", NULL};
+    static const EtFile f[] = {
+        {"OrderController.java",
+         "package com.example;\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping;\n"
+         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+         "@RequestMapping(\"/api\")\npublic class OrderController {\n"
+         "    @GetMapping(name = \"listOrders\",\n"
+         "                produces = \"application/json\",\n"
+         "                consumes = \"application/json\",\n"
+         "                path = \"/orders\")\n"
+         "    public String listOrders() {\n"
+         "        return \"orders\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* Spring (Kotlin) — same prefix contract, including Kotlin's named array form
  * for class-level RequestMapping values. */
 TEST(handles_spring_kotlin) {
@@ -1578,6 +1602,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_fastify_js);
     RUN_TEST(handles_gin_go);
     RUN_TEST(handles_spring_java);
+    RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_jaxrs_java);
     RUN_TEST(handles_aspnet_csharp);

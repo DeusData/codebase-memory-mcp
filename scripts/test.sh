@@ -269,6 +269,9 @@ bash "$ROOT/tests/test_nomic_blob_generator_contract.sh"
 echo "=== Step 0w: published language-count contract ==="
 bash "$ROOT/tests/test_language_count_contract.sh"
 
+echo "=== Step 0x: packaging version-metadata contract ==="
+bash "$ROOT/tests/test_version_metadata_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 

@@ -19,6 +19,8 @@ main() {
 REPO="DeusData/codebase-memory-mcp"
 INSTALL_DIR="$HOME/.local/bin"
 SKIP_CONFIG=false
+CLIENTS_SET=false
+CLIENTS=""
 CBM_DOWNLOAD_URL="${CBM_DOWNLOAD_URL:-https://github.com/${REPO}/releases/latest/download}"
 
 # Security: every remote hop must remain HTTPS. Plain HTTP is accepted only
@@ -79,25 +81,45 @@ download_file() {
     fi
 }
 
-for arg in "$@"; do
-    case "$arg" in
-        --dir=*)        INSTALL_DIR="${arg#--dir=}" ;;
-        --skip-config)  SKIP_CONFIG=true ;;
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dir=*)
+            INSTALL_DIR="${1#--dir=}"
+            shift
+            ;;
+        --dir)
+            if [ "$#" -lt 2 ] || [[ "$2" == -* ]]; then
+                echo "install.sh: '--dir' needs a value. Please consult --help." >&2
+                exit 2
+            fi
+            INSTALL_DIR="$2"
+            shift 2
+            ;;
+        --clients=*)
+            CLIENTS_SET=true
+            CLIENTS="${1#--clients=}"
+            shift
+            ;;
+        --skip-config)
+            SKIP_CONFIG=true
+            shift
+            ;;
         --help|-h)
-            echo "Usage: install.sh [--dir=<path>] [--skip-config]"
-            echo "  --dir PATH     Install directory (default: ~/.local/bin)"
-            echo "  --skip-config  Skip automatic agent configuration"
+            echo "Usage: install.sh [--dir=<path>] [--clients=<list>] [--skip-config]"
+            echo "  --dir PATH       Install directory (default: ~/.local/bin)"
+            echo "  --clients LIST   Configure only comma-separated clients"
+            echo "  --skip-config    Skip automatic agent configuration"
             exit 0
             ;;
+        -*)
+            echo "install.sh: unknown option '$1'. Please consult --help." >&2
+            exit 2
+            ;;
+        *)
+            echo "install.sh: unexpected argument '$1'. Please consult --help." >&2
+            exit 2
+            ;;
     esac
-done
-# Handle --dir <path> (space-separated)
-prev=""
-for arg in "$@"; do
-    if [ "$prev" = "--dir" ]; then
-        INSTALL_DIR="$arg"
-    fi
-    prev="$arg"
 done
 
 detect_os() {
@@ -314,6 +336,9 @@ echo "Verified candidate: $CANDIDATE_VERSION"
 
 DEST="$INSTALL_DIR/codebase-memory-mcp"
 INSTALL_ARGS=(-y --force "--dir=$INSTALL_DIR")
+if [ "$CLIENTS_SET" = true ]; then
+    INSTALL_ARGS+=("--clients=$CLIENTS")
+fi
 if [ "$SKIP_CONFIG" = true ]; then
     INSTALL_ARGS+=(--skip-config)
 fi

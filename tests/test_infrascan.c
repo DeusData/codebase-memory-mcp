@@ -26,6 +26,7 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/var/run/app.json", "requests.get"));
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/locations/", "str.split"));
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/api", "os.path.join"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/html/g", "template.replace"));
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal(NULL, "requests.get"));
     ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("", "requests.get"));
     ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/orders", "requests.get"));

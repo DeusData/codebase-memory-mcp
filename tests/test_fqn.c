@@ -84,6 +84,21 @@ TEST(fqn_module_qn_still_strips_extension) {
     PASS();
 }
 
+TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682) {
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import(
+            "packages/api/src/modules/consumer/consumer.service.ts", "../featureX/featureX.engine"),
+        "packages/api/src/modules/featureX/featureX.engine");
+    ASSERT_FQN(
+        cbm_pipeline_resolve_relative_import("packages/api/src/modules/moduleA/moduleA.service.ts",
+                                             "../moduleQ/moduleQ.service"),
+        "packages/api/src/modules/moduleQ/moduleQ.service");
+    ASSERT_FQN(cbm_pipeline_resolve_relative_import(
+                   "packages/api/src/modules/moduleA/moduleA.service.ts", "./create-thing.dto"),
+               "packages/api/src/modules/moduleA/create-thing.dto");
+    PASS();
+}
+
 TEST(fqn_compute_basic_rs) {
     ASSERT_FQN(cbm_pipeline_fqn_compute("proj", "lib.rs", "new"), "proj.lib.new");
     PASS();
@@ -665,6 +680,7 @@ SUITE(fqn) {
     RUN_TEST(fqn_file_qn_preserves_dotfile_variants_issue1077);
     RUN_TEST(fqn_file_qn_distinguishes_same_stem_header_source_issue964);
     RUN_TEST(fqn_module_qn_still_strips_extension);
+    RUN_TEST(fqn_relative_js_import_preserves_dotted_basename_issue1682);
     RUN_TEST(fqn_compute_basic_rs);
     RUN_TEST(fqn_compute_file_sibling_distinct);
     RUN_TEST(fqn_compute_symbol_still_strips);

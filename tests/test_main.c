@@ -16,6 +16,7 @@ int tf_skip_count = 0;
 #include "foundation/constants.h"  /* CBM_SZ_4K — forced stderr buffer */
 #include "foundation/log.h"        /* crash-durable worker log probe */
 #include "foundation/mem.h"        /* cbm_mem_init — worker budget */
+#include "foundation/log.h"        /* worker liveness heartbeat probe */
 #include "foundation/platform.h"   /* cbm_file_exists — blocking-git marker */
 #include "daemon/runtime.h"        /* bounded worker response probe */
 #include "daemon/ipc.h"            /* Windows private-lock re-exec probe */
@@ -234,6 +235,17 @@ static void tf_index_worker_probe(const char *args_json, const char *response_ou
         fflush(NULL);
         _Exit(response ? 0 : 1);
     }
+    if (strstr(args_json, "\"heartbeat\"")) {
+        FILE *response = response_out ? cbm_fopen(response_out, "wb") : NULL;
+        if (response) {
+            (void)fputs("{\"probe\":\"heartbeat\"}", response);
+            (void)fclose(response);
+        }
+        cbm_log_info("pipeline.discover", "files", "1");
+        (void)fprintf(stderr, "async worker heartbeat probe ready\n");
+        fflush(NULL);
+        _Exit(response ? 0 : 1);
+    }
     if (strstr(args_json, "\"crash\"")) {
         (void)fprintf(stderr, "async worker crash probe\n");
         fflush(NULL);
@@ -346,6 +358,7 @@ static int tf_maybe_run_index_worker(int argc, char **argv) {
                                       invocation.marker_file, invocation.quarantine_file,
                                       invocation.memory_budget_bytes);
     cbm_mem_init_with_cap(0.5, invocation.memory_budget_bytes);
+    cbm_log_init_for_process(false, true);
     tf_index_worker_probe(invocation.args_json, invocation.response_out);
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv) {
@@ -503,9 +516,19 @@ static int tf_maybe_run_runtime_image_holder(int argc, char **argv) {
     Sleep(INFINITE);
     return 25;
 #else
-    (void)argc;
-    (void)argv;
-    return -1;
+    /* POSIX copied-image holder: block reading stdin until the parent closes
+     * the release pipe, exactly like the cat(1) donor this replaced. A system
+     * utility cannot serve as the copied image — a multi-call coreutils
+     * binary (uutils cat) refuses to execute under the copied name. */
+    if (argc != 2 || strcmp(argv[1], "__cbm_runtime_image_holder") != 0) {
+        return -1;
+    }
+    char release[16];
+    ssize_t count;
+    do {
+        count = read(STDIN_FILENO, release, sizeof(release));
+    } while (count > 0 || (count < 0 && errno == EINTR));
+    return count == 0 ? 0 : 25;
 #endif
 }
 
@@ -768,6 +791,7 @@ extern void suite_discover(void);
 extern void suite_graph_buffer(void);
 extern void suite_registry(void);
 extern void suite_pipeline(void);
+extern void suite_importance(void);
 extern void suite_pipeline_semantic_manifest_repro(void);
 extern void suite_cross_repo(void);
 extern void suite_index_resilience(void);
@@ -1041,6 +1065,7 @@ int main(int argc, char **argv) {
     /* Pipeline (M8) */
     RUN_SELECTED_SUITE(registry);
     RUN_SELECTED_SUITE(pipeline);
+    RUN_SELECTED_SUITE(importance);
     RUN_SELECTED_SUITE(index_format);
     RUN_SELECTED_SUITE(pipeline_semantic_manifest_repro);
     RUN_SELECTED_SUITE(call_reference_contract);

@@ -174,8 +174,9 @@ typedef enum {
     CBM_LANG_OBJECTSCRIPT_UDL,     // InterSystems ObjectScript UDL (.cls class files)
     CBM_LANG_OBJECTSCRIPT_ROUTINE, // InterSystems ObjectScript routine (.mac/.int/.rtn/.inc)
     CBM_LANG_OBJECTSCRIPT_EXPORT,  // InterSystems Studio Export XML (<Export generator="Cache">)
-    CBM_LANG_ARKTS, // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
-    CBM_LANG_PLSQL, // Oracle PL/SQL
+    CBM_LANG_ARKTS,    // ArkTS (HarmonyOS/OpenHarmony .ets — TypeScript superset + ArkUI)
+    CBM_LANG_PLSQL,    // Oracle PL/SQL
+    CBM_LANG_CHIALISP, // Chialisp (.clsp/.clib/.clinc — Chia smart-coin s-expression language)
     CBM_LANG_COUNT
 } CBMLanguage;
 
@@ -259,11 +260,19 @@ typedef struct {
     uint32_t site_start_byte;           // exact AST occurrence span; end > start when present
     uint32_t site_end_byte;             // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;      // raw source or C-family preprocessed buffer
-    bool is_method;                     // method/member call with a non-self receiver. Perl:
+    bool is_method;                     // method/member call with an UNRESOLVED receiver. Perl:
                                         // arrow/method call ($obj->m). TS/JS/TSX: member call
-                                        // x.foo() whose receiver is not this/super. Default false.
+                                        // x.foo() whose receiver is not this/super. Python:
+                                        // x.foo() where x is not self/cls/super() and is not
+                                        // rooted in an imported name. Read by the weak-member
+                                        // guard and by the pxc synthetic-carrier dedup key in
+                                        // pass_lsp_cross.c. Default false.
     bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
                                         // C++ operator). Never fall back to textual resolution.
+    bool callee_is_locally_bound;       // bare call foo() whose callee identifier is bound as a
+                                        // parameter of an enclosing function, so it cannot be the
+                                        // module-level foo. Python only today. Read by the
+                                        // weak-local-binding guard. Default false.
 } CBMCall;
 
 typedef struct {
@@ -287,6 +296,10 @@ typedef struct {
     uint32_t site_start_byte;             // exact reference-token span; end > start when present
     uint32_t site_end_byte;               // exclusive byte offset in the source file
     CBMSourceOrigin source_origin;        // raw source or C-family preprocessed buffer
+    bool is_member_access;                // token is the member half of a selector/attribute
+                                          // (Go x.f — field_identifier). The extractor strips
+                                          // the receiver, so this is the only surviving record
+                                          // of selector shape (#1962). Default false.
 } CBMUsage;
 
 typedef struct {
@@ -298,6 +311,9 @@ typedef struct {
     const char *var_name;          // variable name
     const char *enclosing_func_qn; // QN of enclosing function
     bool is_write;                 // true = write, false = read
+    bool is_member_access;         // var_name is the field half of a selector/member LHS
+                                   // (`t.err = x` → "err"); the receiver is stripped here,
+                                   // so this is the only record of selector shape (#1962)
 } CBMReadWrite;
 
 typedef struct {
@@ -506,6 +522,21 @@ typedef struct CBMFileResult {
      * completeness guarantee. Callers should treat a flagged file as "prefer
      * grep here", never treat an unflagged file as provably complete. */
     bool parse_incomplete;
+    /* True when the ranges cover so much of the file that they are no longer
+     * useful advice — one range over 80% of the line count. The file WAS
+     * indexed, but pointing a reader at almost every line tells them nothing,
+     * so the report says "read the source" instead of listing the range.
+     *
+     * Its main customers are non-C languages. The refinement that narrows a
+     * whole-file range using the preprocessed parse only runs for C, C++ and
+     * CUDA, so a Python, Java or Ruby file whose root node is ERROR still
+     * reports 1-N.
+     *
+     * Note the naming: this field and the phase string it produces are both
+     * `parse_unusable`. The older `parse_incomplete` field emits the phase
+     * `parse_partial` instead. That mismatch is historical, not deliberate —
+     * do not copy it. */
+    bool parse_unusable;
     const char *error_ranges;
     int error_region_count;
     bool is_test_file;
@@ -577,6 +608,13 @@ typedef struct {
 
 typedef struct {
     CBMArena *arena;
+    /* Scratch for AST traversal, owned by the cbm_extract_file_ex call that
+     * built this context and destroyed when it returns. Nothing a
+     * CBMFileResult points at may be allocated here: `arena` is the result's
+     * own, and it outlives extraction by the whole pipeline (#1997). NULL in a
+     * context built without one, in which case the stacks fall back to
+     * `arena`. */
+    CBMArena *scratch;
     CBMFileResult *result;
     const char *source;
     int source_len;

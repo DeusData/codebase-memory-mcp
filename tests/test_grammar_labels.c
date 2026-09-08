@@ -141,6 +141,7 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"racket", "Function:2,Module:1"},
     {"rescript", "Function:2,Module:1"},
     {"scheme", "Function:2,Module:1"},
+    {"chialisp", "Constant:1,Function:1,Macro:1,Module:2"},
     {"slang", "Function:2,Module:1"},
     {"squirrel", "Function:2,Module:1"},
     {"starlark", "Function:2,Module:1"},
@@ -235,8 +236,10 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"liquid", "Module:1"},
     {"blade", "Module:1"},
     {"vue", "Module:1"},
-    {"svelte", "Module:1"},
-    {"astro", "Module:1"},
+    /* Svelte's <script> and Astro's frontmatter fence extract structure like a
+     * standalone script, so each fixture's one declaration is a Variable. */
+    {"svelte", "Module:1,Variable:1"},
+    {"astro", "Module:1,Variable:1"},
     {"templ", "Class:1,Module:1"},
     {"typst", "Module:1"},
     {"mermaid", "Module:1"},

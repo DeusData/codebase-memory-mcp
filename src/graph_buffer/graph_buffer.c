@@ -1045,7 +1045,18 @@ static double edge_props_confidence(const char *props_json) {
     if (!p) {
         return CBM_EDGE_CONF_ABSENT;
     }
-    return strtod(p + sizeof(conf_key) - SKIP_ONE, NULL);
+    /* strtod answers 0.0 for text it cannot read, and 0.0 is a real
+     * confidence that beats CBM_EDGE_CONF_ABSENT. So a blob carrying
+     * "confidence":null used to outrank a clean blob that carries no
+     * confidence at all, and displace it. Ask strtod where it stopped: an
+     * end pointer that never moved means it read nothing. */
+    const char *value = p + sizeof(conf_key) - SKIP_ONE;
+    char *end = NULL;
+    double conf = strtod(value, &end);
+    if (end == value) {
+        return CBM_EDGE_CONF_ABSENT;
+    }
+    return conf;
 }
 
 /* Decide whether an incoming property blob replaces the stored one on a

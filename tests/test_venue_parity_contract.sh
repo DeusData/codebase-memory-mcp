@@ -401,7 +401,16 @@ test-infrastructure/vm/win.sh
         case "$entry" in
         *.py) out=$(cd "$ROOT" && python3 "$entry" --help 2>&1) && rc=0 || rc=$? ;;
         esac
-        if [ "$rc" -ne 0 ] || ! printf '%s' "$out" | grep -q "Usage:"; then
+        # Substring test in-shell: piping into `grep -q` is unsafe under
+        # `set -o pipefail` because grep exits at the first match and the
+        # writer takes EPIPE on any payload larger than the pipe buffer,
+        # turning a SATISFIED contract into a probe failure (macOS, 698-byte
+        # --help vs a 512-byte PIPE_BUF).
+        case "$out" in
+        *"Usage:"*) has_usage=1 ;;
+        *) has_usage=0 ;;
+        esac
+        if [ "$rc" -ne 0 ] || [ "$has_usage" -eq 0 ]; then
             echo "INTERFACE CONTRACT: $entry --help must exit 0 and print a Usage: block (rc=$rc)" >&2
             probe_failures=1
         fi
@@ -422,7 +431,11 @@ scripts/smoke-invariants.sh
 "
     for entry in $STRICT_ENTRIES; do
         out=$(cd "$ROOT" && bash "$entry" --definitely-not-a-flag 2>&1) && rc=0 || rc=$?
-        if [ "$rc" -ne 2 ] || ! printf '%s' "$out" | grep -q "Please consult --help."; then
+        case "$out" in
+        *"Please consult --help."*) has_hint=1 ;;
+        *) has_hint=0 ;;
+        esac
+        if [ "$rc" -ne 2 ] || [ "$has_hint" -eq 0 ]; then
             echo "INTERFACE CONTRACT: $entry must reject unknown flags with exit 2 + 'Please consult --help.' (rc=$rc)" >&2
             probe_failures=1
         fi

@@ -14,6 +14,7 @@
 #include "foundation/secure_random.h"
 #include "foundation/sha256.h"
 #include "foundation/subprocess.h"
+#include "foundation/workspace.h"
 #include "mcp/index_supervisor.h"
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
@@ -373,6 +374,11 @@ static bool application_regular_db_exists(const char *project) {
     return stat(path, &status) == 0 && S_ISREG(status.st_mode);
 }
 
+static bool application_canonical_directory_exists(const char *path) {
+    cbm_path_info_t info = {0};
+    return cbm_path_info_utf8(path, &info) == 0 && info.is_directory;
+}
+
 static cbm_daemon_application_watch_t *application_find_watch_locked(
     cbm_daemon_application_t *application, const char *project) {
     for (cbm_daemon_application_watch_t *watch = application->watches; watch; watch = watch->next) {
@@ -429,6 +435,22 @@ static void application_release_session_watch_locked(cbm_daemon_application_sess
     }
 }
 
+static bool application_session_workspace_allowed(const cbm_daemon_application_session_t *session,
+                                                  const char *operation) {
+    const char *root = session ? cbm_mcp_server_session_root(session->mcp) : NULL;
+    char boundary_error[CBM_SZ_1K];
+    bool allowed =
+        root && root[0] &&
+        cbm_workspace_root_allowed(root, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                   cbm_mcp_server_allowed_root(session->mcp), boundary_error,
+                                   sizeof(boundary_error));
+    if (!allowed) {
+        cbm_log_warn("daemon.workspace.skipped", "operation", operation, "detail",
+                     root && root[0] ? boundary_error : "session root is unavailable");
+    }
+    return allowed;
+}
+
 /* Caller holds application->mutex. */
 static void application_refresh_watch_locked(cbm_daemon_application_session_t *session) {
     cbm_daemon_application_t *application = session->application;
@@ -440,6 +462,10 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     const char *project = cbm_mcp_server_session_project(session->mcp);
     const char *root = cbm_mcp_server_session_root(session->mcp);
     if (!project || !project[0] || !root || !root[0]) {
+        return;
+    }
+    if (!application_session_workspace_allowed(session, "watch")) {
+        application_release_session_watch_locked(session);
         return;
     }
     bool enabled = !application->config ||
@@ -1394,6 +1420,11 @@ static void application_auto_index_retry_pending_locked(cbm_daemon_application_t
             session->auto_index_retry_pending = false;
             continue;
         }
+        if (!application_session_workspace_allowed(session, "auto_index_retry")) {
+            session->auto_index_retry_pending = false;
+            application_refresh_watch_locked(session);
+            continue;
+        }
         if (application_regular_db_exists(project)) {
             session->auto_index_retry_pending = false;
             application_refresh_watch_locked(session);
@@ -1557,6 +1588,33 @@ static bool application_index_args_normalize_defaults(yyjson_mut_val *root) {
     return true;
 }
 
+/* One directory is one root. The auto-index job spells repo_path the way the
+ * session policy holds it - the platform's native form, backslashes on
+ * Windows - while an explicit index_repository request arrives in the
+ * handler's forward-slash spelling. Compared byte-exact the two never matched
+ * on Windows, and the request was refused as an options conflict instead of
+ * joining the job already running for its root. The policy keeps its
+ * spelling: the sensitive-root and allowed-root containment checks match it
+ * byte-exact against HOME and the granted roots, and respelling it there
+ * admitted $HOME. So the fold happens here, on this comparison's private copy,
+ * and nothing the daemon stores changes. */
+static bool application_index_args_fold_repo_path(yyjson_mut_doc *document) {
+    yyjson_mut_val *root = yyjson_mut_doc_get_root(document);
+    yyjson_mut_val *repo_path = yyjson_mut_obj_get(root, "repo_path");
+    if (!repo_path || !yyjson_mut_is_str(repo_path)) {
+        return true;
+    }
+    char *folded = strdup(yyjson_mut_get_str(repo_path));
+    if (!folded) {
+        return false;
+    }
+    cbm_normalize_path_sep(folded);
+    yyjson_mut_val *key = yyjson_mut_str(document, "repo_path");
+    yyjson_mut_val *value = yyjson_mut_strcpy(document, folded);
+    free(folded);
+    return key && value && yyjson_mut_obj_replace(root, key, value);
+}
+
 static bool application_index_args_equal(const char *left, const char *right) {
     if (!left || !right) {
         return false;
@@ -1569,12 +1627,18 @@ static bool application_index_args_equal(const char *left, const char *right) {
     yyjson_mut_val *right_root = right_copy ? yyjson_mut_doc_get_root(right_copy) : NULL;
     bool equal = application_index_args_normalize_defaults(left_root) &&
                  application_index_args_normalize_defaults(right_root) &&
+                 application_index_args_fold_repo_path(left_copy) &&
+                 application_index_args_fold_repo_path(right_copy) &&
                  yyjson_mut_equals(left_root, right_root);
     yyjson_mut_doc_free(left_copy);
     yyjson_mut_doc_free(right_copy);
     yyjson_doc_free(left_source);
     yyjson_doc_free(right_source);
     return equal;
+}
+
+bool cbm_daemon_application_index_args_equal_for_test(const char *left, const char *right) {
+    return application_index_args_equal(left, right);
 }
 
 /* Caller holds application->mutex. Keeping watcher ownership validation and
@@ -1940,6 +2004,10 @@ static void application_background_initialize_impl(cbm_daemon_application_sessio
                             : CBM_MCP_DEFAULT_AUTO_INDEX_LIMIT;
     int tracked_files = -1;
     bool auto_index_candidate = auto_index && !db_exists;
+    if (auto_index_candidate &&
+        !application_session_workspace_allowed(session, "auto_index_discovery")) {
+        auto_index_candidate = false;
+    }
     bool within_auto_index_limit =
         !auto_index_candidate ||
         cbm_mcp_auto_index_within_file_limit(root_path, auto_index_limit, &tracked_files);
@@ -2324,9 +2392,7 @@ static cbm_daemon_runtime_application_status_t application_set_context(
     if (canonical && allowed_present) {
         canonical = cbm_canonical_path(allowed, canonical_allowed, sizeof(canonical_allowed));
     }
-    struct stat root_status;
-    canonical =
-        canonical && stat(canonical_root, &root_status) == 0 && S_ISDIR(root_status.st_mode);
+    canonical = canonical && application_canonical_directory_exists(canonical_root);
     bool set =
         canonical && cbm_mcp_server_set_session_context(session->mcp, canonical_root,
                                                         allowed_present ? canonical_allowed : NULL);
@@ -3339,9 +3405,8 @@ static int application_background_index(cbm_daemon_application_t *application,
         return -1;
     }
     char canonical_root[APPLICATION_PATH_CAP];
-    struct stat root_status;
     if (!cbm_canonical_path(root_path, canonical_root, sizeof(canonical_root)) ||
-        stat(canonical_root, &root_status) != 0 || !S_ISDIR(root_status.st_mode)) {
+        !application_canonical_directory_exists(canonical_root)) {
         return -1;
     }
     yyjson_mut_doc *document = yyjson_mut_doc_new(NULL);

@@ -419,6 +419,79 @@ TEST(platform_cache_dir_rejects_truncated_override) {
     PASS();
 }
 
+/* cbm_env_long reads a whole number, or says it could not.
+ *
+ * atoi and atol answer 0 for text they cannot read, and 0 is a real setting at
+ * every place this project reads a number out of the environment. So the
+ * helper reports whether the read worked instead of folding a failure into a
+ * value that looks fine. */
+TEST(platform_env_long_reads_a_clean_number) {
+    const char *name = "CBM_TEST_ENV_LONG";
+    char *saved = getenv(name) ? strdup(getenv(name)) : NULL;
+    long out = 0;
+
+    ASSERT_EQ(cbm_setenv(name, "42", 1), 0);
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, 42);
+
+    /* Zero is a real answer, not a failure. This is the case that made
+     * CBM_INDEX_MAX_RESTARTS=0 mean 100 restarts. */
+    ASSERT_EQ(cbm_setenv(name, "0", 1), 0);
+    out = 999;
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, 0);
+
+    ASSERT_EQ(cbm_setenv(name, "-7", 1), 0);
+    ASSERT_TRUE(cbm_env_long(name, &out));
+    ASSERT_EQ(out, -7);
+
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+    PASS();
+}
+
+TEST(platform_env_long_refuses_what_it_cannot_read) {
+    const char *name = "CBM_TEST_ENV_LONG";
+    char *saved = getenv(name) ? strdup(getenv(name)) : NULL;
+
+    /* Every one of these used to answer 0 through atol. */
+    const char *unreadable[] = {
+        "abc",  "30s",  " 30", "30 ", "",    "1e3",
+        "0x10", "+ 30", "--3", "3.5", "99999999999999999999999999",
+    };
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        ASSERT_EQ(cbm_setenv(name, unreadable[i], 1), 0);
+        long out = 1234; /* a value the helper must not touch */
+        if (cbm_env_long(name, &out)) {
+            printf("  \"%s\" was read as %ld\n", unreadable[i], out);
+        }
+        ASSERT_TRUE(!cbm_env_long(name, &out));
+        ASSERT_EQ(out, 1234);
+    }
+
+    /* A variable nobody set answers false too. */
+    ASSERT_EQ(cbm_unsetenv(name), 0);
+    long out = 555;
+    ASSERT_TRUE(!cbm_env_long(name, &out));
+    ASSERT_EQ(out, 555);
+
+    /* A NULL destination is refused rather than written through. */
+    ASSERT_EQ(cbm_setenv(name, "5", 1), 0);
+    ASSERT_TRUE(!cbm_env_long(name, NULL));
+
+    if (saved) {
+        (void)cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        (void)cbm_unsetenv(name);
+    }
+    PASS();
+}
+
 #ifdef _WIN32
 /* cbm_safe_getenv reads Windows' wide environment as UTF-8. Its matching
  * setter must update that same wide environment; _putenv_s alone interprets
@@ -707,6 +780,8 @@ SUITE(platform) {
     RUN_TEST(platform_default_workers_env_override);
     RUN_TEST(platform_default_workers_env_invalid);
     RUN_TEST(platform_default_workers_env_unset);
+    RUN_TEST(platform_env_long_reads_a_clean_number);
+    RUN_TEST(platform_env_long_refuses_what_it_cannot_read);
     RUN_TEST(platform_system_info);
 #ifdef __linux__
     RUN_TEST(cgroup_v2_cpu_quota);

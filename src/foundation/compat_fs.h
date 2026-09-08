@@ -36,7 +36,15 @@ typedef struct {
     int64_t mtime_ns;
 } cbm_path_info_t;
 
-/* Returns 0 on success and -1 when the path cannot be inspected. */
+enum {
+    CBM_PATH_INFO_OK = 0,
+    CBM_PATH_INFO_UNAVAILABLE = -1,
+    CBM_PATH_INFO_ABSENT = -2,
+};
+
+/* Distinguishes a proven absent path from permission, encoding, and transient
+ * inspection failures. Existing callers that only test zero/nonzero retain
+ * their behavior. */
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out);
 
 /* Open a directory for iteration. Returns NULL on error. */

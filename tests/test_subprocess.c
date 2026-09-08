@@ -21,7 +21,10 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/time.h>
 #include <unistd.h>
+#else
+#include <windows.h>
 #endif
 
 /* ── Layer 1: pure classifier (all platforms) ─────────────────────────────── */
@@ -188,6 +191,52 @@ TEST(subprocess_retries_transient_spawn_refusal) {
     ASSERT_EQ(cbm_subprocess_pending_spawn_eagain_for_testing(), 0);
     ASSERT_EQ(r.outcome, CBM_PROC_CLEAN);
     ASSERT_EQ(r.exit_code, 0);
+    PASS();
+#endif
+}
+
+#ifndef _WIN32
+static volatile sig_atomic_t g_spawn_backoff_alarm_count = 0;
+
+static void spawn_backoff_alarm_handler(int signal_number) {
+    (void)signal_number;
+    g_spawn_backoff_alarm_count++;
+}
+#endif
+
+TEST(subprocess_spawn_backoff_resumes_after_eintr) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX signal interruption");
+#else
+    struct sigaction action = {0};
+    struct sigaction previous_action = {0};
+    action.sa_handler = spawn_backoff_alarm_handler;
+    (void)sigemptyset(&action.sa_mask);
+    bool handler_installed = sigaction(SIGALRM, &action, &previous_action) == 0;
+
+    struct itimerval timer = {
+        .it_interval = {.tv_sec = 0, .tv_usec = 1000},
+        .it_value = {.tv_sec = 0, .tv_usec = 1000},
+    };
+    g_spawn_backoff_alarm_count = 0;
+    bool timer_started = handler_installed && setitimer(ITIMER_REAL, &timer, NULL) == 0;
+
+    uint64_t started_at = cbm_now_ms();
+    cbm_subprocess_force_spawn_eagain_for_testing(3);
+    cbm_proc_result_t result = run_sh("exit 0", 0);
+    uint64_t elapsed_ms = cbm_now_ms() - started_at;
+
+    struct itimerval disabled = {0};
+    (void)setitimer(ITIMER_REAL, &disabled, NULL);
+    if (handler_installed) {
+        (void)sigaction(SIGALRM, &previous_action, NULL);
+    }
+
+    ASSERT_TRUE(handler_installed);
+    ASSERT_TRUE(timer_started);
+    ASSERT_TRUE(g_spawn_backoff_alarm_count > 0);
+    ASSERT_TRUE(elapsed_ms >= 50);
+    ASSERT_EQ(result.outcome, CBM_PROC_CLEAN);
     PASS();
 #endif
 }
@@ -553,6 +602,143 @@ TEST(subprocess_quiet_timeout_kills_ignoring_tree) {
     ASSERT_TRUE(result.forced);
     ASSERT_TRUE(result.tree_quiesced);
     ASSERT_TRUE(parent_gone);
+    ASSERT_TRUE(grandchild_gone);
+    PASS();
+#endif
+}
+
+TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
+#ifndef _WIN32
+    SKIP_PLATFORM("native Windows Job Object descendant-tree probe");
+#else
+    char temp_dir[MAX_PATH];
+    DWORD temp_length = GetTempPathA((DWORD)sizeof(temp_dir), temp_dir);
+    ASSERT_TRUE(temp_length > 0 && temp_length < sizeof(temp_dir));
+    char pid_path[MAX_PATH];
+    ASSERT_TRUE(GetTempFileNameA(temp_dir, "cbm", 0, pid_path) != 0);
+    ASSERT_TRUE(DeleteFileA(pid_path));
+
+    char system_directory[MAX_PATH];
+    UINT system_length = GetSystemDirectoryA(system_directory, (UINT)sizeof(system_directory));
+    ASSERT_TRUE(system_length > 0 && system_length < sizeof(system_directory));
+    char powershell_path[MAX_PATH];
+    ASSERT_TRUE(snprintf(powershell_path, sizeof(powershell_path),
+                         "%s\\WindowsPowerShell\\v1.0\\powershell.exe", system_directory) > 0);
+
+    char script[4096];
+    int script_length = snprintf(
+        script, sizeof(script),
+        "$child=Start-Process powershell.exe "
+        "-ArgumentList '-NoProfile','-Command','while ($true) { Start-Sleep -Milliseconds 100 }' "
+        "-WindowStyle Hidden -PassThru; Set-Content -Encoding ASCII -LiteralPath '%s' "
+        "-Value ($PID.ToString() + ' ' + $child.Id.ToString()); "
+        "while ($true) { Start-Sleep -Milliseconds 100 }",
+        pid_path);
+    ASSERT_TRUE(script_length > 0 && (size_t)script_length < sizeof(script));
+    const char *argv[] = {powershell_path, "-NoProfile", "-Command", script, NULL};
+
+    cbm_proc_opts_t opts = {0};
+    opts.bin = powershell_path;
+    opts.argv = argv;
+    opts.cancel_grace_ms = 100;
+    cbm_subprocess_t *process = NULL;
+    ASSERT_EQ(cbm_subprocess_spawn(&opts, &process), 0);
+    ASSERT_NOT_NULL(process);
+
+    DWORD root_pid = 0;
+    DWORD grandchild_pid = 0;
+    uint64_t ready_deadline = cbm_now_ms() + 3000U;
+    bool ready = false;
+    while (cbm_now_ms() < ready_deadline) {
+        FILE *pid_file = fopen(pid_path, "r");
+        if (pid_file) {
+            unsigned long root_value = 0;
+            unsigned long grandchild_value = 0;
+            int fields = fscanf(pid_file, "%lu %lu", &root_value, &grandchild_value);
+            (void)fclose(pid_file);
+            if (fields == 2 && root_value > 0 && grandchild_value > 0) {
+                root_pid = (DWORD)root_value;
+                grandchild_pid = (DWORD)grandchild_value;
+                ready = true;
+                break;
+            }
+        }
+        cbm_proc_result_t ignored;
+        if (cbm_subprocess_poll(process, &ignored) != CBM_PROC_POLL_RUNNING) {
+            break;
+        }
+        Sleep(10);
+    }
+
+    HANDLE root_handle =
+        ready ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, root_pid) : NULL;
+    HANDLE grandchild_handle =
+        ready ? OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE, FALSE, grandchild_pid) : NULL;
+    /* Request cancellation even if the PID probe failed so a failing test never
+     * leaves its supervised tree running in the shared Windows VM. */
+    bool cancelled = cbm_subprocess_request_cancel(process);
+    cbm_proc_result_t result = {0};
+    bool terminal = false;
+    uint64_t terminal_deadline = cbm_now_ms() + 4000U;
+    while (cbm_now_ms() < terminal_deadline) {
+        cbm_proc_poll_t state = cbm_subprocess_poll(process, &result);
+        if (state == CBM_PROC_POLL_TERMINAL) {
+            terminal = true;
+            break;
+        }
+        if (state == CBM_PROC_POLL_ERROR) {
+            break;
+        }
+        Sleep(10);
+    }
+    /* If the behavior under test regresses, terminate both known Job members
+     * directly and give the supervisor one bounded drain interval. The test
+     * still fails on the original `terminal` verdict, but it cannot strand its
+     * infinite root/grandchild or retain a terminal subprocess/Job handle. */
+    bool cleanup_terminal = terminal;
+    if (!cleanup_terminal) {
+        if (grandchild_handle) {
+            (void)TerminateProcess(grandchild_handle, 1);
+        }
+        if (root_handle) {
+            (void)TerminateProcess(root_handle, 1);
+        }
+        (void)cbm_subprocess_request_cancel(process);
+        uint64_t cleanup_deadline = cbm_now_ms() + 2000U;
+        while (cbm_now_ms() < cleanup_deadline) {
+            cbm_proc_result_t cleanup_result;
+            cbm_proc_poll_t state = cbm_subprocess_poll(process, &cleanup_result);
+            if (state == CBM_PROC_POLL_TERMINAL) {
+                cleanup_terminal = true;
+                break;
+            }
+            if (state == CBM_PROC_POLL_ERROR) {
+                break;
+            }
+            Sleep(10);
+        }
+    }
+    bool root_gone = root_handle && WaitForSingleObject(root_handle, 2000) == WAIT_OBJECT_0;
+    bool grandchild_gone =
+        grandchild_handle && WaitForSingleObject(grandchild_handle, 2000) == WAIT_OBJECT_0;
+    if (root_handle) {
+        CloseHandle(root_handle);
+    }
+    if (grandchild_handle) {
+        CloseHandle(grandchild_handle);
+    }
+    if (cleanup_terminal) {
+        cbm_subprocess_destroy(process);
+    }
+    (void)DeleteFileA(pid_path);
+
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(cancelled);
+    ASSERT_TRUE(terminal);
+    ASSERT_TRUE(result.cancellation_requested);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(root_gone);
     ASSERT_TRUE(grandchild_gone);
     PASS();
 #endif
@@ -1033,6 +1219,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_run_crash_is_crash);
     RUN_TEST(subprocess_run_hang_is_hang);
     RUN_TEST(subprocess_retries_transient_spawn_refusal);
+    RUN_TEST(subprocess_spawn_backoff_resumes_after_eintr);
     RUN_TEST(subprocess_gives_up_after_the_retry_budget);
     RUN_TEST(subprocess_run_spawn_failure);
     RUN_TEST(subprocess_run_null_bin_rejected);
@@ -1040,6 +1227,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_natural_completion_is_cached_across_polls);
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
+    RUN_TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);

@@ -66,6 +66,7 @@ struct cbm_lock_registry {
     cbm_lock_registry_abort_failure_t test_abort_failure;
     bool test_abort_failure_armed;
     atomic_uint_fast64_t test_condition_wait_calls;
+    atomic_uint_fast64_t test_waiter_enqueue_calls;
     atomic_size_t test_condition_waiters_now;
     struct cbm_lock_registry *next_live;
     struct cbm_lock_registry *next_retired;
@@ -228,6 +229,7 @@ static void lock_registry_waiter_push(cbm_lock_registry_t *registry, lock_regist
     }
     entry->waiter_tail = waiter;
     registry->waiter_count++;
+    (void)atomic_fetch_add_explicit(&registry->test_waiter_enqueue_calls, 1, memory_order_relaxed);
 }
 
 static bool lock_registry_waiter_remove(cbm_lock_registry_t *registry, lock_registry_entry_t *entry,
@@ -914,6 +916,7 @@ cbm_private_file_lock_status_t cbm_lock_registry_free(cbm_lock_registry_t **regi
     registry->test_abort_failure = 0;
     registry->test_abort_failure_armed = false;
     atomic_store_explicit(&registry->test_condition_wait_calls, 0, memory_order_relaxed);
+    atomic_store_explicit(&registry->test_waiter_enqueue_calls, 0, memory_order_relaxed);
     atomic_store_explicit(&registry->test_condition_waiters_now, 0, memory_order_relaxed);
     registry->next_retired = lock_registry_retired;
     lock_registry_retired = registry;
@@ -984,6 +987,15 @@ size_t cbm_lock_registry_attempting_waiter_count_for_test(cbm_lock_registry_t *r
 uint64_t cbm_lock_registry_condition_wait_call_count_for_test(const cbm_lock_registry_t *registry) {
     return registry
                ? atomic_load_explicit(&registry->test_condition_wait_calls, memory_order_relaxed)
+               : 0;
+}
+
+/* Enqueue is monotonic, so a test can observe that a waiter joined the queue
+ * after the fact instead of catching a queue depth that the waiter's own
+ * deadline erases again. */
+uint64_t cbm_lock_registry_waiter_enqueue_count_for_test(const cbm_lock_registry_t *registry) {
+    return registry
+               ? atomic_load_explicit(&registry->test_waiter_enqueue_calls, memory_order_relaxed)
                : 0;
 }
 

@@ -20,7 +20,11 @@ import sys
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 GRAMMARS = os.path.join(ROOT, "internal/cbm/vendored/grammars")
 
-FIRST_PARTY = {"cobol", "form", "janet", "magma", "protobuf", "wolfram"}
+# Grammars authored in this repository. This is a REGISTRATION, not an
+# exemption: membership only routes the check -- the audit still requires the
+# vendored LICENSE to be byte-equal to the project root LICENSE, and reports
+# FIRST-PARTY-VAR (a failing verdict) when it is not.
+FIRST_PARTY = {"chialisp", "cobol", "form", "janet", "magma", "protobuf", "wolfram"}
 FORKS = {  # self-maintained forks: vendored LICENSE must match the original upstream
     # arkts: our own ArkTS fork of tree-sitter-typescript. The vendored LICENSE is
     # upstream's MIT verbatim, which is what MIT requires of a derivative; our own

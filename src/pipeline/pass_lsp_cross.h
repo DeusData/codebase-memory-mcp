@@ -54,10 +54,19 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang);
  * receives per-file prefix offsets: file i's defs occupy
  * [out_def_starts[i], out_def_starts[i+1]) — the LSP-surface serializer
  * needs the per-file slices, which the flat array does not otherwise
- * record. */
-CBMLSPDef *cbm_pxc_collect_all_defs(CBMFileResult **cache, const cbm_file_info_t *files,
-                                    int file_count, const char *project_name, char **def_modules,
-                                    int *out_count, int *out_def_starts);
+ * record.
+ *
+ * `ctx` (nullable) enables cross-file base-class resolution: for the
+ * languages whose cross registrars read embedded_types as qualified names
+ * (Python, JS/TS/TSX), every CBMDefinition.base_classes spelling is resolved
+ * to a project QN through ctx->registry plus the file's import map — the same
+ * inputs pass_semantic uses to draw its INHERITS edge, so the LSP's
+ * inheritance view and the graph's cannot diverge. Pass NULL to keep the raw
+ * source spelling (surface-probe paths that build no registry). */
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                    const cbm_file_info_t *files, int file_count,
+                                    const char *project_name, char **def_modules, int *out_count,
+                                    int *out_def_starts);
 
 /* Detect TS dialect flags from a relative path. */
 void cbm_pxc_ts_modes(CBMLanguage lang, const char *rel_path, bool *out_js, bool *out_jsx,
@@ -170,10 +179,14 @@ static inline CBMTypeRegistry *cbm_pxc_registry_for_lang(const CBMCrossLspRegist
     }
 }
 
-/* Borrow the (thread-local) Rust Cargo manifest the cross-file LSP pass set for
- * cross-crate (#56) routing. The Tier-2 prebuilt Rust resolve reads it so it sees
- * exactly what the per-file fallback (cbm_pxc_run_one) would on the same thread. */
+/* Build and borrow the Rust Cargo manifest used for cross-crate (#56) routing.
+ * The manifest owns strings in manifest_arena; callers keep that arena alive
+ * until every resolver worker has joined.  Each worker must install the shared
+ * immutable pointer in its own TLS slot before dispatch and clear it afterward. */
 struct CBMCargoManifest;
+bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *manifest_arena,
+                                 struct CBMCargoManifest *out_manifest);
+void cbm_pxc_set_rust_manifest(const struct CBMCargoManifest *manifest);
 const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
 
 /* Run the cross-file LSP resolver for non-TS languages. Appends

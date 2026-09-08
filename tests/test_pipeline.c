@@ -824,8 +824,8 @@ TEST(pipeline_calls_resolution) {
 
 /* True iff a CALLS edge exists from a node named src_name to a node named
  * tgt_name. Used to assert cross-file call resolution survives a reindex. */
-static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
-                                   const char *tgt_name) {
+static bool cross_file_edge_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name, const char *edge_type) {
     cbm_node_t *srcs = NULL;
     cbm_node_t *tgts = NULL;
     int sc = 0;
@@ -836,7 +836,7 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     for (int i = 0; i < sc && !found; i++) {
         cbm_edge_t *edges = NULL;
         int ec = 0;
-        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, edge_type, &edges, &ec);
         for (int j = 0; j < ec && !found; j++) {
             for (int k = 0; k < tc; k++) {
                 if (edges[j].target_id == tgts[k].id) {
@@ -856,6 +856,11 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
         cbm_store_free_nodes(tgts, tc);
     }
     return found;
+}
+
+static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
+                                   const char *tgt_name) {
+    return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
 }
 
 /* True iff the exact named CALLS edge exists and its serialized strategy
@@ -1052,14 +1057,13 @@ static NamedEdgePropertyObservation observe_named_edge_callee_property(
     }
     observation.database_opened = true;
 
-    static const char sql[] =
-        "SELECT e.properties, json_valid(e.properties), "
-        "CASE WHEN json_valid(e.properties) "
-        "THEN json_extract(e.properties, '$.callee') END "
-        "FROM edges e "
-        "JOIN nodes src ON src.id=e.source_id AND src.project=e.project "
-        "JOIN nodes tgt ON tgt.id=e.target_id AND tgt.project=e.project "
-        "WHERE e.project=?1 AND e.type=?2 AND src.name=?3 AND tgt.name=?4;";
+    static const char sql[] = "SELECT e.properties, json_valid(e.properties), "
+                              "CASE WHEN json_valid(e.properties) "
+                              "THEN json_extract(e.properties, '$.callee') END "
+                              "FROM edges e "
+                              "JOIN nodes src ON src.id=e.source_id AND src.project=e.project "
+                              "JOIN nodes tgt ON tgt.id=e.target_id AND tgt.project=e.project "
+                              "WHERE e.project=?1 AND e.type=?2 AND src.name=?3 AND tgt.name=?4;";
     sqlite3_stmt *stmt = NULL;
     if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK ||
         sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT) != SQLITE_OK ||
@@ -1747,13 +1751,13 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
     long_reference_name[0] = 'l';
     long_reference_name[LONG_REFERENCE_NAME_LEN] = '\0';
     char long_reference_source[1024];
-    int long_reference_source_len = snprintf(
-        long_reference_source, sizeof(long_reference_source),
-        "package parity\n"
-        "func %s() {}\n"
-        "func longPropertiesReferenceAccept(callback func()) {}\n"
-        "func longPropertiesReferenceSite() { longPropertiesReferenceAccept(%s) }\n",
-        long_reference_name, long_reference_name);
+    int long_reference_source_len =
+        snprintf(long_reference_source, sizeof(long_reference_source),
+                 "package parity\n"
+                 "func %s() {}\n"
+                 "func longPropertiesReferenceAccept(callback func()) {}\n"
+                 "func longPropertiesReferenceSite() { longPropertiesReferenceAccept(%s) }\n",
+                 long_reference_name, long_reference_name);
     if (long_reference_source_len <= 0 ||
         (size_t)long_reference_source_len >= sizeof(long_reference_source)) {
         th_rmtree(tmp);
@@ -1941,18 +1945,18 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                 named_edge_count(sequential_store, sequential_project, "CALLS",
                                  shadow_controls[i].source_name, shadow_controls[i].target_name);
         }
-        sequential_long_reference = named_edge_count(
-            sequential_store, sequential_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
-            long_reference_name);
-        sequential_long_usage = named_edge_count(sequential_store, sequential_project, "USAGE",
-                                                 "longPropertiesReferenceSite",
-                                                 long_reference_name);
-        sequential_long_calls = named_edge_count(sequential_store, sequential_project, "CALLS",
-                                                 "longPropertiesReferenceSite",
-                                                 long_reference_name);
+        sequential_long_reference =
+            named_edge_count(sequential_store, sequential_project, "CALL_REFERENCE",
+                             "longPropertiesReferenceSite", long_reference_name);
+        sequential_long_usage =
+            named_edge_count(sequential_store, sequential_project, "USAGE",
+                             "longPropertiesReferenceSite", long_reference_name);
+        sequential_long_calls =
+            named_edge_count(sequential_store, sequential_project, "CALLS",
+                             "longPropertiesReferenceSite", long_reference_name);
         sequential_long_property = observe_named_edge_callee_property(
-            sequential_db_path, sequential_project, "CALL_REFERENCE",
-            "longPropertiesReferenceSite", long_reference_name, long_reference_name);
+            sequential_db_path, sequential_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
+            long_reference_name, long_reference_name);
         cbm_store_close(sequential_store);
     }
     cbm_pipeline_free(sequential);
@@ -1990,9 +1994,9 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
                 named_edge_count(parallel_store, parallel_project, "CALLS",
                                  shadow_controls[i].source_name, shadow_controls[i].target_name);
         }
-        parallel_long_reference = named_edge_count(
-            parallel_store, parallel_project, "CALL_REFERENCE", "longPropertiesReferenceSite",
-            long_reference_name);
+        parallel_long_reference =
+            named_edge_count(parallel_store, parallel_project, "CALL_REFERENCE",
+                             "longPropertiesReferenceSite", long_reference_name);
         parallel_long_usage = named_edge_count(parallel_store, parallel_project, "USAGE",
                                                "longPropertiesReferenceSite", long_reference_name);
         parallel_long_calls = named_edge_count(parallel_store, parallel_project, "CALLS",
@@ -2059,6 +2063,226 @@ TEST(pipeline_call_reference_sequential_parallel_edge_set_parity) {
         ASSERT_EQ(parallel_shadow_leaks[i], 0);
     }
     ASSERT_EQ(sequential_total, expected_total);
+    PASS();
+}
+
+/* Reproduce-first for the multi-worker determinism gap distilled from #1925:
+ * the complexity pass walked Function/Method nodes and their CALLS targets in
+ * temp-id order. Extract workers draw ids from one shared counter, so that
+ * order is worker-scheduling order, and the cycle guard flags whichever member
+ * of a mutual-recursion cycle the DFS enters first. Run to run, `recursive`
+ * therefore flipped between the members of a cycle while the CALLS edge set
+ * stayed identical -- a violation of the MT-byte-identical invariant. The
+ * fixture holds 24 two-member and 6 three-member cycles, one function per
+ * file, whose members are equal-sized (adjacent in the size-ordered work
+ * queue), which is what makes the flip likely. The
+ * fixture exceeds MIN_FILES_FOR_PARALLEL; CBM_INDEX_SINGLE_THREAD forces the
+ * reference run through the sequential path and CBM_WORKERS forces the
+ * repeated runs through pass_parallel.c, exactly like the parity test above.
+ * Every multi-worker run must match the sequential one byte for byte. */
+enum { CX_ORDER_MT_RUNS = 6, CX_ORDER_LINE_MAX = 512 };
+
+static const char *cx_order_fixture_dir(void) {
+    return "tests/fixtures/complexity_pass_cycle_order";
+}
+
+/* Copy the regular files of a flat fixture directory into dst_dir. Returns the
+ * number of files copied, or -1 when one could not be read whole. */
+static int cx_order_copy_fixture(const char *src_dir, const char *dst_dir) {
+    cbm_dir_t *d = cbm_opendir(src_dir);
+    if (!d) {
+        return -1;
+    }
+    int copied = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        if (entry->name[0] == '.' || entry->is_dir) {
+            continue;
+        }
+        char src[CBM_SZ_1K];
+        snprintf(src, sizeof(src), "%s/%s", src_dir, entry->name);
+        FILE *in = cbm_fopen(src, "rb");
+        if (!in) {
+            copied = -1;
+            break;
+        }
+        char buf[CBM_SZ_4K];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, in);
+        fclose(in);
+        if (n == sizeof(buf) - 1) {
+            copied = -1; /* fixture files are tiny; a full buffer means truncation */
+            break;
+        }
+        buf[n] = '\0';
+        write_temp_file(dst_dir, entry->name, buf);
+        copied++;
+    }
+    cbm_closedir(d);
+    return copied;
+}
+
+static int cx_order_cmp_node_qn(const void *pa, const void *pb) {
+    const cbm_node_t *a = *(const cbm_node_t *const *)pa;
+    const cbm_node_t *b = *(const cbm_node_t *const *)pb;
+    return strcmp(a->qualified_name ? a->qualified_name : "",
+                  b->qualified_name ? b->qualified_name : "");
+}
+
+/* One line per Function in qualified-name order: "<qn> <tld> <recursive>".
+ * Sorting by name keeps DB ids and row order out of the comparison. Returns a
+ * heap string, or NULL when the store cannot be read. */
+static char *cx_order_signature(const char *db_path, const char *project, int *func_count) {
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        return NULL;
+    }
+    cbm_node_t *funcs = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_label(s, project, "Function", &funcs, &count) != CBM_STORE_OK) {
+        cbm_store_close(s);
+        return NULL;
+    }
+    const cbm_node_t **sorted = calloc((size_t)count + 1, sizeof(*sorted));
+    char *sig = calloc((size_t)count + 1, CX_ORDER_LINE_MAX);
+    if (sorted && sig) {
+        for (int i = 0; i < count; i++) {
+            sorted[i] = &funcs[i];
+        }
+        qsort(sorted, (size_t)count, sizeof(*sorted), cx_order_cmp_node_qn);
+        size_t used = 0;
+        for (int i = 0; i < count; i++) {
+            const char *props = sorted[i]->properties_json ? sorted[i]->properties_json : "{}";
+            const char *tld = strstr(props, "\"transitive_loop_depth\":");
+            const char *rec = strstr(props, "\"recursive\":");
+            int w = snprintf(sig + used, CX_ORDER_LINE_MAX, "%s %.*s %.*s\n",
+                             sorted[i]->qualified_name ? sorted[i]->qualified_name : "",
+                             tld ? (int)strcspn(tld, ",}") : 0, tld ? tld : "",
+                             rec ? (int)strcspn(rec, ",}") : 0, rec ? rec : "");
+            if (w < 0) {
+                w = 0;
+            } else if (w >= CX_ORDER_LINE_MAX) {
+                w = CX_ORDER_LINE_MAX - 1;
+            }
+            used += (size_t)w;
+        }
+    } else {
+        free(sig);
+        sig = NULL;
+    }
+    free(sorted);
+    cbm_store_free_nodes(funcs, count);
+    cbm_store_close(s);
+    *func_count = count;
+    return sig;
+}
+
+/* First line of `got` that differs from `want`, copied into out (for the
+ * failure diagnostic). Returns false when the strings are identical. */
+static bool cx_order_first_diff(const char *want, const char *got, char *out, size_t cap) {
+    if (strcmp(want, got) == 0) {
+        return false;
+    }
+    while (*want && *got) {
+        size_t lw = strcspn(want, "\n");
+        size_t lg = strcspn(got, "\n");
+        if (lw != lg || memcmp(want, got, lw) != 0) {
+            snprintf(out, cap, "want '%.*s' got '%.*s'", (int)lw, want, (int)lg, got);
+            return true;
+        }
+        want += lw + (want[lw] == '\n');
+        got += lg + (got[lg] == '\n');
+    }
+    snprintf(out, cap, "line count differs");
+    return true;
+}
+
+TEST(pipeline_complexity_props_independent_of_worker_order) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_cx_order_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    int copied = cx_order_copy_fixture(cx_order_fixture_dir(), tmp);
+    if (copied <= 0) {
+        th_rmtree(tmp);
+        FAIL("fixture copy");
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/cx_sequential.db", tmp);
+    cbm_pipeline_t *sequential = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int sequential_rc = sequential ? cbm_pipeline_run(sequential) : -1;
+    int sequential_funcs = 0;
+    char *sequential_sig = NULL;
+    if (sequential && sequential_rc == 0) {
+        sequential_sig =
+            cx_order_signature(db_path, cbm_pipeline_project_name(sequential), &sequential_funcs);
+    }
+    cbm_pipeline_free(sequential);
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel_rc[CX_ORDER_MT_RUNS];
+    char *parallel_sig[CX_ORDER_MT_RUNS];
+    for (int r = 0; r < CX_ORDER_MT_RUNS; r++) {
+        snprintf(db_path, sizeof(db_path), "%s/cx_parallel_%d.db", tmp, r);
+        cbm_pipeline_t *parallel = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        parallel_rc[r] = parallel ? cbm_pipeline_run(parallel) : -1;
+        parallel_sig[r] = NULL;
+        if (parallel && parallel_rc[r] == 0) {
+            int funcs = 0;
+            parallel_sig[r] =
+                cx_order_signature(db_path, cbm_pipeline_project_name(parallel), &funcs);
+        }
+        cbm_pipeline_free(parallel);
+    }
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    /* Verdicts first, then release, then assert: the assertions must not leak. */
+    bool cycles_detected = sequential_sig && strstr(sequential_sig, "\"recursive\":true") != NULL;
+    int mismatch_run = -1;
+    char diff[CBM_SZ_1K] = "";
+    for (int r = 0; r < CX_ORDER_MT_RUNS && mismatch_run < 0; r++) {
+        if (parallel_rc[r] != 0 || !parallel_sig[r]) {
+            mismatch_run = r;
+            snprintf(diff, sizeof(diff), "run %d rc=%d", r, parallel_rc[r]);
+        } else if (sequential_sig &&
+                   cx_order_first_diff(sequential_sig, parallel_sig[r], diff, sizeof(diff))) {
+            mismatch_run = r;
+        }
+    }
+    free(sequential_sig);
+    for (int r = 0; r < CX_ORDER_MT_RUNS; r++) {
+        free(parallel_sig[r]);
+    }
+
+    ASSERT_EQ(sequential_rc, 0);
+    ASSERT_NOT_NULL(sequential_sig);
+    ASSERT_GTE(sequential_funcs, copied); /* at least the one function per fixture file */
+    ASSERT_TRUE(cycles_detected);        /* the cycles must reach the pass at all */
+    if (mismatch_run >= 0) {
+        printf("\n    parallel run %d diverges from sequential: %s\n", mismatch_run, diff);
+        FAIL("complexity props depend on worker id order");
+    }
     PASS();
 }
 
@@ -2472,8 +2696,8 @@ static void closure_probe_repo(const char *tmp) {
 }
 
 /* Fresh full reference build of the same tree into its own DB. */
-static void closure_fresh_full(const char *tmp, const char *db_path, int *out_nodes,
-                               int *out_edges, int *out_ref_edges, const char *project_hint) {
+static void closure_fresh_full(const char *tmp, const char *db_path, int *out_nodes, int *out_edges,
+                               int *out_ref_edges, const char *project_hint) {
     *out_nodes = -1;
     *out_edges = -2;
     *out_ref_edges = -3;
@@ -2490,9 +2714,9 @@ static void closure_fresh_full(const char *tmp, const char *db_path, int *out_no
         if (store) {
             *out_nodes = cbm_store_count_nodes(store, project);
             *out_edges = cbm_store_count_edges(store, project);
-            *out_ref_edges = named_edge_to_file_count(store, project, "CALL_REFERENCE",
-                                                      "closureProbeCaller", "closureProbeHelper",
-                                                      "lib.ts");
+            *out_ref_edges =
+                named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
+                                         "closureProbeHelper", "lib.ts");
             cbm_store_close(store);
         }
     }
@@ -2577,8 +2801,8 @@ TEST(pipeline_closure_repair_body_edit_converges_with_fresh_full) {
     ASSERT_NOT_NULL(store);
     repaired_nodes = cbm_store_count_nodes(store, project);
     repaired_edges = cbm_store_count_edges(store, project);
-    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE",
-                                             "closureProbeCaller", "closureProbeHelper", "lib.ts");
+    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
+                                             "closureProbeHelper", "lib.ts");
     cbm_store_close(store);
 
     char full_db[512];
@@ -2634,8 +2858,8 @@ TEST(pipeline_closure_repair_removed_def_drops_dependent_edge) {
     int repaired_refs = -1;
     cbm_store_t *store = cbm_store_open_path(db);
     ASSERT_NOT_NULL(store);
-    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE",
-                                             "closureProbeCaller", "closureProbeHelper", "lib.ts");
+    repaired_refs = named_edge_to_file_count(store, project, "CALL_REFERENCE", "closureProbeCaller",
+                                             "closureProbeHelper", "lib.ts");
     int repaired_nodes = cbm_store_count_nodes(store, project);
     int repaired_edges = cbm_store_count_edges(store, project);
     cbm_store_close(store);
@@ -2878,8 +3102,7 @@ TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
      * target_a.ts to target_b.ts. Since alias-config governance landed this
      * runs as a closure repair, and the convergence assertions below now
      * prove that route rather than being satisfied by a full rebuild. */
-    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(),
-              CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
     const char *incremental_project = cbm_pipeline_project_name(incremental);
     cbm_store_t *incremental_store = cbm_store_open_path(incremental_db);
     ASSERT_NOT_NULL(incremental_store);
@@ -2933,6 +3156,87 @@ TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full) {
 }
 
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+static int read_published_generation(const char *db_path, char *out, size_t out_size) {
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store) {
+        return CBM_STORE_ERR;
+    }
+    int rc = cbm_store_generation(store, out, out_size);
+    cbm_store_close(store);
+    return rc;
+}
+
+static bool split_published_generation(const char *generation, char uid[18],
+                                       unsigned long long *mutation) {
+    if (!generation || strlen(generation) < 19 || generation[0] != 'u' || generation[17] != 'g') {
+        return false;
+    }
+    memcpy(uid, generation, 17);
+    uid[17] = '\0';
+    char *end = NULL;
+    unsigned long long parsed = strtoull(generation + 18, &end, 10);
+    if (!end || end == generation + 18 || *end != '\0') {
+        return false;
+    }
+    *mutation = parsed;
+    return true;
+}
+
+/* Every published database must carry cursor-generation metadata. A complete
+ * replacement gets a fresh database identity; an isolated delta clones the
+ * live database and advances only its mutation counter. */
+TEST(pipeline_publication_stamps_full_and_delta_generations) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_cursor_generation_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def PublishedGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    cbm_pipeline_free(baseline);
+    char first[128];
+    ASSERT_EQ(read_published_generation(db_path, first, sizeof(first)), CBM_STORE_OK);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *replacement = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(replacement);
+    ASSERT_EQ(cbm_pipeline_run(replacement), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    cbm_pipeline_free(replacement);
+    char second[128];
+    ASSERT_EQ(read_published_generation(db_path, second, sizeof(second)), CBM_STORE_OK);
+
+    write_temp_file(tmp, "generation.py", "def PublishedGeneration():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *delta = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(delta);
+    ASSERT_EQ(cbm_pipeline_run(delta), 0);
+    ASSERT_EQ(cbm_pipeline_incremental_test_last_route(), CBM_INCREMENTAL_ROUTE_CLOSURE_REPAIR);
+    cbm_pipeline_free(delta);
+    char third[128];
+    ASSERT_EQ(read_published_generation(db_path, third, sizeof(third)), CBM_STORE_OK);
+
+    char first_uid[18];
+    char second_uid[18];
+    char third_uid[18];
+    unsigned long long first_mutation = 0;
+    unsigned long long second_mutation = 0;
+    unsigned long long third_mutation = 0;
+    ASSERT_TRUE(split_published_generation(first, first_uid, &first_mutation));
+    ASSERT_TRUE(split_published_generation(second, second_uid, &second_mutation));
+    ASSERT_TRUE(split_published_generation(third, third_uid, &third_mutation));
+    ASSERT_TRUE(strcmp(first_uid, second_uid) != 0);
+    ASSERT_STR_EQ(second_uid, third_uid);
+    ASSERT_TRUE(third_mutation > second_mutation);
+    th_rmtree(tmp);
+    cbm_pipeline_incremental_test_reset_faults();
+    PASS();
+}
+
 static void observe_named_generation(const char *db_path, const char *project,
                                      const char *before_name, const char *after_name,
                                      int *before_count, int *after_count) {
@@ -3067,8 +3371,8 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
     static const char canary[] = "canary-must-survive\n";
     char canary_path[PREDICTABLE_CANARIES][640];
     for (int i = 0; i < PREDICTABLE_CANARIES; i++) {
-        snprintf(canary_path[i], sizeof(canary_path[i]), "%s.stage.%ld.%d", db_path,
-                 (long)getpid(), i + 1);
+        snprintf(canary_path[i], sizeof(canary_path[i]), "%s.stage.%ld.%d", db_path, (long)getpid(),
+                 i + 1);
         ASSERT_EQ(th_write_file(canary_path[i], canary), 0);
     }
 
@@ -4627,6 +4931,328 @@ TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* Python counterpart to the TS/JS receiver guard (#1276), sequential path.
+ * Pins BOTH directions. NEGATIVE: an attribute call on an unknown receiver
+ * (a parameter) must not bind the lone same-named project method through
+ * unique_name. POSITIVE: an import-bound receiver (helper.compute) and a bare
+ * local call must still produce their CALLS edges.
+ * Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_python_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "worker.py",
+                    "class Worker:\n"
+                    "    def backward(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "pkg/__init__.py", "from .helper import compute\n");
+    write_temp_file(tmp, "pkg/helper.py",
+                    "def compute(value):\n"
+                    "    return value * 2\n");
+    write_temp_file(tmp, "caller.py",
+                    "from pkg import helper\n"
+                    "\n"
+                    "def external_call(accelerator):\n"
+                    "    return accelerator.backward()\n"
+                    "\n"
+                    "def imported_call():\n"
+                    "    return helper.compute(42)\n"
+                    "\n"
+                    "def local_helper():\n"
+                    "    return 1\n"
+                    "\n"
+                    "def bare_call():\n"
+                    "    return local_helper()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/python_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: `accelerator` is a parameter — Worker.backward must not bind. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "external_call", "backward"));
+    /* POSITIVE: import-bound receiver and bare local call both survive. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "imported_call", "compute"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "bare_call", "local_helper"));
+    /* Tripwire: a run that emitted no edges at all would satisfy the negative
+     * assertion vacuously. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Fixture for the #1928 cross-language reference-guard probes (sequential and
+ * parallel twins). pad_files > 0 adds filler files to push the index over the
+ * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
+ * path and both must consult the guard. */
+static void write_go_c_ref_guard_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxguard\n\ngo 1.22\n");
+    /* The C probe: a local named `event` and a file-scope function `handle`,
+     * the two shapes Go identifiers collide with. */
+    write_temp_file(tmp, "probe/probe.c",
+                    "static int total_events = 0;\n"
+                    "\n"
+                    "static int handle(void) {\n"
+                    "    int event = 0;\n"
+                    "    total_events += event;\n"
+                    "    return event;\n"
+                    "}\n");
+    /* Go: a local write named like the C local, and a value use named like
+     * the C function. Neither can touch anything in a C translation unit. */
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "func TrackEvent() int {\n"
+                    "\tevent := 1\n"
+                    "\treturn event\n"
+                    "}\n"
+                    "\n"
+                    "func UsesHandle() int {\n"
+                    "\th := handle\n"
+                    "\t_ = h\n"
+                    "\treturn 4\n"
+                    "}\n"
+                    "\n"
+                    "func WriteTotal() {\n"
+                    "\ttotal_events := 5\n"
+                    "\t_ = total_events\n"
+                    "}\n");
+    /* Same-language control: a Go package-level var written from another
+     * file must keep its WRITES edge. */
+    write_temp_file(tmp, "state/vars.go",
+                    "package state\n"
+                    "\n"
+                    "var Counter int\n");
+    write_temp_file(tmp, "state/state.go",
+                    "package state\n"
+                    "\n"
+                    "func Bump() {\n"
+                    "\tCounter = 2\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+TEST(pipeline_go_rw_usage_never_cross_into_c) {
+    /* #1928: USAGE and WRITES/READS resolve through the same short-name
+     * registry as CALLS but never consulted the #725 cross-language guard.
+     * On a Go tree with eBPF C probes every Go identifier spelled like a C
+     * one produced an edge into the C file — 31.5% of all WRITES on the
+     * measured repo crossed the Go/C boundary. Go code cannot write a C
+     * automatic variable, so every edge in that class is false. This is the
+     * SEQUENTIAL-path twin; the parallel twin follows. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_rw_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_c_ref_guard_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_rw.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Reproduce-first: RED before the fix — the Go local write binds the C
+     * probe's global, and the Go value use binds the C `handle`. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "USAGE"));
+    /* Same-language reference edges survive the guard. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Bump", "Counter", "WRITES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
+    /* Parallel twin of the test above: USAGE and WRITES/READS each have a
+     * second, independent resolver in pass_parallel.c (resolve_file_usages /
+     * resolve_file_rw) that must consult the same guard — the field census
+     * that motivated this caught the sequential-only fix leaving 344 Go→C
+     * WRITES alive on a ~1150-file repo. >= 50 files forces the parallel
+     * pipeline. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_rwp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_c_ref_guard_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_rwp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "TrackEvent", "event", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "UsesHandle", "handle", "USAGE"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "WriteTotal", "total_events", "USAGE"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Bump", "Counter", "WRITES"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
+
+/* Fixture for the #1942 bare-reference-vs-Field probes: a Go struct field
+ * named like the commonest local (`err`), and a function whose local of the
+ * same name must NOT bind it — in Go a field is only reachable through a
+ * selector expression, never a bare identifier. Needs Go Field extraction
+ * (#1935) to have anything to falsely bind. */
+static void write_go_bare_field_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "go.mod", "module example.com/fxbare\n\ngo 1.22\n");
+    write_temp_file(tmp, "state/state.go",
+                    "package state\n"
+                    "\n"
+                    "type Tracker struct {\n"
+                    "\terr error\n"
+                    "\tn   int\n"
+                    "}\n");
+    write_temp_file(tmp, "app/app.go",
+                    "package app\n"
+                    "\n"
+                    "import \"errors\"\n"
+                    "\n"
+                    "func Run() error {\n"
+                    "\terr := errors.New(\"x\")\n"
+                    "\treturn err\n"
+                    "}\n");
+    /* #1962: genuine selector references from a sibling file of the same
+     * package. `t.err = nil` writes the field through a selector; `t.n` reads
+     * it. The extractor strips the receiver on both paths, so only the
+     * is_member_access signal can distinguish these from Run's bare local. */
+    write_temp_file(tmp, "state/reset.go",
+                    "package state\n"
+                    "\n"
+                    "func (t *Tracker) Reset() int {\n"
+                    "\tt.err = nil\n"
+                    "\treturn t.n\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad/filler%d.go", i);
+        snprintf(body, sizeof(body), "package pad\n\nfunc filler%d() int { return %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+TEST(pipeline_go_bare_ref_never_binds_field) {
+    /* #1942: the READS/WRITES resolvers and the USAGE registry fallback hand
+     * bare reference text to the short-name registry, which contains Field
+     * nodes — so every Go local `err := …` bound whichever struct field was
+     * named err (21308 USAGE / 5191 WRITES onto Go fields on the measured
+     * repo, top target a test struct's field collecting 3013 edges).
+     * Sequential-path twin; the parallel twin follows. */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_bare_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_field_fixture(tmp, 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* The field must exist for the probe to mean anything (#1935's fix). */
+    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    /* Reproduce-first: RED before the fix — the bare local binds the field. */
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+    /* #1962, reproduce-first: RED while the guard is a blanket veto — genuine
+     * selector references must reach the field (write via `t.err = nil`,
+     * value use via `t.n`). */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
+    /* Parallel twin: resolve_file_rw / resolve_file_usages are independent
+     * resolvers and must consult the same predicate (#1928's lesson). */
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_go_barep_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_go_bare_field_fixture(tmp, 52);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/go_barep.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_TRUE(count_nodes_named(s, project, "err") >= 1);
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "WRITES"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "READS"));
+    ASSERT_FALSE(cross_file_edge_exists(s, project, "Run", "err", "USAGE"));
+    /* #1962 parallel twin: resolve_file_rw / resolve_file_usages must honour
+     * the member-access signal exactly like the sequential resolvers. */
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "err", "WRITES"));
+    ASSERT_TRUE(cross_file_edge_exists(s, project, "Reset", "n", "USAGE"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -4762,6 +5388,229 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
      * receiver and the dev.load weak match to ApiThing.load. */
     ASSERT_FALSE(cross_file_call_exists(s, project, "checkFormat", "test"));
     ASSERT_FALSE(cross_file_call_exists(s, project, "callLoad", "load"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Python bare-call local-binding suppression, sequential path. The bare-call
+ * counterpart of the receiver guard above: `run` is a PARAMETER, so `run()`
+ * cannot be the module-level `run` and must not bind SatoriLive.run.
+ *
+ * The positive control is deliberately a CROSS-FILE bare call with no import,
+ * so it resolves by a weak short-name strategy — one this guard could have
+ * killed. Asserting a same-file (same_module) edge instead would prove nothing,
+ * because no guard in this codebase touches same_module for any input.
+ * Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_python_bare_local_binding_suppresses_weak_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_bare_seq_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "live.py",
+                    "class SatoriLive:\n"
+                    "    def run(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "helpers.py",
+                    "def compute_widget_total():\n"
+                    "    return 7\n");
+    write_temp_file(tmp, "gate.py",
+                    "def _run_with_heavy_slot(run):\n"
+                    "    return run()\n"
+                    "\n"
+                    "def uses_free_function():\n"
+                    "    return compute_widget_total()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_bare.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: the callee is shadowed by a parameter. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "run"));
+    /* POSITIVE: an unshadowed cross-file bare call survives. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "uses_free_function", "compute_widget_total"));
+    /* Tripwire: a run that emitted no edges at all would satisfy the negative
+     * assertion vacuously. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel Python regression for #1276. The field-type heuristic capitalizes
+ * the receiver token and previously promoted accelerator.print() to
+ * MockAccelerator.print at 0.85; ordinary suffix matching also selected one
+ * arbitrary backward()/step() implementation. All are unresolved-receiver
+ * calls and must remain absent, while the import-bound call and the bare local
+ * call remain — the same both-directions pin as the sequential test above.
+ * >= 50 files forces pass_parallel.c and try_field_type_hint(), so this is also
+ * the guard against a sequential/parallel divergence. */
+TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_python_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "targets.py",
+                    "class MockAccelerator:\n"
+                    "    def print(self, value):\n"
+                    "        return value\n"
+                    "\n"
+                    "class OtherPrinter:\n"
+                    "    def print(self, value):\n"
+                    "        return value\n"
+                    "\n"
+                    "class FlashAttentionFunction:\n"
+                    "    def backward(self, loss):\n"
+                    "        return loss\n"
+                    "\n"
+                    "class OtherBackward:\n"
+                    "    def backward(self, loss):\n"
+                    "        return loss\n"
+                    "\n"
+                    "class EulerScheduler:\n"
+                    "    def step(self):\n"
+                    "        return 1\n"
+                    "\n"
+                    "class OtherScheduler:\n"
+                    "    def step(self):\n"
+                    "        return 1\n");
+    write_temp_file(tmp, "pkg/__init__.py", "from .helper import compute\n");
+    write_temp_file(tmp, "pkg/helper.py",
+                    "def compute(value):\n"
+                    "    return value * 2\n");
+    write_temp_file(tmp, "caller.py",
+                    "from pkg import helper\n"
+                    "\n"
+                    "def local_helper():\n"
+                    "    return 1\n"
+                    "\n"
+                    "def train(accelerator, trainer):\n"
+                    "    accelerator.print('hello')\n"
+                    "    accelerator.backward(1)\n"
+                    "    trainer.lr_scheduler.step()\n"
+                    "    helper.compute(42)\n"
+                    "    return local_helper()\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/python_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: every receiver here is a parameter or an attribute of one. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "train", "print"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "train", "backward"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "train", "step"));
+    /* POSITIVE: import-bound and bare local calls survive the parallel path too. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "train", "compute"));
+    ASSERT_TRUE(cross_file_call_exists(s, project, "train", "local_helper"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Parallel counterpart. >= 50 files forces pass_parallel.c, which is wired with
+ * the same gate: a guard wired on only one resolver produces an edge on the
+ * sequential path and not the parallel one, breaking MT determinism. #1386
+ * wired both and tested only the sequential path, and the `parallel` suite is
+ * exactly what catches that. Same both-directions pin as the sequential test. */
+TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_bare_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "live.py",
+                    "class SatoriLive:\n"
+                    "    def run(self):\n"
+                    "        return 1\n"
+                    "\n"
+                    "class BatchJob:\n"
+                    "    def execute(self):\n"
+                    "        return 2\n");
+    write_temp_file(tmp, "helpers.py",
+                    "def compute_widget_total():\n"
+                    "    return 7\n");
+    write_temp_file(tmp, "gate.py",
+                    "def _run_with_heavy_slot(run, execute):\n"
+                    "    run()\n"
+                    "    return execute()\n"
+                    "\n"
+                    "def uses_free_function():\n"
+                    "    return compute_widget_total()\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.py", i);
+        snprintf(body, sizeof(body), "def filler%d():\n    return %d\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_bare_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: both callees are shadowed by parameters. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "run"));
+    ASSERT_FALSE(cross_file_call_exists(s, project, "_run_with_heavy_slot", "execute"));
+    /* POSITIVE: the unshadowed cross-file bare call survives the parallel path. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "uses_free_function", "compute_widget_total"));
+    /* Tripwire against a vacuous pass. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -4948,6 +5797,70 @@ TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier) {
     PASS();
 }
 
+/* Slash-prefixed call arguments are not necessarily HTTP routes. Keep the
+ * parallel arg-url heuristic from minting Route nodes for filesystem paths or
+ * regex-replacement operands, while preserving a genuine API path. */
+TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_arg_url_guard_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/args.py",
+                    "import requests\n"
+                    "TMP = '/tmp/pgv_fuzz.bin'\n"
+                    "def run_copy(path):\n"
+                    "    return path\n"
+                    "def write_fixture():\n"
+                    "    return run_copy(TMP)\n"
+                    "def load_api():\n"
+                    "    return requests.get('/api/data')\n");
+    write_temp_file(tmp, "src/regex.js",
+                    "function sink(value) { return value; }\n"
+                    "export function sanitize(template) {\n"
+                    "  sink(/<table/i);\n"
+                    "  return template.replace('/html/g', '');\n"
+                    "}\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_guard.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_EQ(count_nodes_named(s, project, "/html/g"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/<table/i"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/tmp/pgv_fuzz.bin"), 0);
+    ASSERT_GTE(count_nodes_named(s, project, "/api/data"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Native `fetch()` (#856), sequential path (< 50 files → pass_calls.c). A bare
  * unqualified call to the global fetch API has no import and no local
  * definition anywhere in this project, so registry resolution comes back
@@ -4985,6 +5898,61 @@ TEST(pipeline_native_fetch_classified_as_http_calls) {
     ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 1);
     /* Exactly the bare call, not the method call too. */
     ASSERT_EQ(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* #1892: Swift produced no Route node and no HTTP_CALLS edge, because the
+ * Swift grammar has no "arguments" field and the generic lookup therefore read
+ * no call arguments at all. Alamofire/URLSession were already in the service
+ * pattern table; the URL simply never reached it. This is the Swift twin of
+ * the TypeScript fetch case above. */
+TEST(pipeline_swift_http_call_makes_route_issue1892) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swifthttp_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* URLSession, not Alamofire's `AF` shorthand: the service pattern table
+     * matches the library name in the callee text, and "AF.request" contains
+     * no such name. */
+    write_temp_file(tmp, "Sources/Client.swift",
+                    "import Foundation\n"
+                    "final class Client {\n"
+                    "    func listWidgets() {\n"
+                    "        URLSession.shared.dataTask(with: \"/api/v1/widgets\")\n"
+                    "    }\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/swifthttp.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 1);
+
+    /* The edge carries the URL, so pass_route_nodes can mint the Route the
+     * cross-repo matcher joins a server route against. */
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int widget_routes = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name && strstr(routes[i].qualified_name, "/api/v1/widgets")) {
+            widget_routes++;
+        }
+    }
+    cbm_store_free_nodes(routes, route_count);
+    ASSERT_GTE(widget_routes, 1);
 
     cbm_store_close(s);
     cbm_pipeline_free(p);
@@ -6091,7 +7059,7 @@ TEST(pipeline_swift_cross_package_import) {
     cbm_edge_t *edges = NULL;
     int ec = 0;
     ASSERT_EQ(cbm_store_find_edges_by_source_type(s, importer.id, "IMPORTS", &edges, &ec),
-             CBM_STORE_OK);
+              CBM_STORE_OK);
 
     bool found_exact_edge = false;
     for (int i = 0; i < ec; i++) {
@@ -8787,6 +9755,78 @@ TEST(registry_confidence_suffix_match) {
     PASS();
 }
 
+/* Issue #1893: a call on a library type bound to a same-named project member.
+ * URLSession is Foundation's, not this project's, so PickedFile.data is the
+ * wrong target — and with one candidate it won the top name-only confidence. */
+TEST(registry_receiver_chain_refuses_library_unique_name_issue1893) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
+
+    cbm_resolution_t r =
+        cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
+    ASSERT_NULL(r.qualified_name);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The same refusal on the other name-only exit, where several candidates share
+ * the final name and import distance picks the winner. */
+TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "data", "HomeboxUI.PickedFile.data", "Variable");
+    cbm_registry_add(reg, "data", "HomeboxUI.Payload.data", "Variable");
+
+    cbm_resolution_t r =
+        cbm_registry_resolve(reg, "URLSession.shared.data", "HomeboxUI.Net", NULL, NULL, 0);
+    ASSERT_NULL(r.qualified_name);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The true positive the gate must not eat: the project extends Calendar itself,
+ * so Calendar really is in the receiver chain. */
+TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "Calendar.utcGregorian.startOfDayUTC",
+                                              "HomeboxUI.Stats", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "AuthDTOs.Calendar.startOfDayUTC");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* A lower-case root names a value, whose type the chain does not show. The gate
+ * must not look at it, or every ordinary vm.load style call would be refused. */
+TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "load", "HomeboxUI.EntityListViewModel.load", "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "vm.load", "HomeboxUI.Views", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "HomeboxUI.EntityListViewModel.load");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* An unqualified callee has no chain at all and must pass through unchanged. */
+TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "helper", "proj.pkg.helper", "Function");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "helper", "proj.other", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "proj.pkg.helper");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
 TEST(registry_fuzzy_confidence_single) {
     cbm_registry_t *reg = cbm_registry_new();
     cbm_registry_add(reg, "Handler", "proj.svc.Handler", "Function");
@@ -9528,17 +10568,16 @@ static const char *pkg_entries_entry_for(const cbm_pkg_entries_t *e, const char 
  * above for the full end-to-end proof. */
 
 TEST(pkgmap_swift_targets_registers_module) {
-    static const char src[] =
-        "// swift-tools-version:5.9\n"
-        "import PackageDescription\n"
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\", dependencies: [])]\n"
-        ")\n";
+    static const char src[] = "// swift-tools-version:5.9\n"
+                              "import PackageDescription\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", dependencies: [])]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
@@ -9559,8 +10598,8 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_FALSE(pkg_entries_has_name(&entries, "CoreKit"));
     ASSERT_TRUE(pkg_entries_has_name(&entries, "CoreImpl"));
@@ -9579,15 +10618,14 @@ TEST(pkgmap_swift_products_do_not_register_alias) {
  * fixture in this file happens to follow `name:` with `dependencies:` or a
  * comma, so this specific shape was previously untested and unnoticed. */
 TEST(pkgmap_swift_target_name_immediately_before_close_paren) {
-    static const char src[] =
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\")]\n"
-        ")\n";
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\")]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Sources/Core");
@@ -9605,8 +10643,8 @@ TEST(pkgmap_swift_target_honors_literal_path) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "Core"));
     ASSERT_STR_EQ(pkg_entries_entry_for(&entries, "Core"), "Core/Vendor/CoreLegacy");
@@ -9620,16 +10658,15 @@ TEST(pkgmap_swift_target_honors_literal_path) {
  * target entirely (fail closed), even though its `name:` is a valid
  * literal. */
 TEST(pkgmap_swift_target_computed_path_fails_closed) {
-    static const char src[] =
-        "let customPath = computePath()\n"
-        "let package = Package(\n"
-        "    name: \"Core\",\n"
-        "    targets: [.target(name: \"Core\", path: customPath)]\n"
-        ")\n";
+    static const char src[] = "let customPath = computePath()\n"
+                              "let package = Package(\n"
+                              "    name: \"Core\",\n"
+                              "    targets: [.target(name: \"Core\", path: customPath)]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok = cbm_pkgmap_try_parse("Package.swift", "Core/Package.swift", src, (int)strlen(src),
+                                   &entries);
     ASSERT_TRUE(ok);
     ASSERT_EQ(entries.count, 0);
     cbm_pkg_entries_free(&entries);
@@ -9651,8 +10688,8 @@ TEST(pkgmap_swift_target_in_comment_or_string_not_registered) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Decoy"));
@@ -9681,8 +10718,8 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
         ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
@@ -9697,18 +10734,17 @@ TEST(pkgmap_swift_dependencies_do_not_leak_entries) {
  * (Utils/UtilsPkg) name OTHER modules, not this manifest's own
  * products/targets, so neither mints an entry. */
 TEST(pkgmap_swift_target_name_dependency_does_not_leak_entry) {
-    static const char src[] =
-        "let package = Package(\n"
-        "    name: \"App\",\n"
-        "    targets: [.target(name: \"App\", dependencies: [\n"
-        "        \"Core\",\n"
-        "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
-        "    ])]\n"
-        ")\n";
+    static const char src[] = "let package = Package(\n"
+                              "    name: \"App\",\n"
+                              "    targets: [.target(name: \"App\", dependencies: [\n"
+                              "        \"Core\",\n"
+                              "        .product(name: \"Utils\", package: \"UtilsPkg\")\n"
+                              "    ])]\n"
+                              ")\n";
     cbm_pkg_entries_t entries;
     cbm_pkg_entries_init(&entries);
-    bool ok = cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src,
-                                   (int)strlen(src), &entries);
+    bool ok =
+        cbm_pkgmap_try_parse("Package.swift", "App/Package.swift", src, (int)strlen(src), &entries);
     ASSERT_TRUE(ok);
     ASSERT_TRUE(pkg_entries_has_name(&entries, "App"));
     ASSERT_FALSE(pkg_entries_has_name(&entries, "Core"));
@@ -12457,6 +13493,271 @@ TEST(pipeline_ensemble_routing_method_scoping) {
     PASS();
 }
 
+/* #518/#519 item-7 regression: the DELTA merge is the warm path most users
+ * hit. It used to write nodes_fts with a hand-rolled four-column INSERT of
+ * its own; with a fifth `body` column that literal leaves prose NULL for every
+ * node arriving by delta, invisibly — a full reindex still looks perfect.
+ * Routing the write through cbm_store_fts_rebuild() is what this test binds:
+ * revert pipeline_delta.c to a four-column INSERT and it fails. */
+TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
+    char *td = th_mktempdir("cbm_delta_fts");
+    ASSERT_NOT_NULL(td);
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/delta.db", td);
+
+    cbm_store_t *store = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(store);
+    const char *proj = "deltafts";
+    ASSERT_EQ(cbm_store_upsert_project(store, proj, td), CBM_STORE_OK);
+
+    /* A previous generation already on disk, so the patch runs against a real
+     * id watermark rather than an empty database. */
+    cbm_node_t existing = {.project = proj,
+                           .label = "Function",
+                           .name = "alreadyThere",
+                           .qualified_name = "deltafts.main.alreadyThere",
+                           .file_path = "main.c"};
+    ASSERT_TRUE(cbm_store_upsert_node(store, &existing) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(store, NULL, 0), CBM_STORE_OK);
+
+    /* The delta patch: preseed proxies the resident rows and sets the
+     * watermark, then the NEW node is minted above it. */
+    cbm_gbuf_t *gb = cbm_gbuf_new(proj, td);
+    ASSERT_NOT_NULL(gb);
+    int64_t max_db_id = cbm_delta_preseed(store, proj, gb);
+    ASSERT_TRUE(max_db_id > 0);
+    int64_t new_id = cbm_gbuf_upsert_node(
+        gb, "Section", "Upgrading", "deltafts.README.Upgrading", "README.md", 1, 9,
+        "{\"docstring\":\"migrates the retention ledger before the cutover\"}");
+    ASSERT_TRUE(new_id > max_db_id);
+
+    ASSERT_EQ(cbm_delta_patch(store, proj, gb, max_db_id, NULL, 0), 0);
+    cbm_gbuf_free(gb);
+
+    /* nodes_fts is contentless, so a column-filtered MATCH is the only way to
+     * observe WHICH column a token landed in — and the only assertion that
+     * distinguishes "indexed" from "indexed without its prose". */
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT rowid FROM nodes_fts WHERE nodes_fts MATCH ?1", -1, &st,
+                                 NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(st, 1, "body:retention", -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    ASSERT_EQ((long long)sqlite3_column_int64(st, 0), (long long)new_id);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_DONE);
+    sqlite3_finalize(st);
+
+    /* The identifier columns are still written on the same path. */
+    st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(store),
+                                 "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH ?1", -1, &st,
+                                 NULL),
+              SQLITE_OK);
+    sqlite3_bind_text(st, 1, "name:Upgrading", -1, SQLITE_TRANSIENT);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(st, 0), 1);
+    sqlite3_finalize(st);
+
+    cbm_store_close(store);
+    th_rmtree(td);
+    PASS();
+}
+
+
+/* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
+ * `body` → findable. Each layer has its own test; this one proves they connect.
+ * It is also the guard on the size budget: build_def_props drops an oversized
+ * field ATOMICALLY, so a 500-byte section body that did not fit the 2 KB
+ * properties buffer would vanish silently and every narrower test would still
+ * pass. */
+TEST(pipeline_markdown_and_config_prose_reaches_fts_body) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_prose_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512];
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/prose.db", tmp);
+
+    /* A section body well past the 500-byte cap, so the truncating path — the
+     * one that produces the longest properties JSON — is what gets indexed. */
+    snprintf(path, sizeof(path), "%s/README.md", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "# Installation\n\nThe phlogiston bootstrap provisions a workstation.\n");
+    for (int i = 0; i < 40; i++) {
+        fprintf(f, "Filler prose line %d that pads the section well past the cap.\n", i);
+    }
+    fclose(f);
+
+    snprintf(path, sizeof(path), "%s/META.yaml", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "name: widget\ndescription: Aggregates quicksilver telemetry per shard.\n");
+    fclose(f);
+
+    /* One code file so the run is a normal index rather than a docs-only edge. */
+    snprintf(path, sizeof(path), "%s/main.go", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "package main\n\nfunc main() {}\n");
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s),
+                                 "SELECT COUNT(*) FROM nodes_fts WHERE nodes_fts MATCH ?1", -1, &st,
+                                 NULL),
+              SQLITE_OK);
+    const char *cases[] = {"body:phlogiston", "body:quicksilver"};
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, cases[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+        ASSERT_GT(sqlite3_column_int(st, 0), 0);
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A graph with no Function or Method nodes at all -- a struct-only or
+ * config-only project -- must run pass_semantic_edges cleanly. Its phase-1
+ * scan used to hand qsort() a NULL base with count 0, before the func_count
+ * early-out in phase 1b could run. glibc declares qsort's base nonnull, so
+ * UBSan on the Linux leg reports that call; the macOS SDK carries no such
+ * attribute, so the sanitizer is silent there. The label counts pin the
+ * fixture to what it claims: at least one Struct and zero Function/Method,
+ * i.e. the scan genuinely finds nothing to sort. */
+TEST(pipeline_semantic_edges_no_functions) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_nofunc_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char path[512];
+    char dbpath[512];
+    snprintf(dbpath, sizeof(dbpath), "%s/nofunc.db", tmp);
+
+    snprintf(path, sizeof(path), "%s/main.go", tmp);
+    ASSERT_EQ(th_write_file(path, "package main\n\ntype Widget struct{}\n"), 0);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, dbpath, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    cbm_store_t *s = cbm_store_open_path(dbpath);
+    ASSERT_NOT_NULL(s);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(cbm_store_get_db(s), "SELECT COUNT(*) FROM nodes WHERE label = ?1",
+                                 -1, &st, NULL),
+              SQLITE_OK);
+    const char *labels[] = {"Struct", "Function", "Method"};
+    int counts[3] = {0, 0, 0};
+    for (size_t i = 0; i < sizeof(labels) / sizeof(labels[0]); i++) {
+        sqlite3_reset(st);
+        sqlite3_bind_text(st, 1, labels[i], -1, SQLITE_TRANSIENT);
+        ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+        counts[i] = sqlite3_column_int(st, 0);
+    }
+    sqlite3_finalize(st);
+    cbm_store_close(s);
+    ASSERT_GT(counts[0], 0);
+    ASSERT_EQ(counts[1], 0);
+    ASSERT_EQ(counts[2], 0);
+
+    th_rmtree(tmp);
+    PASS();
+}
+
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Join two Studio Export range strings and hand back the result. The caller
+ * owns nothing: the string lives in the aggregate's arena, so copy it out
+ * before the arena goes away. */
+static void join_export_ranges(const char *agg_ranges, int agg_regions, const char *part_ranges,
+                               int part_regions, char *out, size_t out_size, int *out_regions) {
+    CBMFileResult aggregate;
+    CBMFileResult part;
+    memset(&aggregate, 0, sizeof(aggregate));
+    memset(&part, 0, sizeof(part));
+    cbm_arena_init(&aggregate.arena);
+    cbm_arena_init(&part.arena);
+    aggregate.error_ranges = agg_ranges;
+    aggregate.error_region_count = agg_regions;
+    aggregate.parse_incomplete = true;
+    part.error_ranges = part_ranges;
+    part.error_region_count = part_regions;
+    part.parse_incomplete = true;
+
+    out[0] = '\0';
+    *out_regions = 0;
+    if (cbm_pipeline_coverage_marker_test_join(&aggregate, &part)) {
+        snprintf(out, out_size, "%s", aggregate.error_ranges ? aggregate.error_ranges : "");
+        *out_regions = aggregate.error_region_count;
+    }
+    cbm_arena_destroy(&aggregate.arena);
+    cbm_arena_destroy(&part.arena);
+}
+
+/* Count the "+" characters in a range string. A truncation marker must appear
+ * once and only at the end: every reader stops at the first token that is not
+ * a range, so a marker in the middle silently hides every range after it. */
+static int count_plus(const char *s) {
+    int n = 0;
+    for (const char *p = s; *p; p++) {
+        if (*p == '+') {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
+    char joined[256];
+    int regions = 0;
+
+    /* Neither side dropped anything, so nothing invents a marker. */
+    join_export_ranges("1-2,5-9", 2, "20-24", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,5-9,20-24", joined);
+    ASSERT_EQ(0, count_plus(joined));
+    ASSERT_EQ(3, regions);
+
+    /* The first class overran the cap. Its marker must move to the end, so the
+     * second class's ranges stay visible in front of it. */
+    join_export_ranges("1-2,5-9,+7", 2, "20-24", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,5-9,20-24,+7", joined);
+    ASSERT_EQ(1, count_plus(joined));
+
+    /* The second class overran the cap. Same single trailing marker. */
+    join_export_ranges("1-2", 1, "20-24,+3", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,20-24,+3", joined);
+    ASSERT_EQ(1, count_plus(joined));
+
+    /* Both overran. One marker, carrying the sum, or the report would
+     * under-count what it threw away. */
+    join_export_ranges("1-2,+7", 1, "20-24,+3", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,20-24,+10", joined);
+    ASSERT_EQ(1, count_plus(joined));
+
+    /* An empty aggregate is the first class in the file. No leading comma. */
+    join_export_ranges(NULL, 0, "20-24,+3", 1, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("20-24,+3", joined);
+    ASSERT_EQ(1, regions);
+
+    /* A part with nothing to say leaves the aggregate exactly as it was. */
+    join_export_ranges("1-2,+7", 1, "", 0, joined, sizeof(joined), &regions);
+    ASSERT_STR_EQ("1-2,+7", joined);
+    PASS();
+}
+#endif
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -12501,8 +13802,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+    RUN_TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker);
+#endif
     RUN_TEST(pipeline_env_access_configures_sequential_parallel_parity);
     RUN_TEST(pipeline_call_reference_sequential_parallel_edge_set_parity);
+    RUN_TEST(pipeline_complexity_props_independent_of_worker_order);
     RUN_TEST(pipeline_incremental_cross_file_call_reference_matches_fresh_full);
     RUN_TEST(pipeline_incremental_changed_target_invalidates_stale_inbound_call_reference);
     RUN_TEST(pipeline_incremental_parallel_registry_nodes_advance_shared_ids);
@@ -12510,10 +13815,20 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_incremental_parallel_result_cache_alloc_failure_preserves_db_and_retries);
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
+    RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_go_bare_ref_never_binds_field);
+    RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
+    RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
+    RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
+    RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
+    RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
     /* Git history pass */
@@ -12676,6 +13991,11 @@ SUITE(pipeline) {
     RUN_TEST(registry_confidence_same_module);
     RUN_TEST(registry_confidence_unique_name);
     RUN_TEST(registry_confidence_suffix_match);
+    RUN_TEST(registry_receiver_chain_refuses_library_unique_name_issue1893);
+    RUN_TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893);
+    RUN_TEST(registry_receiver_chain_keeps_project_extension_issue1893);
+    RUN_TEST(registry_receiver_chain_ignores_lowercase_root_issue1893);
+    RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
     RUN_TEST(registry_negative_import_rejects);
@@ -12774,6 +14094,9 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
     RUN_TEST(pipeline_ensemble_routing_settings_targets);
     RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);
+    RUN_TEST(pipeline_delta_patch_indexes_docstring_into_fts_body);
+    RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
+    RUN_TEST(pipeline_semantic_edges_no_functions);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
@@ -12793,6 +14116,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_closure_repair_budget_declines_to_full);
     RUN_TEST(pipeline_incremental_tsconfig_alias_change_matches_fresh_full);
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+    RUN_TEST(pipeline_publication_stamps_full_and_delta_generations);
     RUN_TEST(pipeline_git_context_change_forces_full_and_refreshes_branch);
     RUN_TEST(pipeline_global_extension_config_change_forces_full);
     RUN_TEST(pipeline_publication_never_uses_a_predictable_staging_path);

@@ -214,6 +214,12 @@ typedef struct {
     cbm_daemon_client_id_t client_id;
     /* Kernel-authenticated PID of this client as observed by the daemon. */
     uint64_t authenticated_process_id;
+    /* Nonzero only when the transport connect succeeded but no valid response
+     * arrived in time: the kernel-reported PID of the process that holds the
+     * endpoint. A held-but-mute endpoint is a live process whose runtime is
+     * wedged (2026-08-29 zombie incident) — callers must report this PID
+     * rather than fold the failure into plain absence. */
+    uint64_t muted_endpoint_holder_pid;
     cbm_daemon_conflict_t conflict;
     char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
 } cbm_daemon_runtime_connect_result_t;
@@ -265,6 +271,11 @@ typedef struct {
     uint32_t client_pids[CBM_DAEMON_CONTROL_CLIENT_CAP];
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     char semantic_version[CBM_DAEMON_SEMVER_SIZE];
+    /* Meaningful even when the status request itself FAILED: nonzero when the
+     * endpoint accepted the transport connect but answered nothing — the
+     * kernel-reported PID of the mute holder. `daemon status` uses this to
+     * name a zombie generation instead of reporting bare "not running". */
+    uint64_t muted_endpoint_holder_pid;
 } cbm_daemon_runtime_status_t;
 
 typedef struct {
@@ -421,6 +432,15 @@ void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force);
  * i.e. the tamper case that must still be rejected after unverifiable images
  * became admissible. */
 void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force);
+/* Abandoned-request containment seams (2026-08-29 zombie incident). The
+ * timeout override shrinks the join ceiling to test scale; zero restores the
+ * production constant. The hook replaces the terminal containment stop with a
+ * recordable callback so an in-process harness survives the trigger; NULL
+ * restores process termination. */
+typedef void (*cbm_daemon_runtime_containment_hook_t)(const char *component);
+void cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(uint32_t timeout_ms);
+void cbm_daemon_runtime_set_containment_hook_for_testing(
+    cbm_daemon_runtime_containment_hook_t hook);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

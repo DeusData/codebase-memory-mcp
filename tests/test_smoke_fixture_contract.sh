@@ -8,10 +8,13 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 python3 - "$ROOT" <<'PY'
 from __future__ import annotations
 
+import hashlib
+import os
 import pathlib
 import re
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import urllib.request
@@ -414,6 +417,171 @@ require(
     "tests/test_smoke_fixture_contract.sh" in test_driver,
     "scripts/test.sh must run the smoke fixture contract",
 )
+
+# Functional wrapper contract: install.sh must pass its wrapper-only selectors
+# to the downloaded candidate, while retaining the existing dir/skip controls.
+# Native Windows ships and exercises install.ps1; the Unix wrapper is covered
+# on both macOS and Linux venue legs.
+if sys.platform != "win32":
+    with tempfile.TemporaryDirectory(prefix="cbm-install-wrapper-") as temp:
+        temp_path = pathlib.Path(temp)
+        fixture = temp_path / "fixture"
+        payload = temp_path / "payload"
+        fixture.mkdir()
+        payload.mkdir()
+
+        uname_s = subprocess.check_output(["uname", "-s"], text=True).strip()
+        uname_m = subprocess.check_output(["uname", "-m"], text=True).strip()
+        os_name = "darwin" if uname_s == "Darwin" else "linux"
+        if uname_m in ("arm64", "aarch64"):
+            arch_name = "arm64"
+        else:
+            arch_name = "amd64"
+        portable = "-portable" if os_name == "linux" else ""
+        archive_name = (
+            f"codebase-memory-mcp-{os_name}-{arch_name}{portable}.tar.gz"
+        )
+        archive = fixture / archive_name
+
+        candidate = payload / "codebase-memory-mcp"
+        candidate.write_text(
+            "#!/usr/bin/env bash\n"
+            "set -euo pipefail\n"
+            "if [ \"${1:-}\" = --version ]; then echo 'cbm fixture 0'; exit 0; fi\n"
+            "if [ \"${1:-}\" != install ]; then exit 64; fi\n"
+            "printf '%s\\n' \"$@\" > \"$CBM_INSTALL_ARG_LOG\"\n"
+            "target=''\n"
+            "for arg in \"$@\"; do case \"$arg\" in --dir=*) target=${arg#--dir=} ;; esac; done\n"
+            "[ -n \"$target\" ] || exit 65\n"
+            "mkdir -p \"$target\"\n"
+            "cp \"$0\" \"$target/codebase-memory-mcp\"\n",
+            encoding="utf-8",
+        )
+        candidate.chmod(0o755)
+        (payload / "LICENSE").write_text("fixture license\n", encoding="utf-8")
+        (payload / "install.sh").write_text(install_script, encoding="utf-8")
+        (payload / "THIRD_PARTY_NOTICES.md").write_text(
+            "fixture notices\n", encoding="utf-8"
+        )
+        with tarfile.open(archive, "w:gz") as bundle:
+            for name in (
+                "codebase-memory-mcp",
+                "LICENSE",
+                "install.sh",
+                "THIRD_PARTY_NOTICES.md",
+            ):
+                bundle.add(payload / name, arcname=name)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+        (fixture / "checksums.txt").write_text(
+            f"{digest}  {archive_name}\n", encoding="ascii"
+        )
+
+        # Replace curl only inside the subprocess environment. The wrapper still
+        # performs its real archive/checksum/extraction flow, but all bytes come
+        # from this generated fixture and no socket is opened.
+        fake_bin = temp_path / "fake-bin"
+        fake_bin.mkdir()
+        fake_curl = fake_bin / "curl"
+        fake_curl.write_text(
+            "#!/usr/bin/env python3\n"
+            "import os, pathlib, shutil, sys, urllib.parse\n"
+            "args = sys.argv[1:]\n"
+            "target = pathlib.Path(args[args.index('-o') + 1])\n"
+            "name = pathlib.PurePosixPath(urllib.parse.urlparse(args[-1]).path).name\n"
+            "shutil.copyfile(pathlib.Path(os.environ['CBM_INSTALL_FIXTURE']) / name, target)\n",
+            encoding="utf-8",
+        )
+        fake_curl.chmod(0o755)
+
+        wrapper = root / "install.sh"
+        help_result = subprocess.run(
+            [str(wrapper), "--help"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=10,
+            check=False,
+        )
+        require(
+            help_result.returncode == 0
+            and "--dir" in help_result.stdout
+            and "--skip-config" in help_result.stdout
+            and "--clients" in help_result.stdout,
+            "install.sh --help must document dir, skip-config, and clients",
+        )
+
+        base_env = dict(os.environ)
+        base_env.update(
+            CBM_DOWNLOAD_URL="http://127.0.0.1:9",
+            CBM_INSTALL_FIXTURE=str(fixture),
+            HOME=str(temp_path / "home"),
+            PATH=f"{fake_bin}{os.pathsep}{base_env['PATH']}",
+        )
+        pathlib.Path(base_env["HOME"]).mkdir()
+
+        def run_wrapper(
+            log_name: str, *arguments: str
+        ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+            argument_log = temp_path / log_name
+            env = dict(base_env)
+            env["CBM_INSTALL_ARG_LOG"] = str(argument_log)
+            result = subprocess.run(
+                [str(wrapper), *arguments],
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                timeout=20,
+                check=False,
+            )
+            logged = (
+                argument_log.read_text(encoding="utf-8").splitlines()
+                if argument_log.is_file()
+                else []
+            )
+            return result, logged
+
+        unknown, unknown_args = run_wrapper(
+            "unknown-args.log", "--definitely-not-a-wrapper-flag"
+        )
+        require(
+            unknown.returncode == 2
+            and "Please consult --help." in unknown.stdout
+            and not unknown_args,
+            "install.sh must reject unknown flags before executing the candidate",
+        )
+
+        selected_dir = temp_path / "selected-bin"
+        selected, selected_args = run_wrapper(
+            "selected-args.log",
+            f"--dir={selected_dir}",
+            "--clients=claude,codex",
+            "--skip-config",
+        )
+        require(
+            selected.returncode == 0
+            and selected_args
+            == [
+                "install",
+                "-y",
+                "--force",
+                f"--dir={selected_dir}",
+                "--clients=claude,codex",
+                "--skip-config",
+            ],
+            "install.sh must forward the explicit clients selector with dir and skip-config",
+        )
+
+        ordinary_dir = temp_path / "ordinary-bin"
+        ordinary, ordinary_args = run_wrapper(
+            "ordinary-args.log", f"--dir={ordinary_dir}"
+        )
+        require(
+            ordinary.returncode == 0
+            and ordinary_args
+            == ["install", "-y", "--force", f"--dir={ordinary_dir}"],
+            "install.sh without selectors must preserve the ordinary install arguments",
+        )
 
 # Functional check: the helper must publish a live kernel-assigned port and
 # serve the exact expected artifact. This is intentionally build-free.

@@ -1,92 +1,17 @@
 /*
- * repro_issue56.c — Reproduce-first case for OPEN bug #56.
+ * repro_issue56.c — production-pipeline regression for Rust cross-crate calls.
  *
- * Bug #56: "Cross-crate call graphs stop at boundaries" (Rust)
+ * The fixture is a two-member Cargo workspace. crate_b calls
+ * `crate_a::helper()` and also declares a same-named local helper, so generic
+ * bare-name resolution cannot accidentally satisfy the assertion. The test
+ * requires a persisted CALLS edge into crate_a's namespace.
  *
- * ROOT CAUSE (pipeline / Rust LSP path):
- *   The tree-sitter-only Rust extractor has no access to Cargo metadata
- *   at extraction time, so when it sees `crate_a::helper()` inside
- *   crate_b, it records a raw call-site for the path but has no registry
- *   entry for `crate_a::helper` — only the definitions in the *same file*
- *   were seeded.  The LSP resolver therefore cannot match the call-site to
- *   a callee QN across the crate boundary, and the resulting
- *   CBMResolvedCall is either absent or marked with low confidence and
- *   discarded.  When the pipeline writes graph edges for this project, no
- *   CALLS edge is minted for the cross-crate call — the call graph stops
- *   at the crate edge.
- *
- *   v0.8.1 added a hybrid-LSP Rust path that "materially improves" this
- *   (issue comment, maintainer 2026-06-25), but the reporter was asked to
- *   retest; the issue remains OPEN because no retest confirming resolution
- *   was provided.  The workspace-member wiring test
- *   (rustlsp_extra_cargo_wires_workspace_member in test_rust_lsp.c) only
- *   exercises the *single-file LSP* layer with a manually-parsed manifest;
- *   it does NOT verify that the full production pipeline (rh_index_files →
- *   cbm_pipeline → graph store) persists a cross-crate CALLS edge for a
- *   real multi-file Cargo workspace fixture.  That gap is what this test
- *   fills.
- *
- * FIXTURE:
- *   A minimal Cargo workspace with two crates:
- *
- *   [workspace Cargo.toml]           — workspace root, declares members
- *   crate_a/Cargo.toml               — library crate "crate_a"
- *   crate_a/src/lib.rs               — exposes `pub fn helper() {}`
- *   crate_b/Cargo.toml               — binary crate "crate_b", depends on crate_a
- *   crate_b/src/main.rs              — calls `crate_a::helper()` from `fn run()`;
- *                                       also defines a LOCAL `fn helper()` to break
- *                                       bare-name uniqueness (see note below)
- *
- *   The only meaningful cross-crate CALLS edge is:
- *     crate_b::run  →  crate_a::helper
- *
- * EXPECTED (correct) behaviour:
- *   After indexing the workspace through the production MCP pipeline, the
- *   graph store must contain at least one CALLS edge whose TARGET node's
- *   qualified_name contains "crate_a" (i.e. routes into the crate_a
- *   namespace, not into crate_b's local helper).
- *
- * ACTUAL (buggy) behaviour:
- *   The pipeline extracts both files, but the cross-crate path
- *   `crate_a::helper` in crate_b/src/main.rs is not resolved to a graph
- *   node in crate_a because Cargo workspace member metadata is not
- *   plumbed into the per-file extraction phase.  Result: zero CALLS edges
- *   to the crate_a namespace.
- *
- * WHY THIS IS RED ON CURRENT CODE (even post-v0.8.1):
- *   The rustlsp_extra_cargo_wires_workspace_member unit test exercises only
- *   the LSP layer (cbm_run_rust_lsp_with_manifest called with a parsed
- *   CBMCargoManifest) and confirms the resolver *can* route
- *   `engine::boot()` to `engine.boot` when given the manifest explicitly.
- *   BUT: the production pipeline's per-file extraction path
- *   (cbm_extract_file → cbm_run_rust_lsp) does NOT receive a pre-parsed
- *   workspace manifest — it only gets the individual file's content.
- *   Additionally, cbm_pxc_has_cross_lsp() returns false for CBM_LANG_RUST
- *   (pass_lsp_cross.c), so the cross-file LSP pass is never invoked for
- *   Rust.  Therefore a real workspace indexed through index_repository
- *   produces no CALLS edges crossing into crate_a, and this test is RED.
- *
- * WHY THE OLD >= 2 COUNT TEST FALSE-PASSED:
- *   With a unique `helper` name in the project (one definition in crate_a,
- *   no other `helper` anywhere), the generic pipeline name resolver
- *   (registry.c, resolve_name_lookup) resolves `crate_a::helper` to the
- *   sole `helper` candidate by bare-name suffix scoring — WITHOUT needing
- *   any cross-crate workspace metadata.  This produced calls >= 2 (the
- *   intra-file main→run plus the bare-name-resolved run→helper), making
- *   the old ASSERT_GTE(calls, 2) GREEN even though the bug was not fixed.
- *
- *   Fix: add a LOCAL `fn helper()` in crate_b/src/main.rs so there are
- *   now TWO `helper` candidates in the project registry.  The generic
- *   resolver either picks the wrong one (crate_b-local) or abstains
- *   (ambiguous).  Only a correctly crate-qualified resolver routes
- *   `crate_a::helper` specifically to crate_a's node.  The assertion then
- *   checks the TARGET node's qualified_name contains "crate_a" — a count
- *   check is no longer sufficient because the local helper also contributes
- *   a CALLS edge (run_local→helper).
- *
- * UNCERTAINTY:
- *   If a future version plumbs workspace metadata or wires Rust lsp_cross
- *   correctly, this test will go GREEN — that is the intended outcome.
+ * The direct parallel regression lives in test_parallel.c because the bug was
+ * specific to worker-local pipeline context: the root Cargo manifest was
+ * parsed by the sequential cross-LSP driver but was not propagated into
+ * parallel resolve workers. A confident local result could also suppress the
+ * manifest-aware cross pass. This repro remains as an end-to-end guard for the
+ * same graph contract through the production harness.
  */
 
 #include "test_framework.h"
@@ -108,19 +33,8 @@
  * CALLS edge's TARGET node has a qualified_name containing "crate_a",
  * proving the cross-crate boundary was traversed.
  *
- * RED condition:
- *   No CALLS edge whose target QN contains "crate_a" exists in the store.
- *
- * This test is RED on current code because:
- *   1. cbm_run_rust_lsp is called with NULL manifest (cbm.c:645), so no
- *      workspace metadata is available at extraction time.
- *   2. cbm_pxc_has_cross_lsp returns false for CBM_LANG_RUST
- *      (pass_lsp_cross.c:281), so the cross-file LSP pass never runs for
- *      Rust and cannot seed crate_a defs into crate_b's resolver context.
- *   3. With two `helper` candidates (crate_a and crate_b-local), the
- *      generic resolver's qualified_suffix_match fails (neither QN ends
- *      with ".crate_a.helper") and bare-name scoring picks the crate_b-
- *      local one or abstains, never routing to crate_a.
+ * Regression condition: no CALLS edge whose target QN contains "crate_a"
+ * exists in the store.
  */
 TEST(repro_issue56_cross_crate_calls) {
     /*

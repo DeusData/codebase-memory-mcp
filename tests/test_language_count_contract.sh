@@ -63,7 +63,7 @@ EXEMPT=(
     'docs/EVALUATION_PLAN.md'                  # historical plan, pinned to its authoring date
     'docs/BENCHMARK.md'                        # benchmark corpus subsets (63/17 scored)
     'scripts/clone-bench-repos.sh'             # bench repo tiers (44 + 22)
-    'tests/repro/repro_invariant_breadth.c'    # breadth of one invariant (26/27)
+    'tests/repro/repro_invariant_breadth.c'    # breadth of one invariant (27/27)
     'tests/repro/repro_grammar_scripting.c'    # scripting-grammar probe scope (12)
     'tests/test_grammar_probe_b.c'             # grammar probe scope (12)
     'tests/test_language_count_contract.sh'    # this file, which names the numbers above

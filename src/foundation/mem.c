@@ -248,9 +248,19 @@ cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
 cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
                                                const char *budget_mb, size_t hard_cap_bytes) {
     cbm_mem_budget_t result = cbm_mem_resolve_budget(total_ram, ram_fraction, budget_mb);
+    /* The parent already divided the aggregate budget (env override or
+     * ram_fraction) across job slots. That per-slot share is the hard cap:
+     * N workers × a per-worker absolute override would oversubscribe the host
+     * (#1654). A lower explicit value still wins. Keep CBM_MEM_BUDGET_MB as
+     * the source when the env discriminator fired so the ceiling is visible
+     * as the user's aggregate, not as a silent daemon_worker_cap rewrite. */
     if (hard_cap_bytes > 0 && (result.budget == 0 || result.budget > hard_cap_bytes)) {
+        bool explicit_override =
+            result.source != NULL && strcmp(result.source, "CBM_MEM_BUDGET_MB") == 0;
         result.budget = hard_cap_bytes;
-        result.source = "daemon_worker_cap";
+        if (!explicit_override) {
+            result.source = "daemon_worker_cap";
+        }
         result.hard_capped = true;
     }
     return result;

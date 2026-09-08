@@ -2818,7 +2818,10 @@ static const CBMRegisteredFunc *c_lookup_member_depth(CLSPContext *ctx, const ch
         const char *shortn = dot ? dot + 1 : type_qn;
         size_t slen = strlen(shortn);
         const char *best_qn = NULL;
-        for (int i = 0; i < ctx->registry->type_count; i++) {
+        CBMTypeShortIter it;
+        cbm_registry_types_by_short_name(ctx->registry, shortn, &it);
+        int i;
+        while ((i = cbm_type_short_iter_next(&it)) >= 0) {
             const char *q = ctx->registry->types[i].qualified_name;
             if (!q) {
                 continue;
@@ -5972,6 +5975,7 @@ CBMTypeRegistry *cbm_c_build_cross_registry(CBMArena *arena, CBMLSPDef *defs, in
         c_register_lsp_defs(arena, reg, "", d, 1);
     }
     cbm_registry_finalize(reg);
+    cbm_registry_build_type_short_index(reg);
     reg->read_only = true; /* seal: shared Tier-2 registry is read-only during resolve */
     return reg;
 }
@@ -6055,6 +6059,7 @@ void cbm_run_c_lsp_cross(CBMArena *arena, const char *source, int source_len, co
     // Finalize registry — O(1) lookups. See go_lsp.c "3c. Finalize"
     // comment for the rationale (linear-scan fallback otherwise).
     cbm_registry_finalize(&reg);
+    cbm_registry_build_type_short_index(&reg);
 
     // Initialize context and run
     CLSPContext ctx;

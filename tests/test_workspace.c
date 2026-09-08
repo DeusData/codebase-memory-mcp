@@ -132,6 +132,120 @@ TEST(ws_windows_system_trees_are_sensitive) {
     PASS();
 }
 
+TEST(ws_windows_user_programs_tree_has_exact_sensitive_boundaries) {
+    static const char *const sensitive[] = {
+        "C:/Users/dev/AppData/Local/Programs",
+        "C:/Users/dev/AppData/Local/Programs/Antigravity",
+        "D:/Users/runneradmin/AppData/Local/Programs/Editor",
+        "c:\\uSeRs\\Dev\\aPpDaTa\\LoCaL\\pRoGrAmS\\IDE",
+    };
+    for (size_t i = 0; i < sizeof(sensitive) / sizeof(sensitive[0]); i++) {
+        ASSERT_EQ(cbm_workspace_classify_root(sensitive[i], HOME, CACHE),
+                  CBM_WS_DENY_SENSITIVE);
+    }
+
+    static const char *const allowed[] = {
+        "C:/Users/dev/projects/app",
+        "C:/Users/dev/AppData/Local",
+        "C:/Users/dev/AppData/Local/Programs-src",
+        "C:/Users/dev/AppData/Local/ProgramsBackup",
+        "C:/workspace/Users/dev/AppData/Local/Programs",
+        "C:/Users/dev/team/AppData/Local/Programs",
+    };
+    for (size_t i = 0; i < sizeof(allowed) / sizeof(allowed[0]); i++) {
+        ASSERT_EQ(cbm_workspace_classify_root(allowed[i], HOME, CACHE), CBM_WS_ALLOW);
+    }
+    PASS();
+}
+
+TEST(ws_sensitive_root_explicit_approval_is_preserved) {
+    char root[256];
+    char *created = th_mktempdir("cbm_ws_403_home");
+    ASSERT_NOT_NULL(created);
+    snprintf(root, sizeof(root), "%s", created);
+
+    char cache[256];
+    created = th_mktempdir("cbm_ws_403");
+    ASSERT_NOT_NULL(created);
+    snprintf(cache, sizeof(cache), "%s", created);
+
+    char err[1024];
+    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+    ASSERT_NOT_NULL(strstr(err, "--approve-sensitive"));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+
+    th_cleanup(root);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(ws_sensitive_approval_upgrades_existing_ordinary_exact_grant) {
+    char root[256];
+    char *created = th_mktempdir("cbm_ws_403_exact");
+    ASSERT_NOT_NULL(created);
+    snprintf(root, sizeof(root), "%s", created);
+
+    char cache[256];
+    created = th_mktempdir("cbm_ws_403_exact_cache");
+    ASSERT_NOT_NULL(created);
+    snprintf(cache, sizeof(cache), "%s", created);
+
+    char err[1024];
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, root, false, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_root_allowed(root, root, cache, NULL, err, sizeof(err)));
+    /* A repeated explicit approval must recognize the marked exact grant rather
+     * than append another exception. */
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, root, root, true, err, sizeof(err)));
+
+    char listed[4096];
+    char expected[4096];
+    ASSERT_TRUE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+    snprintf(expected, sizeof(expected), "%s\n(approved) %s\n", root, root);
+    ASSERT_STR_EQ(listed, expected);
+
+    th_cleanup(root);
+    th_cleanup(cache);
+    PASS();
+}
+
+TEST(ws_sensitive_approval_adds_exact_exception_under_ordinary_ancestor) {
+    char ancestor[256];
+    char *created = th_mktempdir("cbm_ws_403_ancestor");
+    ASSERT_NOT_NULL(created);
+    snprintf(ancestor, sizeof(ancestor), "%s", created);
+
+    char cache[256];
+    created = th_mktempdir("cbm_ws_403_ancestor_cache");
+    ASSERT_NOT_NULL(created);
+    snprintf(cache, sizeof(cache), "%s", created);
+
+    char sensitive[1024];
+    snprintf(sensitive, sizeof(sensitive), "%s/private-project", ancestor);
+    ASSERT_EQ(cbm_mkdir(sensitive), 0);
+    char err[1024];
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, NULL, ancestor, false, err, sizeof(err)));
+    ASSERT_FALSE(cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
+
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
+    ASSERT_TRUE(
+        cbm_workspace_root_allowed(sensitive, sensitive, cache, NULL, err, sizeof(err)));
+    ASSERT_TRUE(cbm_workspace_grant_add(cache, sensitive, sensitive, true, err, sizeof(err)));
+
+    char listed[4096];
+    char expected[4096];
+    ASSERT_TRUE(cbm_workspace_grant_list(cache, listed, sizeof(listed)));
+    snprintf(expected, sizeof(expected), "%s\n(approved) %s\n", ancestor, sensitive);
+    ASSERT_STR_EQ(listed, expected);
+
+    th_cleanup(ancestor);
+    th_cleanup(cache);
+    PASS();
+}
+
 /* POSIX is case-sensitive, so a differently-cased directory is a different one
  * and must not be refused. */
 TEST(ws_posix_matching_is_case_sensitive) {
@@ -275,6 +389,10 @@ SUITE(workspace) {
     RUN_TEST(ws_home_itself_is_sensitive_but_subdirs_are_fine);
     RUN_TEST(ws_credential_directories_are_sensitive_at_any_depth);
     RUN_TEST(ws_windows_system_trees_are_sensitive);
+    RUN_TEST(ws_windows_user_programs_tree_has_exact_sensitive_boundaries);
+    RUN_TEST(ws_sensitive_root_explicit_approval_is_preserved);
+    RUN_TEST(ws_sensitive_approval_upgrades_existing_ordinary_exact_grant);
+    RUN_TEST(ws_sensitive_approval_adds_exact_exception_under_ordinary_ancestor);
     RUN_TEST(ws_posix_matching_is_case_sensitive);
     RUN_TEST(ws_null_context_disables_dependent_checks);
     RUN_TEST(ws_every_verdict_has_a_reason);

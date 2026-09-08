@@ -17,6 +17,20 @@
 #include <sys/stat.h>
 #endif
 
+int cbm_nanosleep_full(const struct timespec *req) {
+#ifdef _WIN32
+    return cbm_nanosleep(req, NULL);
+#else
+    struct timespec remaining = *req;
+    while (nanosleep(&remaining, &remaining) != 0) {
+        if (errno != EINTR) {
+            return -1;
+        }
+    }
+    return 0;
+#endif
+}
+
 /* ── strndup (Windows lacks it) ───────────────────────────────── */
 
 #ifdef _WIN32

@@ -236,6 +236,34 @@ TEST(gbuf_edge_props_merge_prefers_higher_confidence) {
     PASS();
 }
 
+/* A confidence the code cannot read is not evidence of anything, so it must
+ * not outrank an edge that simply carries no confidence at all.
+ *
+ * edge_props_confidence answers -1 for "absent" so that any real confidence
+ * beats it. strtod answers 0.0 for text it cannot read, so an unreadable
+ * value used to come back as a real confidence of zero -- which beats -1 and
+ * displaced the stored blob. The function's own comment already promised
+ * that "absent/unparseable reads as -1"; only the absent half was true. */
+TEST(gbuf_edge_props_unreadable_confidence_does_not_displace_absent) {
+    const char *no_conf = "{\"callee\":\"f\",\"strategy\":\"lsp\"}";
+    const char *bad_conf = "{\"callee\":\"f\",\"confidence\":null,\"strategy\":\"registry\"}";
+
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    int64_t a = cbm_gbuf_upsert_node(gb, "Function", "a", "pkg.a", "f.go", 1, 5, "{}");
+    int64_t b = cbm_gbuf_upsert_node(gb, "Function", "b", "pkg.b", "f.go", 6, 10, "{}");
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", no_conf);
+    cbm_gbuf_insert_edge(gb, a, b, "CALLS", bad_conf); /* unreadable, arrives last */
+
+    const cbm_gbuf_edge_t **edges = NULL;
+    int count = 0;
+    cbm_gbuf_find_edges_by_type(gb, "CALLS", &edges, &count);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(edges[0]->properties_json, "\"strategy\":\"lsp\"") != NULL);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 /* An empty incoming blob must never displace real stored properties. */
 TEST(gbuf_edge_props_merge_keeps_existing_on_empty) {
     const char *lsp = "{\"callee\":\"f\",\"confidence\":0.95,\"strategy\":\"lsp\"}";
@@ -1152,6 +1180,7 @@ SUITE(graph_buffer) {
     /* Edge property merge determinism */
     RUN_TEST(gbuf_edge_props_merge_is_order_independent);
     RUN_TEST(gbuf_edge_props_merge_prefers_higher_confidence);
+    RUN_TEST(gbuf_edge_props_unreadable_confidence_does_not_displace_absent);
     RUN_TEST(gbuf_edge_props_merge_keeps_existing_on_empty);
 
     /* Shared ID tests */

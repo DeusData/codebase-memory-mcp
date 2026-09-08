@@ -7,7 +7,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. This npm wrapper downloads, verifies, and caches the selected native runtime set: the executable, its authenticated integration asset, and—when requested—the content-addressed UI pack.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 161 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 45 automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 162 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No hosted service or API key; this package requires Node.js to manage and launch the cached native runtime set. Plug and play across 45 automatic/conditional client surfaces.
 
 ## Installation
 
@@ -29,7 +29,7 @@ Restart your agent. Say **"Index this project"** — done.
 
 - **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
 - **Plug and play** — verified native runtime sets for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (arm64/amd64). No Docker or API keys; Node.js owns package download, cache repair, and launch.
-- **161 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
+- **162 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
 - **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
 - **45 supported automatic/conditional client surfaces** — `install` configures the appropriate MCP, durable-context, and documented hook surfaces without widening client permissions.
 - **Detected automatically (39)** — Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, Cursor, Windsurf, Augment / Auggie, OpenClaw, Kiro, Junie, Hermes, OpenHands, Cline, Warp, Qwen Code, GitHub Copilot CLI, Factory Droid, Crush, Goose, Mistral Vibe, Grok Build, Qoder CLI, Kimi Code CLI, GitLab Duo CLI, Rovo Dev CLI, Amp, Devin CLI / Local, Tabnine, Amazon Q Developer IDE, CodeBuddy Code CLI, IBM Bob Shell, Pochi, Pi, and Oh My Pi (omp).

@@ -12,6 +12,7 @@
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -322,14 +323,23 @@ static bool supervisor_disable_requested(void) {
  * CBM_INDEX_WORKER_TIMEOUT_S override (seconds → ms) tightens it for tests. */
 static int worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
+    enum { MS_PER_SECOND = 1000 };
     char timeout_seconds[CBM_SZ_32] = {0};
+    long s = 0;
+    /* The upper test only stops the seconds-to-ms multiply from overflowing an
+     * int. It sets no policy: a longer timeout than the default is still fine. */
+    if (cbm_env_long("CBM_INDEX_WORKER_TIMEOUT_S", &s) && s > 0 && s <= INT_MAX / MS_PER_SECOND) {
+        return (int)(s * MS_PER_SECOND);
+    }
+    /* atol used to answer 0 for a value it could not read, and 0 fell straight
+     * through to the 15-minute default with nothing on screen. A test set to
+     * give up after 30 seconds then hung for 15 minutes and nobody could see
+     * why. An unreadable value now says so before it is dropped. */
     if (cbm_safe_getenv("CBM_INDEX_WORKER_TIMEOUT_S", timeout_seconds, sizeof(timeout_seconds),
                         NULL) &&
         timeout_seconds[0]) {
-        long s = atol(timeout_seconds);
-        if (s > 0) {
-            return (int)(s * 1000);
-        }
+        cbm_log_warn("index.supervisor.worker_timeout_ignored", "value", timeout_seconds, "action",
+                     "using_default");
     }
     return DEFAULT_QUIET_TIMEOUT_MS;
 }

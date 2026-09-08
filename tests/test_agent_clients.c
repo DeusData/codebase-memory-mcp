@@ -1183,6 +1183,44 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     PASS();
 }
 
+/* #1834: raw JSON in argv selects the deprecated compatibility path. The Pi
+ * bridge must keep arguments out of process listings and feed the existing
+ * stdin transport only after all child handlers are attached. */
+TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834) {
+    char *js = cbm_client_adapter_pi("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+
+    const char *spawn = strstr(js, "spawn(BIN, ['cli', '--json', tool], {");
+    const char *stdio = strstr(js, "stdio: ['pipe', 'pipe', 'pipe']");
+    const char *stdout_handler = strstr(js, "child.stdout.on('data'");
+    const char *stdin_error_handler = strstr(js, "child.stdin.on('error'");
+    const char *error_handler = strstr(js, "child.on('error'");
+    const char *close_handler = strstr(js, "child.on('close'");
+    const char *stdin_end = strstr(js, "child.stdin.end(JSON.stringify(args ?? {}));");
+
+    ASSERT_NOT_NULL(spawn);
+    ASSERT_NOT_NULL(stdio);
+    ASSERT_NOT_NULL(stdout_handler);
+    ASSERT_NOT_NULL(stdin_error_handler);
+    ASSERT_NOT_NULL(error_handler);
+    ASSERT_NOT_NULL(close_handler);
+    ASSERT_NOT_NULL(stdin_end);
+    ASSERT(stdout_handler < stdin_end);
+    ASSERT(stdin_error_handler < stdin_end);
+    ASSERT(error_handler < stdin_end);
+    ASSERT(close_handler < stdin_end);
+    ASSERT_NOT_NULL(strstr(js, "let stdinError;"));
+    ASSERT_NOT_NULL(strstr(js, "stdinError = e;"));
+    ASSERT_NOT_NULL(strstr(js, "if (stdinError)"));
+
+    /* These are the exact deprecated transport shapes being retired. */
+    ASSERT_NULL(strstr(js, "tool, JSON.stringify(args ?? {})]"));
+    ASSERT_NULL(strstr(js, "stdio: ['ignore', 'pipe', 'pipe']"));
+
+    free(js);
+    PASS();
+}
+
 /* Result wrap + abort: Pi's TUI reads result.content; a spawn/parse failure
  * must throw rather than return a result without content; AbortSignal must
  * kill the cli child. String-shape only; a live Pi process is not gated. */
@@ -1253,6 +1291,28 @@ TEST(client_adapter_opencode_sends_the_required_hook_event) {
     PASS();
 }
 
+/* The richer OpenCode adapter carries every context surface the plugin API
+ * documents: session-start tier routing on the first tool result of each
+ * session, post-read coverage notes, and post-compaction reinjection through
+ * the documented experimental surface. It must unwrap hook-augment's Claude
+ * JSON envelope so plain text — not raw JSON — reaches the model. */
+TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'SessionStart'"));
+    ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PostToolUse'"));
+    ASSERT_NOT_NULL(strstr(js, "tool_name: 'Read'"));
+    ASSERT_NOT_NULL(strstr(js, "'experimental.session.compacting'"));
+    ASSERT_NOT_NULL(strstr(js, "additionalContext"));
+    /* file_path is the key hook-augment's default dialect reads; OpenCode's
+     * read tool argues filePath, so the adapter must map it. */
+    ASSERT_NOT_NULL(strstr(js, "file_path: filePath"));
+    /* Session context may only be injected once per session id. */
+    ASSERT_NOT_NULL(strstr(js, "seen.has(sid)"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1294,8 +1354,10 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_pi_registers_every_registry_tool);
     RUN_TEST(client_adapter_pi_default_exports_its_factory_issue1550);
     RUN_TEST(client_adapter_pi_emits_parameters_and_execute);
+    RUN_TEST(client_adapter_pi_sends_arguments_over_stdin_issue1834);
     RUN_TEST(client_adapter_pi_wraps_result_and_honors_abort);
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
+    RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }

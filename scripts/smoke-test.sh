@@ -144,11 +144,12 @@ run_no_crash() {
 
 TMPDIR=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
+CODEX_LIFECYCLE_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
+trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
 
 CLI_STDERR=$(smoke_mktemp_file)
 # 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
@@ -407,7 +408,7 @@ DUP_CHECKED=0
 for TOOL_ARGS in "search_graph --project $PROJECT --name-pattern compute" \
                  "search_code --project $PROJECT --query compute" \
                  "get_architecture --project $PROJECT" \
-                 "index_status --project $PROJECT"; do
+                 "index_status --project $PROJECT --format json"; do
   # shellcheck disable=SC2086
   ENVELOPE=$("$BINARY" cli $TOOL_ARGS --json 2>/dev/null || true)
   [ -z "$ENVELOPE" ] && continue
@@ -575,7 +576,7 @@ fi
 echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
 # 3c: get_graph_schema — verify labels exist
-if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT"); then
+if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT" --format json --limit 500); then
   echo "FAIL: get_graph_schema (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
@@ -647,8 +648,10 @@ cyp_first_cell() {
   # $1 = query; echoes rows[0][0] (or empty). Flag form passes the query as ONE
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
   # metacharacters {}|=~<>" need no JSON escaping.
-  cli query_graph --project "$PROJECT" --query "$1" |
-    sed -n '/^rows: /{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
+  cli query_graph --project "$PROJECT" --query "$1" --format json |
+    python3 -c 'import json,sys
+d=json.load(sys.stdin); rows=d.get("rows", [])
+print(rows[0][0] if rows and rows[0] else "")'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -838,19 +841,20 @@ else
   echo; echo "-- B3 first bytes (od) --"; echo "$IM_ARR" | od -c | head -6; exit 1
 fi
 
-# B4: STDIN — piped JSON resolves; this path must NOT emit a deprecation warning.
-IM_STDIN=$(echo "{\"project\":\"$PROJECT\"}" | "$BINARY" cli get_graph_schema 2>"$CLI_STDERR")
-if ! echo "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); sys.exit(0 if 'node_labels' in d else 1)" 2>/dev/null; then
-  echo "FAIL B4: stdin get_graph_schema did not resolve"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
+# B4: STDIN + --json is the generated-client transport. It must return the
+# complete MCP result envelope and must NOT emit a deprecation warning.
+IM_STDIN=$(printf '%s' "{\"project\":\"$PROJECT\",\"format\":\"json\"}" | "$BINARY" cli --json get_graph_schema 2>"$CLI_STDERR")
+if ! printf '%s' "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); c=d.get('content'); p=json.loads(c[0].get('text','')) if isinstance(c,list) and c and c[0].get('type') == 'text' else None; sys.exit(0 if d.get('isError') is not True and isinstance(p,dict) and isinstance(p.get('node_labels'),list) else 1)" 2>/dev/null; then
+  echo "FAIL B4: compact stdin + --json did not return a successful get_graph_schema MCP payload"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
 fi
 if grep -qi 'deprecated' "$CLI_STDERR"; then
   echo "FAIL B4: stdin path wrongly emitted a deprecation warning"; cat "$CLI_STDERR"; exit 1
 fi
-echo "OK B4: STDIN input resolves, no deprecation warning"
+echo "OK B4: compact STDIN + --json returns a successful schema MCP envelope, no deprecation warning"
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
 IM_ARGS_FILE=$(smoke_mktemp_file)
-echo "{\"project\":\"$PROJECT\"}" > "$IM_ARGS_FILE"
+echo "{\"project\":\"$PROJECT\",\"format\":\"json\",\"limit\":500}" > "$IM_ARGS_FILE"
 if ! IM_AF=$(cli get_graph_schema --args-file "$IM_ARGS_FILE"); then
   echo "FAIL B5: get_graph_schema --args-file exited non-zero"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
 fi
@@ -890,7 +894,8 @@ else
   echo "FAIL B6c: 'notatool --help' did not report 'unknown tool'"; cat "$CLI_STDERR"; exit 1
 fi
 
-# B7: DEPRECATION guard — one raw-JSON call MUST warn on stderr; flag form must NOT.
+# B7: DEPRECATION control — positional raw JSON MUST warn on stderr; this is
+# retained only to prove B4 is exercising the non-deprecated stdin transport.
 cli search_graph "{\"project\":\"$PROJECT\",\"name_pattern\":\"compute\"}" >/dev/null || true
 if grep -qi 'deprecated' "$CLI_STDERR"; then
   echo "OK B7a: raw-JSON cli emits deprecation warning on stderr"
@@ -1428,6 +1433,7 @@ echo '# Personal Rovo guidance' > "$ROVO_INSTRUCTIONS"
 PHASE8_INSTALL_RC=0
 PHASE8_INSTALL_LOG=$(smoke_mktemp_file)
 HOME="$FAKE_HOME" \
+  CODEX_HOME="$FAKE_HOME/.codex" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
@@ -1700,12 +1706,139 @@ if ! grep -q 'existing_section' "$FAKE_HOME/.codex/config.toml"; then
 fi
 echo "OK 8f-h: Codex TOML (MCP + preserved existing)"
 
-# 8i: Codex instructions
-if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] || ! grep -q 'codebase-memory-mcp' "$FAKE_HOME/.codex/AGENTS.md"; then
-  echo "FAIL 8i: Codex AGENTS.md missing"
+# 8i: Codex keeps only a tiny global activation pointer; the installed skill
+# owns all detailed behavior. Exercise the complete lifecycle in a second HOME
+# so Codex-only reinstalls cannot perturb the all-agent fixture below.
+CODEX_POINTER_EXPECTED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' > "$CODEX_POINTER_EXPECTED"
+if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] ||
+   [ "$(smoke_file_sha256 "$FAKE_HOME/.codex/AGENTS.md")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ]; then
+  echo "FAIL 8i: fresh Codex install did not create the exact activation pointer"
   exit 1
 fi
-echo "OK 8i: Codex instructions"
+
+CODEX_LIFECYCLE_HOME=$(smoke_mktemp_dir)
+CODEX_LIFECYCLE_ROOT="$CODEX_LIFECYCLE_HOME/.codex"
+CODEX_INSTRUCTIONS="$CODEX_LIFECYCLE_ROOT/AGENTS.md"
+mkdir -p "$CODEX_LIFECYCLE_ROOT"
+
+CODEX_FRESH_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_FRESH_LOG" 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
+   ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
+   ! grep -q 'SessionStart' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'SubagentStart' "$CODEX_LIFECYCLE_ROOT/config.toml"; then
+  echo "FAIL 8i: isolated fresh Codex install lost the pointer or another surface"
+  exit 1
+fi
+
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'legacy managed guidance' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_INSTRUCTIONS"
+CODEX_EXPECTED_MIGRATED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_EXPECTED_MIGRATED"
+CODEX_EXPECTED_USER=$(smoke_mktemp_file)
+printf '%s\n' '# Personal Codex guidance' '# Keep this line' > "$CODEX_EXPECTED_USER"
+CODEX_LEGACY_SHA=$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")
+
+CODEX_PLAN=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --plan --skip-binary --clients=codex > "$CODEX_PLAN"
+CODEX_INSTRUCTION_PATH=$(json_get "$CODEX_PLAN" \
+  "next((str(x) for x in d.get('instruction_files_planned', []) if str(x).replace('\\\\','/').endswith('/.codex/AGENTS.md')), '')")
+CODEX_CLEANUP_COUNT=$(json_get "$CODEX_PLAN" "len(d.get('cleanup_actions_planned', []))")
+if ! exact_path_match "$CODEX_INSTRUCTION_PATH" "$CODEX_INSTRUCTIONS" ||
+   [ "$CODEX_CLEANUP_COUNT" != "0" ] ||
+   [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
+  echo "FAIL 8i: Codex plan did not describe a non-mutating pointer upsert"
+  exit 1
+fi
+
+CODEX_DRY_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --dry-run --skip-binary --clients=codex -y > "$CODEX_DRY_LOG" 2>&1
+if ! grep -q 'managed activation pointer' "$CODEX_DRY_LOG" ||
+   [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
+  echo "FAIL 8i: Codex dry-run did not preview a byte-identical pointer migration"
+  exit 1
+fi
+
+CODEX_MIGRATE_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_MIGRATE_LOG" 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ]; then
+  echo "FAIL 8i: Codex migration did not replace only the legacy managed block"
+  exit 1
+fi
+
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > /dev/null 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ] ||
+   [ "$(grep -c '<!-- codebase-memory-mcp:start -->' "$CODEX_INSTRUCTIONS")" -ne 1 ]; then
+  echo "FAIL 8i: Codex reinstall changed or duplicated the activation pointer"
+  exit 1
+fi
+CODEX_UNINSTALL_LOG=$(smoke_mktemp_file)
+if ! HOME="$CODEX_LIFECYCLE_HOME" \
+     CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+     XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+     APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+     LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+     "$BINARY" uninstall -y -n > "$CODEX_UNINSTALL_LOG" 2>&1; then
+  echo "FAIL 8i: Codex uninstall returned nonzero"
+  cat "$CODEX_UNINSTALL_LOG"
+  exit 1
+fi
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ]; then
+  echo "FAIL 8i: Codex uninstall did not remove only the activation pointer"
+  exit 1
+fi
+echo "OK 8i: isolated Codex activation-pointer lifecycle"
 
 # 8j-l: Gemini MCP + hooks + merge
 CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
@@ -2303,16 +2436,125 @@ if ! path_match "$CMD" "$SELF_PATH" ||
 fi
 echo "OK 8ak: custom KIMI_CODE_HOME MCP + durable context + UserPromptSubmit hook"
 
-# 8al: Pi has documented instructions and skill, but no invented MCP config.
+# 8al: Pi has documented instructions and skill, no invented MCP config, and
+# an installed generated extension that uses the non-deprecated stdin bridge.
 PI_INSTRUCTIONS="$FAKE_HOME/.pi/agent/AGENTS.md"
 PI_SKILL="$FAKE_HOME/.pi/agent/skills/codebase-memory/SKILL.md"
+PI_EXTENSION="$FAKE_HOME/.pi/agent/extensions/cbmem.ts"
 if ! grep -q 'search_graph' "$PI_INSTRUCTIONS" 2>/dev/null ||
    ! grep -q 'Sessions and Subagents' "$PI_SKILL" 2>/dev/null ||
+   ! grep -Fq "spawn(BIN, ['cli', '--json', tool], {" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq "stdio: ['pipe', 'pipe', 'pipe']" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq "child.stdin.on('error'" "$PI_EXTENSION" 2>/dev/null ||
+   ! grep -Fq 'child.stdin.end(JSON.stringify(args ?? {}));' "$PI_EXTENSION" 2>/dev/null ||
+   grep -Fq 'tool, JSON.stringify(args ?? {})]' "$PI_EXTENSION" 2>/dev/null ||
+   grep -Fq "stdio: ['ignore', 'pipe', 'pipe']" "$PI_EXTENSION" 2>/dev/null ||
    [ -e "$FAKE_HOME/.pi/agent/mcp.json" ]; then
-  echo "FAIL 8al: Pi durable context missing or unsupported MCP config created"
+  echo "FAIL 8al: Pi durable context or stdin client bridge missing, or unsupported MCP config created"
   exit 1
 fi
-echo "OK 8al: Pi durable context only (no MCP config)"
+echo "OK 8al: Pi durable context + stdin client bridge (no MCP config)"
+
+# 8al-node: execute the generated extension against a child that exits without
+# consuming a deliberately over-pipe-capacity payload. This is the lifecycle
+# Node implements: without an stdin error listener, the late EPIPE is an
+# unhandled EventEmitter error and crashes the Pi host. A second call emits a
+# valid MCP envelope before the same early exit, proving parsed JSON remains
+# authoritative over a retained stdin transport error.
+#
+# SKIP_WHITELIST: the minimal C-only Linux image intentionally has no Node.
+# What was tried: making Node a universal core-suite prerequisite would widen
+# the product's C build dependencies. The exact generated-source assertions
+# above still run there; this live probe gates every Node-equipped smoke venue.
+if command -v node >/dev/null 2>&1; then
+  PI_NODE=$(command -v node)
+  PI_PROBE_DIR="$TMPDIR/pi-node-probe"
+  mkdir -p "$PI_PROBE_DIR"
+  # The extension is loaded by the Pi host, not by bare Node, so the probe
+  # provides what that host provides: Node's builtins plus the packages Pi
+  # ships to extensions (`typebox` — Pi's schema library for tool
+  # parameters). Every import the generated file makes must come from that
+  # set, otherwise it loads in this probe and fails in a real install with
+  # ERR_MODULE_NOT_FOUND. The typebox stub is a Proxy: any Type.X(...) call
+  # returns a descriptor, so the probe never depends on which helpers the
+  # emitter uses; it only exercises the tool lifecycle.
+  PI_HOST_PACKAGES="typebox"
+  mkdir -p "$PI_PROBE_DIR/node_modules/typebox"
+  cat >"$PI_PROBE_DIR/node_modules/typebox/package.json" <<'PITYPEBOXPKG'
+{ "name": "typebox", "version": "0.0.0-smoke-stub", "type": "module", "exports": "./index.mjs" }
+PITYPEBOXPKG
+  cat >"$PI_PROBE_DIR/node_modules/typebox/index.mjs" <<'PITYPEBOXSTUB'
+export const Type = new Proxy({}, {
+  get: (_target, helper) => (...args) => ({ smokeStubHelper: String(helper), args }),
+});
+export default { Type };
+PITYPEBOXSTUB
+  PI_FOREIGN_IMPORTS=$(grep -oE "^import .* from '[^']+'" "$PI_EXTENSION" |
+    sed -E "s/.* from '([^']+)'/\1/" | grep -vE '^node:' |
+    grep -vxF -f <(
+      # shellcheck disable=SC2086
+      printf '%s\n' $PI_HOST_PACKAGES
+    ) || true)
+  if [ -n "$PI_FOREIGN_IMPORTS" ]; then
+    echo "FAIL 8al-node: generated Pi extension imports packages the Pi host does not provide: $(echo "$PI_FOREIGN_IMPORTS" | tr '\n' ' ')"
+    exit 1
+  fi
+  python3 - "$PI_EXTENSION" "$PI_PROBE_DIR/cbmem.mjs" <<'PYPIADAPTER'
+import pathlib
+import sys
+
+source, destination = map(pathlib.Path, sys.argv[1:])
+text = source.read_text(encoding="utf-8")
+lines = text.splitlines()
+matches = [i for i, line in enumerate(lines) if line.startswith("const BIN = ")]
+if len(matches) != 1:
+    raise SystemExit("generated Pi extension has no unique BIN declaration")
+lines[matches[0]] = "const BIN = process.execPath;"
+destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PYPIADAPTER
+  cat >"$PI_PROBE_DIR/cli" <<'PICHILD'
+const fs = require('node:fs');
+if (process.argv[3] === 'get_graph_schema') {
+  fs.writeSync(1, JSON.stringify({ content: [{ type: 'text', text: 'schema-ok' }] }) + '\n');
+}
+process.exit(0);
+PICHILD
+  if ! grep -Fxq 'const BIN = process.execPath;' "$PI_PROBE_DIR/cbmem.mjs" ||
+     ! grep -Fxq "const fs = require('node:fs');" "$PI_PROBE_DIR/cli"; then
+    echo "FAIL 8al-node: generated lifecycle probe is not portable across Node launch environments"
+    exit 1
+  fi
+  cat >"$PI_PROBE_DIR/probe.mjs" <<'PIPROBE'
+import extension from './cbmem.mjs';
+
+const tools = [];
+extension({ registerTool: (definition) => tools.push(definition) });
+const byName = (name) => tools.find((tool) => tool.name === name);
+const args = { padding: 'x'.repeat(16 * 1024 * 1024) };
+
+const successful = await byName('get_graph_schema').execute('probe-ok', args);
+if (successful?.content?.[0]?.text !== 'schema-ok') {
+  throw new Error('valid child JSON was not authoritative over stdin EPIPE');
+}
+
+let transportError = '';
+try {
+  await byName('search_graph').execute('probe-error', args);
+} catch (error) {
+  transportError = String(error?.message ?? error);
+}
+if (!/(EPIPE|broken pipe|write)/i.test(transportError)) {
+  throw new Error(`missing surfaced stdin transport error: ${transportError || '<none>'}`);
+}
+PIPROBE
+  if ! (cd "$PI_PROBE_DIR" && "$PI_NODE" probe.mjs); then
+    echo "FAIL 8al-node: generated Pi extension did not contain early-exit stdin errors"
+    exit 1
+  fi
+  echo "OK 8al-node: generated Pi extension contains EPIPE and keeps valid JSON authoritative"
+else
+  echo "SKIP 8al-node: Node unavailable in this C-only smoke venue (whitelisted above)"
+fi
 
 # 8am: Warp receives the documented shared skill; MCP remains user/UI-managed.
 WARP_SKILL="$FAKE_HOME/.agents/skills/codebase-memory/SKILL.md"
@@ -2439,7 +2681,19 @@ ok = ok and owned_total == 2
 sys.exit(0 if ok else 1)
 " 2>/dev/null ||
    ! grep -q 'SessionStart' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
-   ! grep -q 'cbm-code-discovery-gate' "$FAKE_HOME/.claude/settings.json" 2>/dev/null; then
+   ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | SELF_PATH="$SELF_PATH" python3 -c "
+# Claude's gate is registered shell-free (#1733): the binary itself as the
+# command with 'hook-augment' as its argument, so no shim name can be grepped.
+import json, os, sys
+d = json.load(sys.stdin)
+self_path = os.environ['SELF_PATH']
+hooks = [h for entry in d.get('hooks', {}).get('PreToolUse', []) for h in entry.get('hooks', [])]
+ok = any(h.get('args') == ['hook-augment'] and
+         (h.get('command') == self_path or
+          os.path.basename(str(h.get('command', ''))) == os.path.basename(self_path))
+         for h in hooks)
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
   echo "FAIL 8aq: Devin hooks are not deduplicated against Claude SessionStart"
   exit 1
 else
@@ -2603,6 +2857,7 @@ if [[ "$BINARY" == *.exe ]]; then
   UNINSTALL_BINARY="$SELF_PATH"
 fi
 HOME="$FAKE_HOME" \
+  CODEX_HOME="$FAKE_HOME/.codex" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
@@ -2644,9 +2899,14 @@ if cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 hooks = d.get('hooks', {})
+# Shim names cover legacy shell registrations; the exec form (#1733) carries
+# no shim name, so its 'hook-augment' argument is the owned marker there.
 found = any('cbm-code-discovery-gate' in str(h) or
             'cbm-session-reminder' in str(h) or
-            'cbm-subagent-reminder' in str(h)
+            'cbm-subagent-reminder' in str(h) or
+            any('hook-augment' in str(x.get('args', [])) or
+                'hook-augment' in str(x.get('command', ''))
+                for x in h.get('hooks', []))
             for entries in hooks.values() for h in entries)
 sys.exit(1 if found else 0)
 " 2>/dev/null; then

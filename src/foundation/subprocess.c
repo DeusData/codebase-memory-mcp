@@ -970,7 +970,7 @@ static void cbm_spawn_backoff(int attempt) {
     int shift = attempt < CBM_SPAWN_BACKOFF_MAX_SHIFT ? attempt : CBM_SPAWN_BACKOFF_MAX_SHIFT;
     long ms = (long)CBM_SPAWN_BACKOFF_BASE_MS << shift;
     struct timespec delay = {ms / 1000L, (ms % 1000L) * 1000L * 1000L};
-    (void)cbm_nanosleep(&delay, NULL);
+    (void)cbm_nanosleep_full(&delay);
 }
 
 /* fork() fails with EAGAIN under the same pressure posix_spawn does, and the
