@@ -183,6 +183,34 @@ TEST(perllsp_self_method) {
     PASS();
 }
 
+TEST(perllsp_has_qw_arrayref_accessors) {
+    /* `has [qw(a b)] => ...` (the qw word-list multi-accessor form) must emit an
+     * accessor DEF for EACH name — 97 such accessors across Mojolicious emitted
+     * nothing before the quoted_word_list handler, so every `$obj->name` to them
+     * was unresolved. (Same-file accessor CALLS resolve via the pipeline's
+     * same_module registry, not the per-file LSP, so this asserts the def
+     * emission directly.) */
+    const char *src = "package Widget;\n"
+                      "use Mojo::Base -base;\n"
+                      "has [qw(alpha beta)] => undef;\n";
+    CBMFileResult *r = extract_perl(src);
+    ASSERT(r);
+    int has_alpha = 0, has_beta = 0;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (!d->name || !d->label || strcmp(d->label, "Method") != 0)
+            continue;
+        if (strcmp(d->name, "alpha") == 0)
+            has_alpha = 1;
+        if (strcmp(d->name, "beta") == 0)
+            has_beta = 1;
+    }
+    ASSERT(has_alpha);
+    ASSERT(has_beta);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* ── 5. @ISA inheritance ───────────────────────────────────────── */
 
 TEST(perllsp_isa_inheritance) {
@@ -1379,6 +1407,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_static_package_call);
     RUN_TEST(perllsp_static_multilevel_package_call);
     RUN_TEST(perllsp_self_method);
+    RUN_TEST(perllsp_has_qw_arrayref_accessors);
     RUN_TEST(perllsp_isa_inheritance);
     RUN_TEST(perllsp_use_parent_inheritance);
     RUN_TEST(perllsp_use_base_inheritance);

@@ -9132,6 +9132,34 @@ static void perl_emit_has_names(CBMExtractCtx *ctx, TSNode node, const char *ret
             perl_emit_has_accessor(ctx, bw, ret_type, node);
         return;
     }
+    if (strcmp(k, "quoted_word_list") == 0) {
+        /* `has [qw(app tx headers)] => ...`: the qw() word list carries the
+         * space-separated accessor names. Without this the extremely common
+         * multi-accessor `has [qw(...)]` form (97 accessors across Mojolicious)
+         * emitted NO nodes at all — every `$obj->name` to them was unresolved. */
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            char *blob = cbm_node_text(ctx->arena, ts_node_named_child(node, i), ctx->source);
+            if (!blob)
+                continue;
+            char *p = blob;
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+                    p++;
+                char *s = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                    p++;
+                if (p > s) {
+                    char save = *p;
+                    *p = '\0';
+                    if (s[0] && s[0] != '$' && s[0] != '-')
+                        perl_emit_has_accessor(ctx, cbm_arena_strdup(ctx->arena, s), ret_type, node);
+                    *p = save;
+                }
+            }
+        }
+        return;
+    }
     if (strcmp(k, "anonymous_array_expression") == 0 || strcmp(k, "list_expression") == 0) {
         /* `has [qw(a b)] => sub {...}`: the arrayref is the NAME list; the shared
          * default (2nd element of an enclosing list) already gave ret_type. But a
