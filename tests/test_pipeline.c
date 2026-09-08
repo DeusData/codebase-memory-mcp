@@ -12,6 +12,7 @@
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
+#include "pipeline/lsp_surface.h"
 #include "store/store.h"
 #include "git/git_context.h"
 #include "foundation/dump_verify.h"
@@ -13034,6 +13035,200 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+/* Compare natural graph keys: worker-allocated IDs are intentionally opaque. */
+static int streaming_graph_difference(const char *left_path, const char *right_path) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open(left_path, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return -1;
+    }
+    char *attach = sqlite3_mprintf("ATTACH DATABASE %Q AS other", right_path);
+    int rc = sqlite3_exec(db, attach, NULL, NULL, NULL);
+    sqlite3_free(attach);
+    int differences = 0;
+    const char *queries[] = {
+        "SELECT label,name,qualified_name,file_path,start_line,end_line FROM %s.nodes",
+        ("SELECT s.qualified_name,t.qualified_name,e.type,e.properties FROM %s.edges e "
+         "JOIN %s.nodes s ON s.id=e.source_id JOIN %s.nodes t ON t.id=e.target_id"),
+        "SELECT rel_path,surface_sha,defs_json FROM %s.lsp_surface",
+    };
+    for (int i = 0; rc == SQLITE_OK && i < 3; i++) {
+        char *left = sqlite3_mprintf(queries[i], "main", "main", "main");
+        char *right = sqlite3_mprintf(queries[i], "other", "other", "other");
+        for (int direction = 0; direction < 2; direction++) {
+            char *sql = sqlite3_mprintf("SELECT count(*) FROM (%s EXCEPT %s)",
+                                        direction ? right : left, direction ? left : right);
+            sqlite3_stmt *stmt = NULL;
+            rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
+            if (rc == SQLITE_OK && sqlite3_step(stmt) == SQLITE_ROW) {
+                int n = sqlite3_column_int(stmt, 0);
+                if (n) {
+                    fprintf(stderr, "streaming parity query=%d direction=%d differences=%d\n", i,
+                            direction, n);
+                }
+                differences += n;
+            } else {
+                fprintf(stderr, "streaming parity SQL: %s\n", sqlite3_errmsg(db));
+                rc = SQLITE_ERROR;
+            }
+            sqlite3_finalize(stmt);
+            sqlite3_free(sql);
+        }
+        sqlite3_free(left);
+        sqlite3_free(right);
+    }
+    sqlite3_close(db);
+    return rc == SQLITE_OK ? differences : -1;
+}
+
+TEST(pipeline_streaming_surface_survives_extraction_release) {
+    const CBMLanguage languages[] = {CBM_LANG_GO, CBM_LANG_PYTHON, CBM_LANG_JAVA, CBM_LANG_RUST};
+    const char *paths[] = {"types.go", "types.py", "Types.java", "types.rs"};
+    const char *sources[] = {
+        "package types\ntype Service struct { Name string }\nfunc (s *Service) Work(x int) string "
+        "{ return s.Name }\n",
+        "from other import Parent\n@decorate\nclass Child(Parent):\n    def work(self, x: int) -> "
+        "str:\n        return str(x)\n",
+        "package types; public interface Types { String work(int x); }\n",
+        "trait Work { fn work(&self); }\nstruct Service;\nimpl Work for Service { fn work(&self) "
+        "{} }\n",
+    };
+    for (int i = 0; i < 4; i++) {
+        CBMFileResult *original = cbm_extract_file(sources[i], strlen(sources[i]), languages[i],
+                                                   "surface", paths[i], 0, NULL, NULL);
+        ASSERT_NOT_NULL(original);
+        CBMFileResult *copy = cbm_lsp_surface_copy_result(original);
+        ASSERT_NOT_NULL(copy);
+        cbm_file_info_t file = {.rel_path = (char *)paths[i], .language = languages[i]};
+        char *modules[1] = {NULL};
+        int starts[2] = {0};
+        int count = 0;
+        CBMLSPDef *defs =
+            cbm_pxc_collect_all_defs(NULL, &original, &file, 1, "surface", modules, &count, starts);
+        cbm_lsp_surface_row_t *before = NULL;
+        int before_count = 0;
+        int before_rc = cbm_lsp_surface_build_rows("surface", &original, &file, 1, defs, starts,
+                                                   &before, &before_count);
+        free(defs);
+        free(modules[0]);
+        modules[0] = NULL;
+        cbm_free_result(original);
+        /* All original strings and arrays are now dead. ASan checks the copy's
+         * transitive ownership, and codec equality checks the complete surface. */
+        defs = cbm_pxc_collect_all_defs(NULL, &copy, &file, 1, "surface", modules, &count, starts);
+        cbm_lsp_surface_row_t *after = NULL;
+        int after_count = 0;
+        int after_rc = cbm_lsp_surface_build_rows("surface", &copy, &file, 1, defs, starts, &after,
+                                                  &after_count);
+        bool same = before_rc == 0 && after_rc == 0 && before_count == 1 && after_count == 1 &&
+                    strcmp(before[0].defs_json, after[0].defs_json) == 0;
+        bool no_body = copy->calls.count == 0 && copy->usages.count == 0 &&
+                       copy->cached_tree == NULL && copy->defs.items[0].body_tokens == NULL;
+        cbm_store_free_lsp_surfaces(before, before_count);
+        cbm_store_free_lsp_surfaces(after, after_count);
+        free(defs);
+        free(modules[0]);
+        cbm_free_result(copy);
+        ASSERT_TRUE(same);
+        ASSERT_TRUE(no_body);
+    }
+    PASS();
+}
+
+TEST(pipeline_streaming_cross_batch_graph_and_diagnostics) {
+    /* Windows expands /tmp/ to the per-user TEMP path in place. */
+    char tmp[CBM_SZ_512] = "/tmp/cbm_streaming_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "Base.java",
+                    "package batch; public class Base { "
+                    "public void work() {} }\n");
+    write_temp_file(tmp, "Factory.java",
+                    "package batch; public class Factory { "
+                    "public static Base create() { return new Base(); } }\n");
+    write_temp_file(tmp, "Caller.java",
+                    "package batch; public class Caller { "
+                    "public void run(batch.Base value) { value.work(); } }\n");
+    write_temp_file(tmp, "child.py",
+                    "from parent import Parent\nclass Child(Parent):\n"
+                    "    def invoke(self):\n        self.inherited()\n");
+    write_temp_file(tmp, "parent.py", "class Parent:\n    def inherited(self):\n        pass\n");
+    write_temp_file(tmp, "derived.ts",
+                    "import { ParentTS } from './parent';\n"
+                    "export class ChildTS extends ParentTS { invokeTS() { this.baseTS(); } }\n");
+    write_temp_file(tmp, "parent.ts", "export class ParentTS { baseTS() {} }\n");
+    write_temp_file(tmp, "broken.py", "def good():\n    pass\n\ndef broken(\n");
+    for (int i = 0; i < 48; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "pad%02d.ts", i);
+        snprintf(body, sizeof(body), "export const pad%d = %d;\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+    const char *env_names[] = {"CBM_WORKERS", "CBM_INDEX_SINGLE_THREAD",
+                               "CBM_STREAMING_BATCH_FILES", "CBM_DISABLE_LSP_CROSS"};
+    char *saved[4];
+    for (int i = 0; i < 4; i++) {
+        const char *old = getenv(env_names[i]);
+        saved[i] = old ? strdup(old) : NULL;
+        cbm_unsetenv(env_names[i]);
+    }
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char paths[5][512];
+    int run_rc[5];
+    int errors[5] = {0};
+    int java_calls[5] = {0};
+    for (int run = 0; run < 5; run++) {
+        if (run == 1) {
+            cbm_setenv("CBM_STREAMING_BATCH_FILES", "1", 1);
+            cbm_setenv("CBM_WORKERS", "1", 1);
+        } else if (run == 2 || run == 4) {
+            cbm_setenv("CBM_STREAMING_BATCH_FILES", "7", 1);
+            cbm_setenv("CBM_WORKERS", "4", 1);
+        } else {
+            cbm_unsetenv("CBM_STREAMING_BATCH_FILES");
+        }
+        if (run >= 3) {
+            cbm_setenv("CBM_DISABLE_LSP_CROSS", "1", 1);
+        }
+        snprintf(paths[run], sizeof(paths[run]), "%s/run%d.db", tmp, run);
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, paths[run], CBM_MODE_FULL);
+        run_rc[run] = p ? cbm_pipeline_run(p) : -1;
+        cbm_file_error_t *file_errors = NULL;
+        cbm_pipeline_get_file_errors(p, &file_errors, &errors[run]);
+        cbm_store_t *store = cbm_store_open_path(paths[run]);
+        if (store && p) {
+            java_calls[run] =
+                named_edge_count(store, cbm_pipeline_project_name(p), "CALLS", "run", "work");
+        }
+        cbm_store_close(store);
+        cbm_pipeline_free(p);
+    }
+    for (int i = 0; i < 4; i++) {
+        if (saved[i]) {
+            cbm_setenv(env_names[i], saved[i], 1);
+        } else {
+            cbm_unsetenv(env_names[i]);
+        }
+        free(saved[i]);
+    }
+    int single_diff = streaming_graph_difference(paths[0], paths[1]);
+    int batch_diff = streaming_graph_difference(paths[0], paths[2]);
+    int disabled_diff = streaming_graph_difference(paths[3], paths[4]);
+    th_rmtree(tmp);
+    for (int i = 0; i < 5; i++) {
+        ASSERT_EQ(run_rc[i], 0);
+        ASSERT_EQ(errors[i], errors[0]);
+    }
+    ASSERT_GT(errors[0], 0);
+    ASSERT_GT(java_calls[0], 0);
+    ASSERT_EQ(java_calls[1], java_calls[0]);
+    ASSERT_EQ(java_calls[2], java_calls[0]);
+    ASSERT_EQ(single_diff, 0);
+    ASSERT_EQ(batch_diff, 0);
+    ASSERT_EQ(disabled_diff, 0);
+    PASS();
+}
+
 /* The closure-repair route lives and dies by two properties of the persisted
  * per-file LSP surface: a BODY edit must leave the surface_sha unchanged (the
  * early cutoff -- no dependent recomputation owed), while a SIGNATURE edit
@@ -13564,7 +13759,6 @@ TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
     PASS();
 }
 
-
 /* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
  * `body` → findable. Each layer has its own test; this one proves they connect.
  * It is also the guard on the size budget: build_def_props drops an oversized
@@ -13759,6 +13953,8 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_streaming_surface_survives_extraction_release);
+    RUN_TEST(pipeline_streaming_cross_batch_graph_and_diagnostics);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
