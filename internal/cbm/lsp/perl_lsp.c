@@ -753,7 +753,23 @@ static const CBMType *perl_eval_method_call_type(PerlLSPContext *ctx, TSNode nod
         const char *ik = ts_node_type(inv);
         if (perl_is_bareword_node(ik)) {
             char *cls = perl_node_text(ctx, inv);
-            if (cls && cls[0])
+            /* `func->method` where func is an imported Exporter function: the
+             * receiver's type is func's return type (mirrors the edge-emitting
+             * path in perl_resolve_method_call). */
+            const CBMRegisteredFunc *impf = NULL;
+            if (cls && cls[0] >= 'a' && cls[0] <= 'z') {
+                const char *imp = perl_find_import(ctx, cls);
+                if (imp)
+                    impf = cbm_registry_lookup_func(ctx->registry, imp);
+            }
+            const CBMType *rt =
+                (impf && impf->signature && impf->signature->kind == CBM_TYPE_FUNC &&
+                 impf->signature->data.func.return_types)
+                    ? impf->signature->data.func.return_types[0]
+                    : NULL;
+            if (rt && rt->kind == CBM_TYPE_NAMED)
+                class_qn = rt->data.named.qualified_name;
+            else if (cls && cls[0])
                 class_qn = perl_resolve_package_name(ctx, cls);
         } else {
             const CBMType *recv = perl_eval_expr_type(ctx, inv);
@@ -1035,9 +1051,36 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
         const char *ik = ts_node_type(inv);
         if (perl_is_bareword_node(ik)) {
             char *cls = perl_node_text(ctx, inv);
-            if (cls && cls[0])
-                class_qn = perl_resolve_package_name(ctx, cls);
-            strategy = "perl_method_static";
+            /* A lowercase bareword invocant that is an Exporter-imported function
+             * (`use Mod qw(func)`) is a FUNCTION CALL used as `func->method`
+             * (e.g. Mojo::File's `curfile->sibling(...)`), NOT a class name.
+             * Perl spells classes CamelCase and functions lowercase, and the
+             * import map only holds Exporter functions, so the two signals
+             * together are unambiguous. Emit the call edge to the function, then
+             * type the receiver from the function's return type so the chained
+             * method dispatches. */
+            const CBMRegisteredFunc *impf = NULL;
+            if (cls && cls[0] >= 'a' && cls[0] <= 'z') {
+                const char *imp = perl_find_import(ctx, cls);
+                if (imp)
+                    impf = cbm_registry_lookup_func(ctx->registry, imp);
+            }
+            if (impf) {
+                perl_emit_resolved(ctx, impf->qualified_name, "perl_imported_function",
+                                   PERL_CONF_LITERAL, inv);
+                const CBMType *rt =
+                    (impf->signature && impf->signature->kind == CBM_TYPE_FUNC &&
+                     impf->signature->data.func.return_types)
+                        ? impf->signature->data.func.return_types[0]
+                        : NULL;
+                if (rt && rt->kind == CBM_TYPE_NAMED)
+                    class_qn = rt->data.named.qualified_name;
+                strategy = "perl_method_typed";
+            } else {
+                if (cls && cls[0])
+                    class_qn = perl_resolve_package_name(ctx, cls);
+                strategy = "perl_method_static";
+            }
         } else {
             const CBMType *recv = perl_eval_expr_type(ctx, inv);
             if (recv && recv->kind == CBM_TYPE_NAMED) {
@@ -1047,7 +1090,7 @@ static void perl_resolve_method_call(PerlLSPContext *ctx, TSNode call) {
         }
     }
     if (!class_qn)
-        return; /* unknown receiver — zero-edge guarantee */
+        return; /* unknown receiver — zero-edge guarantee (call edge, if any, already emitted) */
 
     const CBMRegisteredFunc *f = perl_lookup_method(ctx, class_qn, mname);
     if (f) {

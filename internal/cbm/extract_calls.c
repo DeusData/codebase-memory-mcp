@@ -4275,6 +4275,38 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                     }
                 }
             }
+
+            /* Perl: `func->method` where `func` is a LOWERCASE bareword is an
+             * Exporter-imported nullary function used as a receiver — the
+             * Mojo::File idiom `curfile->sibling(...)`. The primary call above
+             * recorded the METHOD (`sibling`); emit a SECOND call row for the
+             * FUNCTION invocant (`curfile`) at the invocant's own span so the
+             * Perl LSP (perl_imported_function) can bind an edge to it. Perl
+             * spells classes CamelCase and functions lowercase, so the lowercase
+             * initial distinguishes `curfile->` (function) from `Foo->` (class).
+             * requires_lsp_resolution: LSP-only — a textual short-name fallback
+             * could bind the bareword to an unrelated same-named sub, so a
+             * non-imported bareword stays zero-edge. */
+            if (ctx->language == CBM_LANG_PERL &&
+                strcmp(ts_node_type(node), "method_call_expression") == 0) {
+                TSNode inv = ts_node_child_by_field_name(node, TS_FIELD("invocant"));
+                if (!ts_node_is_null(inv) && strcmp(ts_node_type(inv), "bareword") == 0) {
+                    char *inv_txt = cbm_node_text(ctx->arena, inv, ctx->source);
+                    if (inv_txt && inv_txt[0] >= 'a' && inv_txt[0] <= 'z' &&
+                        perl_is_identifier_callee(inv_txt)) {
+                        CBMCall icall = {0};
+                        icall.callee_name = inv_txt;
+                        icall.enclosing_func_qn = state->enclosing_func_qn;
+                        icall.loop_depth = state->loop_depth;
+                        icall.branch_depth = state->branch_depth;
+                        icall.start_line = (int)ts_node_start_point(inv).row + TS_LINE_OFFSET;
+                        icall.site_start_byte = ts_node_start_byte(inv);
+                        icall.site_end_byte = ts_node_end_byte(inv);
+                        icall.requires_lsp_resolution = true;
+                        cbm_calls_push(&ctx->result->calls, ctx->arena, icall);
+                    }
+                }
+            }
         }
     }
 

@@ -1430,6 +1430,82 @@ TEST(perllsp_cross_unresolvable_module_zero_edges) {
     PASS();
 }
 
+/* ── imported nullary function used as `func->method` (Mojo::File curfile) ── */
+
+TEST(perllsp_cross_imported_func_arrow_method) {
+    /* The Mojo::File idiom `curfile->sibling(...)`: curfile is an Exporter-
+     * imported function (use Mojo::File qw(curfile)), so the lowercase bareword
+     * `curfile` before `->` is a FUNCTION CALL, not a class name. It must resolve
+     * to the curfile function (perl_imported_function) rather than be read as a
+     * static method call on a package literally named "curfile". Because curfile's
+     * return type is File, the chained `->sibling` also dispatches to
+     * File::sibling — the receiver is typed from the function's return type. */
+    const char *source = "use File qw(curfile);\n"
+                         "sub run { curfile->sibling; }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.main.run", .short_name = "run", .label = "Function",
+         .def_module_qn = "test.main"},
+        {.qualified_name = "test.lib.File.curfile", .short_name = "curfile", .label = "Function",
+         .def_module_qn = "test.lib.File", .return_types = "File"},
+        {.qualified_name = "test.lib.File.sibling", .short_name = "sibling", .label = "Function",
+         .def_module_qn = "test.lib.File"},
+    };
+    const char *imp_names[] = {"curfile"};
+    const char *imp_qns[] = {"test.lib.File.curfile"};
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 3, imp_names,
+                           imp_qns, 1, NULL, &out, NULL, NULL, 0);
+    /* (1) the function-call edge to curfile itself. */
+    int call_idx = find_resolved_arr(&out, "main.run", "lib.File.curfile");
+    /* (2) the chained method edge, enabled by typing the receiver from curfile's
+     * return type. */
+    int chain_idx = find_resolved_arr(&out, "main.run", "lib.File.sibling");
+    if (call_idx < 0 || chain_idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(call_idx >= 0);
+    ASSERT(chain_idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* Same idiom, but the import map is NOT caller-supplied — it must be recovered
+ * from the file's own `use Mojo::File qw(curfile)` via PASS-1 qw-collection +
+ * the used-module map (the real indexing path; import_count = 0). Covers both a
+ * top-level `my $x = curfile->...` (attributed to the module) and an in-sub
+ * call. Regression for the real-repo finding that curfile->method emitted zero
+ * edges. */
+TEST(perllsp_cross_imported_func_arrow_method_passone) {
+    const char *source = "package My::Mod;\n"
+                         "use Mojo::File qw(curfile path);\n"
+                         "my $TOP = curfile->sibling('resources');\n"
+                         "sub f { my $y = curfile->sibling('b'); return $y; }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.My.Mod.f", .short_name = "f", .label = "Function",
+         .def_module_qn = "test.lib.My.Mod"},
+        {.qualified_name = "test.lib.Mojo.File.curfile", .short_name = "curfile",
+         .label = "Function", .def_module_qn = "test.lib.Mojo.File", .return_types = "Mojo::File"},
+        {.qualified_name = "test.lib.Mojo.File.sibling", .short_name = "sibling",
+         .label = "Function", .def_module_qn = "test.lib.Mojo.File"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.My.Mod", defs, 3, NULL,
+                           NULL, 0, NULL, &out, NULL, NULL, 0);
+    /* top-level curfile call attributed to the module. */
+    int top_idx = find_resolved_arr(&out, "My.Mod", "lib.Mojo.File.curfile");
+    /* in-sub curfile call attributed to f. */
+    int sub_idx = find_resolved_arr(&out, "Mod.f", "lib.Mojo.File.curfile");
+    if (top_idx < 0 || sub_idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(sub_idx >= 0);
+    ASSERT(top_idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -1480,6 +1556,8 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_mojo_listunpack_c_param);
     RUN_TEST(perllsp_cross_mojo_c_shift_param);
     RUN_TEST(perllsp_cross_return_type_chain);
+    RUN_TEST(perllsp_cross_imported_func_arrow_method);
+    RUN_TEST(perllsp_cross_imported_func_arrow_method_passone);
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);
