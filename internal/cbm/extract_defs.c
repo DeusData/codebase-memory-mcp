@@ -5020,8 +5020,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 static void extract_csharp_extension_members(CBMExtractCtx *ctx, TSNode node, TSNode class_node,
                                              const char *class_qn, const CBMLangSpec *spec) {
     const char *kind = ts_node_type(node);
-    if (strcmp(kind, "local_function_statement") == 0 ||
-        strcmp(kind, "method_declaration") == 0) {
+    if (strcmp(kind, "local_function_statement") == 0 || strcmp(kind, "method_declaration") == 0) {
         TSNode name_node = resolve_method_name(node, ctx->language);
         if (!ts_node_is_null(name_node)) {
             push_method_def(ctx, node, class_node, class_qn, spec, name_node);
