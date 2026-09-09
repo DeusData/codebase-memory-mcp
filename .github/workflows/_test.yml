@@ -311,8 +311,14 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      # Pinned: the unversioned `llvm` formula tracks Homebrew stable, so the
+      # leg's compiler changed under us when stable moved 22 -> 23 (a new
+      # -Wunused-but-set-global under -Werror broke the build on whichever
+      # runner drew the 23 bottle, and passed on the ones that drew 22). A
+      # test verdict must be a function of the code, not of the image snapshot;
+      # moving to a newer major is a deliberate one-line bump here.
       - name: Install LSan-capable toolchain
-        run: brew install llvm ccache
+        run: brew install llvm@22 ccache
 
       - name: Compiler cache (content-verified, restore)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -327,7 +333,7 @@ jobs:
         env:
           ASAN_OPTIONS: "detect_leaks=1:halt_on_error=1"
         run: |
-          LLVM_PREFIX="$(brew --prefix llvm)"
+          LLVM_PREFIX="$(brew --prefix llvm@22)"
           scripts/test.sh CC="$LLVM_PREFIX/bin/clang" CXX="$LLVM_PREFIX/bin/clang++"
 
       - name: Compiler cache (save)

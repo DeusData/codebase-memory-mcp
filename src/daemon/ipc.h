@@ -131,9 +131,11 @@ int cbm_daemon_ipc_lifetime_reservation_probe(const cbm_daemon_ipc_endpoint_t *e
 /* Remove only a provably current-generation stale Unix socket identity. The
  * caller must first observe an absent lifetime reservation and retain the
  * matching startup lock for the complete call; the implementation rechecks
- * both conditions. Stable deletion requires a committed marker whose named
- * anchor and stable path are the same secure socket inode; pending alone may
- * only complete that commit when both paths independently corroborate it.
+ * both conditions. Stable deletion normally requires a committed marker whose
+ * named anchor and stable path are the same secure socket inode; pending alone
+ * may only complete that commit when both paths independently corroborate it.
+ * With both records absent, the exact owner-private two-name/two-link stable
+ * socket and anchor shape is also recoverable after immediate revalidation.
  * A differing stable replacement is preserved while owned anchor/records are
  * collected. Returns 1 when the stable endpoint is absent and all owned
  * artifacts are absent or were removed, 0 when cleanup is refused for a live,
@@ -193,8 +195,10 @@ int cbm_daemon_ipc_startup_lock_try_acquire(const cbm_daemon_ipc_endpoint_t *end
                                             cbm_daemon_ipc_startup_lock_t **lock_out);
 /* Activation-only no-spawn generation probe under the exact matching,
  * retained, unprepared startup lock. It ignores the caller's own startup-v2
- * and frozen-legacy startup claims, and reports only a live daemon lifetime,
- * stable current transport, or deterministic legacy/current sentinel.
+ * and frozen-legacy startup claims, serially cleans a provable stale POSIX
+ * generation under a temporary lifetime reservation, and reports only a live
+ * daemon lifetime, remaining stable transport, or deterministic
+ * legacy/current sentinel.
  * Returns 1 when active, 0 when authoritatively absent, and -1 when the lock,
  * endpoint, transport, or ownership cannot be validated. */
 int cbm_daemon_ipc_generation_probe_under_startup_lock(

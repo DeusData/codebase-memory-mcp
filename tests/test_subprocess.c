@@ -25,6 +25,7 @@
 #include <unistd.h>
 #else
 #include <windows.h>
+#include "../src/foundation/win_utf8.h"
 #endif
 
 /* ── Layer 1: pure classifier (all platforms) ─────────────────────────────── */
@@ -748,22 +749,27 @@ TEST(subprocess_windows_job_object_enforces_memory_limit) {
 #ifndef _WIN32
     SKIP_PLATFORM("native Windows Job Object memory-limit probe");
 #else
-    char self_path[32768];
-    DWORD self_length = GetModuleFileNameA(NULL, self_path, (DWORD)sizeof(self_path));
-    ASSERT_TRUE(self_length > 0 && self_length < sizeof(self_path));
+    char *self_path = cbm_module_path_utf8();
+    ASSERT_TRUE(self_path != NULL);
     const char *argv[] = {self_path, "__cbm_windows_memory_limit_probe", NULL};
     cbm_proc_opts_t opts = {0};
     opts.bin = self_path;
     opts.argv = argv;
-    opts.memory_limit_bytes = (size_t)512U * 1024U * 1024U;
+    opts.memory_limit_bytes = (size_t)1024U * 1024U * 1024U;
     opts.quiet_timeout_ms = 5000;
 
     cbm_proc_result_t result = {0};
-    ASSERT_EQ(cbm_subprocess_run(&opts, &result), 0);
+    int run_rc = cbm_subprocess_run(&opts, &result);
+    free(self_path);
+    ASSERT_EQ(run_rc, 0);
     ASSERT_EQ(result.outcome, CBM_PROC_EXIT_NONZERO);
     ASSERT_EQ(result.exit_code, 73);
     ASSERT_TRUE(result.tree_quiesced);
     ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(result.job_memory_available);
+    ASSERT_TRUE(result.job_memory_limit_bytes == opts.memory_limit_bytes);
+    ASSERT_TRUE(result.peak_job_memory_bytes > 0);
+    ASSERT_TRUE(result.peak_job_memory_bytes <= result.job_memory_limit_bytes);
     PASS();
 #endif
 }

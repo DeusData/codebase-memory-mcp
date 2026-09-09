@@ -1148,6 +1148,33 @@ TEST(elixir_function) {
     PASS();
 }
 
+/* tree-sitter-elixir gives a call's arguments node no field name, so the
+ * generic `arguments` field lookup returns null and first_string_arg was never
+ * populated for any Elixir call — Phoenix route paths, service URLs and config
+ * keys all key off it. */
+TEST(elixir_call_string_argument) {
+    CBMFileResult *r = extract("defmodule Sample do\n"
+                               "  def run do\n"
+                               "    get(\"/wallets\", WalletController)\n"
+                               "  end\n"
+                               "end\n",
+                               CBM_LANG_ELIXIR, "t", "sample.ex");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    int seen = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, "get") != 0) {
+            continue;
+        }
+        seen = 1;
+        ASSERT_NOT_NULL(r->calls.items[i].first_string_arg);
+        ASSERT_STR_EQ("/wallets", r->calls.items[i].first_string_arg);
+    }
+    ASSERT_EQ(1, seen);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Haskell --- */
 TEST(haskell_function) {
     CBMFileResult *r = extract("add :: Int -> Int -> Int\nadd x y = x + y\n\nmultiply :: Int -> "
@@ -3345,7 +3372,10 @@ TEST(vue_embedded_structure_negative_controls_issue1410) {
     PASS();
 }
 
-TEST(vue_embedded_structure_host_controls_issue1410) {
+/* The sibling hosts ride Vue's embedded seam: the function and call a .ts file
+ * yields come out of a plain <script> (or Astro's frontmatter fence) the same
+ * way, alongside the import those blocks always produced. */
+TEST(embedded_structure_sibling_hosts_issue1807) {
     CBMFileResult *plain =
         extract("function plainTs(): void { target(); }\n", CBM_LANG_TYPESCRIPT, "t", "plain.ts");
     ASSERT_NOT_NULL(plain);
@@ -3359,23 +3389,190 @@ TEST(vue_embedded_structure_host_controls_issue1410) {
         const char *path;
         const char *source;
     } hosts[] = {
-        {CBM_LANG_SVELTE, "Control.svelte",
-         "<script>import value from './svelte.js'; function hidden() { target(); }</script>\n"},
-        {CBM_LANG_HTML, "control.html",
-         "<script>import value from './html.js'; function hidden() { target(); }</script>\n"},
-        {CBM_LANG_ASTRO, "Control.astro",
-         "---\nimport value from './astro.js'; function hidden() { target(); }\n---\n"},
+        {CBM_LANG_SVELTE, "Sibling.svelte",
+         "<script>import value from './svelte.js'; function visible() { target(); }</script>\n"},
+        {CBM_LANG_HTML, "sibling.html",
+         "<script>import value from './html.js'; function visible() { target(); }</script>\n"},
+        {CBM_LANG_ASTRO, "Sibling.astro",
+         "---\nimport value from './astro.js'; function visible() { target(); }\n---\n"},
     };
     for (int i = 0; i < 3; i++) {
         CBMFileResult *r = extract(hosts[i].source, hosts[i].language, "t", hosts[i].path);
         ASSERT_NOT_NULL(r);
         ASSERT_FALSE(r->has_error);
         ASSERT_EQ(count_defs_with_label(r, "Module"), 1);
-        ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
-        ASSERT_EQ(r->calls.count, 0);
+        ASSERT_EQ(count_defs_named(r, "Function", "visible"), 1);
+        ASSERT_EQ(count_calls_named(r, "target"), 1);
         ASSERT_EQ(r->imports.count, 1);
         cbm_free_result(r);
     }
+    PASS();
+}
+
+/* Blocks that must never yield inline symbols, whatever the host: an external
+ * program (src=) and a non-JavaScript MIME type. The bodies are deliberately
+ * code, so a leak would surface as a definition and a call. HTML's own tag
+ * walker still records the src= reference as an import; that edge names the
+ * external file and is not the inline body leaking through. */
+TEST(embedded_structure_inert_blocks_issue1807) {
+    static const struct {
+        CBMLanguage language;
+        const char *path;
+        const char *source;
+        int imports;
+    } blocks[] = {
+        {CBM_LANG_VUE, "Inert.vue",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_VUE, "Inert.vue",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_SVELTE, "Inert.svelte",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_SVELTE, "Inert.svelte",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script type=\"importmap\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script type=\"text/x-template\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_HTML, "inert.html",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 1},
+        {CBM_LANG_ASTRO, "Inert.astro",
+         "<script type=\"application/json\">function hidden() { target(); }</script>\n", 0},
+        {CBM_LANG_ASTRO, "Inert.astro",
+         "<script src=\"./x.js\">function hidden() { target(); }</script>\n", 0},
+    };
+    for (int i = 0; i < 10; i++) {
+        CBMFileResult *r = extract(blocks[i].source, blocks[i].language, "t", blocks[i].path);
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_EQ(count_defs_with_label(r, "Module"), 1);
+        ASSERT_EQ(count_defs_with_label(r, "Function"), 0);
+        ASSERT_EQ(r->calls.count, 0);
+        ASSERT_EQ(r->imports.count, blocks[i].imports);
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Svelte's module-level block (<script context="module">, or <script module>
+ * since Svelte 5) is a second block in the same file: both contribute, each
+ * honouring its own lang=, in host-file coordinates. */
+TEST(svelte_embedded_structure_both_blocks_issue1807) {
+    static const char *sources[] = {
+        "<script context=\"module\" lang=\"ts\">\n"
+        "export function fromModule(): number { return shared(); }\n"
+        "</script>\n"
+        "<script lang=\"ts\">\n"
+        "import { shared } from './shared';\n"
+        "function fromInstance(): number { return shared() + fromModule(); }\n"
+        "</script>\n"
+        "<button on:click={fromInstance}>{fromModule()}</button>\n",
+        "<script module lang=\"ts\">\n"
+        "export function fromModule(): number { return shared(); }\n"
+        "</script>\n"
+        "<script lang=\"ts\">\n"
+        "import { shared } from './shared';\n"
+        "function fromInstance(): number { return shared() + fromModule(); }\n"
+        "</script>\n"
+        "<button onclick={fromInstance}>{fromModule()}</button>\n",
+    };
+    for (int i = 0; i < 2; i++) {
+        CBMFileResult *r = extract(sources[i], CBM_LANG_SVELTE, "t", "Widget.svelte");
+        ASSERT_NOT_NULL(r);
+        ASSERT_FALSE(r->has_error);
+        ASSERT_EQ(count_defs_with_label(r, "Function"), 2);
+        ASSERT_EQ(count_defs_named(r, "Function", "fromModule"), 1);
+        ASSERT_EQ(count_defs_named(r, "Function", "fromInstance"), 1);
+        ASSERT_EQ(count_calls_named(r, "shared"), 2);
+        ASSERT_EQ(count_calls_named(r, "fromModule"), 1);
+        ASSERT_EQ(r->imports.count, 1);
+        ASSERT(has_import(r, "shared"));
+        for (int d = 0; d < r->defs.count; d++) {
+            const CBMDefinition *def = &r->defs.items[d];
+            if (strcmp(def->name, "fromModule") == 0) {
+                ASSERT_EQ(def->start_line, 2);
+            } else if (strcmp(def->name, "fromInstance") == 0) {
+                ASSERT_EQ(def->start_line, 6);
+            }
+        }
+        cbm_free_result(r);
+    }
+    PASS();
+}
+
+/* Every type= form HTML itself runs as JavaScript contributes, in host-file
+ * coordinates; a data block on the same page does not. */
+TEST(html_embedded_structure_issue1807) {
+    CBMFileResult *r =
+        extract("<!DOCTYPE html><html><head>\n"
+                "<script type=\"module\">\n"
+                "import { renderApp } from './app.js';\n"
+                "function boot() { renderApp(); }\n"
+                "</script>\n"
+                "<script type=\"text/javascript\">\n"
+                "function legacy() { boot(); }\n"
+                "</script>\n"
+                "<script type=\"application/javascript\">\n"
+                "function fallback() { legacy(); }\n"
+                "</script>\n"
+                "<script type=\"application/ld+json\">{\"@type\": \"Thing\"}</script>\n"
+                "</head><body></body></html>\n",
+                CBM_LANG_HTML, "t", "index.html");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_defs_with_label(r, "Function"), 3);
+    ASSERT_EQ(count_calls_named(r, "renderApp"), 1);
+    ASSERT_EQ(count_calls_named(r, "boot"), 1);
+    ASSERT_EQ(count_calls_named(r, "legacy"), 1);
+    ASSERT_EQ(r->imports.count, 1);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "boot") == 0) {
+            ASSERT_EQ(d->start_line, 4);
+        } else if (strcmp(d->name, "legacy") == 0) {
+            ASSERT_EQ(d->start_line, 7);
+        } else if (strcmp(d->name, "fallback") == 0) {
+            ASSERT_EQ(d->start_line, 10);
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Astro's frontmatter fence and <script> bodies are TypeScript by default: an
+ * interface and typed signatures parse, and both blocks contribute in
+ * host-file coordinates. */
+TEST(astro_embedded_structure_issue1807) {
+    CBMFileResult *r = extract("---\n"
+                               "import Header from './Header.astro';\n"
+                               "interface Props { title: string }\n"
+                               "const { title }: Props = Astro.props;\n"
+                               "function heading(): string { return format(title); }\n"
+                               "---\n"
+                               "<Header />\n"
+                               "<script>\n"
+                               "function hydrate(): void { heading(); }\n"
+                               "</script>\n",
+                               CBM_LANG_ASTRO, "t", "Page.astro");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_any(r, "Props"));
+    ASSERT_EQ(count_defs_named(r, "Function", "heading"), 1);
+    ASSERT_EQ(count_defs_named(r, "Function", "hydrate"), 1);
+    ASSERT_EQ(count_calls_named(r, "format"), 1);
+    ASSERT_EQ(count_calls_named(r, "heading"), 1);
+    ASSERT_EQ(r->imports.count, 1);
+    ASSERT(has_import(r, "Header.astro"));
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (strcmp(d->name, "heading") == 0) {
+            ASSERT_EQ(d->start_line, 5);
+        } else if (strcmp(d->name, "hydrate") == 0) {
+            ASSERT_EQ(d->start_line, 9);
+        }
+    }
+    cbm_free_result(r);
     PASS();
 }
 
@@ -4038,6 +4235,51 @@ TEST(extract_blazor_component_without_page_has_no_route) {
                                CBM_LANG_CSHARP, "t", "Shared/Card.razor");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NULL(mod->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Razor Pages: `@page` is what turns a .cshtml view INTO a page — it is the
+ * defining directive of the model, not an optional annotation as it is on a
+ * Blazor component. So an ASP.NET Core app's routable surface lives entirely
+ * in file types that were unmapped until now, and every one of those routes
+ * was invisible.
+ *
+ * Same mechanism as the .razor case: the directive sits in markup above any
+ * code block, where the C# grammar never reaches, so it is read from raw
+ * source and hangs off the file's Module definition. */
+TEST(extract_razor_page_directive_routes_cshtml_view) {
+    CBMFileResult *r = extract("@page \"/orders\"\n"
+                               "@model OrderIndexModel\n"
+                               "\n"
+                               "<h1>Orders</h1>\n"
+                               "<table><tr><td>@Model.Count</td></tr></table>\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Orders/Index.cshtml");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *mod = find_module_def(r);
+    ASSERT_NOT_NULL(mod);
+    ASSERT_NOT_NULL(mod->route_path);
+    ASSERT_STR_EQ(mod->route_path, "/orders");
+    /* A Razor Page is reached by navigation, i.e. GET — same as a component. */
+    ASSERT_NOT_NULL(mod->route_method);
+    ASSERT_STR_EQ(mod->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The overwhelming majority of .cshtml files are layouts, partials and views
+ * with no `@page` at all. If the scan fired on those, an ASP.NET app would
+ * gain a bogus Route node per view — worse than the missing routes it set out
+ * to fix, because a wrong route looks authoritative. */
+TEST(extract_razor_layout_without_page_has_no_route) {
+    CBMFileResult *r = extract("@model LayoutModel\n"
+                               "<!DOCTYPE html>\n"
+                               "<html><body>@RenderBody()</body></html>\n",
+                               CBM_LANG_CSHARP, "t", "Pages/Shared/_Layout.cshtml");
+    ASSERT_NOT_NULL(r);
     const CBMDefinition *mod = find_module_def(r);
     ASSERT_NOT_NULL(mod);
     ASSERT_NULL(mod->route_path);
@@ -7003,6 +7245,7 @@ SUITE(extraction) {
 
     /* Functional */
     RUN_TEST(elixir_function);
+    RUN_TEST(elixir_call_string_argument);
     RUN_TEST(haskell_function);
     RUN_TEST(ocaml_function);
     RUN_TEST(erlang_function);
@@ -7162,7 +7405,11 @@ SUITE(extraction) {
     RUN_TEST(vue_imports_basic);
     RUN_TEST(vue_embedded_structure_issue1410);
     RUN_TEST(vue_embedded_structure_negative_controls_issue1410);
-    RUN_TEST(vue_embedded_structure_host_controls_issue1410);
+    RUN_TEST(embedded_structure_sibling_hosts_issue1807);
+    RUN_TEST(embedded_structure_inert_blocks_issue1807);
+    RUN_TEST(svelte_embedded_structure_both_blocks_issue1807);
+    RUN_TEST(html_embedded_structure_issue1807);
+    RUN_TEST(astro_embedded_structure_issue1807);
     RUN_TEST(html_imports_basic);
 
     /* config_extraction_test.go ports */
@@ -7208,6 +7455,8 @@ SUITE(extraction) {
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
+    RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
+    RUN_TEST(extract_razor_layout_without_page_has_no_route);
     RUN_TEST(extract_ts_template_string_url_issue1006);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);

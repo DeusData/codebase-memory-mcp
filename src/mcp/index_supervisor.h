@@ -151,6 +151,10 @@ typedef enum {
     CBM_INDEX_WORKER_POLL_TERMINAL = 1,
 } cbm_index_worker_poll_t;
 
+/* Pure Windows backstop policy, available on all platforms for regression tests.
+ * Small/zero budgets disable the OS cap, not the cooperative budget or containment. */
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes);
+
 /* Start returns after process creation. All string arguments are copied by the
  * contained subprocess layer. Recovery values are encoded only as hidden argv
  * and applied after exec by cbm_index_set_worker_role_options(). */

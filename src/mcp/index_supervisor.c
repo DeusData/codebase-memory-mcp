@@ -12,6 +12,7 @@
 #include "foundation/profile.h"  /* cbm_profile_active (keep worker log under CBM_PROFILE) */
 #include "ui/http_server.h"      /* cbm_http_server_resolve_binary_path */
 
+#include <limits.h>
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -322,14 +323,23 @@ static bool supervisor_disable_requested(void) {
  * CBM_INDEX_WORKER_TIMEOUT_S override (seconds → ms) tightens it for tests. */
 static int worker_quiet_timeout_ms(void) {
     enum { DEFAULT_QUIET_TIMEOUT_MS = 900000 }; /* 15 min with no progress */
+    enum { MS_PER_SECOND = 1000 };
     char timeout_seconds[CBM_SZ_32] = {0};
+    long s = 0;
+    /* The upper test only stops the seconds-to-ms multiply from overflowing an
+     * int. It sets no policy: a longer timeout than the default is still fine. */
+    if (cbm_env_long("CBM_INDEX_WORKER_TIMEOUT_S", &s) && s > 0 && s <= INT_MAX / MS_PER_SECOND) {
+        return (int)(s * MS_PER_SECOND);
+    }
+    /* atol used to answer 0 for a value it could not read, and 0 fell straight
+     * through to the 15-minute default with nothing on screen. A test set to
+     * give up after 30 seconds then hung for 15 minutes and nobody could see
+     * why. An unreadable value now says so before it is dropped. */
     if (cbm_safe_getenv("CBM_INDEX_WORKER_TIMEOUT_S", timeout_seconds, sizeof(timeout_seconds),
                         NULL) &&
         timeout_seconds[0]) {
-        long s = atol(timeout_seconds);
-        if (s > 0) {
-            return (int)(s * 1000);
-        }
+        cbm_log_warn("index.supervisor.worker_timeout_ignored", "value", timeout_seconds, "action",
+                     "using_default");
     }
     return DEFAULT_QUIET_TIMEOUT_MS;
 }
@@ -588,6 +598,20 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
     (void)snprintf(exit_text, sizeof(exit_text), "%d", handle->result.exit_code);
     cbm_log_info("index.supervisor.reap", "outcome", cbm_proc_outcome_str(handle->result.outcome),
                  "exit_code", exit_text, "signal", signal_text);
+    if (!worker_result_succeeded(&handle->result) &&
+        handle->process_result.job_memory_limit_bytes > 0) {
+        char limit_text[CBM_SZ_32];
+        char peak_text[CBM_SZ_32];
+        (void)snprintf(limit_text, sizeof(limit_text), "%zu",
+                       handle->process_result.job_memory_limit_bytes);
+        (void)snprintf(peak_text, sizeof(peak_text), "%zu",
+                       handle->process_result.peak_job_memory_bytes);
+        /* A rejected allocation can leave peak commit BELOW the cap. Report
+         * evidence, not an inferred OOM classification or a file to quarantine. */
+        cbm_log_warn("index.supervisor.worker_memory", "job_limit_bytes", limit_text,
+                     "peak_job_memory_bytes",
+                     handle->process_result.job_memory_available ? peak_text : "unavailable");
+    }
     if (handle->result.response_rejected) {
         cbm_log_error("index.supervisor.response_rejected", "reason", "payload_too_large", "log",
                       handle->log_path);
@@ -606,6 +630,23 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
                      cbm_proc_outcome_str(handle->result.outcome), "exit_code", exit_text, "log",
                      handle->log_path);
     }
+}
+
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
+    /* Tiny token budgets must still reach main (image/CRT/stack startup already
+     * needs memory). Keep their argv value but leave the OS cap disabled below
+     * 512 MiB. KILL_ON_JOB_CLOSE remains in force regardless of the cap.
+     *
+     * The cooperative RSS budget, including its fail-whole over-budget gate,
+     * gets first chance to recover/abort. Windows charges job-wide COMMIT, not
+     * RSS, so this 1.5x limit is a looser last-resort backstop for descendants
+     * too, not an exact enforcement of the worker's accounting budget. */
+    const size_t minimum_budget = (size_t)512U * 1024U * 1024U;
+    if (memory_budget_bytes < minimum_budget) {
+        return 0;
+    }
+    size_t headroom = memory_budget_bytes / 2;
+    return memory_budget_bytes > SIZE_MAX - headroom ? SIZE_MAX : memory_budget_bytes + headroom;
 }
 
 int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_bytes,
@@ -695,7 +736,7 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     options.on_log_line = NULL;
     options.log_ud = NULL;
     options.quiet_timeout_ms = worker_quiet_timeout_ms();
-    options.memory_limit_bytes = memory_budget_bytes;
+    options.memory_limit_bytes = cbm_index_worker_job_memory_limit(memory_budget_bytes);
     options.delete_log_on_exit = false;
     if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
         (void)cbm_unlink(handle->response_path);

@@ -791,6 +791,17 @@ static bool cbm_win_job_active(cbm_subprocess_t *process, bool *known) {
     return accounting.ActiveProcesses != 0;
 }
 
+static void cbm_win_capture_job_memory(cbm_subprocess_t *process) {
+    process->result.job_memory_limit_bytes = process->memory_limit_bytes;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    ZeroMemory(&limits, sizeof(limits));
+    if (QueryInformationJobObject(process->job, JobObjectExtendedLimitInformation, &limits,
+                                  sizeof(limits), NULL)) {
+        process->result.peak_job_memory_bytes = (size_t)limits.PeakJobMemoryUsed;
+        process->result.job_memory_available = true;
+    }
+}
+
 static void cbm_win_begin_termination(cbm_subprocess_t *process, uint64_t now) {
     if (process->termination_started) {
         return;
@@ -879,9 +890,11 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
     if (process->force_started_ms != 0 &&
         now - process->force_started_ms >= CBM_SUBPROCESS_FORCE_SETTLE_MS &&
         (!job_known || job_active || !process->root_reaped)) {
+        cbm_win_capture_job_memory(process);
         return cbm_subprocess_finish_failed(process, out);
     }
     if (process->root_reaped && !job_active) {
+        cbm_win_capture_job_memory(process);
         return cbm_subprocess_finish(process, out);
     }
     return CBM_PROC_POLL_RUNNING;

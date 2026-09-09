@@ -213,14 +213,14 @@ char *cbm_client_adapter_pi(const char *binary_path) {
         if (!name || !name[0]) {
             continue;
         }
-        const char *title = cbm_mcp_tool_title(name);
         const char *description = cbm_mcp_tool_description(name);
         const char *schema = cbm_mcp_tool_input_schema(name);
         sb_append(&sb, "  pi.registerTool({\n");
         sb_append(&sb, "    name: ");
         sb_append_js_string(&sb, name);
         sb_append(&sb, ",\n    label: ");
-        sb_append_js_string(&sb, title ? title : name);
+        /* Tools carry no separate title: the name is the MCP display fallback. */
+        sb_append_js_string(&sb, name);
         sb_append(&sb, ",\n    description: ");
         sb_append_js_string(&sb, description ? description : "");
         sb_append(&sb, ",\n    parameters: ");

@@ -1397,7 +1397,11 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
     /* 1. Try relative import resolution (existing logic) */
     char *resolved = cbm_pipeline_resolve_relative_import(source_rel, module_path);
     if (resolved) {
-        char *qn = cbm_pipeline_fqn_module(ctx->project_name, resolved);
+        /* The relative resolver has already removed an explicit JS/TS file
+         * extension.  Treat the remaining path as a module path verbatim so a
+         * dotted extensionless basename such as `featureX.engine` is not
+         * stripped a second time by cbm_pipeline_fqn_module. */
+        char *qn = cbm_pipeline_fqn_folder(ctx->project_name, resolved);
         free(resolved);
         return qn;
     }

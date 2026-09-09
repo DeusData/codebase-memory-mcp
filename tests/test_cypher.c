@@ -810,6 +810,9 @@ TEST(cypher_exec_optional_saturated_does_not_fabricate_no_match) {
     /* The discriminator: C has 5 callees, so claiming it has none is a
      * fabrication. Pre-fix this is exactly what the saturated path emitted. */
     ASSERT_FALSE(saw_c);
+    /* Relationship expansion materializes every matched row (a cap here once
+     * falsified aggregates), so nothing was left unevaluated. */
+    ASSERT_FALSE(r.truncated);
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -1274,6 +1277,9 @@ TEST(cypher_exec_varlength_path_semantics_issue797) {
     ASSERT_EQ(r4.row_count, 0);
     ASSERT_NOT_NULL(r4.warning);
     ASSERT_NOT_NULL(strstr(r4.warning, "clamped"));
+    /* The warning reports the policy clamp, but this shallow fixture has no
+     * candidate beyond the ceiling, so evaluation was still exhaustive. */
+    ASSERT_FALSE(r4.truncated);
     cbm_cypher_result_free(&r4);
 
     cbm_store_close(s);
@@ -1783,6 +1789,7 @@ TEST(cypher_exec_variable_length) {
     ASSERT_EQ(rc, 0);
     /* Should find: ValidateOrder (1 hop), SubmitOrder (2 hops), LogError (1 hop) */
     ASSERT_GTE(r.row_count, 3);
+    ASSERT_FALSE(r.truncated);
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -1866,6 +1873,7 @@ TEST(cypher_exec_var_length_explicit_bound_capped) {
     ASSERT_TRUE(saw_n10);  /* within the ceiling — proves the traversal really ran */
     ASSERT_FALSE(saw_n11); /* clamped away */
     ASSERT_FALSE(saw_n12);
+    ASSERT_TRUE(r.truncated);
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -2143,9 +2151,10 @@ TEST(cypher_optional_match_target_still_allowed_issue1919) {
 TEST(cypher_with_alias_stays_in_scope_issue1919) {
     cbm_store_t *s = setup_cypher_store();
     cbm_cypher_result_t r = {0};
-    int rc = cbm_cypher_execute(
-        s, "MATCH (f:Function)-[:CALLS]->(g) WITH f.name AS caller, g AS callee RETURN caller, callee.name",
-        "test", 0, &r);
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS]->(g) WITH f.name AS caller, g AS "
+                                "callee RETURN caller, callee.name",
+                                "test", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_NULL(r.error);
     ASSERT_TRUE(r.row_count > 0);
@@ -2786,6 +2795,7 @@ TEST(cypher_apply_limit) {
     int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 5", "lim", 0, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 5);
+    ASSERT_FALSE(r.truncated);
     cbm_cypher_result_free(&r);
 
     /* No LIMIT, max_rows=10 → capped at 10 */
@@ -2793,6 +2803,7 @@ TEST(cypher_apply_limit) {
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "lim", 10, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 10);
+    ASSERT_TRUE(r.truncated);
     cbm_cypher_result_free(&r);
 
     /* LIMIT above max_rows → explicit limit wins */
@@ -2800,8 +2811,139 @@ TEST(cypher_apply_limit) {
     rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 30", "lim", 10, &r);
     ASSERT_EQ(rc, 0);
     ASSERT_EQ(r.row_count, 30);
+    ASSERT_FALSE(r.truncated);
     cbm_cypher_result_free(&r);
 
+    cbm_store_close(s);
+    PASS();
+}
+
+/* max_rows is an engine output budget, not Cypher query semantics. Callers
+ * need to distinguish a complete short result from one cut off by that budget.
+ * An explicit LIMIT remains complete because it is part of the query itself. */
+TEST(cypher_result_reports_max_rows_saturation) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "sat", "/tmp/sat");
+
+    for (int i = 0; i < 7; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "func%d", i);
+        snprintf(qn, sizeof(qn), "sat.func%d", i);
+        cbm_node_t n = {.project = "sat",
+                        .label = "Function",
+                        .name = name,
+                        .qualified_name = qn,
+                        .file_path = "test.c"};
+        cbm_store_upsert_node(s, &n);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "sat", 3, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_TRUE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name", "sat", 10, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 7);
+    ASSERT_FALSE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN f.name LIMIT 3", "sat", 10, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_FALSE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    /* RETURN * historically keeps max_rows as its output cap even when a
+     * larger Cypher LIMIT is present; preserve that behavior and report it. */
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (f:Function) RETURN * LIMIT 5", "sat", 3, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 3);
+    ASSERT_TRUE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* An unlabeled MATCH scans every candidate before aggregation: the count is
+ * exact for any max_rows, and no internal ceiling is reported (a bounded scan
+ * here once made count(*) depend on the requested row budget). */
+TEST(cypher_result_unlabeled_scan_is_exhaustive_before_aggregation) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "scan_sat", "/tmp/scan_sat");
+
+    for (int i = 0; i < 11; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "node%d", i);
+        snprintf(qn, sizeof(qn), "scan_sat.node%d", i);
+        cbm_node_t n = {
+            .project = "scan_sat", .label = "Function", .name = name, .qualified_name = qn};
+        cbm_store_upsert_node(s, &n);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (n) RETURN count(*) AS n", "scan_sat", 1, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "11");
+    ASSERT_FALSE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    memset(&r, 0, sizeof(r));
+    rc = cbm_cypher_execute(s, "MATCH (n) RETURN count(*) AS n", "scan_sat", 2, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 1);
+    ASSERT_STR_EQ(r.rows[0][0], "11");
+    ASSERT_FALSE(r.truncated);
+    cbm_cypher_result_free(&r);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Variable-length traversal historically materializes at most 100 visited
+ * nodes. Probe one extra candidate so an exact 100 is distinguishable from a
+ * graph with additional reachable nodes, while preserving the 100-row output. */
+TEST(cypher_result_reports_variable_length_candidate_saturation) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "bfs_sat", "/tmp/bfs_sat");
+
+    cbm_node_t root = {.project = "bfs_sat",
+                       .label = "Function",
+                       .name = "root",
+                       .qualified_name = "bfs_sat.root"};
+    int64_t root_id = cbm_store_upsert_node(s, &root);
+    for (int i = 0; i < 101; i++) {
+        char name[32];
+        char qn[64];
+        snprintf(name, sizeof(name), "target%03d", i);
+        snprintf(qn, sizeof(qn), "bfs_sat.target%03d", i);
+        cbm_node_t target = {
+            .project = "bfs_sat", .label = "Var", .name = name, .qualified_name = qn};
+        int64_t target_id = cbm_store_upsert_node(s, &target);
+        cbm_edge_t edge = {
+            .project = "bfs_sat", .source_id = root_id, .target_id = target_id, .type = "CALLS"};
+        cbm_store_insert_edge(s, &edge);
+    }
+
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (a:Function {name: \"root\"})-[:CALLS*1..2]->(b:Var) "
+                                "RETURN b.name",
+                                "bfs_sat", 1000, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 100);
+    ASSERT_TRUE(r.truncated);
+
+    cbm_cypher_result_free(&r);
     cbm_store_close(s);
     PASS();
 }
@@ -2978,6 +3120,207 @@ TEST(cypher_exec_return_star) {
     /* Should have columns: f.name, f.qualified_name, f.label, f.file_path */
     ASSERT_EQ(r.col_count, 4);
     cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_return_star_dedups_repeated_pattern_var) {
+    /* RETURN * collected its column variables from every pattern in turn and
+     * never deduped, so a variable named in two patterns got its four columns
+     * twice. Here f is named in the MATCH and again in the OPTIONAL MATCH, so
+     * eight columns is right and twelve is the fault. */
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, "MATCH (f:Function) OPTIONAL MATCH (f)-[:CALLS]->(g) RETURN *",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 8);
+    ASSERT_STR_EQ(r.columns[0], "f.name");
+    ASSERT_STR_EQ(r.columns[4], "g.name");
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_return_star_after_with_names_aliases) {
+    /* RETURN * built its columns from the query pattern, never from the
+     * bindings it was about to project. After a WITH the live scope is the
+     * aliases the WITH made, so the old code asked for f and g, found neither,
+     * and answered every value empty with no error. */
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function)-[:CALLS]->(g) "
+                                "WITH f.name AS caller, g.name AS callee RETURN *",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.col_count, 2);
+    ASSERT_STR_EQ(r.columns[0], "caller");
+    ASSERT_STR_EQ(r.columns[1], "callee");
+    /* Three CALLS edges in the fixture. */
+    ASSERT_EQ(r.row_count, 3);
+    for (int i = 0; i < r.row_count; i++) {
+        ASSERT_TRUE(r.rows[i][0][0] != '\0');
+        ASSERT_TRUE(r.rows[i][1][0] != '\0');
+    }
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_wide_with_refused_not_truncated) {
+    /* Every item a WITH projects becomes one variable of the binding that
+     * carries the rest of the query, and a binding holds CYP_MAX_VARS (16) of
+     * them. A 20-alias WITH used to parse, drop aliases 17 to 20 inside
+     * with_add_vbinding_var, and answer RETURN * with 16 columns and no error —
+     * a short result the caller could not tell from a complete one. It has to
+     * be refused at parse time instead. */
+    char query[1024];
+    int off = snprintf(query, sizeof(query), "MATCH (f:Function) WITH ");
+    for (int i = 0; i < 20; i++) { /* 20 > CYP_MAX_VARS (16) */
+        off +=
+            snprintf(query + off, sizeof(query) - (size_t)off, "%sf.name AS c%d", i ? ", " : "", i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, " RETURN *");
+
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+    int rc = cbm_cypher_execute(s, query, "test", 0, &r);
+    ASSERT_TRUE(rc != 0); /* refused, not silently narrowed to 16 columns */
+    cbm_cypher_result_free(&r);
+
+    /* The width just under the bound still works, so the guard rejects only
+     * what the binding genuinely cannot carry. */
+    char ok_query[1024];
+    off = snprintf(ok_query, sizeof(ok_query), "MATCH (f:Function) WITH ");
+    for (int i = 0; i < 16; i++) {
+        off += snprintf(ok_query + off, sizeof(ok_query) - (size_t)off, "%sf.name AS c%d",
+                        i ? ", " : "", i);
+    }
+    snprintf(ok_query + off, sizeof(ok_query) - (size_t)off, " RETURN *");
+    cbm_cypher_result_t r16 = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, ok_query, "test", 0, &r16), 0);
+    ASSERT_EQ(r16.col_count, 16);
+    cbm_cypher_result_free(&r16);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* Build "MATCH (a0:NoSuchLabelXYZ)-[:CALLS]->(a1)-…->(aN-1)" into buf. The label
+ * matches nothing, so any query built on it is instant and needs no fixture. */
+static void build_node_chain(char *buf, size_t buf_sz, int nodes) {
+    int off = snprintf(buf, buf_sz, "MATCH (a0:NoSuchLabelXYZ)");
+    for (int i = 1; i < nodes; i++) {
+        off += snprintf(buf + off, buf_sz - (size_t)off, "-[:CALLS]->(a%d)", i);
+    }
+}
+
+TEST(cypher_wide_pattern_refused) {
+    /* A binding holds CYP_MAX_VARS (16) node variables, and binding_set drops
+     * the 17th without a word. The query then answers a column of empty strings
+     * for every name it could not bind, which reads as "the graph holds no such
+     * data". Refuse the query instead of answering it wrong. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[2048];
+
+    build_node_chain(query, sizeof(query), 20); /* 20 > CYP_MAX_VARS */
+    strncat(query, " RETURN a0.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    ASSERT_TRUE(strstr(wide.error, "node") != NULL); /* says which limit was passed */
+    cbm_cypher_result_free(&wide);
+
+    /* The width right at the bound still runs, so the guard refuses only what a
+     * binding genuinely cannot hold. */
+    build_node_chain(query, sizeof(query), 16);
+    strncat(query, " RETURN a0.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t ok = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, query, "test", 0, &ok), 0);
+    cbm_cypher_result_free(&ok);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_wide_edge_pattern_refused) {
+    /* Same shape on the edge table, where binding_set_edge stops at
+     * CYP_MAX_EDGE_VARS (8). Only NAMED relationships take a slot. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[2048];
+    int off = snprintf(query, sizeof(query), "MATCH (a0:NoSuchLabelXYZ)");
+    for (int i = 1; i <= 9; i++) { /* 9 > CYP_MAX_EDGE_VARS */
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "-[r%d:CALLS]->(a%d)", i, i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, " RETURN a0.name");
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    ASSERT_TRUE(strstr(wide.error, "edge") != NULL);
+    cbm_cypher_result_free(&wide);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_unnamed_head_takes_a_slot) {
+    /* The head of the first pattern is bound whether the query names it or not:
+     * execute_single falls back to the synthetic name "_n0". So an unnamed head
+     * plus CYP_MAX_VARS (16) named nodes needs 17 slots and only 16 exist. Before
+     * the fix, the capacity check counted names alone, let this query through,
+     * and binding_set dropped the 16th name without a word — a0..a14 answered and
+     * a15 came back empty. Refuse it instead. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[2048];
+    int off = snprintf(query, sizeof(query), "MATCH (:NoSuchLabelXYZ)");
+    for (int i = 0; i < 16; i++) { /* 16 named + the unnamed head = 17 */
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "-[:CALLS]->(a%d)", i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, " RETURN a0.name");
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    ASSERT_TRUE(strstr(wide.error, "node") != NULL);
+    cbm_cypher_result_free(&wide);
+
+    /* One name fewer fits exactly, so the guard still refuses only what a
+     * binding genuinely cannot hold. */
+    off = snprintf(query, sizeof(query), "MATCH (:NoSuchLabelXYZ)");
+    for (int i = 0; i < 15; i++) {
+        off += snprintf(query + off, sizeof(query) - (size_t)off, "-[:CALLS]->(a%d)", i);
+    }
+    snprintf(query + off, sizeof(query) - (size_t)off, " RETURN a0.name");
+    cbm_cypher_result_t ok = {0};
+    ASSERT_EQ(cbm_cypher_execute(s, query, "test", 0, &ok), 0);
+    cbm_cypher_result_free(&ok);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_scope_check_survives_wide_pattern) {
+    /* Regression test for #1995. check_projection_scope models declared names in
+     * a fixed array and used to skip the check entirely when a query declared
+     * more than it held. So the same out-of-scope name was refused on a narrow
+     * query and quietly accepted on a wide one. Both must now be refused. */
+    cbm_store_t *s = setup_cypher_store();
+    char query[4096];
+
+    build_node_chain(query, sizeof(query), 10);
+    strncat(query, " RETURN zzz.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t narrow = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &narrow) != 0);
+    ASSERT_NOT_NULL(narrow.error);
+    ASSERT_TRUE(strstr(narrow.error, "zzz") != NULL);
+    cbm_cypher_result_free(&narrow);
+
+    /* 35 declared names — this one used to answer a zzz.name column of nothing. */
+    build_node_chain(query, sizeof(query), 35);
+    strncat(query, " RETURN zzz.name", sizeof(query) - strlen(query) - 1);
+    cbm_cypher_result_t wide = {0};
+    ASSERT_TRUE(cbm_cypher_execute(s, query, "test", 0, &wide) != 0);
+    ASSERT_NOT_NULL(wide.error);
+    cbm_cypher_result_free(&wide);
+
     cbm_store_close(s);
     PASS();
 }
@@ -4277,6 +4620,9 @@ SUITE(cypher) {
     RUN_TEST(cypher_edge_filter_regex);
     RUN_TEST(cypher_edge_builtin_type_filter);
     RUN_TEST(cypher_apply_limit);
+    RUN_TEST(cypher_result_reports_max_rows_saturation);
+    RUN_TEST(cypher_result_unlabeled_scan_is_exhaustive_before_aggregation);
+    RUN_TEST(cypher_result_reports_variable_length_candidate_saturation);
     /* Phase 1: Simple operators */
     RUN_TEST(cypher_lex_neq_operators);
     RUN_TEST(cypher_lex_ends_keyword);
@@ -4290,6 +4636,13 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_where_is_null);
     RUN_TEST(cypher_exec_where_is_not_null);
     RUN_TEST(cypher_exec_return_star);
+    RUN_TEST(cypher_return_star_dedups_repeated_pattern_var);
+    RUN_TEST(cypher_return_star_after_with_names_aliases);
+    RUN_TEST(cypher_wide_with_refused_not_truncated);
+    RUN_TEST(cypher_wide_pattern_refused);
+    RUN_TEST(cypher_wide_edge_pattern_refused);
+    RUN_TEST(cypher_unnamed_head_takes_a_slot);
+    RUN_TEST(cypher_scope_check_survives_wide_pattern);
     RUN_TEST(cypher_parse_neq);
     RUN_TEST(cypher_parse_in);
     RUN_TEST(cypher_parse_is_null);

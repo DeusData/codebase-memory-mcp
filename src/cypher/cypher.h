@@ -321,6 +321,10 @@ typedef struct {
     /* rows[row_idx][col_idx] = string value */
     const char ***rows;
     int row_count;
+    /* True when an internal row/candidate ceiling prevented exhaustive
+     * evaluation. A Cypher LIMIT is part of query semantics and does not set
+     * this flag by itself. */
+    bool truncated;
     /* Non-NULL when the query was rejected (e.g. result too large) */
     char *error;
     /* Non-NULL advisory (caller-visible, not an error): e.g. a variable-
