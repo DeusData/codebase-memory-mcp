@@ -1691,7 +1691,7 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 /* `file_node_id` is the defining file's node id (0 when it has none), looked up
  * once per file by the caller: computing the file QN and finding its node for
  * every definition was 700 k allocations and lookups on the Go corpus. */
-static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
                                  int64_t file_node_id, int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
@@ -1700,7 +1700,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        cbm_registry_add_def(ctx->registry, def->name, def->qualified_name, def->label,
+                             def->file_path ? def->file_path : rel);
         (*reg_entries)++;
     }
     const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
@@ -1879,8 +1880,8 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             free(file_qn);
             pp_add_file_doc(file_node, result->module_doc);
             for (int d = 0; d < result->defs.count; d++) {
-                defines_edges +=
-                    register_and_link_def(ctx, &result->defs.items[d], file_node_id, &reg_entries);
+                defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel,
+                                                       file_node_id, &reg_entries);
             }
         }
 

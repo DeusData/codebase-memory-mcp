@@ -7390,6 +7390,101 @@ TEST(pipeline_scala_index_built_only_for_scala_importers) {
     PASS();
 }
 
+static void write_scala_companion_fixture(const char *tmp) {
+    write_temp_file(
+        tmp, "rational.scala",
+        "package numeric\n"
+        "class Rational(n: Int, d: Int) { def reciprocal: Rational = Rational.make(d, n) }\n"
+        "object Rational {\n"
+        "  def make(n: Int, d: Int): Rational = new Rational(n, d)\n"
+        "  def fromInt(n: Int): Rational = make(n, 1)\n"
+        "}\n");
+    write_temp_file(tmp, "factory_user.scala",
+                    "package app\n"
+                    "import numeric.Rational\n"
+                    "object FactoryUser { def half: Rational = Rational.make(1, 2) }\n");
+    write_temp_file(tmp, "member_user.scala",
+                    "package app\n"
+                    "import numeric.Rational.fromInt\n"
+                    "object MemberUser { def two: Rational = fromInt(2) }\n");
+}
+
+static bool scala_companion_edges_are_exact(cbm_store_t *s, const char *project) {
+    return cross_file_call_to_owner_has_strategy(s, project, "half", "make", "Rational$.make",
+                                                 "import_map") &&
+           cross_file_call_to_owner_has_strategy(s, project, "two", "fromInt", "Rational$.fromInt",
+                                                 "import_map");
+}
+
+/* A class with a companion object is one importable name. `import pkg.Foo`
+ * must not fail closed as ambiguous now that class and companion have
+ * distinct QNs, `Foo.factory()` must bind into the companion (`Foo$`), and
+ * `import pkg.Foo.member` must bind the companion member. */
+TEST(pipeline_scala_companion_import_and_factory_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_companion_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_companion_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_companion.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_companion_edges_are_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* The parallel route registers definitions through its own serial registry
+ * build; the companion owner must be recorded there too, or `Rational.make`
+ * falls back to the class on a 4-worker index. */
+TEST(pipeline_scala_companion_parallel_import_and_factory_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_companion_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_companion_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "companion_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object CompanionFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_companion_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_companion_edges_are_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_scala_import_alias_parallel_resolves_exact_method) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_par_XXXXXX");
@@ -17879,6 +17974,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
     RUN_TEST(pipeline_scala_member_import_in_split_package_binds_owner_member);
     RUN_TEST(pipeline_scala_index_built_only_for_scala_importers);
+    RUN_TEST(pipeline_scala_companion_import_and_factory_call);
+    RUN_TEST(pipeline_scala_companion_parallel_import_and_factory_call);
     RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);

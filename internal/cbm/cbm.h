@@ -694,6 +694,24 @@ typedef struct {
     int count;
 } CBMReturnTypeTable;
 
+// --- Scala companion cache ---
+// The class/trait/enum names of every scope an object_definition has asked
+// about, keyed by (scope node, name bytes). A scope is scanned once, on its
+// first query; names are byte ranges into the source, never copied. One extra
+// key per scanned scope (len == 0) records the scan itself, so a scope without
+// any class is not rescanned either. Open addressing, power-of-two capacity.
+typedef struct {
+    const void *scope; // ts_node id of the scope (parent) node; NULL = empty slot
+    uint32_t off;
+    uint32_t len;
+} CBMScalaScopeName;
+
+typedef struct {
+    CBMScalaScopeName *slots;
+    uint32_t cap; // 0 until the first query
+    uint32_t count;
+} CBMScalaCompanionCache;
+
 typedef struct {
     CBMArena *arena;
     /* Scratch for AST traversal, owned by the cbm_extract_file_ex call that
@@ -738,6 +756,9 @@ typedef struct {
      * POD section index. */
     void *doc_memo;
     void *doc_pod_index;
+    /* Scala only; lives in `scratch` (or `arena` without one). Nothing in a
+     * CBMFileResult points at it. */
+    CBMScalaCompanionCache scala_companions;
 } CBMExtractCtx;
 
 // --- Public API ---
@@ -944,6 +965,11 @@ void cbm_infrabinding_push(CBMInfraBindingArray *arr, CBMArena *a, CBMInfraBindi
 void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
+
+/* True for a Scala object_definition with a same-named class/trait/enum
+ * sibling. O(1) per query after the first one in a scope, which scans the
+ * scope's named children once into ctx->scala_companions. */
+bool cbm_scala_is_companion_object(CBMExtractCtx *ctx, TSNode node);
 
 // --- Sub-extractor entry points ---
 
