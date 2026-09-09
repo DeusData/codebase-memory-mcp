@@ -6306,7 +6306,18 @@ static const char *coverage_path_freshness(cbm_store_t *store, const char *proje
     if (rc != CBM_STORE_OK) {
         return "unavailable";
     }
-    bool matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+    bool matches;
+#ifdef _WIN32
+    cbm_path_info_t path_info = {0};
+    matches = cbm_path_info_utf8(abs_path, &path_info) == CBM_PATH_INFO_OK &&
+              hash.mtime_ns == path_info.mtime_ns && hash.size == path_info.size;
+    /* Imported artifacts may have been restamped from Windows stat() values. */
+    if (!matches && hash.mtime_ns >= 0 && hash.mtime_ns % CBM_NSEC_PER_SEC == 0) {
+        matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+    }
+#else
+    matches = hash.mtime_ns == coverage_stat_mtime_ns(&st) && hash.size == st.st_size;
+#endif
     cbm_store_clear_file_hash(&hash);
     return matches ? "metadata_match" : "metadata_changed";
 }
@@ -11711,6 +11722,17 @@ static char *build_snippet_response(cbm_mcp_server_t *srv, cbm_node_t *node,
                                     cbm_node_t *alternatives, int alt_count, const char *args) {
     char *root_path = get_project_root(srv, node->project);
 
+    bool outside = false;
+    const char *freshness =
+        coverage_path_freshness(srv->store, node->project, root_path, node->file_path, &outside);
+    if (strcmp(freshness, "metadata_match") != 0 && strcmp(freshness, "not_tracked") != 0) {
+        free(root_path);
+        return cbm_mcp_text_result(
+            "source changed since indexing; re-index the project before requesting this "
+            "snippet",
+            true);
+    }
+
     int original_start = node->start_line > 0 ? node->start_line : SKIP_ONE;
     /* A one-line symbol legitimately has end == start. Treat only missing or
      * inverted end metadata as unknown; expanding a valid one-line node by 50
@@ -13871,8 +13893,14 @@ static bool scan_and_classify_grep_matches(
                 break;
             }
             if (store) {
-                (void)cbm_store_find_nodes_by_file(store, project, file, &file_nodes,
-                                                   &file_node_count);
+                bool outside = false;
+                const char *freshness =
+                    coverage_path_freshness(store, project, root_path, file, &outside);
+                if (strcmp(freshness, "metadata_match") == 0 ||
+                    strcmp(freshness, "not_tracked") == 0) {
+                    (void)cbm_store_find_nodes_by_file(store, project, file, &file_nodes,
+                                                       &file_node_count);
+                }
             }
         }
 

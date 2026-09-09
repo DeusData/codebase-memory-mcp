@@ -2867,6 +2867,104 @@ TEST(tool_get_architecture_cycles_detects_scc) {
     PASS();
 }
 
+/* A source edit after indexing invalidates stored line coordinates. The read
+ * tools must not present those coordinates as current source truth. */
+TEST(tool_get_code_snippet_rejects_changed_source_coordinates_issue1750) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    struct stat source_stat;
+    ASSERT_EQ(stat(source_path, &source_stat), 0);
+#ifdef __APPLE__
+    int64_t source_mtime_ns =
+        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+        (int64_t)source_stat.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+                              (int64_t)source_stat.st_mtim.tv_nsec;
+#endif
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture",
+                                         source_mtime_ns, source_stat.st_size),
+              CBM_STORE_OK);
+
+    FILE *fp = fopen(source_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("// inserted\n// inserted\npackage main\n\n"
+          "func HandleRequest() error {\n\treturn nil\n}\n\n"
+          "func ProcessOrder(id int) {\n\t// process\n}\n\n"
+          "func Run() {\n\t// server\n}\n",
+          fp);
+    fclose(fp);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "get_code_snippet",
+        "{\"project\":\"test-project\",\"qualified_name\":\""
+        "test-project.cmd.server.main.ProcessOrder\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "isError"));
+    ASSERT_NOT_NULL(strstr(response, "changed since indexing"));
+    ASSERT_NULL(strstr(response, "// process"));
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_search_code_does_not_map_changed_source_to_stale_nodes_issue1750) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    struct stat source_stat;
+    ASSERT_EQ(stat(source_path, &source_stat), 0);
+#ifdef __APPLE__
+    int64_t source_mtime_ns =
+        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+        (int64_t)source_stat.st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
+#else
+    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
+                              (int64_t)source_stat.st_mtim.tv_nsec;
+#endif
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "fixture",
+                                         source_mtime_ns, source_stat.st_size),
+              CBM_STORE_OK);
+
+    FILE *fp = fopen(source_path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("// inserted\n// inserted\npackage main\n\n"
+          "func HandleRequest() error {\n\treturn nil\n}\n\n"
+          "func ProcessOrder(id int) {\n\t// process\n}\n\n"
+          "func Run() {\n\t// server\n}\n",
+          fp);
+    fclose(fp);
+
+    char *response = cbm_mcp_handle_tool(
+        srv, "search_code",
+        "{\"project\":\"test-project\",\"pattern\":\"process\","
+        "\"mode\":\"full\",\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "raw_matches"));
+    ASSERT_NOT_NULL(strstr(response, "// process"));
+    ASSERT_NULL(strstr(response, "test-project.cmd.server.main.ProcessOrder"));
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
 /* Context-bomb guard: get_code_snippet on a whole-file node (a Module/File
  * span) used to read the ENTIRE file into one response — a field-eval agent
  * that fell back to a Module snippet pulled ~400KB in a single call. The read
@@ -20243,6 +20341,7 @@ SUITE(mcp) {
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
+    RUN_TEST(tool_get_code_snippet_rejects_changed_source_coordinates_issue1750);
     RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
     RUN_TEST(tool_get_code_snippet_pages_outline_rows_to_exact_budget);
     RUN_TEST(tool_search_graph_includes_node_properties);
@@ -20323,6 +20422,7 @@ SUITE(mcp) {
     RUN_TEST(tool_search_code_limit_declares_a_minimum_issue1511);
     RUN_TEST(tool_search_code_declares_independent_result_and_raw_content_paging);
     RUN_TEST(tool_search_code_no_project);
+    RUN_TEST(tool_search_code_does_not_map_changed_source_to_stale_nodes_issue1750);
     RUN_TEST(search_code_multi_word);
     RUN_TEST(search_code_full_preserves_utf8_source);
     RUN_TEST(search_code_raw_match_preserves_utf8_content);
