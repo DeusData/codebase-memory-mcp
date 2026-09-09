@@ -1862,6 +1862,14 @@ static const cbm_gbuf_node_t *first_namespace_file(const cbm_pipeline_ctx_t *ctx
     return NULL;
 }
 
+/* A Scala companion object carries the class QN plus a trailing `$`. Returns
+ * true when `a` is the companion of `b` (a == b + "$"). */
+static bool scala_qn_is_companion_of(const char *a, const char *b) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    return la == lb + 1 && a[lb] == '$' && strncmp(a, b, lb) == 0;
+}
+
 static const cbm_gbuf_node_t *scala_symbol_in_namespace(const cbm_pipeline_ctx_t *ctx,
                                                         const char *file_qn_list,
                                                         const char *symbol,
@@ -1883,6 +1891,15 @@ static const cbm_gbuf_node_t *scala_symbol_in_namespace(const cbm_pipeline_ctx_t
         }
         if (match && match->qualified_name && candidate->qualified_name &&
             strcmp(match->qualified_name, candidate->qualified_name) != 0) {
+            /* A class and its companion object are one importable name; the
+             * class stands for the pair. */
+            if (scala_qn_is_companion_of(candidate->qualified_name, match->qualified_name)) {
+                continue;
+            }
+            if (scala_qn_is_companion_of(match->qualified_name, candidate->qualified_name)) {
+                match = candidate;
+                continue;
+            }
             return NULL; /* ambiguous within a split package */
         }
         match = candidate;
@@ -1947,14 +1964,19 @@ static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_
         /* `import pkg.Owner.member`: the member lives under the owner's QN, so
          * look it up there first. A namespace-wide name search would be
          * ambiguous whenever a split package (main + benchmark module) has two
-         * same-named members and would then fall back to the owner. */
+         * same-named members and would then fall back to the owner. Only
+         * object members are importable, so when Owner has a companion the
+         * `Owner$` scope is tried before the class. */
         if (owner && owner->qualified_name) {
-            char member_qn[CBM_SZ_512];
-            snprintf(member_qn, sizeof(member_qn), "%s.%s", owner->qualified_name,
-                     remainder + top_len + 1);
-            const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
-            if (scoped && scoped->label && import_targetable_label(scoped->label)) {
-                return scoped;
+            const char *scopes[2] = {"$", ""};
+            for (int si = 0; si < 2; si++) {
+                char member_qn[CBM_SZ_512];
+                snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name, scopes[si],
+                         remainder + top_len + 1);
+                const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+                if (scoped && scoped->label && import_targetable_label(scoped->label)) {
+                    return scoped;
+                }
             }
         }
         const char *leaf = strrchr(remainder, '.');

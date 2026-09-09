@@ -4635,10 +4635,11 @@ TEST(swift_non_url_constructor_untouched_issue1892) {
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
 TEST(extract_ts_await_generic_call_issue2210) {
-    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
-                               "async function plain() { return await parseJsonBody(); }\n"
-                               "async function generic() { return await parseJsonBody<string>(); }\n",
-                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    CBMFileResult *r =
+        extract("function parseJsonBody<T>() { return {} as T; }\n"
+                "async function plain() { return await parseJsonBody(); }\n"
+                "async function generic() { return await parseJsonBody<string>(); }\n",
+                CBM_LANG_TYPESCRIPT, "t", "await.ts");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
@@ -5780,6 +5781,60 @@ TEST(extract_ts_member_call_flags_is_method) {
     }
     ASSERT_TRUE(member >= 1); /* re.test() flagged */
     ASSERT_TRUE(bare >= 1);   /* helper() not flagged */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_companion_owners_are_distinct) {
+    CBMFileResult *r = extract("case class Rational private (n: Int, d: Int) {\n"
+                               "  lazy val isWhole: Boolean = d == 1\n"
+                               "  def reciprocal: Rational = Rational(d, n)\n"
+                               "}\n"
+                               "case object Rational {\n"
+                               "  val zero: Rational = Rational(0, 1)\n"
+                               "  def apply(n: Int, d: Int): Rational = new Rational(n, d)\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Rational.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational.reciprocal"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$.apply"));
+    /* Class-body vals keep their module-level QN like every other language;
+     * parent_class tells the two owners apart. */
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.isWhole"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.zero"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_trait_companion_and_standalone_object) {
+    CBMFileResult *r = extract("trait Codec {\n"
+                               "  def encode(s: String): Array[Byte]\n"
+                               "}\n"
+                               "object Codec {\n"
+                               "  def utf8: Codec = ???\n"
+                               "}\n"
+                               "object Registry {\n"
+                               "  def lookup(name: String): Option[Codec] = None\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Codec.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Trait companions collide just like class companions. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec.encode"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$.utf8"));
+    /* A standalone object has nothing to collide with and keeps its plain QN. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry"));
+    ASSERT_FALSE(has_def_qn(r, "t.Codec.Registry$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry.lookup"));
+
     cbm_free_result(r);
     PASS();
 }
@@ -8322,6 +8377,8 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_companion_owners_are_distinct);
+    RUN_TEST(extract_scala_trait_companion_and_standalone_object);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
