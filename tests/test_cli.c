@@ -14141,6 +14141,16 @@ TEST(cli_build_args_json_repeated_array_issue680) {
     PASS();
 }
 
+TEST(cli_build_args_json_array_literal) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"create\",\"billing\",\"account\"]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"create\",\"billing\",\"account\"]") != NULL);
+    free(json);
+    PASS();
+}
+
 /* kebab-case flag names map to snake_case JSON keys. */
 TEST(cli_build_args_json_kebab_to_snake_issue680) {
     char *err = NULL;
@@ -15244,6 +15254,7 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_array_literal);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);

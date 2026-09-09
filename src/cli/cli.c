@@ -13212,6 +13212,37 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
             arr = yyjson_mut_arr(out);
             yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
         }
+        /* Accept the JSON-array spelling shown by MCP schemas in addition to
+         * repeated flags. This keeps `--semantic-query '["a","b"]'` from
+         * becoming one opaque keyword while preserving the established
+         * `--semantic-query a --semantic-query b` form. */
+        yyjson_doc *array_doc =
+            have_value && value && value[0] == '[' ? yyjson_read(value, strlen(value), 0) : NULL;
+        yyjson_val *array_root = array_doc ? yyjson_doc_get_root(array_doc) : NULL;
+        bool string_array =
+            array_root && yyjson_is_arr(array_root) && yyjson_arr_size(array_root) > 0;
+        if (string_array) {
+            size_t idx;
+            size_t count;
+            yyjson_val *item;
+            yyjson_arr_foreach(array_root, idx, count, item) {
+                if (!yyjson_is_str(item)) {
+                    string_array = false;
+                    break;
+                }
+            }
+        }
+        if (string_array) {
+            size_t idx;
+            size_t count;
+            yyjson_val *item;
+            yyjson_arr_foreach(array_root, idx, count, item) {
+                yyjson_mut_arr_add_strcpy(out, arr, yyjson_get_str(item));
+            }
+            yyjson_doc_free(array_doc);
+            return;
+        }
+        yyjson_doc_free(array_doc);
         yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
         return;
     }
