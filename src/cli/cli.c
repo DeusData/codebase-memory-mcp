@@ -6961,6 +6961,12 @@ int cbm_remove_indexes(const char *home_dir) {
             if (cbm_unlink(path) == 0) {
                 count++;
             }
+            /* Remove the SQLite sidecars (-wal/-shm/-journal) for both the
+             * live and staged DBs. Idempotent and ENOENT-tolerant, so it runs
+             * even when the .db unlink failed -- an orphan -wal can outlive
+             * its .db. Sidecars are not indexes, so count is unchanged. */
+            cbm_remove_db_sidecars(path);
+            cbm_remove_db_sidecars(tmp_path);
         }
     }
     cbm_closedir(d);

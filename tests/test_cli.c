@@ -1670,6 +1670,53 @@ TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     PASS();
 }
 
+/* Removing an index must also delete its SQLite sidecars (-wal/-shm/-journal),
+ * not just the .db. cbm_remove_indexes is the single deletion chokepoint for
+ * both explicit deleters (install --reset-indexes, uninstall), so an orphan
+ * -wal/-shm left behind here outlives the index everywhere. Reporter ask (c)
+ * on issue #2054. */
+TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-remove-indexes-sidecars-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    char db_path[640];
+    char wal_path[640];
+    char shm_path[640];
+    snprintf(db_path, sizeof(db_path), "%s/proj.db", cache_dir);
+    snprintf(wal_path, sizeof(wal_path), "%s/proj.db-wal", cache_dir);
+    snprintf(shm_path, sizeof(shm_path), "%s/proj.db-shm", cache_dir);
+    write_test_file(db_path, "db");
+    write_test_file(wal_path, "wal");
+    write_test_file(shm_path, "shm");
+
+    int rc = cbm_remove_indexes(tmpdir);
+
+    struct stat st;
+    bool db_absent = stat(db_path, &st) != 0;
+    bool wal_absent = stat(wal_path, &st) != 0;
+    bool shm_absent = stat(shm_path, &st) != 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    /* One .db removed; sidecars are not indexes, so the count is unchanged. */
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(db_absent);
+    ASSERT_TRUE(wal_absent);
+    ASSERT_TRUE(shm_absent);
+    PASS();
+}
+
 TEST(cli_install_config_only_waits_for_cohort_drain) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-install-config-race-XXXXXX");
@@ -14884,6 +14931,7 @@ SUITE(cli) {
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
+    RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
     RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
     RUN_TEST(cli_install_config_and_path_finish_before_guard_release);
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
