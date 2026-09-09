@@ -4053,8 +4053,8 @@ static bool win_sid_is_trusted_installer(const uint8_t *sid, size_t sid_length) 
  * reached through the already-loaded module handle in win_security_t and the
  * function pointers are resolved dynamically, matching this file's SID-API style
  * and adding no static import. */
-typedef NTSTATUS(NTAPI *lsa_open_policy_fn)(PLSA_UNICODE_STRING, PLSA_OBJECT_ATTRIBUTES, ACCESS_MASK,
-                                            PLSA_HANDLE);
+typedef NTSTATUS(NTAPI *lsa_open_policy_fn)(PLSA_UNICODE_STRING, PLSA_OBJECT_ATTRIBUTES,
+                                            ACCESS_MASK, PLSA_HANDLE);
 typedef NTSTATUS(NTAPI *lsa_query_information_policy_fn)(LSA_HANDLE, POLICY_INFORMATION_CLASS,
                                                          PVOID *);
 typedef NTSTATUS(NTAPI *lsa_free_memory_fn)(PVOID);
@@ -4074,9 +4074,8 @@ static BOOL CALLBACK win_resolve_local_admin_sid(PINIT_ONCE once, PVOID paramete
     HMODULE advapi = security->advapi;
     lsa_open_policy_fn lsa_open =
         (lsa_open_policy_fn)(void (*)(void))GetProcAddress(advapi, "LsaOpenPolicy");
-    lsa_query_information_policy_fn lsa_query =
-        (lsa_query_information_policy_fn)(void (*)(void))GetProcAddress(advapi,
-                                                                        "LsaQueryInformationPolicy");
+    lsa_query_information_policy_fn lsa_query = (lsa_query_information_policy_fn)(void (*)(
+        void))GetProcAddress(advapi, "LsaQueryInformationPolicy");
     lsa_free_memory_fn lsa_free =
         (lsa_free_memory_fn)(void (*)(void))GetProcAddress(advapi, "LsaFreeMemory");
     lsa_close_fn lsa_close = (lsa_close_fn)(void (*)(void))GetProcAddress(advapi, "LsaClose");

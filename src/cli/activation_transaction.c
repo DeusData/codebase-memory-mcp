@@ -440,8 +440,8 @@ static void activation_windows_security_destroy(activation_windows_security_t *s
 typedef NTSTATUS(NTAPI *activation_lsa_open_policy_fn)(PLSA_UNICODE_STRING, PLSA_OBJECT_ATTRIBUTES,
                                                        ACCESS_MASK, PLSA_HANDLE);
 typedef NTSTATUS(NTAPI *activation_lsa_query_information_policy_fn)(LSA_HANDLE,
-                                                                   POLICY_INFORMATION_CLASS,
-                                                                   PVOID *);
+                                                                    POLICY_INFORMATION_CLASS,
+                                                                    PVOID *);
 typedef NTSTATUS(NTAPI *activation_lsa_free_memory_fn)(PVOID);
 typedef NTSTATUS(NTAPI *activation_lsa_close_fn)(LSA_HANDLE);
 typedef BOOL(WINAPI *activation_create_well_known_sid_fn)(WELL_KNOWN_SID_TYPE, PSID, PSID, DWORD *);
@@ -486,7 +486,8 @@ static PSID activation_windows_local_admin_sid(void) {
         (void)create_sid(WinAccountAdministratorSid, domain->DomainSid, NULL, &needed);
         if (needed > 0U) {
             PSID admin = malloc(needed);
-            if (admin && create_sid(WinAccountAdministratorSid, domain->DomainSid, admin, &needed) &&
+            if (admin &&
+                create_sid(WinAccountAdministratorSid, domain->DomainSid, admin, &needed) &&
                 IsValidSid(admin)) {
                 cached = admin;
             } else {
@@ -506,7 +507,7 @@ static PSID activation_windows_local_admin_sid(void) {
  * offending owner's SID string, mirroring the daemon's ACL/owner diagnostics, so
  * the operator sees the exact identity to remove or the directory to move. */
 static void activation_windows_note_untrusted_owner(const char *predicate, PSID owner,
-                                                     DWORD os_error) {
+                                                    DWORD os_error) {
     char label[192];
     LPSTR owner_text = NULL;
     (void)snprintf(
