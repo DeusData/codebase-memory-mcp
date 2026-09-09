@@ -59,7 +59,7 @@ jobs:
           # The paginated files endpoint remains filename-only for this gate.
           FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
           printf '%s\n' "$FILES"
-          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
+          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|scripts/ci/(self-index-coverage-gate\.sh|coverage-gate-allowlist\.txt|parse-partial-baseline\.txt)|tests/test_coverage_gate_contract\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
@@ -126,6 +126,21 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+
+      # Index this repo with the binary just built and check its own
+      # parse-coverage report is still useful advice (#963). Ubuntu only: the
+      # flagged line ranges depend on which conditional-compilation branches
+      # the preprocessor keeps, so they differ per platform. The gate asserts
+      # proportions, never exact line numbers.
+      - name: Parse-coverage gate (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          # The gate compares this branch against the merge base, so it needs
+          # the commit GitHub used to build the merge. Without this it falls
+          # back to the first parent of HEAD, which is the same commit on a
+          # pull_request checkout — this makes it explicit rather than lucky.
+          COVERAGE_GATE_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: scripts/ci/self-index-coverage-gate.sh "$(pwd)/build/c/codebase-memory-mcp"
 
       - name: Build prod + smoke (macOS)
         if: matrix.os == 'macos-14'
