@@ -4173,6 +4173,70 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* JAX-RS @Path values are URI templates relative to the enclosing resource;
+ * the leading slash is optional and ignored by the framework. Relative class
+ * and method templates must compose to the same rooted routes as the
+ * slash-prefixed spelling above. */
+TEST(extract_java_jaxrs_relative_path_templates) {
+    CBMFileResult *r = extract("import jakarta.ws.rs.GET;\n"
+                               "import jakarta.ws.rs.Path;\n"
+                               "@Path(\"api/v1/widgets\")\n"
+                               "public class WidgetResource {\n"
+                               "  @GET\n"
+                               "  public String list() { return \"\"; }\n"
+                               "  @GET\n"
+                               "  @Path(\"count\")\n"
+                               "  public String count() { return \"\"; }\n"
+                               "  @GET\n"
+                               "  @Path(\"{id}/tags\")\n"
+                               "  public String tags() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "WidgetResource.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *list = find_def_by_name(r, "list");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(list->route_path);
+    ASSERT_STR_EQ(list->route_path, "/api/v1/widgets");
+    ASSERT_STR_EQ(list->route_method, "GET");
+    const CBMDefinition *count = find_def_by_name(r, "count");
+    ASSERT_NOT_NULL(count);
+    ASSERT_NOT_NULL(count->route_path);
+    ASSERT_STR_EQ(count->route_path, "/api/v1/widgets/count");
+    ASSERT_STR_EQ(count->route_method, "GET");
+    const CBMDefinition *tags = find_def_by_name(r, "tags");
+    ASSERT_NOT_NULL(tags);
+    ASSERT_NOT_NULL(tags->route_path);
+    ASSERT_STR_EQ(tags->route_path, "/api/v1/widgets/{id}/tags");
+    ASSERT_STR_EQ(tags->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Negative control: relative templates are accepted for JAX-RS @Path only.
+ * A slash-less string on a non-JAX-RS mapping annotation must keep the
+ * previous behaviour (the literal is not read as a route path), so the
+ * relaxation cannot broaden route extraction for other frameworks. */
+TEST(extract_java_spring_relative_string_not_route_path) {
+    CBMFileResult *r = extract("import org.springframework.web.bind.annotation.GetMapping;\n"
+                               "import org.springframework.web.bind.annotation.RequestMapping;\n"
+                               "@RequestMapping(\"api\")\n"
+                               "public class OrderController {\n"
+                               "  @GetMapping(\"orders\")\n"
+                               "  public String listOrders() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "OrderController.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *list = find_def_by_name(r, "listOrders");
+    ASSERT_NOT_NULL(list);
+    ASSERT_NOT_NULL(list->route_path);
+    ASSERT_STR_EQ(list->route_path, "/");
+    ASSERT_STR_EQ(list->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Return the file's Module definition (extraction pushes it first), or NULL. */
 static const CBMDefinition *find_module_def(CBMFileResult *r) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -7453,6 +7517,8 @@ SUITE(extraction) {
     RUN_TEST(arkts_lazy_import);
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_java_jaxrs_relative_path_templates);
+    RUN_TEST(extract_java_spring_relative_string_not_route_path);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);

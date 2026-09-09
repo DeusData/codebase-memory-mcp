@@ -486,6 +486,48 @@ TEST(handles_jaxrs_java) {
     PASS();
 }
 
+/* JAX-RS (Java): @Path values are URI templates relative to the enclosing
+ * resource, and the leading slash is optional. The slash-less spelling must
+ * produce the same rooted Route set as the fixture above. */
+TEST(handles_jaxrs_java_relative_path) {
+    static const char *routes[] = {"/api/v1/widgets", "/api/v1/widgets/count", NULL};
+    static const EtFile f[] = {
+        {"WidgetResource.java",
+         "package com.example;\n\n"
+         "import jakarta.ws.rs.GET;\n"
+         "import jakarta.ws.rs.Path;\n\n"
+         "@Path(\"api/v1/widgets\")\npublic class WidgetResource {\n"
+         "    @GET\n"
+         "    public String list() {\n"
+         "        return \"widgets\";\n    }\n\n"
+         "    @GET\n"
+         "    @Path(\"count\")\n"
+         "    public String count() {\n"
+         "        return \"42\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
+/* Negative control: the relative-template acceptance is scoped to JAX-RS
+ * @Path. A slash-less string on a Spring mapping annotation is still not read
+ * as a route path, so the handler keeps the "/" fallback and no "/api/orders"
+ * Route node appears. */
+TEST(handles_spring_java_relative_string_not_route) {
+    static const char *routes[] = {"/", NULL};
+    static const EtFile f[] = {
+        {"OrderController.java",
+         "package com.example;\n\n"
+         "import org.springframework.web.bind.annotation.RequestMapping;\n"
+         "import org.springframework.web.bind.annotation.GetMapping;\n\n"
+         "@RequestMapping(\"api\")\npublic class OrderController {\n"
+         "    @GetMapping(\"orders\")\n"
+         "    public String listOrders() {\n"
+         "        return \"orders\";\n    }\n}\n"}};
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* ASP.NET Minimal API (C#) — route registration via static MapGet/MapPost calls
  * with identifier handlers, under a Microsoft/AspNetCore path so the resolved
  * callee QN carries the "MapGet"/"Microsoft.AspNetCore" route-reg substrings.
@@ -1636,6 +1678,8 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_jaxrs_java);
+    RUN_TEST(handles_jaxrs_java_relative_path);
+    RUN_TEST(handles_spring_java_relative_string_not_route);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
