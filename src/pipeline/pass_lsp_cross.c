@@ -1800,6 +1800,58 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     return true;
 }
 
+void cbm_pxc_perl_duck_prepass_driver(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult **cache, char **def_modules,
+                                      CBMLSPDef *all_defs, int def_count,
+                                      CBMPerlInheritIndex *perl_inherit, CBMArena *arena) {
+    if (!ctx || !files || file_count <= 0 || !cache || !def_modules || !all_defs || def_count <= 0 ||
+        !arena)
+        return;
+    int perl_n = 0;
+    for (int i = 0; i < file_count; i++)
+        if (cache[i] && files[i].language == CBM_LANG_PERL)
+            perl_n++;
+    if (perl_n == 0)
+        return;
+
+    const char **p_src = (const char **)calloc((size_t)perl_n, sizeof(char *));
+    int *p_len = (int *)calloc((size_t)perl_n, sizeof(int));
+    const char **p_mod = (const char **)calloc((size_t)perl_n, sizeof(char *));
+    TSTree **p_tree = (TSTree **)calloc((size_t)perl_n, sizeof(TSTree *));
+    char **p_own = (char **)calloc((size_t)perl_n, sizeof(char *));
+    if (p_src && p_len && p_mod && p_tree && p_own) {
+        int k = 0;
+        for (int i = 0; i < file_count && k < perl_n; i++) {
+            if (!cache[i] || files[i].language != CBM_LANG_PERL)
+                continue;
+            int slen = 0;
+            char *src = pxc_read_file(files[i].path, &slen);
+            if (!src || slen <= 0) {
+                free(src);
+                continue;
+            }
+            if (!def_modules[i])
+                def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+                                                             pxc_module_is_dir(files[i].language));
+            p_own[k] = src;
+            p_src[k] = src;
+            p_len[k] = slen;
+            p_mod[k] = def_modules[i];
+            p_tree[k] = cache[i]->cached_tree;
+            k++;
+        }
+        cbm_perl_duck_prepass(arena, p_src, p_len, p_mod, p_tree, k, all_defs, def_count,
+                              perl_inherit);
+        for (int j = 0; j < k; j++)
+            free(p_own[j]);
+    }
+    free(p_src);
+    free(p_len);
+    free(p_mod);
+    free(p_tree);
+    free(p_own);
+}
+
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
                                 int file_count, CBMFileResult **cache) {
     if (!ctx || !files || file_count <= 0 || !cache)
@@ -1882,6 +1934,19 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
     CBMPerlInheritIndex perl_inherit;
     cbm_perl_build_inherit_index(cache, files, file_count, def_modules, &perl_inherit);
     cross_registries.perl_inherit = &perl_inherit;
+
+    /* Perl cross-file duck-typing pre-pass (shared driver): infer typeless-
+     * accessor return types from project-wide $self/$class usage BEFORE
+     * resolution. Strings live in seq_cross_arena, which outlives this pass. */
+    if (all_defs) {
+        CBMArena *xa = &ctx->seq_cross_arena;
+        if (!ctx->seq_cross_arena_live) {
+            cbm_arena_init(xa);
+            ctx->seq_cross_arena_live = true;
+        }
+        cbm_pxc_perl_duck_prepass_driver(ctx, files, file_count, cache, def_modules, all_defs,
+                                         def_count, &perl_inherit, xa);
+    }
 
     int processed = 0;
     int skipped_no_lsp = 0;

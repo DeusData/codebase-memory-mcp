@@ -246,4 +246,15 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx);
 
+/* Perl cross-file duck-typing pre-pass DRIVER: gathers each Perl file's source
+ * (via the pipeline file reader) + module QN + cached tree, then calls
+ * cbm_perl_duck_prepass to infer typeless-accessor return types into all_defs
+ * BEFORE resolution. Shared by the parallel (pipeline.c) and sequential
+ * (pass_lsp_cross.c) drivers. `arena` owns the inferred type strings and must
+ * outlive the resolve loop. No-op unless the project has Perl files. */
+void cbm_pxc_perl_duck_prepass_driver(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult **cache, char **def_modules,
+                                      CBMLSPDef *all_defs, int def_count,
+                                      CBMPerlInheritIndex *perl_inherit, CBMArena *arena);
+
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

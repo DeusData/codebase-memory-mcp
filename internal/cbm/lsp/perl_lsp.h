@@ -165,4 +165,18 @@ void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
                              * resolution; NULL/0 falls back to `defs`. */
                             CBMLSPDef *all_defs, int all_def_count);
 
+/* Cross-file duck-typing PRE-PASS (run ONCE over all Perl files BEFORE the
+ * per-file resolve loop). Aggregates project-wide `$self`/`$class` accessor-
+ * chain usage per accessor def and writes an inferred UNIQUE return class into
+ * all_defs[idx].return_types (DOTTED spelling), so a typeless accessor whose
+ * type only shows in cross-file usage (e.g. Mojolicious::Controller::req →
+ * Mojo::Message::Request) drives chain dispatch everywhere. `arena` must
+ * outlive the resolve loop (it owns the inferred type strings). Parallel arrays
+ * are per Perl file; cached_trees entries may be NULL (parsed internally, not
+ * freed by the caller). Sound: ambiguous/polymorphic accessors stay untyped. */
+void cbm_perl_duck_prepass(CBMArena *arena, const char **sources, const int *source_lens,
+                           const char **module_qns, TSTree **cached_trees, int file_count,
+                           CBMLSPDef *all_defs, int all_def_count,
+                           const struct CBMPerlInheritIndex *inherit_idx);
+
 #endif /* CBM_LSP_PERL_LSP_H */

@@ -3029,6 +3029,271 @@ static void perl_duck_collect(PerlLSPContext *ctx, TSNode node, PerlDuckCollecto
     free(kids);
 }
 
+/* ── cross-file duck-typing PRE-PASS ────────────────────────────────
+ * The per-file duck block inside cbm_run_perl_lsp_cross only sees
+ * `$self->ACC->M2` usage WITHIN the accessor's own file, sets the type as a
+ * side-effect while that file is processed (files resolved earlier miss it),
+ * and spells it with colons (which the cross-file return-type-class worklist
+ * seeding, which needs dots, then skips). This pre-pass runs ONCE over ALL
+ * Perl files before any resolution: it aggregates `$self`/`$class` accessor-
+ * chain usage per accessor DEF (own OR inherited, attributed through @ISA)
+ * across the whole project, then for each STILL-UNTYPED accessor infers a
+ * UNIQUE base-most class from the union method-set (same gate as the per-file
+ * block) and writes it into all_defs[idx].return_types in the DOTTED spelling
+ * the seeding path expects. So `sub req { (shift->tx||...)->req }` — whose body
+ * inference fails (polymorphic `tx`) and whose own-file `$self->req` samples
+ * are too few — is typed to Mojo::Message::Request from its project-wide usage,
+ * and every `$c->req->url` chain dispatches. SOUND: an ambiguous/polymorphic
+ * accessor (no single covering class, e.g. Mojolicious's `tx` used with the
+ * WebSocket-only `send` plus base methods) yields base_n != 1 and stays
+ * zero-edge — the correct-edge guarantee is preserved. */
+
+/* One aggregation slot: an accessor def index + its accumulated method set
+ * (method-name strings copied into the persistent arena). */
+typedef struct {
+    int didx;
+    const char *methods[PERL_DUCK_MAX_M];
+    int mcount;
+} PerlDuckAgg;
+
+/* Def index of accessor `acc_name` reachable from module `mod` (own def, else
+ * the first @ISA ancestor that defines it); -1 if none. Bounded DFS. */
+static int perl_duck_find_accessor_def(PerlLSPContext *ctx, const char *mod, const char *acc_name,
+                                       CBMLSPDef *all_defs, int all_def_count,
+                                       const struct CBMPerlInheritIndex *inherit_idx, int depth,
+                                       const char **visited, int *visited_n) {
+    if (!mod || !acc_name || depth > 12 || *visited_n >= 64)
+        return -1;
+    for (int i = 0; i < *visited_n; i++)
+        if (strcmp(visited[i], mod) == 0)
+            return -1;
+    visited[(*visited_n)++] = mod;
+    for (int i = 0; i < all_def_count; i++) {
+        CBMLSPDef *d = &all_defs[i];
+        if (d->def_module_qn && d->short_name && d->label &&
+            (strcmp(d->label, "Function") == 0 || strcmp(d->label, "Method") == 0) &&
+            strcmp(d->def_module_qn, mod) == 0 && strcmp(d->short_name, acc_name) == 0)
+            return i;
+    }
+    const char *const *ps = cbm_perl_inherit_lookup(inherit_idx, mod);
+    if (ps) {
+        for (int i = 0; ps[i]; i++) {
+            const char *pm =
+                perl_resolve_used_module(ctx, ps[i], all_defs, all_def_count, NULL, NULL, 0);
+            if (pm && pm[0]) {
+                int r = perl_duck_find_accessor_def(ctx, pm, acc_name, all_defs, all_def_count,
+                                                    inherit_idx, depth + 1, visited, visited_n);
+                if (r >= 0)
+                    return r;
+            }
+        }
+    }
+    return -1;
+}
+
+void cbm_perl_duck_prepass(CBMArena *arena, const char **sources, const int *source_lens,
+                           const char **module_qns, TSTree **cached_trees, int file_count,
+                           CBMLSPDef *all_defs, int all_def_count,
+                           const struct CBMPerlInheritIndex *inherit_idx) {
+    if (!arena || !sources || !module_qns || file_count <= 0 || !all_defs || all_def_count <= 0)
+        return;
+
+    enum { PERL_DUCK_AGG_CAP = 1024 };
+    PerlDuckAgg *agg = (PerlDuckAgg *)calloc((size_t)PERL_DUCK_AGG_CAP, sizeof(PerlDuckAgg));
+    if (!agg)
+        return;
+    int agg_n = 0;
+
+    /* Phase 1: collect + aggregate per accessor def across all files. */
+    for (int f = 0; f < file_count; f++) {
+        const char *source = sources[f];
+        int slen = source_lens ? source_lens[f] : 0;
+        const char *module_qn = module_qns[f];
+        if (!source || slen <= 0 || !module_qn || !module_qn[0])
+            continue;
+
+        TSParser *parser = NULL;
+        TSTree *tree = cached_trees ? cached_trees[f] : NULL;
+        bool owns_tree = false;
+        if (!tree) {
+            parser = ts_parser_new();
+            if (!parser)
+                continue;
+            ts_parser_set_language(parser, tree_sitter_perl());
+            tree = ts_parser_parse_string(parser, NULL, source, (uint32_t)slen);
+            owns_tree = true;
+            if (!tree) {
+                ts_parser_delete(parser);
+                continue;
+            }
+        }
+        TSNode root = ts_tree_root_node(tree);
+
+        CBMArena scratch;
+        cbm_arena_init(&scratch);
+        CBMTypeRegistry reg;
+        cbm_registry_init(&reg, &scratch);
+        PerlLSPContext ctx;
+        perl_lsp_init(&ctx, &scratch, source, slen, &reg, module_qn, NULL);
+
+        PerlDuckCollector col;
+        col.count = 0;
+        perl_duck_collect(&ctx, root, &col);
+        for (int ai = 0; ai < col.count; ai++) {
+            PerlDuckAcc *acc = &col.accs[ai];
+            const char *vis[64];
+            int vn = 0;
+            int didx = perl_duck_find_accessor_def(&ctx, module_qn, acc->name, all_defs,
+                                                   all_def_count, inherit_idx, 0, vis, &vn);
+            if (didx < 0)
+                continue;
+            /* Only aggregate accessors that carry NO declared/inferred return
+             * type — a body-inferred type already drives the chain. */
+            if (all_defs[didx].return_types && all_defs[didx].return_types[0])
+                continue;
+            PerlDuckAgg *slot = NULL;
+            for (int i = 0; i < agg_n; i++)
+                if (agg[i].didx == didx) {
+                    slot = &agg[i];
+                    break;
+                }
+            if (!slot) {
+                if (agg_n >= PERL_DUCK_AGG_CAP)
+                    continue;
+                slot = &agg[agg_n++];
+                slot->didx = didx;
+                slot->mcount = 0;
+            }
+            for (int mm = 0; mm < acc->mcount; mm++) {
+                const char *m2 = acc->methods[mm];
+                if (!m2 || !m2[0])
+                    continue;
+                bool dup = false;
+                for (int j = 0; j < slot->mcount; j++)
+                    if (strcmp(slot->methods[j], m2) == 0) {
+                        dup = true;
+                        break;
+                    }
+                if (dup)
+                    continue;
+                if (slot->mcount < PERL_DUCK_MAX_M) {
+                    /* col.methods point into the scratch arena — persist. */
+                    char *keep = cbm_arena_strdup(arena, m2);
+                    if (keep)
+                        slot->methods[slot->mcount++] = keep;
+                }
+            }
+        }
+
+        cbm_arena_destroy(&scratch);
+        if (owns_tree && tree)
+            ts_tree_delete(tree);
+        if (parser)
+            ts_parser_delete(parser);
+    }
+
+    /* Phase 2: infer + set return types. A minimal ctx over the persistent
+     * arena backs perl_resolve_used_module (which only needs ctx->arena). */
+    CBMTypeRegistry ireg;
+    cbm_registry_init(&ireg, arena);
+    PerlLSPContext ictx;
+    perl_lsp_init(&ictx, arena, "", 0, &ireg, "", NULL);
+
+    for (int a = 0; a < agg_n; a++) {
+        PerlDuckAgg *slot = &agg[a];
+        int didx = slot->didx;
+        if (all_defs[didx].return_types && all_defs[didx].return_types[0])
+            continue;
+        int distinct = 0;
+        for (int mm = 0; mm < slot->mcount; mm++)
+            if (!perl_duck_is_universal(slot->methods[mm]))
+                distinct++;
+        if (distinct < PERL_DUCK_MIN)
+            continue;
+        const char *own_mod = all_defs[didx].def_module_qn;
+
+        /* candidate classes = union of OWN-definers of ANY of the methods. */
+        const char *cand[32];
+        int cand_n = 0;
+        for (int mm = 0; mm < slot->mcount && cand_n < 32; mm++) {
+            const char *mn = slot->methods[mm];
+            for (int i = 0; i < all_def_count && cand_n < 32; i++) {
+                CBMLSPDef *d = &all_defs[i];
+                if (!d->def_module_qn || !d->short_name || strcmp(d->short_name, mn) != 0)
+                    continue;
+                if (!d->label ||
+                    (strcmp(d->label, "Function") != 0 && strcmp(d->label, "Method") != 0))
+                    continue;
+                bool dup = false;
+                for (int q = 0; q < cand_n; q++)
+                    if (strcmp(cand[q], d->def_module_qn) == 0) {
+                        dup = true;
+                        break;
+                    }
+                if (!dup)
+                    cand[cand_n++] = d->def_module_qn;
+            }
+        }
+        /* keep candidates that define ALL of the accessor's methods. */
+        const char *cover[32];
+        int cover_n = 0;
+        for (int c = 0; c < cand_n; c++) {
+            bool all = true;
+            for (int mm = 0; mm < slot->mcount && all; mm++) {
+                const char *vis[64];
+                int vn = 0;
+                if (!perl_duck_class_defines(&ictx, cand[c], slot->methods[mm], all_defs,
+                                             all_def_count, inherit_idx, NULL, NULL, 0, 0, vis, &vn))
+                    all = false;
+            }
+            if (all && cover_n < 32)
+                cover[cover_n++] = cand[c];
+        }
+        /* reduce to the base-most: unique survivor is the inferred class. */
+        const char *K = NULL;
+        int base_n = 0;
+        for (int c = 0; c < cover_n; c++) {
+            bool is_descendant = false;
+            for (int b = 0; b < cover_n && !is_descendant; b++) {
+                if (b == c)
+                    continue;
+                const char *vis[64];
+                int vn = 0;
+                if (perl_duck_is_a(&ictx, cover[c], cover[b], all_defs, all_def_count, inherit_idx,
+                                   NULL, NULL, 0, 0, vis, &vn))
+                    is_descendant = true;
+            }
+            if (!is_descendant) {
+                base_n++;
+                K = cover[c];
+            }
+        }
+        if (base_n != 1 || !K || (own_mod && strcmp(K, own_mod) == 0))
+            continue; /* ambiguous / self — stay zero-edge */
+
+        /* Store DOTTED ("::" → ".") so the return-type-class worklist seeding
+         * (which converts "." → "::") attaches the class's method table across
+         * files — matching perl_infer_return_types' storage convention. */
+        size_t klen = strlen(K);
+        char *dotted = (char *)cbm_arena_alloc(arena, klen + 1);
+        if (!dotted)
+            continue;
+        size_t w = 0;
+        for (size_t r = 0; r < klen; r++) {
+            if (K[r] == ':' && r + 1 < klen && K[r + 1] == ':') {
+                dotted[w++] = '.';
+                r++;
+            } else {
+                dotted[w++] = K[r];
+            }
+        }
+        dotted[w] = '\0';
+        all_defs[didx].return_types = dotted;
+    }
+
+    free(agg);
+}
+
 void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
