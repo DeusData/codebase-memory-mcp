@@ -17383,6 +17383,16 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
 }
 
 /* Background auto-index thread function */
+/* Extraction builds a THREAD-LOCAL node-type bitset cache (cbm_kind_in_set).
+ * Every worker thread that runs extraction must free that cache before it exits,
+ * or the calloc'd bitsets are orphaned when the thread's TLS is torn down and
+ * LeakSanitizer reports them at process exit. Parallel workers do this in
+ * pass_parallel.c; the in-process (sequential) auto-index runs extraction on
+ * THIS short-lived thread, so it must free its own cache too. Declared extern
+ * (not via internal/cbm/helpers.h) to avoid pulling the extraction layer's
+ * header into the MCP TU — the same pattern test_main.c uses for teardown. */
+extern void cbm_kind_in_set_free_cache(void);
+
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
@@ -17422,6 +17432,7 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
+    cbm_kind_in_set_free_cache(); /* free THIS thread's extraction bitset cache (see above) */
     cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
