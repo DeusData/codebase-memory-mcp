@@ -3,7 +3,7 @@
   "promiseMatches": [],
   "deadAffordances": 0,
   "deadAffordanceMatches": [],
-  "filesScanned": 209,
+  "filesScanned": 190,
   "whitelist": [
     {
       "rule": "disabled",
@@ -102,5 +102,5 @@
     "onToggle"
   ],
   "scanned": "src/**/*.{ts,tsx} ohne *.test.*",
-  "generatedAt": "2026-09-09T22:03:25.635Z"
+  "generatedAt": "2026-09-09T17:55:42.944Z"
 }

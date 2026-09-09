@@ -3,6 +3,156 @@
   "dashHits": [],
   "documentedQuoteExceptions": [
     {
+      "file": "verification/pr-2068/audit-architecture.json",
+      "line": 1546,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\nsym 40226\\nedg 1739",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/explore-context-e2e.json",
+      "line": 1871,
+      "text": "\"reader\": \"1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\\n13\\n14\\n15\\n16\\n17\\n18\\n19\\n20\\n21\\n22\\n23\\n24\\n25\\n26\\n27\\n28\\n29\\n30\\n31\\n32\\n33\\n34\\n35\\n36\\n37\\n/*\\n * app",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/explore-context-settled-before-provisional-fix.json",
+      "line": 1390,
+      "text": "\"reader\": \"1\\n2\\n3\\n4\\n5\\n6\\n7\\n8\\n9\\n10\\n11\\n12\\n13\\n14\\n15\\n16\\n17\\n18\\n19\\n20\\n21\\n22\\n23\\n24\\n25\\n26\\n27\\n28\\n29\\n30\\n31\\n32\\n33\\n34\\n35\\n36\\n37\\n/*\\n * app",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/final-comparison.json",
+      "line": 15,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/final-reviewed-local-diagnosis.json",
+      "line": 5,
+      "text": "\"content\": \"LOCAL REVIEW ONLY — deliberately redacted browser verification. No publication requested.\\n\"",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/handoff-recheck/repair-map-e2e.json",
+      "line": 9,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/handoff-recheck/repair-map-e2e.json",
+      "line": 15,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/handoff-recheck/repair-map-e2e.json",
+      "line": 21,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/handoff-recheck/repair-map-e2e.json",
+      "line": 27,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/handoff-recheck/repair-map-e2e.json",
+      "line": 33,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/handoff-recheck/repair-map-e2e.json",
+      "line": 39,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-callsite-failure.json",
+      "line": 9,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-callsite-failure.json",
+      "line": 15,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-callsite-failure.json",
+      "line": 21,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-callsite-failure.json",
+      "line": 27,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-e2e.json",
+      "line": 9,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-e2e.json",
+      "line": 15,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-e2e.json",
+      "line": 21,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-e2e.json",
+      "line": 27,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-e2e.json",
+      "line": 33,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-e2e.json",
+      "line": 39,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-eof-failure.json",
+      "line": 9,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-eof-failure.json",
+      "line": 15,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-eof-failure.json",
+      "line": 21,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
+      "file": "verification/pr-2068/repair-map-eof-failure.json",
+      "line": 27,
+      "text": "\"text\": \"CODEATLAS\\nv0.0.1\\ndirty\\nExplore\\nGalaxy\\nArchitecture\\nAgents\\nSystem\\nDaemon\\nChat\\nSearch\\n⌘ / Ctrl K\\nTools\\nBrief\\nExplained\\ncbm-pr2068\\n⌄\\nProj",
+      "reason": "woertliches Zitat aus einer Server- oder Werkzeugantwort in einem Beweisartefakt: ein umgeschriebenes Zitat waere ein Beweis ueber einen Text, den es nicht gab"
+    },
+    {
       "file": "verification/w4/coverage.json",
       "line": 63,
       "text": "\"note\": \"Purposely not indexed — excluded BY DESIGN via gitignore/.cbmignore/skip-lists (see each file's reason). Not an error: change the ignore rules and re-i",
@@ -34,9 +184,201 @@
     },
     {
       "file": "README.md",
-      "line": 47,
+      "line": 46,
       "text": "Projektregeln in `CLAUDE.md`, der aufgenommene Fremdcode in `THIRD_PARTY.md`.",
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "README.md",
+      "line": 118,
+      "text": "python3 ~/Downloads/cbm-atlas-trace.py --install-claude --root /absolute/repository --project INDEXED_NAME --daemon-url http://127.0.0.1:9749",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "README.md",
+      "line": 121,
+      "text": "Installation is explicit and local: it preserves unrelated Claude settings,",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "README.md",
+      "line": 122,
+      "text": "adds a PostToolUse entry to `.claude/settings.local.json`, and copies the hook",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "README.md",
+      "line": 123,
+      "text": "into `.claude/hooks/`. It refuses conflicting hooks, symlinks and malformed",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "README.md",
+      "line": 124,
+      "text": "configuration. It makes no network request or account change. Start a new Claude",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 116,
+      "text": "def install_claude(root, project, origin):",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 126,
+      "text": "directory = root / '.claude'",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 142,
+      "text": "command = ('ATLAS_PROJECT=' + shlex.quote(project) + ' ATLAS_AGENT_NAME=' + shlex.quote('Claude Code')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 155,
+      "text": "references_target = any(word in (str(target), '.claude/hooks/cbm-atlas-trace.py',",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 156,
+      "text": "'./.claude/hooks/cbm-atlas-trace.py') for word in words)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 189,
+      "text": "'daemon': origin, 'next': 'Start a new Claude Code session in this repository, perform a tool call, then load activity.'}",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 193,
+      "text": "parser = argparse.ArgumentParser(description='Install the local Code Atlas Claude Code tool hook.')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 194,
+      "text": "parser.add_argument('--install-claude', action='store_true', required=True)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 200,
+      "text": "result = install_claude(args.root, args.project, args.daemon_url)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/atlas-trace.py",
+      "line": 267,
+      "text": "sys.exit(setup_main() if '--install-claude' in sys.argv else main())",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 61,
+      "text": "(root / '.claude').mkdir(parents=True)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 62,
+      "text": "settings = root / '.claude/settings.local.json'",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 67,
+      "text": "result = hook.install_claude(root, \"project'; echo bad\", 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 68,
+      "text": "again = hook.install_claude(root, \"project'; echo bad\", 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 78,
+      "text": "self.assertEqual(hook.shlex.split(command)[-1], str(root.resolve() / '.claude/hooks/cbm-atlas-trace.py'))",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 81,
+      "text": "hook.install_claude(root, 'another-project', 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 88,
+      "text": "hook.install_claude(root, 'fixture', 'https://example.com')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 89,
+      "text": "self.assertFalse((root / '.claude').exists())",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 90,
+      "text": "(root / '.claude').mkdir()",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 91,
+      "text": "settings = root / '.claude/settings.local.json'",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 94,
+      "text": "hook.install_claude(root, 'fixture', 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 101,
+      "text": "hook.install_claude(root, 'fixture', 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 103,
+      "text": "self.assertFalse((root / '.claude/hooks').exists())",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 108,
+      "text": "hook.install_claude(root, 'fixture', 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 109,
+      "text": "settings = root / '.claude/settings.local.json'",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 119,
+      "text": "entry['hooks'][0]['command'] = 'python3 .claude/hooks/cbm-atlas-trace.py'",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "agents/hooks/test_atlas_trace.py",
+      "line": 123,
+      "text": "hook.install_claude(root, 'fixture', 'http://127.0.0.1:9749')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
       "file": "fixtures/agent-events/HERKUNFT.md",
@@ -45,10 +387,142 @@
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
     },
     {
+      "file": "src/agents/AgentSetup.tsx",
+      "line": 8,
+      "text": "`python3 ~/Downloads/cbm-atlas-trace.py --install-claude --root ${shellWord(root)} --project ${shellWord(project)} --daemon-url ${shellWord(`http://127.0.0.1:${",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "src/agents/AgentSetup.tsx",
+      "line": 34,
+      "text": "<p>Claude Code on macOS/Linux · Python 3 required. This installs a project-local PostToolUse hook. Connecting the browser only reads history; it does not config",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "src/agents/AgentSetup.tsx",
+      "line": 38,
+      "text": "<li>Review and run this command in your terminal. It copies the hook into <code>.claude/hooks/</code> and adds it to <code>.claude/settings.local.json</code>, p",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "src/agents/AgentSetup.tsx",
+      "line": 43,
+      "text": "<li>Start a new Claude Code session in that repository and perform a tool call. Then choose <strong>Load recorded activity</strong> here. A new recorded event i",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
       "file": "tests/scaffold/w6a.test.mjs",
       "line": 70,
       "text": "assert.equal(s.attributionHits, 0, 'keine Claude/Anthropic-Treffer im Repo');",
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-boundary-initial-unavailable.json",
+      "line": 16,
+      "text": "\"path\": \"/Users/bernhard/Desktop/codebasememorymcp_branch 2068/.claude/settings.local.json\",",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-boundary-initial-unavailable.json",
+      "line": 20,
+      "text": "\"path\": \"/Users/bernhard/.claude/settings.json\",",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-diagnosis-restart.json",
+      "line": 796,
+      "text": "\"path\": \"/Users/bernhard/Desktop/codebasememorymcp_branch 2068/.claude/settings.local.json\",",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-diagnosis-restart.json",
+      "line": 800,
+      "text": "\"path\": \"/Users/bernhard/.claude/settings.json\",",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-diagnosis-restart.json",
+      "line": 1190,
+      "text": "\"text\": \"Connect your agent\\n\\nClaude Code on macOS/Linux \\u00b7 Python 3 required. This installs a project-local PostToolUse hook. Connecting the browser only ",
+      "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-diagnosis-restart.json",
+      "line": 1191,
+      "text": "\"command\": \"python3 ~/Downloads/cbm-atlas-trace.py --install-claude --root '/Users/bernhard/Desktop/codebasememorymcp_branch 2068' --project 'cbm-pr2068' --daem",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-diagnosis-restart.json",
+      "line": 1279,
+      "text": "\"path\": \"/Users/bernhard/Desktop/codebasememorymcp_branch 2068/.claude/settings.local.json\",",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-agent-diagnosis-restart.json",
+      "line": 1283,
+      "text": "\"path\": \"/Users/bernhard/.claude/settings.json\",",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 116,
+      "text": "def install_claude(root, project, origin):",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 126,
+      "text": "directory = root / '.claude'",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 142,
+      "text": "command = ('ATLAS_PROJECT=' + shlex.quote(project) + ' ATLAS_AGENT_NAME=' + shlex.quote('Claude Code')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 155,
+      "text": "references_target = any(word in (str(target), '.claude/hooks/cbm-atlas-trace.py',",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 156,
+      "text": "'./.claude/hooks/cbm-atlas-trace.py') for word in words)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 189,
+      "text": "'daemon': origin, 'next': 'Start a new Claude Code session in this repository, perform a tool call, then load activity.'}",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 193,
+      "text": "parser = argparse.ArgumentParser(description='Install the local Code Atlas Claude Code tool hook.')",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 194,
+      "text": "parser.add_argument('--install-claude', action='store_true', required=True)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 200,
+      "text": "result = install_claude(args.root, args.project, args.daemon_url)",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
+    },
+    {
+      "file": "verification/pr-2068/final-downloaded-hook.txt",
+      "line": 267,
+      "text": "sys.exit(setup_main() if '--install-claude' in sys.argv else main())",
+      "reason": "explicit client setup protocol/configuration reference in scoped source/test, exact README instructions, named local evidence fields, or the byte-identical hook download; authorship claims remain forbidden"
     },
     {
       "file": "verification/w6/audit.json",
@@ -139,8 +613,8 @@
       "reason": "Docblocks und Zeilenkommentare sind kein Bildschirmtext. Der Parser sieht den Unterschied, ein regulaerer Ausdruck koennte ihn nicht sehen."
     }
   ],
-  "filesConsidered": 734,
-  "textFiles": 579,
-  "binaryFiles": 155,
-  "generatedAt": "2026-09-09T17:55:42.603Z"
+  "filesConsidered": 1028,
+  "textFiles": 704,
+  "binaryFiles": 324,
+  "generatedAt": "2026-09-09T22:07:16.679Z"
 }

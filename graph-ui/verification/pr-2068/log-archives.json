@@ -1,0 +1,239 @@
+{
+  "format": "gzip; decompression preserves the original bytes",
+  "logs": [
+    {
+      "original": "audit-style.log",
+      "archive": "audit-style.log.gz",
+      "sha256": "2b0871f5fe1b3b94049a56e1f35223ae4c3054e82063ca14a1452013500b72be",
+      "bytes": 475
+    },
+    {
+      "original": "feedback-acceptance-tests.log",
+      "archive": "feedback-acceptance-tests.log.gz",
+      "sha256": "8954fb25a6356807552f9a92f0d9795e7b72a558a92b4d8e82ebd5fd3c32806b",
+      "bytes": 13610
+    },
+    {
+      "original": "feedback-acceptance.log",
+      "archive": "feedback-acceptance.log.gz",
+      "sha256": "8954fb25a6356807552f9a92f0d9795e7b72a558a92b4d8e82ebd5fd3c32806b",
+      "bytes": 13610
+    },
+    {
+      "original": "feedback-alert-final-tests.log",
+      "archive": "feedback-alert-final-tests.log.gz",
+      "sha256": "dba313c1d087d0166a557b82502072a841f22d2cd1875f372c98f9c18202efeb",
+      "bytes": 247
+    },
+    {
+      "original": "feedback-alert-tests.log",
+      "archive": "feedback-alert-tests.log.gz",
+      "sha256": "dba313c1d087d0166a557b82502072a841f22d2cd1875f372c98f9c18202efeb",
+      "bytes": 247
+    },
+    {
+      "original": "feedback-embed-build.log",
+      "archive": "feedback-embed-build.log.gz",
+      "sha256": "5609ea53f7119aabd26706d96758bd7fa73125bdaa2f39aea902072848b8351d",
+      "bytes": 28618
+    },
+    {
+      "original": "feedback-frontend-build.log",
+      "archive": "feedback-frontend-build.log.gz",
+      "sha256": "b8cdff4398be35a0840f854c518062e3d6787c15ce044577d015ed101c032bb4",
+      "bytes": 8771
+    },
+    {
+      "original": "feedback-frontend-unit-initial.log",
+      "archive": "feedback-frontend-unit-initial.log.gz",
+      "sha256": "0cdb5b6efb30c70f3ef9573863d6c239dc0fa60458fadde332c9653084387fa4",
+      "bytes": 309
+    },
+    {
+      "original": "feedback-native-scope-tests.log",
+      "archive": "feedback-native-scope-tests.log.gz",
+      "sha256": "6e77418825baf4c00d9a21b8c26025c28954b0358038f8a13fc79860e3b61de8",
+      "bytes": 66094
+    },
+    {
+      "original": "feedback-native-tests.log",
+      "archive": "feedback-native-tests.log.gz",
+      "sha256": "6e77418825baf4c00d9a21b8c26025c28954b0358038f8a13fc79860e3b61de8",
+      "bytes": 66094
+    },
+    {
+      "original": "feedback-promises.log",
+      "archive": "feedback-promises.log.gz",
+      "sha256": "705f14fe5962e83d0d4111c1ffe76e70bb90f9ab59cbb27a9c3ae944655b8758",
+      "bytes": 320
+    },
+    {
+      "original": "feedback-style.log",
+      "archive": "feedback-style.log.gz",
+      "sha256": "03ff335738af75b2a27c4728565cff5ad2895715f8f4d1c2078d2fa5e9ce38db",
+      "bytes": 475
+    },
+    {
+      "original": "feedback-typecheck.log",
+      "archive": "feedback-typecheck.log.gz",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0
+    },
+    {
+      "original": "feedback-ui-build.log",
+      "archive": "feedback-ui-build.log.gz",
+      "sha256": "b8cdff4398be35a0840f854c518062e3d6787c15ce044577d015ed101c032bb4",
+      "bytes": 8771
+    },
+    {
+      "original": "feedback-unit-final-tests.log",
+      "archive": "feedback-unit-final-tests.log.gz",
+      "sha256": "ba67d668cf42bbfe806adb2116bd855d2b131161b19f06308c618fc4d667867d",
+      "bytes": 308
+    },
+    {
+      "original": "feedback-unit-tests.log",
+      "archive": "feedback-unit-tests.log.gz",
+      "sha256": "0cdb5b6efb30c70f3ef9573863d6c239dc0fa60458fadde332c9653084387fa4",
+      "bytes": 309
+    },
+    {
+      "original": "final-frontend-acceptance.log",
+      "archive": "final-frontend-acceptance.log.gz",
+      "sha256": "a5d044e8812925d19ad16614a9d353b3669e92c0cd9108ec1f024e9902613fa3",
+      "bytes": 13618
+    },
+    {
+      "original": "final-frontend-build.log",
+      "archive": "final-frontend-build.log.gz",
+      "sha256": "a45ad6cdf541b408b2500b595c3e0d53b9d6bda25433134a0570fa0bc8cfafcf",
+      "bytes": 8771
+    },
+    {
+      "original": "final-frontend-promises.log",
+      "archive": "final-frontend-promises.log.gz",
+      "sha256": "d3946fafced274dd31d4be30936705285622a3f1d10b74cbbb1c976b36d25b5c",
+      "bytes": 320
+    },
+    {
+      "original": "final-frontend-style.log",
+      "archive": "final-frontend-style.log.gz",
+      "sha256": "b8e6335c49ecb92c891f9b3e8acc29f129c09412232ca335078fa9f0db2bd831",
+      "bytes": 2894
+    },
+    {
+      "original": "final-frontend-unit.log",
+      "archive": "final-frontend-unit.log.gz",
+      "sha256": "5bd4dc5caf122e42a092c311e773b0ba2c1d1646cc7fecd2e91d34d2dd3addbe",
+      "bytes": 308
+    },
+    {
+      "original": "final-operational-client-gate.log",
+      "archive": "final-operational-client-gate.log.gz",
+      "sha256": "4480ddd1644cc09f29d71355864234eed893092063b372bf2eec1efa2ac60b5a",
+      "bytes": 307
+    },
+    {
+      "original": "frontend-acceptance.log",
+      "archive": "frontend-acceptance.log.gz",
+      "sha256": "417ea64e699a8d826df0ce258c9ff1672f54090ff3433b6518cca2fe13614c0f",
+      "bytes": 13602
+    },
+    {
+      "original": "frontend-build.log",
+      "archive": "frontend-build.log.gz",
+      "sha256": "95eb22692c94126a595398a51ea84c75c835a032b650997d17af43a50372b252",
+      "bytes": 8771
+    },
+    {
+      "original": "frontend-unit-tests.log",
+      "archive": "frontend-unit-tests.log.gz",
+      "sha256": "27a8e4fd2d3e1d6c98fc02e082e6945d3d0503f35a8a8a2e034ba639cd7861ea",
+      "bytes": 308
+    },
+    {
+      "original": "hook-tests.log",
+      "archive": "hook-tests.log.gz",
+      "sha256": "903a371054920cecf53d6e8054f10298ffa960bbb71e7c70d5f2485c5a7350d9",
+      "bytes": 101
+    },
+    {
+      "original": "native-activity-tests.log",
+      "archive": "native-activity-tests.log.gz",
+      "sha256": "53df698e8ed064720b9952c3d7b699bd03ce36c8ce2b8eb23f09979acd50ae27",
+      "bytes": 62268
+    },
+    {
+      "original": "native-final-job-status-tests.log",
+      "archive": "native-final-job-status-tests.log.gz",
+      "sha256": "eecd08b5bf059bc888292a7ee009ed36bf770af51224f5801f91b61a4da263c4",
+      "bytes": 57367
+    },
+    {
+      "original": "native-full-tests.log",
+      "archive": "native-full-tests.log.gz",
+      "sha256": "3e43457c76d1039feabbe5d2d35af917739d2a695437d01a602fe5e3d9376720",
+      "bytes": 7878
+    },
+    {
+      "original": "native-lint.log",
+      "archive": "native-lint.log.gz",
+      "sha256": "1debed8dce243dce5d13d17203922a5fca3619fa4d7b7e6ee6261f19fbaea168",
+      "bytes": 6057167
+    },
+    {
+      "original": "native-log-transport-repair.log",
+      "archive": "native-log-transport-repair.log.gz",
+      "sha256": "01cda0f9472a227bf79f21933f9a405e59c044a3247fea826d898ffa78473c96",
+      "bytes": 34479
+    },
+    {
+      "original": "native-map-resolution-repair.log",
+      "archive": "native-map-resolution-repair.log.gz",
+      "sha256": "ce6131c867d49b7bb4cfa087a91b61dca0fd0e110ce033f57d5e5b2ee4272573",
+      "bytes": 2914
+    },
+    {
+      "original": "cbm-2068-handoff-style.log",
+      "archive": "handoff-style.log.gz",
+      "sha256": "f85c2fab780dd98cf1a05369f509dbcd14aaa3ac1d1574dfc9f358a595b6c28b",
+      "bytes": 476
+    },
+    {
+      "original": "cbm-2068-handoff-client-gate.log",
+      "archive": "handoff-client-gate.log.gz",
+      "sha256": "669d1c77c7ca7aab49cc8a9ce58bc5dfb751d9bcaabb58b6c675dd285007910a",
+      "bytes": 594
+    },
+    {
+      "original": "cbm-2068-handoff-promises.log",
+      "archive": "handoff-promises.log.gz",
+      "sha256": "d3946fafced274dd31d4be30936705285622a3f1d10b74cbbb1c976b36d25b5c",
+      "bytes": 320
+    },
+    {
+      "original": "cbm-2068-handoff-acceptance.log",
+      "archive": "handoff-acceptance.log.gz",
+      "sha256": "845d2129d1ef5fdb84646753400bcb3d574306d259de7d019bd3a893a7ad8d94",
+      "bytes": 13623
+    },
+    {
+      "original": "cbm-2068-handoff-unit.log",
+      "archive": "handoff-unit.log.gz",
+      "sha256": "603b9975c10729571b81cbab5fda18eb17b556e799efc0967108c026cea3a19a",
+      "bytes": 309
+    },
+    {
+      "original": "cbm-2068-handoff-build.log",
+      "archive": "handoff-build.log.gz",
+      "sha256": "34b2ce2a9282181898eabfa137ece6e98cc829936b3d0abcb1c07607fd8d73e3",
+      "bytes": 8771
+    },
+    {
+      "original": "cbm-2068-handoff-hook.log",
+      "archive": "handoff-hook.log.gz",
+      "sha256": "a42fda04e991dba320a50128306f62c7964aa532354e5f2fc83223e8f9aff126",
+      "bytes": 105
+    }
+  ]
+}

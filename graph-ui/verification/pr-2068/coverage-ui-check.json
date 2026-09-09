@@ -1,0 +1,434 @@
+{
+  "at": "2026-09-09T20:15:31.342Z",
+  "origin": "http://127.0.0.1:9749",
+  "project": "cbm-pr2068",
+  "banner": "Project events · cbm-pr2068\nLast checked 10:15:29 PM\nHistory (2 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths · 0 skipped · 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.",
+  "diagnosis": "LOCAL EVIDENCE\n\nIndex coverage diagnosis\n\ncbm-pr2068\n\nClose diagnosis\n\nThe map can omit excluded files, unsupported inputs and failed or partial parses. Inspect the recorded reasons before relying on missing graph relationships.\n\nRun local diagnosis\nReads existing coverage metadata through this daemon. No agent, upload or issue creation.\nPartial parse: 85\nExcluded by index rules: 196\nUnsupported language: 0\nIndexing skipped: 0\nUnclassified coverage record: 0\n\nCounts describe returned path records, including directories. They do not measure all repository files. Unsupported inputs and files never discovered may be absent from these records.\n\nPartial parses mark source ranges the index parser could not interpret reliably. Grammar or preprocessor limitations and malformed source can cause this; a partial parse alone does not establish a build or runtime failure. Exclusions follow indexing rules.\n\nAll recorded coverage entries have been loaded. The parser limitations and exclusions listed below still apply.\n\nChecked 2026-09-09T20:15:30.294Z · Index generation 2026-09-09T19:51:51Z · Recording complete\n\nBest-effort signal only. No recorded issue does not prove graph or source completeness; read flagged source and qualify claims when metadata is changed or unavailable.\n\nFilter recorded paths or reasons\nPartial parse · file graph-ui/src/galaxy/coverage-shadow-scene.test.tsx\n\nRecorded reason: Source lines: 10-10\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file graph-ui/src/galaxy/hierarchy-layout.ts\n\nRecorded reason: Source lines: 249-249\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file internal/cbm/helpers.c\n\nRecorded reason: Source lines: 501-501\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file internal/cbm/lsp/generated/java_stdlib_data.c\n\nRecorded reason: Source lines: 1329-1329\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file internal/cbm/preprocessor.h\n\nRecorded reason: Source lines: 39-39\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file pkg/chocolatey/tools/chocolateyInstall.ps1\n\nRecorded reason: Source lines: 9-12, 13-13, 14-14\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file scripts/ci/check-binary-composition.sh\n\nRecorded reason: Source lines: 228-228, 229-229\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file scripts/ci/clean-test-residue.ps1\n\nRecorded reason: Source lines: 39-39\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file scripts/setup-windows.ps1\n\nRecorded reason: Source lines: 113-113, 113-113, 245-327\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file scripts/smoke-invariants.sh\n\nRecorded reason: Source lines: 137-137\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file scripts/test-windows.ps1\n\nRecorded reason: Source lines: 109-109\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/activation_transaction.c\n\nRecorded reason: Source lines: 208-208, 1426-2331\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/agent_clients.h\n\nRecorded reason: Source lines: 118-118\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/agent_profiles.h\n\nRecorded reason: Source lines: 67-67\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/cli.c\n\nRecorded reason: Source lines: 1-13337\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_json_like.c\n\nRecorded reason: Source lines: 46-46, 47-47, 48-48, 49-49, 1363-1363, 1368-1368, 1373-1373\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_json_like.h\n\nRecorded reason: Source lines: 155-155\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_text_edit.c\n\nRecorded reason: Source lines: 49-49, 50-50, 51-51, 52-52, 53-53, 54-54, 348-348, 353-353, 358-358\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_toml_edit.c\n\nRecorded reason: Source lines: 45-45, 46-46, 47-47, 48-48, 392-392, 397-397, 402-402\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_toml_edit.h\n\nRecorded reason: Source lines: 107-107\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_yaml_edit.c\n\nRecorded reason: Source lines: 625-625, 630-630, 635-635\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/config_yaml_edit.h\n\nRecorded reason: Source lines: 126-126\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cli/hook_augment.c\n\nRecorded reason: Source lines: 406-406, 431-431, 441-441, 531-531, 897-897\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/cypher/cypher.c\n\nRecorded reason: Source lines: 2308-2308, 2309-2309, 2463-2463, 2464-2464, 2598-2598\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/daemon/ipc.c\n\nRecorded reason: Source lines: 3365-3365, 3365-3365, 3365-3365, 3366-3366, 3366-3366, 3366-3366, 3367-3367, 3367-3367, 3368-3368, 3369-3369, 3370-3370, 3370-3370, 3370-3370, 3371-3371, 3371-3371, 3372-3372, 3373-3373, 3373-3373, 3374-3374, 3375-3375, 3375-3375, 3375-3375, 3376-3376, 3376-3376, 3376-3376, 3377-3377, 3377-3377, 3377-3377, 3378-3378, 3378-3378, 3379-3379, 3379-3379, 3379-3379, 3380-3380, 3380-3380, 3380-3380, 3381-3381, 3381-3381, 3381-3381, 3382-3382, 3382-3382, 3383-3383, 3384-3384, 3384-3384, 3384-3384, 3385-3385, 3385-3385, 3385-3385, 3386-3386, 3386-3386, 3386-3386, 3386-3386, 3387-3387, 3387-3387, 3388-3388, 3389-3389, 3390-3390, 3391-3391, 3391-3391, 3392-3392, 3392-3392\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/daemon/runtime.c\n\nRecorded reason: Source lines: 47-47\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/discover/discover.c\n\nRecorded reason: Source lines: 572-572\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/foundation/compat_thread.c\n\nRecorded reason: Source lines: 104-104, 104-104\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/foundation/log.c\n\nRecorded reason: Source lines: 280-280, 284-284, 297-297, 301-301, 327-327, 331-331\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/foundation/platform.c\n\nRecorded reason: Source lines: 470-470, 492-492, 525-525, 547-547\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/foundation/private_file_lock.c\n\nRecorded reason: Source lines: 616-616, 616-616, 616-616, 617-617, 617-617, 618-618, 619-619, 620-620, 620-620, 620-620, 621-621, 621-621, 622-622, 623-623, 623-623, 623-623, 624-624, 624-624, 624-624, 625-625, 625-625, 626-626, 626-626, 626-626, 627-627, 627-627, 628-628, 629-629, 629-629, 631-631, 632-632, 632-632, 634-634, 635-635, 635-635, 635-635, 636-636, 636-636, 636-636, 637-637, 637-637, 638-638, 638-638, 638-638, 638-638, 639-639\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/foundation/slab_alloc.c\n\nRecorded reason: Source lines: 118-118, 121-121, 124-124\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/git/git_context.c\n\nRecorded reason: Source lines: 181-181\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/mcp/compact_out.c\n\nRecorded reason: Source lines: 1034-1034, 1042-1042, 1070-1070, 1079-1079, 1082-1082, 1110-1110, 1118-1118, 1153-1153, 1191-1191\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/mcp/mcp.c\n\nRecorded reason: Source lines: 185-185, 195-195, 4216-4216, 4362-4362, 6510-6510, 6586-6586, 7328-7328, 7969-7969, 8549-8549, 9767-9767, 11964-11964, 14848-14848, 14850-14850, 14852-14852, 16738-16738, 17140-17140, 17153-17153\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/artifact.c\n\nRecorded reason: Source lines: 61-61, 64-64, 65-65, 76-76, 77-77, 635-635\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_calls.c\n\nRecorded reason: Source lines: 83-83, 84-84\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_complexity.c\n\nRecorded reason: Source lines: 34-34, 35-35\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_cross_repo.c\n\nRecorded reason: Source lines: 96-96\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_definitions.c\n\nRecorded reason: Source lines: 108-108, 109-109\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_githistory.c\n\nRecorded reason: Source lines: 36-36, 37-37\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_importance.c\n\nRecorded reason: Source lines: 99-99, 100-100\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_k8s.c\n\nRecorded reason: Source lines: 70-70, 71-71\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_lsp_cross.c\n\nRecorded reason: Source lines: 53-53, 54-54\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_parallel.c\n\nRecorded reason: Source lines: 334-334, 335-335, 1413-1413\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_pkgmap.c\n\nRecorded reason: Source lines: 86-86\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_semantic_edges.c\n\nRecorded reason: Source lines: 298-298, 299-299\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_semantic.c\n\nRecorded reason: Source lines: 69-69, 70-70\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_similarity.c\n\nRecorded reason: Source lines: 75-75, 76-76\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pass_usages.c\n\nRecorded reason: Source lines: 89-89, 90-90\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pipeline_incremental.c\n\nRecorded reason: Source lines: 98-98, 99-99, 1140-1140, 1229-1229\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/pipeline/pipeline.c\n\nRecorded reason: Source lines: 247-247, 248-248\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/store/store.c\n\nRecorded reason: Source lines: 6764-6764, 6802-6802, 6868-6868, 7524-7524\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/ui/activity.c\n\nRecorded reason: Source lines: 174-174, 203-203\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/ui/http_server.c\n\nRecorded reason: Source lines: 825-825, 2841-2841, 2882-2882\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/ui/httpd.h\n\nRecorded reason: Source lines: 114-114, 116-116\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file src/watcher/watcher.c\n\nRecorded reason: Source lines: 344-344, 346-346, 348-348, 899-899\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/fixtures/plsql/create_type_as_object_limitation.tps\n\nRecorded reason: Source lines: 4-8\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/repro/repro_call_argument_matrix_a.c\n\nRecorded reason: Source lines: 1265-1265\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/repro/repro_call_argument_matrix_b.c\n\nRecorded reason: Source lines: 1188-1188, 1189-1189, 1190-1190, 1191-1191, 1192-1192, 1193-1193, 1194-1194, 1195-1195, 1196-1196, 1197-1197, 1198-1198, 1199-1199, 1200-1200, 1201-1201, 1202-1202, 1203-1203, 1204-1204, 1205-1205, 1206-1206, 1207-1207, 1208-1208, 1209-1209, 1210-1210, 1211-1211, 1212-1212, 1213-1213, 1214-1214, 1215-1215, 1216-1216, 1217-1217, 1218-1218, 1219-1219, 1220-1220, 1221-1221, 1222-1222, 1223-1223, 1224-1224, 1225-1225, 1246-1246, 1247-1247, 1248-1248, 1360-1360\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/repro/repro_call_node_behaviors.c\n\nRecorded reason: Source lines: 674-674, 677-677, 680-680, 683-683, 686-686, 689-689, 692-692\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_cli.c\n\nRecorded reason: Source lines: 453-453, 469-469, 492-492, 528-528, 542-542, 585-585, 593-593, 1414-1414, 1417-1417, 1657-1657, 1662-1662, 5011-5011, 5013-5013, 5015-5015, 5046-5046, 5048-5048, 5053-5053, 5055-5055, 5057-5057, 5119-5119, 5121-5121, 5123-5123, 5468-5468, 5470-5470, 5472-5472, 5474-5474, 5486-5486, 5488-5488, 5490-5490, 5587-5587, 5589-5589, 5591-5591, 5593-5593, 7574-14767\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_daemon_ipc.c\n\nRecorded reason: Source lines: 970-970, 970-970, 971-971, 971-971, 971-971\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_daemon_runtime.c\n\nRecorded reason: Source lines: 4597-4598, 4599-4627\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_index_resilience.c\n\nRecorded reason: Source lines: 194-194, 350-350, 612-612\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_mcp.c\n\nRecorded reason: Source lines: 57-57, 1374-1374, 2604-2604, 2612-2612, 2843-2843, 8455-8455, 8490-8490, 15735-15735\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_path_alias.c\n\nRecorded reason: Source lines: 31-31, 32-32\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_ui.c\n\nRecorded reason: Source lines: 934-934, 985-985, 1150-1150, 1250-1250, 1340-1340, 1452-1452, 1941-1941, 1943-1943, 2034-2034, 2041-2440\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tests/test_worker_pool.c\n\nRecorded reason: Source lines: 209-209\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-arkts/src/parser.c\n\nRecorded reason: Source lines: 10713-10713, 10759-10759, 10797-10797, 10829-10829, 10863-10863, 10905-10905, 10938-10938, 10972-10972, 11001-11001, 11034-11034, 11349-11349, 11388-11388, 11425-11425, 11980-11980, 12120-12120, 286864-286864\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-arkts/src/tree_sitter/alloc.h\n\nRecorded reason: Source lines: 50-50\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-arkts/src/tree_sitter/array.h\n\nRecorded reason: Source lines: 160-160, 287-287\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-arkts/src/tree_sitter/parser.h\n\nRecorded reason: Source lines: 282-282\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-chialisp/src/parser.c\n\nRecorded reason: Source lines: 165-165, 483-483\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-chialisp/src/tree_sitter/alloc.h\n\nRecorded reason: Source lines: 50-50\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-chialisp/src/tree_sitter/array.h\n\nRecorded reason: Source lines: 160-160, 287-287\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-chialisp/src/tree_sitter/parser.h\n\nRecorded reason: Source lines: 282-282\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-form/src/parser.c\n\nRecorded reason: Source lines: 1260-1260, 1308-1308, 1981-1981, 1995-1995, 2008-2008, 2021-2021, 2034-2034, 2389-2389, 21601-21601\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-form/src/tree_sitter/alloc.h\n\nRecorded reason: Source lines: 50-50\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-form/src/tree_sitter/array.h\n\nRecorded reason: Source lines: 310-310\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-form/src/tree_sitter/parser.h\n\nRecorded reason: Source lines: 278-278\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-magma/src/parser.c\n\nRecorded reason: Source lines: 1337-1337, 1348-1348, 1356-1356, 1365-1365, 1373-1373, 1472-1472, 1485-1485, 1543-1543, 1934-1934, 26330-26330\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-magma/src/tree_sitter/alloc.h\n\nRecorded reason: Source lines: 50-50\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-magma/src/tree_sitter/array.h\n\nRecorded reason: Source lines: 310-310\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nPartial parse · file tools/tree-sitter-magma/src/tree_sitter/parser.h\n\nRecorded reason: Source lines: 278-278\n\nEvidence: check_index_coverage.scope:.\n\nRead the reported source ranges; verify missing symbols before relying on graph paths.\n\nExcluded by index rules · dir .git\n\nRecorded reason: excluded subtree\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · dir build\n\nRecorded reason: excluded subtree\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file docs/graph-ui-screenshot.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/design/design.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/design/live-agents.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · dir graph-ui/dist\n\nRecorded reason: excluded subtree\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · dir graph-ui/node_modules\n\nRecorded reason: excluded subtree\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/tsconfig.node.tsbuildinfo\n\nRecorded reason: gitignore\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/tsconfig.tsbuildinfo\n\nRecorded reason: gitignore\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · dir graph-ui/vendor\n\nRecorded reason: excluded subtree\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/verification/pr-2068/after-architecture-first.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/verification/pr-2068/after-architecture-relationship.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/verification/pr-2068/after-architecture.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/verification/pr-2068/after-context-and-impact.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nExcluded by index rules · file graph-ui/verification/pr-2068/after-project-readme.png\n\nRecorded reason: ignored-suffix\n\nEvidence: check_index_coverage.scope:.\n\nReview the recorded exclusion rule; open the source directly or adjust that rule before reindexing.\n\nShowing 100 of 281 matching records. Filter to locate another path.\n\nReview the local report\n\nThis draft contains paths and recorded reasons. Edit it before sharing. Copy and download stay local; publication would require a separate, explicit action outside this panel.\n\nCopy edited report\nDownload edited report",
+  "screenshot": {
+    "file": "coverage-after-diagnosis.png",
+    "sha256": "0fec3f551e8b22723a1d4ca81e3a16321d8b9c22fc35da3ae94c2d6eb0716be0"
+  },
+  "requests": [
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/?project=cbm-pr2068"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/assets/index-BUsVgQwH.js"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/assets/index-DxDVy-h7.css"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/layout?project=cbm-pr2068&max_nodes=5000"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn&project=cbm-pr2068"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "get_architecture"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/api/ui-log"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "check_index_coverage"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=test-infrastructure"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tests"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tools"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2FISSUE_TEMPLATE"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2Fworkflows"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs%2Fdevelopment"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fagents"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fdocs"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Feval"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ffixtures"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fllm"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fspike"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fsrc"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftests"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftools"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fverification"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal%2Fcbm"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fchocolatey"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fglama"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fgo"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fhomebrew"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fnpm"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fpypi"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fscoop"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fwinget"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts%2Fci"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts%2Fgit-hooks"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts%2Fhooks"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fcli"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fcypher"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fdaemon"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fdiscover"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "check_index_coverage"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "index_status"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "get_architecture"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "check_index_coverage"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/rpc",
+      "tool": "query_graph"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=test-infrastructure"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tests"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tools"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2FISSUE_TEMPLATE"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2Fworkflows"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs%2Fdevelopment"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fagents"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fdocs"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Feval"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ffixtures"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fllm"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fspike"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fsrc"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftests"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftools"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fverification"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal%2Fcbm"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fchocolatey"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fglama"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fgo"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fhomebrew"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fnpm"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fpypi"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fscoop"
+    },
+    {
+      "method": "POST",
+      "url": "http://127.0.0.1:9749/api/ui-log"
+    },
+    {
+      "method": "GET",
+      "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fwinget"
+    }
+  ],
+  "blocked": [],
+  "errors": [],
+  "noIndexMutation": true
+}
