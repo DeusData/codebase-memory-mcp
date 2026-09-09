@@ -9,6 +9,7 @@
 #include "../src/foundation/constants.h"
 #include "../src/foundation/log.h"
 #include "../src/foundation/platform.h" /* cbm_file_size */
+#include "../src/foundation/mem.h"      /* cbm_mem_set_budget_for_tests — over-budget seam */
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/workspace.h"
 #include "../src/mcp/compact_out.h"
@@ -17670,6 +17671,161 @@ static int idx823_supervised_name_override_check(const char *repo_dir, const cha
 }
 #endif
 
+/* Write the 64-file Go fixture (above MIN_FILES_FOR_PARALLEL, so the gated
+ * parallel extract path runs). generation 2 gives every file a second
+ * definition so a re-run must re-extract all of them — an unchanged repo is an
+ * incremental no-op and never reaches the memory gate. */
+static bool budget_fixture_write(const char *repo, int generation) {
+    for (int i = 0; i < 64; i++) {
+        char path[CBM_SZ_1K];
+        char body[CBM_SZ_256];
+        snprintf(path, sizeof(path), "%s/f%02d.go", repo, i);
+        if (generation == 1) {
+            snprintf(body, sizeof(body), "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n", i,
+                     i);
+        } else {
+            snprintf(body, sizeof(body),
+                     "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n\n"
+                     "func G%02d() int {\n\treturn F%02d() + 1\n}\n",
+                     i, i, i, i);
+        }
+        if (th_write_file(path, body) != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Parse the JSON object inside an MCP tool result. NULL when absent. */
+static yyjson_doc *budget_result_doc(const char *result) {
+    char *text = extract_text_content(result);
+    yyjson_doc *doc = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    free(text);
+    return doc;
+}
+
+static const char *budget_doc_str(yyjson_doc *doc, const char *key) {
+    return doc ? yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), key)) : NULL;
+}
+
+static int budget_doc_int(yyjson_doc *doc, const char *key, int missing) {
+    yyjson_val *val = doc ? yyjson_obj_get(yyjson_doc_get_root(doc), key) : NULL;
+    return val && yyjson_is_int(val) ? (int)yyjson_get_int(val) : missing;
+}
+
+/* Decision A (#1997 #832): an attempt that stays over the memory budget after
+ * back-pressure fails WHOLE and the response says so — reason, numbers, hint,
+ * and that the previous index still serves — instead of the generic "check
+ * repo_path" error. In-process: the runner is never a marked supervisor host,
+ * and the budget seam stands in for a 1 MiB machine. */
+TEST(index_repository_over_budget_reports_named_reason) {
+    char repo[CBM_SZ_1K];
+    char cache[CBM_SZ_1K];
+    snprintf(repo, sizeof(repo), "%s/cbm-mcp-budget-repo-XXXXXX", cbm_tmpdir());
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-budget-cache-XXXXXX", cbm_tmpdir());
+    if (!cbm_mkdtemp(repo)) {
+        FAIL("cbm_mkdtemp repo failed");
+    }
+    if (!cbm_mkdtemp(cache)) {
+        th_rmtree(repo);
+        FAIL("cbm_mkdtemp cache failed");
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    const char *saved_workers = getenv("CBM_WORKERS");
+    char *saved_workers_copy = saved_workers ? strdup(saved_workers) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    bool files_ok = budget_fixture_write(repo, 1);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    bool had_server = srv != NULL;
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+
+    /* Generation 1 at the process budget publishes. */
+    char *first = srv && files_ok ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
+    yyjson_doc *first_doc = budget_result_doc(first);
+    const char *first_status = budget_doc_str(first_doc, "status");
+    bool first_indexed = first_status && strcmp(first_status, "indexed") == 0;
+    int nodes_first = budget_doc_int(first_doc, "nodes", -1);
+    const char *first_project = budget_doc_str(first_doc, "project");
+    char *project = first_project ? strdup(first_project) : NULL;
+    yyjson_doc_free(first_doc);
+    free(first);
+    char db_path[CBM_SZ_2K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project ? project : "missing");
+    long db_size_before = (long)cbm_file_size(db_path);
+
+    /* Generation 2 at 1 MiB over a changed repo fails whole. */
+    files_ok = files_ok && budget_fixture_write(repo, 2);
+    size_t saved_budget = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    char *second = srv && files_ok ? cbm_mcp_handle_tool(srv, "index_repository", args) : NULL;
+    cbm_mem_set_budget_for_tests(saved_budget);
+    bool second_is_error = second && strstr(second, "\"isError\":true") != NULL;
+    yyjson_doc *second_doc = budget_result_doc(second);
+    const char *second_status = budget_doc_str(second_doc, "status");
+    const char *second_reason = budget_doc_str(second_doc, "reason");
+    const char *second_previous = budget_doc_str(second_doc, "previous_index");
+    const char *second_hint = budget_doc_str(second_doc, "hint");
+    bool status_error = second_status && strcmp(second_status, "error") == 0;
+    bool reason_named = second_reason && strcmp(second_reason, "over_memory_budget") == 0;
+    bool previous_preserved = second_previous && strcmp(second_previous, "preserved") == 0;
+    bool hint_names_knob = second_hint && strstr(second_hint, "CBM_MEM_BUDGET_MB") != NULL;
+    int budget_mb = budget_doc_int(second_doc, "budget_mb", -1);
+    int peak_rss_mb = budget_doc_int(second_doc, "peak_rss_mb", -1);
+    yyjson_doc_free(second_doc);
+    free(second);
+    long db_size_after = (long)cbm_file_size(db_path);
+
+    /* The previous generation still answers with its full graph. */
+    char status_args[CBM_SZ_2K];
+    snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\"}", project ? project : "");
+    char *status = srv && project ? cbm_mcp_handle_tool(srv, "index_status", status_args) : NULL;
+    /* index_status answers in the tree format ("nodes: <n>" on its own line). */
+    char *status_text = extract_text_content(status);
+    const char *nodes_line = status_text ? strstr(status_text, "\nnodes: ") : NULL;
+    int nodes_after = nodes_line ? (int)strtol(nodes_line + strlen("\nnodes: "), NULL, 10) : -1;
+    if (nodes_after != nodes_first) {
+        printf("    index_status after the failed attempt: %.400s\n",
+               status_text ? status_text : "(null)");
+    }
+    free(status_text);
+    free(status);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    free(project);
+    if (saved_workers_copy) {
+        cbm_setenv("CBM_WORKERS", saved_workers_copy, 1);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    free(saved_workers_copy);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    th_rmtree(cache);
+    th_rmtree(repo);
+
+    ASSERT_TRUE(files_ok);
+    ASSERT_TRUE(had_server);
+    ASSERT_TRUE(first_indexed);
+    ASSERT_GT(nodes_first, 0);
+    ASSERT_TRUE(second_is_error);
+    ASSERT_TRUE(status_error);
+    ASSERT_TRUE(reason_named);
+    ASSERT_TRUE(previous_preserved);
+    ASSERT_TRUE(hint_names_knob);
+    ASSERT_EQ(budget_mb, 1);
+    ASSERT_GT(peak_rss_mb, budget_mb);
+    /* Preserved on disk and still served: same file size, same node count. */
+    ASSERT_GT(db_size_before, 0L);
+    ASSERT_EQ(db_size_after, db_size_before);
+    ASSERT_EQ(nodes_after, nodes_first);
+    PASS();
+}
+
 TEST(index_repository_cli_name_override_issue823) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX fork harness required to isolate supervisor host mark");
@@ -20238,6 +20394,7 @@ SUITE(mcp) {
     RUN_TEST(index_repository_relative_path_uses_explicit_session_root);
     RUN_TEST(index_repository_supervisor_uses_canonical_session_path);
     RUN_TEST(index_repository_cli_name_override_issue823);
+    RUN_TEST(index_repository_over_budget_reports_named_reason);
     RUN_TEST(index_supervisor_unsafe_clean_is_never_fallback_or_recovery);
     RUN_TEST(index_supervisor_gate_requires_marked_host_issue845);
     RUN_TEST(index_supervisor_start_failure_is_fail_closed_in_real_host);

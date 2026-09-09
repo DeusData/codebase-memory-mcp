@@ -1476,6 +1476,130 @@ TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership) {
     PASS();
 }
 
+/* ── Nested .gitignore BELOW another .gitignore (issue #1973) ─────── */
+
+/* Laravel layout: storage/.gitignore exists (here: EMPTY) and
+ * storage/dump/.gitignore contains "*". git ignores every file under
+ * storage/dump/; the walk used to load only the SHALLOWEST nested .gitignore
+ * on a path (try_load_nested_gitignore() bailed once a frame carried a
+ * local matcher), so the deeper "*" was never consulted and thousands of
+ * ignored JSON dumps were discovered — the #1973 OOM kill. The bounded count
+ * (daemon auto-index admission) walks the same frames and must agree. */
+TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973) {
+    enum { DUMP_FILES = 20 };
+    char *base = th_mktempdir("cbm_disc_ngi_1973");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "node_modules/\n");
+    th_write_file(TH_PATH(base, "storage/.gitignore"), "");
+    th_write_file(TH_PATH(base, "storage/dump/.gitignore"), "*\n");
+    th_write_file(TH_PATH(base, "app/x.php"), "<?php\nfunction appFn() { return 1; }\n");
+    th_write_file(TH_PATH(base, "storage/dump/nested/deep.json"), "{\"deep\": true}\n");
+    bool fixture_ready = true;
+    for (int i = 0; i < DUMP_FILES; i++) {
+        char rel[64];
+        snprintf(rel, sizeof(rel), "storage/dump/%05d.json", i);
+        fixture_ready = fixture_ready &&
+                        th_write_file(TH_PATH(base, rel), "{\"route\": \"/api/v1/thing\"}\n") == 0;
+    }
+    ASSERT_TRUE(fixture_ready);
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT(strstr(files[i].rel_path, "storage/dump/") == NULL);
+    }
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/x.php"));
+    ASSERT_EQ(count, 1);
+    cbm_discover_free(files, count);
+
+    int bounded_count = -1;
+    cbm_discover_status_t bounded_status =
+        cbm_discover_count_bounded(base, &opts, DUMP_FILES + 2, 0, &bounded_count);
+    ASSERT_EQ(bounded_status, CBM_DISCOVER_OK);
+    ASSERT_EQ(bounded_count, 1);
+
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence between .gitignore files on one path is git's: patterns in a
+ * deeper file override those in a shallower one, and every ancestor's
+ * patterns still apply to the subtree. A negation in the deepest file
+ * re-includes a file its ancestor ignores; siblings the deeper file does not
+ * mention stay ignored; a root pattern still reaches two levels down. */
+TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern) {
+    char *base = th_mktempdir("cbm_disc_ngi_neg");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.log\n");
+    th_write_file(TH_PATH(base, "storage/.gitignore"), "*.json\n");
+    th_write_file(TH_PATH(base, "storage/dump/.gitignore"), "!keep.json\n");
+    th_write_file(TH_PATH(base, "app/x.php"), "<?php\nfunction appFn() { return 1; }\n");
+    th_write_file(TH_PATH(base, "storage/top.json"), "{\"top\": 1}\n");
+    th_write_file(TH_PATH(base, "storage/dump/keep.json"), "{\"keep\": 1}\n");
+    th_write_file(TH_PATH(base, "storage/dump/drop.json"), "{\"drop\": 1}\n");
+    th_write_file(TH_PATH(base, "storage/dump/run.log"), "log line\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "app/x.php"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "storage/dump/keep.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/top.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/dump/drop.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "storage/dump/run.log"));
+    ASSERT_EQ(count, 2);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Three nesting levels: the deepest file wins for the paths it names, an
+ * intermediate negation reaches through an EMPTY .gitignore below it, and the
+ * root pattern still governs everything outside the re-included subtree. */
+TEST(discover_nested_gitignore_three_levels_deeper_file_wins) {
+    char *base = th_mktempdir("cbm_disc_ngi_3lvl");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.json\n");
+    th_write_file(TH_PATH(base, "a/.gitignore"), "!*.json\n");
+    th_write_file(TH_PATH(base, "a/b/.gitignore"), "");
+    th_write_file(TH_PATH(base, "a/b/c/.gitignore"), "drop.json\n");
+    th_write_file(TH_PATH(base, "main.py"), "x = 1\n");
+    th_write_file(TH_PATH(base, "root.json"), "{\"root\": 1}\n");
+    th_write_file(TH_PATH(base, "a/x.json"), "{\"a\": 1}\n");
+    th_write_file(TH_PATH(base, "a/b/x.json"), "{\"b\": 1}\n");
+    th_write_file(TH_PATH(base, "a/b/c/keep.json"), "{\"keep\": 1}\n");
+    th_write_file(TH_PATH(base, "a/b/c/drop.json"), "{\"drop\": 1}\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(base, &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(discover_has_rel_path(files, count, "main.py"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/x.json"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/b/x.json"));
+    ASSERT_TRUE(discover_has_rel_path(files, count, "a/b/c/keep.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "root.json"));
+    ASSERT_FALSE(discover_has_rel_path(files, count, "a/b/c/drop.json"));
+    ASSERT_EQ(count, 4);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Shebang fallback for extensionless scripts (issue #1199) ────── */
 
 /* Language detected for a discovered file by relative path, or CBM_LANG_COUNT
@@ -1851,4 +1975,9 @@ SUITE(discover) {
     RUN_TEST(discover_nested_gitignore);
     RUN_TEST(discover_nested_gitignore_stacks_with_root);
     RUN_TEST(discover_many_nested_gitignores_do_not_exhaust_matcher_ownership);
+
+    /* Nested .gitignore below another .gitignore (issue #1973) */
+    RUN_TEST(discover_nested_gitignore_below_ancestor_gitignore_issue1973);
+    RUN_TEST(discover_nested_gitignore_negation_overrides_ancestor_pattern);
+    RUN_TEST(discover_nested_gitignore_three_levels_deeper_file_wins);
 }

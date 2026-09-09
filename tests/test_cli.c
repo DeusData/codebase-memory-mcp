@@ -45,6 +45,7 @@
 #endif
 #include <errno.h>
 #include <limits.h>
+#include <wchar.h> /* wcscmp/wcslen/swprintf for the Windows user-PATH test (#2117) */
 #include <zlib.h>
 
 /* Internal prompt seam used to restore process-global state after command
@@ -14670,6 +14671,110 @@ TEST(cli_windows_update_hands_off_to_install_script) {
     ASSERT_TRUE(preserved);
     PASS();
 }
+
+/* #2117: install registers the install dir in the persistent current-user PATH
+ * via the wide registry API and de-duplicates on reinstall; uninstall must take
+ * exactly that entry back out and leave every other entry byte-for-byte intact,
+ * or the PATH grows without bound (a real Windows host reached ~8000 chars).
+ * This drives the actual query/append/remove logic through the hermetic
+ * CBM_TEST_WINDOWS_USER_PATH_RUN_ID seam, against a GUID-scoped scratch key
+ * under HKCU\Software\CodebaseMemoryMCP\Smoke — the developer's live
+ * HKCU\Environment\Path is never opened. The non-ASCII install dir doubles as
+ * the mojibake guard: a broken UTF-8->UTF-16 round-trip would fail the segment
+ * match and leak a duplicate instead of de-duplicating.
+ *
+ * Return codes mirror the internal enum: 0 = added/removed, 1 = already
+ * present / nothing to remove. */
+int cbm_cli_ensure_windows_user_path_for_test(const char *bin_dir, bool dry_run);
+int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run);
+
+static const wchar_t k_cli_user_path_run_id[] = L"0123456789abcdef0123456789abcdef";
+
+static int cli_test_read_smoke_path(HKEY key, wchar_t *out, DWORD out_bytes) {
+    DWORD type = 0;
+    DWORD bytes = out_bytes;
+    return RegQueryValueExW(key, L"Path", NULL, &type, (BYTE *)out, &bytes) == ERROR_SUCCESS ? 0
+                                                                                             : -1;
+}
+
+static int cli_test_set_smoke_path(HKEY key, const wchar_t *value) {
+    DWORD bytes = (DWORD)((wcslen(value) + 1U) * sizeof(wchar_t));
+    LONG rc = RegSetValueExW(key, L"Path", 0, REG_EXPAND_SZ, (const BYTE *)value, bytes);
+    return rc == ERROR_SUCCESS ? 0 : -1;
+}
+
+TEST(cli_uninstall_removes_only_its_own_windows_user_path_entry_issue2117) {
+    if (!SetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", k_cli_user_path_run_id) ||
+        !SetEnvironmentVariableW(L"SMOKE_TEMP_ROOT", L"C:\\Temp\\cbm-smoke") ||
+        !SetEnvironmentVariableW(L"SMOKE_DOWNLOAD_URL", L"http://127.0.0.1:8765")) {
+        FAIL("could not arm the Windows user-PATH test seam");
+    }
+
+    wchar_t key_path[128];
+    swprintf(key_path, sizeof(key_path) / sizeof(key_path[0]),
+             L"Software\\CodebaseMemoryMCP\\Smoke\\%ls", k_cli_user_path_run_id);
+    /* Start from a clean leaf so a prior aborted run cannot skew the result. */
+    RegDeleteKeyW(HKEY_CURRENT_USER, key_path);
+    HKEY key = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key_path, 0, NULL, REG_OPTION_NON_VOLATILE,
+                        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &key,
+                        NULL) != ERROR_SUCCESS) {
+        FAIL("could not create the scratch smoke registry key");
+    }
+    DWORD sentinel_bytes = (DWORD)((wcslen(k_cli_user_path_run_id) + 1U) * sizeof(wchar_t));
+    RegSetValueExW(key, L"CbmSmokeRunId", 0, REG_SZ, (const BYTE *)k_cli_user_path_run_id,
+                   sentinel_bytes);
+
+    /* Non-ASCII install dir (Omega mu epsilon-tonos gamma alpha). */
+    wchar_t bin_dir_w[] = L"C:\\Users\\dev\\install_\u03A9\u03BC\u03AD\u03B3\u03B1\\bin";
+    char bin_dir[512];
+    WideCharToMultiByte(CP_UTF8, 0, bin_dir_w, -1, bin_dir, (int)sizeof(bin_dir), NULL, NULL);
+
+    wchar_t readback[1024];
+    wchar_t expected_appended[1024];
+    swprintf(expected_appended, sizeof(expected_appended) / sizeof(expected_appended[0]),
+             L"C:\\Tools\\alpha;C:\\Tools\\omega;%ls", bin_dir_w);
+    wchar_t seeded_middle[1024];
+    swprintf(seeded_middle, sizeof(seeded_middle) / sizeof(seeded_middle[0]),
+             L"C:\\Tools\\alpha;%ls;C:\\Tools\\omega", bin_dir_w);
+
+    int ok = 1;
+    /* Scenario A — append to a PATH lacking our dir, de-dup, then remove. */
+    ok &= cli_test_set_smoke_path(key, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+    ok &= cbm_cli_ensure_windows_user_path_for_test(bin_dir, false) == 0; /* added */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, expected_appended) == 0;
+    /* Reinstall must not duplicate: the non-ASCII entry must round-trip-match. */
+    ok &= cbm_cli_ensure_windows_user_path_for_test(bin_dir, false) == 1; /* already present */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, expected_appended) == 0;
+    /* Remove our entry — the two unrelated entries survive byte-for-byte. */
+    ok &= cbm_cli_remove_windows_user_path_for_test(bin_dir, false) == 0; /* removed */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+    /* Idempotent removal: nothing of ours left to take out. */
+    ok &= cbm_cli_remove_windows_user_path_for_test(bin_dir, false) == 1; /* nothing to remove */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+
+    /* Scenario B — our entry in the MIDDLE: neighbours on both sides survive. */
+    ok &= cli_test_set_smoke_path(key, seeded_middle) == 0;
+    ok &= cbm_cli_remove_windows_user_path_for_test(bin_dir, false) == 0; /* removed */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+
+    /* Teardown: delete only our scratch leaf; clear the seam env. */
+    RegCloseKey(key);
+    RegDeleteKeyW(HKEY_CURRENT_USER, key_path);
+    SetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", NULL);
+    SetEnvironmentVariableW(L"SMOKE_TEMP_ROOT", NULL);
+    SetEnvironmentVariableW(L"SMOKE_DOWNLOAD_URL", NULL);
+
+    if (!ok) {
+        FAIL("uninstall must remove exactly its own user-PATH entry and leave others intact");
+    }
+    PASS();
+}
 #endif /* _WIN32 */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -14796,6 +14901,7 @@ SUITE(cli) {
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
     RUN_TEST(cli_windows_update_hands_off_to_install_script);
+    RUN_TEST(cli_uninstall_removes_only_its_own_windows_user_path_entry_issue2117);
 #endif
 
     /* Version (2 tests — selfupdate_test.go) */

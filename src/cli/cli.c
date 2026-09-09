@@ -6491,6 +6491,127 @@ static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     return CLI_OK;
 }
 
+/* Uninstall counterpart to cli_ensure_windows_user_path: remove exactly the
+ * install-dir segment install added, leaving every other segment byte-for-byte
+ * intact. Without this, every install/uninstall cycle leaves its entry behind
+ * and the current-user PATH grows without bound (#2117). Segment identity uses
+ * the same case- and trailing-separator-insensitive comparison as the install
+ * `present` scan, so we remove precisely what install would have de-duplicated.
+ * Returns CLI_OK when a segment was removed, CLI_TRUE when the directory was
+ * not present (nothing to do), CLI_ERR on a registry failure. dry_run reports
+ * without mutating. */
+static int cli_remove_windows_user_path(const char *bin_dir, bool dry_run) {
+    wchar_t *wide_dir = cli_windows_utf8_to_wide(bin_dir);
+    HKEY environment = NULL;
+    if (!wide_dir || cli_windows_open_user_path_key(&environment) != CLI_OK) {
+        free(wide_dir);
+        return CLI_ERR;
+    }
+
+    DWORD type = REG_EXPAND_SZ;
+    DWORD bytes = 0;
+    LONG queried = RegQueryValueExW(environment, L"Path", NULL, &type, NULL, &bytes);
+    if (queried == ERROR_FILE_NOT_FOUND) {
+        /* No user PATH value at all — nothing of ours to remove. */
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_TRUE;
+    }
+    if (queried != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    size_t existing_capacity = (size_t)bytes / sizeof(wchar_t) + 1U;
+    wchar_t *existing = calloc(existing_capacity, sizeof(*existing));
+    if (!existing) {
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    DWORD read_bytes = bytes;
+    if (RegQueryValueExW(environment, L"Path", NULL, &type, (BYTE *)existing, &read_bytes) !=
+        ERROR_SUCCESS) {
+        RegCloseKey(environment);
+        free(existing);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    existing[existing_capacity - 1U] = L'\0';
+
+    /* Rebuild the value from every segment that is NOT our directory. Kept
+     * segments keep their exact original characters; a single ';' rejoins
+     * consecutive kept segments so unrelated entries survive byte-for-byte and
+     * no stray separator is left where our entry used to be. The result is
+     * never longer than the input, so the input length bounds the buffer. */
+    size_t existing_length = wcslen(existing);
+    wchar_t *rebuilt = calloc(existing_length + 1U, sizeof(*rebuilt));
+    if (!rebuilt) {
+        RegCloseKey(environment);
+        free(existing);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    size_t out = 0;
+    bool removed = false;
+    bool wrote_segment = false;
+    const wchar_t *cursor = existing;
+    while (*cursor) {
+        const wchar_t *separator = wcschr(cursor, L';');
+        size_t length = separator ? (size_t)(separator - cursor) : wcslen(cursor);
+        if (cli_windows_path_segment_equal(cursor, length, wide_dir)) {
+            removed = true;
+        } else {
+            if (wrote_segment) {
+                rebuilt[out++] = L';';
+            }
+            memcpy(rebuilt + out, cursor, length * sizeof(*rebuilt));
+            out += length;
+            wrote_segment = true;
+        }
+        cursor = separator ? separator + 1 : cursor + length;
+    }
+    rebuilt[out] = L'\0';
+
+    if (!removed) {
+        RegCloseKey(environment);
+        free(rebuilt);
+        free(existing);
+        free(wide_dir);
+        return CLI_TRUE;
+    }
+    if (dry_run) {
+        RegCloseKey(environment);
+        free(rebuilt);
+        free(existing);
+        free(wide_dir);
+        return CLI_OK;
+    }
+    DWORD output_bytes = (DWORD)((out + 1U) * sizeof(*rebuilt));
+    LONG stored =
+        RegSetValueExW(environment, L"Path", 0, type, (const BYTE *)rebuilt, output_bytes);
+    RegCloseKey(environment);
+    free(rebuilt);
+    free(existing);
+    free(wide_dir);
+    if (stored != ERROR_SUCCESS) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Thin seams so the hermetic Windows PATH unit test can drive the append and
+ * remove logic against a GUID-scoped scratch key (the CBM_TEST_WINDOWS_USER_
+ * PATH_RUN_ID seam) without touching the developer's live HKCU PATH. */
+int cbm_cli_ensure_windows_user_path_for_test(const char *bin_dir, bool dry_run) {
+    return cli_ensure_windows_user_path(bin_dir, dry_run);
+}
+int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run) {
+    return cli_remove_windows_user_path(bin_dir, dry_run);
+}
+#endif
+
 #endif
 
 /* ── Tar.gz / zip extraction (TEST-ONLY) ──────────────────────────
@@ -12080,6 +12201,43 @@ static int cli_uninstall_activate(void *opaque) {
                               "and index removal were not started\n");
         return CLI_ACTIVATION_PARTIAL;
     }
+
+#ifdef _WIN32
+    /* #2117: install registers the install directory in the persistent
+     * current-user PATH; uninstall must take it back out, or every cycle leaves
+     * a stale entry and the PATH grows without bound. Remove only our segment.
+     * A registry hiccup here is a warning, never a hard failure: the user is
+     * removing the tool and must not be blocked from finishing over a cosmetic
+     * PATH edit. Suppress the mutation under the test-ops seam exactly as
+     * install does, so the CLI suite never touches the developer's real PATH. */
+    if (activation->bin_path && activation->bin_path[0]) {
+        const char *slash = strrchr(activation->bin_path, '/');
+        const char *backslash = strrchr(activation->bin_path, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (slash && slash != activation->bin_path) {
+            size_t dir_len = (size_t)(slash - activation->bin_path);
+            char bin_dir[CLI_BUF_1K];
+            if (dir_len < sizeof(bin_dir)) {
+                memcpy(bin_dir, activation->bin_path, dir_len);
+                bin_dir[dir_len] = '\0';
+                int path_rc = cli_remove_windows_user_path(
+                    bin_dir, activation->dry_run || g_cli_activation_test_ops_set);
+                if (path_rc == CLI_OK) {
+                    printf(activation->dry_run ? "\nWould remove %s from the current-user PATH\n"
+                                               : "\nRemoved %s from the current-user PATH\n",
+                           bin_dir);
+                } else if (path_rc == CLI_ERR) {
+                    (void)fprintf(stderr,
+                                  "warning: could not update the current-user PATH; %s may "
+                                  "remain on it\n",
+                                  bin_dir);
+                }
+            }
+        }
+    }
+#endif
 
     if (activation->delete_indexes && !activation->dry_run) {
         int expected = count_db_indexes(activation->home);
