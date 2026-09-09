@@ -47,6 +47,25 @@ enum {
  * their behavior. */
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out);
 
+/* Measure logical regular-file bytes beneath path without following symlinks
+ * or Windows reparse points. Saturates at UINT64_MAX. */
+bool cbm_directory_size_bytes(const char *path, uint64_t *bytes_out);
+
+/* Return bytes available to the current process on the filesystem containing
+ * an existing path (statvfs / GetDiskFreeSpaceExW). */
+bool cbm_filesystem_free_bytes(const char *path, uint64_t *bytes_out);
+
+/* Sum a SQLite main file and its -wal/-shm/-journal sidecars when present.
+ * Missing artifacts contribute zero; inspection errors fail the measurement. */
+bool cbm_db_artifact_bytes(const char *db_path, uint64_t *bytes_out);
+
+/* Sum this indexing attempt's explicit worker log/response plus every regular
+ * sibling whose name starts with "<final-db-basename>.stage.". */
+bool cbm_index_task_temp_bytes(const char *final_db_path, const char *stage_token,
+                               const char *log_path, const char *response_path,
+                               uint64_t *bytes_out);
+bool cbm_index_staging_cleanup(const char *final_db_path, const char *stage_token);
+
 /* Open a directory for iteration. Returns NULL on error. */
 cbm_dir_t *cbm_opendir(const char *path);
 
