@@ -6247,6 +6247,123 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_companion_owners_are_distinct) {
+    CBMFileResult *r = extract("case class Rational private (n: Int, d: Int) {\n"
+                               "  lazy val isWhole: Boolean = d == 1\n"
+                               "  def reciprocal: Rational = Rational(d, n)\n"
+                               "}\n"
+                               "case object Rational {\n"
+                               "  val zero: Rational = Rational(0, 1)\n"
+                               "  def apply(n: Int, d: Int): Rational = new Rational(n, d)\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Rational.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational.reciprocal"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$.apply"));
+    /* Class-body vals keep their module-level QN like every other language;
+     * parent_class tells the two owners apart. */
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.isWhole"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.zero"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_trait_companion_and_standalone_object) {
+    CBMFileResult *r = extract("trait Codec {\n"
+                               "  def encode(s: String): Array[Byte]\n"
+                               "}\n"
+                               "object Codec {\n"
+                               "  def utf8: Codec = ???\n"
+                               "}\n"
+                               "object Registry {\n"
+                               "  def lookup(name: String): Option[Codec] = None\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Codec.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Trait companions collide just like class companions. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec.encode"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$.utf8"));
+    /* A standalone object has nothing to collide with and keeps its plain QN. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry"));
+    ASSERT_FALSE(has_def_qn(r, "t.Codec.Registry$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry.lookup"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Companion detection is answered per scope from a cache built on the first
+ * query in that scope, so the same name must be judged against its own
+ * scope's siblings only: `object Node` is a companion at the top level and
+ * standalone inside `Tree`, and a scope with no class at all (`Ops`) must not
+ * turn any of its objects into companions. A flat sealed hierarchy of many
+ * case classes and case objects in one scope is the shape that used to be
+ * quadratic; every object there must still be classified correctly. */
+TEST(extract_scala_companion_detection_is_scoped) {
+    CBMFileResult *r = extract("class Node(v: Int)\n"
+                               "object Node { def leaf: Node = new Node(0) }\n"
+                               "object Tree {\n"
+                               "  object Node { def root: Int = 0 }\n"
+                               "  class Leaf\n"
+                               "  object Leaf { def make: Leaf = new Leaf }\n"
+                               "}\n"
+                               "object Ops {\n"
+                               "  object Node { def count: Int = 1 }\n"
+                               "  object Leaf { def count: Int = 2 }\n"
+                               "}\n"
+                               "sealed trait Op\n"
+                               "case class Add(n: Int) extends Op\n"
+                               "case object Add extends Op\n"
+                               "case class Sub(n: Int) extends Op\n"
+                               "case object Neg extends Op\n"
+                               "case object Op { def all: Seq[Op] = Nil }\n",
+                               CBM_LANG_SCALA, "t", "Ast.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Node$.leaf"));
+    /* Inside `Tree` there is no class Node, so its `object Node` is standalone,
+     * while `Leaf` has a class sibling there. */
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Node"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Tree.Node$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Node.root"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Tree.Leaf$.make"));
+    /* `Ops` holds objects only; nothing there is a companion, whatever the
+     * neighbouring scopes declare. */
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Node"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Node$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Leaf"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Ops.Leaf$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Ops.Node.count"));
+    /* Sealed hierarchy in one scope: companions of a case class and of the
+     * sealed trait get `$`, a case object without a class sibling does not. */
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Add"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Add$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Sub"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Sub$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Neg"));
+    ASSERT_FALSE(has_def_qn(r, "t.Ast.Neg$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Ast.Op$.all"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_scala_import_selectors_and_aliases) {
     CBMFileResult *r = extract("import foo.Direct\n"
                                "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
@@ -8910,6 +9027,9 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_companion_owners_are_distinct);
+    RUN_TEST(extract_scala_trait_companion_and_standalone_object);
+    RUN_TEST(extract_scala_companion_detection_is_scoped);
     RUN_TEST(extract_scala_import_selectors_and_aliases);
     RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_scala_chained_package_clauses);

@@ -239,6 +239,14 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
 
+/* cbm_registry_add for a definition with a known declaring file. The one
+ * entry point the pipeline registers through: besides the plain add, a
+ * type-like `Foo$` declared in a Scala file is recorded as a companion owner,
+ * which is the only thing that lets the resolver read `Foo.m` as `Foo$.m`.
+ * `Foo$` from any other language is an ordinary name. */
+void cbm_registry_add_def(cbm_registry_t *r, const char *name, const char *qualified_name,
+                          const char *label, const char *file_path);
+
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
  * Returns result with qualified_name="" if unresolved.

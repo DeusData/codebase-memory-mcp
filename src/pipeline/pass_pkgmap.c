@@ -1932,15 +1932,20 @@ static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_
             return owner;
         }
         /* `import pkg.Owner.member`: the member must exist under the owner's
-         * QN. Binding the owner instead would mislabel the edge. */
-        char member_qn[CBM_SZ_512];
-        if (snprintf(member_qn, sizeof(member_qn), "%s.%s", owner->qualified_name,
-                     remainder + top_len + 1) >= (int)sizeof(member_qn)) {
-            return NULL;
-        }
-        const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
-        if (scoped && scoped->label && import_targetable_label(scoped->label)) {
-            return scoped;
+         * QN. Binding the owner instead would mislabel the edge. Only object
+         * members are importable, so when Owner has a companion the `Owner$`
+         * scope is tried before the class. */
+        static const char *const scopes[] = {"$", ""};
+        for (size_t si = 0; si < sizeof(scopes) / sizeof(scopes[0]); si++) {
+            char member_qn[CBM_SZ_512];
+            if (snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name, scopes[si],
+                         remainder + top_len + 1) >= (int)sizeof(member_qn)) {
+                return NULL;
+            }
+            const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+            if (scoped && scoped->label && import_targetable_label(scoped->label)) {
+                return scoped;
+            }
         }
         return NULL;
     }

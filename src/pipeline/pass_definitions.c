@@ -337,7 +337,8 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        cbm_registry_add_def(ctx->registry, def->name, def->qualified_name, def->label,
+                             def->file_path ? def->file_path : rel);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
