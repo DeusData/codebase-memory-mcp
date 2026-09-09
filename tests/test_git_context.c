@@ -232,10 +232,43 @@ TEST(canonical_root_linked_worktree) {
 #endif /* _WIN32 */
 }
 
+TEST(git_snapshot_reports_head_and_dirty_state_read_only) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git snapshot test not supported on Windows CI");
+#else
+    char *tmp = th_mktempdir("cbm_git_snapshot");
+    ASSERT_NOT_NULL(tmp);
+    if (make_git_repo(tmp) != 0) {
+        th_rmtree(tmp);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+
+    cbm_git_snapshot_t clean = {0};
+    ASSERT_EQ(cbm_git_snapshot_read(tmp, &clean), 0);
+    ASSERT_TRUE(clean.available);
+    ASSERT_NOT_NULL(clean.head_sha);
+    ASSERT_EQ(strlen(clean.head_sha), 40);
+    ASSERT_FALSE(clean.dirty);
+
+    ASSERT_EQ(th_write_file(TH_PATH(tmp, "untracked.c"), "int untracked;\n"), 0);
+    cbm_git_snapshot_t dirty = {0};
+    ASSERT_EQ(cbm_git_snapshot_read(tmp, &dirty), 0);
+    ASSERT_TRUE(dirty.available);
+    ASSERT_STR_EQ(dirty.head_sha, clean.head_sha);
+    ASSERT_TRUE(dirty.dirty);
+
+    cbm_git_snapshot_free(&dirty);
+    cbm_git_snapshot_free(&clean);
+    th_rmtree(tmp);
+    PASS();
+#endif
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
     RUN_TEST(canonical_root_repo_root);
     RUN_TEST(canonical_root_subdir);
     RUN_TEST(canonical_root_linked_worktree);
+    RUN_TEST(git_snapshot_reports_head_and_dirty_state_read_only);
 }
