@@ -19,9 +19,17 @@ typedef struct {
     char *base_sha;
 } cbm_git_context_t;
 
+typedef struct {
+    bool available;
+    bool dirty;
+    char *head_sha;
+} cbm_git_snapshot_t;
+
 int cbm_git_context_resolve(const char *path, cbm_git_context_t *out);
 void cbm_git_context_free(cbm_git_context_t *ctx);
 char *cbm_git_context_branch_qn(const char *project_name, const cbm_git_context_t *ctx);
 int cbm_git_context_props_json(const cbm_git_context_t *ctx, char *buf, int buf_size);
+int cbm_git_snapshot_read(const char *path, cbm_git_snapshot_t *out);
+void cbm_git_snapshot_free(cbm_git_snapshot_t *snapshot);
 
 #endif
