@@ -4148,12 +4148,12 @@ TEST(arkts_ts_compat) {
 TEST(extract_java_jaxrs_path_composition_issue1005) {
     CBMFileResult *r = extract("import jakarta.ws.rs.GET;\n"
                                "import jakarta.ws.rs.Path;\n"
-                               "@Path(\"/api/v1/widgets\")\n"
+                               "@Path(\"api/v1/widgets\")\n"
                                "public class WidgetResource {\n"
                                "  @GET\n"
                                "  public String list() { return \"\"; }\n"
                                "  @GET\n"
-                               "  @Path(\"/count\")\n"
+                               "  @Path(\"count\")\n"
                                "  public String count() { return \"\"; }\n"
                                "}\n",
                                CBM_LANG_JAVA, "t", "WidgetResource.java");
