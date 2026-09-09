@@ -17433,7 +17433,7 @@ static void *autoindex_thread(void *arg) {
 
     cbm_pipeline_free(p);
     cbm_kind_in_set_free_cache(); /* free THIS thread's extraction bitset cache (see above) */
-    cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
+    cbm_mem_collect();            /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
         cbm_log_info("autoindex.done", "project", srv->session_project);
