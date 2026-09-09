@@ -56,6 +56,17 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
     return 0;
 }
 
+static const CBMImport *find_import(CBMFileResult *r, const char *local, const char *path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local) == 0 &&
+            strcmp(imp->module_path, path) == 0) {
+            return imp;
+        }
+    }
+    return NULL;
+}
+
 /* Count definitions with a given label. */
 /* Check for a definition with the given qualified name. Distinct from
  * find_def_by_name, which returns the first match by NAME and so cannot tell two
@@ -5773,6 +5784,40 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+TEST(extract_scala_import_selectors_and_aliases) {
+    CBMFileResult *r = extract("import foo.Direct\n"
+                               "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
+                               "import modern.{Source as ModernAlias, *}\n"
+                               "import alpha.One, beta.Two\n",
+                               CBM_LANG_SCALA, "t", "Imports.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_import(r, "Direct", "foo.Direct"));
+    ASSERT_NOT_NULL(find_import(r, "Selected", "foo.Selected"));
+    ASSERT_NOT_NULL(find_import(r, "Alias", "foo.Original"));
+    ASSERT_NULL(find_import(r, "Hidden", "foo.Hidden"));
+    ASSERT_NOT_NULL(find_import(r, "*", "foo"));
+    ASSERT_NOT_NULL(find_import(r, "ModernAlias", "modern.Source"));
+    ASSERT_NOT_NULL(find_import(r, "*", "modern"));
+    ASSERT_NOT_NULL(find_import(r, "One", "alpha.One"));
+    ASSERT_NOT_NULL(find_import(r, "Two", "beta.Two"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_package_namespace) {
+    CBMFileResult *r = extract("package com.example.app.account\n"
+                               "import com.example.app.model.Target\n"
+                               "object Consumer\n",
+                               CBM_LANG_SCALA, "t", "modules/client/Consumer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app.account");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* this/super receivers keep the enclosing-class target, where a weak
  * namespace-proximity match is usually correct — so they are NOT flagged. A
  * new_expression has no member receiver and is never flagged either. */
@@ -8277,6 +8322,8 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_import_selectors_and_aliases);
+    RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
 
