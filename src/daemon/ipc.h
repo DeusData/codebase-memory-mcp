@@ -94,6 +94,13 @@ const char *cbm_daemon_ipc_validation_detail(void);
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* #1537: seed the detail so a test can prove the CLI refusal surfaces it. */
 void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail);
+#ifdef _WIN32
+/* #1705: run the daemon's directory-owner/ACE trust predicate against an
+ * arbitrary SID, so a test can assert THIS machine's built-in Administrator
+ * (RID-500) is trusted while a foreign S-1-5-21-*-500 is not. Returns false on
+ * any setup failure. Windows only. */
+bool cbm_daemon_ipc_win_sid_trusted_for_testing(void *sid);
+#endif
 #endif
 
 /* Create/validate an owner-only directory and securely open one regular

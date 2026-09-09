@@ -3377,6 +3377,7 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <ntsecapi.h>
 #include <fcntl.h>
 #include <io.h>
 #include <shlobj.h>
@@ -4034,16 +4035,120 @@ static bool win_sid_is_trusted_installer(const uint8_t *sid, size_t sid_length) 
     return true;
 }
 
+/* #1705: the built-in Administrator ACCOUNT of THIS machine — RID 500 under the
+ * local machine's own account-domain SID (S-1-5-21-<machine>-500) — is a
+ * legitimate owner/grantee of directories an elevated install created, even when
+ * that account has been renamed or is disabled. It is resolved by asking LSA for
+ * the local machine account-domain SID and synthesizing its RID-500 SID with
+ * CreateWellKnownSid, then compared with EqualSid.
+ *
+ * It is deliberately NOT tested with IsWellKnownSid(sid, WinAccountAdministratorSid)
+ * and NOT by matching a trailing RID of 500: BOTH of those accept ANY domain's
+ * -500 — a domain administrator, or another machine's built-in Administrator —
+ * which is exactly the cross-machine trust escalation this must never open. Only
+ * THIS machine's -500 is trusted.
+ *
+ * Resolved once per process and cached; any LSA or synthesis failure leaves the
+ * cache NULL and therefore grants NO tolerance at all (fail closed). advapi32 is
+ * reached through the already-loaded module handle in win_security_t and the
+ * function pointers are resolved dynamically, matching this file's SID-API style
+ * and adding no static import. */
+typedef NTSTATUS(NTAPI *lsa_open_policy_fn)(PLSA_UNICODE_STRING, PLSA_OBJECT_ATTRIBUTES, ACCESS_MASK,
+                                            PLSA_HANDLE);
+typedef NTSTATUS(NTAPI *lsa_query_information_policy_fn)(LSA_HANDLE, POLICY_INFORMATION_CLASS,
+                                                         PVOID *);
+typedef NTSTATUS(NTAPI *lsa_free_memory_fn)(PVOID);
+typedef NTSTATUS(NTAPI *lsa_close_fn)(LSA_HANDLE);
+typedef BOOL(WINAPI *create_well_known_sid_fn)(WELL_KNOWN_SID_TYPE, PSID, PSID, DWORD *);
+
+static INIT_ONCE g_local_admin_sid_once = INIT_ONCE_STATIC_INIT;
+static PSID g_local_admin_sid = NULL; /* process-lifetime cache; NULL => no tolerance */
+
+static BOOL CALLBACK win_resolve_local_admin_sid(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)context;
+    win_security_t *security = (win_security_t *)parameter;
+    if (!security || !security->advapi) {
+        return TRUE; /* ran once; cache stays NULL (fail closed) */
+    }
+    HMODULE advapi = security->advapi;
+    lsa_open_policy_fn lsa_open =
+        (lsa_open_policy_fn)(void (*)(void))GetProcAddress(advapi, "LsaOpenPolicy");
+    lsa_query_information_policy_fn lsa_query =
+        (lsa_query_information_policy_fn)(void (*)(void))GetProcAddress(advapi,
+                                                                        "LsaQueryInformationPolicy");
+    lsa_free_memory_fn lsa_free =
+        (lsa_free_memory_fn)(void (*)(void))GetProcAddress(advapi, "LsaFreeMemory");
+    lsa_close_fn lsa_close = (lsa_close_fn)(void (*)(void))GetProcAddress(advapi, "LsaClose");
+    create_well_known_sid_fn create_sid =
+        (create_well_known_sid_fn)(void (*)(void))GetProcAddress(advapi, "CreateWellKnownSid");
+    if (!lsa_open || !lsa_query || !lsa_free || !lsa_close || !create_sid) {
+        return TRUE;
+    }
+    LSA_OBJECT_ATTRIBUTES attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    LSA_HANDLE policy = NULL;
+    /* STATUS_SUCCESS is 0; any other status (including informational positives) is
+     * treated as failure, keeping the outcome fail-closed. */
+    if (lsa_open(NULL, &attributes, POLICY_VIEW_LOCAL_INFORMATION, &policy) != 0 || !policy) {
+        return TRUE;
+    }
+    POLICY_ACCOUNT_DOMAIN_INFO *domain = NULL;
+    if (lsa_query(policy, PolicyAccountDomainInformation, (PVOID *)&domain) == 0 && domain &&
+        domain->DomainSid && security->is_valid_sid(domain->DomainSid)) {
+        DWORD needed = 0;
+        (void)create_sid(WinAccountAdministratorSid, domain->DomainSid, NULL, &needed);
+        if (needed > 0U) {
+            PSID resolved = malloc(needed);
+            if (resolved &&
+                create_sid(WinAccountAdministratorSid, domain->DomainSid, resolved, &needed) &&
+                security->is_valid_sid(resolved)) {
+                g_local_admin_sid = resolved;
+            } else {
+                free(resolved);
+            }
+        }
+    }
+    if (domain) {
+        (void)lsa_free(domain);
+    }
+    (void)lsa_close(policy);
+    return TRUE;
+}
+
+static PSID win_local_admin_sid(win_security_t *security) {
+    if (!security || !security->advapi) {
+        return NULL;
+    }
+    (void)InitOnceExecuteOnce(&g_local_admin_sid_once, win_resolve_local_admin_sid, (PVOID)security,
+                              NULL);
+    return g_local_admin_sid;
+}
+
 static bool win_sid_trusted(win_security_t *security, PSID sid) {
     if (!security || !sid || !security->is_valid_sid(sid)) {
         return false;
     }
     DWORD sid_length = security->get_length_sid(sid);
+    PSID local_admin = win_local_admin_sid(security);
     return (sid_length > 0U && security->equal_sid(sid, security->user_sid)) ||
            security->is_well_known_sid(sid, WinLocalSystemSid) ||
            security->is_well_known_sid(sid, WinBuiltinAdministratorsSid) ||
+           (local_admin && security->equal_sid(sid, local_admin)) ||
            win_sid_is_trusted_installer((const uint8_t *)sid, (size_t)sid_length);
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_daemon_ipc_win_sid_trusted_for_testing(void *sid) {
+    win_security_t security;
+    if (!win_security_init(&security)) {
+        return false;
+    }
+    bool trusted = win_sid_trusted(&security, (PSID)sid);
+    win_security_destroy(&security);
+    return trusted;
+}
+#endif
 
 /* AppContainer identities: package SIDs (S-1-15-2-*) and capability SIDs
  * (S-1-15-3-*), under the APP_PACKAGE identifier authority (15).
