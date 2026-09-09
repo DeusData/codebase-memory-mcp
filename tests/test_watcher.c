@@ -147,6 +147,57 @@ TEST(watcher_null_safety) {
     PASS();
 }
 
+TEST(watcher_worktree_state_is_reproducible) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_state_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char path[300];
+        th_write_file(wt_path(path, sizeof(path), tmpdir, "file.txt"), "same\n");
+    }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    char commit_a[64] = {0};
+    char commit_b[64] = {0};
+    char clean_fingerprint[17] = {0};
+    char repeated_fingerprint[17] = {0};
+    bool dirty = true;
+    ASSERT_EQ(cbm_watcher_worktree_state(tmpdir, commit_a, sizeof(commit_a),
+                                         clean_fingerprint, &dirty),
+              0);
+    ASSERT_FALSE(dirty);
+    ASSERT_EQ(strlen(commit_a), 40);
+
+    ASSERT_EQ(cbm_watcher_worktree_state(tmpdir, commit_b, sizeof(commit_b),
+                                         repeated_fingerprint, &dirty),
+              0);
+    ASSERT_FALSE(dirty);
+    ASSERT_STR_EQ(commit_a, commit_b);
+    ASSERT_STR_EQ(clean_fingerprint, repeated_fingerprint);
+
+    {
+        char path[300];
+        th_write_file(wt_path(path, sizeof(path), tmpdir, "file.txt"), "edit\n");
+    }
+    char dirty_fingerprint[17] = {0};
+    ASSERT_EQ(cbm_watcher_worktree_state(tmpdir, commit_b, sizeof(commit_b),
+                                         dirty_fingerprint, &dirty),
+              0);
+    ASSERT_TRUE(dirty);
+    ASSERT_STR_EQ(commit_a, commit_b);
+    ASSERT_TRUE(strcmp(clean_fingerprint, dirty_fingerprint) != 0);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
 /* ══════════════════════════════════════════════════════════════════
  *  POLL WITH REAL GIT REPO
  * ══════════════════════════════════════════════════════════════════ */
@@ -158,6 +209,74 @@ static int index_callback(const char *name, const char *path, void *ud) {
     (void)path;
     (void)ud;
     index_call_count++;
+    return 0;
+}
+
+static int flaky_failures_remaining = 0;
+static int unwatch_index_callback(const char *name, const char *path, void *ud) {
+    (void)path;
+    cbm_watcher_t *w = *(cbm_watcher_t **)ud;
+    cbm_watcher_unwatch(w, name);
+    return 0;
+}
+
+TEST(watcher_unwatch_during_index) {
+    char tmpdir[] = "/tmp/cbm_watcher_unwatch_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    ASSERT_EQ(wt_git(tmpdir, "init -q"), 0);
+    char path[300];
+    th_write_file(wt_path(path, sizeof(path), tmpdir, "file.txt"), "hello\n");
+    ASSERT_EQ(wt_git(tmpdir, "add ."), 0);
+    ASSERT_EQ(wt_git(tmpdir, "commit -q -m init"), 0);
+    cbm_watcher_t *w = cbm_watcher_new(NULL, unwatch_index_callback, &w);
+    ASSERT_NOT_NULL(w);
+    cbm_watcher_watch(w, "temp-repo", tmpdir);
+    cbm_watcher_poll_once(w);
+    th_write_file(path, "changed\n");
+    cbm_watcher_touch(w, "temp-repo");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(cbm_watcher_watch_count(w), 0);
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    cbm_watcher_free(w);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_recovers_missing_root) {
+    char tmpdir[] = "/tmp/cbm_watcher_recover_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmpdir));
+    char repo[300];
+    wt_path(repo, sizeof(repo), tmpdir, "repo");
+    cbm_watcher_t *w = cbm_watcher_new(NULL, index_callback, NULL);
+    ASSERT_NOT_NULL(w);
+    cbm_watcher_watch(w, "temp-repo", repo);
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(wt_git(tmpdir, "init -q repo"), 0);
+    char path[340];
+    th_write_file(wt_path(path, sizeof(path), repo, "file.txt"), "hello\n");
+    ASSERT_EQ(wt_git(repo, "add ."), 0);
+    ASSERT_EQ(wt_git(repo, "commit -q -m init"), 0);
+    cbm_watcher_touch(w, "temp-repo");
+    cbm_watcher_poll_once(w);
+    th_write_file(path, "changed\n");
+    cbm_watcher_touch(w, "temp-repo");
+    index_call_count = 0;
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(index_call_count, 1);
+    cbm_watcher_free(w);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+static int flaky_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)path;
+    (void)ud;
+    index_call_count++;
+    if (flaky_failures_remaining > 0) {
+        flaky_failures_remaining--;
+        return -1;
+    }
     return 0;
 }
 
@@ -631,8 +750,8 @@ TEST(watcher_git_removed_no_crash) {
 }
 
 TEST(watcher_continued_dirty) {
-    /* If working tree stays dirty, each poll should re-trigger reindex.
-     * Port of repeated git sentinel detection behavior. */
+    /* A successfully indexed dirty fingerprint must not be indexed again
+     * until the worktree content or HEAD changes. */
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_cont_XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -664,7 +783,18 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 1);
 
-    /* Still dirty — should detect again */
+    /* Still dirty but unchanged — the successful fingerprint is committed. */
+    cbm_watcher_touch(w, "cont-repo");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* A second edit keeps the same porcelain status (" M file.txt") but
+     * changes the content hash, so it must trigger another index. */
+    {
+        char _p[1024];
+        snprintf(_p, sizeof(_p), "%s/file.txt", tmpdir);
+        th_append_file(_p, "dirty again\n");
+    }
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, 2);
@@ -687,6 +817,49 @@ TEST(watcher_continued_dirty) {
     cbm_watcher_touch(w, "cont-repo");
     cbm_watcher_poll_once(w);
     ASSERT_EQ(index_call_count, final_count); /* stable */
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(watcher_failed_callback_retries_same_fingerprint) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_retry_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    if (wt_git(tmpdir, "init -q") != 0) { th_rmtree(tmpdir); FAIL("git init failed"); }
+    { char p[300]; th_write_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "hello\n"); }
+    wt_git(tmpdir, "add file.txt");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, flaky_index_callback, NULL);
+    cbm_watcher_watch(w, "retry-repo", tmpdir);
+    index_call_count = 0;
+    flaky_failures_remaining = 1;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    {
+        char p[300];
+        th_append_file(wt_path(p, sizeof(p), tmpdir, "file.txt"), "dirty\n");
+    }
+
+    cbm_watcher_touch(w, "retry-repo");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* The failed callback must not commit the candidate fingerprint. */
+    cbm_watcher_touch(w, "retry-repo");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 1);
+    ASSERT_EQ(index_call_count, 2);
+
+    /* Success commits it; an unchanged dirty worktree is now a noop. */
+    cbm_watcher_touch(w, "retry-repo");
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(index_call_count, 2);
 
     cbm_watcher_free(w);
     cbm_store_close(store);
@@ -1492,6 +1665,8 @@ TEST(watcher_null_watch_count) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(watcher) {
+    RUN_TEST(watcher_unwatch_during_index);
+    RUN_TEST(watcher_recovers_missing_root);
     /* Adaptive interval */
     RUN_TEST(poll_interval_base);
     RUN_TEST(poll_interval_scaling);
@@ -1504,6 +1679,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_unwatch_nonexistent);
     RUN_TEST(watcher_watch_replace);
     RUN_TEST(watcher_null_safety);
+    RUN_TEST(watcher_worktree_state_is_reproducible);
 
     /* Polling */
     RUN_TEST(watcher_poll_no_projects);
@@ -1528,6 +1704,7 @@ SUITE(watcher) {
     /* Git removal + continued dirty + baseline dirty */
     RUN_TEST(watcher_git_removed_no_crash);
     RUN_TEST(watcher_continued_dirty);
+    RUN_TEST(watcher_failed_callback_retries_same_fingerprint);
     RUN_TEST(watcher_baseline_dirty_repo);
     RUN_TEST(watcher_unwatch_prunes_state);
     RUN_TEST(watcher_watch_after_unwatch);

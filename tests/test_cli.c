@@ -63,6 +63,20 @@ static void test_rmdir_r(const char *path) {
     th_rmtree(path);
 }
 
+static char *save_test_env(const char *name) {
+    const char *value = getenv(name);
+    return value ? strdup(value) : NULL;
+}
+
+static void restore_test_env(const char *name, char *saved) {
+    if (saved) {
+        cbm_setenv(name, saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv(name);
+    }
+}
+
 /* Helper: create tar.gz with a single file */
 static unsigned char *create_test_targz(const char *filename, const unsigned char *content,
                                         int content_len, int *out_len) {
@@ -554,7 +568,7 @@ TEST(cli_skill_files_content) {
 
     /* Exploring capabilities */
     ASSERT(strstr(sk[0].content, "search_graph") != NULL);
-    ASSERT(strstr(sk[0].content, "get_graph_schema") != NULL);
+    ASSERT(strstr(sk[0].content, "get_context") != NULL);
 
     /* Tracing capabilities */
     ASSERT(strstr(sk[0].content, "trace_path") != NULL);
@@ -568,7 +582,8 @@ TEST(cli_skill_files_content) {
     /* Reference capabilities */
     ASSERT(strstr(sk[0].content, "query_graph") != NULL);
     ASSERT(strstr(sk[0].content, "Cypher") != NULL);
-    ASSERT(strstr(sk[0].content, "14 MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "Default MCP Tools") != NULL);
+    ASSERT(strstr(sk[0].content, "explicit enablement") != NULL);
 
     /* Gotchas section */
     ASSERT(strstr(sk[0].content, "Gotchas") != NULL);
@@ -1501,9 +1516,9 @@ TEST(cli_detect_agents_finds_cursor_issue222) {
     PASS();
 }
 
-/* issue #388: `install --plan` must emit a machine-readable receipt of planned
- * writes WITHOUT mutating any config (the pre-mutation trust primitive). */
-TEST(cli_install_plan_receipt_no_mutation_issue388) {
+/* `install --plan` must target one explicitly selected client, advertise its
+ * non-destructive guarantees, and omit hooks/instructions unless requested. */
+TEST(cli_install_plan_targets_one_client_safely) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-plan-XXXXXX");
     if (!cbm_mkdtemp(tmpdir))
@@ -1516,14 +1531,22 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
     test_mkdirp(dir);
 
-    char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
+    char *json = cbm_build_install_plan_json_for_client(
+        tmpdir, "/usr/local/bin/codebase-memory-mcp", "cursor", false, false);
     ASSERT_NOT_NULL(json);
     ASSERT(strstr(json, "agent.install.plan.v1") != NULL);
     ASSERT(strstr(json, "writes_started") != NULL);
     ASSERT(strstr(json, "next_safe_command") != NULL);
-    ASSERT(strstr(json, "cursor") != NULL);
+    ASSERT(strstr(json, "\"client\": \"cursor\"") != NULL);
+    ASSERT(strstr(json, "\"deletes_indexes\": false") != NULL);
+    ASSERT(strstr(json, "\"stops_processes\": false") != NULL);
+    ASSERT(strstr(json, "install --client cursor") != NULL);
+    ASSERT(strstr(json, "install -y") == NULL);
     ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
-    ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    ASSERT(strstr(json, ".codex/config.toml") == NULL);
+    ASSERT(strstr(json, ".codex/AGENTS.md") == NULL);
+    ASSERT(strstr(json, "\"instruction_files_planned\": []") != NULL);
+    ASSERT(strstr(json, "\"hooks_planned\": []") != NULL);
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
@@ -1535,6 +1558,129 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
     ASSERT(stat(cfg, &st) != 0); /* must not exist */
 
     test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_plan_extensions_are_opt_in) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-plan-opts-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
+    test_mkdirp(dir);
+    snprintf(dir, sizeof(dir), "%s/.cursor", tmpdir);
+    test_mkdirp(dir);
+
+    char *json = cbm_build_install_plan_json_for_client(
+        tmpdir, "/usr/local/bin/codebase-memory-mcp", "codex", true, true);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"client\": \"codex\"") != NULL);
+    ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    ASSERT(strstr(json, ".codex/AGENTS.md") != NULL);
+    ASSERT(strstr(json, "\"hooks_planned\": []") == NULL);
+    ASSERT(strstr(json, ".cursor/mcp.json") == NULL);
+    ASSERT(strstr(json, "install --client codex --with-hooks --with-instructions") != NULL);
+    free(json);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_plan_all_is_explicit) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-plan-all-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/.codex", tmpdir);
+    test_mkdirp(dir);
+    snprintf(dir, sizeof(dir), "%s/.cursor", tmpdir);
+    test_mkdirp(dir);
+
+    char *json = cbm_build_install_plan_json_for_client(
+        tmpdir, "/usr/local/bin/codebase-memory-mcp", "all", false, false);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"client\": \"all\"") != NULL);
+    ASSERT(strstr(json, ".codex/config.toml") != NULL);
+    ASSERT(strstr(json, ".cursor/mcp.json") != NULL);
+    free(json);
+
+    ASSERT_NULL(cbm_build_install_plan_json_for_client(
+        tmpdir, "/usr/local/bin/codebase-memory-mcp", NULL, false, false));
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
+TEST(cli_install_command_requires_client) {
+    char *plan_argv[] = {"--plan"};
+    ASSERT(cbm_cmd_install(1, plan_argv) != 0);
+
+    char *missing_value_argv[] = {"--client"};
+    ASSERT(cbm_cmd_install(1, missing_value_argv) != 0);
+
+    char *unknown_argv[] = {"--client", "unknown-client"};
+    ASSERT(cbm_cmd_install(2, unknown_argv) != 0);
+    PASS();
+}
+
+TEST(cli_install_command_preserves_indexes_and_targets_client) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-install-safe-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/.codex", tmpdir);
+    test_mkdirp(path);
+    snprintf(path, sizeof(path), "%s/.cursor", tmpdir);
+    test_mkdirp(path);
+
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    test_mkdirp(cache_dir);
+    char index_path[512];
+    snprintf(index_path, sizeof(index_path), "%s/existing-project.db", cache_dir);
+    ASSERT_EQ(write_test_file(index_path, "sentinel-index"), 0);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_cache = save_test_env("CBM_CACHE_DIR");
+    char *saved_shell = save_test_env("SHELL");
+    char *saved_claude_config = save_test_env("CLAUDE_CONFIG_DIR");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    cbm_setenv("SHELL", "/bin/sh", 1);
+    cbm_unsetenv("CLAUDE_CONFIG_DIR");
+
+    char *argv[] = {"--client", "codex"};
+    int rc = cbm_cmd_install(2, argv);
+
+    struct stat st;
+    bool index_survived = stat(index_path, &st) == 0;
+    snprintf(path, sizeof(path), "%s/.codex/config.toml", tmpdir);
+    bool codex_written = stat(path, &st) == 0;
+    const char *codex_config = codex_written ? read_test_file(path) : NULL;
+    bool hooks_absent = !codex_config || strstr(codex_config, "hooks.SessionStart") == NULL;
+    snprintf(path, sizeof(path), "%s/.codex/AGENTS.md", tmpdir);
+    bool instructions_absent = stat(path, &st) != 0;
+    snprintf(path, sizeof(path), "%s/.cursor/mcp.json", tmpdir);
+    bool cursor_untouched = stat(path, &st) != 0;
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("CBM_CACHE_DIR", saved_cache);
+    restore_test_env("SHELL", saved_shell);
+    restore_test_env("CLAUDE_CONFIG_DIR", saved_claude_config);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(index_survived);
+    ASSERT_TRUE(codex_written);
+    ASSERT_TRUE(hooks_absent);
+    ASSERT_TRUE(instructions_absent);
+    ASSERT_TRUE(cursor_untouched);
     PASS();
 }
 
@@ -2668,7 +2814,11 @@ SUITE(cli) {
     RUN_TEST(cli_detect_agents_finds_claude_via_env);
     RUN_TEST(cli_detect_agents_finds_codex);
     RUN_TEST(cli_detect_agents_finds_cursor_issue222);
-    RUN_TEST(cli_install_plan_receipt_no_mutation_issue388);
+    RUN_TEST(cli_install_plan_targets_one_client_safely);
+    RUN_TEST(cli_install_plan_extensions_are_opt_in);
+    RUN_TEST(cli_install_plan_all_is_explicit);
+    RUN_TEST(cli_install_command_requires_client);
+    RUN_TEST(cli_install_command_preserves_indexes_and_targets_client);
     RUN_TEST(cli_codex_session_hook_issue330);
     RUN_TEST(cli_gemini_session_hook_parity);
     RUN_TEST(cli_detect_agents_finds_gemini);

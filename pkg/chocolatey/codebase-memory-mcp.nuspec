@@ -13,19 +13,16 @@
     <tags>mcp ai claude code-intelligence codebase developer-tools tree-sitter llm</tags>
     <summary>Fast code intelligence engine for AI coding agents</summary>
     <description>
-codebase-memory-mcp is a single static binary MCP server that indexes codebases at
-extreme speed and exposes 14 MCP tools for AI coding agents.
-
-Full indexes an average repository in milliseconds, the Linux kernel (28M LOC) in
-3 minutes. Answers structural queries in under 1ms. Supports 159 languages via
-vendored tree-sitter grammars. Zero dependencies. Plug and play across 11 coding
-agents including Claude Code, Codex CLI, Gemini CLI, and Zed.
+codebase-memory-mcp is a preview local code-intelligence MCP server for coding
+agents. It indexes the current worktree and returns focused, reproducible
+structural evidence. Language quality is tiered, and performance claims are
+published only with versioned benchmark artifacts.
 
 After installation, run:
 
-    codebase-memory-mcp install
+    codebase-memory-mcp install --client codex
 
-to configure your coding agents automatically.
+to configure only the explicitly selected MCP client.
     </description>
     <releaseNotes>https://github.com/DeusData/codebase-memory-mcp/releases/tag/v0.8.1</releaseNotes>
   </metadata>

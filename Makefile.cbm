@@ -131,13 +131,13 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/lang_specs.c \
     $(CBM_DIR)/service_patterns.c
 
-# LSP resolvers (compiled as one unit via lsp_all.c)
-LSP_SRCS = $(CBM_DIR)/lsp_all.c
+# Static resolvers (legacy source filename retained for compatibility)
+STATIC_RESOLVER_SRCS = $(CBM_DIR)/lsp_all.c
 
 # Tree-sitter runtime
 TS_RUNTIME_SRC = $(CBM_DIR)/ts_runtime.c
 
-# All 64 grammar shim files
+# All currently registered grammar shim files
 GRAMMAR_SRCS = $(wildcard $(CBM_DIR)/grammar_*.c)
 
 # LZ4 + Aho-Corasick
@@ -174,6 +174,7 @@ GRAPH_BUFFER_SRCS = src/graph_buffer/graph_buffer.c
 # Pipeline module (new)
 PIPELINE_SRCS = \
     src/pipeline/fqn.c \
+    src/pipeline/content_hash.c \
     src/pipeline/path_alias.c \
     src/pipeline/registry.c \
     src/pipeline/pipeline.c \
@@ -221,11 +222,10 @@ WATCHER_SRCS = src/watcher/watcher.c
 # CLI module (new)
 CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c
 
-# UI module (graph visualization)
+# UI module (authenticated diagnostic dashboard)
 UI_SRCS = \
     src/ui/config.c \
     src/ui/http_server.c \
-    src/ui/layout3d.c \
     src/ui/httpd.c \
     src/ui/embedded_stub.c
 
@@ -279,7 +279,7 @@ YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
 PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
-EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
+EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(STATIC_RESOLVER_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
 # ── Test sources ─────────────────────────────────────────────────
@@ -384,6 +384,7 @@ TEST_SIMHASH_SRCS = tests/test_simhash.c
 TEST_STACK_OVERFLOW_SRCS = tests/test_stack_overflow.c
 
 ALL_TEST_SRCS = $(TEST_FOUNDATION_SRCS) $(TEST_EXTRACTION_SRCS) $(TEST_STORE_SRCS) $(TEST_CYPHER_SRCS) $(TEST_MCP_SRCS) $(TEST_DISCOVER_SRCS) $(TEST_GRAPH_BUFFER_SRCS) $(TEST_PIPELINE_SRCS) $(TEST_WATCHER_SRCS) $(TEST_LZ4_SRCS) $(TEST_ZSTD_SRCS) $(TEST_ARTIFACT_SRCS) $(TEST_SQLITE_WRITER_SRCS) $(TEST_GO_LSP_SRCS) $(TEST_C_LSP_SRCS) $(TEST_PHP_LSP_SRCS) $(TEST_CS_LSP_SRCS) $(TEST_CS_LSP_BENCH_SRCS) $(TEST_SCOPE_SRCS) $(TEST_TYPE_REP_SRCS) $(TEST_PY_LSP_SRCS) $(TEST_PY_LSP_BENCH_SRCS) $(TEST_PY_LSP_STRESS_SRCS) $(TEST_PY_LSP_SCALE_SRCS) $(TEST_TS_LSP_SRCS) $(TEST_JAVA_LSP_SRCS) $(TEST_KOTLIN_LSP_SRCS) $(TEST_RUST_LSP_SRCS) $(TEST_TRACES_SRCS) $(TEST_CLI_SRCS) $(TEST_MEM_SRCS) $(TEST_UI_SRCS) $(TEST_HTTPD_SRCS) $(TEST_SECURITY_SRCS) $(TEST_YAML_SRCS) $(TEST_SIMHASH_SRCS) $(TEST_STACK_OVERFLOW_SRCS) $(TEST_INTEGRATION_SRCS)
+TEST_HEADERS = $(wildcard tests/*.h src/*.h src/**/*.h $(CBM_DIR)/*.h)
 
 
 # ── Build directories ────────────────────────────────────────────
@@ -398,8 +399,9 @@ GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_I
                       $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -fsanitize=thread -fno-omit-frame-pointer
+DEPFLAGS = -MMD -MP
 
-# Object files for grammars + ts_runtime + lsp_all + preprocessor
+# Object files for grammars + tree-sitter runtime + static resolvers + preprocessor
 GRAMMAR_OBJS_TEST = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/%.o,$(GRAMMAR_SRCS))
 TS_RUNTIME_OBJ_TEST = $(BUILD_DIR)/ts_runtime.o
 LSP_OBJ_TEST = $(BUILD_DIR)/lsp_all.o
@@ -407,7 +409,17 @@ PP_OBJ_TEST = $(BUILD_DIR)/preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security
+.PHONY: test test-foundation test-tsan cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-cppcheck lint-format security product-manifest-check
+
+PRODUCT_MANIFEST = product-manifest.json
+PRODUCT_GENERATOR = scripts/generate-product-surfaces.py
+PRODUCT_HEADER = src/product_manifest_generated.h
+
+$(PRODUCT_HEADER): $(PRODUCT_MANIFEST) $(PRODUCT_GENERATOR)
+	python3 $(PRODUCT_GENERATOR)
+
+product-manifest-check:
+	python3 $(PRODUCT_GENERATOR) --check
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -420,19 +432,19 @@ $(BUILD_DIR)/test-foundation: $(TEST_FOUNDATION_SRCS) $(FOUNDATION_SRCS) | $(BUI
 test-foundation: $(BUILD_DIR)/test-foundation
 	cd $(CURDIR) && $(BUILD_DIR)/test-foundation
 
-# ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
+# ── Grammar/tree-sitter/static-resolver objects (relaxed warnings) ─
 
 $(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 $(BUILD_DIR)/ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 $(BUILD_DIR)/lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS_TEST) $(SANITIZE) $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
+	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 # ── Full test binary ─────────────────────────────────────────────
 
@@ -489,7 +501,7 @@ $(UNIXCODER_OBJ): $(UNIXCODER_BLOB_SRC) vendored/nomic/code_vectors.bin | $(BUIL
 
 OBJS_VENDORED_TEST = $(MIMALLOC_OBJ_TEST) $(SQLITE3_OBJ_TEST) $(TRE_OBJ_TEST) $(GRAMMAR_OBJS_TEST) $(TS_RUNTIME_OBJ_TEST) $(LSP_OBJ_TEST) $(PP_OBJ_TEST) $(LZ4_OBJ_TEST) $(ZSTD_OBJ_TEST) $(UNIXCODER_OBJ)
 
-$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
+$(BUILD_DIR)/test-runner: $(ALL_TEST_SRCS) $(TEST_HEADERS) $(PRODUCT_HEADER) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_TEST) -o $@ \
 		$(ALL_TEST_SRCS) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
@@ -506,23 +518,29 @@ test-tsan:
 
 # ── Production binary ────────────────────────────────────────────
 
-# Grammar/TS/LSP objects for production (compiled with relaxed warnings, -O2)
+# Grammar/tree-sitter/static-resolver objects for production (relaxed warnings, -O2)
 GRAMMAR_OBJS_PROD = $(patsubst $(CBM_DIR)/%.c,$(BUILD_DIR)/prod_%.o,$(GRAMMAR_SRCS))
 TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 
 $(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS) $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 $(BUILD_DIR)/prod_ts_runtime.o: $(CBM_DIR)/ts_runtime.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS) $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 $(BUILD_DIR)/prod_lsp_all.o: $(CBM_DIR)/lsp_all.c | $(BUILD_DIR)
-	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
+	$(CC) $(GRAMMAR_CFLAGS) $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
 
 $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
-	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored -c -o $@ $<
+	$(CXX) $(CXXFLAGS_PROD) -w -I$(CBM_DIR)/vendored $(DEPFLAGS) -MF $(@:.o=.d) -c -o $@ $<
+
+VENDORED_DEPS = $(GRAMMAR_OBJS_TEST:.o=.d) $(TS_RUNTIME_OBJ_TEST:.o=.d) \
+                $(LSP_OBJ_TEST:.o=.d) $(PP_OBJ_TEST:.o=.d) \
+                $(GRAMMAR_OBJS_PROD:.o=.d) $(TS_RUNTIME_OBJ_PROD:.o=.d) \
+                $(LSP_OBJ_PROD:.o=.d) $(PP_OBJ_PROD:.o=.d)
+-include $(VENDORED_DEPS)
 
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
@@ -540,7 +558,7 @@ OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(
 
 MAIN_SRC = src/main.c
 
-$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
+$(BUILD_DIR)/codebase-memory-mcp: $(MAIN_SRC) $(PRODUCT_HEADER) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_PROD) | $(BUILD_DIR)
 	$(CC) $(CFLAGS_PROD) -o $@ \
 		$(MAIN_SRC) $(PROD_SRCS) \
 		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \

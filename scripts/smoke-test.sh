@@ -11,6 +11,9 @@ set -euo pipefail
 
 BINARY="${1:?usage: smoke-test.sh <binary-path>}"
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+# The smoke suite intentionally exercises optional Cypher/schema/admin tools.
+# Production defaults remain the nine core tools.
+export CBM_MCP_TOOLSETS="core,advanced,admin"
 TMPDIR=$(mktemp -d)
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
@@ -563,7 +566,7 @@ echo "=== Phase 6: CLI subcommands ==="
 
 # 6a: install --dry-run -y
 echo "--- Phase 6a: install --dry-run ---"
-INSTALL_OUT=$("$BINARY" install --dry-run -y 2>&1)
+INSTALL_OUT=$("$BINARY" install --client all --dry-run -y 2>&1)
 if ! echo "$INSTALL_OUT" | grep -qi 'install\|skill\|mcp\|agent'; then
   echo "FAIL: install --dry-run produced unexpected output"
   echo "$INSTALL_OUT"
@@ -754,7 +757,7 @@ HOME="$FAKE_HOME" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
   PATH="$FAKE_HOME/.local/bin:$PATH" \
-  "$BINARY" install -y 2>&1 || true
+  "$BINARY" install --client all --with-hooks --with-instructions -y 2>&1
 
 # Helper for JSON validation (pipe file to python — avoids MSYS2 path translation issues)
 json_get() { cat "$1" 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print($2)" 2>/dev/null || echo ""; }
@@ -1115,7 +1118,7 @@ echo "--- Phase 9b: adversarial install/uninstall tests ---"
 # completes without crash and prints "Detected agents:" line.
 EMPTY_HOME=$(mktemp -d)
 mkdir -p "$EMPTY_HOME/.local/bin"
-INSTALL_OUT=$(HOME="$EMPTY_HOME" "$BINARY" install -y 2>&1) || true
+INSTALL_OUT=$(HOME="$EMPTY_HOME" "$BINARY" install --client all -y 2>&1) || true
 if ! echo "$INSTALL_OUT" | grep -qi 'detected agents'; then
   echo "FAIL 9b-1: install output missing 'Detected agents' line"
   exit 1
@@ -1127,8 +1130,8 @@ rm -rf "$EMPTY_HOME"
 IDEM_HOME=$(mktemp -d)
 mkdir -p "$IDEM_HOME/.claude" "$IDEM_HOME/.local/bin"
 cp "$BINARY" "$IDEM_HOME/.local/bin/codebase-memory-mcp"
-HOME="$IDEM_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
-HOME="$IDEM_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
+HOME="$IDEM_HOME" "$BINARY" install --client all -y 2>&1 > /dev/null || true
+HOME="$IDEM_HOME" "$BINARY" install --client all -y 2>&1 > /dev/null || true
 # Count MCP entries — should be exactly 1
 COUNT=$(cat "$IDEM_HOME/.claude.json" 2>/dev/null | python3 -c "
 import json, sys
@@ -1154,7 +1157,7 @@ CORRUPT_HOME=$(mktemp -d)
 mkdir -p "$CORRUPT_HOME/.claude" "$CORRUPT_HOME/.local/bin"
 cp "$BINARY" "$CORRUPT_HOME/.local/bin/codebase-memory-mcp"
 echo '{invalid json here' > "$CORRUPT_HOME/.claude.json"
-HOME="$CORRUPT_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
+HOME="$CORRUPT_HOME" "$BINARY" install --client all -y 2>&1 > /dev/null || true
 # Should either fix it or handle gracefully — not crash
 echo "OK 9b-4: install over corrupt JSON doesn't crash"
 rm -rf "$CORRUPT_HOME"
@@ -1163,7 +1166,7 @@ rm -rf "$CORRUPT_HOME"
 DBL_HOME=$(mktemp -d)
 mkdir -p "$DBL_HOME/.claude" "$DBL_HOME/.local/bin"
 cp "$BINARY" "$DBL_HOME/.local/bin/codebase-memory-mcp"
-HOME="$DBL_HOME" "$BINARY" install -y 2>&1 > /dev/null || true
+HOME="$DBL_HOME" "$BINARY" install --client all -y 2>&1 > /dev/null || true
 HOME="$DBL_HOME" "$BINARY" uninstall -y -n 2>&1 > /dev/null || true
 HOME="$DBL_HOME" "$BINARY" uninstall -y -n 2>&1 > /dev/null || true
 echo "OK 9b-8: double uninstall doesn't crash"

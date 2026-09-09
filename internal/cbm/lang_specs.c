@@ -66,7 +66,6 @@ extern const TSLanguage *tree_sitter_glsl(void);
 extern const TSLanguage *tree_sitter_ini(void);
 // Scientific/math languages
 extern const TSLanguage *tree_sitter_matlab(void);
-extern const TSLanguage *tree_sitter_lean(void);
 extern const TSLanguage *tree_sitter_form(void);
 extern const TSLanguage *tree_sitter_magma(void);
 extern const TSLanguage *tree_sitter_wolfram(void);
@@ -131,7 +130,6 @@ extern const TSLanguage *tree_sitter_csv(void);
 extern const TSLanguage *tree_sitter_requirements(void);
 extern const TSLanguage *tree_sitter_hlsl(void);
 extern const TSLanguage *tree_sitter_vhdl(void);
-extern const TSLanguage *tree_sitter_systemverilog(void);
 extern const TSLanguage *tree_sitter_devicetree(void);
 extern const TSLanguage *tree_sitter_linkerscript(void);
 extern const TSLanguage *tree_sitter_gn(void);
@@ -907,14 +905,6 @@ static const char *matlab_branch_types[] = {"if_statement",     "for_statement",
                                             "switch_statement", "try_statement", NULL};
 static const char *matlab_var_types[] = {"assignment", NULL};
 
-// ==================== LEAN ====================
-static const char *lean_func_types[] = {"def", "theorem", "instance", "abbrev", NULL};
-static const char *lean_class_types[] = {"structure", "class_inductive", "inductive", NULL};
-static const char *lean_module_types[] = {"module", NULL};
-static const char *lean_call_types[] = {"apply", "command", NULL};
-static const char *lean_import_types[] = {"import", "extends", "instance", NULL};
-static const char *lean_branch_types[] = {"if", "match", "do", NULL};
-
 // ==================== FORM ====================
 static const char *form_func_types[] = {"procedure_definition", NULL};
 static const char *form_module_types[] = {"source_file", NULL};
@@ -1368,24 +1358,6 @@ static const char *vhdl_var_types[] = {"variable_declaration", "signal_declarati
 static const char *vhdl_assign_types[] = {"variable_assignment", "signal_assignment", NULL};
 static const char *vhdl_func_types[] = {"subprogram_declaration", "subprogram_definition", NULL};
 static const char *vhdl_module_types[] = {"design_file", NULL};
-static const char *systemverilog_func_types[] = {"function_declaration", "task_declaration",
-                                                 "function_body_declaration", "function_statement",
-                                                 NULL};
-static const char *systemverilog_class_types[] = {"class_declaration",
-                                                  "module_declaration",
-                                                  "interface_declaration",
-                                                  "library_declaration",
-                                                  "package_declaration",
-                                                  "type_declaration",
-                                                  NULL};
-static const char *systemverilog_call_types[] = {"function_subroutine_call", "system_tf_call",
-                                                 "method_call", NULL};
-static const char *systemverilog_import_types[] = {
-    "package_import_declaration", "extends",  "import",     "include",
-    "include_statement",          "instance", "use_clause", NULL};
-static const char *systemverilog_branch_types[] = {"case_statement", "if", NULL};
-static const char *systemverilog_var_types[] = {"parameter", "localparam", NULL};
-static const char *systemverilog_module_types[] = {"source_file", NULL};
 static const char *devicetree_call_types[] = {"call_expression", NULL};
 static const char *devicetree_import_types[] = {"dtsi_include", "preproc_include", NULL};
 static const char *devicetree_module_types[] = {"document", NULL};
@@ -1941,11 +1913,8 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                          matlab_branch_types, matlab_var_types, matlab_var_types, empty_types, NULL,
                          empty_types, NULL, NULL, tree_sitter_matlab, NULL},
 
-    // CBM_LANG_LEAN
-    [CBM_LANG_LEAN] = {CBM_LANG_LEAN, lean_func_types, lean_class_types, empty_types,
-                       lean_module_types, lean_call_types, lean_import_types, empty_types,
-                       lean_branch_types, empty_types, empty_types, empty_types, NULL, empty_types,
-                       NULL, NULL, tree_sitter_lean, NULL},
+    /* Compatibility tombstone: Lean parser support was removed. */
+    [CBM_LANG_LEAN] = {0},
 
     // CBM_LANG_FORM
     [CBM_LANG_FORM] = {CBM_LANG_FORM, form_func_types, empty_types, empty_types, form_module_types,
@@ -2326,13 +2295,8 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                        vhdl_branch_types, vhdl_var_types, vhdl_assign_types, empty_types, NULL,
                        empty_types, NULL, NULL, tree_sitter_vhdl, NULL},
 
-    // CBM_LANG_SYSTEMVERILOG
-    [CBM_LANG_SYSTEMVERILOG] = {CBM_LANG_SYSTEMVERILOG, systemverilog_func_types,
-                                systemverilog_class_types, empty_types, systemverilog_module_types,
-                                systemverilog_call_types, systemverilog_import_types, empty_types,
-                                systemverilog_branch_types, systemverilog_var_types, empty_types,
-                                empty_types, NULL, empty_types, NULL, NULL,
-                                tree_sitter_systemverilog, NULL},
+    /* Compatibility tombstone: dedicated SystemVerilog parser support was removed. */
+    [CBM_LANG_SYSTEMVERILOG] = {0},
 
     // CBM_LANG_DEVICETREE
     [CBM_LANG_DEVICETREE] = {CBM_LANG_DEVICETREE, empty_types, empty_types, empty_types,

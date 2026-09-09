@@ -17,9 +17,5 @@ Install-ChocolateyZipPackage `
 $binPath = Join-Path $installDir 'codebase-memory-mcp.exe'
 Install-BinFile -Name 'codebase-memory-mcp' -Path $binPath
 
-# Configure coding agents (non-fatal)
-try {
-  & $binPath install -y 2>&1 | Out-Null
-} catch {
-  Write-Warning "Agent configuration failed (non-fatal). Run manually: codebase-memory-mcp install"
-}
+Write-Host 'Register one MCP client explicitly after installation:'
+Write-Host '  codebase-memory-mcp install --client codex'

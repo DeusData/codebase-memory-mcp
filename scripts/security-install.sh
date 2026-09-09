@@ -30,10 +30,10 @@ FAIL=0
 
 # ── 1. Run install and capture written files ─────────────────────
 
-echo "--- Running install -y ---"
+echo "--- Running install --client all -y ---"
 
 # Run install (non-interactive with -y flag)
-"$BINARY" install -y > "$TMPDIR/install_output.txt" 2>&1 || true
+"$BINARY" install --client all -y > "$TMPDIR/install_output.txt" 2>&1 || true
 
 echo "Install output:"
 cat "$TMPDIR/install_output.txt"

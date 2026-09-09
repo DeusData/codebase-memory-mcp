@@ -35,4 +35,8 @@ echo "==> assertions"
 printf '%s' "${OUT}" | grep -q '"result"'     || { echo "FAIL: no JSON-RPC result (server did not respond)"; exit 1; }
 printf '%s' "${OUT}" | grep -q 'search_graph' || { echo "FAIL: tools/list missing expected tool 'search_graph'"; exit 1; }
 COUNT="$(printf '%s' "${OUT}" | grep -o '"name"' | wc -l | tr -d ' ')"
-echo "PASS: server started and introspected; ~${COUNT} name entries (>=14 tools expected)"
+if [ "${COUNT}" -lt 9 ]; then
+  echo "FAIL: default tools/list exposed fewer than 9 core tools"
+  exit 1
+fi
+echo "PASS: server started and introspected; ${COUNT} core tool entries"

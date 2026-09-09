@@ -98,6 +98,43 @@ TEST(sw_minimal_data) {
     ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "/tmp/test");
     sqlite3_finalize(stmt);
 
+    /* Schema-v2 identity, provenance, and freshness metadata. */
+    sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 2);
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(
+        db,
+        "SELECT symbol_id, language, signature, origin, confidence FROM nodes WHERE id=2", -1,
+        &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_NOT_NULL(sqlite3_column_text(stmt, 0));
+    ASSERT_EQ((int)strlen((const char *)sqlite3_column_text(stmt, 0)), CBM_SYMBOL_ID_HEX_LEN);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), CBM_ORIGIN_TREE_SITTER);
+    ASSERT_FLOAT_EQ(sqlite3_column_double(stmt, 4), 1.0, 0.0001);
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db,
+                       "SELECT generation, commit_hash, dirty_fingerprint, "
+                       "structural_indexed_at, derived_indexed_at FROM projects",
+                       -1, &stmt, NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int64(stmt, 0), 1);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 1), "");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 3), "2026-03-14T00:00:00Z");
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 4), "");
+    sqlite3_finalize(stmt);
+
+    sqlite3_prepare_v2(db, "SELECT origin, confidence, evidence FROM edges WHERE id=1", -1, &stmt,
+                       NULL);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 0), CBM_ORIGIN_TREE_SITTER);
+    ASSERT_FLOAT_EQ(sqlite3_column_double(stmt, 1), 1.0, 0.0001);
+    ASSERT_STR_EQ((const char *)sqlite3_column_text(stmt, 2), "{}");
+    sqlite3_finalize(stmt);
+
     /* Node content: check node 2 */
     sqlite3_prepare_v2(db, "SELECT qualified_name, label FROM nodes WHERE id=2", -1, &stmt, NULL);
     rc = sqlite3_step(stmt);

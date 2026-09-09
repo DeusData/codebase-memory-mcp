@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdatomic.h>
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -364,6 +365,155 @@ static void th_server_stop(th_server_t *ts) {
     cbm_http_server_free(ts->srv);
 }
 
+static void th_token_query(const th_server_t *ts, char *buf, size_t bufsz) {
+    snprintf(buf, bufsz, "token=%s", cbm_http_server_token(ts->srv));
+}
+
+TEST(ui_server_uses_strong_per_process_token) {
+    th_server_t a, b;
+    ASSERT_EQ(th_server_start(&a), 0);
+    ASSERT_EQ(th_server_start(&b), 0);
+
+    const char *a_token = cbm_http_server_token(a.srv);
+    const char *b_token = cbm_http_server_token(b.srv);
+    ASSERT_NOT_NULL(a_token);
+    ASSERT_NOT_NULL(b_token);
+    ASSERT_EQ((int)strlen(a_token), 64);
+    ASSERT_EQ((int)strlen(b_token), 64);
+    ASSERT_TRUE(strcmp(a_token, b_token) != 0);
+    for (const char *p = a_token; *p; p++)
+        ASSERT_TRUE((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'));
+
+    char launch_url[256];
+    ASSERT_TRUE(cbm_http_server_launch_url(a.srv, launch_url, sizeof(launch_url)));
+    ASSERT_NOT_NULL(strstr(launch_url, "http://127.0.0.1:"));
+    ASSERT_NOT_NULL(strstr(launch_url, "#token="));
+    ASSERT_NOT_NULL(strstr(launch_url, a_token));
+
+    th_server_stop(&b);
+    th_server_stop(&a);
+    PASS();
+}
+
+TEST(ui_server_api_requires_token) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[4096];
+
+    ASSERT_GT(th_http(port, "GET /api/logs?lines=1 HTTP/1.1\r\n\r\n", resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 403);
+    ASSERT_NOT_NULL(strstr(resp, "authentication required"));
+    ASSERT_NOT_NULL(strstr(resp, "Cache-Control: no-store"));
+    ASSERT_NOT_NULL(strstr(resp, "Referrer-Policy: no-referrer"));
+
+    ASSERT_GT(th_http(port, "GET /api/logs?lines=1&token=wrong HTTP/1.1\r\n\r\n", resp,
+                      sizeof(resp)),
+              0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    char query[96], req[256];
+    th_token_query(&ts, query, sizeof(query));
+    snprintf(req, sizeof(req), "GET /api/logs?lines=1&%s HTTP/1.1\r\n\r\n", query);
+    ASSERT_GT(th_http(port, req, resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"lines\""));
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rpc_requires_token) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}";
+    char req[1024], resp[4096];
+    snprintf(req, sizeof(req),
+             "POST /rpc HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             (int)strlen(body), body);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 403);
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rpc_allows_diagnostic_tool) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body =
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"index_status\",\"arguments\":{}}}";
+    char query[96], req[1024], resp[8192];
+    th_token_query(&ts, query, sizeof(query));
+    snprintf(req, sizeof(req),
+             "POST /rpc?%s HTTP/1.1\r\n"
+             "Content-Type: application/json\r\n"
+             "Content-Length: %d\r\n\r\n%s",
+             query, (int)strlen(body), body);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"jsonrpc\""));
+    ASSERT_NULL(strstr(resp, "read-only dashboard"));
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_rpc_denies_mutating_and_advanced_tools) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    const char *blocked[] = {"index_repository", "delete_project", "query_graph", "upsert_adr"};
+    char query[96], body[512], req[1024], resp[4096];
+    th_token_query(&ts, query, sizeof(query));
+
+    for (size_t i = 0; i < sizeof(blocked) / sizeof(blocked[0]); i++) {
+        snprintf(body, sizeof(body),
+                 "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+                 "\"params\":{\"name\":\"%s\",\"arguments\":{}}}",
+                 blocked[i]);
+        snprintf(req, sizeof(req),
+                 "POST /rpc?%s HTTP/1.1\r\n"
+                 "Content-Type: application/json\r\n"
+                 "Content-Length: %d\r\n\r\n%s",
+                 query, (int)strlen(body), body);
+        ASSERT_GT(th_http(port, req, resp, sizeof(resp)), 0);
+        ASSERT_EQ(th_status(resp), 403);
+        ASSERT_NOT_NULL(strstr(resp, "read-only dashboard"));
+    }
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_removed_mutating_routes_are_not_available) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char query[96], req[512], resp[4096];
+    th_token_query(&ts, query, sizeof(query));
+    const char *routes[] = {
+        "GET /api/browse?path=/&",
+        "POST /api/index?",
+        "DELETE /api/project?name=x&",
+        "POST /api/process-kill?",
+        "GET /api/processes?",
+        "POST /api/adr?",
+    };
+
+    for (size_t i = 0; i < sizeof(routes) / sizeof(routes[0]); i++) {
+        snprintf(req, sizeof(req), "%s%s HTTP/1.1\r\nContent-Length: 0\r\n\r\n", routes[i],
+                 query);
+        ASSERT_GT(th_http(port, req, resp, sizeof(resp)), 0);
+        ASSERT_EQ(th_status(resp), 404);
+    }
+
+    th_server_stop(&ts);
+    PASS();
+}
+
 TEST(ui_server_unknown_path_404) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -432,11 +582,13 @@ TEST(ui_server_rpc_initialize) {
                        "\"capabilities\":{},"
                        "\"clientInfo\":{\"name\":\"t\",\"version\":\"0\"}}}";
     char req[1024];
+    char query[96];
+    th_token_query(&ts, query, sizeof(query));
     snprintf(req, sizeof(req),
-             "POST /rpc HTTP/1.1\r\n"
+             "POST /rpc?%s HTTP/1.1\r\n"
              "Content-Type: application/json\r\n"
              "Content-Length: %d\r\n\r\n%s",
-             (int)strlen(body), body);
+             query, (int)strlen(body), body);
     char resp[8192];
     int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
     ASSERT_GT(n, 0);
@@ -487,22 +639,16 @@ TEST(ui_server_nul_in_target_rejected) {
 }
 
 TEST(ui_server_browse_traversal_probe) {
-    /* Percent-encoded traversal in the QUERY VALUE is decoded (that is the
-     * documented contract) and then hits the same directory checks as any
-     * other path. The server must answer with a well-formed JSON error or
-     * listing — never crash, never echo raw unescaped input. */
+    /* Directory browsing is not part of the diagnostic dashboard. */
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
-    char resp[65536];
-    int n = th_http(cbm_http_server_port(ts.srv),
-                    "GET /api/browse?path=%2Ftmp%2F..%2F..%2Fprivate HTTP/1.1\r\n\r\n", resp,
-                    sizeof(resp));
+    char query[96], req[512], resp[4096];
+    th_token_query(&ts, query, sizeof(query));
+    snprintf(req, sizeof(req),
+             "GET /api/browse?path=%%2Ftmp%%2F..%%2F..%%2Fprivate&%s HTTP/1.1\r\n\r\n", query);
+    int n = th_http(cbm_http_server_port(ts.srv), req, resp, sizeof(resp));
     ASSERT_GT(n, 0);
-    int st = th_status(resp);
-    ASSERT_TRUE(st == 200 || st == 400 || st == 403);
-    const char *json = strstr(resp, "\r\n\r\n");
-    ASSERT_NOT_NULL(json);
-    ASSERT_EQ(json[4], '{');
+    ASSERT_EQ(th_status(resp), 404);
     th_server_stop(&ts);
     PASS();
 }
@@ -543,9 +689,54 @@ TEST(ui_server_stop_joins_cleanly) {
     PASS();
 }
 
+typedef struct {
+    cbm_http_conn_t *conn;
+    char *body;
+    size_t len;
+    atomic_bool done;
+} stalled_reply_t;
+
+static void *send_stalled_reply(void *arg) {
+    stalled_reply_t *reply = arg;
+    cbm_http_reply_buf(reply->conn, 200, "", reply->body, reply->len);
+    atomic_store(&reply->done, true);
+    return NULL;
+}
+
+TEST(httpd_stalled_reader_hits_deadline) {
+    cbm_httpd_t *listener = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(listener);
+    cbm_httpd_set_recv_deadline_ms(listener, 100);
+    th_sock_t client = th_connect(cbm_httpd_port(listener));
+    ASSERT_TRUE(client != TH_SOCK_BAD);
+    int small = 1024;
+    setsockopt(client, SOL_SOCKET, SO_RCVBUF, (const char *)&small, sizeof(small));
+    cbm_http_conn_t *conn = cbm_httpd_accept(listener, 1000);
+    ASSERT_NOT_NULL(conn);
+    stalled_reply_t reply = {.conn = conn, .len = 16 * 1024 * 1024};
+    reply.body = calloc(reply.len, 1);
+    ASSERT_NOT_NULL(reply.body);
+    atomic_init(&reply.done, false);
+    cbm_thread_t thread;
+    ASSERT_EQ(cbm_thread_create(&thread, 0, send_stalled_reply, &reply), 0);
+    for (int i = 0; i < 200 && !atomic_load(&reply.done); i++) {
+        cbm_usleep(10000);
+    }
+    bool bounded = atomic_load(&reply.done);
+    /* Release the sender even when the regression reappears. */
+    th_sock_close(client);
+    cbm_thread_join(&thread);
+    cbm_httpd_conn_close(conn);
+    cbm_httpd_close(listener);
+    free(reply.body);
+    ASSERT_TRUE(bounded);
+    PASS();
+}
+
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(httpd) {
+    RUN_TEST(httpd_stalled_reader_hits_deadline);
     /* Parser / helpers */
     RUN_TEST(httpd_parse_simple_get);
     RUN_TEST(httpd_parse_post_with_body_offset);
@@ -568,6 +759,12 @@ SUITE(httpd) {
     RUN_TEST(httpd_listen_port_collision_returns_null);
 
     /* Full UI server */
+    RUN_TEST(ui_server_uses_strong_per_process_token);
+    RUN_TEST(ui_server_api_requires_token);
+    RUN_TEST(ui_server_rpc_requires_token);
+    RUN_TEST(ui_server_rpc_allows_diagnostic_tool);
+    RUN_TEST(ui_server_rpc_denies_mutating_and_advanced_tools);
+    RUN_TEST(ui_server_removed_mutating_routes_are_not_available);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_root_serves_stub_404);
     RUN_TEST(ui_server_cors_localhost_reflected);

@@ -10,8 +10,9 @@
       "bin": "codebase-memory-mcp.exe"
     }
   },
-  "post_install": [
-    "& \"$dir\\codebase-memory-mcp.exe\" install -y 2>&1 | Out-Null"
+  "notes": [
+    "Register one MCP client explicitly after installation:",
+    "  codebase-memory-mcp install --client codex"
   ],
   "checkver": {
     "github": "https://github.com/DeusData/codebase-memory-mcp"

@@ -5,12 +5,13 @@
  *   1. Structure: Project/Folder/Package/File nodes
  *   2. Definitions: Extract + write nodes + build registry
  *   3. Imports: Resolve import edges
- *   4. Calls: Call resolution (registry + LSP)
+ *   4. Calls: Call resolution (registry + static resolvers)
  *   5. Usages: Usage/type_ref edges
  *   6. Semantic: Inherits/decorates/implements
  *   7. Post: Tests, communities, HTTP links, config, git history
  *
- * Depends on: foundation, extraction, lsp, store, graph_buffer, discover
+ * Depends on: foundation, extraction, static resolvers, store, graph_buffer,
+ * discover
  */
 #ifndef CBM_PIPELINE_H
 #define CBM_PIPELINE_H
@@ -31,9 +32,11 @@ typedef struct cbm_pipeline cbm_pipeline_t;
 #ifndef CBM_INDEX_MODE_T_DEFINED
 #define CBM_INDEX_MODE_T_DEFINED
 typedef enum {
-    /* All modes run the LSP type-aware call/usage resolution (per-file +
-     * cross-file). The mode only controls file discovery breadth and whether
-     * SIMILAR_TO / SEMANTICALLY_RELATED edges are computed. */
+    /* All modes run type-aware static call/usage resolution (per-file +
+     * cross-file). The mode only controls discovery breadth and whether
+     * derived similarity/semantic edges are computed. Legacy enum names are
+     * retained for source compatibility; public CLI names are structural and
+     * enriched. */
     CBM_MODE_FULL = 0,     /* Full: everything including SIMILAR_TO + SEMANTICALLY_RELATED */
     CBM_MODE_MODERATE = 1, /* Moderate: fast discovery + SIMILAR_TO + SEMANTICALLY_RELATED */
     CBM_MODE_FAST = 2,     /* Fast: skip non-essential files, no similarity/semantic edges */
@@ -72,19 +75,23 @@ int cbm_pipeline_get_mode(const cbm_pipeline_t *p);
  * to NULL/0 when p is NULL or nothing was excluded. Do not free. */
 void cbm_pipeline_get_excluded(const cbm_pipeline_t *p, char ***out, int *count);
 
-/* ── Index lock (prevents concurrent pipeline runs on same DB) ──── */
+/* ── Index locks ───────────────────────────────────────────────── */
 
-/* Try to acquire the global index lock. Returns true if acquired,
- * false if another pipeline is already running (non-blocking).
- * Use this in the watcher — skip reindex if busy. */
+/* Legacy process-wide lock API retained for embedders. New code should use
+ * the project-scoped variants below. */
 bool cbm_pipeline_try_lock(void);
 
-/* Acquire the global index lock, blocking until available.
- * Use this in MCP handler and autoindex — wait for busy watcher to finish. */
 void cbm_pipeline_lock(void);
 
 /* Release the global index lock. */
 void cbm_pipeline_unlock(void);
+
+/* Project-scoped variants. Pipelines targeting the same project serialize,
+ * while unrelated repositories may index concurrently. The project key must
+ * be a non-empty stable project name for the duration of the call. */
+bool cbm_pipeline_try_lock_project(const char *project);
+void cbm_pipeline_lock_project(const char *project);
+void cbm_pipeline_unlock_project(const char *project);
 
 /* ── FQN helpers (used by passes and external callers) ──────────── */
 

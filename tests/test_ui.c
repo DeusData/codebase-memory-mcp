@@ -1,7 +1,7 @@
 /*
- * test_ui.c — Tests for the graph visualization UI module.
+ * test_ui.c — Tests for diagnostic dashboard configuration and assets.
  *
- * Covers: config persistence, embedded asset lookup, layout engine.
+ * Covers: config persistence and embedded asset lookup.
  */
 #include "../src/foundation/compat.h"
 #include "../src/foundation/compat_fs.h"
@@ -9,8 +9,6 @@
 #include "test_helpers.h"
 #include "ui/config.h"
 #include "ui/embedded_assets.h"
-#include "ui/layout3d.h"
-#include "store/store.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -195,225 +193,6 @@ TEST(embedded_stub_count) {
     PASS();
 }
 
-/* ── Layout tests ─────────────────────────────────────────────── */
-
-TEST(layout_empty_graph) {
-    cbm_store_t *store = cbm_store_open_memory();
-    ASSERT_NOT_NULL(store);
-
-    /* No nodes in store → empty result */
-    cbm_layout_result_t *r =
-        cbm_layout_compute(store, "test-project", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(r->node_count, 0);
-    ASSERT_EQ(r->edge_count, 0);
-
-    cbm_layout_free(r);
-    cbm_store_close(store);
-    PASS();
-}
-
-TEST(layout_single_node) {
-    cbm_store_t *store = cbm_store_open_memory();
-    ASSERT_NOT_NULL(store);
-
-    cbm_store_upsert_project(store, "test", "/tmp/test");
-    cbm_node_t node = {
-        .project = "test",
-        .label = "Function",
-        .name = "main",
-        .qualified_name = "test::main",
-        .file_path = "main.c",
-        .start_line = 1,
-        .end_line = 10,
-    };
-    int64_t id = cbm_store_upsert_node(store, &node);
-    ASSERT_GT(id, 0);
-
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(r->node_count, 1);
-    ASSERT_STR_EQ(r->nodes[0].name, "main");
-    ASSERT_EQ(r->total_nodes, 1);
-
-    cbm_layout_free(r);
-    cbm_store_close(store);
-    PASS();
-}
-
-TEST(layout_two_connected) {
-    cbm_store_t *store = cbm_store_open_memory();
-    ASSERT_NOT_NULL(store);
-
-    cbm_store_upsert_project(store, "test", "/tmp/test");
-
-    cbm_node_t n1 = {.project = "test",
-                     .label = "Function",
-                     .name = "foo",
-                     .qualified_name = "test::foo",
-                     .file_path = "a.c",
-                     .start_line = 1,
-                     .end_line = 5};
-    cbm_node_t n2 = {.project = "test",
-                     .label = "Function",
-                     .name = "bar",
-                     .qualified_name = "test::bar",
-                     .file_path = "b.c",
-                     .start_line = 1,
-                     .end_line = 5};
-    int64_t id1 = cbm_store_upsert_node(store, &n1);
-    int64_t id2 = cbm_store_upsert_node(store, &n2);
-
-    cbm_edge_t edge = {.project = "test", .source_id = id1, .target_id = id2, .type = "CALLS"};
-    cbm_store_insert_edge(store, &edge);
-
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NOT_NULL(r);
-    ASSERT_EQ(r->node_count, 2);
-
-    /* Nodes should be positioned apart (not at same point) */
-    float dx = r->nodes[0].x - r->nodes[1].x;
-    float dy = r->nodes[0].y - r->nodes[1].y;
-    float dz = r->nodes[0].z - r->nodes[1].z;
-    float dist = sqrtf(dx * dx + dy * dy + dz * dz);
-    ASSERT_GT((long long)(dist * 100), 0);
-
-    ASSERT_EQ(r->edge_count, 1);
-
-    cbm_layout_free(r);
-    cbm_store_close(store);
-    PASS();
-}
-
-TEST(layout_respects_max_nodes) {
-    cbm_store_t *store = cbm_store_open_memory();
-    ASSERT_NOT_NULL(store);
-
-    cbm_store_upsert_project(store, "test", "/tmp/test");
-
-    /* Insert 20 nodes */
-    for (int i = 0; i < 20; i++) {
-        char name[32], qn[64];
-        snprintf(name, sizeof(name), "fn%d", i);
-        snprintf(qn, sizeof(qn), "test::fn%d", i);
-        cbm_node_t n = {.project = "test",
-                        .label = "Function",
-                        .name = name,
-                        .qualified_name = qn,
-                        .file_path = "a.c",
-                        .start_line = i,
-                        .end_line = i + 1};
-        cbm_store_upsert_node(store, &n);
-    }
-
-    /* max_nodes=5 should return at most 5 */
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 5);
-    ASSERT_NOT_NULL(r);
-    ASSERT_LTE(r->node_count, 5);
-    ASSERT_EQ(r->total_nodes, 20);
-
-    cbm_layout_free(r);
-    cbm_store_close(store);
-    PASS();
-}
-
-TEST(layout_deterministic) {
-    cbm_store_t *store = cbm_store_open_memory();
-    ASSERT_NOT_NULL(store);
-
-    cbm_store_upsert_project(store, "test", "/tmp/test");
-
-    cbm_node_t n1 = {.project = "test",
-                     .label = "Function",
-                     .name = "alpha",
-                     .qualified_name = "test::alpha",
-                     .file_path = "a.c",
-                     .start_line = 1,
-                     .end_line = 5};
-    cbm_node_t n2 = {.project = "test",
-                     .label = "Function",
-                     .name = "beta",
-                     .qualified_name = "test::beta",
-                     .file_path = "b.c",
-                     .start_line = 1,
-                     .end_line = 5};
-    cbm_store_upsert_node(store, &n1);
-    cbm_store_upsert_node(store, &n2);
-
-    /* Run twice, check positions match */
-    cbm_layout_result_t *r1 = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    cbm_layout_result_t *r2 = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NOT_NULL(r1);
-    ASSERT_NOT_NULL(r2);
-    ASSERT_EQ(r1->node_count, r2->node_count);
-
-    for (int i = 0; i < r1->node_count; i++) {
-        ASSERT_FLOAT_EQ(r1->nodes[i].x, r2->nodes[i].x, 0.001);
-        ASSERT_FLOAT_EQ(r1->nodes[i].y, r2->nodes[i].y, 0.001);
-        ASSERT_FLOAT_EQ(r1->nodes[i].z, r2->nodes[i].z, 0.001);
-    }
-
-    cbm_layout_free(r1);
-    cbm_layout_free(r2);
-    cbm_store_close(store);
-    PASS();
-}
-
-TEST(layout_to_json) {
-    cbm_store_t *store = cbm_store_open_memory();
-    ASSERT_NOT_NULL(store);
-
-    cbm_store_upsert_project(store, "test", "/tmp/test");
-
-    cbm_node_t n = {.project = "test",
-                    .label = "Function",
-                    .name = "hello",
-                    .qualified_name = "test::hello",
-                    .file_path = "a.c",
-                    .start_line = 1,
-                    .end_line = 5};
-    cbm_store_upsert_node(store, &n);
-
-    cbm_layout_result_t *r = cbm_layout_compute(store, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NOT_NULL(r);
-
-    char *json = cbm_layout_to_json(r);
-    ASSERT_NOT_NULL(json);
-
-    /* Should contain key fields */
-    ASSERT(strstr(json, "\"nodes\"") != NULL);
-    ASSERT(strstr(json, "\"edges\"") != NULL);
-    ASSERT(strstr(json, "\"total_nodes\"") != NULL);
-    ASSERT(strstr(json, "\"hello\"") != NULL);
-    ASSERT(strstr(json, "\"Function\"") != NULL);
-
-    free(json);
-    cbm_layout_free(r);
-    cbm_store_close(store);
-    PASS();
-}
-
-TEST(layout_null_inputs) {
-    /* NULL store → NULL result */
-    cbm_layout_result_t *r = cbm_layout_compute(NULL, "test", CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NULL(r);
-
-    /* NULL project → NULL result */
-    cbm_store_t *store = cbm_store_open_memory();
-    r = cbm_layout_compute(store, NULL, CBM_LAYOUT_OVERVIEW, NULL, 0, 100);
-    ASSERT_NULL(r);
-
-    /* cbm_layout_free(NULL) should not crash */
-    cbm_layout_free(NULL);
-
-    /* cbm_layout_to_json(NULL) should return NULL */
-    char *json = cbm_layout_to_json(NULL);
-    ASSERT_NULL(json);
-
-    cbm_store_close(store);
-    PASS();
-}
-
 /* ── Suite ────────────────────────────────────────────────────── */
 
 SUITE(ui) {
@@ -428,12 +207,4 @@ SUITE(ui) {
     RUN_TEST(embedded_lookup_not_found);
     RUN_TEST(embedded_stub_count);
 
-    /* Layout engine */
-    RUN_TEST(layout_empty_graph);
-    RUN_TEST(layout_single_node);
-    RUN_TEST(layout_two_connected);
-    RUN_TEST(layout_respects_max_nodes);
-    RUN_TEST(layout_deterministic);
-    RUN_TEST(layout_to_json);
-    RUN_TEST(layout_null_inputs);
 }

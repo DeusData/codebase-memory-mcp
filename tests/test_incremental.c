@@ -16,6 +16,8 @@
 #include <mcp/mcp.h>
 #include <store/store.h>
 #include <pipeline/pipeline.h>
+#include <pipeline/pipeline_internal.h>
+#include <pipeline/content_hash.h>
 #include <foundation/log.h>
 #include <foundation/mem.h>
 
@@ -26,6 +28,7 @@
 #include <unistd.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <utime.h>
 
 /* ── Globals ──────────────────────────────────────────────────────── */
 
@@ -46,6 +49,228 @@ static size_t g_rss_before_full = 0;
 static double g_full_index_ms = 0;
 
 /* ── Helpers ──────────────────────────────────────────────────────── */
+
+static int create_small_delta_fixture(char *tmpdir, size_t tmpdir_size, char *repo,
+                                      size_t repo_size, char *db_path, size_t db_path_size) {
+    snprintf(tmpdir, tmpdir_size, "/tmp/cbm_incr_delta_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        return -1;
+    }
+    snprintf(repo, repo_size, "%s/repo", tmpdir);
+    snprintf(db_path, db_path_size, "%s/index.db", tmpdir);
+    if (cbm_mkdir_p(repo, 0755) != 0) {
+        th_rmtree(tmpdir);
+        return -1;
+    }
+
+    static const char *names[] = {"alpha", "bravo", "charlie", "delta", "echo", "foxtrot"};
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char path[512];
+        char source[256];
+        snprintf(path, sizeof(path), "%s/%s.py", repo, names[i]);
+        snprintf(source, sizeof(source), "def %s_old():\n    return %zu\n", names[i], i);
+        th_write_file(path, source);
+    }
+    return 0;
+}
+
+static int run_small_delta_index(const char *repo, const char *db_path, char **out_project) {
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    if (!pipeline) {
+        return -1;
+    }
+    if (out_project) {
+        free(*out_project);
+        *out_project = strdup(cbm_pipeline_project_name(pipeline));
+    }
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_pipeline_free(pipeline);
+    return rc;
+}
+
+static int store_has_named_node(const char *db_path, const char *project, const char *name) {
+    cbm_store_t *store = cbm_store_open_path_query(db_path);
+    if (!store) {
+        return 0;
+    }
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_name(store, project, name, &nodes, &count);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(store);
+    return rc == CBM_STORE_OK && count > 0;
+}
+
+TEST(incr_small_delta_updates_db_in_place) {
+    char tmpdir[256];
+    char repo[320];
+    char db_path[384];
+    char *project = NULL;
+    ASSERT_EQ(create_small_delta_fixture(tmpdir, sizeof(tmpdir), repo, sizeof(repo), db_path,
+                                         sizeof(db_path)),
+              0);
+    ASSERT_EQ(run_small_delta_index(repo, db_path, &project), 0);
+    ASSERT_NOT_NULL(project);
+
+    struct stat before;
+    ASSERT_EQ(stat(db_path, &before), 0);
+
+    char changed_path[512];
+    snprintf(changed_path, sizeof(changed_path), "%s/alpha.py", repo);
+    th_write_file(changed_path, "def alpha_new():\n    return 101\n");
+    ASSERT_EQ(run_small_delta_index(repo, db_path, NULL), 0);
+
+    struct stat after;
+    ASSERT_EQ(stat(db_path, &after), 0);
+#ifndef _WIN32
+    /* A sibling-DB rewrite replaces the inode. A true SQLite delta keeps the
+     * live database and commits only the affected rows. */
+    ASSERT_EQ(before.st_ino, after.st_ino);
+#endif
+    ASSERT_TRUE(store_has_named_node(db_path, project, "alpha_new"));
+    ASSERT_FALSE(store_has_named_node(db_path, project, "alpha_old"));
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incr_delta_failure_rolls_back) {
+    char tmpdir[256];
+    char repo[320];
+    char db_path[384];
+    char *project = NULL;
+    ASSERT_EQ(create_small_delta_fixture(tmpdir, sizeof(tmpdir), repo, sizeof(repo), db_path,
+                                         sizeof(db_path)),
+              0);
+    ASSERT_EQ(run_small_delta_index(repo, db_path, &project), 0);
+    ASSERT_NOT_NULL(project);
+
+    char changed_path[512];
+    snprintf(changed_path, sizeof(changed_path), "%s/alpha.py", repo);
+    th_write_file(changed_path, "def alpha_uncommitted():\n    return 999\n");
+
+    cbm_setenv("CBM_TEST_INCREMENTAL_FAULT", "after_delete", 1);
+    int rc = run_small_delta_index(repo, db_path, NULL);
+    cbm_unsetenv("CBM_TEST_INCREMENTAL_FAULT");
+
+    ASSERT(rc != 0);
+    ASSERT_TRUE(store_has_named_node(db_path, project, "alpha_old"));
+    ASSERT_FALSE(store_has_named_node(db_path, project, "alpha_uncommitted"));
+
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+TEST(incr_content_hash_detects_same_metadata_change) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_incr_hash_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char path[320];
+    snprintf(path, sizeof(path), "%s/same.py", tmpdir);
+    th_write_file(path, "AAAA\n");
+
+    struct utimbuf fixed_time = {.actime = 1700000000, .modtime = 1700000000};
+    ASSERT_EQ(utime(path, &fixed_time), 0);
+
+    struct stat before;
+    ASSERT_EQ(stat(path, &before), 0);
+    char first[CBM_CONTENT_HASH_SIZE] = {0};
+    ASSERT_EQ(cbm_content_hash_file(path, first), 0);
+    ASSERT(strncmp(first, "xxh3-128:", 9) == 0);
+    ASSERT(strlen(first) == CBM_CONTENT_HASH_SIZE - 1);
+
+    /* Replace with different bytes while preserving both metadata signals
+     * used by the old classifier. */
+    th_write_file(path, "BBBB\n");
+    ASSERT_EQ(utime(path, &fixed_time), 0);
+
+    struct stat after;
+    ASSERT_EQ(stat(path, &after), 0);
+    ASSERT_EQ(before.st_size, after.st_size);
+    ASSERT_EQ(before.st_mtime, after.st_mtime);
+
+    char second[CBM_CONTENT_HASH_SIZE] = {0};
+    ASSERT_EQ(cbm_content_hash_file(path, second), 0);
+    ASSERT(strcmp(first, second) != 0);
+
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(incr_failed_candidate_preserves_live_db) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_incr_publish_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char repo[320];
+    char outdir[320];
+    char source[384];
+    char db_path[384];
+    snprintf(repo, sizeof(repo), "%s/repo", tmpdir);
+    snprintf(outdir, sizeof(outdir), "%s/out", tmpdir);
+    snprintf(source, sizeof(source), "%s/module.py", repo);
+    snprintf(db_path, sizeof(db_path), "%s/index.db", outdir);
+    cbm_mkdir_p(repo, 0755);
+    cbm_mkdir_p(outdir, 0755);
+    th_write_file(source, "def preserved_old():\n    return 1\n");
+
+    cbm_pipeline_t *first = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    if (!first) {
+        th_rmtree(tmpdir);
+        FAIL("first pipeline allocation failed");
+    }
+    char *project = strdup(cbm_pipeline_project_name(first));
+    int first_rc = cbm_pipeline_run(first);
+    cbm_pipeline_free(first);
+    if (first_rc != 0 || !project) {
+        free(project);
+        th_rmtree(tmpdir);
+        FAIL("initial index failed");
+    }
+
+    /* A read-only parent makes creation of index.db.next fail. The old DB
+     * must remain queryable because publication has not succeeded. */
+    th_write_file(source, "def replacement_new():\n    return 2\n");
+    if (chmod(outdir, 0555) != 0) {
+        free(project);
+        th_rmtree(tmpdir);
+        FAIL("chmod failed");
+    }
+    cbm_pipeline_t *second = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    int second_rc = second ? cbm_pipeline_run(second) : 0;
+    cbm_pipeline_free(second);
+    chmod(outdir, 0755);
+
+    cbm_store_t *store = cbm_store_open_path(db_path);
+    cbm_node_t *old_nodes = NULL;
+    cbm_node_t *new_nodes = NULL;
+    int old_count = 0;
+    int new_count = 0;
+    if (store) {
+        cbm_store_find_nodes_by_name(store, project, "preserved_old", &old_nodes, &old_count);
+        cbm_store_find_nodes_by_name(store, project, "replacement_new", &new_nodes, &new_count);
+    }
+
+    ASSERT(second != NULL);
+    ASSERT(second_rc != 0);
+    ASSERT_NOT_NULL(store);
+    ASSERT_GT(old_count, 0);
+    ASSERT_EQ(new_count, 0);
+
+    cbm_store_free_nodes(old_nodes, old_count);
+    cbm_store_free_nodes(new_nodes, new_count);
+    cbm_store_close(store);
+    free(project);
+    th_rmtree(tmpdir);
+    PASS();
+}
+#endif
 
 static double now_ms(void) {
     struct timespec ts;
@@ -241,6 +466,8 @@ static int incremental_setup(void) {
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
         return -1;
+    cbm_mcp_server_set_toolsets(
+        g_srv, CBM_MCP_TOOLSET_CORE | CBM_MCP_TOOLSET_ADVANCED | CBM_MCP_TOOLSET_ADMIN);
 
     g_rss_before_full = cbm_mem_rss();
 
@@ -318,6 +545,23 @@ TEST(incr_full_has_functions) {
     int modules = count_by_label("Module");
     ASSERT_GT(modules, 200);
 
+    PASS();
+}
+
+TEST(incr_full_file_hashes_are_xxh3_128) {
+    cbm_store_t *store = open_store();
+    ASSERT_NOT_NULL(store);
+    cbm_file_hash_t *hashes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_get_file_hashes(store, g_project, &hashes, &count), CBM_STORE_OK);
+    ASSERT_GT(count, 0);
+    for (int i = 0; i < count; i++) {
+        ASSERT_NOT_NULL(hashes[i].sha256);
+        ASSERT(strncmp(hashes[i].sha256, "xxh3-128:", 9) == 0);
+        ASSERT_EQ(strlen(hashes[i].sha256), CBM_CONTENT_HASH_SIZE - 1);
+    }
+    cbm_store_free_file_hashes(hashes, count);
+    cbm_store_close(store);
     PASS();
 }
 
@@ -712,6 +956,38 @@ TEST(incr_replace_file_content) {
     PASS();
 }
 
+TEST(incr_detects_same_size_same_mtime_content) {
+    const char *rel_path = "fastapi/incr_same_meta.py";
+    char full_path[512];
+    snprintf(full_path, sizeof(full_path), "%s/%s", g_repodir, rel_path);
+    struct utimbuf fixed_time = {.actime = 1700000000, .modtime = 1700000000};
+
+    write_file_at(rel_path, "def hash_old_fn():\n    return 'old'\n");
+    ASSERT_EQ(utime(full_path, &fixed_time), 0);
+    char *resp = index_repo();
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT(has_function("hash_old_fn"));
+
+    struct stat before;
+    ASSERT_EQ(stat(full_path, &before), 0);
+    write_file_at(rel_path, "def hash_new_fn():\n    return 'new'\n");
+    ASSERT_EQ(utime(full_path, &fixed_time), 0);
+    struct stat after;
+    ASSERT_EQ(stat(full_path, &after), 0);
+    ASSERT_EQ(before.st_size, after.st_size);
+    ASSERT_EQ(before.st_mtime, after.st_mtime);
+
+    resp = index_repo();
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+    ASSERT(!has_function("hash_old_fn"));
+    ASSERT(has_function("hash_new_fn"));
+
+    delete_file_at(rel_path);
+    PASS();
+}
+
 TEST(incr_batch_add_delete) {
     /* Add 20 files */
     for (int i = 0; i < 20; i++) {
@@ -788,6 +1064,9 @@ TEST(incr_accuracy_vs_full) {
     int incr_nodes = get_node_count();
     int incr_edges = get_edge_count();
     int incr_calls = get_edge_count_by_type("CALLS");
+    int incr_imports = get_edge_count_by_type("IMPORTS");
+    int incr_defines = get_edge_count_by_type("DEFINES");
+    int incr_contains = get_edge_count_by_type("CONTAINS_FILE");
 
     /* Delete DB, force full reindex */
     unlink(g_dbpath);
@@ -798,14 +1077,25 @@ TEST(incr_accuracy_vs_full) {
     int full_nodes = get_node_count();
     int full_edges = get_edge_count();
     int full_calls = get_edge_count_by_type("CALLS");
+    int full_imports = get_edge_count_by_type("IMPORTS");
+    int full_defines = get_edge_count_by_type("DEFINES");
+    int full_contains = get_edge_count_by_type("CONTAINS_FILE");
 
-    /* Within tight tolerance (±2 for dedup timing differences) */
+    /* Deterministic structural edges must converge tightly. Aggregate edge
+     * count includes heuristic similarity/semantic/usage edges whose candidate
+     * ordering is currently nondeterministic between parallel full and
+     * sequential incremental runs, so report (but do not hide) that drift. */
     ASSERT_LTE(abs(full_nodes - incr_nodes), 2);
-    ASSERT_LTE(abs(full_nodes - incr_nodes), 50);
     ASSERT_LTE(abs(full_calls - incr_calls), 2);
+    ASSERT_LTE(abs(full_imports - incr_imports), 2);
+    ASSERT_LTE(abs(full_defines - incr_defines), 2);
+    ASSERT_LTE(abs(full_contains - incr_contains), 2);
 
-    printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges\n", incr_nodes,
-           incr_edges, full_nodes, full_edges);
+    printf("    [accuracy] incr: %d nodes/%d edges, full: %d nodes/%d edges"
+           " (aggregate drift=%d; calls %d/%d, imports %d/%d, defines %d/%d, contains %d/%d)\n",
+           incr_nodes, incr_edges, full_nodes, full_edges, abs(full_edges - incr_edges), incr_calls,
+           full_calls, incr_imports, full_imports, incr_defines, full_defines, incr_contains,
+           full_contains);
 
     delete_file_at("fastapi/incr_accuracy.py");
     PASS();
@@ -920,6 +1210,15 @@ static int resp_lacks_key(const char *resp, const char *key) {
 
 /* Helper: assert response is not an error */
 #define NOT_ERROR(resp) ASSERT(strstr((resp), "\"isError\":true") == NULL)
+
+/* Removed runtime ingestion must fail honestly instead of acknowledging data
+ * that is never persisted into runtime edges. */
+#define TOOL_UNSUPPORTED(resp)                         \
+    do {                                               \
+        ASSERT_NOT_NULL(strstr((resp), "unsupported")); \
+        ASSERT_NOT_NULL(strstr((resp), "isError"));     \
+        ASSERT_NULL(strstr((resp), "accepted"));        \
+    } while (0)
 
 /* ── list_projects ─────────────────────────────────────────────── */
 
@@ -1799,6 +2098,7 @@ TEST(tool_ingest_traces_empty) {
     char *r =
         call_tool_timed("ingest_traces", &ms, "{\"project\":\"%s\",\"traces\":[]}", g_project);
     TOOL_OK(r, ms);
+    TOOL_UNSUPPORTED(r);
     free(r);
     PASS();
 }
@@ -1809,6 +2109,7 @@ TEST(tool_ingest_traces_basic) {
         "ingest_traces", &ms,
         "{\"project\":\"%s\",\"traces\":[{\"caller\":\"a\",\"callee\":\"b\"}]}", g_project);
     TOOL_OK(r, ms);
+    TOOL_UNSUPPORTED(r);
     free(r);
     PASS();
 }
@@ -2236,6 +2537,7 @@ TEST(tool_ingest_traces_multiple) {
                               "]}",
                               g_project);
     TOOL_OK(r, ms);
+    TOOL_UNSUPPORTED(r);
     free(r);
     PASS();
 }
@@ -2689,6 +2991,7 @@ TEST(tool_ingest_traces_partial) {
         call_tool_timed("ingest_traces", &ms,
                         "{\"project\":\"%s\",\"traces\":[{\"caller\":\"onlyA\"}]}", g_project);
     TOOL_OK(r, ms);
+    TOOL_UNSUPPORTED(r);
     free(r);
     PASS();
 }
@@ -2731,6 +3034,7 @@ TEST(tool_err_ingest_bad_project) {
     char *r =
         call_tool_timed("ingest_traces", &ms, "{\"project\":\"nonexistent-xyz\",\"traces\":[]}");
     TOOL_OK(r, ms);
+    TOOL_UNSUPPORTED(r);
     free(r);
     PASS();
 }
@@ -2741,6 +3045,7 @@ TEST(tool_err_ingest_no_traces) {
     double ms;
     char *r = call_tool_timed("ingest_traces", &ms, "{\"project\":\"%s\"}", g_project);
     TOOL_OK(r, ms);
+    TOOL_UNSUPPORTED(r);
     free(r);
     PASS();
 }
@@ -2819,6 +3124,21 @@ TEST(tool_delete_and_verify) {
  * ══════════════════════════════════════════════════════════════════ */
 
 SUITE(incremental) {
+    RUN_TEST(incr_small_delta_updates_db_in_place);
+    RUN_TEST(incr_delta_failure_rolls_back);
+    RUN_TEST(incr_content_hash_detects_same_metadata_change);
+#ifndef _WIN32
+    RUN_TEST(incr_failed_candidate_preserves_live_db);
+#endif
+    const char *filter = getenv("CBM_TEST_FILTER");
+    if (filter &&
+        (strcmp(filter, "incr_small_delta_updates_db_in_place") == 0 ||
+         strcmp(filter, "incr_delta_failure_rolls_back") == 0 ||
+         strcmp(filter, "incr_content_hash_detects_same_metadata_change") == 0 ||
+         strcmp(filter, "incr_failed_candidate_preserves_live_db") == 0)) {
+        return;
+    }
+
     if (incremental_setup() != 0) {
         printf("  SETUP FAILED — skipping incremental tests (network?)\n");
         return;
@@ -2827,6 +3147,7 @@ SUITE(incremental) {
     /* Phase 1: Full index baseline (needed for tool tests below) */
     RUN_TEST(incr_full_index);
     RUN_TEST(incr_full_has_functions);
+    RUN_TEST(incr_full_file_hashes_are_xxh3_128);
     RUN_TEST(incr_full_edge_types);
 
     /* Inject test functions so tool tests (trace_path etc.) always have data,
@@ -2872,6 +3193,7 @@ SUITE(incremental) {
     /* Phase 5: Stress */
     RUN_TEST(incr_rapid_reindex);
     RUN_TEST(incr_replace_file_content);
+    RUN_TEST(incr_detects_same_size_same_mtime_content);
     RUN_TEST(incr_batch_add_delete);
 
     /* Phase 6: Recovery + accuracy */

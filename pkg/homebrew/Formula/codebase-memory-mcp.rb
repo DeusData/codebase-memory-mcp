@@ -34,8 +34,8 @@ class CodebaseMemoryMcp < Formula
 
   def caveats
     <<~EOS
-      Run the following to configure your coding agents:
-        codebase-memory-mcp install
+      Register only the intended MCP client:
+        codebase-memory-mcp install --client codex
 
       To tap this formula directly:
         brew tap deusdata/codebase-memory-mcp https://github.com/DeusData/codebase-memory-mcp

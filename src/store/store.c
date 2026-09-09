@@ -23,6 +23,12 @@ enum {
     ST_COL_7 = 7,
     ST_COL_8 = 8,
     ST_COL_9 = 9,
+    ST_COL_10 = 10,
+    ST_COL_11 = 11,
+    ST_COL_12 = 12,
+    ST_COL_13 = 13,
+    ST_COL_14 = 14,
+    ST_COL_15 = 15,
     ST_FOUND = -1,
     ST_BUF_16 = 16,
     ST_BUF_64 = 64,
@@ -67,6 +73,8 @@ enum {
 #include "xxhash/xxhash.h"
 
 #include <sqlite3.h>
+#include <ctype.h>
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -98,6 +106,7 @@ struct cbm_store {
     sqlite3 *db;
     const char *db_path; /* heap-allocated, or NULL for :memory: */
     char errbuf[CBM_SZ_512];
+    bool code_fts_available;
 
     /* Prepared statements (lazily initialized, cached for lifetime) */
     sqlite3_stmt *stmt_upsert_node;
@@ -106,6 +115,7 @@ struct cbm_store {
     sqlite3_stmt *stmt_find_node_by_qn_any; /* QN lookup without project filter */
     sqlite3_stmt *stmt_find_nodes_by_name;
     sqlite3_stmt *stmt_find_nodes_by_name_any; /* name lookup without project filter */
+    sqlite3_stmt *stmt_find_nodes_by_project;
     sqlite3_stmt *stmt_find_nodes_by_label;
     sqlite3_stmt *stmt_find_nodes_by_file;
     sqlite3_stmt *stmt_count_nodes;
@@ -169,6 +179,21 @@ static const char *safe_props(const char *s) {
     return (s && s[0]) ? s : "{}";
 }
 
+static const char *safe_origin(const char *origin) {
+    if (origin &&
+        (strcmp(origin, CBM_ORIGIN_SCIP) == 0 ||
+         strcmp(origin, CBM_ORIGIN_STATIC_RESOLVER) == 0 ||
+         strcmp(origin, CBM_ORIGIN_TREE_SITTER) == 0 ||
+         strcmp(origin, CBM_ORIGIN_HEURISTIC) == 0)) {
+        return origin;
+    }
+    return CBM_ORIGIN_TREE_SITTER;
+}
+
+static double safe_confidence(double confidence) {
+    return confidence > 0.0 && confidence <= 1.0 ? confidence : 1.0;
+}
+
 /* Duplicate a string onto the heap. */
 static char *heap_strdup(const char *s) {
     if (!s) {
@@ -180,6 +205,128 @@ static char *heap_strdup(const char *s) {
         memcpy(d, s, len + SKIP_ONE);
     }
     return d;
+}
+
+static char *normalize_identity_text(const char *input, bool path, bool lower,
+                                     bool collapse_whitespace) {
+    const char *src = input ? input : "";
+    size_t len = strlen(src);
+    char *out = malloc(len + SKIP_ONE);
+    if (!out) {
+        return NULL;
+    }
+    size_t start = 0;
+    if (path) {
+        while (start + SKIP_ONE < len && src[start] == '.' &&
+               (src[start + SKIP_ONE] == '/' || src[start + SKIP_ONE] == '\\')) {
+            start += CBM_SZ_2;
+        }
+    }
+    size_t used = 0;
+    bool pending_space = false;
+    bool previous_slash = false;
+    for (size_t i = start; i < len; i++) {
+        unsigned char raw = (unsigned char)src[i];
+        if (collapse_whitespace && isspace(raw)) {
+            pending_space = used > 0;
+            continue;
+        }
+        char ch = (char)raw;
+        if (path && ch == '\\') {
+            ch = '/';
+        }
+        if (path && ch == '/' && previous_slash) {
+            continue;
+        }
+        if (pending_space) {
+            out[used++] = ' ';
+            pending_space = false;
+        }
+        if (lower) {
+            ch = (char)tolower((unsigned char)ch);
+        }
+        out[used++] = ch;
+        previous_slash = path && ch == '/';
+    }
+    out[used] = '\0';
+    return out;
+}
+
+static int symbol_hash_update_field(XXH3_state_t *state, const char *value) {
+    uint64_t len = value ? (uint64_t)strlen(value) : 0;
+    uint8_t encoded_len[sizeof(len)];
+    for (size_t i = 0; i < sizeof(encoded_len); i++) {
+        encoded_len[sizeof(encoded_len) - i - SKIP_ONE] = (uint8_t)(len >> (i * 8U));
+    }
+    if (XXH3_128bits_update(state, encoded_len, sizeof(encoded_len)) == XXH_ERROR) {
+        return CBM_STORE_ERR;
+    }
+    if (len > 0 && XXH3_128bits_update(state, value, (size_t)len) == XXH_ERROR) {
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_compute_symbol_id(const cbm_node_t *n, char out[CBM_SYMBOL_ID_BUFSZ]) {
+    if (!n || !out) {
+        return CBM_STORE_ERR;
+    }
+    out[0] = '\0';
+
+    char *language = normalize_identity_text(n->language, false, true, true);
+    char *path = normalize_identity_text(n->file_path, true, false, false);
+    char *label = normalize_identity_text(n->label, false, false, true);
+    char *qn = normalize_identity_text(n->qualified_name, false, false, true);
+    char *signature = normalize_identity_text(n->signature, false, false, true);
+    if (!language || !path || !label || !qn || !signature) {
+        free(language);
+        free(path);
+        free(label);
+        free(qn);
+        free(signature);
+        return CBM_STORE_ERR;
+    }
+
+    XXH3_state_t *state = XXH3_createState();
+    int rc = state && XXH3_128bits_reset(state) != XXH_ERROR ? CBM_STORE_OK : CBM_STORE_ERR;
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, "cbm-symbol-v2");
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, language);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, path);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, label);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, qn);
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, signature);
+    }
+    char range[CBM_SZ_64];
+    snprintf(range, sizeof(range), "%d:%d", n->start_line, n->end_line);
+    if (rc == CBM_STORE_OK) {
+        rc = symbol_hash_update_field(state, range);
+    }
+    if (rc == CBM_STORE_OK) {
+        XXH128_hash_t hash = XXH3_128bits_digest(state);
+        int written = snprintf(out, CBM_SYMBOL_ID_BUFSZ, "%016" PRIx64 "%016" PRIx64,
+                               hash.high64, hash.low64);
+        rc = written == CBM_SYMBOL_ID_HEX_LEN ? CBM_STORE_OK : CBM_STORE_ERR;
+    }
+    if (state) {
+        XXH3_freeState(state);
+    }
+    free(language);
+    free(path);
+    free(label);
+    free(qn);
+    free(signature);
+    return rc;
 }
 
 /* Prepare a statement (cached). If already prepared, reset+clear. */
@@ -212,12 +359,223 @@ static void iso_now(char *buf, size_t sz) {
 
 /* ── Schema ─────────────────────────────────────────────────────── */
 
+static bool table_has_column(cbm_store_t *s, const char *table, const char *column) {
+    char sql[CBM_SZ_256];
+    snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table);
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bool found = false;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, SKIP_ONE);
+        if (name && strcmp(name, column) == 0) {
+            found = true;
+            break;
+        }
+    }
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static bool table_exists(cbm_store_t *s, const char *table) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(
+            s->db, "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1", CBM_NOT_FOUND,
+            &stmt, NULL) != SQLITE_OK) {
+        return false;
+    }
+    bind_text(stmt, SKIP_ONE, table);
+    bool found = sqlite3_step(stmt) == SQLITE_ROW;
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+static const char *nodes_v2_ddl(const char *table) {
+    if (strcmp(table, "nodes_v2") == 0) {
+        return "CREATE TABLE nodes_v2 ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               "project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+               "label TEXT NOT NULL,"
+               "name TEXT NOT NULL,"
+               "qualified_name TEXT NOT NULL,"
+               "file_path TEXT DEFAULT '',"
+               "start_line INTEGER DEFAULT 0,"
+               "end_line INTEGER DEFAULT 0,"
+               "properties TEXT DEFAULT '{}',"
+               "symbol_id TEXT NOT NULL,"
+               "language TEXT NOT NULL DEFAULT '',"
+               "signature TEXT NOT NULL DEFAULT '',"
+               "origin TEXT NOT NULL DEFAULT 'tree_sitter',"
+               "confidence REAL NOT NULL DEFAULT 1.0,"
+               "UNIQUE(project, symbol_id)"
+               ");";
+    }
+    return "CREATE TABLE IF NOT EXISTS nodes ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+           "project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+           "label TEXT NOT NULL,"
+           "name TEXT NOT NULL,"
+           "qualified_name TEXT NOT NULL,"
+           "file_path TEXT DEFAULT '',"
+           "start_line INTEGER DEFAULT 0,"
+           "end_line INTEGER DEFAULT 0,"
+           "properties TEXT DEFAULT '{}',"
+           "symbol_id TEXT NOT NULL,"
+           "language TEXT NOT NULL DEFAULT '',"
+           "signature TEXT NOT NULL DEFAULT '',"
+           "origin TEXT NOT NULL DEFAULT 'tree_sitter',"
+           "confidence REAL NOT NULL DEFAULT 1.0,"
+           "UNIQUE(project, symbol_id)"
+           ");";
+}
+
+static const char *edges_v2_ddl(const char *table) {
+    if (strcmp(table, "edges_v2") == 0) {
+        return "CREATE TABLE edges_v2 ("
+               "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+               "project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+               "source_id INTEGER NOT NULL REFERENCES nodes_v2(id) ON DELETE CASCADE,"
+               "target_id INTEGER NOT NULL REFERENCES nodes_v2(id) ON DELETE CASCADE,"
+               "type TEXT NOT NULL,"
+               "properties TEXT DEFAULT '{}',"
+               "url_path_gen TEXT GENERATED ALWAYS AS "
+               "(json_extract(properties,'$.url_path')),"
+               "origin TEXT NOT NULL DEFAULT 'tree_sitter',"
+               "confidence REAL NOT NULL DEFAULT 1.0,"
+               "evidence TEXT NOT NULL DEFAULT '{}',"
+               "UNIQUE(source_id, target_id, type)"
+               ");";
+    }
+    return "CREATE TABLE IF NOT EXISTS edges ("
+           "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+           "project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+           "source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
+           "target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
+           "type TEXT NOT NULL,"
+           "properties TEXT DEFAULT '{}',"
+           "url_path_gen TEXT GENERATED ALWAYS AS "
+           "(json_extract(properties,'$.url_path')),"
+           "origin TEXT NOT NULL DEFAULT 'tree_sitter',"
+           "confidence REAL NOT NULL DEFAULT 1.0,"
+           "evidence TEXT NOT NULL DEFAULT '{}',"
+           "UNIQUE(source_id, target_id, type)"
+           ");";
+}
+
+static int ensure_project_freshness_columns(cbm_store_t *s) {
+    static const struct {
+        const char *name;
+        const char *ddl;
+    } columns[] = {
+        {"generation",
+         "ALTER TABLE projects ADD COLUMN generation INTEGER NOT NULL DEFAULT 0;"},
+        {"commit_hash", "ALTER TABLE projects ADD COLUMN commit_hash TEXT NOT NULL DEFAULT '';"},
+        {"dirty_fingerprint",
+         "ALTER TABLE projects ADD COLUMN dirty_fingerprint TEXT NOT NULL DEFAULT '';"},
+        {"structural_indexed_at",
+         "ALTER TABLE projects ADD COLUMN structural_indexed_at TEXT NOT NULL DEFAULT '';"},
+        {"derived_indexed_at",
+         "ALTER TABLE projects ADD COLUMN derived_indexed_at TEXT NOT NULL DEFAULT '';"},
+        {"structural_digest",
+         "ALTER TABLE projects ADD COLUMN structural_digest TEXT NOT NULL DEFAULT '';"},
+        {"parser_version",
+         "ALTER TABLE projects ADD COLUMN parser_version TEXT NOT NULL DEFAULT '';"},
+    };
+    for (size_t i = 0; i < sizeof(columns) / sizeof(columns[0]); i++) {
+        if (!table_has_column(s, "projects", columns[i].name) &&
+            exec_sql(s, columns[i].ddl) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    }
+    return CBM_STORE_OK;
+}
+
+static int migrate_v1_graph_tables(cbm_store_t *s) {
+    if (exec_sql(s, "PRAGMA foreign_keys=OFF;") != CBM_STORE_OK ||
+        exec_sql(s, "BEGIN IMMEDIATE;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+
+    int rc = exec_sql(s, nodes_v2_ddl("nodes_v2"));
+    if (rc == CBM_STORE_OK) {
+        rc = exec_sql(
+            s,
+            "INSERT INTO nodes_v2("
+            "id,project,label,name,qualified_name,file_path,start_line,end_line,properties,"
+            "symbol_id,language,signature,origin,confidence)"
+            " SELECT id,project,label,name,qualified_name,file_path,start_line,end_line,properties,"
+            "cbm_symbol_id("
+            "CASE WHEN json_valid(properties) THEN "
+            "COALESCE(json_extract(properties,'$.language'),'') ELSE '' END,"
+            "file_path,start_line,end_line,label,qualified_name,"
+            "CASE WHEN json_valid(properties) THEN "
+            "COALESCE(json_extract(properties,'$.signature'),'') ELSE '' END),"
+            "CASE WHEN json_valid(properties) THEN "
+            "COALESCE(json_extract(properties,'$.language'),'') ELSE '' END,"
+            "CASE WHEN json_valid(properties) THEN "
+            "COALESCE(json_extract(properties,'$.signature'),'') ELSE '' END,"
+            "'tree_sitter',1.0 FROM nodes ORDER BY id;");
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = exec_sql(s, edges_v2_ddl("edges_v2"));
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = exec_sql(s,
+                      "INSERT INTO edges_v2("
+                      "id,project,source_id,target_id,type,properties,origin,confidence,evidence)"
+                      " SELECT id,project,source_id,target_id,type,properties,"
+                      "'tree_sitter',1.0,'{}' FROM edges ORDER BY id;");
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = exec_sql(s,
+                      "DROP TABLE edges;"
+                      "DROP TABLE nodes;"
+                      "ALTER TABLE nodes_v2 RENAME TO nodes;"
+                      "ALTER TABLE edges_v2 RENAME TO edges;");
+    }
+    if (rc == CBM_STORE_OK) {
+        rc = exec_sql(s, "COMMIT;");
+    } else {
+        (void)exec_sql(s, "ROLLBACK;");
+    }
+    (void)exec_sql(s, "PRAGMA foreign_keys=ON;");
+    return rc;
+}
+
+static int ensure_edge_evidence_columns(cbm_store_t *s) {
+    if (!table_has_column(s, "edges", "origin") &&
+        exec_sql(s,
+                 "ALTER TABLE edges ADD COLUMN origin TEXT NOT NULL DEFAULT 'tree_sitter';") !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (!table_has_column(s, "edges", "confidence") &&
+        exec_sql(s, "ALTER TABLE edges ADD COLUMN confidence REAL NOT NULL DEFAULT 1.0;") !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (!table_has_column(s, "edges", "evidence") &&
+        exec_sql(s, "ALTER TABLE edges ADD COLUMN evidence TEXT NOT NULL DEFAULT '{}';") !=
+            CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
 static int init_schema(cbm_store_t *s) {
     const char *ddl =
         "CREATE TABLE IF NOT EXISTS projects ("
         "  name TEXT PRIMARY KEY,"
         "  indexed_at TEXT NOT NULL,"
-        "  root_path TEXT NOT NULL"
+        "  root_path TEXT NOT NULL,"
+        "  generation INTEGER NOT NULL DEFAULT 0,"
+        "  commit_hash TEXT NOT NULL DEFAULT '',"
+        "  dirty_fingerprint TEXT NOT NULL DEFAULT '',"
+        "  structural_indexed_at TEXT NOT NULL DEFAULT '',"
+        "  derived_indexed_at TEXT NOT NULL DEFAULT '',"
+        "  structural_digest TEXT NOT NULL DEFAULT '',"
+        "  parser_version TEXT NOT NULL DEFAULT ''"
         ");"
         "CREATE TABLE IF NOT EXISTS file_hashes ("
         "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
@@ -227,39 +585,41 @@ static int init_schema(cbm_store_t *s) {
         "  size INTEGER NOT NULL DEFAULT 0,"
         "  PRIMARY KEY (project, rel_path)"
         ");"
-        "CREATE TABLE IF NOT EXISTS nodes ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
-        "  label TEXT NOT NULL,"
-        "  name TEXT NOT NULL,"
-        "  qualified_name TEXT NOT NULL,"
-        "  file_path TEXT DEFAULT '',"
-        "  start_line INTEGER DEFAULT 0,"
-        "  end_line INTEGER DEFAULT 0,"
-        "  properties TEXT DEFAULT '{}',"
-        "  UNIQUE(project, qualified_name)"
-        ");"
-        "CREATE TABLE IF NOT EXISTS edges ("
-        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
-        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
-        "  source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
-        "  target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
-        "  type TEXT NOT NULL,"
-        "  properties TEXT DEFAULT '{}',"
-        "  url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),"
-        "  UNIQUE(source_id, target_id, type)"
-        ");"
         "CREATE TABLE IF NOT EXISTS project_summaries ("
         "  project TEXT PRIMARY KEY,"
         "  summary TEXT NOT NULL,"
         "  source_hash TEXT NOT NULL,"
         "  created_at TEXT NOT NULL,"
         "  updated_at TEXT NOT NULL"
+        ");"
+        "CREATE TABLE IF NOT EXISTS code_documents ("
+        "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "  project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "  file_path TEXT NOT NULL,"
+        "  content TEXT NOT NULL,"
+        "  UNIQUE(project, file_path)"
         ");";
 
     int rc = exec_sql(s, ddl);
     if (rc != CBM_STORE_OK) {
         return rc;
+    }
+    if (ensure_project_freshness_columns(s) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    if (table_exists(s, "nodes") && !table_has_column(s, "nodes", "symbol_id")) {
+        if (migrate_v1_graph_tables(s) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    } else {
+        if (exec_sql(s, nodes_v2_ddl("nodes")) != CBM_STORE_OK ||
+            exec_sql(s, edges_v2_ddl("edges")) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+    }
+    if (ensure_edge_evidence_columns(s) != CBM_STORE_OK ||
+        exec_sql(s, "PRAGMA user_version=2;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
     }
 
     /* FTS5 contentless virtual table for BM25 full-text search.
@@ -281,6 +641,42 @@ static int init_schema(cbm_store_t *s) {
             sqlite3_free(fts_err);
         }
     }
+    /* Source-code search uses a content-backed table as the source of truth and
+     * an external-content trigram FTS5 table only as a candidate accelerator.
+     * Regex and short-query searches always scan code_documents in-process, so
+     * a SQLite build without trigram support remains functionally correct. */
+    {
+        char *fts_err = NULL;
+        int fts_rc = sqlite3_exec(
+            s->db,
+            "CREATE VIRTUAL TABLE IF NOT EXISTS code_documents_fts USING fts5("
+            "  content, content='code_documents', content_rowid='id',"
+            "  tokenize='trigram case_sensitive 0'"
+            ");",
+            NULL, NULL, &fts_err);
+        if (fts_rc == SQLITE_OK) {
+            const char *trigger_sql =
+                "CREATE TRIGGER IF NOT EXISTS code_documents_ai AFTER INSERT ON code_documents "
+                "BEGIN "
+                "  INSERT INTO code_documents_fts(rowid, content) VALUES (new.id, new.content);"
+                "END;"
+                "CREATE TRIGGER IF NOT EXISTS code_documents_ad AFTER DELETE ON code_documents "
+                "BEGIN "
+                "  INSERT INTO code_documents_fts(code_documents_fts,rowid,content) "
+                "  VALUES('delete', old.id, old.content);"
+                "END;"
+                "CREATE TRIGGER IF NOT EXISTS code_documents_au AFTER UPDATE ON code_documents "
+                "BEGIN "
+                "  INSERT INTO code_documents_fts(code_documents_fts,rowid,content) "
+                "  VALUES('delete', old.id, old.content);"
+                "  INSERT INTO code_documents_fts(rowid,content) VALUES(new.id,new.content);"
+                "END;";
+            s->code_fts_available = exec_sql(s, trigger_sql) == CBM_STORE_OK;
+        }
+        if (fts_err) {
+            sqlite3_free(fts_err);
+        }
+    }
     return CBM_STORE_OK;
 }
 
@@ -289,6 +685,9 @@ static int create_user_indexes(cbm_store_t *s) {
         "CREATE INDEX IF NOT EXISTS idx_nodes_label ON nodes(project, label);"
         "CREATE INDEX IF NOT EXISTS idx_nodes_name ON nodes(project, name);"
         "CREATE INDEX IF NOT EXISTS idx_nodes_file ON nodes(project, file_path);"
+        "CREATE INDEX IF NOT EXISTS idx_nodes_qn ON nodes(project, qualified_name, symbol_id);"
+        "CREATE INDEX IF NOT EXISTS idx_code_documents_project_path "
+        "ON code_documents(project, file_path);"
         "CREATE INDEX IF NOT EXISTS idx_edges_source ON edges(source_id, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_target ON edges(target_id, type);"
         "CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(project, type);"
@@ -358,6 +757,21 @@ static int configure_pragmas(cbm_store_t *s, bool in_memory) {
         rc = exec_sql(s, mmap_sql);
     }
     return rc;
+}
+
+/* Connection-local settings that are safe for a genuinely read-only query
+ * handle. In particular, do not negotiate journal_mode or checkpoint WAL:
+ * both are writes and belong to indexing/publication handles. */
+static int configure_query_pragmas(cbm_store_t *s) {
+    if (exec_sql(s, "PRAGMA foreign_keys = ON;") != CBM_STORE_OK ||
+        exec_sql(s, "PRAGMA temp_store = MEMORY;") != CBM_STORE_OK ||
+        exec_sql(s, "PRAGMA busy_timeout = 10000;") != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    char mmap_sql[ST_BUF_64];
+    snprintf(mmap_sql, sizeof(mmap_sql), "PRAGMA mmap_size = %lld;",
+             (long long)cbm_store_resolve_mmap_size());
+    return exec_sql(s, mmap_sql);
 }
 
 /* ── camelCase splitter for FTS5 indexing ───────────────────────── */
@@ -437,6 +851,29 @@ static void sqlite_camel_split(sqlite3_context *ctx, int argc, sqlite3_value **a
     }
     buf[len] = '\0';
     sqlite3_result_text(ctx, buf, len, CBM_SQLITE_TRANSIENT);
+}
+
+/* SQL bridge used only by the v1→v2 migration. */
+static void sqlite_symbol_id(sqlite3_context *ctx, int argc, sqlite3_value **argv) {
+    if (argc != ST_COL_7) {
+        sqlite3_result_error(ctx, "cbm_symbol_id expects 7 arguments", CBM_NOT_FOUND);
+        return;
+    }
+    cbm_node_t node = {
+        .language = (const char *)sqlite3_value_text(argv[0]),
+        .file_path = (const char *)sqlite3_value_text(argv[SKIP_ONE]),
+        .start_line = sqlite3_value_int(argv[ST_COL_2]),
+        .end_line = sqlite3_value_int(argv[ST_COL_3]),
+        .label = (const char *)sqlite3_value_text(argv[ST_COL_4]),
+        .qualified_name = (const char *)sqlite3_value_text(argv[ST_COL_5]),
+        .signature = (const char *)sqlite3_value_text(argv[ST_COL_6]),
+    };
+    char symbol_id[CBM_SYMBOL_ID_BUFSZ];
+    if (cbm_store_compute_symbol_id(&node, symbol_id) != CBM_STORE_OK) {
+        sqlite3_result_error_nomem(ctx);
+        return;
+    }
+    sqlite3_result_text(ctx, symbol_id, CBM_SYMBOL_ID_HEX_LEN, CBM_SQLITE_TRANSIENT);
 }
 
 /* ── REGEXP function for SQLite ──────────────────────────────────── */
@@ -592,6 +1029,8 @@ static cbm_store_t *store_open_internal(const char *path, bool in_memory) {
     /* camelCase splitter for FTS5 BM25 indexing */
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_symbol_id", ST_COL_7,
+                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_symbol_id, NULL, NULL);
 
     if (configure_pragmas(s, in_memory) != CBM_STORE_OK || init_schema(s) != CBM_STORE_OK ||
         create_user_indexes(s) != CBM_STORE_OK) {
@@ -615,7 +1054,10 @@ cbm_store_t *cbm_store_open_path(const char *db_path) {
     return store_open_internal(db_path, false);
 }
 
-cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+cbm_store_t *cbm_store_open_path_query_ex(const char *db_path, int *status) {
+    if (status) {
+        *status = CBM_STORE_ERR;
+    }
     if (!db_path) {
         return NULL;
     }
@@ -625,8 +1067,8 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
         return NULL;
     }
 
-    /* Open read-write but do NOT create — returns SQLITE_CANTOPEN if absent. */
-    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READWRITE, NULL);
+    /* Query handles are strictly read-only and never migrate an index. */
+    int rc = sqlite3_open_v2(db_path, &s->db, SQLITE_OPEN_READONLY, NULL);
     if (rc != SQLITE_OK) {
         /* sqlite3_open_v2 allocates a handle even on failure — must close it. */
         sqlite3_close(s->db);
@@ -635,6 +1077,24 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
     }
 
     s->db_path = heap_strdup(db_path);
+
+    sqlite3_stmt *version_stmt = NULL;
+    int schema_version = 0;
+    if (sqlite3_prepare_v2(s->db, "PRAGMA user_version", CBM_NOT_FOUND, &version_stmt, NULL) ==
+            SQLITE_OK &&
+        sqlite3_step(version_stmt) == SQLITE_ROW) {
+        schema_version = sqlite3_column_int(version_stmt, 0);
+    }
+    sqlite3_finalize(version_stmt);
+    if (schema_version < CBM_STORE_SCHEMA_VERSION) {
+        sqlite3_close(s->db);
+        safe_str_free(&s->db_path);
+        free(s);
+        if (status) {
+            *status = CBM_STORE_MIGRATION_REQUIRED;
+        }
+        return NULL;
+    }
 
     /* Security: block ATTACH/DETACH to prevent file creation via SQL injection. */
     sqlite3_set_authorizer(s->db, store_authorizer, NULL);
@@ -648,15 +1108,25 @@ cbm_store_t *cbm_store_open_path_query(const char *db_path) {
                             NULL, sqlite_cosine_i8, NULL, NULL);
     sqlite3_create_function(s->db, "cbm_camel_split", SKIP_ONE, SQLITE_UTF8 | SQLITE_DETERMINISTIC,
                             NULL, sqlite_camel_split, NULL, NULL);
+    sqlite3_create_function(s->db, "cbm_symbol_id", ST_COL_7,
+                            SQLITE_UTF8 | SQLITE_DETERMINISTIC, NULL, sqlite_symbol_id, NULL, NULL);
 
-    if (configure_pragmas(s, false) != CBM_STORE_OK) {
+    if (configure_query_pragmas(s) != CBM_STORE_OK) {
         sqlite3_close(s->db);
         safe_str_free(&s->db_path);
         free(s);
         return NULL;
     }
 
+    s->code_fts_available = table_exists(s, "code_documents_fts");
+    if (status) {
+        *status = CBM_STORE_OK;
+    }
     return s;
+}
+
+cbm_store_t *cbm_store_open_path_query(const char *db_path) {
+    return cbm_store_open_path_query_ex(db_path, NULL);
 }
 
 /* ── Integrity check ───────────────────────────────────────────── */
@@ -754,6 +1224,7 @@ void cbm_store_close(cbm_store_t *s) {
     finalize_stmt(&s->stmt_find_node_by_qn_any);
     finalize_stmt(&s->stmt_find_nodes_by_name);
     finalize_stmt(&s->stmt_find_nodes_by_name_any);
+    finalize_stmt(&s->stmt_find_nodes_by_project);
     finalize_stmt(&s->stmt_find_nodes_by_label);
     finalize_stmt(&s->stmt_find_nodes_by_file);
     finalize_stmt(&s->stmt_count_nodes);
@@ -843,6 +1314,7 @@ int cbm_store_drop_indexes(cbm_store_t *s) {
     return exec_sql(s, "DROP INDEX IF EXISTS idx_nodes_label;"
                        "DROP INDEX IF EXISTS idx_nodes_name;"
                        "DROP INDEX IF EXISTS idx_nodes_file;"
+                       "DROP INDEX IF EXISTS idx_nodes_qn;"
                        "DROP INDEX IF EXISTS idx_edges_source;"
                        "DROP INDEX IF EXISTS idx_edges_target;"
                        "DROP INDEX IF EXISTS idx_edges_type;"
@@ -945,8 +1417,11 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path) {
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_project,
-                       "INSERT INTO projects (name, indexed_at, root_path) VALUES (?1, ?2, ?3) "
-                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3;");
+                       "INSERT INTO projects "
+                       "(name, indexed_at, root_path, structural_indexed_at) "
+                       "VALUES (?1, ?2, ?3, ?2) "
+                       "ON CONFLICT(name) DO UPDATE SET indexed_at=?2, root_path=?3, "
+                       "structural_indexed_at=?2;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -966,10 +1441,270 @@ int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_
     return CBM_STORE_OK;
 }
 
+int cbm_store_upsert_code_document(cbm_store_t *s, const char *project, const char *file_path,
+                                   const char *content) {
+    if (!s || !project || !file_path || !content) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql = "INSERT INTO code_documents(project,file_path,content) VALUES(?1,?2,?3) "
+                      "ON CONFLICT(project,file_path) DO UPDATE SET content=excluded.content";
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "upsert_code_document");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    bind_text(stmt, 2, file_path);
+    bind_text(stmt, 3, content);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "upsert_code_document");
+        return CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_delete_code_document(cbm_store_t *s, const char *project, const char *file_path) {
+    if (!s || !project || !file_path) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                          "DELETE FROM code_documents WHERE project=?1 AND file_path=?2", -1,
+                          &stmt, NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    bind_text(stmt, 2, file_path);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+int cbm_store_delete_code_documents(cbm_store_t *s, const char *project) {
+    if (!s || !project) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, "DELETE FROM code_documents WHERE project=?1", -1, &stmt,
+                          NULL) != SQLITE_OK) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, 1, project);
+    int rc = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    return rc == SQLITE_DONE ? CBM_STORE_OK : CBM_STORE_ERR;
+}
+
+void cbm_store_code_search_free(cbm_code_search_output_t *out) {
+    if (!out) {
+        return;
+    }
+    for (int i = 0; i < out->count; i++) {
+        free(out->matches[i].file_path);
+        free(out->matches[i].content);
+    }
+    free(out->matches);
+    memset(out, 0, sizeof(*out));
+}
+
+int cbm_store_code_search(cbm_store_t *s, const cbm_code_search_params_t *params,
+                          cbm_code_search_output_t *out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!s || !params || !params->project || !params->pattern || !params->pattern[0] ||
+        params->cursor < 0 || params->limit < 0) {
+        return CBM_STORE_ERR;
+    }
+    cbm_regex_t pattern_re, path_re;
+    bool have_pattern = false, have_path = false;
+    sqlite3_stmt *stmt = NULL;
+    int result = CBM_STORE_ERR;
+    if (params->regex) {
+        int flags = CBM_REG_EXTENDED | CBM_REG_NOSUB;
+        if (!params->case_sensitive) {
+            flags |= CBM_REG_ICASE;
+        }
+        if (cbm_regcomp(&pattern_re, params->pattern, flags) != 0) {
+            store_set_error(s, "invalid code search regex");
+            goto done;
+        }
+        have_pattern = true;
+    }
+    if (params->path_filter && params->path_filter[0]) {
+        if (cbm_regcomp(&path_re, params->path_filter, CBM_REG_EXTENDED | CBM_REG_NOSUB) != 0) {
+            store_set_error(s, "invalid code search path regex");
+            goto done;
+        }
+        have_path = true;
+    }
+    const char *sql = "SELECT file_path,content FROM code_documents WHERE project=?1 "
+                      "AND (?2 IS NULL OR file_path GLOB ?2) ORDER BY file_path";
+    if (sqlite3_prepare_v2(s->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "code_search");
+        goto done;
+    }
+    bind_text(stmt, 1, params->project);
+    if (params->file_pattern && params->file_pattern[0]) {
+        bind_text(stmt, 2, params->file_pattern);
+    }
+    int limit = params->limit ? params->limit : 100;
+    int total = 0;
+    int rc;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        const char *path = (const char *)sqlite3_column_text(stmt, 0);
+        const char *content = (const char *)sqlite3_column_text(stmt, 1);
+        if (have_path && cbm_regexec(&path_re, path, 0, NULL, 0) != 0) {
+            continue;
+        }
+        int line_number = 1;
+        while (*content) {
+            const char *end = strchr(content, '\n');
+            size_t len = end ? (size_t)(end - content) : strlen(content);
+            char *line = malloc(len + 1);
+            if (!line) {
+                goto done;
+            }
+            memcpy(line, content, len);
+            line[len] = '\0';
+            bool match = have_pattern ? cbm_regexec(&pattern_re, line, 0, NULL, 0) == 0
+                                     : (params->case_sensitive
+                                            ? strstr(line, params->pattern) != NULL
+                                            : cbm_strcasestr(line, params->pattern) != NULL);
+            if (match && total++ >= params->cursor) {
+                if (out->count < limit) {
+                    cbm_code_match_t *grown =
+                        realloc(out->matches, ((size_t)out->count + 1) * sizeof(*grown));
+                    if (!grown) {
+                        free(line);
+                        goto done;
+                    }
+                    out->matches = grown;
+                    char *path_copy = strdup(path);
+                    if (!path_copy) {
+                        free(line);
+                        goto done;
+                    }
+                    out->matches[out->count++] = (cbm_code_match_t){
+                        .file_path = path_copy, .line = line_number, .content = line};
+                    line = NULL;
+                } else {
+                    out->has_more = true;
+                    if (!params->include_total) {
+                        free(line);
+                        goto success;
+                    }
+                }
+            }
+            free(line);
+            if (!end) {
+                break;
+            }
+            content = end + 1;
+            line_number++;
+        }
+    }
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "code_search");
+        goto done;
+    }
+success:
+    out->total = params->include_total ? total : -1;
+    out->next_cursor = out->has_more ? params->cursor + out->count : 0;
+    result = CBM_STORE_OK;
+done:
+    sqlite3_finalize(stmt);
+    if (have_pattern) {
+        cbm_regfree(&pattern_re);
+    }
+    if (have_path) {
+        cbm_regfree(&path_re);
+    }
+    if (result != CBM_STORE_OK) {
+        cbm_store_code_search_free(out);
+    }
+    return result;
+}
+
+int cbm_store_set_project_freshness(cbm_store_t *s, const char *name, int64_t generation,
+                                    const char *commit_hash, const char *dirty_fingerprint,
+                                    const char *structural_indexed_at,
+                                    const char *derived_indexed_at) {
+    if (!s || !s->db || !name) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    const char *sql =
+        "UPDATE projects SET generation=?2, commit_hash=?3, dirty_fingerprint=?4, "
+        "structural_indexed_at=?5, derived_indexed_at=?6 WHERE name=?1;";
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "set_project_freshness prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, name);
+    sqlite3_bind_int64(stmt, ST_COL_2, generation);
+    bind_text(stmt, ST_COL_3, safe_str(commit_hash));
+    bind_text(stmt, ST_COL_4, safe_str(dirty_fingerprint));
+    bind_text(stmt, ST_COL_5, safe_str(structural_indexed_at));
+    bind_text(stmt, ST_COL_6, safe_str(derived_indexed_at));
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE || sqlite3_changes(s->db) == 0) {
+        store_set_error(s, "set_project_freshness: project not found");
+        return step == SQLITE_DONE ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+int cbm_store_set_project_structural_metadata(cbm_store_t *s, const char *name,
+                                              const char *structural_digest,
+                                              const char *parser_version) {
+    if (!s || !s->db || !name) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db,
+                           "UPDATE projects SET structural_digest=?2, parser_version=?3 "
+                           "WHERE name=?1;",
+                           CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "set_project_structural_metadata prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, name);
+    bind_text(stmt, ST_COL_2, safe_str(structural_digest));
+    bind_text(stmt, ST_COL_3, safe_str(parser_version));
+    int step = sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE || sqlite3_changes(s->db) == 0) {
+        return step == SQLITE_DONE ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
+    }
+    return CBM_STORE_OK;
+}
+
+static void scan_project(sqlite3_stmt *stmt, cbm_project_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
+    out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
+    out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_2));
+    out->generation = sqlite3_column_int64(stmt, ST_COL_3);
+    out->commit_hash = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_4));
+    out->dirty_fingerprint = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_5));
+    out->structural_indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_6));
+    out->derived_indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_7));
+    out->structural_digest = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
+    out->parser_version = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_9));
+}
+
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_project,
-                       "SELECT name, indexed_at, root_path FROM projects WHERE name = ?1;");
+                       "SELECT name, indexed_at, root_path, generation, commit_hash, "
+                       "dirty_fingerprint, structural_indexed_at, derived_indexed_at, "
+                       "structural_digest, parser_version "
+                       "FROM projects WHERE name = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -977,9 +1712,7 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
     bind_text(stmt, SKIP_ONE, name);
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
-        out->name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        out->indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        out->root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        scan_project(stmt, out);
         return CBM_STORE_OK;
     }
     return CBM_STORE_NOT_FOUND;
@@ -988,7 +1721,10 @@ int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) 
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_list_projects,
-                       "SELECT name, indexed_at, root_path FROM projects ORDER BY name;");
+                       "SELECT name, indexed_at, root_path, generation, commit_hash, "
+                       "dirty_fingerprint, structural_indexed_at, derived_indexed_at, "
+                       "structural_digest, parser_version "
+                       "FROM projects ORDER BY name;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1003,9 +1739,7 @@ int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count) {
             cap *= ST_GROWTH;
             arr = safe_realloc(arr, cap * sizeof(cbm_project_t));
         }
-        arr[n].name = heap_strdup((const char *)sqlite3_column_text(stmt, 0));
-        arr[n].indexed_at = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
-        arr[n].root_path = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
+        scan_project(stmt, &arr[n]);
         n++;
     }
 
@@ -1032,14 +1766,56 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name) {
 
 /* ── Node CRUD ──────────────────────────────────────────────────── */
 
+static bool valid_symbol_id(const char *symbol_id) {
+    if (!symbol_id || strlen(symbol_id) != CBM_SYMBOL_ID_HEX_LEN) {
+        return false;
+    }
+    for (int i = 0; i < CBM_SYMBOL_ID_HEX_LEN; i++) {
+        char ch = symbol_id[i];
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+#define NODE_SELECT_COLUMNS                                                                    \
+    "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, "       \
+    "properties, "                                                                              \
+    "symbol_id, language, signature, origin, confidence"
+#define NODE_SELECT_COLUMNS_N                                                                     \
+    "SELECT n.id, n.project, n.label, n.name, n.qualified_name, n.file_path, n.start_line, "      \
+    "n.end_line, n.properties, n.symbol_id, n.language, n.signature, n.origin, n.confidence"
+
 int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
+    if (!s || !s->db || !n) {
+        return CBM_STORE_ERR;
+    }
+    char computed_id[CBM_SYMBOL_ID_BUFSZ];
+    const char *symbol_id = n->symbol_id;
+    if (!valid_symbol_id(symbol_id)) {
+        bool legacy_identity = !n->signature || n->signature[0] == '\0';
+        cbm_node_t existing = {0};
+        if (legacy_identity && n->project && n->qualified_name &&
+            cbm_store_find_node_by_qn(s, n->project, n->qualified_name, &existing) ==
+                CBM_STORE_OK) {
+            snprintf(computed_id, sizeof(computed_id), "%s", safe_str(existing.symbol_id));
+            cbm_node_free_fields(&existing);
+        } else if (cbm_store_compute_symbol_id(n, computed_id) != CBM_STORE_OK) {
+            return CBM_STORE_ERR;
+        }
+        symbol_id = computed_id;
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_upsert_node,
                        "INSERT INTO nodes (project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties) "
-                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) "
-                       "ON CONFLICT(project, qualified_name) DO UPDATE SET "
-                       "label=?2, name=?3, file_path=?5, start_line=?6, end_line=?7, properties=?8 "
+                       "start_line, end_line, properties, symbol_id, language, signature, "
+                       "origin, confidence) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) "
+                       "ON CONFLICT(project, symbol_id) DO UPDATE SET "
+                       "label=?2, name=?3, qualified_name=?4, file_path=?5, start_line=?6, "
+                       "end_line=?7, properties=?8, language=?10, signature=?11, origin=?12, "
+                       "confidence=?13 "
                        "RETURNING id;");
     if (!stmt) {
         return CBM_STORE_ERR;
@@ -1053,6 +1829,11 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
     sqlite3_bind_int(stmt, ST_COL_6, n->start_line);
     sqlite3_bind_int(stmt, ST_COL_7, n->end_line);
     bind_text(stmt, ST_COL_8, safe_props(n->properties_json));
+    bind_text(stmt, ST_COL_9, symbol_id);
+    bind_text(stmt, ST_COL_10, safe_str(n->language));
+    bind_text(stmt, ST_COL_11, safe_str(n->signature));
+    bind_text(stmt, ST_COL_12, safe_origin(n->origin));
+    sqlite3_bind_double(stmt, ST_COL_13, safe_confidence(n->confidence));
 
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
@@ -1067,6 +1848,7 @@ int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n) {
 
 /* Scan a node from current row of stmt. Heap-allocates strings. */
 static void scan_node(sqlite3_stmt *stmt, cbm_node_t *n) {
+    memset(n, 0, sizeof(*n));
     n->id = sqlite3_column_int64(stmt, 0);
     n->project = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
     n->label = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_2));
@@ -1076,13 +1858,17 @@ static void scan_node(sqlite3_stmt *stmt, cbm_node_t *n) {
     n->start_line = sqlite3_column_int(stmt, CBM_SZ_6);
     n->end_line = sqlite3_column_int(stmt, CBM_SZ_7);
     n->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
+    n->symbol_id = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_9));
+    n->language = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_10));
+    n->signature = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_11));
+    n->origin = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_12));
+    n->confidence = sqlite3_column_double(stmt, ST_COL_13);
 }
 
 int cbm_store_find_node_by_id(cbm_store_t *s, int64_t id, cbm_node_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_node_by_id,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes WHERE id = ?1;");
+                       NODE_SELECT_COLUMNS " FROM nodes WHERE id = ?1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1103,9 +1889,9 @@ int cbm_store_find_node_by_qn(cbm_store_t *s, const char *project, const char *q
     }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_node_by_qn,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
-                       "WHERE project = ?1 AND qualified_name = ?2;");
+                       NODE_SELECT_COLUMNS " FROM nodes "
+                                           "WHERE project = ?1 AND qualified_name = ?2 "
+                                           "ORDER BY symbol_id LIMIT 1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1126,9 +1912,9 @@ int cbm_store_find_node_by_qn_any(cbm_store_t *s, const char *qn, cbm_node_t *ou
     }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_node_by_qn_any,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
-                       "WHERE qualified_name = ?1 LIMIT 1;");
+                       NODE_SELECT_COLUMNS " FROM nodes "
+                                           "WHERE qualified_name = ?1 "
+                                           "ORDER BY project, symbol_id LIMIT 1;");
     if (!stmt) {
         return CBM_STORE_ERR;
     }
@@ -1151,9 +1937,8 @@ int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_
     }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_find_nodes_by_name_any,
-                       "SELECT id, project, label, name, qualified_name, file_path, "
-                       "start_line, end_line, properties FROM nodes "
-                       "WHERE name = ?1;");
+                       NODE_SELECT_COLUMNS " FROM nodes WHERE name = ?1 "
+                                           "ORDER BY project, symbol_id;");
     if (!stmt) {
         *out = NULL;
         *count = 0;
@@ -1173,6 +1958,54 @@ int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_
         scan_node(stmt, &arr[n]);
         n++;
     }
+    *out = arr;
+    *count = n;
+    return CBM_STORE_OK;
+}
+
+int cbm_store_find_nodes_by_project(cbm_store_t *s, const char *project, cbm_node_t **out,
+                                    int *count) {
+    if (!out || !count) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !project) {
+        return CBM_STORE_ERR;
+    }
+
+    sqlite3_stmt *stmt =
+        prepare_cached(s, &s->stmt_find_nodes_by_project,
+                       NODE_SELECT_COLUMNS " FROM nodes WHERE project = ?1 ORDER BY symbol_id;");
+    if (!stmt) {
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_t *arr = malloc((size_t)cap * sizeof(cbm_node_t));
+    if (!arr) {
+        return CBM_STORE_ERR;
+    }
+    int rc = SQLITE_ROW;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            arr = safe_realloc(arr, (size_t)cap * sizeof(cbm_node_t));
+        }
+        scan_node(stmt, &arr[n]);
+        n++;
+    }
+    if (rc != SQLITE_DONE) {
+        for (int i = 0; i < n; i++) {
+            cbm_node_free_fields(&arr[i]);
+        }
+        free(arr);
+        store_set_error_sqlite(s, "find_nodes_by_project");
+        return CBM_STORE_ERR;
+    }
+
     *out = arr;
     *count = n;
     return CBM_STORE_OK;
@@ -1241,28 +2074,91 @@ static int find_nodes_generic(cbm_store_t *s, sqlite3_stmt **slot, const char *s
 int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char *name,
                                  cbm_node_t **out, int *count) {
     return find_nodes_generic(s, &s->stmt_find_nodes_by_name,
-                              "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
-                              "WHERE project = ?1 AND name = ?2;",
+                              NODE_SELECT_COLUMNS " FROM nodes "
+                                                  "WHERE project = ?1 AND name = ?2 "
+                                                  "ORDER BY symbol_id;",
                               project, name, out, count);
 }
 
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
                                   cbm_node_t **out, int *count) {
     return find_nodes_generic(s, &s->stmt_find_nodes_by_label,
-                              "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
-                              "WHERE project = ?1 AND label = ?2;",
+                              NODE_SELECT_COLUMNS " FROM nodes "
+                                                  "WHERE project = ?1 AND label = ?2 "
+                                                  "ORDER BY symbol_id;",
                               project, label, out, count);
 }
 
 int cbm_store_find_nodes_by_file(cbm_store_t *s, const char *project, const char *file_path,
                                  cbm_node_t **out, int *count) {
     return find_nodes_generic(s, &s->stmt_find_nodes_by_file,
-                              "SELECT id, project, label, name, qualified_name, file_path, "
-                              "start_line, end_line, properties FROM nodes "
-                              "WHERE project = ?1 AND file_path = ?2;",
+                              NODE_SELECT_COLUMNS " FROM nodes "
+                                                  "WHERE project = ?1 AND file_path = ?2 "
+                                                  "ORDER BY start_line, symbol_id;",
                               project, file_path, out, count);
+}
+
+int cbm_store_find_nodes_by_files(cbm_store_t *s, const char *project, const char **file_paths,
+                                  int file_count, cbm_node_t **out, int *count) {
+    if (out) {
+        *out = NULL;
+    }
+    if (count) {
+        *count = 0;
+    }
+    if (!s || !s->db || !project || !file_paths || file_count <= 0 || !out || !count) {
+        return CBM_STORE_ERR;
+    }
+
+    char sql[ST_SQL_BUF];
+    int pos = snprintf(sql, sizeof(sql), "%s FROM nodes n WHERE n.project=?1 "
+                                               "AND n.file_path IN (",
+                       NODE_SELECT_COLUMNS_N);
+    for (int i = 0; i < file_count; i++) {
+        pos += snprintf(sql + pos, sizeof(sql) - (size_t)pos, "%s?%d", i ? "," : "", i + 2);
+        if (pos < 0 || pos >= (int)sizeof(sql) - ST_IN_CLAUSE_MARGIN) {
+            store_set_error(s, "too many file paths for batch query");
+            return CBM_STORE_ERR;
+        }
+    }
+    (void)snprintf(sql + pos, sizeof(sql) - (size_t)pos,
+                   ") ORDER BY n.file_path,n.start_line,n.end_line,n.symbol_id,n.id");
+
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "find_nodes_by_files prepare");
+        return CBM_STORE_ERR;
+    }
+    bind_text(stmt, SKIP_ONE, project);
+    for (int i = 0; i < file_count; i++) {
+        bind_text(stmt, i + ST_COL_2, file_paths[i]);
+    }
+
+    int cap = ST_INIT_CAP_16;
+    int n = 0;
+    cbm_node_t *nodes = malloc((size_t)cap * sizeof(*nodes));
+    if (!nodes) {
+        sqlite3_finalize(stmt);
+        return CBM_STORE_ERR;
+    }
+    int step = SQLITE_DONE;
+    while ((step = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (n >= cap) {
+            cap *= ST_GROWTH;
+            nodes = safe_realloc(nodes, (size_t)cap * sizeof(*nodes));
+        }
+        memset(&nodes[n], 0, sizeof(nodes[n]));
+        scan_node(stmt, &nodes[n++]);
+    }
+    sqlite3_finalize(stmt);
+    if (step != SQLITE_DONE) {
+        cbm_store_free_nodes(nodes, n);
+        store_set_error_sqlite(s, "find_nodes_by_files step");
+        return CBM_STORE_ERR;
+    }
+    *out = nodes;
+    *count = n;
+    return CBM_STORE_OK;
 }
 
 int cbm_store_count_nodes(cbm_store_t *s, const char *project) {
@@ -1354,13 +2250,22 @@ int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int cou
 
 /* ── Edge CRUD ──────────────────────────────────────────────────── */
 
+#define EDGE_SELECT_COLUMNS                                                               \
+    "SELECT id, project, source_id, target_id, type, properties, origin, confidence, "   \
+    "evidence"
+
 int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
+    if (!s || !s->db || !e) {
+        return CBM_STORE_ERR;
+    }
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_insert_edge,
-                       "INSERT INTO edges (project, source_id, target_id, type, properties) "
-                       "VALUES (?1, ?2, ?3, ?4, ?5) "
+                       "INSERT INTO edges (project, source_id, target_id, type, properties, "
+                       "origin, confidence, evidence) "
+                       "VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) "
                        "ON CONFLICT(source_id, target_id, type) DO UPDATE SET "
-                       "properties = json_patch(properties, ?5) "
+                       "properties=json_patch(properties, ?5), origin=?6, confidence=?7, "
+                       "evidence=?8 "
                        "RETURNING id;");
     if (!stmt) {
         return CBM_STORE_ERR;
@@ -1371,6 +2276,9 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
     sqlite3_bind_int64(stmt, CBM_SZ_3, e->target_id);
     bind_text(stmt, ST_COL_4, safe_str(e->type));
     bind_text(stmt, ST_COL_5, safe_props(e->properties_json));
+    bind_text(stmt, ST_COL_6, safe_origin(e->origin));
+    sqlite3_bind_double(stmt, ST_COL_7, safe_confidence(e->confidence));
+    bind_text(stmt, ST_COL_8, safe_props(e->evidence_json));
 
     int rc = sqlite3_step(stmt);
     if (rc == SQLITE_ROW) {
@@ -1385,12 +2293,16 @@ int64_t cbm_store_insert_edge(cbm_store_t *s, const cbm_edge_t *e) {
 
 /* Scan an edge from current row of stmt. */
 static void scan_edge(sqlite3_stmt *stmt, cbm_edge_t *e) {
+    memset(e, 0, sizeof(*e));
     e->id = sqlite3_column_int64(stmt, 0);
     e->project = heap_strdup((const char *)sqlite3_column_text(stmt, SKIP_ONE));
     e->source_id = sqlite3_column_int64(stmt, CBM_SZ_2);
     e->target_id = sqlite3_column_int64(stmt, CBM_SZ_3);
     e->type = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_4));
     e->properties_json = heap_strdup((const char *)sqlite3_column_text(stmt, CBM_SZ_5));
+    e->origin = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_6));
+    e->confidence = sqlite3_column_double(stmt, ST_COL_7);
+    e->evidence_json = heap_strdup((const char *)sqlite3_column_text(stmt, ST_COL_8));
 }
 
 /* Generic: find multiple edges by a filter. */
@@ -1461,8 +2373,8 @@ int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t
                                    int *count) {
     bind_id_t b = {source_id};
     return find_edges_generic(s, &s->stmt_find_edges_by_source,
-                              "SELECT id, project, source_id, target_id, type, properties "
-                              "FROM edges WHERE source_id = ?1;",
+                              EDGE_SELECT_COLUMNS " FROM edges WHERE source_id = ?1 "
+                                                  "ORDER BY id;",
                               bind_source_id, &b, out, count);
 }
 
@@ -1470,8 +2382,8 @@ int cbm_store_find_edges_by_target(cbm_store_t *s, int64_t target_id, cbm_edge_t
                                    int *count) {
     bind_id_t b = {target_id};
     return find_edges_generic(s, &s->stmt_find_edges_by_target,
-                              "SELECT id, project, source_id, target_id, type, properties "
-                              "FROM edges WHERE target_id = ?1;",
+                              EDGE_SELECT_COLUMNS " FROM edges WHERE target_id = ?1 "
+                                                  "ORDER BY id;",
                               bind_source_id, &b, out, count);
 }
 
@@ -1479,8 +2391,9 @@ int cbm_store_find_edges_by_source_type(cbm_store_t *s, int64_t source_id, const
                                         cbm_edge_t **out, int *count) {
     bind_id_type_t b = {source_id, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_source_type,
-                              "SELECT id, project, source_id, target_id, type, properties "
-                              "FROM edges WHERE source_id = ?1 AND type = ?2;",
+                              EDGE_SELECT_COLUMNS " FROM edges "
+                                                  "WHERE source_id = ?1 AND type = ?2 "
+                                                  "ORDER BY id;",
                               bind_id_and_type, &b, out, count);
 }
 
@@ -1488,8 +2401,9 @@ int cbm_store_find_edges_by_target_type(cbm_store_t *s, int64_t target_id, const
                                         cbm_edge_t **out, int *count) {
     bind_id_type_t b = {target_id, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_target_type,
-                              "SELECT id, project, source_id, target_id, type, properties "
-                              "FROM edges WHERE target_id = ?1 AND type = ?2;",
+                              EDGE_SELECT_COLUMNS " FROM edges "
+                                                  "WHERE target_id = ?1 AND type = ?2 "
+                                                  "ORDER BY id;",
                               bind_id_and_type, &b, out, count);
 }
 
@@ -1497,8 +2411,9 @@ int cbm_store_find_edges_by_type(cbm_store_t *s, const char *project, const char
                                  cbm_edge_t **out, int *count) {
     bind_proj_type_t b = {project, type};
     return find_edges_generic(s, &s->stmt_find_edges_by_type,
-                              "SELECT id, project, source_id, target_id, type, properties "
-                              "FROM edges WHERE project = ?1 AND type = ?2;",
+                              EDGE_SELECT_COLUMNS " FROM edges "
+                                                  "WHERE project = ?1 AND type = ?2 "
+                                                  "ORDER BY id;",
                               bind_proj_and_type, &b, out, count);
 }
 
@@ -1684,12 +2599,11 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
                                          int *count) {
     *out = NULL;
     *count = 0;
-    const char *sql = "SELECT id, project, label, name, qualified_name, file_path, "
-                      "start_line, end_line, properties FROM nodes "
+    const char *sql = NODE_SELECT_COLUMNS " FROM nodes "
                       "WHERE project = ?1 AND file_path = ?2 "
                       "AND label NOT IN ('Module', 'Package', 'File', 'Folder') "
                       "AND start_line <= ?4 AND end_line >= ?3 "
-                      "ORDER BY start_line";
+                      "ORDER BY start_line, symbol_id";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
@@ -1735,12 +2649,14 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
     snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
 
     const char *sql_with_project =
-        "SELECT id, project, label, name, qualified_name, file_path, "
-        "start_line, end_line, properties FROM nodes "
-        "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
-    const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
-                          "start_line, end_line, properties FROM nodes "
-                          "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2)";
+        NODE_SELECT_COLUMNS " FROM nodes "
+                            "WHERE project = ?1 AND "
+                            "(qualified_name LIKE ?2 OR qualified_name = ?3) "
+                            "ORDER BY symbol_id";
+    const char *sql_any = NODE_SELECT_COLUMNS " FROM nodes "
+                                             "WHERE "
+                                             "(qualified_name LIKE ?1 OR qualified_name = ?2) "
+                                             "ORDER BY project, symbol_id";
 
     sqlite3_stmt *stmt = NULL;
     int rc =
@@ -2017,8 +2933,9 @@ int cbm_store_find_edges_by_url_path(cbm_store_t *s, const char *project, const 
     char like_pattern[CBM_SZ_512];
     snprintf(like_pattern, sizeof(like_pattern), "%%\"url_path\":\"%%%s%%\"%%", keyword);
 
-    const char *sql = "SELECT id, project, source_id, target_id, type, properties FROM edges "
-                      "WHERE project = ?1 AND properties LIKE ?2";
+    const char *sql = EDGE_SELECT_COLUMNS " FROM edges "
+                                         "WHERE project = ?1 AND properties LIKE ?2 "
+                                         "ORDER BY id";
 
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(s->db, sql, CBM_NOT_FOUND, &stmt, NULL);
@@ -2445,8 +3362,7 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
     char count_sql[CBM_SZ_4K];
     int bind_idx = 0;
 
-    const char *select_cols = "SELECT n.id, n.project, n.label, n.name, n.qualified_name, "
-                              "n.file_path, n.start_line, n.end_line, n.properties, "
+    const char *select_cols = NODE_SELECT_COLUMNS_N ", "
                               "(SELECT COUNT(*) FROM edges e WHERE e.target_id = n.id AND "
                               "e.type IN ('CALLS', 'USAGE')) AS in_deg, "
                               "(SELECT COUNT(*) FROM edges e WHERE e.source_id = n.id AND "
@@ -2527,8 +3443,8 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
         }
         memset(&results[n], 0, sizeof(cbm_search_result_t));
         scan_node(main_stmt, &results[n].node);
-        results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_9);
-        results[n].out_degree = sqlite3_column_int(main_stmt, CBM_DECIMAL_BASE);
+        results[n].in_degree = sqlite3_column_int(main_stmt, ST_COL_14);
+        results[n].out_degree = sqlite3_column_int(main_stmt, ST_COL_15);
         n++;
     }
 
@@ -2546,12 +3462,7 @@ void cbm_store_search_free(cbm_search_output_t *out) {
     }
     for (int i = 0; i < out->count; i++) {
         cbm_search_result_t *r = &out->results[i];
-        safe_str_free(&r->node.project);
-        safe_str_free(&r->node.label);
-        safe_str_free(&r->node.name);
-        safe_str_free(&r->node.qualified_name);
-        safe_str_free(&r->node.file_path);
-        safe_str_free(&r->node.properties_json);
+        cbm_node_free_fields(&r->node);
         for (int j = 0; j < r->connected_count; j++) {
             safe_str_free(&r->connected_names[j]);
         }
@@ -2583,7 +3494,7 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
 
     char edge_sql[ST_SQL_BUF];
     snprintf(edge_sql, sizeof(edge_sql),
-             "SELECT n1.name, n2.name, e.type "
+             "SELECT n1.name, n2.name, e.type, e.confidence "
              "FROM edges e "
              "JOIN nodes n1 ON n1.id = e.source_id "
              "JOIN nodes n2 ON n2.id = e.target_id "
@@ -2619,7 +3530,7 @@ static int bfs_collect_edges(cbm_store_t *s, int64_t start_id, const cbm_node_ho
         edges[en].from_name = heap_strdup((const char *)sqlite3_column_text(estmt, 0));
         edges[en].to_name = heap_strdup((const char *)sqlite3_column_text(estmt, SKIP_ONE));
         edges[en].type = heap_strdup((const char *)sqlite3_column_text(estmt, CBM_SZ_2));
-        edges[en].confidence = (double)SKIP_ONE;
+        edges[en].confidence = sqlite3_column_double(estmt, ST_COL_3);
         en++;
     }
     sqlite3_finalize(estmt);
@@ -2688,7 +3599,8 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
              "  WHERE e.type IN (%s) AND bfs.hop < %d"
              ")"
              "SELECT DISTINCT n.id, n.project, n.label, n.name, n.qualified_name, "
-             "n.file_path, n.start_line, n.end_line, n.properties, bfs.hop "
+             "n.file_path, n.start_line, n.end_line, n.properties, n.symbol_id, "
+             "n.language, n.signature, n.origin, n.confidence, bfs.hop "
              "FROM bfs "
              "JOIN nodes n ON n.id = bfs.node_id "
              "WHERE bfs.hop > 0 " /* exclude root */
@@ -2722,7 +3634,7 @@ int cbm_store_bfs(cbm_store_t *s, int64_t start_id, const char *direction, const
             visited = safe_realloc(visited, cap * sizeof(cbm_node_hop_t));
         }
         scan_node(stmt, &visited[n].node);
-        visited[n].hop = sqlite3_column_int(stmt, ST_COL_9);
+        visited[n].hop = sqlite3_column_int(stmt, ST_COL_14);
         n++;
     }
 
@@ -2748,22 +3660,12 @@ void cbm_store_traverse_free(cbm_traverse_result_t *out) {
         return;
     }
     /* Free root */
-    safe_str_free(&out->root.project);
-    safe_str_free(&out->root.label);
-    safe_str_free(&out->root.name);
-    safe_str_free(&out->root.qualified_name);
-    safe_str_free(&out->root.file_path);
-    safe_str_free(&out->root.properties_json);
+    cbm_node_free_fields(&out->root);
 
     /* Free visited */
     for (int i = 0; i < out->visited_count; i++) {
         cbm_node_hop_t *h = &out->visited[i];
-        safe_str_free(&h->node.project);
-        safe_str_free(&h->node.label);
-        safe_str_free(&h->node.name);
-        safe_str_free(&h->node.qualified_name);
-        safe_str_free(&h->node.file_path);
-        safe_str_free(&h->node.properties_json);
+        cbm_node_free_fields(&h->node);
     }
     free(out->visited);
 
@@ -5515,6 +6417,10 @@ void cbm_node_free_fields(cbm_node_t *n) {
     safe_str_free(&n->qualified_name);
     safe_str_free(&n->file_path);
     safe_str_free(&n->properties_json);
+    safe_str_free(&n->symbol_id);
+    safe_str_free(&n->language);
+    safe_str_free(&n->signature);
+    safe_str_free(&n->origin);
 }
 
 void cbm_store_free_nodes(cbm_node_t *nodes, int count) {
@@ -5535,6 +6441,8 @@ void cbm_store_free_edges(cbm_edge_t *edges, int count) {
         safe_str_free(&edges[i].project);
         safe_str_free(&edges[i].type);
         safe_str_free(&edges[i].properties_json);
+        safe_str_free(&edges[i].origin);
+        safe_str_free(&edges[i].evidence_json);
     }
     free(edges);
 }
@@ -5543,6 +6451,12 @@ void cbm_project_free_fields(cbm_project_t *p) {
     safe_str_free(&p->name);
     safe_str_free(&p->indexed_at);
     safe_str_free(&p->root_path);
+    safe_str_free(&p->commit_hash);
+    safe_str_free(&p->dirty_fingerprint);
+    safe_str_free(&p->structural_indexed_at);
+    safe_str_free(&p->derived_indexed_at);
+    safe_str_free(&p->structural_digest);
+    safe_str_free(&p->parser_version);
 }
 
 void cbm_store_free_projects(cbm_project_t *projects, int count) {

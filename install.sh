@@ -198,18 +198,15 @@ VERSION=$("$DEST" --version 2>&1) || {
 }
 echo "Installed: $VERSION"
 
-# Configure agents
+# Client registration is intentionally never inferred by the binary installer.
+# This keeps package installation from rewriting every detected agent config.
+echo ""
 if [ "$SKIP_CONFIG" = true ]; then
-    echo ""
-    echo "Skipping agent configuration (--skip-config)"
+    echo "Agent registration skipped (--skip-config)."
 else
-    echo ""
-    echo "Configuring coding agents..."
-    "$DEST" install -y 2>&1 || {
-        echo ""
-        echo "Agent configuration failed (non-fatal)."
-        echo "Run manually: codebase-memory-mcp install"
-    }
+    echo "Register one MCP client explicitly, for example:"
+    echo "  codebase-memory-mcp install --client codex"
+    echo "Use --client all only when you intentionally want every detected client."
 fi
 
 # PATH check
@@ -222,7 +219,7 @@ if ! echo "$PATH" | tr ':' '\n' | grep -qx "$INSTALL_DIR"; then
 fi
 
 echo ""
-echo "Done! Restart your coding agent to start using codebase-memory-mcp."
+echo "Done! Register the intended client, then restart that coding agent."
 
 } # end main()
 

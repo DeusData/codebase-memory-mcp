@@ -124,19 +124,15 @@ try {
     exit 1
 }
 
-# Configure agents
+# Client registration is intentionally never inferred by the binary installer.
 if ($SkipConfig) {
     Write-Host ""
-    Write-Host "Skipping agent configuration (--skip-config)"
+    Write-Host "Agent registration skipped (--skip-config)."
 } else {
     Write-Host ""
-    Write-Host "Configuring coding agents..."
-    try {
-        & $Dest install -y 2>&1 | Write-Host
-    } catch {
-        Write-Host "Agent configuration failed (non-fatal)."
-        Write-Host "Run manually: codebase-memory-mcp install"
-    }
+    Write-Host "Register one MCP client explicitly, for example:"
+    Write-Host "  codebase-memory-mcp install --client codex"
+    Write-Host "Use --client all only when you intentionally want every detected client."
 }
 
 # Add to PATH (user scope, no admin needed)

@@ -3,18 +3,10 @@
  *
  * SCOPE
  * ─────
- * Probes 25 grammar-only code languages not yet covered by probes _a, _b, _c:
- *   agda, assembly, bicep, cfml, cfscript, cobol, elm, func, janet, lean,
+ * Probes grammar-only code languages not yet covered by probes _a, _b, _c:
+ *   agda, assembly, bicep, cfml, cfscript, cobol, elm, func, janet,
  *   llvm_ir, magma, move, nasm, objc, pony, purescript, pine, qml, smali,
  *   tablegen, tlaplus, verilog, vhdl, wolfram.
- *
- * SKIPPED (with reason):
- *   systemverilog — CBM_LANG_SYSTEMVERILOG has no extension entry in the
- *     EXT_TABLE (language.c); the only SV extension ".sv" maps to
- *     CBM_LANG_VERILOG.  File-based index_repository cannot route to
- *     CBM_LANG_SYSTEMVERILOG via extension alone.  It is already exercised
- *     by the test_grammar_regression.c direct-language fixture and the
- *     grammar_labels histogram (Class:1,Function:1,Module:1).
  *
  * COLOUR LEGEND
  * ─────────────
@@ -659,76 +651,6 @@ TEST(probe_janet_function_extraction_gap) {
     ASSERT_TRUE(m.ok);
     /* RED: Janet defn forms not configured in lang_spec → 0 Function nodes. */
     ASSERT_TRUE(m.functions >= 1); /* expected RED — empty func_types in spec */
-    PASS();
-}
-
-/* ══════════════════════════════════════════════════════════════════
- * GROUP 10 — Lean (.lean)
- *
- * Lean label histogram: Function:2, Module:1.
- * Spec: lean_func_types = {"def","theorem","instance","abbrev"},
- *       lean_class_types = {"structure","class_inductive","inductive"},
- *       lean_import_types = {"import","extends","instance"}.
- * Extension: .lean → CBM_LANG_LEAN.
- * ══════════════════════════════════════════════════════════════════ */
-
-/* Lean: two `def` definitions → 2 Function nodes. */
-TEST(probe_lean_def_functions) {
-    GpdMetrics m = gpd_metrics("math.lean",
-        "def double (n : Nat) : Nat := n * 2\n"
-        "\n"
-        "def square (n : Nat) : Nat := n * n\n");
-    ASSERT_TRUE(m.ok);
-    /* GREEN: both def bindings must produce Function nodes. */
-    ASSERT_TRUE(m.functions >= 2);
-    PASS();
-}
-
-/* Lean: theorem definition → Function node. */
-TEST(probe_lean_theorem) {
-    GpdMetrics m = gpd_metrics("proofs.lean",
-        "theorem add_comm (a b : Nat) : a + b = b + a := by\n"
-        "  omega\n"
-        "\n"
-        "theorem mul_comm (a b : Nat) : a * b = b * a := by\n"
-        "  omega\n");
-    ASSERT_TRUE(m.ok);
-    /* GREEN: theorem definitions must produce Function nodes. */
-    ASSERT_TRUE(m.functions >= 1);
-    PASS();
-}
-
-/* Lean: structure definition → type-like node.
- * RED: histogram shows Function/Module only; structure not yet extracted as
- *      type node despite lean_class_types having "structure". */
-TEST(probe_lean_structure_type) {
-    GpdMetrics m = gpd_metrics("types.lean",
-        "structure Point where\n"
-        "  x : Float\n"
-        "  y : Float\n"
-        "\n"
-        "def origin : Point := { x := 0, y := 0 }\n");
-    ASSERT_TRUE(m.ok);
-    /* RED: Lean structure not extracted as type-like node (node-extraction gap). */
-    ASSERT_TRUE(m.types >= 1); /* expected RED */
-    PASS();
-}
-
-/* Lean: `import` in two-file fixture → IMPORTS edge.
- * RED: grammar-only Lean has no import-resolver in the pipeline. */
-TEST(probe_lean_imports_edge) {
-    static const GpdFile files[] = {
-        {"MathUtils.lean",
-         "def double (n : Nat) : Nat := n * 2\n"},
-        {"Main.lean",
-         "import MathUtils\n"
-         "\n"
-         "def quad (n : Nat) : Nat := double (double n)\n"}
-    };
-    GpdMetrics m = gpd_metrics_files(files, 2);
-    ASSERT_TRUE(m.ok);
-    /* RED: Lean `import` not resolved into IMPORTS edges. */
-    ASSERT_TRUE(m.imports >= 1); /* expected RED */
     PASS();
 }
 
@@ -1568,7 +1490,7 @@ TEST(probe_tlaplus_no_type_nodes) {
  *       verilog_class_types = {"module_declaration","class_declaration",...},
  *       verilog_import_types = {"extends","import","package_import_declaration"}.
  * Extension: .v → CBM_LANG_VERILOG.
- * Note: .sv also maps to CBM_LANG_VERILOG (not CBM_LANG_SYSTEMVERILOG).
+ * Note: .sv uses the experimental Verilog structural fallback.
  * ══════════════════════════════════════════════════════════════════ */
 
 /* Verilog: module declaration → type-like node. */
@@ -1613,8 +1535,7 @@ TEST(probe_verilog_function) {
     PASS();
 }
 
-/* Verilog: SystemVerilog-style file (.sv) — lands on CBM_LANG_VERILOG via EXT_TABLE.
- * No separate CBM_LANG_SYSTEMVERILOG routing is available through file extension. */
+/* Experimental .sv fallback: route through the lightweight Verilog parser. */
 TEST(probe_verilog_sv_extension) {
     GpdMetrics m = gpd_metrics("adder.sv",
         "module adder(\n"
@@ -1833,12 +1754,6 @@ SUITE(grammar_probe_d) {
     /* Janet (.janet) */
     RUN_TEST(probe_janet_no_crash);
     RUN_TEST(probe_janet_function_extraction_gap);
-
-    /* Lean (.lean) */
-    RUN_TEST(probe_lean_def_functions);
-    RUN_TEST(probe_lean_theorem);
-    RUN_TEST(probe_lean_structure_type);
-    RUN_TEST(probe_lean_imports_edge);
 
     /* LLVM IR (.ll) */
     RUN_TEST(probe_llvmir_function);

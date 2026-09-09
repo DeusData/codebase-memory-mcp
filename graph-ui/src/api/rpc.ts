@@ -1,4 +1,5 @@
 /* JSON-RPC client — speaks the same protocol as MCP clients via POST /rpc */
+import { dashboardFetch } from "./dashboardAuth";
 
 let _nextId = 1;
 
@@ -16,7 +17,7 @@ export async function callTool<T = unknown>(
   name: string,
   args: Record<string, unknown> = {},
 ): Promise<T> {
-  const res = await fetch("/rpc", {
+  const res = await dashboardFetch("/rpc", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -35,6 +36,10 @@ export async function callTool<T = unknown>(
 
   if (json.error) {
     throw new RpcError(json.error.code ?? -1, json.error.message ?? "unknown");
+  }
+
+  if (json?.result?.structuredContent !== undefined) {
+    return json.result.structuredContent as T;
   }
 
   /* MCP tool results are wrapped: { result: { content: [{ text: "..." }] } } */

@@ -28,6 +28,7 @@ typedef SOCKET cbm_sock_t;
 #include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
 typedef int cbm_sock_t;
@@ -91,10 +92,22 @@ static int wait_readable(cbm_sock_t fd, int timeout_ms) {
 #endif
 }
 
-static int send_all(cbm_sock_t fd, const void *data, size_t len) {
+static int send_all(cbm_sock_t fd, const void *data, size_t len, int64_t deadline) {
     const char *p = data;
     size_t off = 0;
     while (off < len) {
+        int64_t remaining = deadline - now_ms();
+        if (remaining <= 0)
+            return -1;
+#ifdef _WIN32
+        DWORD timeout = (DWORD)remaining;
+#else
+        struct timeval timeout = {.tv_sec = remaining / 1000,
+                                  .tv_usec = (remaining % 1000) * 1000};
+#endif
+        if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const char *)&timeout,
+                       sizeof(timeout)) != 0)
+            return -1;
 #ifdef _WIN32
         int n = send(fd, p + off, (int)(len - off), CBM_SEND_FLAGS);
 #else
@@ -516,10 +529,11 @@ void cbm_http_reply_buf(cbm_http_conn_t *c, int status, const char *extra_header
                       status, status_reason(status), extra_headers ? extra_headers : "", len);
     if (hn < 0 || hn >= (int)sizeof(head))
         return; /* oversized extra_headers — drop the response, conn closes */
-    if (send_all(c->fd, head, (size_t)hn) != 0)
+    int64_t deadline = now_ms() + c->recv_deadline_ms;
+    if (send_all(c->fd, head, (size_t)hn, deadline) != 0)
         return;
     if (len > 0)
-        (void)send_all(c->fd, data, len);
+        (void)send_all(c->fd, data, len, deadline);
 }
 
 void cbm_http_replyf(cbm_http_conn_t *c, int status, const char *extra_headers, const char *fmt,

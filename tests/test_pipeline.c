@@ -5144,6 +5144,29 @@ TEST(pipeline_lock_release_allows_contender) {
     PASS();
 }
 
+TEST(pipeline_lock_is_scoped_per_project) {
+    ASSERT_TRUE(cbm_pipeline_try_lock_project("project-a"));
+    ASSERT_FALSE(cbm_pipeline_try_lock_project("project-a"));
+
+    /* An unrelated repository must not be serialized behind project-a. */
+    ASSERT_TRUE(cbm_pipeline_try_lock_project("project-b"));
+
+    cbm_pipeline_unlock_project("project-b");
+    cbm_pipeline_unlock_project("project-a");
+
+    ASSERT_TRUE(cbm_pipeline_try_lock_project("project-a"));
+    cbm_pipeline_unlock_project("project-a");
+    PASS();
+}
+
+TEST(incremental_rebuild_threshold) {
+    ASSERT_FALSE(cbm_pipeline_incremental_requires_rebuild(100, 100, 20, 0));
+    ASSERT_TRUE(cbm_pipeline_incremental_requires_rebuild(100, 100, 21, 0));
+    ASSERT_TRUE(cbm_pipeline_incremental_requires_rebuild(100, 100, 10, 11));
+    ASSERT_FALSE(cbm_pipeline_incremental_requires_rebuild(100, 100, 1, 0));
+    PASS();
+}
+
 /* ── Resource management & internal helper tests ─────────────────── */
 
 TEST(pipeline_empty_path) {
@@ -5672,6 +5695,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_lock_blocking);
     RUN_TEST(pipeline_lock_contention);
     RUN_TEST(pipeline_lock_release_allows_contender);
+    RUN_TEST(pipeline_lock_is_scoped_per_project);
+    RUN_TEST(incremental_rebuild_threshold);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
     RUN_TEST(pipeline_null_repo);

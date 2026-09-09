@@ -143,6 +143,7 @@ TEST(mcp_initialize_response) {
     ASSERT_NOT_NULL(strstr(json, "capabilities"));
     ASSERT_NOT_NULL(strstr(json, "tools"));
     ASSERT_NOT_NULL(strstr(json, "2025-11-25"));
+    ASSERT_NOT_NULL(strstr(json, "\"version\":\"" CBM_VERSION "\""));
     free(json);
 
     /* Client requests a supported version: server echoes it */
@@ -167,22 +168,96 @@ TEST(mcp_initialize_response) {
 TEST(mcp_tools_list) {
     char *json = cbm_mcp_tools_list();
     ASSERT_NOT_NULL(json);
-    /* Should contain all 14 tools */
+    /* The default surface is intentionally small and agent-oriented. */
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_TRUE(yyjson_is_arr(tools));
+    ASSERT_EQ((int)yyjson_arr_size(tools), 9);
+
+    ASSERT_NOT_NULL(strstr(json, "get_context"));
     ASSERT_NOT_NULL(strstr(json, "index_repository"));
     ASSERT_NOT_NULL(strstr(json, "search_graph"));
-    ASSERT_NOT_NULL(strstr(json, "query_graph"));
     ASSERT_NOT_NULL(strstr(json, "trace_path"));
     ASSERT_NOT_NULL(strstr(json, "get_code_snippet"));
-    ASSERT_NOT_NULL(strstr(json, "get_graph_schema"));
     ASSERT_NOT_NULL(strstr(json, "get_architecture"));
     ASSERT_NOT_NULL(strstr(json, "search_code"));
-    ASSERT_NOT_NULL(strstr(json, "list_projects"));
-    ASSERT_NOT_NULL(strstr(json, "delete_project"));
     ASSERT_NOT_NULL(strstr(json, "index_status"));
     ASSERT_NOT_NULL(strstr(json, "detect_changes"));
-    ASSERT_NOT_NULL(strstr(json, "manage_adr"));
-    ASSERT_NOT_NULL(strstr(json, "ingest_traces"));
+
+    ASSERT_NULL(strstr(json, "\"name\":\"query_graph\""));
+    ASSERT_NULL(strstr(json, "\"name\":\"get_graph_schema\""));
+    ASSERT_NULL(strstr(json, "\"name\":\"manage_adr\""));
+    ASSERT_NULL(strstr(json, "\"name\":\"list_projects\""));
+    ASSERT_NULL(strstr(json, "\"name\":\"delete_project\""));
+    ASSERT_NULL(strstr(json, "\"name\":\"ingest_traces\""));
+
+    size_t idx, max;
+    yyjson_val *tool;
+    yyjson_arr_foreach(tools, idx, max, tool) {
+        yyjson_val *input_schema = yyjson_obj_get(tool, "inputSchema");
+        ASSERT_TRUE(yyjson_is_obj(input_schema));
+        yyjson_val *required = yyjson_obj_get(input_schema, "required");
+        if (required && yyjson_is_arr(required)) {
+            size_t req_idx, req_max;
+            yyjson_val *required_name;
+            yyjson_arr_foreach(required, req_idx, req_max, required_name) {
+                ASSERT_FALSE(yyjson_is_str(required_name) &&
+                             strcmp(yyjson_get_str(required_name), "project") == 0);
+            }
+        }
+        ASSERT_TRUE(yyjson_is_obj(yyjson_obj_get(tool, "outputSchema")));
+        yyjson_val *annotations = yyjson_obj_get(tool, "annotations");
+        ASSERT_TRUE(yyjson_is_obj(annotations));
+        ASSERT_TRUE(yyjson_is_bool(yyjson_obj_get(annotations, "readOnlyHint")));
+        ASSERT_TRUE(yyjson_is_bool(yyjson_obj_get(annotations, "destructiveHint")));
+        ASSERT_TRUE(yyjson_is_bool(yyjson_obj_get(annotations, "idempotentHint")));
+        ASSERT_TRUE(yyjson_is_bool(yyjson_obj_get(annotations, "openWorldHint")));
+    }
+    yyjson_doc_free(doc);
     free(json);
+    PASS();
+}
+
+TEST(mcp_toolsets_are_explicit) {
+    unsigned all =
+        CBM_MCP_TOOLSET_CORE | CBM_MCP_TOOLSET_ADVANCED | CBM_MCP_TOOLSET_ADMIN;
+    char *json = cbm_mcp_tools_list_for_toolsets(all);
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *tools = yyjson_obj_get(yyjson_doc_get_root(doc), "tools");
+    ASSERT_TRUE(yyjson_is_arr(tools));
+    ASSERT_EQ((int)yyjson_arr_size(tools), 14);
+    size_t idx, max;
+    yyjson_val *tool;
+    yyjson_arr_foreach(tools, idx, max, tool) {
+        ASSERT_TRUE(yyjson_is_obj(yyjson_obj_get(tool, "outputSchema")));
+        ASSERT_TRUE(yyjson_is_obj(yyjson_obj_get(tool, "annotations")));
+    }
+    ASSERT_NOT_NULL(strstr(json, "\"name\":\"query_graph\""));
+    ASSERT_NOT_NULL(strstr(json, "\"name\":\"get_graph_schema\""));
+    ASSERT_NOT_NULL(strstr(json, "\"name\":\"manage_adr\""));
+    ASSERT_NOT_NULL(strstr(json, "\"name\":\"list_projects\""));
+    ASSERT_NOT_NULL(strstr(json, "\"name\":\"delete_project\""));
+    ASSERT_NULL(strstr(json, "\"name\":\"ingest_traces\""));
+    yyjson_doc_free(doc);
+    free(json);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_EQ((int)cbm_mcp_server_get_toolsets(srv), (int)CBM_MCP_TOOLSET_CORE);
+    cbm_mcp_server_set_toolsets(srv, all);
+    ASSERT_EQ((int)cbm_mcp_server_get_toolsets(srv), (int)all);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":20,\"method\":\"tools/list\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"query_graph\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"name\":\"delete_project\""));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -221,7 +296,22 @@ TEST(mcp_text_result) {
     ASSERT_NOT_NULL(strstr(json, "\"type\":\"text\""));
     /* The text value is JSON-escaped inside the "text" field */
     ASSERT_NOT_NULL(strstr(json, "total"));
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\":{\"total\":5}"));
     ASSERT_NULL(strstr(json, "\"isError\":true"));
+    free(json);
+    PASS();
+}
+
+TEST(mcp_text_result_plain_text_has_typed_structured_content) {
+    char *json = cbm_mcp_text_result("plain text", false);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"structuredContent\""));
+    ASSERT_NOT_NULL(strstr(json, "\"code\":\"ok\""));
+    ASSERT_NOT_NULL(strstr(json, "\"message\":\"plain text\""));
+    ASSERT_NOT_NULL(strstr(json, "\"is_error\":false"));
+    /* Compatibility text is a JSON copy of structuredContent, not an
+     * untyped string that violates the advertised object outputSchema. */
+    ASSERT_NOT_NULL(strstr(json, "\\\"message\\\":\\\"plain text\\\""));
     free(json);
     PASS();
 }
@@ -339,7 +429,9 @@ TEST(server_handle_tools_list) {
     ASSERT_NOT_NULL(resp);
     ASSERT_NOT_NULL(strstr(resp, "\"id\":2"));
     ASSERT_NOT_NULL(strstr(resp, "search_graph"));
-    ASSERT_NOT_NULL(strstr(resp, "query_graph"));
+    ASSERT_NOT_NULL(strstr(resp, "get_context"));
+    ASSERT_NULL(strstr(resp, "\"name\":\"query_graph\""));
+    ASSERT_NULL(strstr(resp, "\"name\":\"delete_project\""));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -370,8 +462,13 @@ static cbm_mcp_server_t *setup_mcp_with_data(void) {
     return srv;
 }
 
+static void enable_toolset(cbm_mcp_server_t *srv, unsigned toolset) {
+    cbm_mcp_server_set_toolsets(srv, CBM_MCP_TOOLSET_CORE | toolset);
+}
+
 TEST(tool_list_projects_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADMIN);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":10,\"method\":\"tools/call\","
@@ -388,6 +485,7 @@ TEST(tool_list_projects_empty) {
 
 TEST(tool_get_graph_schema_empty) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":11,\"method\":\"tools/call\","
@@ -435,6 +533,7 @@ TEST(tool_search_graph_basic) {
 static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz);
 static void cleanup_snippet_dir(const char *tmp_dir);
 static char *extract_text_content(const char *mcp_result);
+static bool json_contains_string_fragment(const char *json, const char *fragment);
 
 TEST(tool_search_graph_includes_node_properties) {
     /* search_graph results must surface each node's properties_json
@@ -466,8 +565,217 @@ TEST(tool_search_graph_includes_node_properties) {
     PASS();
 }
 
+TEST(tool_session_project_fallback_and_explicit_precedence) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+
+    const char *project = "session-project";
+    ASSERT_EQ(cbm_store_upsert_project(st, project, "/tmp/session-project"), CBM_STORE_OK);
+    cbm_node_t node = {
+        .project = project,
+        .label = "Function",
+        .name = "SessionFn",
+        .qualified_name = "session-project.SessionFn",
+        .file_path = "session.c",
+        .start_line = 1,
+        .end_line = 2,
+    };
+    ASSERT_GT(cbm_store_upsert_node(st, &node), 0);
+    cbm_mcp_server_set_project(srv, project);
+
+    /* A core read tool inherits the active session project. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":41,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"name_pattern\":\"SessionFn\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "SessionFn"));
+    free(resp);
+
+    /* An explicit project is never overwritten by the session fallback. */
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\","
+             "\"arguments\":{\"project\":\"explicit-missing\","
+             "\"name_pattern\":\"SessionFn\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "not found"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+TEST(tool_get_context_is_budgeted_structured_and_deterministic) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    const char *request =
+        "{\"jsonrpc\":\"2.0\",\"id\":43,\"method\":\"tools/call\","
+        "\"params\":{\"name\":\"get_context\","
+        "\"arguments\":{\"query\":\"HandleRequest\",\"intent\":\"debug\","
+        "\"budget_tokens\":500}}}";
+    char *first = cbm_mcp_server_handle(srv, request);
+    char *second = cbm_mcp_server_handle(srv, request);
+    ASSERT_NOT_NULL(first);
+    ASSERT_NOT_NULL(second);
+    ASSERT_NULL(strstr(first, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(first, "\"structuredContent\""));
+
+    char *first_text = extract_text_content(first);
+    char *second_text = extract_text_content(second);
+    ASSERT_NOT_NULL(first_text);
+    ASSERT_NOT_NULL(second_text);
+    ASSERT_STR_EQ(first_text, second_text);
+    ASSERT_NOT_NULL(strstr(first_text, "\"freshness\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"seed_symbols\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"ranked_evidence\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"snippets\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"important_paths\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"traces\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"change_risks\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"provenance\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"estimated_tokens\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"truncated\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"worktree_verified\":false"));
+    ASSERT_NOT_NULL(strstr(first_text, "HandleRequest"));
+    ASSERT_NOT_NULL(strstr(first_text, "\"why_matched\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"source\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"origin\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"confidence\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"file_path\":\"main.go\""));
+    ASSERT_NOT_NULL(strstr(first_text, "\"start_line\":3"));
+    ASSERT_NOT_NULL(strstr(first_text, "\"end_line\":5"));
+    ASSERT_NULL(strstr(first_text, "\"summary\""));
+
+    yyjson_doc *context_doc = yyjson_read(first_text, strlen(first_text), 0);
+    ASSERT_NOT_NULL(context_doc);
+    yyjson_val *context = yyjson_doc_get_root(context_doc);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(context, "project")), "test-project");
+    ASSERT_TRUE(yyjson_is_obj(yyjson_obj_get(context, "freshness")));
+    ASSERT_TRUE(yyjson_is_arr(yyjson_obj_get(context, "seed_symbols")));
+    yyjson_val *evidence = yyjson_obj_get(context, "ranked_evidence");
+    yyjson_val *snippets = yyjson_obj_get(context, "snippets");
+    ASSERT_TRUE(yyjson_is_arr(evidence));
+    ASSERT_TRUE(yyjson_arr_size(evidence) > 0);
+    ASSERT_TRUE(yyjson_is_arr(snippets));
+    ASSERT_TRUE(yyjson_arr_size(snippets) > 0);
+    ASSERT_TRUE(yyjson_get_int(yyjson_obj_get(context, "estimated_tokens")) <= 500);
+    ASSERT_TRUE(strlen(first_text) <= 500u * 4u);
+    ASSERT_NOT_NULL(strstr(first_text, "reciprocal_rank_fusion"));
+
+    size_t idx, max;
+    yyjson_val *item;
+    yyjson_arr_foreach(evidence, idx, max, item) {
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "why_matched")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "source")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "origin")));
+        ASSERT_TRUE(yyjson_is_num(yyjson_obj_get(item, "confidence")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "file_path")));
+        ASSERT_TRUE(yyjson_is_int(yyjson_obj_get(item, "start_line")));
+        ASSERT_TRUE(yyjson_is_int(yyjson_obj_get(item, "end_line")));
+    }
+    yyjson_arr_foreach(snippets, idx, max, item) {
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "why_matched")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "source")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "origin")));
+        ASSERT_TRUE(yyjson_is_num(yyjson_obj_get(item, "confidence")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "file_path")));
+        ASSERT_TRUE(yyjson_is_int(yyjson_obj_get(item, "start_line")));
+        ASSERT_TRUE(yyjson_is_int(yyjson_obj_get(item, "end_line")));
+        ASSERT_TRUE(yyjson_is_str(yyjson_obj_get(item, "text")));
+    }
+    yyjson_doc_free(context_doc);
+
+    free(first_text);
+    free(second_text);
+    free(first);
+    free(second);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_get_context_validates_intent_depth_and_budget) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    const char *bad_args[] = {
+        "{\"query\":\"HandleRequest\",\"intent\":\"summarize\"}",
+        "{\"query\":\"HandleRequest\",\"depth\":5}",
+        "{\"query\":\"HandleRequest\",\"depth\":-1}",
+        "{\"query\":\"HandleRequest\",\"budget_tokens\":499}",
+        "{\"query\":\"HandleRequest\",\"budget_tokens\":12001}",
+        "{\"query\":\"HandleRequest\",\"depth\":\"2\"}",
+        "{\"query\":\"HandleRequest\",\"focus_symbols\":[1]}",
+    };
+    for (size_t i = 0; i < sizeof(bad_args) / sizeof(bad_args[0]); i++) {
+        char *resp = cbm_mcp_handle_tool(srv, "get_context", bad_args[i]);
+        ASSERT_NOT_NULL(resp);
+        ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+        ASSERT_NOT_NULL(strstr(resp, "\"code\":\"invalid_arguments\""));
+        ASSERT_NOT_NULL(strstr(resp, "\"structuredContent\""));
+        free(resp);
+    }
+
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(tool_get_context_honors_graph_depth) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(
+        srv, "get_context",
+        "{\"query\":\"HandleRequest\",\"depth\":2,\"budget_tokens\":3000}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"traces\""));
+    ASSERT_NOT_NULL(strstr(inner, "ProcessOrder"));
+    ASSERT_NOT_NULL(strstr(inner, "Greeting"));
+    ASSERT_NOT_NULL(strstr(inner, "\"depth\":2"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+TEST(toolsets_gate_dispatch_and_admin_never_inherits_project) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_project(srv, "session-project");
+
+    char *resp = cbm_mcp_handle_tool(srv, "query_graph", "{\"query\":\"MATCH (n) RETURN n\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "advanced"));
+    free(resp);
+
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADMIN);
+    resp = cbm_mcp_handle_tool(srv, "delete_project", "{}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "project is required"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(tool_query_graph_basic) {
     cbm_mcp_server_t *srv = setup_mcp_with_data();
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
 
     char *resp = cbm_mcp_server_handle(
         srv, "{\"jsonrpc\":\"2.0\",\"id\":14,\"method\":\"tools/call\","
@@ -534,6 +842,7 @@ TEST(tool_trace_missing_function_name) {
 
 TEST(tool_delete_project_not_found) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADMIN);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":22,\"method\":\"tools/call\","
@@ -615,6 +924,7 @@ TEST(tool_get_architecture_emits_populated_sections) {
 
 TEST(tool_query_graph_missing_query) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":23,\"method\":\"tools/call\","
@@ -816,6 +1126,75 @@ TEST(search_code_ampersand_accepted_issue272) {
     PASS();
 }
 
+TEST(search_code_preserves_unicode_and_handles_spaced_paths) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":95,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"Привет\","
+                                   "\"mode\":\"full\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    if (!json_contains_string_fragment(inner, "Привет")) {
+        fprintf(stderr, "search_code unicode response: %s\n", inner);
+    }
+    ASSERT_TRUE(json_contains_string_fragment(inner, "Привет"));
+    ASSERT_TRUE(strstr(resp, "\"isError\":true") == NULL);
+    free(inner);
+    free(resp);
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(search_code_does_not_follow_predictable_temp_symlink) {
+    char tmp[512];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+
+    char victim[512];
+    snprintf(victim, sizeof(victim), "%s/temp-victim.txt", tmp);
+    FILE *vf = fopen(victim, "w");
+    ASSERT_NOT_NULL(vf);
+    fputs("do-not-overwrite\n", vf);
+    fclose(vf);
+
+    char legacy_temp[512];
+    snprintf(legacy_temp, sizeof(legacy_temp), "%s/cbm_search_%d.pat", cbm_tmpdir(),
+             (int)getpid());
+    unlink(legacy_temp);
+    ASSERT_EQ(symlink(victim, legacy_temp), 0);
+
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":96,\"method\":\"tools/call\","
+                                   "\"params\":{\"name\":\"search_code\","
+                                   "\"arguments\":{\"pattern\":\"HandleRequest\","
+                                   "\"project\":\"test-project\"}}}");
+    ASSERT_NOT_NULL(resp);
+    free(resp);
+
+    vf = fopen(victim, "r");
+    ASSERT_NOT_NULL(vf);
+    char contents[64] = {0};
+    ASSERT_NOT_NULL(fgets(contents, sizeof(contents), vf));
+    fclose(vf);
+    ASSERT_STR_EQ(contents, "do-not-overwrite\n");
+
+    unlink(legacy_temp);
+    unlink(victim);
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+#endif
+
 TEST(tool_detect_changes_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -831,8 +1210,139 @@ TEST(tool_detect_changes_no_project) {
     PASS();
 }
 
+#ifndef _WIN32
+static bool mcp_test_git(const char *root, const char *arguments) {
+    char command[1024];
+    int written =
+        snprintf(command, sizeof(command), "git -C '%s' %s >/dev/null 2>&1", root, arguments);
+    return written > 0 && (size_t)written < sizeof(command) && system(command) == 0;
+}
+
+static void mcp_test_remove_tree(const char *root) {
+    char command[768];
+    int written = snprintf(command, sizeof(command), "rm -rf '%s'", root);
+    if (written > 0 && (size_t)written < sizeof(command)) {
+        (void)system(command);
+    }
+}
+
+TEST(tool_detect_changes_honors_since_and_reports_status_and_impact) {
+    char root[256];
+    snprintf(root, sizeof(root), "/tmp/cbm-detect-test-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    ASSERT_TRUE(mcp_test_git(root, "init -q"));
+    ASSERT_TRUE(mcp_test_git(root, "config user.email test@example.invalid"));
+    ASSERT_TRUE(mcp_test_git(root, "config user.name CBM-Test"));
+
+    char path[512];
+    snprintf(path, sizeof(path), "%s/base.c", root);
+    FILE *fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int base(void) { return 1; }\n", fp);
+    fclose(fp);
+    snprintf(path, sizeof(path), "%s/old.c", root);
+    fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int old_name(void) { return 1; }\n", fp);
+    fclose(fp);
+    snprintf(path, sizeof(path), "%s/test_base.c", root);
+    fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int test_base(void) { return 0; }\n", fp);
+    fclose(fp);
+    snprintf(path, sizeof(path), "%s/obsolete.c", root);
+    fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int obsolete(void) { return 0; }\n", fp);
+    fclose(fp);
+    ASSERT_TRUE(mcp_test_git(root, "add ."));
+    ASSERT_TRUE(mcp_test_git(root, "commit -qm initial"));
+
+    snprintf(path, sizeof(path), "%s/base.c", root);
+    fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int base(void) { return 2; }\n", fp);
+    fclose(fp);
+    ASSERT_TRUE(mcp_test_git(root, "add base.c"));
+    ASSERT_TRUE(mcp_test_git(root, "commit -qm change-base"));
+
+    ASSERT_TRUE(mcp_test_git(root, "mv old.c renamed.c"));
+    snprintf(path, sizeof(path), "%s/obsolete.c", root);
+    ASSERT_EQ(unlink(path), 0);
+    snprintf(path, sizeof(path), "%s/new.c", root);
+    fp = fopen(path, "w");
+    ASSERT_NOT_NULL(fp);
+    fputs("int newly_added(void) { return 3; }\n", fp);
+    fclose(fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(cbm_store_upsert_project(store, "detect-project", root), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, "detect-project");
+
+    cbm_node_t base = {.project = "detect-project",
+                       .label = "Function",
+                       .name = "base",
+                       .qualified_name = "detect-project.base",
+                       .file_path = "base.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    cbm_node_t test = {.project = "detect-project",
+                       .label = "Function",
+                       .name = "test_base",
+                       .qualified_name = "detect-project.test_base",
+                       .file_path = "test_base.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    int64_t base_id = cbm_store_upsert_node(store, &base);
+    int64_t test_id = cbm_store_upsert_node(store, &test);
+    ASSERT_GT(base_id, 0);
+    ASSERT_GT(test_id, 0);
+    cbm_edge_t edge = {.project = "detect-project",
+                       .source_id = test_id,
+                       .target_id = base_id,
+                       .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    /* A deliberately missing base_branch proves that `since` is the selected
+     * baseline instead of being parsed and silently discarded. */
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":135,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"detect_changes\",\"arguments\":{"
+             "\"since\":\"HEAD~1\",\"base_branch\":\"definitely-missing\","
+             "\"depth\":2}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NULL(strstr(resp, "\"isError\":true"));
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"since\":\"HEAD~1\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"type\":\"modified\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"type\":\"renamed\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"old_path\":\"old.c\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"path\":\"renamed.c\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"type\":\"deleted\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"path\":\"obsolete.c\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"type\":\"added\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"path\":\"new.c\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"impacted_symbols\""));
+    ASSERT_NOT_NULL(strstr(inner, "\"impacted_tests\""));
+    ASSERT_NOT_NULL(strstr(inner, "detect-project.test_base"));
+    ASSERT_NOT_NULL(strstr(inner, "\"impact_paths\""));
+    ASSERT_NOT_NULL(strstr(inner, "--CALLS-->"));
+
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    mcp_test_remove_tree(root);
+    PASS();
+}
+#endif
+
 TEST(tool_manage_adr_no_project) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
 
     char *resp =
         cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":36,\"method\":\"tools/call\","
@@ -874,6 +1384,7 @@ TEST(tool_manage_adr_get_with_existing_adr) {
     /* Create server and register the project */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     ASSERT_NOT_NULL(st);
     cbm_store_upsert_project(st, "test-adr-uaf", tmp_dir);
@@ -909,6 +1420,7 @@ TEST(tool_manage_adr_get_with_existing_adr) {
 TEST(tool_manage_adr_unified_backend_issue256) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     ASSERT_NOT_NULL(srv);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
     cbm_store_t *st = cbm_mcp_server_store(srv);
     ASSERT_NOT_NULL(st);
     cbm_store_upsert_project(st, "adr-unify", "/tmp/adr-unify");
@@ -953,8 +1465,10 @@ TEST(tool_ingest_traces_basic) {
              "\"params\":{\"name\":\"ingest_traces\","
              "\"arguments\":{\"traces\":[{\"caller\":\"a\",\"callee\":\"b\"}]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
-    ASSERT_NOT_NULL(strstr(resp, "traces_received"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":\"unsupported\""));
+    ASSERT_NOT_NULL(strstr(resp, "not implemented"));
+    ASSERT_NULL(strstr(resp, "accepted"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -969,7 +1483,9 @@ TEST(tool_ingest_traces_empty) {
                                    "\"params\":{\"name\":\"ingest_traces\","
                                    "\"arguments\":{\"traces\":[]}}}");
     ASSERT_NOT_NULL(resp);
-    ASSERT_NOT_NULL(strstr(resp, "accepted"));
+    ASSERT_NOT_NULL(strstr(resp, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"code\":\"unsupported\""));
+    ASSERT_NULL(strstr(resp, "accepted"));
     free(resp);
 
     cbm_mcp_server_free(srv);
@@ -982,6 +1498,7 @@ TEST(tool_ingest_traces_empty) {
 
 TEST(store_idle_eviction) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
     cbm_mcp_server_set_project(srv, "test-evict");
 
     /* Trigger resolve_store via a tool call to set store_last_used */
@@ -1000,6 +1517,7 @@ TEST(store_idle_eviction) {
 
 TEST(store_idle_no_eviction_within_timeout) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
     cbm_mcp_server_set_project(srv, "test-evict");
 
     char *resp = cbm_mcp_handle_tool(srv, "get_graph_schema", "{\"project\":\"test-evict\"}");
@@ -1032,6 +1550,7 @@ TEST(store_idle_evict_protects_initial_store) {
 
 TEST(store_idle_evict_access_resets_timer) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    enable_toolset(srv, CBM_MCP_TOOLSET_ADVANCED);
     cbm_mcp_server_set_project(srv, "test-evict");
 
     /* First access */
@@ -1142,6 +1661,14 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
                 "}\n");
     fclose(fp);
 
+    char spaced_src_path[512];
+    snprintf(spaced_src_path, sizeof(spaced_src_path), "%s/with space.go", proj_dir);
+    fp = fopen(spaced_src_path, "w");
+    if (!fp)
+        return NULL;
+    fprintf(fp, "package main\n\nfunc Greeting() string {\n\treturn \"Привет\"\n}\n");
+    fclose(fp);
+
     /* Create server with in-memory store */
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
     if (!srv)
@@ -1202,6 +1729,16 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     n_run2.end_line = 13;
     cbm_store_upsert_node(st, &n_run2);
 
+    cbm_node_t n_greeting = {0};
+    n_greeting.project = proj_name;
+    n_greeting.label = "Function";
+    n_greeting.name = "Greeting";
+    n_greeting.qualified_name = "test-project.cmd.server.greeting.Greeting";
+    n_greeting.file_path = "with space.go";
+    n_greeting.start_line = 3;
+    n_greeting.end_line = 5;
+    int64_t id_greeting = cbm_store_upsert_node(st, &n_greeting);
+
     /* Create edges: HandleRequest -> ProcessOrder, HandleRequest -> Run1 */
     cbm_edge_t e1 = {.project = proj_name, .source_id = id_hr, .target_id = id_po, .type = "CALLS"};
     cbm_store_insert_edge(st, &e1);
@@ -1211,6 +1748,10 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
     cbm_store_insert_edge(st, &e2);
     (void)id_run1; /* run1 used for edge above */
 
+    cbm_edge_t e3 = {
+        .project = proj_name, .source_id = id_po, .target_id = id_greeting, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e3);
+
     return srv;
 }
 
@@ -1218,6 +1759,8 @@ static cbm_mcp_server_t *setup_snippet_server(char *tmp_dir, size_t tmp_sz) {
 static void cleanup_snippet_dir(const char *tmp_dir) {
     char path[512];
     snprintf(path, sizeof(path), "%s/project/main.go", tmp_dir);
+    unlink(path);
+    snprintf(path, sizeof(path), "%s/project/with space.go", tmp_dir);
     unlink(path);
     snprintf(path, sizeof(path), "%s/project", tmp_dir);
     rmdir(path);
@@ -1256,6 +1799,45 @@ static char *extract_text_content(const char *mcp_result) {
     char *result = str ? strdup(str) : strdup(mcp_result);
     yyjson_doc_free(doc);
     return result;
+}
+
+static bool yy_val_contains_string_fragment(yyjson_val *val, const char *fragment) {
+    if (yyjson_is_str(val)) {
+        return strstr(yyjson_get_str(val), fragment) != NULL;
+    }
+    if (yyjson_is_arr(val) || yyjson_is_obj(val)) {
+        yyjson_val *child = NULL;
+        yyjson_arr_iter arr_iter;
+        yyjson_obj_iter obj_iter;
+        if (yyjson_is_arr(val)) {
+            yyjson_arr_iter_init(val, &arr_iter);
+            while ((child = yyjson_arr_iter_next(&arr_iter)) != NULL) {
+                if (yy_val_contains_string_fragment(child, fragment)) {
+                    return true;
+                }
+            }
+        } else {
+            yyjson_obj_iter_init(val, &obj_iter);
+            yyjson_val *key = NULL;
+            while ((key = yyjson_obj_iter_next(&obj_iter)) != NULL) {
+                child = yyjson_obj_iter_get_val(key);
+                if (yy_val_contains_string_fragment(child, fragment)) {
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+static bool json_contains_string_fragment(const char *json, const char *fragment) {
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    if (!doc) {
+        return false;
+    }
+    bool found = yy_val_contains_string_fragment(yyjson_doc_get_root(doc), fragment);
+    yyjson_doc_free(doc);
+    return found;
 }
 
 /* Call get_code_snippet and extract inner text content.
@@ -1995,8 +2577,10 @@ SUITE(mcp) {
     /* MCP protocol helpers */
     RUN_TEST(mcp_initialize_response);
     RUN_TEST(mcp_tools_list);
+    RUN_TEST(mcp_toolsets_are_explicit);
     RUN_TEST(mcp_tools_array_schemas_have_items);
     RUN_TEST(mcp_text_result);
+    RUN_TEST(mcp_text_result_plain_text_has_typed_structured_content);
     RUN_TEST(mcp_text_result_error);
 
     /* Argument extraction */
@@ -2038,6 +2622,11 @@ SUITE(mcp) {
     RUN_TEST(tool_unknown_tool);
     RUN_TEST(tool_search_graph_basic);
     RUN_TEST(tool_search_graph_includes_node_properties);
+    RUN_TEST(tool_session_project_fallback_and_explicit_precedence);
+    RUN_TEST(tool_get_context_is_budgeted_structured_and_deterministic);
+    RUN_TEST(tool_get_context_validates_intent_depth_and_budget);
+    RUN_TEST(tool_get_context_honors_graph_depth);
+    RUN_TEST(toolsets_gate_dispatch_and_admin_never_inherits_project);
     RUN_TEST(tool_query_graph_basic);
     RUN_TEST(tool_index_status_no_project);
 
@@ -2059,7 +2648,14 @@ SUITE(mcp) {
     RUN_TEST(search_code_invalid_regex_errors_issue283);
     RUN_TEST(search_code_literal_pipe_warns_issue282);
     RUN_TEST(search_code_ampersand_accepted_issue272);
+    RUN_TEST(search_code_preserves_unicode_and_handles_spaced_paths);
+#ifndef _WIN32
+    RUN_TEST(search_code_does_not_follow_predictable_temp_symlink);
+#endif
     RUN_TEST(tool_detect_changes_no_project);
+#ifndef _WIN32
+    RUN_TEST(tool_detect_changes_honors_since_and_reports_status_and_impact);
+#endif
     RUN_TEST(tool_manage_adr_no_project);
     RUN_TEST(tool_manage_adr_get_with_existing_adr);
     RUN_TEST(tool_manage_adr_unified_backend_issue256);

@@ -261,15 +261,17 @@ int cbm_config_delete(cbm_config_t *cfg, const char *key);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 
-/* install: copy binary, install skills, install editor MCP configs, ensure PATH.
- * Prompts to delete old indexes if any exist — rejects on "no". */
+/* install: register the MCP server for one explicit --client <name>.
+ * Existing indexes and running server processes are never touched.
+ * Hooks and instruction files require --with-hooks / --with-instructions. */
 int cbm_cmd_install(int argc, char **argv);
 
 /* uninstall: remove skills, remove editor MCP configs, remove binary. */
 int cbm_cmd_uninstall(int argc, char **argv);
 
-/* update: check latest release, prompt for index deletion, prompt for ui/standard,
- * download and replace binary. */
+/* update: check the latest release, choose ui/standard, download and replace
+ * the binary. Existing indexes, client configs and running processes remain
+ * untouched. */
 int cbm_cmd_update(int argc, char **argv);
 
 /* config: get/set/list/reset runtime config values. */
@@ -281,10 +283,15 @@ int cbm_cmd_config(int argc, char **argv);
  * path returns 0 with no stdout output. */
 int cbm_cmd_hook_augment(void);
 
-/* Build the agent.install.plan.v1 install receipt for <home> (issue #388):
- * a machine-readable JSON list of the config/instruction/hook files `install`
- * would write, produced WITHOUT mutating anything. Returns a heap JSON string
- * (caller frees) or NULL on error. Exposed for `install --plan` and testing. */
+/* Build a client-scoped agent.install.plan.v1 receipt without mutation.
+ * client must be a supported canonical client name or "all".
+ * Returns a heap JSON string (caller frees) or NULL on invalid input/error. */
+char *cbm_build_install_plan_json_for_client(const char *home, const char *binary_path,
+                                             const char *client, bool with_hooks,
+                                             bool with_instructions);
+
+/* Compatibility wrapper: builds an explicit "all" plan with safe defaults
+ * (MCP config only; no hooks or instruction files). */
 char *cbm_build_install_plan_json(const char *home, const char *binary_path);
 
 #endif /* CBM_CLI_H */

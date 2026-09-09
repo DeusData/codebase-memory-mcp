@@ -44,6 +44,54 @@ TEST(gbuf_upsert_node) {
     PASS();
 }
 
+TEST(gbuf_v2_overloads_and_metadata) {
+    cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
+    ASSERT_NOT_NULL(gb);
+
+    cbm_gbuf_node_spec_t first = {
+        .label = "Method",
+        .name = "parse",
+        .qualified_name = "pkg.Parser.parse",
+        .file_path = "parser.go",
+        .start_line = 10,
+        .end_line = 12,
+        .properties_json = "{}",
+        .language = "go",
+        .signature = "parse(string) error",
+        .origin = CBM_ORIGIN_STATIC_RESOLVER,
+        .confidence = 0.95,
+    };
+    cbm_gbuf_node_spec_t second = first;
+    second.start_line = 20;
+    second.end_line = 22;
+    second.signature = "parse([]byte) error";
+
+    int64_t first_id = cbm_gbuf_upsert_node_v2(gb, &first);
+    int64_t second_id = cbm_gbuf_upsert_node_v2(gb, &second);
+    ASSERT_GT(first_id, 0);
+    ASSERT_GT(second_id, 0);
+    ASSERT_NEQ(first_id, second_id);
+    ASSERT_EQ(cbm_gbuf_node_count(gb), 2);
+
+    const cbm_gbuf_node_t *first_found = cbm_gbuf_find_by_id(gb, first_id);
+    ASSERT_NOT_NULL(first_found);
+    ASSERT_NOT_NULL(first_found->symbol_id);
+    ASSERT_STR_EQ(first_found->signature, "parse(string) error");
+    ASSERT_STR_EQ(first_found->origin, CBM_ORIGIN_STATIC_RESOLVER);
+    ASSERT_FLOAT_EQ(first_found->confidence, 0.95, 0.0001);
+
+    const cbm_gbuf_node_t *representative = cbm_gbuf_find_by_qn(gb, "pkg.Parser.parse");
+    ASSERT_NOT_NULL(representative);
+    const char *expected = strcmp(first_found->symbol_id,
+                                  cbm_gbuf_find_by_id(gb, second_id)->symbol_id) < 0
+                               ? first_found->symbol_id
+                               : cbm_gbuf_find_by_id(gb, second_id)->symbol_id;
+    ASSERT_STR_EQ(representative->symbol_id, expected);
+
+    cbm_gbuf_free(gb);
+    PASS();
+}
+
 TEST(gbuf_upsert_updates) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp");
     int64_t id1 = cbm_gbuf_upsert_node(gb, "Function", "main", "pkg.main", "main.go", 1, 10, "{}");
@@ -934,6 +982,7 @@ SUITE(graph_buffer) {
     RUN_TEST(gbuf_create_free);
     RUN_TEST(gbuf_free_null);
     RUN_TEST(gbuf_upsert_node);
+    RUN_TEST(gbuf_v2_overloads_and_metadata);
     RUN_TEST(gbuf_upsert_updates);
     RUN_TEST(gbuf_find_by_id);
     RUN_TEST(gbuf_find_by_label);

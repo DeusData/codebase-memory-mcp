@@ -1,1 +1,0 @@
-crewai[anthropic]>=0.100

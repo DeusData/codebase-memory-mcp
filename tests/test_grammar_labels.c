@@ -147,10 +147,8 @@ static const LabelGolden LABEL_GOLDENS[] = {
     {"vimscript", "Function:1,Module:1"},
     {"elm", "Class:1,Function:1,Module:1"},
     {"func", "Function:1,Module:1"},
-    {"lean", "Function:2,Module:1"},
     {"move", "Function:1,Module:1"},
     {"smali", "Class:1,Function:1,Module:1"},
-    {"systemverilog", "Class:1,Function:1,Module:1"},
     {"verilog", "Class:1,Module:1"},
     {"vhdl", "Class:1,Module:1"},
     {"wgsl", "Function:2,Module:1"},
@@ -306,7 +304,7 @@ static int non_module_defs(CBMFileResult *r) {
  * lone Module node is correct for them. */
 static const char *MUST_EXTRACT_DEFS[] = {
     "agda",   "pony",          "move",     "cobol",    "janet",    "pine",  "smali",  "verilog",
-    "vhdl",   "systemverilog", "protobuf", "graphql",  "thrift",   "capnp", "smithy", "wit",
+    "vhdl",   "protobuf",      "graphql",  "thrift",   "capnp",    "smithy", "wit",
     "prisma", "cmake",         "puppet",   "tablegen", "assembly", "nasm",  NULL};
 
 TEST(grammar_code_extracts_defs) {

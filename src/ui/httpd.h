@@ -62,7 +62,7 @@ cbm_httpd_t *cbm_httpd_listen(int port);
 /* The actually-bound port (differs from the requested one for port 0). */
 int cbm_httpd_port(const cbm_httpd_t *d);
 
-/* Override the per-connection receive deadline (tests use short values). */
+/* Override the per-connection I/O deadline, also applied to each response. */
 void cbm_httpd_set_recv_deadline_ms(cbm_httpd_t *d, int ms);
 
 void cbm_httpd_close(cbm_httpd_t *d);

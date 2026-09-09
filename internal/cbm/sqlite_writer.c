@@ -374,6 +374,17 @@ static void rec_add_int(RecordBuilder *r, int64_t val) {
     }
 }
 
+static void rec_add_real(RecordBuilder *r, double val) {
+    enum { SQLITE_SERIAL_REAL = 7 };
+    uint8_t serial = SQLITE_SERIAL_REAL;
+    dynbuf_append(&r->header, &serial, SKIP_ONE);
+    uint64_t bits = 0;
+    memcpy(&bits, &val, sizeof(bits));
+    uint8_t encoded[sizeof(bits)];
+    put_int_be(encoded, (int64_t)bits, (int)sizeof(encoded));
+    dynbuf_append(&r->body, encoded, (int)sizeof(encoded));
+}
+
 static void rec_add_text(RecordBuilder *r, const char *s) {
     int slen = s ? (int)strlen(s) : 0;
     int64_t st = text_serial_type(slen);
@@ -738,6 +749,29 @@ static uint8_t *build_node_record(const CBMDumpNode *n, int *out_len) {
     rec_add_int(&r, n->start_line);
     rec_add_int(&r, n->end_line);
     rec_add_text(&r, n->properties ? n->properties : "{}");
+    char computed_id[CBM_SYMBOL_ID_BUFSZ];
+    const char *symbol_id = n->symbol_id;
+    if (!symbol_id || strlen(symbol_id) != CBM_SYMBOL_ID_HEX_LEN) {
+        cbm_node_t identity = {
+            .label = n->label,
+            .qualified_name = n->qualified_name,
+            .file_path = n->file_path,
+            .start_line = n->start_line,
+            .end_line = n->end_line,
+            .language = n->language,
+            .signature = n->signature,
+        };
+        if (cbm_store_compute_symbol_id(&identity, computed_id) == CBM_STORE_OK) {
+            symbol_id = computed_id;
+        } else {
+            symbol_id = "";
+        }
+    }
+    rec_add_text(&r, symbol_id);
+    rec_add_text(&r, n->language ? n->language : "");
+    rec_add_text(&r, n->signature ? n->signature : "");
+    rec_add_text(&r, n->origin ? n->origin : CBM_ORIGIN_TREE_SITTER);
+    rec_add_real(&r, n->confidence > 0.0 && n->confidence <= 1.0 ? n->confidence : 1.0);
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
@@ -756,6 +790,9 @@ static uint8_t *build_edge_record(const CBMDumpEdge *e, int *out_len) {
     rec_add_int(&r, e->target_id);
     rec_add_text(&r, e->type);
     rec_add_text(&r, e->properties ? e->properties : "{}");
+    rec_add_text(&r, e->origin ? e->origin : CBM_ORIGIN_TREE_SITTER);
+    rec_add_real(&r, e->confidence > 0.0 && e->confidence <= 1.0 ? e->confidence : 1.0);
+    rec_add_text(&r, e->evidence ? e->evidence : "{}");
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
@@ -795,7 +832,7 @@ static uint8_t *build_token_vec_record(const CBMDumpTokenVec *tv, int *out_len) 
     return data;
 }
 
-// Build a projects table record: (name, indexed_at, root_path)
+// Build a projects table record with schema-v2 freshness metadata.
 static uint8_t *build_project_record(const char *name, const char *indexed_at,
                                      const char *root_path, int *out_len) {
     RecordBuilder r;
@@ -804,6 +841,13 @@ static uint8_t *build_project_record(const char *name, const char *indexed_at,
     rec_add_text(&r, name);
     rec_add_text(&r, indexed_at);
     rec_add_text(&r, root_path);
+    rec_add_int(&r, FIRST_ROWID);
+    rec_add_text(&r, "");
+    rec_add_text(&r, "");
+    rec_add_text(&r, indexed_at);
+    rec_add_text(&r, "");
+    rec_add_text(&r, "");
+    rec_add_text(&r, "");
 
     uint8_t *data = rec_finalize(&r, out_len);
     rec_free(&r);
@@ -1420,8 +1464,7 @@ static int cmp_node_by_file(const void *a, const void *b) {
 static int cmp_node_by_qn(const void *a, const void *b) {
     int ia = *(const int *)a;
     int ib = *(const int *)b;
-    int c = strcmp(safe_str(g_sort_nodes[ia].qualified_name),
-                   safe_str(g_sort_nodes[ib].qualified_name));
+    int c = strcmp(safe_str(g_sort_nodes[ia].symbol_id), safe_str(g_sort_nodes[ib].symbol_id));
     if (c) {
         return c;
     }
@@ -1661,7 +1704,7 @@ static const char *ncol_file(const CBMDumpNode *n) {
     return n->file_path ? n->file_path : "";
 }
 static const char *ncol_qn(const CBMDumpNode *n) {
-    return n->qualified_name;
+    return n->symbol_id;
 }
 
 /* Build a 2-text node index from a pre-sorted permutation. Returns root page or 0. */
@@ -1835,7 +1878,7 @@ static void write_sqlite_file_header(uint8_t *page1, uint32_t total_pages) {
     put_u32(page1 + HDR_OFF_DEFAULT_CACHE, 0);
     put_u32(page1 + HDR_OFF_AUTOVAC_TOP, 0);
     put_u32(page1 + HDR_OFF_TEXT_ENCODING, SKIP_ONE);
-    put_u32(page1 + HDR_OFF_USER_VERSION, 0);
+    put_u32(page1 + HDR_OFF_USER_VERSION, CBM_STORE_SCHEMA_VERSION);
     put_u32(page1 + HDR_OFF_INCR_VACUUM, 0);
     put_u32(page1 + HDR_OFF_APP_ID, 0);
     put_u32(page1 + HDR_OFF_VERSION_VALID, SKIP_ONE);
@@ -2123,7 +2166,11 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     MasterEntry master[] = {
         {"table", "projects", "projects", projects_root,
          "CREATE TABLE projects (\n\t\tname TEXT PRIMARY KEY,\n\t\tindexed_at TEXT NOT "
-         "NULL,\n\t\troot_path TEXT NOT NULL\n\t)"},
+         "NULL,\n\t\troot_path TEXT NOT NULL,\n\t\tgeneration INTEGER NOT NULL DEFAULT "
+         "0,\n\t\tcommit_hash TEXT NOT NULL DEFAULT '',\n\t\tdirty_fingerprint TEXT NOT NULL "
+         "DEFAULT '',\n\t\tstructural_indexed_at TEXT NOT NULL DEFAULT "
+         "'',\n\t\tderived_indexed_at TEXT NOT NULL DEFAULT '',\n\t\tstructural_digest TEXT NOT "
+         "NULL DEFAULT '',\n\t\tparser_version TEXT NOT NULL DEFAULT ''\n\t)"},
         {"index", "sqlite_autoindex_projects_1", "projects", autoindex_projects_root, NULL},
         {"table", "file_hashes", "file_hashes", file_hashes_root,
          "CREATE TABLE file_hashes (\n\t\tproject TEXT NOT NULL REFERENCES projects(name) ON "
@@ -2137,7 +2184,10 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "NULL REFERENCES projects(name) ON DELETE CASCADE,\n\t\tlabel TEXT NOT NULL,\n\t\tname "
          "TEXT NOT NULL,\n\t\tqualified_name TEXT NOT NULL,\n\t\tfile_path TEXT DEFAULT "
          "'',\n\t\tstart_line INTEGER DEFAULT 0,\n\t\tend_line INTEGER DEFAULT 0,\n\t\tproperties "
-         "TEXT DEFAULT '{}',\n\t\tUNIQUE(project, qualified_name)\n\t)"},
+         "TEXT DEFAULT '{}',\n\t\tsymbol_id TEXT NOT NULL,\n\t\tlanguage TEXT NOT NULL DEFAULT "
+         "'',\n\t\tsignature TEXT NOT NULL DEFAULT '',\n\t\torigin TEXT NOT NULL DEFAULT "
+         "'tree_sitter',\n\t\tconfidence REAL NOT NULL DEFAULT "
+         "1.0,\n\t\tUNIQUE(project, symbol_id)\n\t)"},
         {"index", "sqlite_autoindex_nodes_1", "nodes", autoindex_nodes_root, NULL},
         {"index", "idx_nodes_label", "nodes", idx_nodes_label_root,
          "CREATE INDEX idx_nodes_label ON nodes(project, label)"},
@@ -2151,7 +2201,9 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
          "REFERENCES nodes(id) ON DELETE CASCADE,\n\t\ttarget_id INTEGER NOT NULL REFERENCES "
          "nodes(id) ON DELETE CASCADE,\n\t\ttype TEXT NOT NULL,\n\t\tproperties TEXT DEFAULT "
          "'{}',\n\t\turl_path_gen TEXT GENERATED ALWAYS AS "
-         "(json_extract(properties,'$.url_path')),\n\t\tUNIQUE(source_id, target_id, type)\n\t)"},
+         "(json_extract(properties,'$.url_path')),\n\t\torigin TEXT NOT NULL DEFAULT "
+         "'tree_sitter',\n\t\tconfidence REAL NOT NULL DEFAULT 1.0,\n\t\tevidence TEXT NOT NULL "
+         "DEFAULT '{}',\n\t\tUNIQUE(source_id, target_id, type)\n\t)"},
         {"index", "sqlite_autoindex_edges_1", "edges", autoindex_edges_root, NULL},
         {"index", "idx_edges_source", "edges", idx_edges_source_root,
          "CREATE INDEX idx_edges_source ON edges(source_id, type)"},
@@ -2244,6 +2296,61 @@ int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int co
     return 0;
 }
 
+static CBMDumpNode *normalize_dump_nodes(CBMDumpNode *nodes, int count, char ***out_owned_ids) {
+    *out_owned_ids = NULL;
+    if (count <= 0) {
+        return nodes;
+    }
+    CBMDumpNode *copy = malloc((size_t)count * sizeof(*copy));
+    char **owned = calloc((size_t)count, sizeof(*owned));
+    if (!copy || !owned) {
+        free(copy);
+        free(owned);
+        return NULL;
+    }
+    memcpy(copy, nodes, (size_t)count * sizeof(*copy));
+    for (int i = 0; i < count; i++) {
+        if (copy[i].symbol_id && strlen(copy[i].symbol_id) == CBM_SYMBOL_ID_HEX_LEN) {
+            continue;
+        }
+        cbm_node_t identity = {
+            .label = copy[i].label,
+            .qualified_name = copy[i].qualified_name,
+            .file_path = copy[i].file_path,
+            .start_line = copy[i].start_line,
+            .end_line = copy[i].end_line,
+            .language = copy[i].language,
+            .signature = copy[i].signature,
+        };
+        owned[i] = malloc(CBM_SYMBOL_ID_BUFSZ);
+        if (!owned[i] ||
+            cbm_store_compute_symbol_id(&identity, owned[i]) != CBM_STORE_OK) {
+            for (int j = 0; j <= i; j++) {
+                free(owned[j]);
+            }
+            free(owned);
+            free(copy);
+            return NULL;
+        }
+        copy[i].symbol_id = owned[i];
+    }
+    *out_owned_ids = owned;
+    return copy;
+}
+
+static void free_normalized_dump_nodes(CBMDumpNode *copy, char **owned_ids, int count,
+                                       CBMDumpNode *original) {
+    if (owned_ids) {
+        for (int i = 0; i < count; i++) {
+            free(owned_ids[i]);
+        }
+        free(owned_ids);
+    }
+    if (copy != original) {
+        free(copy);
+    }
+}
+
 int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *root_path,
                         const char *indexed_at, CBMDumpNode *nodes, int node_count,
                         CBMDumpEdge *edges, int edge_count, CBMDumpVector *vectors,
@@ -2264,7 +2371,15 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     w->wc.project = project;
     w->wc.root_path = root_path;
     w->wc.indexed_at = indexed_at;
-    w->wc.nodes = nodes;
+    char **owned_symbol_ids = NULL;
+    CBMDumpNode *normalized_nodes = normalize_dump_nodes(nodes, node_count, &owned_symbol_ids);
+    if (node_count > 0 && !normalized_nodes) {
+        FILE *fp = w->wc.fp;
+        free(w);
+        (void)fclose(fp);
+        return ERR_WRITE_FAILED;
+    }
+    w->wc.nodes = normalized_nodes;
     w->wc.node_count = node_count;
     w->wc.edges = edges;
     w->wc.edge_count = edge_count;
@@ -2277,9 +2392,12 @@ int cbm_writer_finalize(cbm_db_writer_t *w, const char *project, const char *roo
     free(w);
     if (err != 0) {
         (void)fclose(wc.fp); /* wc is a value copy, valid after free(w) */
+        free_normalized_dump_nodes(normalized_nodes, owned_symbol_ids, node_count, nodes);
         return err;
     }
-    return write_db_after_nodes(&wc, nodes_root);
+    int rc = write_db_after_nodes(&wc, nodes_root);
+    free_normalized_dump_nodes(normalized_nodes, owned_symbol_ids, node_count, nodes);
+    return rc;
 }
 
 int cbm_write_db(const char *path, const char *project, const char *root_path,

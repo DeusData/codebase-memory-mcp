@@ -117,7 +117,6 @@ static const lang_name_entry_t LANG_NAME_TABLE[] = {
     {"glsl", CBM_LANG_GLSL},
     {"ini", CBM_LANG_INI},
     {"matlab", CBM_LANG_MATLAB},
-    {"lean", CBM_LANG_LEAN},
     {"form", CBM_LANG_FORM},
     {"magma", CBM_LANG_MAGMA},
     {"wolfram", CBM_LANG_WOLFRAM},

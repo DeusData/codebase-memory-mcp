@@ -75,6 +75,11 @@ typedef struct {
 CBMHashTable *cbm_pipeline_get_pkgmap(void);
 void cbm_pipeline_set_pkgmap(CBMHashTable *map);
 
+/* A delta affecting more than 20% of the larger current/stored file set is
+ * cheaper and safer to process as a full sibling-DB rebuild. */
+bool cbm_pipeline_incremental_requires_rebuild(int current_count, int stored_count,
+                                               int changed_count, int deleted_count);
+
 /* Unified module resolver: relative → pkgmap → fqn_module fallback.
  * Handles bare specifiers via pkgmap lookup with prefix matching.
  * Caller must free() the returned string. */

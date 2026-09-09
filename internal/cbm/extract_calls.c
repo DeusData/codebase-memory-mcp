@@ -12,8 +12,6 @@
 #include <string.h>
 #include <ctype.h>
 
-/* Max ancestor depth for Lean type-position check. */
-enum { LEAN_MAX_PARENT_DEPTH = 20 };
 /* Max positional args to scan for URL/string. */
 enum { MAX_POSITIONAL_SCAN = 3 };
 /* Max positional args to scan for handler ref. */
@@ -63,47 +61,6 @@ static void walk_calls(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec)
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang);
 static void extract_jsx_refs(CBMExtractCtx *ctx, TSNode node);
 static char *gotemplate_callee(CBMArena *a, TSNode node, const char *source);
-
-// Lean 4: check if an apply node is inside a type annotation.
-// Strategy: walk up to the nearest declaration boundary; if the apply falls
-// inside that declaration's explicit_binder/implicit_binder, or before the
-// body field, it's a type annotation. We check byte ranges: a call is valid
-// only if it overlaps the body range of the enclosing declaration.
-static bool lean_is_in_type_position(TSNode node) {
-    TSNode cur = ts_node_parent(node);
-    for (int depth = 0; depth < LEAN_MAX_PARENT_DEPTH; depth++) {
-        if (ts_node_is_null(cur)) {
-            return false;
-        }
-        const char *pk = ts_node_type(cur);
-        // Inside a binder — definitely type position
-        if (strcmp(pk, "explicit_binder") == 0 || strcmp(pk, "implicit_binder") == 0 ||
-            strcmp(pk, "instance_binder") == 0) {
-            return true;
-        }
-        // At a declaration boundary: check if apply is inside the body field
-        if (strcmp(pk, "def") == 0 || strcmp(pk, "theorem") == 0 || strcmp(pk, "instance") == 0 ||
-            strcmp(pk, "abbrev") == 0 || strcmp(pk, "structure") == 0 ||
-            strcmp(pk, "inductive") == 0) {
-            // Check if apply comes after the type annotation.
-            // Strategy: if the node starts after the end of the "type" field, it's in value
-            // position. If there's no "type" field, allow the call (no annotation to filter).
-            TSNode type_field = ts_node_child_by_field_name(cur, TS_FIELD("type"));
-            if (ts_node_is_null(type_field)) {
-                return false; // no type annotation → allow call
-            }
-            uint32_t type_end = ts_node_end_byte(type_field);
-            uint32_t node_start = ts_node_start_byte(node);
-            // If apply starts after the type annotation ends, it's a value (call)
-            if (node_start > type_end) {
-                return false;
-            }
-            return true; // apply is within or before type annotation → type position
-        }
-        cur = ts_node_parent(cur);
-    }
-    return false;
-}
 
 /* Resolve a selector_expression that may chain through call_expressions.
  * Go pattern: pb.NewFooClient(conn).GetBar → "pb.NewFooClient.GetBar"
@@ -598,13 +555,6 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
 
 // Extract callee name from a call node
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang) {
-    // Lean 4: skip type-position applies
-    if (lang == CBM_LANG_LEAN && strcmp(ts_node_type(node), "apply") == 0) {
-        if (lean_is_in_type_position(node)) {
-            return NULL;
-        }
-    }
-
     // Helm / Go templates: resolve `include "x"` / `template "x"` to the
     // referenced named template so it links to the define'd Function (#338).
     if (lang == CBM_LANG_GOTEMPLATE) {

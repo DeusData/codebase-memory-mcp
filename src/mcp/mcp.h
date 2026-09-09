@@ -2,7 +2,7 @@
  * mcp.h — MCP (Model Context Protocol) server for codebase-memory-mcp.
  *
  * Implements JSON-RPC 2.0 over stdio with the MCP tool calling protocol.
- * Provides 14 graph analysis tools (search, trace, query, index, etc.)
+ * Provides a small core toolset plus explicit advanced/admin groups.
  */
 #ifndef CBM_MCP_H
 #define CBM_MCP_H
@@ -10,6 +10,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include "product_manifest_generated.h"
+
+#ifndef CBM_VERSION
+#define CBM_VERSION CBM_PRODUCT_VERSION
+#endif
 
 /* ── Forward declarations ─────────────────────────────────────── */
 
@@ -57,6 +62,18 @@ char *cbm_mcp_text_result(const char *text, bool is_error);
 /* Format the tools/list response. Returns heap-allocated JSON. */
 char *cbm_mcp_tools_list(void);
 
+/* MCP tools are grouped so the default context stays small. Core is always
+ * enabled unless an embedding explicitly replaces the mask. */
+enum {
+    CBM_MCP_TOOLSET_CORE = 1U << 0,
+    CBM_MCP_TOOLSET_ADVANCED = 1U << 1,
+    CBM_MCP_TOOLSET_ADMIN = 1U << 2,
+};
+
+/* Format tools/list for an explicit toolset mask. Primarily useful for
+ * embedders and deterministic tests; ingest_traces is never advertised. */
+char *cbm_mcp_tools_list_for_toolsets(unsigned toolsets);
+
 /* Format the initialize response. params_json is the raw initialize params
  * (used for protocol version negotiation). Returns heap-allocated JSON. */
 char *cbm_mcp_initialize_response(const char *params_json);
@@ -88,6 +105,11 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path);
 
 /* Free an MCP server. */
 void cbm_mcp_server_free(cbm_mcp_server_t *srv);
+
+/* Replace/query the enabled MCP toolset mask. CORE is the default. Unknown
+ * bits are ignored. tools/list and tools/call use the same mask. */
+void cbm_mcp_server_set_toolsets(cbm_mcp_server_t *srv, unsigned toolsets);
+unsigned cbm_mcp_server_get_toolsets(const cbm_mcp_server_t *srv);
 
 /* Set external watcher reference (for auto-index registration). Not owned. */
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);

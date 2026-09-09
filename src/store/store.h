@@ -23,6 +23,18 @@ typedef struct cbm_store cbm_store_t;
 #define CBM_STORE_OK 0
 #define CBM_STORE_ERR (-1)
 #define CBM_STORE_NOT_FOUND (-2)
+#define CBM_STORE_MIGRATION_REQUIRED (-3)
+
+/* On-disk schema and stable identity constants. */
+#define CBM_STORE_SCHEMA_VERSION 2
+#define CBM_SYMBOL_ID_HEX_LEN 32
+#define CBM_SYMBOL_ID_BUFSZ (CBM_SYMBOL_ID_HEX_LEN + 1)
+
+/* Provenance values are strings on disk so future sources remain extensible. */
+#define CBM_ORIGIN_SCIP "scip"
+#define CBM_ORIGIN_STATIC_RESOLVER "static_resolver"
+#define CBM_ORIGIN_TREE_SITTER "tree_sitter"
+#define CBM_ORIGIN_HEURISTIC "heuristic"
 
 /* ── Data structures ────────────────────────────────────────────── */
 
@@ -36,6 +48,11 @@ typedef struct {
     int start_line;
     int end_line;
     const char *properties_json; /* JSON string, NULL → "{}" */
+    const char *symbol_id;       /* stable 128-bit identity, 32 lowercase hex chars */
+    const char *language;        /* normalized language name, e.g. "go" */
+    const char *signature;       /* source signature; normalized only for identity hashing */
+    const char *origin;          /* CBM_ORIGIN_* */
+    double confidence;           /* [0,1], zero-initialized callers default to 1.0 */
 } cbm_node_t;
 
 typedef struct {
@@ -45,12 +62,22 @@ typedef struct {
     int64_t target_id;
     const char *type;            /* CALLS, HTTP_CALLS, IMPORTS, ... */
     const char *properties_json; /* JSON string, NULL → "{}" */
+    const char *origin;          /* CBM_ORIGIN_* */
+    double confidence;           /* [0,1], zero-initialized callers default to 1.0 */
+    const char *evidence_json;   /* reproducible resolver evidence, NULL → "{}" */
 } cbm_edge_t;
 
 typedef struct {
     const char *name;
     const char *indexed_at; /* ISO 8601 */
     const char *root_path;
+    int64_t generation;
+    const char *commit_hash;
+    const char *dirty_fingerprint;
+    const char *structural_indexed_at;
+    const char *derived_indexed_at;
+    const char *structural_digest;
+    const char *parser_version;
 } cbm_project_t;
 
 typedef struct {
@@ -134,7 +161,37 @@ typedef struct {
     cbm_search_result_t *results;
     int count;
     int total; /* total before pagination */
+    bool has_more;
 } cbm_search_output_t;
+
+/* ── Indexed source documents / code search ─────────────────────── */
+
+typedef struct {
+    const char *project;
+    const char *pattern;
+    const char *file_pattern; /* glob on the indexed relative path, NULL = any */
+    const char *path_filter;  /* regular expression on the relative path, NULL = any */
+    bool regex;
+    bool case_sensitive;
+    int limit;                /* 0 = default */
+    int cursor;               /* deterministic zero-based match offset */
+    bool include_total;       /* exact total is omitted (-1) unless requested */
+} cbm_code_search_params_t;
+
+typedef struct {
+    char *file_path;
+    int line;
+    char *content;
+} cbm_code_match_t;
+
+typedef struct {
+    cbm_code_match_t *matches;
+    int count;
+    int total; /* -1 when include_total=false */
+    bool has_more;
+    int next_cursor; /* 0 when there is no next page */
+    bool used_fts;
+} cbm_code_search_output_t;
 
 /* ── Traversal ──────────────────────────────────────────────────── */
 
@@ -202,6 +259,10 @@ cbm_store_t *cbm_store_open_path(const char *db_path);
  * Returns NULL if the file does not exist — never creates a new .db file. */
 cbm_store_t *cbm_store_open_path_query(const char *db_path);
 
+/* Query-only open with a typed status. Existing schema-v1 databases are never
+ * mutated by this path and return CBM_STORE_MIGRATION_REQUIRED. */
+cbm_store_t *cbm_store_open_path_query_ex(const char *db_path, int *status);
+
 /* Check database integrity. Returns true if the DB passes basic sanity checks
  * (projects table has correct types, no corruption indicators).
  * Returns false if corruption is detected — caller should delete and re-index. */
@@ -267,6 +328,13 @@ int cbm_store_dump_to_file(cbm_store_t *s, const char *dest_path);
 /* ── Project CRUD ───────────────────────────────────────────────── */
 
 int cbm_store_upsert_project(cbm_store_t *s, const char *name, const char *root_path);
+int cbm_store_set_project_freshness(cbm_store_t *s, const char *name, int64_t generation,
+                                    const char *commit_hash, const char *dirty_fingerprint,
+                                    const char *structural_indexed_at,
+                                    const char *derived_indexed_at);
+int cbm_store_set_project_structural_metadata(cbm_store_t *s, const char *name,
+                                              const char *structural_digest,
+                                              const char *parser_version);
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out);
 int cbm_store_list_projects(cbm_store_t *s, cbm_project_t **out, int *count);
 int cbm_store_delete_project(cbm_store_t *s, const char *name);
@@ -275,6 +343,11 @@ int cbm_store_delete_project(cbm_store_t *s, const char *name);
 
 /* Upsert a single node. Returns node ID (>0) or CBM_STORE_ERR. */
 int64_t cbm_store_upsert_node(cbm_store_t *s, const cbm_node_t *n);
+
+/* Compute the stable schema-v2 identity for a node. The identity includes
+ * language, normalized path, source range, kind, qualified name, and normalized
+ * signature. out must have CBM_SYMBOL_ID_BUFSZ bytes. */
+int cbm_store_compute_symbol_id(const cbm_node_t *n, char out[CBM_SYMBOL_ID_BUFSZ]);
 
 /* Upsert nodes in batch. out_ids must have room for count entries. */
 int cbm_store_upsert_node_batch(cbm_store_t *s, const cbm_node_t *nodes, int count,
@@ -296,6 +369,11 @@ int cbm_store_find_nodes_by_name(cbm_store_t *s, const char *project, const char
 /* Find nodes by name across all projects. Returns allocated array, caller frees. */
 int cbm_store_find_nodes_by_name_any(cbm_store_t *s, const char *name, cbm_node_t **out,
                                      int *count);
+
+/* Find every node in a project in deterministic symbol identity order.
+ * Returns an allocated array; caller releases it with cbm_store_free_nodes(). */
+int cbm_store_find_nodes_by_project(cbm_store_t *s, const char *project, cbm_node_t **out,
+                                    int *count);
 
 /* Find nodes by label. */
 int cbm_store_find_nodes_by_label(cbm_store_t *s, const char *project, const char *label,
@@ -379,6 +457,22 @@ int cbm_store_search(cbm_store_t *s, const cbm_search_params_t *params, cbm_sear
 
 /* Free a search output's allocated memory. */
 void cbm_store_search_free(cbm_search_output_t *out);
+
+/* Persist the exact source text used for in-process code search. The FTS
+ * candidate index is maintained transactionally with this table. */
+int cbm_store_upsert_code_document(cbm_store_t *s, const char *project, const char *file_path,
+                                   const char *content);
+int cbm_store_delete_code_document(cbm_store_t *s, const char *project, const char *file_path);
+int cbm_store_delete_code_documents(cbm_store_t *s, const char *project);
+int cbm_store_code_search(cbm_store_t *s, const cbm_code_search_params_t *params,
+                          cbm_code_search_output_t *out);
+void cbm_store_code_search_free(cbm_code_search_output_t *out);
+
+/* Fetch nodes for many files in one SQL statement, ordered by file/range/id.
+ * This is the batch primitive used to classify code-search matches without
+ * issuing one query per matched file. */
+int cbm_store_find_nodes_by_files(cbm_store_t *s, const char *project, const char **file_paths,
+                                  int file_count, cbm_node_t **out, int *count);
 
 /* ── Traversal ──────────────────────────────────────────────────── */
 

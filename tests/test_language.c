@@ -306,7 +306,12 @@ TEST(lang_ext_mlx) {
     PASS();
 }
 TEST(lang_ext_lean) {
-    ASSERT_EQ(cbm_language_for_extension(".lean"), CBM_LANG_LEAN);
+    ASSERT_EQ(cbm_language_for_extension(".lean"), CBM_LANG_COUNT);
+    PASS();
+}
+TEST(lang_removed_parser_names_are_unknown) {
+    ASSERT_STR_EQ(cbm_language_name(CBM_LANG_LEAN), "Unknown");
+    ASSERT_STR_EQ(cbm_language_name(CBM_LANG_SYSTEMVERILOG), "Unknown");
     PASS();
 }
 TEST(lang_ext_form) {
@@ -1041,11 +1046,15 @@ TEST(lang_ext_sosl) {
 
 /* --- Ported from lang_test.go: TestForLanguage --- */
 TEST(lang_all_have_names) {
-    /* Every language enum value from 0 to CBM_LANG_COUNT-1
-     * should have a non-"Unknown" name. */
+    /* Removed parsers keep enum tombstones so persisted language IDs do not
+     * shift across schema versions. All active language IDs must be named. */
     for (int i = 0; i < CBM_LANG_COUNT; i++) {
         const char *name = cbm_language_name((CBMLanguage)i);
         ASSERT_NOT_NULL(name);
+        if (i == CBM_LANG_LEAN || i == CBM_LANG_SYSTEMVERILOG) {
+            ASSERT_STR_EQ(name, "Unknown");
+            continue;
+        }
         ASSERT_TRUE(strcmp(name, "Unknown") != 0);
     }
     PASS();
@@ -1132,6 +1141,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_matlab);
     RUN_TEST(lang_ext_mlx);
     RUN_TEST(lang_ext_lean);
+    RUN_TEST(lang_removed_parser_names_are_unknown);
     RUN_TEST(lang_ext_form);
     RUN_TEST(lang_ext_prc);
     RUN_TEST(lang_ext_magma);

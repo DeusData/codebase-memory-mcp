@@ -71,6 +71,20 @@ TEST(default_worker_count_minimum) {
     PASS();
 }
 
+TEST(worker_count_scales_with_project_size) {
+    ASSERT_EQ(cbm_worker_count_for_files(0, true), 1);
+    ASSERT_EQ(cbm_worker_count_for_files(1, true), 1);
+
+    int medium = cbm_worker_count_for_files(100, true);
+    ASSERT_GTE(medium, 1);
+    ASSERT_LTE(medium, 2);
+
+    int large = cbm_worker_count_for_files(100000, true);
+    ASSERT_GTE(large, 1);
+    ASSERT_LTE(large, cbm_default_worker_count(true));
+    PASS();
+}
+
 /* ── Worker Pool Tests ────────────────────────────────────────────── */
 
 static void sum_worker(int idx, void *ctx) {
@@ -376,6 +390,7 @@ SUITE(system_info) {
     RUN_TEST(default_worker_count_initial);
     RUN_TEST(default_worker_count_incremental);
     RUN_TEST(default_worker_count_minimum);
+    RUN_TEST(worker_count_scales_with_project_size);
 }
 
 SUITE(worker_pool) {

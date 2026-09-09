@@ -2197,6 +2197,10 @@ static void node_deep_copy(cbm_node_t *dst, const cbm_node_t *src) {
     dst->qualified_name = heap_strdup(src->qualified_name);
     dst->file_path = heap_strdup(src->file_path);
     dst->properties_json = heap_strdup(src->properties_json);
+    dst->symbol_id = heap_strdup(src->symbol_id);
+    dst->language = heap_strdup(src->language);
+    dst->signature = heap_strdup(src->signature);
+    dst->origin = heap_strdup(src->origin);
 }
 
 static void node_fields_free(cbm_node_t *n) {
@@ -2209,6 +2213,10 @@ static void node_fields_free(cbm_node_t *n) {
     safe_str_free(&n->qualified_name);
     safe_str_free(&n->file_path);
     safe_str_free(&n->properties_json);
+    safe_str_free(&n->symbol_id);
+    safe_str_free(&n->language);
+    safe_str_free(&n->signature);
+    safe_str_free(&n->origin);
 }
 
 /* Deep copy an edge (binding owns the strings) */
@@ -2217,12 +2225,16 @@ static void edge_deep_copy(cbm_edge_t *dst, const cbm_edge_t *src) {
     dst->project = heap_strdup(src->project);
     dst->type = heap_strdup(src->type);
     dst->properties_json = heap_strdup(src->properties_json);
+    dst->origin = heap_strdup(src->origin);
+    dst->evidence_json = heap_strdup(src->evidence_json);
 }
 
 static void edge_fields_free(cbm_edge_t *e) {
     safe_str_free(&e->project);
     safe_str_free(&e->type);
     safe_str_free(&e->properties_json);
+    safe_str_free(&e->origin);
+    safe_str_free(&e->evidence_json);
 }
 
 /* Set an edge variable in a binding */
@@ -2767,12 +2779,8 @@ static void scan_pattern_nodes(cbm_store_t *store, const char *project, int max_
         *out_nodes = malloc(sout.count * sizeof(cbm_node_t));
         for (int i = 0; i < sout.count; i++) {
             (*out_nodes)[i] = sout.results[i].node;
-            sout.results[i].node.name = NULL;
-            sout.results[i].node.project = NULL;
-            sout.results[i].node.label = NULL;
-            sout.results[i].node.qualified_name = NULL;
-            sout.results[i].node.file_path = NULL;
-            sout.results[i].node.properties_json = NULL;
+            /* Transfer every owned field, including stable symbol identity. */
+            memset(&sout.results[i].node, 0, sizeof(sout.results[i].node));
         }
         cbm_store_search_free(&sout);
     }

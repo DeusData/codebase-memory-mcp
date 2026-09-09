@@ -44,8 +44,10 @@ cat >"${tmpdir}/wrapper.sh" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 exec 3<>"${FIFO}"
-"${CBM_BINARY}" <&3 >/dev/null 2>"${TMPDIR_PATH}/child.err" &
+"${CBM_BINARY}" <&3 >"${TMPDIR_PATH}/child.out" 2>"${TMPDIR_PATH}/child.err" &
 echo "$!" >"${TMPDIR_PATH}/child.pid"
+# Leave getline blocked in a partial request while the watchdog fires.
+printf '{"jsonrpc":"2.0","id":1,"method":"ping"}\n{"jsonrpc":' >&3
 wait
 SH
 chmod +x "${tmpdir}/wrapper.sh"
@@ -74,6 +76,14 @@ if ! kill -0 "${child_pid}" 2>/dev/null; then
 fi
 
 # Kill the wrapper parent: the orphaned child must now self-exit.
+for _ in {1..50}; do
+  grep -q '"id":1' "${tmpdir}/child.out" 2>/dev/null && break
+  sleep 0.1
+done
+if ! grep -q '"id":1' "${tmpdir}/child.out"; then
+  echo "child did not become ready" >&2
+  exit 3
+fi
 kill -9 "${wrapper_pid}"
 wait "${wrapper_pid}" 2>/dev/null || true
 

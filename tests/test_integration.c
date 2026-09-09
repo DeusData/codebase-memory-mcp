@@ -128,6 +128,8 @@ static int integration_setup(void) {
     g_srv = cbm_mcp_server_new(NULL);
     if (!g_srv)
         return -1;
+    cbm_mcp_server_set_toolsets(
+        g_srv, CBM_MCP_TOOLSET_CORE | CBM_MCP_TOOLSET_ADVANCED | CBM_MCP_TOOLSET_ADMIN);
 
     /* Index our temp project via MCP tool handler */
     char args[512];

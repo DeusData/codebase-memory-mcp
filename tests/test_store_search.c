@@ -7,6 +7,7 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include <store/store.h>
+#include <sqlite3.h>
 #include <string.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -163,6 +164,162 @@ TEST(store_search_pagination) {
     cbm_store_search_free(&out);
 
     cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_code_search_literal_regex_and_filters) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_code_document(
+                  s, "test", "src/a.c",
+                  "static int alpha_beta(void) { return 1; }\n"
+                  "const char *marker = \"foo$bar [literal]\";\n"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_code_document(
+                  s, "test", "tests/a_test.c", "void alpha_beta_test(void) {}\n"),
+              CBM_STORE_OK);
+
+    cbm_code_search_params_t literal = {
+        .project = "test",
+        .pattern = "foo$bar [literal]",
+        .file_pattern = "*.c",
+        .path_filter = "^src/",
+        .limit = 10,
+        .include_total = true,
+    };
+    cbm_code_search_output_t out = {0};
+    ASSERT_EQ(cbm_store_code_search(s, &literal, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_EQ(out.total, 1);
+    ASSERT_STR_EQ(out.matches[0].file_path, "src/a.c");
+    ASSERT_EQ(out.matches[0].line, 2);
+    ASSERT_NOT_NULL(strstr(out.matches[0].content, "foo$bar [literal]"));
+    cbm_store_code_search_free(&out);
+
+    cbm_code_search_params_t regex = {
+        .project = "test",
+        .pattern = "alpha_.*\\(void\\)",
+        .path_filter = "^tests/",
+        .regex = true,
+        .limit = 10,
+        .include_total = true,
+    };
+    ASSERT_EQ(cbm_store_code_search(s, &regex, &out), CBM_STORE_OK);
+    ASSERT_EQ(out.count, 1);
+    ASSERT_STR_EQ(out.matches[0].file_path, "tests/a_test.c");
+    cbm_store_code_search_free(&out);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_code_search_cursor_total_and_updates) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_code_document(s, "test", "b.go", "needle b1\nneedle b2\n"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_code_document(s, "test", "a.go", "needle a1\nneedle a2\n"),
+              CBM_STORE_OK);
+
+    cbm_code_search_params_t params = {
+        .project = "test", .pattern = "needle", .limit = 2, .include_total = false};
+    cbm_code_search_output_t first = {0};
+    ASSERT_EQ(cbm_store_code_search(s, &params, &first), CBM_STORE_OK);
+    ASSERT_EQ(first.count, 2);
+    ASSERT_EQ(first.total, -1);
+    ASSERT_TRUE(first.has_more);
+    ASSERT_EQ(first.next_cursor, 2);
+    ASSERT_STR_EQ(first.matches[0].file_path, "a.go");
+    ASSERT_EQ(first.matches[0].line, 1);
+    ASSERT_EQ(first.matches[1].line, 2);
+
+    params.cursor = first.next_cursor;
+    cbm_code_search_output_t second = {0};
+    ASSERT_EQ(cbm_store_code_search(s, &params, &second), CBM_STORE_OK);
+    ASSERT_EQ(second.count, 2);
+    ASSERT_FALSE(second.has_more);
+    ASSERT_EQ(second.next_cursor, 0);
+    ASSERT_STR_EQ(second.matches[0].file_path, "b.go");
+    cbm_store_code_search_free(&first);
+    cbm_store_code_search_free(&second);
+
+    ASSERT_EQ(cbm_store_upsert_code_document(s, "test", "a.go", "replacement only\n"),
+              CBM_STORE_OK);
+    params.cursor = 0;
+    params.include_total = true;
+    cbm_code_search_output_t updated = {0};
+    ASSERT_EQ(cbm_store_code_search(s, &params, &updated), CBM_STORE_OK);
+    ASSERT_EQ(updated.total, 2);
+    ASSERT_STR_EQ(updated.matches[0].file_path, "b.go");
+    cbm_store_code_search_free(&updated);
+
+    ASSERT_EQ(cbm_store_delete_code_document(s, "test", "b.go"), CBM_STORE_OK);
+    cbm_code_search_output_t deleted = {0};
+    ASSERT_EQ(cbm_store_code_search(s, &params, &deleted), CBM_STORE_OK);
+    ASSERT_EQ(deleted.total, 0);
+    cbm_store_code_search_free(&deleted);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_find_nodes_by_files_is_batched_and_stable) {
+    int64_t ids[3];
+    cbm_store_t *s = setup_search_store(ids);
+    const char *files[] = {"service.go", "main.go"};
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_files(s, "test", files, 2, &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(nodes[0].file_path, "main.go");
+    ASSERT_STR_EQ(nodes[1].file_path, "service.go");
+    ASSERT_STR_EQ(nodes[2].file_path, "service.go");
+    /* IDs are content-derived, not insertion counters. Input order must not
+     * affect the returned order within a file. */
+    const char *reversed[] = {"main.go", "service.go"};
+    cbm_node_t *again = NULL;
+    int again_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_files(s, "test", reversed, 2, &again, &again_count),
+              CBM_STORE_OK);
+    ASSERT_EQ(again_count, count);
+    for (int i = 0; i < count; i++) {
+        ASSERT_EQ(again[i].id, nodes[i].id);
+    }
+    cbm_store_free_nodes(again, again_count);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_query_open_rejects_schema_v1_without_mutating) {
+    char path[] = "/tmp/cbm-query-v1-XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_TRUE(fd >= 0);
+    close(fd);
+
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db,
+                           "CREATE TABLE projects(name TEXT PRIMARY KEY,indexed_at TEXT,"
+                           "root_path TEXT);"
+                           "PRAGMA user_version=1;",
+                           NULL, NULL, NULL),
+              SQLITE_OK);
+    sqlite3_close(db);
+
+    int status = CBM_STORE_OK;
+    cbm_store_t *s = cbm_store_open_path_query_ex(path, &status);
+    ASSERT_NULL(s);
+    ASSERT_EQ(status, CBM_STORE_MIGRATION_REQUIRED);
+
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), 1);
+    sqlite3_finalize(stmt);
+    sqlite3_close(db);
+    unlink(path);
     PASS();
 }
 
@@ -1237,6 +1394,10 @@ SUITE(store_search) {
     RUN_TEST(store_search_by_file_pattern);
     RUN_TEST(store_search_file_pattern_substring_issue200);
     RUN_TEST(store_search_pagination);
+    RUN_TEST(store_code_search_literal_regex_and_filters);
+    RUN_TEST(store_code_search_cursor_total_and_updates);
+    RUN_TEST(store_find_nodes_by_files_is_batched_and_stable);
+    RUN_TEST(store_query_open_rejects_schema_v1_without_mutating);
     RUN_TEST(store_search_degree_filter);
     RUN_TEST(store_search_all);
     RUN_TEST(store_search_exclude_labels);

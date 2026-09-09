@@ -823,21 +823,6 @@
     "module_root": "design_file"
   },
   {
-    "name": "systemverilog",
-    "enum": "SYSTEMVERILOG",
-    "display": "SystemVerilog",
-    "ts_func": "tree_sitter_systemverilog",
-    "repo": "https://github.com/gmlarumbe/tree-sitter-systemverilog",
-    "subdir": "",
-    "extensions": [
-      ".sv",
-      ".svh"
-    ],
-    "filenames": [],
-    "has_scanner": false,
-    "module_root": "source_file"
-  },
-  {
     "name": "devicetree",
     "enum": "DEVICETREE",
     "display": "DeviceTree",

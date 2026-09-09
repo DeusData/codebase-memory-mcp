@@ -319,25 +319,6 @@ static TSNode resolve_func_name_scripting(TSNode node, CBMLanguage lang, const c
     return null_node;
 }
 
-// Lean: resolve function name from declId field.
-static TSNode resolve_lean_func_name(TSNode node, TSNode name) {
-    TSNode decl_id = ts_node_child_by_field_name(node, TS_FIELD("declId"));
-    if (!ts_node_is_null(decl_id)) {
-        TSNode id = cbm_find_child_by_kind(decl_id, "ident");
-        if (!ts_node_is_null(id)) {
-            return id;
-        }
-        if (ts_node_named_child_count(decl_id) > 0) {
-            return ts_node_named_child(decl_id, 0);
-        }
-        return decl_id;
-    }
-    if (!ts_node_is_null(name)) {
-        return name;
-    }
-    return cbm_find_child_by_kind(node, "ident");
-}
-
 // Haskell: resolve function name from first named child (variable/name).
 static TSNode resolve_haskell_func_name(TSNode node) {
     if (ts_node_named_child_count(node) > 0) {
@@ -441,10 +422,6 @@ static TSNode resolve_func_name_fp(TSNode node, CBMLanguage lang, const char *ki
             return name;
         }
         return cbm_find_child_by_kind(node, "identifier");
-    }
-
-    if (lang == CBM_LANG_LEAN) {
-        return resolve_lean_func_name(node, name);
     }
 
     if (lang == CBM_LANG_WOLFRAM &&
@@ -893,10 +870,10 @@ static TSNode resolve_func_name(TSNode node, CBMLanguage lang) {
             }
         }
 
-        /* Verilog/SystemVerilog (FIELD_COUNT 0): function/task names live on a
+        /* Verilog (FIELD_COUNT 0): function/task names live on a
          * nested *_identifier wrapper; the function name is the first
          * simple_identifier descendant (params/returns come after the name). */
-        if ((lang == CBM_LANG_VERILOG || lang == CBM_LANG_SYSTEMVERILOG) &&
+        if (lang == CBM_LANG_VERILOG &&
             (strcmp(kind, "function_declaration") == 0 || strcmp(kind, "task_declaration") == 0)) {
             TSNode si =
                 find_first_descendant_by_kind(node, "simple_identifier", CBM_DESCENDANT_MAX_DEPTH);
@@ -3105,11 +3082,11 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             name_node = ts_node_child_by_field_name(node, TS_FIELD("type"));
         }
     }
-    // Verilog/SystemVerilog (FIELD_COUNT 0): module/class/interface/package use a
+    // Verilog (FIELD_COUNT 0): module/class/interface/package use a
     // nested simple_identifier (first descendant); type_declaration must use the
     // DIRECT-child simple_identifier (member/enum idents precede the typedef name).
     if (ts_node_is_null(name_node) &&
-        (ctx->language == CBM_LANG_VERILOG || ctx->language == CBM_LANG_SYSTEMVERILOG)) {
+        ctx->language == CBM_LANG_VERILOG) {
         if (strcmp(kind, "type_declaration") == 0) {
             name_node = cbm_find_child_by_kind(node, "simple_identifier");
         } else if (strcmp(kind, "module_declaration") == 0 ||

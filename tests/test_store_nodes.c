@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <unistd.h>
 
 /* ── Schema / Open / Close ──────────────────────────────────────── */
 
@@ -33,6 +34,100 @@ TEST(store_open_memory_twice) {
     /* independent databases */
     cbm_store_close(s1);
     cbm_store_close(s2);
+    PASS();
+}
+
+TEST(store_schema_v2_metadata) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_NOT_NULL(db);
+
+    sqlite3_stmt *stmt = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA user_version", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_ROW);
+    ASSERT_EQ(sqlite3_column_int(stmt, 0), CBM_STORE_SCHEMA_VERSION);
+    sqlite3_finalize(stmt);
+
+    const char *required[] = {
+        "symbol_id", "language", "signature", "origin", "confidence",
+    };
+    bool found[5] = {false, false, false, false, false};
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA table_info(nodes)", -1, &stmt, NULL), SQLITE_OK);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(stmt, 1);
+        for (int i = 0; i < 5; i++) {
+            if (name && strcmp(name, required[i]) == 0) {
+                found[i] = true;
+            }
+        }
+    }
+    sqlite3_finalize(stmt);
+    for (int i = 0; i < 5; i++) {
+        ASSERT(found[i]);
+    }
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_schema_v1_migrates_without_data_loss) {
+    char path[] = "/tmp/cbm_store_v1_XXXXXX";
+    int fd = mkstemp(path);
+    ASSERT_GT(fd, -1);
+    close(fd);
+
+    sqlite3 *legacy = NULL;
+    ASSERT_EQ(sqlite3_open(path, &legacy), SQLITE_OK);
+    const char *v1 =
+        "PRAGMA foreign_keys=ON;"
+        "CREATE TABLE projects(name TEXT PRIMARY KEY,indexed_at TEXT NOT NULL,"
+        "root_path TEXT NOT NULL);"
+        "CREATE TABLE nodes(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "label TEXT NOT NULL,name TEXT NOT NULL,qualified_name TEXT NOT NULL,"
+        "file_path TEXT DEFAULT '',start_line INTEGER DEFAULT 0,end_line INTEGER DEFAULT 0,"
+        "properties TEXT DEFAULT '{}',UNIQUE(project,qualified_name));"
+        "CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        "project TEXT NOT NULL REFERENCES projects(name) ON DELETE CASCADE,"
+        "source_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
+        "target_id INTEGER NOT NULL REFERENCES nodes(id) ON DELETE CASCADE,"
+        "type TEXT NOT NULL,properties TEXT DEFAULT '{}',"
+        "url_path_gen TEXT GENERATED ALWAYS AS (json_extract(properties,'$.url_path')),"
+        "UNIQUE(source_id,target_id,type));"
+        "INSERT INTO projects VALUES('legacy','2026-01-01T00:00:00Z','/tmp/legacy');"
+        "INSERT INTO nodes(project,label,name,qualified_name,file_path,start_line,end_line,"
+        "properties) VALUES"
+        "('legacy','Function','a','legacy.a','a.go',1,3,"
+        "'{\"language\":\"go\",\"signature\":\"a()\"}'),"
+        "('legacy','Function','b','legacy.b','b.go',4,6,'{}');"
+        "INSERT INTO edges(project,source_id,target_id,type,properties)"
+        " VALUES('legacy',1,2,'CALLS','{}');";
+    char *error = NULL;
+    ASSERT_EQ(sqlite3_exec(legacy, v1, NULL, NULL, &error), SQLITE_OK);
+    sqlite3_free(error);
+    sqlite3_close(legacy);
+
+    cbm_store_t *s = cbm_store_open_path(path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_count_nodes(s, "legacy"), 2);
+    ASSERT_EQ(cbm_store_count_edges(s, "legacy"), 1);
+
+    cbm_node_t migrated = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, "legacy", "legacy.a", &migrated), CBM_STORE_OK);
+    ASSERT_EQ(strlen(migrated.symbol_id), CBM_SYMBOL_ID_HEX_LEN);
+    ASSERT_STR_EQ(migrated.language, "go");
+    ASSERT_STR_EQ(migrated.signature, "a()");
+    ASSERT_STR_EQ(migrated.origin, CBM_ORIGIN_TREE_SITTER);
+    cbm_node_free_fields(&migrated);
+
+    sqlite3_stmt *stmt = NULL;
+    sqlite3 *db = cbm_store_get_db(s);
+    ASSERT_EQ(sqlite3_prepare_v2(db, "PRAGMA foreign_key_check", -1, &stmt, NULL), SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(stmt), SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    cbm_store_close(s);
+    unlink(path);
     PASS();
 }
 
@@ -160,6 +255,145 @@ TEST(store_node_crud) {
     /* Count */
     int cnt = cbm_store_count_nodes(s, "test");
     ASSERT_EQ(cnt, 1);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_node_v2_identity_and_overloads) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+
+    cbm_node_t first = {
+        .project = "test",
+        .label = "Method",
+        .name = "parse",
+        .qualified_name = "test.Parser.parse",
+        .file_path = "parser.go",
+        .start_line = 10,
+        .end_line = 12,
+        .language = "go",
+        .signature = "parse( value   string ) error",
+        .origin = CBM_ORIGIN_STATIC_RESOLVER,
+        .confidence = 0.95,
+    };
+    cbm_node_t second = first;
+    second.start_line = 20;
+    second.end_line = 22;
+    second.signature = "parse(value []byte) error";
+
+    int64_t first_id = cbm_store_upsert_node(s, &first);
+    int64_t second_id = cbm_store_upsert_node(s, &second);
+    ASSERT_GT(first_id, 0);
+    ASSERT_GT(second_id, 0);
+    ASSERT_NEQ(first_id, second_id);
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 2);
+
+    cbm_node_t first_found = {0};
+    ASSERT_EQ(cbm_store_find_node_by_id(s, first_id, &first_found), CBM_STORE_OK);
+    ASSERT_NOT_NULL(first_found.symbol_id);
+    ASSERT_EQ(strlen(first_found.symbol_id), CBM_SYMBOL_ID_HEX_LEN);
+    ASSERT_STR_EQ(first_found.language, "go");
+    ASSERT_STR_EQ(first_found.signature, "parse( value   string ) error");
+    ASSERT_STR_EQ(first_found.origin, CBM_ORIGIN_STATIC_RESOLVER);
+    ASSERT_FLOAT_EQ(first_found.confidence, 0.95, 0.0001);
+
+    char stable_id[CBM_SYMBOL_ID_BUFSZ];
+    ASSERT_EQ(cbm_store_compute_symbol_id(&first, stable_id), CBM_STORE_OK);
+    ASSERT_STR_EQ(first_found.symbol_id, stable_id);
+    cbm_node_free_fields(&first_found);
+
+    /* Compatibility lookup remains deterministic when a QN is overloaded. */
+    cbm_node_t by_qn_a = {0};
+    cbm_node_t by_qn_b = {0};
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, "test", first.qualified_name, &by_qn_a), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_find_node_by_qn(s, "test", first.qualified_name, &by_qn_b), CBM_STORE_OK);
+    ASSERT_STR_EQ(by_qn_a.symbol_id, by_qn_b.symbol_id);
+    cbm_node_free_fields(&by_qn_a);
+    cbm_node_free_fields(&by_qn_b);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_find_nodes_by_project_symbol_order) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(s, "other", "/tmp/other"), CBM_STORE_OK);
+
+    cbm_node_t high = {
+        .project = "test",
+        .label = "Function",
+        .name = "high",
+        .qualified_name = "test.high",
+        .symbol_id = "ffffffffffffffffffffffffffffffff",
+    };
+    cbm_node_t low = {
+        .project = "test",
+        .label = "Function",
+        .name = "low",
+        .qualified_name = "test.low",
+        .symbol_id = "00000000000000000000000000000001",
+    };
+    cbm_node_t middle = {
+        .project = "test",
+        .label = "Function",
+        .name = "middle",
+        .qualified_name = "test.middle",
+        .symbol_id = "7fffffffffffffffffffffffffffffff",
+    };
+    cbm_node_t excluded = {
+        .project = "other",
+        .label = "Function",
+        .name = "excluded",
+        .qualified_name = "other.excluded",
+        .symbol_id = "00000000000000000000000000000000",
+    };
+    ASSERT_GT(cbm_store_upsert_node(s, &high), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &low), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &middle), 0);
+    ASSERT_GT(cbm_store_upsert_node(s, &excluded), 0);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_project(s, "test", &nodes, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 3);
+    ASSERT_STR_EQ(nodes[0].symbol_id, low.symbol_id);
+    ASSERT_STR_EQ(nodes[1].symbol_id, middle.symbol_id);
+    ASSERT_STR_EQ(nodes[2].symbol_id, high.symbol_id);
+    for (int i = 0; i < count; i++) {
+        ASSERT_STR_EQ(nodes[i].project, "test");
+    }
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(store_project_freshness_roundtrip) {
+    cbm_store_t *s = cbm_store_open_memory();
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_upsert_project(s, "test", "/tmp/test"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_project_freshness(s, "test", 7, "abc123", "dirty:feed",
+                                              "2026-07-30T10:00:00Z",
+                                              "2026-07-30T10:01:00Z"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_set_project_structural_metadata(
+                  s, "test", "xxh3-128:0123456789abcdef0123456789abcdef", "parsers-2026.07"),
+              CBM_STORE_OK);
+
+    cbm_project_t p = {0};
+    ASSERT_EQ(cbm_store_get_project(s, "test", &p), CBM_STORE_OK);
+    ASSERT_EQ(p.generation, 7);
+    ASSERT_STR_EQ(p.commit_hash, "abc123");
+    ASSERT_STR_EQ(p.dirty_fingerprint, "dirty:feed");
+    ASSERT_STR_EQ(p.structural_indexed_at, "2026-07-30T10:00:00Z");
+    ASSERT_STR_EQ(p.derived_indexed_at, "2026-07-30T10:01:00Z");
+    ASSERT_STR_EQ(p.structural_digest, "xxh3-128:0123456789abcdef0123456789abcdef");
+    ASSERT_STR_EQ(p.parser_version, "parsers-2026.07");
+    cbm_project_free_fields(&p);
 
     cbm_store_close(s);
     PASS();
@@ -1541,6 +1775,8 @@ SUITE(store_nodes) {
     RUN_TEST(store_open_memory);
     RUN_TEST(store_close_null);
     RUN_TEST(store_open_memory_twice);
+    RUN_TEST(store_schema_v2_metadata);
+    RUN_TEST(store_schema_v1_migrates_without_data_loss);
     RUN_TEST(store_integrity_clean);
     RUN_TEST(store_integrity_empty);
     RUN_TEST(store_integrity_corrupt_bad_path);
@@ -1551,6 +1787,9 @@ SUITE(store_nodes) {
     RUN_TEST(store_project_update);
     RUN_TEST(store_project_delete);
     RUN_TEST(store_node_crud);
+    RUN_TEST(store_node_v2_identity_and_overloads);
+    RUN_TEST(store_find_nodes_by_project_symbol_order);
+    RUN_TEST(store_project_freshness_roundtrip);
     RUN_TEST(store_node_dedup);
     RUN_TEST(store_node_find_by_label);
     RUN_TEST(store_node_find_by_file);

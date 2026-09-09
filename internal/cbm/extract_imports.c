@@ -2825,9 +2825,6 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     case CBM_LANG_DART:
         parse_dart_imports(ctx);
         break;
-    case CBM_LANG_LEAN:
-        parse_generic_imports(ctx, "import");
-        break;
     case CBM_LANG_FORM:
         parse_generic_imports(ctx, "include_directive");
         break;

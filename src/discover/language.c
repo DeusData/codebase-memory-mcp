@@ -161,9 +161,6 @@ static const ext_entry_t EXT_TABLE[] = {
     {".kt", CBM_LANG_KOTLIN},
     {".kts", CBM_LANG_KOTLIN},
 
-    /* Lean */
-    {".lean", CBM_LANG_LEAN},
-
     /* Lua */
     {".lua", CBM_LANG_LUA},
 
@@ -234,7 +231,7 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Swift */
     {".swift", CBM_LANG_SWIFT},
 
-    /* SystemVerilog + Verilog */
+    /* SystemVerilog uses the lightweight Verilog structural fallback. */
     {".sv", CBM_LANG_VERILOG},
     {".v", CBM_LANG_VERILOG},
 
@@ -566,10 +563,6 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Starlark */
     {".star", CBM_LANG_STARLARK},
 
-    /* SystemVerilog */
-
-    /* SystemVerilog */
-
     /* Sway */
     {".sw", CBM_LANG_SWAY},
 
@@ -735,7 +728,6 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_GLSL] = "GLSL",
     [CBM_LANG_INI] = "INI",
     [CBM_LANG_MATLAB] = "MATLAB",
-    [CBM_LANG_LEAN] = "Lean",
     [CBM_LANG_FORM] = "FORM",
     [CBM_LANG_MAGMA] = "Magma",
     [CBM_LANG_WOLFRAM] = "Wolfram",
@@ -785,7 +777,6 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_PRISMA] = "Prisma",
     [CBM_LANG_HYPRLANG] = "Hyprlang",
     [CBM_LANG_DOTENV] = "DotEnv",
-    [CBM_LANG_SYSTEMVERILOG] = "SystemVerilog",
     [CBM_LANG_DIFF] = "Diff",
     [CBM_LANG_WGSL] = "WGSL",
     [CBM_LANG_KDL] = "KDL",

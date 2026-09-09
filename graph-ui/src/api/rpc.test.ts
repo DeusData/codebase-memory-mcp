@@ -1,29 +1,40 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { callTool } from "./rpc";
+import { clearDashboardToken, setDashboardToken } from "./dashboardAuth";
+
+const TOKEN = "a".repeat(64);
 
 describe("callTool", () => {
   afterEach(() => {
+    clearDashboardToken();
     vi.unstubAllGlobals();
   });
 
-  it("sends a JSON-RPC tools/call request and unwraps its JSON text", async () => {
+  it("sends a tokenized tools/call request and prefers structuredContent", async () => {
+    expect(setDashboardToken(TOKEN)).toBe(true);
     const fetchMock = vi.fn().mockResolvedValue({
       ok: true,
-      json: async () => ({ result: { content: [{ text: '{"projects":[]}' }] } }),
+      json: async () => ({
+        result: {
+          structuredContent: { status: "ready" },
+          content: [{ text: '{"status":"stale-copy"}' }],
+        },
+      }),
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    await expect(callTool("list_projects")).resolves.toEqual({ projects: [] });
+    await expect(callTool("index_status")).resolves.toEqual({ status: "ready" });
 
-    expect(fetchMock).toHaveBeenCalledWith("/rpc", expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith(`/rpc?token=${TOKEN}`, expect.objectContaining({
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: expect.stringContaining('"name":"list_projects"'),
+      body: expect.stringContaining('"name":"index_status"'),
     }));
   });
 
   it("returns an unwrapped result when the server does not provide text content", async () => {
+    setDashboardToken(TOKEN);
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: true,
       json: async () => ({ result: { accepted: true } }),
@@ -33,6 +44,7 @@ describe("callTool", () => {
   });
 
   it("surfaces transport and JSON-RPC errors as RpcError", async () => {
+    setDashboardToken(TOKEN);
     vi.stubGlobal("fetch", vi.fn().mockResolvedValue({
       ok: false,
       status: 503,
@@ -51,5 +63,15 @@ describe("callTool", () => {
       code: -32602,
       message: "invalid params",
     });
+  });
+
+  it("refuses to send requests when the launch capability is missing", async () => {
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(callTool("index_status")).rejects.toMatchObject({
+      message: "Dashboard authentication token is missing",
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

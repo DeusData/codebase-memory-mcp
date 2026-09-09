@@ -44,10 +44,8 @@ reference/
 # Local-only scratch / session notes (never pushed)
 private/
 
-# Build artifacts (C engine output at repo root only — mindforge-ui/build/ is
-# electron-builder's buildResources SOURCE dir: entitlements.plist, notarize.js — tracked)
+# Build artifacts
 /build/
-mindforge-ui/dist/
 node_modules/
 graph-ui/dist/
 graph-ui/tsconfig.tsbuildinfo
@@ -68,9 +66,5 @@ node_modules/
 # Python
 __pycache__/
 
-# fablize runtime state (per-project ledger/spec/goals/brain — local by default)
-.fablize/
-
 # Virtualenvs
 .venv/
-crew/.venv/

@@ -85,7 +85,7 @@ static cbm_store_t *lang_open_indexed(LangProj *lp) {
         return NULL;
     }
     char args[700];
-    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", lp->tmpdir);
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\",\"mode\":\"enriched\"}", lp->tmpdir);
     char *resp = cbm_mcp_handle_tool(lp->srv, "index_repository", args);
     if (resp) {
         free(resp);

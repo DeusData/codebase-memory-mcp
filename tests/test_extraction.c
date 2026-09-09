@@ -968,17 +968,6 @@ TEST(matlab_function) {
     PASS();
 }
 
-/* --- Lean 4 --- */
-TEST(lean_function) {
-    CBMFileResult *r =
-        extract("def add (x y : Nat) : Nat := x + y\n", CBM_LANG_LEAN, "t", "Math.lean");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    ASSERT(has_def(r, "Function", "add"));
-    cbm_free_result(r);
-    PASS();
-}
-
 /* --- FORM --- */
 TEST(form_procedure) {
     CBMFileResult *r = extract("#procedure doSomething\n  id x = y;\n#endprocedure\n",
@@ -1591,52 +1580,6 @@ TEST(matlab_call) {
     ASSERT_GT(r->calls.count, 0);
     ASSERT(has_call(r, "inv"));
     ASSERT(has_call(r, "disp"));
-    cbm_free_result(r);
-    PASS();
-}
-
-/* --- Lean parse (theorem) --- */
-TEST(lean_parse) {
-    CBMFileResult *r = extract("theorem add_comm (a b : Nat) : a + b = b + a := by omega\n",
-                               CBM_LANG_LEAN, "t", "Comm.lean");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    cbm_free_result(r);
-    PASS();
-}
-
-/* --- Lean call (recursive fib) --- */
-TEST(lean_call) {
-    CBMFileResult *r = extract("def fib : Nat \xe2\x86\x92 Nat\n  | 0 => 1\n  | 1 => 1\n  | n + 2 "
-                               "=> fib (n + 1) + fib n\n",
-                               CBM_LANG_LEAN, "t", "Fib.lean");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    ASSERT_GT(r->calls.count, 0);
-    ASSERT(has_call(r, "fib"));
-    cbm_free_result(r);
-    PASS();
-}
-
-/* --- Lean type annotation not call --- */
-TEST(lean_type_annotation_not_call) {
-    CBMFileResult *r = extract(
-        "def listLen (xs : List Nat) : Nat := 0\ndef greet : IO Unit := IO.println \"hi\"\n",
-        CBM_LANG_LEAN, "t", "Types.lean");
-    ASSERT_NOT_NULL(r);
-    ASSERT_FALSE(r->has_error);
-    /* "List" in binder type position should NOT be extracted as a call */
-    for (int i = 0; i < r->calls.count; i++) {
-        ASSERT_FALSE(strcmp(r->calls.items[i].callee_name, "List") == 0);
-    }
-    /* IO.println in the body should be present */
-    int found_println = 0;
-    for (int i = 0; i < r->calls.count; i++) {
-        if (strstr(r->calls.items[i].callee_name, "println") != NULL) {
-            found_println = 1;
-        }
-    }
-    ASSERT_TRUE(found_println);
     cbm_free_result(r);
     PASS();
 }
@@ -2894,7 +2837,6 @@ SUITE(extraction) {
 
     /* Scientific */
     RUN_TEST(matlab_function);
-    RUN_TEST(lean_function);
     RUN_TEST(form_procedure);
     RUN_TEST(wolfram_function);
     RUN_TEST(magma_function);
@@ -2950,9 +2892,6 @@ SUITE(extraction) {
     /* Scientific extended */
     RUN_TEST(matlab_parse);
     RUN_TEST(matlab_call);
-    RUN_TEST(lean_parse);
-    RUN_TEST(lean_call);
-    RUN_TEST(lean_type_annotation_not_call);
     RUN_TEST(form_parse);
     RUN_TEST(form_call);
     RUN_TEST(magma_procedure);

@@ -16,6 +16,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #define PL_NSEC_PER_SEC 1000000000LL
 #include "pipeline/pipeline.h"
 #include "pipeline/artifact.h"
+#include "pipeline/content_hash.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/worker_pool.h"
@@ -33,6 +34,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include "foundation/mem.h"
 
 #include <stdint.h>
+#include <sqlite3.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -40,16 +42,42 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6, P
 #include <sys/stat.h>
 #include <time.h>
 
+#ifdef _WIN32
+#include <windows.h>
+#include "foundation/win_utf8.h"
+#endif
+
 static inline void *intptr_to_ptr(intptr_t v) {
     void *p;
     memcpy(&p, &v, sizeof(p));
     return p;
 }
 
-/* ── Global index lock ─────────────────────────────────────────── */
-/* Prevents concurrent pipeline runs on the same DB file.
- * Atomic spinlock: 0 = free, 1 = locked. */
+/* ── Index locks ───────────────────────────────────────────────── */
+/* The legacy API is retained for embedders, while production call sites use
+ * project-scoped locks below. A small fixed table is sufficient because a
+ * process only has a handful of simultaneously active indexing requests; keys
+ * are released and slots reused as soon as an index operation finishes. */
 static atomic_int g_pipeline_busy = 0;
+
+#define PROJECT_LOCK_SLOTS 64
+typedef struct {
+    char *key;
+    bool busy;
+} cbm_project_lock_slot_t;
+
+static cbm_project_lock_slot_t g_project_locks[PROJECT_LOCK_SLOTS];
+static atomic_flag g_project_locks_guard = ATOMIC_FLAG_INIT;
+
+static void project_locks_guard_acquire(void) {
+    while (atomic_flag_test_and_set_explicit(&g_project_locks_guard, memory_order_acquire)) {
+        /* The guarded section is only a short fixed-size table scan. */
+    }
+}
+
+static void project_locks_guard_release(void) {
+    atomic_flag_clear_explicit(&g_project_locks_guard, memory_order_release);
+}
 
 bool cbm_pipeline_try_lock(void) {
     return atomic_exchange(&g_pipeline_busy, 1) == 0;
@@ -66,6 +94,67 @@ void cbm_pipeline_lock(void) {
 
 void cbm_pipeline_unlock(void) {
     atomic_store(&g_pipeline_busy, 0);
+}
+
+bool cbm_pipeline_try_lock_project(const char *project) {
+    if (!project || project[0] == '\0') {
+        return false;
+    }
+
+    project_locks_guard_acquire();
+    int free_slot = CBM_NOT_FOUND;
+    for (int i = 0; i < PROJECT_LOCK_SLOTS; i++) {
+        if (!g_project_locks[i].key) {
+            if (free_slot == CBM_NOT_FOUND) {
+                free_slot = i;
+            }
+            continue;
+        }
+        if (strcmp(g_project_locks[i].key, project) == 0) {
+            bool acquired = !g_project_locks[i].busy;
+            if (acquired) {
+                g_project_locks[i].busy = true;
+            }
+            project_locks_guard_release();
+            return acquired;
+        }
+    }
+
+    if (free_slot != CBM_NOT_FOUND) {
+        char *key = strdup(project);
+        if (key) {
+            g_project_locks[free_slot].key = key;
+            g_project_locks[free_slot].busy = true;
+            project_locks_guard_release();
+            return true;
+        }
+    }
+    project_locks_guard_release();
+    return false;
+}
+
+void cbm_pipeline_lock_project(const char *project) {
+    while (!cbm_pipeline_try_lock_project(project)) {
+        struct timespec ts = {0, LOCK_SPIN_NS};
+        cbm_nanosleep(&ts, NULL);
+    }
+}
+
+void cbm_pipeline_unlock_project(const char *project) {
+    if (!project || project[0] == '\0') {
+        return;
+    }
+
+    project_locks_guard_acquire();
+    for (int i = 0; i < PROJECT_LOCK_SLOTS; i++) {
+        if (g_project_locks[i].key && strcmp(g_project_locks[i].key, project) == 0) {
+            g_project_locks[i].busy = false;
+            free(g_project_locks[i].key);
+            g_project_locks[i].key = NULL;
+            break;
+        }
+    }
+    project_locks_guard_release();
 }
 
 /* ── Internal state ──────────────────────────────────────────────── */
@@ -92,9 +181,9 @@ struct cbm_pipeline {
     cbm_userconfig_t *userconfig;
 };
 
-/* ── Global pkgmap (one active pipeline at a time) ─────────────── */
+/* ── Per-index-thread package map ─────────────────────────────── */
 
-static CBMHashTable *g_pkgmap = NULL;
+static CBM_TLS CBMHashTable *g_pkgmap = NULL;
 
 CBMHashTable *cbm_pipeline_get_pkgmap(void) {
     return g_pkgmap;
@@ -731,9 +820,9 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
-/* Try incremental pipeline or delete old DB for reindex.
+/* Try incremental pipeline or preserve the old DB while a full replacement is built.
  * Returns >= 0 if incremental was used (the return code), or -1 to proceed with full. */
-static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
+static int try_incremental_or_reindex(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count) {
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_NOT_FOUND;
@@ -764,14 +853,7 @@ static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *file
     } else if (check_store) {
         cbm_store_close(check_store);
     }
-    cbm_log_info("pipeline.route", "path", "reindex", "action", "deleting old db");
-    cbm_unlink(db_path);
-    char wal[PL_WAL_BUF];
-    char shm[PL_WAL_BUF];
-    snprintf(wal, sizeof(wal), "%s-wal", db_path);
-    snprintf(shm, sizeof(shm), "%s-shm", db_path);
-    cbm_unlink(wal);
-    cbm_unlink(shm);
+    cbm_log_info("pipeline.route", "path", "reindex", "action", "preserving old db");
     free(db_path);
     return CBM_NOT_FOUND;
 }
@@ -786,6 +868,81 @@ static int64_t stat_mtime_ns(const struct stat *fst) {
 #else
     return ((int64_t)fst->st_mtim.tv_sec * PL_NSEC_PER_SEC) + (int64_t)fst->st_mtim.tv_nsec;
 #endif
+}
+
+static void cleanup_temp_db(const char *path) {
+    cbm_unlink(path);
+    char wal[PL_WAL_BUF];
+    char shm[PL_WAL_BUF];
+    snprintf(wal, sizeof(wal), "%s-wal", path);
+    snprintf(shm, sizeof(shm), "%s-shm", path);
+    cbm_unlink(wal);
+    cbm_unlink(shm);
+}
+
+static int publish_temp_db(const char *temp_path, const char *db_path) {
+    /* Replacing only the main file can replay the previous database's WAL
+     * onto unrelated pages, and strands existing readers on an old inode.
+     * SQLite backup commits the validated candidate as one destination
+     * transaction while coordinating with all other SQLite connections. */
+    sqlite3 *source = NULL;
+    sqlite3 *destination = NULL;
+    int result = CBM_NOT_FOUND;
+    if (sqlite3_open_v2(temp_path, &source, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK ||
+        sqlite3_open_v2(db_path, &destination, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE,
+                        NULL) != SQLITE_OK) {
+        goto done;
+    }
+    sqlite3_busy_timeout(destination, 1000);
+    sqlite3_backup *backup = sqlite3_backup_init(destination, "main", source, "main");
+    if (!backup) {
+        goto done;
+    }
+    int rc = SQLITE_BUSY;
+    for (int attempt = 0; attempt < 5; attempt++) {
+        rc = sqlite3_backup_step(backup, -1);
+        if (rc != SQLITE_BUSY && rc != SQLITE_LOCKED) {
+            break;
+        }
+        cbm_usleep(10000U << attempt);
+    }
+    int finish_rc = sqlite3_backup_finish(backup);
+    if (rc == SQLITE_DONE && finish_rc == SQLITE_OK) {
+        result = 0;
+    }
+done:
+    sqlite3_close(destination);
+    sqlite3_close(source);
+    if (result == 0) {
+        cleanup_temp_db(temp_path);
+    }
+    return result;
+}
+
+static int persist_full_hashes(cbm_store_t *store, const char *project,
+                               const cbm_file_info_t *files, int file_count) {
+    if (cbm_store_delete_file_hashes(store, project) != CBM_STORE_OK) {
+        return CBM_NOT_FOUND;
+    }
+    for (int i = 0; i < file_count; i++) {
+        struct stat before;
+        struct stat after;
+        char hash[CBM_CONTENT_HASH_SIZE];
+        if (stat(files[i].path, &before) != 0 ||
+            cbm_content_hash_file(files[i].path, hash) != 0 ||
+            stat(files[i].path, &after) != 0 ||
+            stat_mtime_ns(&before) != stat_mtime_ns(&after) ||
+            before.st_size != after.st_size) {
+            cbm_log_error("pipeline.err", "phase", "hash", "file", files[i].rel_path);
+            return CBM_NOT_FOUND;
+        }
+        if (cbm_store_upsert_file_hash(store, project, files[i].rel_path, hash,
+                                       stat_mtime_ns(&after), after.st_size) != CBM_STORE_OK) {
+            cbm_log_error("pipeline.err", "phase", "persist_hash", "file", files[i].rel_path);
+            return CBM_NOT_FOUND;
+        }
+    }
+    return 0;
 }
 
 /* Dump graph to SQLite and persist file hashes for incremental indexing. */
@@ -809,41 +966,79 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_info_t *fil
         *last_slash = '\0';
         cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
     }
-    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, db_path);
+
+    size_t temp_len = strlen(db_path) + sizeof(".next");
+    char *temp_path = malloc(temp_len);
+    if (!temp_path) {
+        return CBM_NOT_FOUND;
+    }
+    snprintf(temp_path, temp_len, "%s.next", db_path);
+    cleanup_temp_db(temp_path);
+
+    int rc = cbm_gbuf_dump_to_sqlite(p->gbuf, temp_path);
     if (rc != 0) {
         cbm_log_error("pipeline.err", "phase", "dump");
+        cleanup_temp_db(temp_path);
+        free(temp_path);
         return rc;
     }
     cbm_log_info("pass.timing", "pass", "dump", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
-    cbm_store_t *hash_store = cbm_store_open_path(db_path);
-    if (hash_store) {
-        cbm_store_delete_file_hashes(hash_store, p->project_name);
-        for (int i = 0; i < file_count; i++) {
-            struct stat fst;
-            if (stat(files[i].path, &fst) == 0) {
-                cbm_store_upsert_file_hash(hash_store, p->project_name, files[i].rel_path, "",
-                                           stat_mtime_ns(&fst), fst.st_size);
-            }
-        }
+    cbm_store_t *hash_store = cbm_store_open_path(temp_path);
+    if (!hash_store) {
+        cleanup_temp_db(temp_path);
+        free(temp_path);
+        return CBM_NOT_FOUND;
+    }
 
+    rc = persist_full_hashes(hash_store, p->project_name, files, file_count);
+    if (rc == 0) {
         /* FTS5 backfill: populate nodes_fts with camelCase-split names.
          * Contentless FTS5 requires the special 'delete-all' command instead of
          * DELETE FROM to wipe prior rows (there's no underlying content table).
          * Falls back to plain names if cbm_camel_split is unavailable (which
          * shouldn't happen because we always register it, but we stay defensive). */
-        cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
-        if (cbm_store_exec(hash_store,
-                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
-                           "FROM nodes;") != CBM_STORE_OK) {
+        rc = cbm_store_exec(hash_store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+        if (rc == CBM_STORE_OK &&
             cbm_store_exec(hash_store,
                            "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
-                           "SELECT id, name, qualified_name, label, file_path FROM nodes;");
+                           "SELECT id, cbm_camel_split(name), qualified_name, label, file_path "
+                           "FROM nodes;") != CBM_STORE_OK &&
+            cbm_store_exec(hash_store,
+                           "INSERT INTO nodes_fts(rowid, name, qualified_name, label, file_path) "
+                           "SELECT id, name, qualified_name, label, file_path FROM nodes;") !=
+                CBM_STORE_OK) {
+            rc = CBM_NOT_FOUND;
         }
-
-        cbm_store_close(hash_store);
-        cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
     }
+    if (rc == 0 && cbm_store_checkpoint(hash_store) != CBM_STORE_OK) {
+        rc = CBM_NOT_FOUND;
+    }
+    if (rc == 0 && !cbm_store_check_integrity(hash_store)) {
+        rc = CBM_NOT_FOUND;
+    }
+    cbm_store_close(hash_store);
+    if (rc != 0) {
+        cleanup_temp_db(temp_path);
+        free(temp_path);
+        return rc;
+    }
+
+    /* The temporary WAL belongs to the temporary basename and must be fully
+     * checkpointed before only the main DB file is atomically published. */
+    char temp_wal[PL_WAL_BUF];
+    char temp_shm[PL_WAL_BUF];
+    snprintf(temp_wal, sizeof(temp_wal), "%s-wal", temp_path);
+    snprintf(temp_shm, sizeof(temp_shm), "%s-shm", temp_path);
+    cbm_unlink(temp_wal);
+    cbm_unlink(temp_shm);
+    if (publish_temp_db(temp_path, db_path) != 0) {
+        cbm_log_error("pipeline.err", "phase", "publish");
+        cleanup_temp_db(temp_path);
+        free(temp_path);
+        return CBM_NOT_FOUND;
+    }
+    free(temp_path);
+    cbm_log_info("pass.timing", "pass", "persist_hashes", "files", itoa_buf(file_count));
 
     /* Export persistent artifact if enabled */
     if (p->persistence) {
@@ -953,7 +1148,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
 
-    int worker_count = cbm_default_worker_count(true);
+    int worker_count = cbm_worker_count_for_files(file_count, true);
     CBM_PROF_START(t_extract_total);
     int rc = (worker_count > SKIP_ONE && file_count > MIN_FILES_FOR_PARALLEL)
                  ? run_parallel_pipeline(p, ctx, files, file_count, worker_count, &t)
@@ -1015,7 +1210,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
 
     /* Check for existing DB → try incremental or delete for reindex */
-    rc = try_incremental_or_delete_db(p, files, file_count);
+    rc = try_incremental_or_reindex(p, files, file_count);
     if (rc >= 0) {
         cbm_discover_free(files, file_count);
         return rc;

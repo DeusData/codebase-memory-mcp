@@ -73,7 +73,6 @@ clone cobol       "OCamlPro/gnucobol"              # 540K LOC (already large)
 clone verilog     "YosysHQ/yosys"                  # 517K LOC (already large)
 clone emacslisp   "emacs-mirror/emacs"             # 5.3M LOC (already huge)
 clone matlab      "acristoffers/tree-sitter-matlab" # 133K LOC (best available)
-clone lean        "leanprover-community/mathlib4"  # 2.3M LOC (already huge)
 clone form        "vermaseren/form"                # 221K LOC (already large)
 clone wolfram     "WolframResearch/WolframLanguageForJupyter" # 4K LOC (largest public Wolfram repo)
 
@@ -101,7 +100,6 @@ symlink markdown  python        # httpie docs
 symlink makefile  c             # redis Makefile
 clone glsl        "repalash/Open-Shaders"
 symlink ini       python        # httpie .cfg/.ini files
-symlink magma     lean          # .m files — disambiguated via content markers
 symlink kubernetes yaml         # YAML subtype — Deployment/Service manifests
 symlink kustomize yaml          # YAML subtype — kustomization.yaml
 

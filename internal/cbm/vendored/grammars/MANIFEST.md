@@ -119,7 +119,6 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | kconfig | 14 | tree-sitter-grammars/tree-sitter-kconfig | `9ac99fe4c0c2` | VERIFIED-BOTH | ✅ |
 | kdl | 14 | tree-sitter-grammars/tree-sitter-kdl | `b37e3d58e5c5` | VERIFIED-NVIM | ✅ |
 | kotlin | 14 | fwcd/tree-sitter-kotlin | `93bfeee1555d` | VERIFIED-BOTH | ✅ |
-| lean | 13 | Julian/tree-sitter-lean | `d98426109258` | VERIFIED-HELIX | ✅ |
 | linkerscript | 14 | tree-sitter-grammars/tree-sitter-linkerscript | `f99011a35542` | VERIFIED-NVIM | ✅ |
 | liquid | 14 | hankthetank27/tree-sitter-liquid | `9566ca799110` | VERIFIED-NVIM | ✅ |
 | llvm | 15 | benwilliamgraham/tree-sitter-llvm | `2914786ae677` | VERIFIED-BOTH | ✅ |
@@ -172,7 +171,6 @@ Guarded by the `contract_all_grammars_in_graph` graph-breadth test in
 | svelte | 14 | tree-sitter-grammars/tree-sitter-svelte | `ae5199db4775` | VERIFIED-NVIM | ✅ |
 | sway | 14 | FuelLabs/tree-sitter-sway | `9b7845ce06ec` | VERIFIED-BOTH | ✅ |
 | swift | 14 | alex-pinkus/tree-sitter-swift | `8abb3e8b3325` | VERIFIED-BOTH | ✅ |
-| systemverilog | 15 | gmlarumbe/tree-sitter-systemverilog | `293928578cb2` | VERIFIED-BOTH | ✅ |
 | tablegen | 14 | tree-sitter-grammars/tree-sitter-tablegen | `b1170880c613` | VERIFIED-NVIM | ✅ |
 | tcl | 15 | tree-sitter-grammars/tree-sitter-tcl | `8f11ac7206a5` | VERIFIED-BOTH | ✅ |
 | teal | 15 | euclidianAce/tree-sitter-teal | `05d276e73705` | VERIFIED-BOTH | ✅ |

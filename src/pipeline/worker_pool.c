@@ -21,6 +21,8 @@ enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 /* 8 MB stack per worker — matches main thread default.
  * Required for deep AST recursion (tree-sitter + walk_defs). */
 #define CBM_WORKER_STACK_SIZE ((size_t)8 * CBM_SZ_1K * CBM_SZ_1K)
+#define CBM_FILES_PER_WORKER 50
+#define CBM_MEMORY_PER_WORKER ((size_t)512 * CBM_SZ_1K * CBM_SZ_1K)
 
 /* ── Serial fallback ─────────────────────────────────────────────── */
 
@@ -93,6 +95,31 @@ static void run_pthreads(int count, cbm_parallel_fn fn, void *ctx, int nworkers)
 
 /* ── Public API ──────────────────────────────────────────────────── */
 
+int cbm_worker_count_for_files(int file_count, bool initial) {
+    if (file_count <= 1) {
+        return WP_MIN;
+    }
+
+    int workers = cbm_default_worker_count(initial);
+    int work_cap = (file_count + CBM_FILES_PER_WORKER - 1) / CBM_FILES_PER_WORKER;
+    if (workers > work_cap) {
+        workers = work_cap;
+    }
+
+    cbm_system_info_t info = cbm_system_info();
+    if (info.total_ram > 0) {
+        size_t memory_cap = info.total_ram / CBM_MEMORY_PER_WORKER;
+        if (memory_cap < (size_t)WP_MIN) {
+            memory_cap = WP_MIN;
+        }
+        if ((size_t)workers > memory_cap) {
+            workers = (int)memory_cap;
+        }
+    }
+
+    return workers > WP_MIN ? workers : WP_MIN;
+}
+
 void cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for_opts_t opts) {
     if (count <= 0 || !fn) {
         return;
@@ -101,7 +128,7 @@ void cbm_parallel_for(int count, cbm_parallel_fn fn, void *ctx, cbm_parallel_for
     /* Determine worker count */
     int nworkers = opts.max_workers;
     if (nworkers <= 0) {
-        nworkers = cbm_default_worker_count(true);
+        nworkers = cbm_worker_count_for_files(count, true);
     }
     if (nworkers < WP_MIN) {
         nworkers = SKIP_ONE;

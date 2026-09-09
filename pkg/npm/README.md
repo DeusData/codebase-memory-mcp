@@ -1,89 +1,60 @@
 # codebase-memory-mcp
 
 [![npm](https://img.shields.io/npm/v/codebase-memory-mcp?style=flat&color=blue)](https://www.npmjs.com/package/codebase-memory-mcp)
-[![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](https://github.com/DeusData/codebase-memory-mcp/blob/main/LICENSE)
-[![Platform](https://img.shields.io/badge/macOS_%7C_Linux_%7C_Windows-supported-lightgrey)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 
-**The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a single static binary — this package downloads and runs it automatically.
+A preview local code-intelligence layer for coding agents. It indexes the
+current worktree into a structural graph and returns focused, reproducible
+evidence within a caller-supplied token budget.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across 159 languages — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 14 MCP tools. Zero dependencies. Plug and play across 11 coding agents.
+The binary and all indexing run locally. Language support is deliberately
+tiered: Go, Python, JavaScript/TypeScript, Java, C/C++, and Rust are the core
+quality targets; C#, PHP, and Kotlin static resolvers are preview features;
+other bundled Tree-sitter grammars provide best-effort structural results.
 
 ## Installation
 
 ```bash
 npm install -g codebase-memory-mcp
+codebase-memory-mcp install --client codex
 ```
 
-The binary for your platform is downloaded automatically at install time. Then configure your coding agents:
+`install` changes only the explicitly selected MCP client. It does not delete
+indexes or enable hooks and instruction files.
+
+To register the client, build the first structural index, verify the
+environment, and start the watcher:
 
 ```bash
-codebase-memory-mcp install
+codebase-memory-mcp setup . --client codex
 ```
 
-Restart your agent. Say **"Index this project"** — done.
+Add `--no-watch`, `--with-hooks`, or `--with-instructions` only when those
+behaviors are wanted.
 
-## Why codebase-memory-mcp
+## Core MCP tools
 
-- **Extreme indexing speed** — Linux kernel (28M LOC, 75K files) in 3 minutes. RAM-first pipeline with LZ4 compression and in-memory SQLite.
-- **Plug and play** — single static binary for macOS (arm64/amd64), Linux (arm64/amd64), and Windows (amd64). No Docker, no runtime dependencies, no API keys.
-- **159 languages** — vendored tree-sitter grammars compiled into the binary. Nothing to install, nothing that breaks.
-- **120x fewer tokens** — 5 structural queries: ~3,400 tokens vs ~412,000 via file-by-file search.
-- **11 agents, one command** — `install` auto-detects Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode, Antigravity, Aider, KiloCode, VS Code, OpenClaw, and Kiro.
-- **14 MCP tools** — search, trace, architecture, impact analysis, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- `get_context`
+- `search_graph`
+- `search_code`
+- `trace_path`
+- `get_code_snippet`
+- `get_architecture`
+- `detect_changes`
+- `index_status`
+- `index_repository`
 
-## Supported Platforms
+Advanced graph, ADR, cross-repository, and administrative tools must be enabled
+explicitly. Tool responses include structured content plus a text JSON copy.
 
-| OS      | Architecture |
-|---------|-------------|
-| macOS   | arm64, amd64 |
-| Linux   | arm64, amd64 |
-| Windows | amd64 |
+## Evidence policy
 
-## Usage
-
-```bash
-codebase-memory-mcp install          # configure all detected coding agents
-codebase-memory-mcp --version
-codebase-memory-mcp --help
-codebase-memory-mcp update           # update to latest release
-codebase-memory-mcp uninstall        # remove agent configs
-```
-
-### CLI Mode
-
-Every MCP tool is also available directly from the command line:
-
-```bash
-codebase-memory-mcp cli index_repository '{"repo_path": "/path/to/repo"}'
-codebase-memory-mcp cli search_graph '{"name_pattern": ".*Handler.*", "label": "Function"}'
-codebase-memory-mcp cli trace_call_path '{"function_name": "main", "direction": "both"}'
-codebase-memory-mcp cli get_architecture '{}'
-```
-
-## MCP Tools
-
-| Category | Tools |
-|----------|-------|
-| **Indexing** | `index_repository`, `list_projects`, `delete_project`, `index_status` |
-| **Querying** | `search_graph`, `trace_call_path`, `detect_changes`, `query_graph` |
-| **Analysis** | `get_architecture`, `get_graph_schema`, `get_code_snippet`, `search_code` |
-| **Advanced** | `manage_adr`, `ingest_traces` |
-
-## Performance
-
-Benchmarked on Apple M3 Pro:
-
-| Operation | Time |
-|-----------|------|
-| Linux kernel full index (28M LOC, 75K files) | 3 min |
-| Django full index | ~6s |
-| Cypher query | <1ms |
-| Trace call path (depth=5) | <10ms |
-
-## Full Documentation
-
-See [github.com/DeusData/codebase-memory-mcp](https://github.com/DeusData/codebase-memory-mcp) for the full README including all MCP tools, configuration options, graph data model, and language support details.
+The project does not publish blanket speed, token, or language-accuracy claims
+without a versioned benchmark artifact. See
+[CAPABILITIES.md](https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/CAPABILITIES.md)
+for the current product contract and
+[BENCHMARK.md](https://github.com/DeusData/codebase-memory-mcp/blob/main/docs/BENCHMARK.md)
+for the reproducibility requirements.
 
 ## License
 

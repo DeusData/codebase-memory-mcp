@@ -21,6 +21,11 @@ typedef struct {
     bool force_pthreads; /* unused, kept for API compat */
 } cbm_parallel_for_opts_t;
 
+/* Bound indexing parallelism by CPU, project size and physical/cgroup memory.
+ * This avoids creating more parser workers than a small repository can feed
+ * or a constrained machine can hold. */
+int cbm_worker_count_for_files(int file_count, bool initial);
+
 /* Dispatch `count` iterations of `fn(idx, ctx)` across worker threads.
  * Each index [0..count-1] is visited exactly once.
  * Blocks until all iterations complete.

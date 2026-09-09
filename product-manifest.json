@@ -1,0 +1,75 @@
+{
+  "schema_version": 1,
+  "product": {
+    "name": "codebase-memory-mcp",
+    "version": "0.8.1",
+    "status": "preview",
+    "positioning": "A fast local code-intelligence layer that gives coding agents fresh, reproducible and verifiable context from the current worktree within a token budget."
+  },
+  "promises": [
+    "fresh",
+    "trustworthy",
+    "efficient"
+  ],
+  "language_tiers": {
+    "core": [
+      "go",
+      "python",
+      "javascript",
+      "typescript",
+      "java",
+      "c",
+      "cpp",
+      "rust"
+    ],
+    "preview": [
+      "csharp",
+      "php",
+      "kotlin"
+    ],
+    "structural": {
+      "source": "internal/cbm/vendored/grammars/MANIFEST.md",
+      "guarantee": "best-effort Tree-sitter structure without precise cross-file resolution"
+    },
+    "removed": [
+      "lean",
+      "systemverilog-dedicated-parser"
+    ]
+  },
+  "toolsets": {
+    "core": [
+      "get_context",
+      "search_graph",
+      "search_code",
+      "trace_path",
+      "get_code_snippet",
+      "get_architecture",
+      "detect_changes",
+      "index_status",
+      "index_repository"
+    ],
+    "advanced": [
+      "query_graph",
+      "get_graph_schema",
+      "manage_adr"
+    ],
+    "admin": [
+      "list_projects",
+      "delete_project"
+    ]
+  },
+  "historical_evidence": {
+    "source": "https://arxiv.org/abs/2603.27277",
+    "languages_evaluated": 66,
+    "answer_quality_percent": 83,
+    "baseline_quality_percent": 92,
+    "token_reduction": "10x"
+  },
+  "forbidden_unverified_claims": [
+    "158 languages",
+    "159 languages",
+    "120x",
+    "99% fewer tokens",
+    "Linux kernel in 3 minutes"
+  ]
+}

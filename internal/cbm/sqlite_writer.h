@@ -2,6 +2,7 @@
 #define CBM_SQLITE_WRITER_H
 
 #include <stdint.h>
+#include "store/store.h"
 
 // --- Input structs (flat, borrowed strings) ---
 
@@ -15,6 +16,11 @@ typedef struct {
     int start_line;
     int end_line;
     const char *properties; // JSON string
+    const char *symbol_id;
+    const char *language;
+    const char *signature;
+    const char *origin;
+    double confidence;
 } CBMDumpNode;
 
 typedef struct {
@@ -25,6 +31,9 @@ typedef struct {
     const char *type;
     const char *properties; // JSON string
     const char *url_path;   // extracted from properties by Go (for idx_edges_url_path)
+    const char *origin;
+    double confidence;
+    const char *evidence; // JSON string
 } CBMDumpEdge;
 
 typedef struct {

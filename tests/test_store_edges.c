@@ -62,6 +62,34 @@ TEST(store_edge_insert_find) {
     PASS();
 }
 
+TEST(store_edge_v2_evidence_roundtrip) {
+    int64_t ids[2];
+    cbm_store_t *s = setup_store_with_nodes(2, ids);
+
+    cbm_edge_t e = {
+        .project = "test",
+        .source_id = ids[0],
+        .target_id = ids[1],
+        .type = "CALLS",
+        .origin = CBM_ORIGIN_STATIC_RESOLVER,
+        .confidence = 0.875,
+        .evidence_json = "{\"resolver\":\"go\",\"candidate_rank\":1}",
+    };
+    ASSERT_GT(cbm_store_insert_edge(s, &e), 0);
+
+    cbm_edge_t *edges = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_edges_by_source(s, ids[0], &edges, &count), CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(edges[0].origin, CBM_ORIGIN_STATIC_RESOLVER);
+    ASSERT_FLOAT_EQ(edges[0].confidence, 0.875, 0.0001);
+    ASSERT_STR_EQ(edges[0].evidence_json, "{\"resolver\":\"go\",\"candidate_rank\":1}");
+    cbm_store_free_edges(edges, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(store_edge_dedup) {
     int64_t ids[2];
     cbm_store_t *s = setup_store_with_nodes(2, ids);
@@ -580,6 +608,7 @@ TEST(store_edge_find_source_type_nonexistent) {
 
 SUITE(store_edges) {
     RUN_TEST(store_edge_insert_find);
+    RUN_TEST(store_edge_v2_evidence_roundtrip);
     RUN_TEST(store_edge_dedup);
     RUN_TEST(store_edge_find_by_source_type);
     RUN_TEST(store_edge_find_by_target_type);

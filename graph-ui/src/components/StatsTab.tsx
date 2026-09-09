@@ -1,407 +1,182 @@
-import { useMemo, useState, useCallback, useEffect } from "react";
-import { ScrollArea } from "@/components/ui/scroll-area";
-import { useProjects } from "../hooks/useProjects";
-import { colorForLabel } from "../lib/colors";
+import { useCallback, useEffect, useState } from "react";
+import { callTool } from "../api/rpc";
+import { dashboardFetch } from "../api/dashboardAuth";
 
-interface StatsTabProps {
-  onSelectProject: (project: string) => void;
+type DiagnosticValue = string | number | boolean | null | DiagnosticValue[] | {
+  [key: string]: DiagnosticValue;
+};
+
+interface IndexDiagnostic {
+  project?: string;
+  status?: string;
+  freshness?: string;
+  generation?: number;
+  commit?: string;
+  dirty_fingerprint?: string;
+  nodes?: number;
+  edges?: number;
+  languages?: DiagnosticValue;
+  unresolved_calls?: number;
+  ambiguous_calls?: number;
+  digest?: string;
+  [key: string]: DiagnosticValue | undefined;
 }
 
-/* ── Glowy health dot ───────────────────────────────────── */
+interface HealthDiagnostic {
+  status?: string;
+  nodes?: number;
+  edges?: number;
+  size_bytes?: number;
+  reason?: string;
+}
 
-function HealthDot({ name }: { name: string }) {
-  const [status, setStatus] = useState<"loading" | "healthy" | "corrupt" | "missing">("loading");
-  const [info, setInfo] = useState("");
-
-  useEffect(() => {
-    fetch(`/api/project-health?name=${encodeURIComponent(name)}`)
-      .then((r) => r.json())
-      .then((d) => {
-        setStatus(d.status ?? "corrupt");
-        if (d.nodes !== undefined) {
-          const sizeMB = ((d.size_bytes ?? 0) / 1024 / 1024).toFixed(1);
-          setInfo(`${d.nodes.toLocaleString()} nodes, ${d.edges.toLocaleString()} edges, ${sizeMB} MB`);
-        } else if (d.reason) {
-          setInfo(d.reason);
-        }
-      })
-      .catch(() => setStatus("corrupt"));
-  }, [name]);
-
-  const dotColor =
-    status === "healthy" ? "#34d399" :
-    status === "missing" ? "#fbbf24" :
-    status === "corrupt" ? "#f87171" : "#555";
-
-  const label =
-    status === "healthy" ? "Database healthy" :
-    status === "missing" ? "Database missing" :
-    status === "corrupt" ? "Database unhealthy" : "Checking...";
-
+function Metric({ label, value }: { label: string; value: string | number }) {
   return (
-    <div className="group relative inline-flex items-center">
-      {/* Glow layer */}
-      <span
-        className="absolute w-3 h-3 rounded-full animate-pulse opacity-40 blur-[3px]"
-        style={{ backgroundColor: dotColor }}
-      />
-      {/* Dot */}
-      <span
-        className="relative w-[8px] h-[8px] rounded-full"
-        style={{ backgroundColor: dotColor, boxShadow: `0 0 6px ${dotColor}80` }}
-      />
-      {/* Tooltip */}
-      <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-3 hidden group-hover:block z-20 pointer-events-none">
-        <div className="bg-[#0b1920] border border-border/50 rounded-lg px-3 py-2 text-[11px] whitespace-nowrap shadow-xl">
-          <p className="font-medium" style={{ color: dotColor }}>{label}</p>
-          {info && <p className="text-foreground/35 text-[10px] mt-0.5">{info}</p>}
-        </div>
-      </div>
+    <div className="rounded-xl border border-border/30 bg-white/[0.02] p-4">
+      <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-1">{label}</p>
+      <p className="text-[18px] font-semibold tabular-nums text-foreground/80 break-all">
+        {typeof value === "number" ? value.toLocaleString() : value}
+      </p>
     </div>
   );
 }
 
-/* ── ADR button + modal ─────────────────────────────────── */
-
-function AdrButton({ project }: { project: string }) {
-  const [hasAdr, setHasAdr] = useState<boolean | null>(null);
-  const [open, setOpen] = useState(false);
-  const [content, setContent] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [updatedAt, setUpdatedAt] = useState("");
-
-  const fetchAdr = useCallback(async () => {
-    try {
-      const res = await fetch(`/api/adr?project=${encodeURIComponent(project)}`);
-      const data = await res.json();
-      setHasAdr(data.has_adr ?? false);
-      if (data.content) setContent(data.content);
-      if (data.updated_at) setUpdatedAt(data.updated_at);
-    } catch { setHasAdr(false); }
-  }, [project]);
-
-  useEffect(() => { fetchAdr(); }, [fetchAdr]);
-
-  const save = async () => {
-    setSaving(true);
-    try {
-      await fetch("/api/adr", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project, content }),
-      });
-      await fetchAdr();
-      setOpen(false);
-    } catch { /* ignore */ }
-    finally { setSaving(false); }
-  };
-
-  if (hasAdr === null) return null;
-
-  return (
-    <>
-      <button
-        onClick={() => { setOpen(true); fetchAdr(); }}
-        className={`px-2.5 py-1 rounded-lg text-[10px] font-medium transition-all ${
-          hasAdr
-            ? "bg-accent/15 text-accent hover:bg-accent/25"
-            : "bg-white/[0.03] text-foreground/25 hover:text-foreground/40 hover:bg-white/[0.06]"
-        }`}
-      >
-        {hasAdr ? "ADR" : "+ ADR"}
-      </button>
-
-      {open && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={() => setOpen(false)}>
-          <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
-          <div className="relative bg-[#0e2028] border border-border/40 rounded-2xl p-6 w-full max-w-2xl shadow-2xl max-h-[80vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-4">
-              <div>
-                <h3 className="text-[15px] font-semibold text-foreground/90">Architecture Decision Record</h3>
-                <p className="text-[11px] text-foreground/30 font-mono mt-0.5">{project}</p>
-              </div>
-              <button onClick={() => setOpen(false)} className="text-foreground/20 hover:text-foreground/50 text-[16px] p-1">×</button>
-            </div>
-            {updatedAt && (
-              <p className="text-[10px] text-foreground/20 mb-3">Last updated: {updatedAt}</p>
-            )}
-            <textarea
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              placeholder={"# Architecture Decision Record\n\n## Context\n...\n\n## Decision\n...\n\n## Consequences\n..."}
-              className="flex-1 min-h-[300px] bg-white/[0.03] border border-white/[0.06] rounded-xl px-4 py-3 text-[12px] text-foreground font-mono placeholder-foreground/15 outline-none focus:border-primary/30 resize-none leading-relaxed"
-            />
-            <div className="flex justify-end gap-2 mt-4">
-              {hasAdr && (
-                <button
-                  onClick={async () => {
-                    setContent(""); await save();
-                  }}
-                  className="px-3 py-2 rounded-lg text-[12px] text-destructive/60 hover:text-destructive hover:bg-destructive/10 font-medium transition-all"
-                >
-                  Delete
-                </button>
-              )}
-              <button onClick={() => setOpen(false)} className="px-4 py-2 rounded-lg text-[12px] text-foreground/40 hover:bg-white/[0.04] font-medium transition-all">Cancel</button>
-              <button onClick={save} disabled={saving} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
-                {saving ? "Saving..." : "Save"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-    </>
-  );
-}
-
-/* ── Create Index Modal ─────────────────────────────────── */
-
-function CreateIndexModal({ onClose, onCreated }: { onClose: () => void; onCreated: () => void }) {
-  const [currentPath, setCurrentPath] = useState("");
-  const [dirs, setDirs] = useState<string[]>([]);
-  const [parentPath, setParentPath] = useState("");
+export function StatsTab() {
+  const [project, setProject] = useState("");
+  const [status, setStatus] = useState<IndexDiagnostic | null>(null);
+  const [health, setHealth] = useState<HealthDiagnostic | null>(null);
   const [loading, setLoading] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const browse = useCallback(async (path?: string) => {
+  const refresh = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
-      const q = path ? `?path=${encodeURIComponent(path)}` : "";
-      const res = await fetch(`/api/browse${q}`);
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setCurrentPath(data.path ?? "");
-      setDirs((data.dirs ?? []).sort());
-      setParentPath(data.parent ?? "/");
-    } catch (e) { setError(e instanceof Error ? e.message : "Browse failed"); }
-    finally { setLoading(false); }
-  }, []);
+      const args = project.trim() ? { project: project.trim() } : {};
+      const next = await callTool<IndexDiagnostic>("index_status", args);
+      setStatus(next);
 
-  useEffect(() => { browse(); }, [browse]);
-
-  const submit = async () => {
-    if (!currentPath) return;
-    setSubmitting(true); setError(null);
-    try {
-      const res = await fetch("/api/index", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ root_path: currentPath }) });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error ?? "Failed");
-      onCreated(); onClose();
-    } catch (e) { setError(e instanceof Error ? e.message : "Failed"); }
-    finally { setSubmitting(false); }
-  };
-
-  /* Breadcrumb segments */
-  const segments = currentPath.split("/").filter(Boolean);
-
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center" onClick={onClose}>
-      <div className="absolute inset-0 bg-black/60 backdrop-blur-sm" />
-      <div className="relative bg-[#0e2028] border border-border/40 rounded-2xl w-full max-w-lg shadow-2xl flex flex-col overflow-hidden" style={{ height: "min(70vh, 550px)" }} onClick={(e) => e.stopPropagation()}>
-        {/* Header */}
-        <div className="px-5 pt-5 pb-3 shrink-0">
-          <h3 className="text-[15px] font-semibold text-foreground/90 mb-1">Select Repository Folder</h3>
-          <p className="text-[12px] text-foreground/30">Navigate to the project root and click "Index This Folder".</p>
-        </div>
-
-        {/* Breadcrumb */}
-        <div className="px-5 py-2 border-y border-border/20 flex items-center gap-0.5 overflow-x-auto text-[11px] shrink-0">
-          <button onClick={() => browse("/")} className="text-primary/60 hover:text-primary shrink-0 transition-colors">/</button>
-          {segments.map((seg, i) => (
-            <span key={i} className="flex items-center gap-0.5 shrink-0">
-              <span className="text-foreground/15">/</span>
-              <button
-                onClick={() => browse("/" + segments.slice(0, i + 1).join("/"))}
-                className={`transition-colors ${i === segments.length - 1 ? "text-foreground/70 font-medium" : "text-primary/50 hover:text-primary"}`}
-              >
-                {seg}
-              </button>
-            </span>
-          ))}
-        </div>
-
-        {/* Directory list */}
-        <ScrollArea className="flex-1 min-h-0">
-          <div className="px-2 py-1">
-            {/* Go up */}
-            {currentPath !== "/" && (
-              <button
-                onClick={() => browse(parentPath)}
-                className="flex items-center gap-2 w-full text-left px-3 py-2 rounded-lg hover:bg-white/[0.04] text-[12px] text-foreground/40 transition-colors"
-              >
-                <span className="text-foreground/20">↑</span>
-                <span>..</span>
-              </button>
-            )}
-            {loading ? (
-              <p className="text-foreground/20 text-[12px] text-center py-8">Loading...</p>
-            ) : dirs.length === 0 ? (
-              <p className="text-foreground/15 text-[12px] text-center py-8">No subdirectories</p>
-            ) : (
-              dirs.map((d) => (
-                <button
-                  key={d}
-                  onClick={() => browse(`${currentPath}/${d}`)}
-                  className="flex items-center gap-2 w-full text-left px-3 py-1.5 rounded-lg hover:bg-white/[0.04] text-[12px] text-foreground/60 transition-colors group"
-                >
-                  <span className="text-foreground/20 group-hover:text-foreground/40">📁</span>
-                  <span className="truncate">{d}</span>
-                </button>
-              ))
-            )}
-          </div>
-        </ScrollArea>
-
-        {/* Footer */}
-        <div className="px-5 py-4 border-t border-border/20 shrink-0">
-          {error && <div className="rounded-lg bg-destructive/10 border border-destructive/20 px-3 py-2 mb-3"><p className="text-destructive text-[11px]">{error}</p></div>}
-          <div className="flex items-center justify-between">
-            <p className="text-[11px] text-foreground/25 font-mono truncate max-w-[250px]">{currentPath}</p>
-            <div className="flex gap-2 shrink-0">
-              <button onClick={onClose} className="px-3 py-2 rounded-lg text-[12px] text-foreground/40 hover:bg-white/[0.04] font-medium transition-all">Cancel</button>
-              <button onClick={submit} disabled={submitting || !currentPath} className="px-4 py-2 rounded-lg bg-primary/20 hover:bg-primary/30 text-primary text-[12px] font-medium transition-all disabled:opacity-30">
-                {submitting ? "Starting..." : "Index This Folder"}
-              </button>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-  );
-}
-
-/* ── Index Progress ─────────────────────────────────────── */
-
-function IndexProgress({ onDone }: { onDone: () => void }) {
-  const [jobs, setJobs] = useState<{ slot: number; status: string; path: string }[]>([]);
-  useEffect(() => {
-    const poll = setInterval(async () => {
-      try {
-        const data = await (await fetch("/api/index-status")).json();
-        setJobs(data);
-        if (data.length > 0 && data.every((j: { status: string }) => j.status !== "indexing")) onDone();
-      } catch { /* */ }
-    }, 2000);
-    return () => clearInterval(poll);
-  }, [onDone]);
-  const active = jobs.filter((j) => j.status === "indexing");
-  if (active.length === 0) return null;
-  return (
-    <div className="rounded-xl border border-primary/20 bg-primary/5 p-4 mb-6">
-      {active.map((j) => (
-        <div key={j.slot} className="flex items-center gap-3">
-          <div className="w-4 h-4 border-2 border-primary/30 border-t-primary rounded-full animate-spin shrink-0" />
-          <div>
-            <p className="text-[12px] text-primary font-medium">Indexing in progress</p>
-            <p className="text-[11px] text-foreground/30 font-mono">{j.path}</p>
-          </div>
-        </div>
-      ))}
-    </div>
-  );
-}
-
-/* ── Main Stats Tab ─────────────────────────────────────── */
-
-export function StatsTab({ onSelectProject }: StatsTabProps) {
-  const { projects, loading, error, refresh } = useProjects();
-  const [showModal, setShowModal] = useState(false);
-  const [indexing, setIndexing] = useState(false);
-
-  const aggregate = useMemo(() => {
-    let totalNodes = 0, totalEdges = 0;
-    for (const p of projects) {
-      totalNodes += p.schema?.node_labels?.reduce((s, l) => s + l.count, 0) ?? 0;
-      totalEdges += p.schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
+      const resolvedProject = project.trim() || next.project;
+      if (resolvedProject) {
+        const response = await dashboardFetch(
+          `/api/project-health?name=${encodeURIComponent(resolvedProject)}`,
+        );
+        setHealth(response.ok ? await response.json() : null);
+      } else {
+        setHealth(null);
+      }
+    } catch (cause) {
+      setStatus(null);
+      setHealth(null);
+      setError(cause instanceof Error ? cause.message : "Unable to load index diagnostics");
+    } finally {
+      setLoading(false);
     }
-    return { projects: projects.length, nodes: totalNodes, edges: totalEdges };
-  }, [projects]);
+  }, [project]);
 
-  const deleteProject = useCallback(async (name: string) => {
-    if (!confirm(`Delete index for "${name}"?`)) return;
-    try { await fetch(`/api/project?name=${encodeURIComponent(name)}`, { method: "DELETE" }); refresh(); } catch { /* */ }
-  }, [refresh]);
+  useEffect(() => {
+    void refresh();
+  }, []); // Load the session project once; manual refresh handles later input.
+
+  const fields: Array<[string, string | number | undefined]> = [
+    ["Freshness", status?.freshness],
+    ["Generation", status?.generation],
+    ["Nodes", status?.nodes ?? health?.nodes],
+    ["Edges", status?.edges ?? health?.edges],
+    ["DB size", health?.size_bytes !== undefined
+      ? `${(health.size_bytes / 1024 / 1024).toFixed(1)} MB`
+      : undefined],
+    ["Unresolved calls", status?.unresolved_calls],
+    ["Ambiguous calls", status?.ambiguous_calls],
+  ];
 
   return (
-    <ScrollArea className="h-full">
-      <div className="p-8 max-w-3xl mx-auto">
-        {projects.length > 0 && (
-          <div className="flex gap-4 mb-8">
-            {[
-              { label: "Projects", value: aggregate.projects, color: "text-primary" },
-              { label: "Nodes", value: aggregate.nodes, color: "text-foreground/80" },
-              { label: "Edges", value: aggregate.edges, color: "text-foreground/80" },
-            ].map((s) => (
-              <div key={s.label} className="flex-1 rounded-xl border border-border/30 bg-white/[0.02] p-4">
-                <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-1">{s.label}</p>
-                <p className={`text-[22px] font-semibold tabular-nums ${s.color}`}>{s.value.toLocaleString()}</p>
-              </div>
-            ))}
-          </div>
-        )}
-
-        {indexing && <IndexProgress onDone={() => { setIndexing(false); refresh(); }} />}
-
-        <div className="flex items-center justify-between mb-6">
-          <h2 className="text-[15px] font-semibold text-foreground/80">Indexed Projects</h2>
-          <div className="flex items-center gap-2">
-            <button onClick={() => setShowModal(true)} className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">+ New Index</button>
-            <button onClick={refresh} disabled={loading} className="px-3 py-1.5 rounded-lg bg-white/[0.04] hover:bg-white/[0.07] text-[12px] text-foreground/40 font-medium transition-all disabled:opacity-30">{loading ? "..." : "Refresh"}</button>
-          </div>
+    <div className="h-full overflow-auto">
+      <div className="p-8 max-w-4xl mx-auto">
+        <div className="mb-8">
+          <h2 className="text-[16px] font-semibold text-foreground/85 mb-1">Index diagnostics</h2>
+          <p className="text-[12px] text-foreground/30">
+            Read-only freshness, integrity, coverage, and reproducibility information.
+          </p>
         </div>
 
-        {error && <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-4 mb-6"><p className="text-destructive text-[13px]">{error}</p></div>}
+        <form
+          className="flex gap-2 mb-6"
+          onSubmit={(event) => {
+            event.preventDefault();
+            void refresh();
+          }}
+        >
+          <input
+            value={project}
+            onChange={(event) => setProject(event.target.value)}
+            placeholder="Project name (leave empty for session project)"
+            className="flex-1 rounded-lg border border-border/30 bg-white/[0.03] px-3 py-2 text-[12px] font-mono outline-none focus:border-primary/40"
+          />
+          <button
+            type="submit"
+            disabled={loading}
+            className="rounded-lg bg-primary/15 px-4 py-2 text-[12px] font-medium text-primary hover:bg-primary/25 disabled:opacity-40"
+          >
+            {loading ? "Checking…" : "Refresh"}
+          </button>
+        </form>
 
-        {!loading && projects.length === 0 && !error && (
-          <div className="text-center py-20">
-            <p className="text-foreground/25 text-[13px] mb-2">No indexed projects</p>
-            <button onClick={() => setShowModal(true)} className="px-4 py-2 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">Index your first repository</button>
+        {error && (
+          <div className="rounded-xl border border-destructive/20 bg-destructive/5 p-4 mb-6">
+            <p className="text-destructive text-[12px]">{error}</p>
           </div>
         )}
 
-        <div className="space-y-3">
-          {projects.map((p) => {
-            const totalNodes = p.schema?.node_labels?.reduce((s, l) => s + l.count, 0) ?? 0;
-            const totalEdges = p.schema?.edge_types?.reduce((s, t) => s + t.count, 0) ?? 0;
-            return (
-              <div key={p.project.name} className="rounded-xl border border-border/30 bg-white/[0.02] hover:bg-white/[0.035] transition-all p-5">
-                <div className="flex items-start justify-between gap-3 mb-3">
-                  <div className="min-w-0 flex items-start gap-2.5">
-                    <div className="mt-1.5"><HealthDot name={p.project.name} /></div>
-                    <div className="min-w-0">
-                      <h3 className="text-[14px] font-semibold text-foreground/90 mb-0.5">{p.project.name}</h3>
-                      <p className="text-[11px] text-foreground/20 font-mono truncate">{p.project.root_path}</p>
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 shrink-0">
-                    <AdrButton project={p.project.name} />
-                    <button onClick={() => onSelectProject(p.project.name)} className="px-3 py-1.5 rounded-lg bg-primary/15 hover:bg-primary/25 text-primary text-[12px] font-medium transition-all">View Graph</button>
-                    <button onClick={() => deleteProject(p.project.name)} className="px-2 py-1.5 rounded-lg hover:bg-destructive/10 text-foreground/20 hover:text-destructive text-[12px] transition-all" title="Delete index">✕</button>
-                  </div>
-                </div>
-                {p.schema && (
-                  <>
-                    <div className="flex gap-6 text-[12px] text-foreground/30 mb-3">
-                      <span><strong className="text-foreground/55 tabular-nums">{totalNodes.toLocaleString()}</strong> nodes</span>
-                      <span><strong className="text-foreground/55 tabular-nums">{totalEdges.toLocaleString()}</strong> edges</span>
-                    </div>
-                    <div className="flex flex-wrap gap-1">
-                      {p.schema.node_labels?.map((l) => (
-                        <span key={l.label} className="inline-flex items-center gap-1 px-1.5 py-[2px] rounded-md text-[10px] font-medium" style={{ backgroundColor: colorForLabel(l.label) + "10", color: colorForLabel(l.label) + "bb" }}>
-                          <span className="w-[4px] h-[4px] rounded-full" style={{ backgroundColor: colorForLabel(l.label) }} />
-                          {l.label} {l.count.toLocaleString()}
-                        </span>
-                      ))}
-                    </div>
-                  </>
+        {status && (
+          <>
+            <div className="flex items-center gap-3 rounded-xl border border-border/30 bg-white/[0.02] p-4 mb-4">
+              <span
+                className={`h-2.5 w-2.5 rounded-full ${
+                  status.status === "ready" && health?.status !== "corrupt"
+                    ? "bg-emerald-400"
+                    : "bg-amber-400"
+                }`}
+              />
+              <div>
+                <p className="text-[13px] font-medium text-foreground/80">
+                  {status.project ?? (project || "Session project")}
+                </p>
+                <p className="text-[11px] text-foreground/30">
+                  Index: {status.status ?? "unknown"} · Integrity: {health?.status ?? "unknown"}
+                </p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-4">
+              {fields
+                .filter((field): field is [string, string | number] => field[1] !== undefined)
+                .map(([label, value]) => <Metric key={label} label={label} value={value} />)}
+            </div>
+
+            {(status.commit || status.dirty_fingerprint || status.digest) && (
+              <div className="rounded-xl border border-border/30 bg-black/20 p-4 mb-4 font-mono text-[11px]">
+                {status.commit && <p className="text-foreground/45">commit: {status.commit}</p>}
+                {status.dirty_fingerprint && (
+                  <p className="text-foreground/45">dirty: {status.dirty_fingerprint}</p>
                 )}
+                {status.digest && <p className="text-foreground/45">digest: {status.digest}</p>}
               </div>
-            );
-          })}
-        </div>
+            )}
+
+            {status.languages !== undefined && (
+              <div className="rounded-xl border border-border/30 bg-white/[0.02] p-4">
+                <p className="text-[10px] text-foreground/25 uppercase tracking-widest mb-2">
+                  Language coverage
+                </p>
+                <pre className="overflow-auto text-[11px] text-foreground/50">
+                  {JSON.stringify(status.languages, null, 2)}
+                </pre>
+              </div>
+            )}
+          </>
+        )}
       </div>
-      {showModal && <CreateIndexModal onClose={() => setShowModal(false)} onCreated={() => { setIndexing(true); refresh(); }} />}
-    </ScrollArea>
+    </div>
   );
 }

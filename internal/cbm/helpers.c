@@ -632,7 +632,6 @@ static const char *func_kinds_bash[] = {"function_definition", NULL};
 static const char *func_kinds_erlang[] = {"function_clause", NULL};
 static const char *func_kinds_csharp[] = {"method_declaration", "constructor_declaration", NULL};
 static const char *func_kinds_matlab[] = {"function_definition", NULL};
-static const char *func_kinds_lean[] = {"def", "theorem", "instance", "abbrev", NULL};
 static const char *func_kinds_form[] = {"procedure_definition", NULL};
 static const char *func_kinds_magma[] = {"function_definition", "procedure_definition",
                                          "intrinsic_definition", NULL};
@@ -684,8 +683,6 @@ static const char **func_kinds_for_lang(CBMLanguage lang) {
         return func_kinds_csharp;
     case CBM_LANG_MATLAB:
         return func_kinds_matlab;
-    case CBM_LANG_LEAN:
-        return func_kinds_lean;
     case CBM_LANG_FORM:
         return func_kinds_form;
     case CBM_LANG_MAGMA:
@@ -931,8 +928,6 @@ static const char **get_module_parents(CBMLanguage lang) {
         return module_parents_commonlisp;
     case CBM_LANG_MATLAB:
         return module_parents_matlab;
-    case CBM_LANG_LEAN:
-        return module_parents_zig;
     case CBM_LANG_FORM:
         return module_parents_form;
     case CBM_LANG_MAGMA:

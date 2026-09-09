@@ -25,6 +25,7 @@
 enum {
     MAIN_MIN_ARGC = 1,
     MAIN_CLI_ARGC = 2,
+    MAIN_SETUP_CONFIG_ARGC = 3,
     MAIN_FLAG_OFF = 5, /* strlen("--ui=") */
     MAIN_PORT_OFF = 7, /* strlen("--port=") */
     MAIN_MAX_PORT = 65536,
@@ -43,6 +44,7 @@ enum {
 #include "ui/config.h"
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
+#include "product_manifest_generated.h"
 #include <yyjson/yyjson.h>
 
 #include <stdio.h>
@@ -50,9 +52,10 @@ enum {
 #include <string.h>
 #include <signal.h>
 #include <stdatomic.h>
+#include <sys/stat.h>
 
 #ifndef CBM_VERSION
-#define CBM_VERSION "dev"
+#define CBM_VERSION CBM_PRODUCT_VERSION
 #endif
 
 /* ── Globals for signal handling ────────────────────────────────── */
@@ -61,6 +64,9 @@ static cbm_watcher_t *g_watcher = NULL;
 static cbm_mcp_server_t *g_server = NULL;
 static cbm_http_server_t *g_http_server = NULL;
 static atomic_int g_shutdown = 0;
+#ifndef _WIN32
+static pthread_t g_main_thread;
+#endif
 
 /* Idempotent shutdown: cancels the active pipeline, stops background servers,
  * and closes stdin to unblock the MCP read loop. Invoked from the signal
@@ -79,17 +85,19 @@ static void request_shutdown(void) {
             cbm_pipeline_cancel(p);
         }
     }
-    /* Release pipeline lock to prevent stale lock on restart */
-    cbm_pipeline_unlock();
-
     if (g_watcher) {
         cbm_watcher_stop(g_watcher);
     }
     if (g_http_server) {
         cbm_http_server_stop(g_http_server);
     }
-    /* Close stdin to unblock getline in the MCP server loop */
-    (void)fclose(stdin);
+    /* Never fclose here: it takes a stdio lock and is not signal-safe.
+     * A signal on the reader thread interrupts its blocking read. */
+#ifdef _WIN32
+    (void)_close(0);
+#else
+    (void)close(STDIN_FILENO);
+#endif
 }
 
 static void signal_handler(int sig) {
@@ -121,8 +129,10 @@ static void *parent_watchdog_thread(void *arg) {
          * where a changing ppid carries no signal. */
         if (initial_ppid > 1 && getppid() != initial_ppid) {
             cbm_log_warn("parent.exited", "reason", "ppid_changed");
-            request_shutdown();
-            exit(0);
+            /* Interrupt the reader itself; closing its fd from this thread
+             * cannot reliably wake an in-progress read on every platform. */
+            (void)pthread_kill(g_main_thread, SIGTERM);
+            return NULL;
         }
     }
     return NULL;
@@ -154,27 +164,27 @@ static int watcher_index_fn(const char *project_name, const char *root_path, voi
 
     /* Skip indexing if shutdown is in progress */
     if (atomic_load(&g_shutdown)) {
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     /* Non-blocking: skip if another pipeline is already running.
      * Watcher will retry on next poll cycle (5-60s). */
-    if (!cbm_pipeline_try_lock()) {
+    if (!cbm_pipeline_try_lock_project(project_name)) {
         cbm_log_info("watcher.skip", "project", project_name, "reason", "pipeline_busy");
-        return 0;
+        return CBM_NOT_FOUND;
     }
 
     cbm_log_info("watcher.reindex", "project", project_name, "path", root_path);
 
     cbm_pipeline_t *p = cbm_pipeline_new(root_path, NULL, CBM_MODE_FULL);
     if (!p) {
-        cbm_pipeline_unlock();
+        cbm_pipeline_unlock_project(project_name);
         return CBM_NOT_FOUND;
     }
 
     int rc = cbm_pipeline_run(p);
     cbm_pipeline_free(p);
-    cbm_pipeline_unlock();
+    cbm_pipeline_unlock_project(project_name);
     return rc;
 }
 
@@ -277,6 +287,90 @@ static int run_cli(int argc, char **argv) {
     return exit_code;
 }
 
+/* ── Guided setup ──────────────────────────────────────────────── */
+
+static bool setup_has_flag(int argc, char **argv, const char *flag) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], flag) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *setup_repo_path(int argc, char **argv) {
+    const char *path = ".";
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--client") == 0) {
+            i++; /* skip the client name */
+            continue;
+        }
+        if (argv[i][0] != '-') {
+            path = argv[i];
+        }
+    }
+    return path;
+}
+
+static char *setup_index_arguments(const char *repo_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_obj_add_str(doc, root, "repo_path", repo_path);
+    yyjson_mut_obj_add_str(doc, root, "mode", "structural");
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+static int run_setup(int argc, char **argv) {
+    const char *repo_path = setup_repo_path(argc, argv);
+    bool no_watch = setup_has_flag(argc, argv, "--no-watch");
+    bool dry_run = setup_has_flag(argc, argv, "--dry-run");
+    bool plan = setup_has_flag(argc, argv, "--plan");
+
+    struct stat st;
+    if (stat(repo_path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        (void)fprintf(stderr, "error: setup path is not a directory: %s\n", repo_path);
+        return SKIP_ONE;
+    }
+
+    int install_rc = cbm_cmd_install(argc, argv);
+    if (install_rc != 0) {
+        return install_rc;
+    }
+    if (dry_run || plan) {
+        printf("setup: would index %s in structural mode; watcher=%s\n", repo_path,
+               no_watch ? "disabled" : "enabled");
+        return 0;
+    }
+
+    char *arguments = setup_index_arguments(repo_path);
+    if (!arguments) {
+        (void)fprintf(stderr, "error: failed to build setup index request\n");
+        return SKIP_ONE;
+    }
+    char *index_argv[] = {"index_repository", arguments};
+    int index_rc = run_cli(MAIN_CLI_ARGC, index_argv);
+    free(arguments);
+    if (index_rc != 0) {
+        return index_rc;
+    }
+
+    char *config_argv[] = {"set", CBM_CONFIG_AUTO_INDEX, no_watch ? "false" : "true"};
+    int config_rc = cbm_cmd_config(MAIN_SETUP_CONFIG_ARGC, config_argv);
+    if (config_rc != 0) {
+        return config_rc;
+    }
+
+    printf("setup complete: environment=ok, structural_index=ready, watcher=%s\n",
+           no_watch ? "disabled" : "enabled_on_mcp_start");
+    return 0;
+}
+
 /* ── Help ───────────────────────────────────────────────────────── */
 
 static void print_help(void) {
@@ -284,23 +378,24 @@ static void print_help(void) {
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli <tool> [json]  Run a single tool\n");
-    printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run]\n");
+    printf("  codebase-memory-mcp install --client <name> [--with-hooks] [--with-instructions]\n");
+    printf("  codebase-memory-mcp setup [path] --client <name> [--no-watch]\n");
     printf("  codebase-memory-mcp uninstall [-y|-n] [--dry-run]\n");
     printf("  codebase-memory-mcp update [-y|-n]\n");
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
-    printf("\nUI options:\n");
-    printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
-    printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
-    printf("  --port=N     Set UI port (default 9749, persisted)\n");
-    printf("\nSupported agents (auto-detected):\n");
+    printf("\nDiagnostic dashboard options:\n");
+    printf("  --ui=true    Enable the local diagnostic dashboard (persisted)\n");
+    printf("  --ui=false   Disable the local diagnostic dashboard (persisted)\n");
+    printf("  --port=N     Set dashboard port (default 9749, persisted)\n");
+    printf("\nSupported clients (select explicitly; use --client all intentionally):\n");
     printf("  Claude Code, Codex CLI, Gemini CLI, Zed, OpenCode,\n");
     printf("  Antigravity, Aider, KiloCode, Kiro\n");
-    printf("\nTools: index_repository, search_graph, query_graph, trace_path,\n");
-    printf("  get_code_snippet, get_graph_schema, get_architecture, search_code,\n");
-    printf("  list_projects, delete_project, index_status, detect_changes,\n");
-    printf("  manage_adr, ingest_traces\n");
+    printf("\nDefault tools: get_context, search_graph, search_code, trace_path,\n");
+    printf("  get_code_snippet, get_architecture, detect_changes, index_status,\n");
+    printf("  index_repository\n");
+    printf("Advanced/admin tools require CBM_MCP_TOOLSETS=advanced[,admin].\n");
 }
 
 /* ── Main ───────────────────────────────────────────────────────── */
@@ -333,6 +428,10 @@ static int handle_subcommand(int argc, char **argv) {
         }
         if (strcmp(argv[i], "install") == 0) {
             return cbm_cmd_install(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
+        }
+        if (strcmp(argv[i], "setup") == 0) {
+            cbm_mem_init(MAIN_RAM_FRACTION);
+            return run_setup(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
         if (strcmp(argv[i], "uninstall") == 0) {
             return cbm_cmd_uninstall(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
@@ -410,6 +509,8 @@ int main(int argc, char **argv) {
      * ppid==1 (early reparent races, double-fork/container launchers), and the
      * watchdog already no-ops safely in that case via its initial_ppid>1 guard. */
 #ifndef _WIN32
+    g_main_thread = pthread_self();
+    setup_signal_handlers();
     /* main() outlives the watchdog (it joins before returning), so a stack
      * local is a valid lifetime for the thread's argument. */
     pid_t initial_ppid = getppid();
@@ -427,8 +528,6 @@ int main(int argc, char **argv) {
     cbm_mem_init(MAIN_RAM_FRACTION); /* 50% of RAM — safe now because mimalloc tracks ALL
                                       * memory (C + C++ allocations) via global override.
                                       * No more untracked heap blind spots. */
-    /* Store binary path for subprocess spawning + hook log sink */
-    cbm_http_server_set_binary_path(argv[0]);
     cbm_log_set_sink(cbm_ui_log_append);
     cbm_log_info("server.start", "version", CBM_VERSION);
     cbm_diag_start(); /* starts if CBM_DIAGNOSTICS=1 */
@@ -504,6 +603,13 @@ int main(int argc, char **argv) {
     if (ui_cfg.ui_enabled && CBM_EMBEDDED_FILE_COUNT > 0) {
         g_http_server = cbm_http_server_new(ui_cfg.ui_port);
         if (g_http_server) {
+            char dashboard_url[160];
+            if (cbm_http_server_launch_url(g_http_server, dashboard_url,
+                                           sizeof(dashboard_url))) {
+                (void)fprintf(stderr,
+                              "codebase-memory-mcp: diagnostic dashboard (read-only): %s\n",
+                              dashboard_url);
+            }
             if (cbm_thread_create(&http_tid, 0, http_thread, g_http_server) == 0) {
                 http_started = true;
             }

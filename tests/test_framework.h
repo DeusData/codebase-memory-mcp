@@ -53,6 +53,18 @@ static inline const char *tf_reset(void) {
     return isatty(1) ? "\033[0m" : "";
 }
 
+/* Run one suite with CBM_TEST_SUITE=mcp. Unset means run everything. */
+static inline int tf_suite_enabled(const char *name) {
+    const char *filter = getenv("CBM_TEST_SUITE");
+    return !filter || !filter[0] || strcmp(filter, name) == 0;
+}
+
+/* Run one test inside the selected suite with CBM_TEST_FILTER=test_name. */
+static inline int tf_test_enabled(const char *name) {
+    const char *filter = getenv("CBM_TEST_FILTER");
+    return !filter || !filter[0] || strcmp(filter, name) == 0;
+}
+
 /* ── Test definition ───────────────────────────────────────────── */
 
 #define TEST(name) static int test_##name(void)
@@ -224,6 +236,8 @@ static inline const char *tf_reset(void) {
 
 #define RUN_TEST(name)                                    \
     do {                                                  \
+        if (!tf_test_enabled(#name))                      \
+            break;                                        \
         printf("  %-55s", #name);                         \
         fflush(stdout);                                   \
         int _result = test_##name();                      \
@@ -243,6 +257,8 @@ static inline const char *tf_reset(void) {
 
 #define RUN_SUITE(name)                                            \
     do {                                                           \
+        if (!tf_suite_enabled(#name))                              \
+            break;                                                 \
         printf("\n%s=== %s ===%s\n", tf_dim(), #name, tf_reset()); \
         suite_##name();                                            \
     } while (0)

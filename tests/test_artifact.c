@@ -36,13 +36,15 @@ static void create_test_db(const char *path) {
     cbm_store_exec(s, "INSERT OR IGNORE INTO projects(name, indexed_at, root_path) "
                       "VALUES('test-proj', '2026-01-01', '/tmp/test');");
 
-    cbm_store_exec(s, "INSERT INTO nodes(project, label, name, qualified_name, file_path) "
-                      "VALUES('test-proj', 'Function', 'foo', 'test-proj.foo', 'main.c');");
-    cbm_store_exec(s, "INSERT INTO nodes(project, label, name, qualified_name, file_path) "
-                      "VALUES('test-proj', 'Function', 'bar', 'test-proj.bar', 'main.c');");
-
-    cbm_store_exec(s, "INSERT INTO edges(project, source_id, target_id, type) "
-                      "VALUES('test-proj', 1, 2, 'CALLS');");
+    cbm_node_t node = {.project = "test-proj", .label = "Function", .name = "foo",
+                       .qualified_name = "test-proj.foo", .file_path = "main.c"};
+    int64_t source = cbm_store_upsert_node(s, &node);
+    node.name = "bar";
+    node.qualified_name = "test-proj.bar";
+    int64_t target = cbm_store_upsert_node(s, &node);
+    cbm_edge_t edge = {.project = "test-proj", .source_id = source, .target_id = target,
+                       .type = "CALLS"};
+    cbm_store_insert_edge(s, &edge);
 
     cbm_store_close(s);
 }

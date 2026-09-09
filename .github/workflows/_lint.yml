@@ -20,6 +20,9 @@ jobs:
       - name: No-skips policy (tests pass or fail)
         run: bash scripts/check-no-test-skips.sh
 
+      - name: Product manifest and public claims are in sync
+        run: python3 scripts/generate-product-surfaces.py --check
+
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev cmake
 

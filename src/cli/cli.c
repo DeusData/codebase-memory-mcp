@@ -8,6 +8,7 @@
 #include "foundation/compat.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
+#include "product_manifest_generated.h"
 
 /* CLI buffer size constants. */
 enum {
@@ -75,7 +76,7 @@ enum {
 #include "foundation/compat_fs.h"
 
 #ifndef CBM_VERSION
-#define CBM_VERSION "dev"
+#define CBM_VERSION CBM_PRODUCT_VERSION
 #endif
 #include <errno.h>  // EEXIST
 #include <fcntl.h>  // open, O_WRONLY, O_CREAT, O_TRUNC
@@ -120,7 +121,7 @@ static void (*cbm_sqlite_transient_fn(void))(void *) {
 
 /* ── Version ──────────────────────────────────────────────────── */
 
-static const char *cli_version = "dev";
+static const char *cli_version = CBM_PRODUCT_VERSION;
 
 void cbm_cli_set_version(const char *ver) {
     if (ver) {
@@ -419,7 +420,7 @@ static const char skill_content[] =
     "\n"
     "# Codebase Memory — Knowledge Graph Tools\n"
     "\n"
-    "Graph tools return precise structural results in ~500 tokens vs ~80K for grep.\n"
+    "Graph tools return focused structural evidence with source coordinates and provenance.\n"
     "\n"
     "## Quick Decision Matrix\n"
     "\n"
@@ -430,16 +431,17 @@ static const char skill_content[] =
     "| Full call context | `trace_path(direction=\"both\")` |\n"
     "| Find by name pattern | `search_graph(name_pattern=\"...\")` |\n"
     "| Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |\n"
-    "| Cross-service edges | `query_graph` with Cypher |\n"
+    "| Broad task context | `get_context(query=\"...\", intent=\"understand\")` |\n"
+    "| Cross-service edges | advanced `query_graph` toolset |\n"
     "| Impact of local changes | `detect_changes()` |\n"
     "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
     "| Text search | `search_code` or Grep |\n"
     "\n"
     "## Exploration Workflow\n"
-    "1. `list_projects` — check if project is indexed\n"
-    "2. `get_graph_schema` — understand node/edge types\n"
-    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
-    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
+    "1. `index_status` — check whether the session project is fresh\n"
+    "2. `get_context(query=\"...\", intent=\"understand\")` — get a budgeted evidence pack\n"
+    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — narrow results\n"
+    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read exact source\n"
     "\n"
     "## Tracing Workflow\n"
     "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
@@ -453,18 +455,20 @@ static const char skill_content[] =
     "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
     "direction=\"inbound\")`\n"
     "\n"
-    "## 14 MCP Tools\n"
-    "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
-    "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
-    "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
-    "`manage_adr`, `ingest_traces`\n"
+    "## Default MCP Tools\n"
+    "`get_context`, `search_graph`, `search_code`, `trace_path`,\n"
+    "`get_code_snippet`, `get_architecture`, `detect_changes`, `index_status`,\n"
+    "`index_repository`\n"
+    "\n"
+    "Advanced (`query_graph`, `get_graph_schema`, `manage_adr`) and admin\n"
+    "(`list_projects`, `delete_project`) toolsets require explicit enablement.\n"
     "\n"
     "## Edge Types\n"
     "CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
     "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH,\n"
     "CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE\n"
     "\n"
-    "## Cypher Examples (for query_graph)\n"
+    "## Cypher Examples (advanced query_graph toolset)\n"
     "```\n"
     "MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, "
     "r.confidence LIMIT 20\n"
@@ -473,14 +477,11 @@ static const char skill_content[] =
     "```\n"
     "\n"
     "## Gotchas\n"
-    "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
-    "use `query_graph` with Cypher to see actual edges.\n"
-    "2. `query_graph` has a 200-row cap — use `search_graph` with degree filters "
-    "for counting.\n"
-    "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
-    "4. `direction=\"outbound\"` misses cross-service callers — use "
+    "1. `query_graph` and `get_graph_schema` are advanced tools, not defaults.\n"
+    "2. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
+    "3. `direction=\"outbound\"` misses cross-service callers — use "
     "`direction=\"both\"`.\n"
-    "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
+    "4. Results default to 10 per page — check `has_more` and use `offset`.\n";
 
 static const char codex_instructions_content[] =
     "# Codebase Knowledge Graph\n"
@@ -491,7 +492,7 @@ static const char codex_instructions_content[] =
     "- `search_graph` — find functions, classes, routes by pattern\n"
     "- `trace_path` — trace who calls a function or what it calls\n"
     "- `get_code_snippet` — read function source code\n"
-    "- `query_graph` — run Cypher queries for complex patterns\n"
+    "- `get_context` — retrieve a token-budgeted evidence pack\n"
     "- `get_architecture` — high-level project summary\n"
     "\n"
     "Always prefer graph tools over grep for code discovery.\n";
@@ -1113,11 +1114,13 @@ static const char agent_instructions_content[] =
     "ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.\n"
     "\n"
     "## Priority Order\n"
-    "1. `search_graph` — find functions, classes, routes, variables by pattern\n"
-    "2. `trace_path` — trace who calls a function or what it calls\n"
-    "3. `get_code_snippet` — read specific function/class source code\n"
-    "4. `query_graph` — run Cypher queries for complex patterns\n"
+    "1. `get_context` — retrieve a ranked evidence pack within a token budget\n"
+    "2. `search_graph` — find functions, classes, routes, variables by pattern\n"
+    "3. `trace_path` — trace who calls a function or what it calls\n"
+    "4. `get_code_snippet` — read specific function/class source code\n"
     "5. `get_architecture` — high-level project summary\n"
+    "\n"
+    "`query_graph` is available only when the advanced toolset is enabled.\n"
     "\n"
     "## When to fall back to grep/glob\n"
     "- Searching for string literals, error messages, config values\n"
@@ -1445,8 +1448,8 @@ int cbm_remove_codex_mcp(const char *config_path) {
  * and a JSON string (Gemini settings.json) — i.e. it contains NO single quotes
  * and NO newlines. (issues #330 + Gemini/Antigravity parity) */
 #define CMM_SESSION_REMINDER_CMD                                                    \
-    "echo \"Code discovery: prefer codebase-memory-mcp (search_graph, trace_path, " \
-    "get_code_snippet, query_graph, search_code) over grep/file-read; run "         \
+    "echo \"Code discovery: prefer codebase-memory-mcp (get_context, search_graph, " \
+    "trace_path, get_code_snippet, search_code) over grep/file-read; run "           \
     "index_repository first if the project is not indexed.\""
 
 /* Sentinel-delimited block so upsert/remove are robust to the nested TOML
@@ -1941,12 +1944,13 @@ static void cbm_install_session_reminder_script(const char *home) {
            "cat << 'REMINDER'\n"
            "CRITICAL - Code Discovery Protocol:\n"
            "1. ALWAYS use codebase-memory-mcp tools FIRST for ANY code exploration:\n"
+           "   - get_context(query/intent/budget_tokens) for ranked evidence packs\n"
            "   - search_graph(name_pattern/label/qn_pattern) to find functions/classes/routes\n"
            "   - trace_path(function_name, mode=calls|data_flow|cross_service) for call chains\n"
            "   - get_code_snippet(qualified_name) for exact symbol source (precise ranges)\n"
-           "   - query_graph(query) for complex Cypher patterns\n"
            "   - get_architecture(aspects) for project structure\n"
-           "   - search_code(pattern) for text search (graph-augmented grep)\n"
+           "   - search_code(pattern) for indexed text search\n"
+           "   - query_graph(query) only when the advanced toolset is explicitly enabled\n"
            "2. Use Grep/Glob/Read freely for text, configs, non-code files, and\n"
            "   always Read a file before editing it.\n"
            "3. If a project is not indexed yet, run index_repository FIRST.\n"
@@ -2754,39 +2758,6 @@ static int cbm_macos_adhoc_sign(const char *binary_path) {
 }
 #endif
 
-/* ── Kill other MCP server instances ──────────────────────────── */
-
-static int cbm_kill_other_instances(void) {
-#ifdef _WIN32
-    /* taskkill /IM kills ALL matching processes INCLUDING self.
-     * Use /FI filter to exclude our own PID. */
-    char pid_filter[CBM_SZ_64];
-    snprintf(pid_filter, sizeof(pid_filter), "PID ne %lu", (unsigned long)GetCurrentProcessId());
-    const char *argv[] = {"taskkill", "/F",       "/FI", "IMAGENAME eq codebase-memory-mcp.exe",
-                          "/FI",      pid_filter, NULL};
-    (void)cbm_exec_no_shell(argv);
-    return 0;
-#else
-    int killed = 0;
-    pid_t self = getpid();
-    FILE *fp = cbm_popen("pgrep -x codebase-memory-mcp", "r");
-    if (!fp) {
-        return 0;
-    }
-    char line[CLI_BUF_32];
-    while (fgets(line, sizeof(line), fp)) {
-        pid_t pid = (pid_t)strtol(line, NULL, CLI_STRTOL_BASE);
-        if (pid > 0 && pid != self) {
-            if (kill(pid, SIGTERM) == 0) {
-                killed++;
-            }
-        }
-    }
-    cbm_pclose(fp);
-    return killed;
-#endif
-}
-
 /* Download checksums.txt and verify the archive integrity.
  * Returns: 0 = verified OK, 1 = mismatch (FAIL), -1 = could not verify (warning). */
 static int verify_download_checksum(const char *archive_path, const char *archive_name) {
@@ -2874,6 +2845,75 @@ static const char *detect_arch(void) {
 
 /* ── Agent config install/refresh (shared by install + update) ── */
 
+/* Canonical client names accepted by `install --client`. A few historical
+ * spellings remain aliases, but receipts always use the canonical name. */
+static const char *cbm_canonical_install_client(const char *client) {
+    if (!client || !client[0]) {
+        return NULL;
+    }
+    if (strcmp(client, "all") == 0 || strcmp(client, "claude-code") == 0 ||
+        strcmp(client, "codex") == 0 || strcmp(client, "gemini") == 0 ||
+        strcmp(client, "zed") == 0 || strcmp(client, "opencode") == 0 ||
+        strcmp(client, "antigravity") == 0 || strcmp(client, "aider") == 0 ||
+        strcmp(client, "kilocode") == 0 || strcmp(client, "vscode") == 0 ||
+        strcmp(client, "cursor") == 0 || strcmp(client, "openclaw") == 0 ||
+        strcmp(client, "kiro") == 0) {
+        return client;
+    }
+    if (strcmp(client, "claude") == 0) {
+        return "claude-code";
+    }
+    if (strcmp(client, "codex-cli") == 0) {
+        return "codex";
+    }
+    if (strcmp(client, "gemini-cli") == 0) {
+        return "gemini";
+    }
+    if (strcmp(client, "vs-code") == 0) {
+        return "vscode";
+    }
+    if (strcmp(client, "kilo-code") == 0) {
+        return "kilocode";
+    }
+    return NULL;
+}
+
+/* A named client is explicit intent, so select it even when its config
+ * directory does not exist yet. "all" is intentionally different: it means
+ * every client detected on this machine and is never an implicit default. */
+static cbm_detected_agents_t cbm_select_install_agents(const char *home, const char *client) {
+    cbm_detected_agents_t agents = {0};
+    if (strcmp(client, "all") == 0) {
+        return cbm_detect_agents(home);
+    }
+    if (strcmp(client, "claude-code") == 0) {
+        agents.claude_code = true;
+    } else if (strcmp(client, "codex") == 0) {
+        agents.codex = true;
+    } else if (strcmp(client, "gemini") == 0) {
+        agents.gemini = true;
+    } else if (strcmp(client, "zed") == 0) {
+        agents.zed = true;
+    } else if (strcmp(client, "opencode") == 0) {
+        agents.opencode = true;
+    } else if (strcmp(client, "antigravity") == 0) {
+        agents.antigravity = true;
+    } else if (strcmp(client, "aider") == 0) {
+        agents.aider = true;
+    } else if (strcmp(client, "kilocode") == 0) {
+        agents.kilocode = true;
+    } else if (strcmp(client, "vscode") == 0) {
+        agents.vscode = true;
+    } else if (strcmp(client, "cursor") == 0) {
+        agents.cursor = true;
+    } else if (strcmp(client, "openclaw") == 0) {
+        agents.openclaw = true;
+    } else if (strcmp(client, "kiro") == 0) {
+        agents.kiro = true;
+    }
+    return agents;
+}
+
 /* Print detected agent names on a single line. */
 static void print_detected_agents(const cbm_detected_agents_t *a) {
     struct {
@@ -2948,7 +2988,7 @@ static void plan_record(const char *agent, const char *kind, const char *path) {
 }
 
 static void install_claude_code_config(const char *home, const char *binary_path, bool force,
-                                       bool dry_run) {
+                                       bool dry_run, bool with_hooks, bool with_instructions) {
     char config_dir[CLI_BUF_1K];
     cbm_claude_config_dir(home, config_dir, sizeof(config_dir));
     char user_root[CLI_BUF_1K];
@@ -2960,27 +3000,32 @@ static void install_claude_code_config(const char *home, const char *binary_path
     /* Plan mode: record the planned writes and return without mutating (#388). */
     if (g_install_plan) {
         char p[CLI_BUF_1K];
-        plan_record("Claude Code", "skills", skills_dir);
+        if (with_instructions) {
+            plan_record("Claude Code", "skills", skills_dir);
+        }
         snprintf(p, sizeof(p), "%s/.mcp.json", config_dir);
         plan_record("Claude Code", "mcp_config", p);
         snprintf(p, sizeof(p), "%s/.claude.json", user_root);
         plan_record("Claude Code", "mcp_config", p);
-        snprintf(p, sizeof(p), "%s/settings.json", config_dir);
-        plan_record("Claude Code", "mcp_config", p);
-        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
-        plan_record("Claude Code", "hook", p);
-        snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
-        plan_record("Claude Code", "hook", p);
+        if (with_hooks) {
+            snprintf(p, sizeof(p), "%s/settings.json", config_dir);
+            plan_record("Claude Code", "hook", p);
+            snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_HOOK_GATE_SCRIPT);
+            plan_record("Claude Code", "hook", p);
+            snprintf(p, sizeof(p), "%s/hooks/%s", config_dir, CMM_SESSION_REMINDER_SCRIPT);
+            plan_record("Claude Code", "hook", p);
+        }
         return;
     }
 
     printf("Claude Code:\n");
 
-    int skill_count = cbm_install_skills(skills_dir, force, dry_run);
-    printf("  skills: %d installed\n", skill_count);
-
-    if (cbm_remove_old_monolithic_skill(skills_dir, dry_run)) {
-        printf("  removed old monolithic skill\n");
+    if (with_instructions) {
+        int skill_count = cbm_install_skills(skills_dir, force, dry_run);
+        printf("  skills: %d installed\n", skill_count);
+        if (cbm_remove_old_monolithic_skill(skills_dir, dry_run)) {
+            printf("  removed old monolithic skill\n");
+        }
     }
 
     char mcp_path[CLI_BUF_1K];
@@ -2999,14 +3044,16 @@ static void install_claude_code_config(const char *home, const char *binary_path
 
     char settings_path[CLI_BUF_1K];
     snprintf(settings_path, sizeof(settings_path), "%s/settings.json", config_dir);
-    if (!dry_run) {
-        cbm_upsert_claude_hooks(settings_path);
-        cbm_install_hook_gate_script(home, binary_path);
-        cbm_install_session_reminder_script(home);
-        cbm_upsert_session_hooks(settings_path);
+    if (with_hooks) {
+        if (!dry_run) {
+            cbm_upsert_claude_hooks(settings_path);
+            cbm_install_hook_gate_script(home, binary_path);
+            cbm_install_session_reminder_script(home);
+            cbm_upsert_session_hooks(settings_path);
+        }
+        printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
+        printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
     }
-    printf("  hooks: PreToolUse (Grep/Glob search-graph augmenter, non-blocking)\n");
-    printf("  hooks: SessionStart (MCP usage reminder on startup/resume/clear/compact)\n");
 
     /* Migration nudge: when CLAUDE_CONFIG_DIR is set and a legacy ~/.claude tree
      * still exists, mention it so users can clean up stale artifacts. */
@@ -3051,36 +3098,42 @@ static void install_generic_agent_config(const char *label, const char *binary_p
 
 /* Install MCP configs for CLI-based agents (Codex, Gemini, OpenCode, Antigravity, Aider). */
 /* Install Gemini CLI config with hooks. */
-static void install_gemini_config(const char *home, const char *binary_path, bool dry_run) {
+static void install_gemini_config(const char *home, const char *binary_path, bool dry_run,
+                                  bool with_hooks, bool with_instructions) {
     char cp[CLI_BUF_1K];
     char ip[CLI_BUF_1K];
     snprintf(cp, sizeof(cp), "%s/.gemini/settings.json", home);
     snprintf(ip, sizeof(ip), "%s/.gemini/GEMINI.md", home);
-    install_generic_agent_config("Gemini CLI", binary_path, cp, ip, dry_run,
+    install_generic_agent_config("Gemini CLI", binary_path, cp, with_instructions ? ip : NULL,
+                                 dry_run,
                                  cbm_install_editor_mcp);
-    if (g_install_plan) {
+    if (g_install_plan && with_hooks) {
         plan_record("Gemini CLI", "hook", cp); /* BeforeTool + SessionStart in settings.json */
         return;
     }
-    if (!dry_run) {
-        cbm_upsert_gemini_hooks(cp);
-        cbm_upsert_gemini_session_hooks(cp);
+    if (with_hooks) {
+        if (!dry_run) {
+            cbm_upsert_gemini_hooks(cp);
+            cbm_upsert_gemini_session_hooks(cp);
+        }
+        printf("  hooks: BeforeTool + SessionStart (codebase-memory-mcp reminder)\n");
     }
-    printf("  hooks: BeforeTool + SessionStart (codebase-memory-mcp reminder)\n");
 }
 
 static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const char *home,
-                                      const char *binary_path, bool dry_run) {
+                                      const char *binary_path, bool dry_run, bool with_hooks,
+                                      bool with_instructions) {
     if (agents->codex) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.codex/config.toml", home);
         snprintf(ip, sizeof(ip), "%s/.codex/AGENTS.md", home);
-        install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
+        install_generic_agent_config("Codex CLI", binary_path, cp,
+                                     with_instructions ? ip : NULL, dry_run,
                                      cbm_upsert_codex_mcp);
-        if (g_install_plan) {
+        if (g_install_plan && with_hooks) {
             plan_record("Codex CLI", "hook", cp);
-        } else {
+        } else if (with_hooks) {
             if (!dry_run) {
                 cbm_upsert_codex_hooks(cp);
             }
@@ -3088,14 +3141,15 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         }
     }
     if (agents->gemini) {
-        install_gemini_config(home, binary_path, dry_run);
+        install_gemini_config(home, binary_path, dry_run, with_hooks, with_instructions);
     }
     if (agents->opencode) {
         char cp[CLI_BUF_1K];
         char ip[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.config/opencode/opencode.json", home);
         snprintf(ip, sizeof(ip), "%s/.config/opencode/AGENTS.md", home);
-        install_generic_agent_config("OpenCode", binary_path, cp, ip, dry_run,
+        install_generic_agent_config("OpenCode", binary_path, cp,
+                                     with_instructions ? ip : NULL, dry_run,
                                      cbm_upsert_opencode_mcp);
     }
     if (agents->antigravity) {
@@ -3110,16 +3164,17 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             snprintf(cfg_dir, sizeof(cfg_dir), "%s/.gemini/config", home);
             cbm_mkdir_p(cfg_dir, CLI_OCTAL_PERM);
         }
-        install_generic_agent_config("Antigravity", binary_path, cp, ip, dry_run,
+        install_generic_agent_config("Antigravity", binary_path, cp,
+                                     with_instructions ? ip : NULL, dry_run,
                                      cbm_upsert_antigravity_mcp);
         /* Antigravity CLI is Gemini-lineage and keeps a settings.json under
          * ~/.gemini/antigravity-cli/; install the SessionStart reminder there
          * using the shared Gemini hook JSON schema. */
         char sp[CLI_BUF_1K];
         snprintf(sp, sizeof(sp), "%s/.gemini/antigravity-cli/settings.json", home);
-        if (g_install_plan) {
+        if (g_install_plan && with_hooks) {
             plan_record("Antigravity", "hook", sp);
-        } else {
+        } else if (with_hooks) {
             if (!dry_run) {
                 cbm_upsert_gemini_session_hooks(sp);
             }
@@ -3129,9 +3184,9 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
     if (agents->aider) {
         char ip[CLI_BUF_1K];
         snprintf(ip, sizeof(ip), "%s/CONVENTIONS.md", home);
-        if (g_install_plan) {
+        if (g_install_plan && with_instructions) {
             plan_record("Aider", "instructions", ip);
-        } else {
+        } else if (with_instructions) {
             printf("Aider:\n");
             if (!dry_run) {
                 cbm_upsert_instructions(ip, agent_instructions_content);
@@ -3143,7 +3198,8 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
 
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
 static void install_editor_agent_configs(const cbm_detected_agents_t *agents, const char *home,
-                                         const char *binary_path, bool dry_run) {
+                                         const char *binary_path, bool dry_run,
+                                         bool with_instructions) {
     if (agents->zed) {
         char cp[CLI_BUF_1K];
 #ifdef __APPLE__
@@ -3169,7 +3225,8 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
                  cbm_app_config_dir());
 #endif
         snprintf(ip, sizeof(ip), "%s/.kilocode/rules/codebase-memory-mcp.md", home);
-        install_generic_agent_config("KiloCode", binary_path, cp, ip, dry_run,
+        install_generic_agent_config("KiloCode", binary_path, cp,
+                                     with_instructions ? ip : NULL, dry_run,
                                      cbm_install_editor_mcp);
     }
     if (agents->vscode) {
@@ -3207,18 +3264,21 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
     }
 }
 
-static void cbm_install_agent_configs(const char *home, const char *binary_path, bool force,
-                                      bool dry_run) {
-    cbm_detected_agents_t agents = cbm_detect_agents(home);
+static void cbm_install_agent_configs(const char *home, const char *binary_path,
+                                      const char *client, bool force, bool dry_run,
+                                      bool with_hooks, bool with_instructions) {
+    cbm_detected_agents_t agents = cbm_select_install_agents(home, client);
     if (!g_install_plan) {
         print_detected_agents(&agents);
     }
 
     if (agents.claude_code) {
-        install_claude_code_config(home, binary_path, force, dry_run);
+        install_claude_code_config(home, binary_path, force, dry_run, with_hooks,
+                                   with_instructions);
     }
-    install_cli_agent_configs(&agents, home, binary_path, dry_run);
-    install_editor_agent_configs(&agents, home, binary_path, dry_run);
+    install_cli_agent_configs(&agents, home, binary_path, dry_run, with_hooks,
+                              with_instructions);
+    install_editor_agent_configs(&agents, home, binary_path, dry_run, with_instructions);
 }
 
 /* Count .db files in the cache directory. */
@@ -3271,12 +3331,14 @@ static void cbm_detect_self_path(char *buf, size_t buf_sz, const char *home) {
     }
 }
 
-/* Build the agent.install.plan.v1 receipt (#388): a machine-readable list of
- * the config / instruction / hook files `install` WOULD write, produced by
- * running the real install dispatch in record-only mode (no mutation, no
- * network). Returns a heap JSON string (caller frees) or NULL. */
-char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
-    if (!home || !binary_path) {
+/* Build a client-scoped agent.install.plan.v1 receipt by running the same
+ * dispatch as install in record-only mode (no mutation, process control, index
+ * deletion, or network). */
+char *cbm_build_install_plan_json_for_client(const char *home, const char *binary_path,
+                                             const char *client, bool with_hooks,
+                                             bool with_instructions) {
+    const char *canonical_client = cbm_canonical_install_client(client);
+    if (!home || !binary_path || !canonical_client) {
         return NULL;
     }
 
@@ -3284,7 +3346,8 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
      * site records into `plan` — so the receipt cannot drift from behavior. */
     cbm_install_plan_t plan = {0};
     g_install_plan = &plan;
-    cbm_install_agent_configs(home, binary_path, false, true);
+    cbm_install_agent_configs(home, binary_path, canonical_client, false, true, with_hooks,
+                              with_instructions);
     g_install_plan = NULL;
 
     cbm_detected_agents_t det = cbm_detect_agents(home);
@@ -3310,6 +3373,7 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
     yyjson_mut_obj_add_str(doc, root, "type", "agent.install.plan.v1");
+    yyjson_mut_obj_add_str(doc, root, "client", canonical_client);
 
     yyjson_mut_val *agents = yyjson_mut_arr(doc);
     for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
@@ -3339,8 +3403,15 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     yyjson_mut_obj_add_val(doc, root, "instruction_files_planned", instrs);
     yyjson_mut_obj_add_val(doc, root, "hooks_planned", hooks);
     yyjson_mut_obj_add_bool(doc, root, "writes_started", false);
+    yyjson_mut_obj_add_bool(doc, root, "deletes_indexes", false);
+    yyjson_mut_obj_add_bool(doc, root, "stops_processes", false);
     yyjson_mut_obj_add_bool(doc, root, "network_after_install", false);
-    yyjson_mut_obj_add_str(doc, root, "next_safe_command", "codebase-memory-mcp install -y");
+    char next_safe_command[CLI_BUF_512];
+    snprintf(next_safe_command, sizeof(next_safe_command),
+             "codebase-memory-mcp install --client %s%s%s", canonical_client,
+             with_hooks ? " --with-hooks" : "",
+             with_instructions ? " --with-instructions" : "");
+    yyjson_mut_obj_add_strcpy(doc, root, "next_safe_command", next_safe_command);
 
     char *json = yyjson_mut_write(doc, YYJSON_WRITE_PRETTY, NULL);
     yyjson_mut_doc_free(doc);
@@ -3348,21 +3419,62 @@ char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
     return json; /* malloc'd; caller frees */
 }
 
+char *cbm_build_install_plan_json(const char *home, const char *binary_path) {
+    return cbm_build_install_plan_json_for_client(home, binary_path, "all", false, false);
+}
+
 int cbm_cmd_install(int argc, char **argv) {
     parse_auto_answer(argc, argv);
     bool dry_run = false;
     bool force = false;
     bool plan = false;
+    bool with_hooks = false;
+    bool with_instructions = false;
+    const char *client_arg = NULL;
     for (int i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--dry-run") == 0) {
             dry_run = true;
-        }
-        if (strcmp(argv[i], "--force") == 0) {
+        } else if (strcmp(argv[i], "--force") == 0) {
             force = true;
-        }
-        if (strcmp(argv[i], "--plan") == 0) {
+        } else if (strcmp(argv[i], "--plan") == 0) {
             plan = true;
+        } else if (strcmp(argv[i], "--with-hooks") == 0) {
+            with_hooks = true;
+        } else if (strcmp(argv[i], "--with-instructions") == 0) {
+            with_instructions = true;
+        } else if (strcmp(argv[i], "--client") == 0) {
+            if (client_arg || i + 1 >= argc || argv[i + 1][0] == '-') {
+                (void)fprintf(stderr,
+                              "error: --client requires exactly one client name "
+                              "(use --client all explicitly for all detected clients)\n");
+                return CLI_TRUE;
+            }
+            client_arg = argv[++i];
+        } else if (strncmp(argv[i], "--client=", sizeof("--client=") - 1) == 0) {
+            if (client_arg || argv[i][sizeof("--client=") - 1] == '\0') {
+                (void)fprintf(stderr,
+                              "error: --client requires exactly one client name "
+                              "(use --client all explicitly for all detected clients)\n");
+                return CLI_TRUE;
+            }
+            client_arg = argv[i] + sizeof("--client=") - 1;
         }
+    }
+
+    if (!client_arg) {
+        (void)fprintf(stderr,
+                      "error: install requires --client <name>; use --client all explicitly "
+                      "for all detected clients\n");
+        return CLI_TRUE;
+    }
+    const char *client = cbm_canonical_install_client(client_arg);
+    if (!client) {
+        (void)fprintf(stderr,
+                      "error: unsupported client '%s'; expected one of: claude-code, codex, "
+                      "gemini, zed, opencode, antigravity, aider, kilocode, vscode, cursor, "
+                      "openclaw, kiro, all\n",
+                      client_arg);
+        return CLI_TRUE;
     }
 
     const char *home = cbm_get_home_dir();
@@ -3377,7 +3489,8 @@ int cbm_cmd_install(int argc, char **argv) {
     if (plan) {
         char self_path[CLI_BUF_1K] = {0};
         cbm_detect_self_path(self_path, sizeof(self_path), home);
-        char *json = cbm_build_install_plan_json(home, self_path);
+        char *json = cbm_build_install_plan_json_for_client(
+            home, self_path, client, with_hooks, with_instructions);
         if (!json) {
             (void)fprintf(stderr, "error: failed to build install plan\n");
             return CLI_TRUE;
@@ -3389,63 +3502,20 @@ int cbm_cmd_install(int argc, char **argv) {
 
     printf("codebase-memory-mcp install %s\n\n", CBM_VERSION);
 
-    int index_count = count_db_indexes(home);
-    if (index_count > 0) {
-        printf("Found %d existing index(es) that must be rebuilt:\n", index_count);
-        cbm_list_indexes(home);
-        printf("\n");
-        if (!prompt_yn("Delete these indexes and continue with install?")) {
-            printf("Install cancelled.\n");
-            return CLI_TRUE;
-        }
-        if (!dry_run) {
-            int removed = cbm_remove_indexes(home);
-            printf("Removed %d index(es).\n\n", removed);
-        }
-    }
+    /* Install is configuration-only: it never removes indexes and never stops
+     * running MCP processes. Existing sessions keep using the current binary
+     * until the client restarts them naturally. */
 
-    /* Step 1b: Kill running MCP server instances so agents pick up new config */
-    if (!dry_run) {
-        int killed = cbm_kill_other_instances();
-        if (killed > 0) {
-            printf("Stopped %d running MCP server instance(s).\n\n", killed);
-        }
-    }
-
-    /* Step 1c: macOS ad-hoc signing (in case binary was placed without signing) */
-#ifdef __APPLE__
-    {
-        char sign_path[CLI_BUF_1K];
-        snprintf(sign_path, sizeof(sign_path), "%s/.local/bin/codebase-memory-mcp", home);
-        struct stat sign_st;
-        if (stat(sign_path, &sign_st) == 0) {
-            (void)cbm_macos_adhoc_sign(sign_path);
-        }
-    }
-#endif
-
-    /* Step 2: Binary path — detect actual location at runtime. */
+    /* Detect the existing binary; install only writes the selected client
+     * registration and explicitly requested client-side additions. */
     char self_path[CLI_BUF_1K] = {0};
     cbm_detect_self_path(self_path, sizeof(self_path), home);
 
-    /* Step 3: Install/refresh all agent configs */
-    cbm_install_agent_configs(home, self_path, force, dry_run);
+    /* Install/refresh only the explicitly selected client(s). */
+    cbm_install_agent_configs(home, self_path, client, force, dry_run, with_hooks,
+                              with_instructions);
 
-    /* Step 4: Ensure PATH */
-    char bin_dir[CLI_BUF_1K];
-    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", home);
-    const char *rc = cbm_detect_shell_rc(home);
-    if (rc[0]) {
-        int path_rc = cbm_ensure_path(bin_dir, rc, dry_run);
-        if (path_rc == 0) {
-            printf("\nAdded %s to PATH in %s\n", bin_dir, rc);
-        } else if (path_rc == CLI_TRUE) {
-            printf("\nPATH already includes %s\n", bin_dir);
-        }
-    }
-
-    printf("\nInstall complete. Restart your shell or run:\n");
-    printf("  source %s\n", rc);
+    printf("\nInstall complete. Restart the selected MCP client.\n");
     if (dry_run) {
         printf("\n(dry-run — no files were modified)\n");
     }
@@ -3770,29 +3840,9 @@ static void build_update_url(char *url, int url_sz, const char *os, const char *
              arch, portable, ext);
 }
 
-/* Prompt to delete existing indexes. Returns 0 to continue, 1 to abort. */
-static int update_clear_indexes(const char *home, bool dry_run) {
-    int index_count = count_db_indexes(home);
-    if (index_count == 0) {
-        return 0;
-    }
-    printf("Found %d existing index(es) that must be rebuilt after update:\n", index_count);
-    cbm_list_indexes(home);
-    printf("\n");
-    if (dry_run) {
-        printf("(dry-run — indexes would be deleted)\n\n");
-        return 0;
-    }
-    if (!prompt_yn("Delete these indexes and continue with update?")) {
-        printf("Update cancelled.\n");
-        return CLI_TRUE;
-    }
-    int removed = cbm_remove_indexes(home);
-    printf("Removed %d index(es).\n\n", removed);
-    return 0;
-}
-
-/* Download, verify checksum, kill old instances, and install binary. Returns 0 on success. */
+/* Download, verify checksum, and install the binary. Running MCP processes are
+ * never terminated globally; clients switch versions after their normal
+ * restart. Returns 0 on success. */
 static int download_verify_install(const char *url, const char *ext, const char *os,
                                    const char *arch, bool want_ui, const char *bin_dest) {
     char tmp_archive[CLI_BUF_256];
@@ -3814,11 +3864,6 @@ static int download_verify_install(const char *url, const char *ext, const char 
     if (crc == CLI_TRUE) {
         cbm_unlink(tmp_archive);
         return CLI_TRUE;
-    }
-
-    int killed = cbm_kill_other_instances();
-    if (killed > 0) {
-        printf("Stopped %d running MCP server instance(s).\n", killed);
     }
 
     if (extract_and_install_binary((extract_install_args_t){tmp_archive, ext, bin_dest}) != 0) {
@@ -3960,12 +4005,10 @@ int cbm_cmd_update(int argc, char **argv) {
         return 0;
     }
 
-    /* Step 1: Check for existing indexes */
-    if (update_clear_indexes(home, dry_run) != 0) {
-        return CLI_TRUE;
-    }
+    /* Existing indexes stay available. Schema migrations/rebuild decisions are
+     * made by the indexer, never by the binary updater. */
 
-    /* Step 2: Determine variant */
+    /* Determine variant */
     int want_ui_rc = select_update_variant(variant_flag);
     if (want_ui_rc < 0) {
         return CLI_TRUE;
@@ -4022,20 +4065,15 @@ int cbm_cmd_update(int argc, char **argv) {
     }
 #endif
 
-    /* Step 6: Refresh all agent configs (skills, MCP entries, hooks) */
-    printf("Refreshing agent configurations...\n");
-    cbm_install_agent_configs(home, bin_dest, true, false);
-
-    /* Step 7: Verify new version (exec directly, no shell interpretation) */
+    /* Verify new version (exec directly, no shell interpretation) */
     printf("\nUpdate complete. Verifying:\n");
     {
         const char *ver_argv[] = {bin_dest, "--version", NULL};
         (void)cbm_exec_no_shell(ver_argv);
     }
 
-    printf("\nAll project indexes were cleared. They will be rebuilt\n");
-    printf("automatically when you next use the MCP server.\n");
-    printf("\nPlease restart your MCP client to use the new binary.\n");
+    printf("\nExisting indexes and client configurations were preserved.\n");
+    printf("Please restart your MCP client to use the new binary.\n");
     (void)variant;
     return 0;
 }

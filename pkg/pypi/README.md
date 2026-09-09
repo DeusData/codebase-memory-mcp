@@ -2,7 +2,10 @@
 
 mcp-name: io.github.DeusData/codebase-memory-mcp
 
-**Fast code intelligence engine for AI coding agents.** Indexes an average repository in milliseconds, the Linux kernel (28M LOC) in 3 minutes. Answers structural queries in under 1ms.
+**Preview local code intelligence for AI coding agents.** It indexes the
+current worktree and returns focused, reproducible structural evidence. Current
+performance and quality claims are published only with a versioned benchmark
+artifact.
 
 This package installs the `codebase-memory-mcp` binary from [GitHub Releases](https://github.com/DeusData/codebase-memory-mcp/releases). The binary is downloaded on first run and cached in your OS cache directory.
 
@@ -17,7 +20,7 @@ pipx install codebase-memory-mcp
 ## Usage
 
 ```bash
-codebase-memory-mcp install   # configure your coding agents
+codebase-memory-mcp install --client codex
 codebase-memory-mcp --help
 ```
 

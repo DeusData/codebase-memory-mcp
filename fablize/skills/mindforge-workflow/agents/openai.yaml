@@ -1,4 +1,0 @@
-interface:
-  display_name: "MindForge Workflow"
-  short_description: "Graph-first coding with verified memory"
-  default_prompt: "Use $mindforge-workflow to complete this repository task with graph context, verification, and reflection."

@@ -11,6 +11,7 @@
 #define CBM_WATCHER_H
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /* Forward declarations */
@@ -22,7 +23,9 @@ typedef struct cbm_watcher cbm_watcher_t;
 
 /* ── Index callback ─────────────────────────────────────────────── */
 
-/* Called when file changes are detected. Return 0 on success, -1 on error.
+/* Called when a new worktree fingerprint is detected. Return 0 only when the
+ * index was successfully published; any non-zero result leaves the fingerprint
+ * pending so a later poll retries it.
  * project_name: project identifier
  * root_path: absolute path to the repository root */
 typedef int (*cbm_index_fn)(const char *project_name, const char *root_path, void *user_data);
@@ -68,5 +71,15 @@ int cbm_watcher_watch_count(cbm_watcher_t *w);
 
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
+
+/* Capture the repository state used by freshness checks.
+ *
+ * The fingerprint covers HEAD, the complete porcelain status and XXH3-128
+ * content hashes for changed/untracked files. The same unchanged dirty
+ * worktree therefore produces the same fingerprint. Returns 0 on success.
+ */
+int cbm_watcher_worktree_state(const char *root_path, char *commit_out,
+                               size_t commit_out_size, char fingerprint_out[17],
+                               bool *dirty_out);
 
 #endif /* CBM_WATCHER_H */

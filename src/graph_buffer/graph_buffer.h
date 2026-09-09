@@ -32,6 +32,11 @@ typedef struct {
     int start_line;
     int end_line;
     char *properties_json; /* heap-owned JSON string, "{}" default */
+    char *symbol_id;       /* heap-owned stable identity */
+    char *language;        /* heap-owned */
+    char *signature;       /* heap-owned */
+    char *origin;          /* heap-owned CBM_ORIGIN_* */
+    double confidence;
 } cbm_gbuf_node_t;
 
 typedef struct {
@@ -41,7 +46,35 @@ typedef struct {
     int64_t target_id;     /* temp node ID */
     char *type;            /* heap-owned */
     char *properties_json; /* heap-owned JSON string, "{}" default */
+    char *origin;          /* heap-owned CBM_ORIGIN_* */
+    double confidence;
+    char *evidence_json; /* heap-owned JSON string, "{}" default */
 } cbm_gbuf_edge_t;
+
+typedef struct {
+    const char *label;
+    const char *name;
+    const char *qualified_name;
+    const char *file_path;
+    int start_line;
+    int end_line;
+    const char *properties_json;
+    const char *symbol_id;
+    const char *language;
+    const char *signature;
+    const char *origin;
+    double confidence;
+} cbm_gbuf_node_spec_t;
+
+typedef struct {
+    int64_t source_id;
+    int64_t target_id;
+    const char *type;
+    const char *properties_json;
+    const char *origin;
+    double confidence;
+    const char *evidence_json;
+} cbm_gbuf_edge_spec_t;
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
@@ -74,6 +107,9 @@ int cbm_gbuf_merge(cbm_gbuf_t *dst, cbm_gbuf_t *src);
 int64_t cbm_gbuf_upsert_node(cbm_gbuf_t *gb, const char *label, const char *name,
                              const char *qualified_name, const char *file_path, int start_line,
                              int end_line, const char *properties_json);
+
+/* Schema-v2 upsert keyed by stable symbol identity, allowing overloaded QNs. */
+int64_t cbm_gbuf_upsert_node_v2(cbm_gbuf_t *gb, const cbm_gbuf_node_spec_t *spec);
 
 /* Find a node by qualified name. Returns NULL if not found. */
 const cbm_gbuf_node_t *cbm_gbuf_find_by_qn(const cbm_gbuf_t *gb, const char *qn);
@@ -125,6 +161,7 @@ void cbm_gbuf_foreach_edge(const cbm_gbuf_t *gb, cbm_gbuf_edge_visitor_fn fn, vo
  * Returns 0 on error. */
 int64_t cbm_gbuf_insert_edge(cbm_gbuf_t *gb, int64_t source_id, int64_t target_id, const char *type,
                              const char *properties_json);
+int64_t cbm_gbuf_insert_edge_v2(cbm_gbuf_t *gb, const cbm_gbuf_edge_spec_t *spec);
 
 /* Find edges from source_id with given type.
  * Sets *out and *count. Caller does NOT free. */

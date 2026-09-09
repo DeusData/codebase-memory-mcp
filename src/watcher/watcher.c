@@ -6,7 +6,8 @@
  *
  *
  * Per-project state tracks:
- *   - Last git HEAD hash (detects commits, checkout, pull)
+ *   - Last successfully indexed worktree fingerprint
+ *     (HEAD + porcelain status + changed-file content hashes)
  *   - Last poll time + adaptive interval
  *   - Whether the project is a git repo
  *
@@ -23,7 +24,9 @@
 #include "foundation/compat_thread.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
+#include "pipeline/content_hash.h"
 
+#include <inttypes.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,12 +39,13 @@
 typedef struct {
     char *project_name;
     char *root_path;
-    char last_head[CBM_SZ_64]; /* git HEAD hash */
+    char last_fingerprint[17]; /* HEAD + sorted status + changed-file contents */
     bool is_git;               /* false → skip polling */
     bool baseline_done;        /* true after first poll */
     int file_count;            /* approximate, for interval calc */
     int interval_ms;           /* adaptive poll interval */
-    int64_t next_poll_ns;      /* next poll time (monotonic ns) */
+    atomic_int_fast64_t next_poll_ns; /* shared with touch() */
+    atomic_int references;          /* map ownership + active snapshots */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -53,6 +57,7 @@ struct cbm_watcher {
     CBMHashTable *projects; /* name → project_state_t* */
     cbm_mutex_t projects_lock;
     atomic_int stopped;
+    atomic_bool polling;
 };
 
 /* ── Constants ─────────────────────────────────────────────────── */
@@ -134,64 +139,142 @@ static int git_head(const char *root_path, char *out, size_t out_size) {
     return CBM_NOT_FOUND;
 }
 
-/* Returns true if working tree has changes (modified, untracked, etc.).
- * Also checks submodules via `git submodule foreach` to detect uncommitted
- * changes inside submodules that `git status` alone would not report. */
-static bool git_is_dirty(const char *root_path) {
+/* Small deterministic combiner for the worktree fingerprint. File contents
+ * themselves use XXH3-128 via cbm_content_hash_file(). */
+static uint64_t fingerprint_update(uint64_t hash, const void *data, size_t len) {
+    const unsigned char *bytes = data;
+    for (size_t i = 0; i < len; i++) {
+        hash ^= bytes[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void fingerprint_status_record(const char *root_path, const char *record, size_t len,
+                                      bool *expect_rename_source, uint64_t *hash) {
+    bool has_status = !*expect_rename_source;
+    const char *rel_path = record;
+    if (has_status) {
+        if (len < 3) {
+            return;
+        }
+        rel_path = record + 3;
+        *expect_rename_source =
+            record[0] == 'R' || record[0] == 'C' || record[1] == 'R' || record[1] == 'C';
+    } else {
+        *expect_rename_source = false;
+    }
+
+    unsigned char marker = has_status ? 1 : 2;
+    *hash = fingerprint_update(*hash, &marker, sizeof(marker));
+    *hash = fingerprint_update(*hash, record, len);
+
+    size_t root_len = strlen(root_path);
+    size_t rel_len = strlen(rel_path);
+    char *full_path = malloc(root_len + rel_len + 2);
+    if (!full_path) {
+        static const char oom[] = "<hash-oom>";
+        *hash = fingerprint_update(*hash, oom, sizeof(oom));
+        return;
+    }
+    snprintf(full_path, root_len + rel_len + 2, "%s/%s", root_path, rel_path);
+
+    char content_hash[CBM_CONTENT_HASH_SIZE];
+    if (cbm_content_hash_file(full_path, content_hash) == 0) {
+        *hash = fingerprint_update(*hash, content_hash, strlen(content_hash));
+    } else {
+        /* Deleted paths and dirty submodule directories cannot be opened as
+         * regular files. Their status record still participates in the
+         * fingerprint, with an explicit marker to avoid ambiguity. */
+        static const char unavailable[] = "<content-unavailable>";
+        *hash = fingerprint_update(*hash, unavailable, sizeof(unavailable));
+    }
+    free(full_path);
+}
+
+/* Build a deterministic fingerprint from HEAD, Git's path-sorted porcelain
+ * status, and XXH3-128 content hashes for every changed/untracked path. */
+int cbm_watcher_worktree_state(const char *root_path, char *commit_out,
+                               size_t commit_out_size, char fingerprint_out[17],
+                               bool *dirty_out) {
+    if (!root_path || !commit_out || commit_out_size == 0 || !fingerprint_out ||
+        !dirty_out || !cbm_validate_shell_arg(root_path)) {
+        return CBM_NOT_FOUND;
+    }
+
+    char head[CBM_SZ_64] = {0};
+    if (git_head(root_path, head, sizeof(head)) != 0) {
+        return CBM_NOT_FOUND;
+    }
+
     char cmd[CBM_SZ_1K];
     snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C \"%s\" status --porcelain "
-             "--untracked-files=normal 2>%s",
+             "git --no-optional-locks -C \"%s\" status --porcelain=v1 -z "
+             "--untracked-files=all 2>%s",
              root_path, WATCHER_NULDEV);
     FILE *fp = cbm_popen(cmd, "r");
     if (!fp) {
-        return false;
+        return CBM_NOT_FOUND;
     }
 
-    char line[CBM_SZ_256];
+    uint64_t hash = UINT64_C(1469598103934665603);
+    hash = fingerprint_update(hash, head, strlen(head));
     bool dirty = false;
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
-        }
-        if (len > 0) {
-            dirty = true;
-        }
-    }
-    cbm_pclose(fp);
-
-    if (dirty) {
-        return true;
+    bool expect_rename_source = false;
+    size_t cap = CBM_SZ_1K;
+    size_t len = 0;
+    char *record = malloc(cap);
+    if (!record) {
+        cbm_pclose(fp);
+        return CBM_NOT_FOUND;
     }
 
-#if !defined(_WIN32)
-    /* Check submodules: uncommitted changes inside a submodule are invisible
-     * to the parent's git status. Use `git submodule foreach` as a portable
-     * fallback (Apple Git lacks --recurse-submodules). POSIX-only: foreach takes
-     * an inner shell command that cmd.exe cannot pass intact; the parent-repo
-     * status check above already covers the common (non-submodule) case. */
-    snprintf(cmd, sizeof(cmd),
-             "git --no-optional-locks -C '%s' submodule foreach --quiet --recursive "
-             "'git status --porcelain --untracked-files=normal 2>/dev/null' "
-             "2>/dev/null",
-             root_path);
-    fp = cbm_popen(cmd, "r");
-    if (!fp) {
-        return false;
-    }
-    if (fgets(line, sizeof(line), fp)) {
-        size_t len = strlen(line);
-        while (len > 0 && (line[len - SKIP_ONE] == '\n' || line[len - SKIP_ONE] == '\r')) {
-            line[--len] = '\0';
+    int ch;
+    while ((ch = fgetc(fp)) != EOF) {
+        if (ch != '\0') {
+            if (len + 1 >= cap) {
+                size_t next_cap = cap * PAIR_LEN;
+                char *grown = realloc(record, next_cap);
+                if (!grown) {
+                    free(record);
+                    cbm_pclose(fp);
+                    return CBM_NOT_FOUND;
+                }
+                record = grown;
+                cap = next_cap;
+            }
+            record[len++] = (char)ch;
+            continue;
         }
+
+        record[len] = '\0';
         if (len > 0) {
             dirty = true;
+            fingerprint_status_record(root_path, record, len, &expect_rename_source, &hash);
         }
+        len = 0;
     }
-    cbm_pclose(fp);
-#endif
-    return dirty;
+    if (len > 0) {
+        record[len] = '\0';
+        dirty = true;
+        fingerprint_status_record(root_path, record, len, &expect_rename_source, &hash);
+    }
+    bool read_ok = !ferror(fp);
+    free(record);
+    int status_rc = cbm_pclose(fp);
+    if (!read_ok || status_rc != 0) {
+        return CBM_NOT_FOUND;
+    }
+
+    snprintf(commit_out, commit_out_size, "%s", head);
+    snprintf(fingerprint_out, 17, "%016" PRIx64, hash);
+    *dirty_out = dirty;
+    return 0;
+}
+
+static int git_worktree_fingerprint(const char *root_path, char out[17], bool *out_dirty) {
+    char commit[CBM_SZ_64];
+    return cbm_watcher_worktree_state(root_path, commit, sizeof(commit), out, out_dirty);
 }
 
 /* Count tracked files via git ls-files */
@@ -228,12 +311,23 @@ static project_state_t *state_new(const char *name, const char *root_path) {
     }
     s->project_name = strdup(name);
     s->root_path = strdup(root_path);
+    if (!s->project_name || !s->root_path) {
+        free(s->project_name);
+        free(s->root_path);
+        free(s);
+        return NULL;
+    }
+    atomic_init(&s->references, 1);
+    atomic_init(&s->next_poll_ns, 0);
     s->interval_ms = POLL_BASE_MS;
     return s;
 }
 
 static void state_free(project_state_t *s) {
     if (!s) {
+        return;
+    }
+    if (atomic_fetch_sub(&s->references, 1) != 1) {
         return;
     }
     free(s->project_name);
@@ -265,6 +359,7 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     }
     cbm_mutex_init(&w->projects_lock);
     atomic_init(&w->stopped, 0);
+    atomic_init(&w->polling, false);
     return w;
 }
 
@@ -361,16 +456,21 @@ static void init_baseline(project_state_t *s) {
     struct stat st;
     if (stat(s->root_path, &st) != 0) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
-        s->baseline_done = true;
+        s->baseline_done = false;
         s->is_git = false;
+        s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
         return;
     }
 
     s->is_git = is_git_repo(s->root_path);
-    s->baseline_done = true;
+    s->baseline_done = s->is_git;
 
     if (s->is_git) {
-        git_head(s->root_path, s->last_head, sizeof(s->last_head));
+        bool dirty = false;
+        char fingerprint[sizeof(s->last_fingerprint)] = {0};
+        if (git_worktree_fingerprint(s->root_path, fingerprint, &dirty) == 0 && !dirty) {
+            memcpy(s->last_fingerprint, fingerprint, sizeof(s->last_fingerprint));
+        }
         s->file_count = git_file_count(s->root_path);
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
@@ -382,25 +482,27 @@ static void init_baseline(project_state_t *s) {
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
 }
 
-/* Check if a project has changes. Returns true if reindex needed. */
-static bool check_changes(project_state_t *s) {
+/* Check if a project has changes without mutating the committed fingerprint. */
+static bool check_changes(project_state_t *s, char candidate[17]) {
     if (!s->is_git) {
         return false;
     }
 
-    /* Check HEAD movement */
-    char head[CBM_SZ_64] = {0};
-    if (git_head(s->root_path, head, sizeof(head)) == 0) {
-        if (s->last_head[0] != '\0' && strcmp(head, s->last_head) != 0) {
-            /* HEAD moved — commit, checkout, pull */
-            strncpy(s->last_head, head, sizeof(s->last_head) - 1);
-            return true;
-        }
-        strncpy(s->last_head, head, sizeof(s->last_head) - 1);
+    bool dirty = false;
+    if (git_worktree_fingerprint(s->root_path, candidate, &dirty) != 0) {
+        return false;
     }
 
-    /* Check working tree */
-    return git_is_dirty(s->root_path);
+    /* A dirty baseline is intentionally processed on the first real poll.
+     * A clean baseline can be learned without invoking the callback. */
+    if (s->last_fingerprint[0] == '\0') {
+        if (!dirty) {
+            memcpy(s->last_fingerprint, candidate, sizeof(s->last_fingerprint));
+            return false;
+        }
+        return true;
+    }
+    return strcmp(candidate, s->last_fingerprint) != 0;
 }
 
 /* Context for poll_once foreach callback */
@@ -415,6 +517,11 @@ static void poll_project(const char *key, void *val, void *ud) {
     poll_ctx_t *ctx = ud;
     project_state_t *s = val;
     if (!s) {
+        return;
+    }
+
+    /* Respect the interval even when initialization must be retried. */
+    if (ctx->now < s->next_poll_ns) {
         return;
     }
 
@@ -435,7 +542,8 @@ static void poll_project(const char *key, void *val, void *ud) {
     }
 
     /* Check for changes */
-    bool changed = check_changes(s);
+    char candidate[sizeof(s->last_fingerprint)] = {0};
+    bool changed = check_changes(s, candidate);
     if (!changed) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
@@ -447,8 +555,10 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
-            /* Update HEAD after successful reindex */
-            git_head(s->root_path, s->last_head, sizeof(s->last_head));
+            /* Commit the exact pre-index snapshot only after success. If the
+             * worktree changes during indexing, the next poll sees a new
+             * fingerprint and schedules another pass. */
+            memcpy(s->last_fingerprint, candidate, sizeof(s->last_fingerprint));
             /* Refresh file count for interval */
             s->file_count = git_file_count(s->root_path);
             s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
@@ -471,12 +581,19 @@ static void snapshot_project(const char *key, void *val, void *ud) {
     (void)key;
     snapshot_ctx_t *sc = ud;
     if (val && sc->count < sc->cap) {
+        project_state_t *s = val;
+        atomic_fetch_add(&s->references, 1);
         sc->items[sc->count++] = val;
     }
 }
 
 int cbm_watcher_poll_once(cbm_watcher_t *w) {
     if (!w) {
+        return 0;
+    }
+
+    /* Only one poll owns mutable baseline state; callbacks may reenter. */
+    if (atomic_exchange(&w->polling, true)) {
         return 0;
     }
 
@@ -487,11 +604,13 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
     int n = cbm_ht_count(w->projects);
     if (n == 0) {
         cbm_mutex_unlock(&w->projects_lock);
+        atomic_store(&w->polling, false);
         return 0;
     }
     project_state_t **snap = malloc(n * sizeof(project_state_t *));
     if (!snap) {
         cbm_mutex_unlock(&w->projects_lock);
+        atomic_store(&w->polling, false);
         return 0;
     }
     snapshot_ctx_t sc = {.items = snap, .count = 0, .cap = n};
@@ -505,8 +624,10 @@ int cbm_watcher_poll_once(cbm_watcher_t *w) {
     };
     for (int i = 0; i < sc.count; i++) {
         poll_project(NULL, snap[i], &ctx);
+        state_free(snap[i]);
     }
     free(snap);
+    atomic_store(&w->polling, false);
     return ctx.reindexed;
 }
 

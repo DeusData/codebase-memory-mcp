@@ -43,9 +43,9 @@ TEST(checkpoint_does_not_truncate_wal) {
     for (int i = 0; i < N_ROWS; i++) {
         char sql[256];
         snprintf(sql, sizeof(sql),
-                 "INSERT INTO nodes(project, label, name, qualified_name, file_path) "
-                 "VALUES('p', 'Function', 'fn', 'p.module.fn_%d', 'f.c');",
-                 i);
+                 "INSERT INTO nodes(project, label, name, qualified_name, file_path, symbol_id) "
+                 "VALUES('p', 'Function', 'fn', 'p.module.fn_%d', 'f.c', '%032x');",
+                 i, (unsigned)i);
         rc_sql = cbm_store_exec(s, sql);
         ASSERT_EQ(rc_sql, 0);
     }

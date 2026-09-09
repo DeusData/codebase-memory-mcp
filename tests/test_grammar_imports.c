@@ -71,8 +71,6 @@ static const ImportCase IMPORT_CASES[] = {
     {"kotlin", CBM_LANG_KOTLIN, "fixture.kt",
      "package com.example.app\n\nimport kotlin.collections.List\nimport java.util.UUID\nimport kotlinx.coroutines.runBlocking\n",
      3, NULL},
-    {"lean", CBM_LANG_LEAN, "imports.lean",
-     "import Std.Data.List.Basic\nimport Mathlib.Tactic\n\ndef hello : String := \"world\"\n", 2, NULL},
     {"lua", CBM_LANG_LUA, "a.lua",
      "local socket = require(\"socket\")\nlocal json = require(\"dkjson\")\n\nlocal function connect()\n  return socket, json\nend\n\nreturn connect\n",
      2, NULL},
