@@ -13,7 +13,7 @@
  * file LSP picks them up.
  *
  * Languages covered: Go, C/C++/CUDA, Python, TypeScript/JavaScript/JSX/
- * TSX, PHP, C#, and JVM (Java/Kotlin via the shared filter helper).
+ * TSX, PHP, C#, Ruby, and JVM (Java/Kotlin via the shared filter helper).
  * Anything else short-circuits via cbm_pxc_has_cross_lsp.
  *
  * Previously this work ran as a separate sequential pipeline pass
@@ -37,6 +37,7 @@
 #include "lsp/ts_lsp.h"   /* cbm_ts_build_cross_registry / cbm_run_ts_lsp_cross_with_registry */
 #include "lsp/java_lsp.h" /* cbm_java_build_cross_registry / cbm_run_java_lsp_cross_with_registry */
 #include "lsp/rust_lsp.h" /* cbm_rust_build_cross_registry / cbm_run_rust_lsp_cross_with_registry */
+#include "lsp/ruby_lsp.h" /* cbm_run_ruby_lsp_cross (fallback cbm_pxc_run_one path) */
 #include "pipeline/pipeline_internal.h"
 #include <stdbool.h>
 
