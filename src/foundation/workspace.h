@@ -93,10 +93,15 @@ bool cbm_workspace_grant_list(const char *cache_dir, char *out, size_t out_sz);
 /* The whole decision, used by every entry point that accepts a repo path.
  * canonical_path must already be canonicalized. configured_root is the legacy
  * CBM_ALLOWED_ROOT / session policy, treated as an additional grant, or NULL.
- * On refusal, err receives a message that names the command which would fix it. */
+ * allow_broad_root is PATH_ALLOW_BROAD (or NULL): an operator-set exact match
+ * for canonical_path that lifts a CBM_WS_DENY_TOO_SHALLOW verdict only. It is
+ * process environment, not a recorded grant, so it does not appear in
+ * cbm_workspace_grant_list and does not widen CBM_WS_DENY_ABSOLUTE or
+ * CBM_WS_DENY_SENSITIVE. On refusal, err receives a message that names the
+ * command which would fix it. */
 bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir,
-                                const char *cache_dir, const char *configured_root, char *err,
-                                size_t err_sz);
+                                const char *cache_dir, const char *configured_root,
+                                const char *allow_broad_root, char *err, size_t err_sz);
 
 /* The home and cache directories the policy should be evaluated against. Shared
  * so two callers cannot derive them differently and reach different verdicts for
