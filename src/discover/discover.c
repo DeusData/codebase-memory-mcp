@@ -52,13 +52,23 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
-    "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
-    "__tests__", "__mocks__",     "__snapshots__",  "__fixtures__", "__test__",    "docs",
-    "doc",       "documentation", "examples",       "example",      "samples",     "sample",
-    "assets",    "static",        "public",         "media",        "third_party", "thirdparty",
-    "3rdparty",  "external",      "migrations",     "seeds",        "e2e",         "integration",
-    "locale",    "locales",       "i18n",           "l10n",         "scripts",     "tools",
-    "hack",      "bin",           "build",          "out",          NULL};
+    /* Generated */
+    "generated", "gen", "auto-generated",
+    /* Tests */
+    "fixtures", "testdata", "test_data", "__tests__", "__mocks__", "__snapshots__", "__fixtures__",
+    "__test__",
+    /* Docs and samples */
+    "docs", "doc", "documentation", "examples", "example", "samples", "sample",
+    /* Assets */
+    "assets", "static", "public", "media",
+    /* Third-party */
+    "third_party", "thirdparty", "3rdparty",
+    /* Data and integration tests */
+    "migrations", "seeds", "e2e", "integration",
+    /* Localization */
+    "locale", "locales", "i18n", "l10n",
+    /* Tooling and build output */
+    "scripts", "tools", "hack", "bin", "build", "out", NULL};
 
 /* ── Ignored suffixes ───────────────────────────────── */
 
