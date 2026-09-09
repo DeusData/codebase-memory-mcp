@@ -101,6 +101,18 @@ void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail);
  * any setup failure. Windows only. */
 bool cbm_daemon_ipc_win_sid_trusted_for_testing(void *sid);
 #endif
+#ifndef _WIN32
+/* #1830 seams (POSIX). Override the single-uid user-namespace overflow uid that
+ * ancestors may be owned by (active=false restores the real /proc-derived
+ * value); and expose the pure uid_map-parse and ancestor accept/refuse decision
+ * so they can be tested without a chown-able overflow-owned directory. */
+void cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(bool active,
+                                                             unsigned long overflow_uid);
+bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, unsigned long euid);
+bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
+                                                    unsigned long euid, bool overflow_active,
+                                                    unsigned long overflow_uid);
+#endif
 #endif
 
 /* Create/validate an owner-only directory and securely open one regular
