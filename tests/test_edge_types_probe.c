@@ -473,12 +473,12 @@ TEST(handles_jaxrs_java) {
          "package com.example;\n\n"
          "import jakarta.ws.rs.GET;\n"
          "import jakarta.ws.rs.Path;\n\n"
-         "@Path(\"/api/v1/widgets\")\npublic class WidgetResource {\n"
+         "@Path(\"api/v1/widgets\")\npublic class WidgetResource {\n"
          "    @GET\n"
          "    public String list() {\n"
          "        return \"widgets\";\n    }\n\n"
          "    @GET\n"
-         "    @Path(\"/count\")\n"
+         "    @Path(\"count\")\n"
          "    public String count() {\n"
          "        return \"42\";\n    }\n}\n"}};
     ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 2));
