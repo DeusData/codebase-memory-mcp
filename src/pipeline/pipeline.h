@@ -53,6 +53,13 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
+ * when the run succeeded / did not reach post-publish export. Used to
+ * truthfully attribute a failed run to the persistence export (#1665) instead
+ * of the generic pipeline-error hint. Valid until the next cbm_pipeline_run or
+ * cbm_pipeline_free(). Returns "" for NULL p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
