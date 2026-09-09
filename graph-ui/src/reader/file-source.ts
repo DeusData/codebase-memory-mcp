@@ -30,6 +30,7 @@ import { fileNodeForPath, moduleForFile, COLUMNS } from '../provider/cypher';
 import type { RpcIntelligenceClient } from '../provider/rpc-client';
 import type { CodeSnippetResult } from '../provider/rpc-schemas';
 import { moduleQualifiedName, moduleQnFromFileQn, normalizeWorkspacePath } from '../app/module-qn';
+import { reportError } from '../provider/error-observer';
 
 /** Das Werkzeug, aus dem der Inhalt des Readers kommt. Der Beweislauf schreibt es mit. */
 export const READER_RPC_TOOL = 'get_code_snippet';
@@ -72,6 +73,18 @@ export class FileNotReadableError extends Error {
         super(message);
         this.name = 'FileNotReadableError';
     }
+}
+
+/**
+ * A file the reader cannot show is announced to the frontend log before it
+ * is thrown (provider/error-observer.ts). The /rpc failures underneath
+ * announce themselves; a file the index does not know, or the server's
+ * placeholder for a file gone from disk, is a successful call with nothing
+ * in it, and only this module knows that it is a failure.
+ */
+function notReadable(path: string, message: string): FileNotReadableError {
+    reportError({ source: 'reader', level: 'warn', message });
+    return new FileNotReadableError(path, message);
 }
 
 function toOptionalNumber(cell: string | undefined): number | undefined {
@@ -164,7 +177,7 @@ export async function loadFileDocument(
 
     const node = await lookupModuleNode(client, project, path);
     if (node === undefined) {
-        throw new FileNotReadableError(
+        throw notReadable(
             path,
             `The index has no module node for ${path}. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here.`,
         );
@@ -173,7 +186,7 @@ export async function loadFileDocument(
     const qualifiedName = node.qualifiedName;
     const snippet = await client.getCodeSnippet(project, qualifiedName);
     if (snippet.source.length === 0 || snippet.source === SOURCE_UNAVAILABLE) {
-        throw new FileNotReadableError(
+        throw notReadable(
             path,
             snippet.source === SOURCE_UNAVAILABLE
                 ? `The server could not read ${path} from the repository (${qualifiedName}): `

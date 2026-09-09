@@ -107,6 +107,11 @@ void cbm_ui_log_init(void);
 /* Append a log line to the UI ring buffer (called from log hook). */
 void cbm_ui_log_append(const char *line);
 
+/* Where the frontend's log file lives: <cache_dir>/logs/ui.log, one JSON
+ * line per entry. Written by POST /api/ui-log, read by GET /api/ui-log.
+ * Returns false when the path does not fit in out. */
+bool cbm_ui_log_file_path(char *out, size_t outsz);
+
 /* Set the binary path for subprocess spawning (call from main). */
 void cbm_http_server_set_binary_path(const char *path);
 

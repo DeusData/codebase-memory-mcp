@@ -34,7 +34,7 @@
     },
     {
       "file": "README.md",
-      "line": 38,
+      "line": 47,
       "text": "Projektregeln in `CLAUDE.md`, der aufgenommene Fremdcode in `THIRD_PARTY.md`.",
       "reason": "der Satz, der Attribution verbietet, muss seinen Gegenstand nennen duerfen; die Zeile traegt kein Urheberschafts-Muster"
     },
@@ -139,8 +139,8 @@
       "reason": "Docblocks und Zeilenkommentare sind kein Bildschirmtext. Der Parser sieht den Unterschied, ein regulaerer Ausdruck koennte ihn nicht sehen."
     }
   ],
-  "filesConsidered": 727,
-  "textFiles": 572,
+  "filesConsidered": 734,
+  "textFiles": 579,
   "binaryFiles": 155,
-  "generatedAt": "2026-09-09T17:46:30.681Z"
+  "generatedAt": "2026-09-09T17:55:42.603Z"
 }

@@ -798,6 +798,7 @@ export default function App(): JSX.Element {
             saveAdr: (name, content) => api.saveAdr(name, content),
             logs: (lines) => api.logs(lines),
             processes: () => api.processes(),
+            uiLogTail: (lines) => api.uiLogTail(lines),
         }),
         [client, api],
     );

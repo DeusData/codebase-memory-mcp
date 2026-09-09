@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
@@ -410,6 +411,7 @@ static char g_log_ring[LOG_RING_SIZE][LOG_LINE_MAX];
 static int g_log_head = 0;
 static int g_log_count = 0;
 static cbm_mutex_t g_log_mutex;
+static cbm_mutex_t g_ui_log_mutex; /* the frontend log file, further down */
 
 enum { CBM_LOG_MUTEX_UNINIT = 0, CBM_LOG_MUTEX_INITING = 1, CBM_LOG_MUTEX_INITED = 2 };
 static atomic_int g_log_mutex_init = CBM_LOG_MUTEX_UNINIT;
@@ -424,6 +426,7 @@ void cbm_ui_log_init(void) {
     state = CBM_LOG_MUTEX_UNINIT;
     if (atomic_compare_exchange_strong(&g_log_mutex_init, &state, CBM_LOG_MUTEX_INITING)) {
         cbm_mutex_init(&g_log_mutex);
+        cbm_mutex_init(&g_ui_log_mutex);
         atomic_store(&g_log_mutex_init, CBM_LOG_MUTEX_INITED);
         return;
     }
@@ -550,6 +553,387 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
     free(buf);
+}
+
+/* ── Frontend log file ────────────────────────────────────────── */
+
+/*
+ * POST /api/ui-log — the frontend's console and error stream, on disk.
+ *
+ * The browser keeps its own console and nothing there reaches this process,
+ * so a reader who saw a panel fail had nothing to hand over and an agent
+ * nothing to read. The UI's logging layer (graph-ui/src/app/ui-log.ts)
+ * batches console output, uncaught errors, rejected promises and failed
+ * /rpc and /api calls and posts them here. Each entry becomes one JSON line
+ * in <cache_dir>/logs/ui.log, beside the daemon's own records, so `tail -f`
+ * and GET /api/ui-log read the same file and a bug report can attach it
+ * whole. Warnings and errors are also mirrored into the ring that GET
+ * /api/logs serves, so the two sides of one failure sit in one list; the
+ * chatter below that level stays in the file only.
+ *
+ * Bounds, all fixed here: 64 KiB per post, 100 entries per post, 4096
+ * characters per text field (cut on a UTF-8 boundary and marked), and the
+ * file rotates once to ui.log.1 when it reaches CBM_UI_LOG_ROTATE_BYTES
+ * (default 5 MiB). Nothing in a post is trusted beyond its shape: every
+ * string is escaped again on the way out, the level is normalised to a known
+ * word, and an entry that is not an object is counted as dropped.
+ */
+#define UI_LOG_BODY_MAX (64 * 1024)
+#define UI_LOG_ENTRIES_MAX 100
+#define UI_LOG_FIELD_MAX 4096
+#define UI_LOG_ROTATE_DEFAULT (5 * 1024 * 1024)
+#define UI_LOG_TAIL_DEFAULT_LINES 200
+#define UI_LOG_TAIL_MAX_LINES 1000
+#define UI_LOG_TAIL_READ_BYTES (256 * 1024)
+/* One JSON line: three long fields escaped at up to 6x, plus the short ones. */
+#define UI_LOG_LINE_CAP (3 * 6 * UI_LOG_FIELD_MAX + 4096)
+
+bool cbm_ui_log_file_path(char *out, size_t outsz) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir || dir[0] == '\0')
+        dir = cbm_tmpdir();
+    int n = snprintf(out, outsz, "%s/logs/ui.log", dir);
+    return n > 0 && (size_t)n < outsz;
+}
+
+static int64_t ui_log_rotate_bytes(void) {
+    const char *env = getenv("CBM_UI_LOG_ROTATE_BYTES");
+    if (env && env[0] != '\0') {
+        long long v = atoll(env);
+        if (v > 0)
+            return (int64_t)v;
+    }
+    return UI_LOG_ROTATE_DEFAULT;
+}
+
+typedef struct {
+    char field[UI_LOG_FIELD_MAX + 32];
+    char esc[6 * UI_LOG_FIELD_MAX + 64];
+    char page[6 * 256 + 64];
+    char session[6 * 128 + 64];
+    char line[UI_LOG_LINE_CAP];
+} ui_log_scratch_t;
+
+/* Copy a text field under a cap, cutting on a UTF-8 boundary and saying so. */
+static void ui_log_copy_field(char *out, size_t outsz, const char *in, size_t cap) {
+    size_t n = strlen(in);
+    bool cut = false;
+    if (n > cap) {
+        n = cap;
+        cut = true;
+        while (n > 0 && ((unsigned char)in[n] & 0xC0) == 0x80)
+            n--;
+    }
+    if (n >= outsz)
+        n = outsz - 1;
+    memcpy(out, in, n);
+    out[n] = '\0';
+    if (cut)
+        snprintf(out + n, outsz - n, " [cut at %d]", (int)cap);
+}
+
+static const char *ui_log_level_name(yyjson_val *v) {
+    static const char *const known[] = {"debug", "log", "info", "warn", "error"};
+    const char *s = (v && yyjson_is_str(v)) ? yyjson_get_str(v) : "";
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        if (strcmp(s, known[i]) == 0)
+            return known[i];
+    }
+    return "log";
+}
+
+/* Append `,"key":"<escaped value>"` for a string member, or nothing when the
+ * member is absent or not a string (required ones are written empty). */
+static void ui_log_add_str(ui_log_scratch_t *s, int *pos, const char *key, yyjson_val *v,
+                           bool required) {
+    if (!v || !yyjson_is_str(v)) {
+        if (required)
+            http_appendf(s->line, sizeof(s->line), pos, ",\"%s\":\"\"", key);
+        return;
+    }
+    ui_log_copy_field(s->field, sizeof(s->field), yyjson_get_str(v), UI_LOG_FIELD_MAX);
+    cbm_json_escape(s->esc, (int)sizeof(s->esc), s->field);
+    http_appendf(s->line, sizeof(s->line), pos, ",\"%s\":\"%s\"", key, s->esc);
+}
+
+static void ui_log_add_int(ui_log_scratch_t *s, int *pos, const char *key, yyjson_val *v) {
+    if (!v || !yyjson_is_num(v))
+        return;
+    http_appendf(s->line, sizeof(s->line), pos, ",\"%s\":%lld", key, (long long)yyjson_get_sint(v));
+}
+
+static void ui_log_utc_now(char *out, size_t outsz) {
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    if (cbm_gmtime_r(&now, &tm_utc) && strftime(out, outsz, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) > 0)
+        return;
+    snprintf(out, outsz, "%lld", (long long)now);
+}
+
+static void handle_ui_log_post(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    if (req->body_len > UI_LOG_BODY_MAX) {
+        cbm_http_replyf(c, 413, g_cors_json, "{\"error\":\"body exceeds %d bytes\"}",
+                        UI_LOG_BODY_MAX);
+        return;
+    }
+    if (req->body_len == 0) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(req->body, req->body_len, 0);
+    if (!doc) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
+        return;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *entries = root ? yyjson_obj_get(root, "entries") : NULL;
+    if (!root || !yyjson_is_obj(root) || !entries || !yyjson_is_arr(entries)) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"entries[] required\"}");
+        return;
+    }
+
+    ui_log_scratch_t *s = calloc(1, sizeof(*s));
+    char path[CBM_SZ_1K];
+    if (!s || !cbm_ui_log_file_path(path, sizeof(path))) {
+        free(s);
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"no log path\"}");
+        return;
+    }
+
+    /* Page and session are the same for every entry of a post. */
+    yyjson_val *v_page = yyjson_obj_get(root, "page");
+    yyjson_val *v_session = yyjson_obj_get(root, "session");
+    ui_log_copy_field(s->field, sizeof(s->field),
+                      (v_page && yyjson_is_str(v_page)) ? yyjson_get_str(v_page) : "", 256);
+    cbm_json_escape(s->page, (int)sizeof(s->page), s->field);
+    ui_log_copy_field(s->field, sizeof(s->field),
+                      (v_session && yyjson_is_str(v_session)) ? yyjson_get_str(v_session) : "",
+                      128);
+    cbm_json_escape(s->session, (int)sizeof(s->session), s->field);
+
+    char received[40];
+    ui_log_utc_now(received, sizeof(received));
+
+    int accepted = 0;
+    int dropped = 0;
+    bool file_error = false;
+
+    cbm_mutex_lock(&g_ui_log_mutex);
+    int64_t size = cbm_file_size(path);
+    if (size >= ui_log_rotate_bytes()) {
+        char previous[CBM_SZ_1K + 8];
+        snprintf(previous, sizeof(previous), "%s.1", path);
+        (void)cbm_rename_replace(path, previous);
+    }
+    FILE *f = cbm_fopen(path, "ab");
+    if (!f) {
+        char logdir[CBM_SZ_1K];
+        snprintf(logdir, sizeof(logdir), "%s", path);
+        char *slash = strrchr(logdir, '/');
+        if (slash) {
+            *slash = '\0';
+            cbm_mkdir_p(logdir, 0755);
+        }
+        f = cbm_fopen(path, "ab");
+    }
+    file_error = f == NULL;
+
+    size_t idx, max;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, idx, max, entry) {
+        if (!yyjson_is_obj(entry) || accepted >= UI_LOG_ENTRIES_MAX) {
+            dropped++;
+            continue;
+        }
+        const char *level = ui_log_level_name(yyjson_obj_get(entry, "level"));
+        yyjson_val *v_source = yyjson_obj_get(entry, "source");
+        yyjson_val *v_message = yyjson_obj_get(entry, "message");
+
+        int pos = 0;
+        http_appendf(s->line, sizeof(s->line), &pos,
+                     "{\"received\":\"%s\",\"page\":\"%s\",\"session\":\"%s\"", received, s->page,
+                     s->session);
+        ui_log_add_int(s, &pos, "seq", yyjson_obj_get(entry, "seq"));
+        ui_log_add_str(s, &pos, "ts", yyjson_obj_get(entry, "ts"), false);
+        http_appendf(s->line, sizeof(s->line), &pos, ",\"level\":\"%s\"", level);
+        ui_log_add_str(s, &pos, "source", v_source, true);
+        ui_log_add_str(s, &pos, "message", v_message, true);
+        ui_log_add_str(s, &pos, "detail", yyjson_obj_get(entry, "detail"), false);
+        ui_log_add_str(s, &pos, "stack", yyjson_obj_get(entry, "stack"), false);
+        ui_log_add_str(s, &pos, "url", yyjson_obj_get(entry, "url"), false);
+        ui_log_add_int(s, &pos, "line", yyjson_obj_get(entry, "line"));
+        ui_log_add_int(s, &pos, "col", yyjson_obj_get(entry, "col"));
+        http_appendf(s->line, sizeof(s->line), &pos, "}\n");
+        if ((size_t)pos >= sizeof(s->line)) {
+            /* Cannot happen with the field caps above; never write a torn line. */
+            dropped++;
+            continue;
+        }
+        if (f && fputs(s->line, f) == EOF)
+            file_error = true;
+        accepted++;
+
+        if (strcmp(level, "warn") == 0 || strcmp(level, "error") == 0) {
+            char ring[LOG_LINE_MAX];
+            snprintf(ring, sizeof(ring), "ui.%s %.48s: %.400s", level,
+                     (v_source && yyjson_is_str(v_source)) ? yyjson_get_str(v_source) : "",
+                     (v_message && yyjson_is_str(v_message)) ? yyjson_get_str(v_message) : "");
+            cbm_ui_log_append(ring);
+        }
+    }
+    if (f) {
+        if (fflush(f) != 0)
+            file_error = true;
+        fclose(f);
+    }
+    cbm_mutex_unlock(&g_ui_log_mutex);
+
+    cbm_json_escape(s->esc, (int)sizeof(s->esc), path);
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"accepted\":%d,\"dropped\":%d,\"path\":\"%s\",\"file_error\":%s}", accepted,
+                    dropped, s->esc, file_error ? "true" : "false");
+    free(s);
+    yyjson_doc_free(doc);
+}
+
+/* Append `s` as the inside of a JSON string; the caller writes the quotes. */
+static void ui_log_append_json_text(char *buf, size_t bufsz, int *pos, const char *s, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (*pos < 0 || (size_t)*pos + 8 >= bufsz) {
+            *pos = (int)bufsz;
+            return;
+        }
+        unsigned char ch = (unsigned char)s[i];
+        if (ch == '"' || ch == '\\') {
+            buf[(*pos)++] = '\\';
+            buf[(*pos)++] = (char)ch;
+        } else if (ch == '\n') {
+            buf[(*pos)++] = '\\';
+            buf[(*pos)++] = 'n';
+        } else if (ch == '\r') {
+            buf[(*pos)++] = '\\';
+            buf[(*pos)++] = 'r';
+        } else if (ch == '\t') {
+            buf[(*pos)++] = '\\';
+            buf[(*pos)++] = 't';
+        } else if (ch < 0x20) {
+            *pos += snprintf(buf + *pos, bufsz - (size_t)*pos, "\\u%04x", (unsigned)ch);
+        } else {
+            buf[(*pos)++] = (char)ch;
+        }
+    }
+}
+
+/* GET /api/ui-log?lines=N — the last N lines of the frontend log file.
+ *
+ * Reads at most the last 256 KiB of the file, so a tail is a bounded read
+ * whatever the rotation size. `partial` is true when the answer does not
+ * start at the first line of the file, either because more lines exist than
+ * were asked for or because the window cut the file. */
+static void handle_ui_log_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char lines_str[16] = {0};
+    int max_lines = UI_LOG_TAIL_DEFAULT_LINES;
+    if (cbm_http_query_param(req->query, "lines", lines_str, (int)sizeof(lines_str))) {
+        int v = atoi(lines_str);
+        if (v > 0 && v <= UI_LOG_TAIL_MAX_LINES)
+            max_lines = v;
+    }
+    char path[CBM_SZ_1K];
+    if (!cbm_ui_log_file_path(path, sizeof(path))) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"no log path\"}");
+        return;
+    }
+    char previous[CBM_SZ_1K + 8];
+    snprintf(previous, sizeof(previous), "%s.1", path);
+
+    cbm_mutex_lock(&g_ui_log_mutex);
+    int64_t size = cbm_file_size(path);
+    bool has_previous = cbm_file_exists(previous);
+    char *data = NULL;
+    size_t got = 0;
+    bool partial = false;
+    if (size > 0) {
+        size_t want =
+            size > (int64_t)UI_LOG_TAIL_READ_BYTES ? (size_t)UI_LOG_TAIL_READ_BYTES : (size_t)size;
+        FILE *f = cbm_fopen(path, "rb");
+        if (f) {
+            data = malloc(want + 1);
+            if (data) {
+                if (size > (int64_t)want) {
+                    partial = true;
+                    if (fseek(f, (long)(size - (int64_t)want), SEEK_SET) != 0)
+                        partial = false;
+                }
+                got = fread(data, 1, want, f);
+                data[got] = '\0';
+            }
+            fclose(f);
+        }
+    }
+    cbm_mutex_unlock(&g_ui_log_mutex);
+
+    /* A window that starts inside a line begins after that line's end. */
+    size_t start = 0;
+    if (partial && data) {
+        const char *nl = memchr(data, '\n', got);
+        start = nl ? (size_t)(nl - data) + 1 : got;
+    }
+    int total = 0;
+    for (size_t i = start; i < got; i++) {
+        if (data[i] == '\n')
+            total++;
+    }
+    if (got > start && data[got - 1] != '\n')
+        total++;
+    int skip = total > max_lines ? total - max_lines : 0;
+    if (skip > 0)
+        partial = true;
+
+    size_t buf_size = 6 * (got - start) + 2 * sizeof(path) + 512;
+    char *buf = malloc(buf_size);
+    if (!buf) {
+        free(data);
+        cbm_http_replyf(c, 500, g_cors, "oom");
+        return;
+    }
+    int pos = 0;
+    http_appendf(buf, buf_size, &pos, "{\"path\":\"");
+    ui_log_append_json_text(buf, buf_size, &pos, path, strlen(path));
+    http_appendf(buf, buf_size, &pos, "\"");
+    if (has_previous) {
+        http_appendf(buf, buf_size, &pos, ",\"previous_path\":\"");
+        ui_log_append_json_text(buf, buf_size, &pos, previous, strlen(previous));
+        http_appendf(buf, buf_size, &pos, "\"");
+    }
+    http_appendf(buf, buf_size, &pos, ",\"size_bytes\":%lld,\"partial\":%s,\"lines\":[",
+                 (long long)(size > 0 ? size : 0), partial ? "true" : "false");
+    int emitted = 0;
+    int seen = 0;
+    size_t line_start = start;
+    for (size_t i = start; i <= got; i++) {
+        if (i < got && data[i] != '\n')
+            continue;
+        if (i == got && line_start == got)
+            break;
+        if (seen++ >= skip) {
+            if (emitted > 0)
+                http_appendf(buf, buf_size, &pos, ",");
+            http_appendf(buf, buf_size, &pos, "\"");
+            ui_log_append_json_text(buf, buf_size, &pos, data + line_start, i - line_start);
+            http_appendf(buf, buf_size, &pos, "\"");
+            emitted++;
+        }
+        line_start = i + 1;
+    }
+    http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
+    if ((size_t)pos >= buf_size)
+        pos = (int)buf_size - 1;
+    buf[pos] = '\0';
+    cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
+    free(buf);
+    free(data);
 }
 
 /* ── Process monitoring ───────────────────────────────────────── */
@@ -2761,6 +3145,18 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     /* GET /api/logs → recent log lines */
     if (is_get && cbm_http_path_match(req->path, "/api/logs*")) {
         handle_logs(c, req);
+        return;
+    }
+
+    /* POST /api/ui-log → the frontend's console and errors, to a file */
+    if (is_post && cbm_http_path_match(req->path, "/api/ui-log")) {
+        handle_ui_log_post(c, req);
+        return;
+    }
+
+    /* GET /api/ui-log → the tail of that file */
+    if (is_get && cbm_http_path_match(req->path, "/api/ui-log*")) {
+        handle_ui_log_get(c, req);
         return;
     }
 

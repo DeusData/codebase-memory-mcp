@@ -9,6 +9,8 @@
  * rpc-transport und rpc-client hindurch; ersetzt ist nur die Leitung.
  */
 import { describe, expect, it } from 'vitest';
+import { observeErrors } from '../provider/error-observer';
+import type { ErrorReport } from '../provider/error-observer';
 import { RpcIntelligenceClient } from '../provider/rpc-client';
 import { FakeRpc, queryContains, rowsText } from '../test-support/rpc-recordings';
 import type { Route } from '../test-support/rpc-recordings';
@@ -229,6 +231,51 @@ describe('loadFileDocument, seit dem schlanken Vertrag (#1597)', () => {
             .rejects.toBeInstanceOf(FileNotReadableError);
         await expect(loadFileDocument(client, PROJECT, 'src/ui/http_server.c'))
             .rejects.toThrow(/could not read/);
+    });
+});
+
+describe('loadFileDocument announces to the frontend log', () => {
+    it('a file without a module node, and the server placeholder, before it throws', async () => {
+        const reports: ErrorReport[] = [];
+        const stop = observeErrors((report) => reports.push(report));
+        try {
+            const missing = clientFor([
+                noModuleRoute,
+                { tool: 'query_graph', when: queryContains('MATCH (n:File)'), text: rowsText(FILE_COLUMNS, []) },
+            ]);
+            await expect(loadFileDocument(missing.client, PROJECT, 'assets/logo.svg'))
+                .rejects.toBeInstanceOf(FileNotReadableError);
+
+            const gone = clientFor([
+                moduleRoute('probe-small.src.ui.http_server', 2244),
+                snippetRoute({ start_line: 1, end_line: 500, source_mode: 'full', source: '(source not available)' }),
+            ]);
+            await expect(loadFileDocument(gone.client, PROJECT, 'src/ui/http_server.c'))
+                .rejects.toBeInstanceOf(FileNotReadableError);
+        } finally {
+            stop();
+        }
+        expect(reports.map((report) => [report.source, report.level])).toEqual([
+            ['reader', 'warn'],
+            ['reader', 'warn'],
+        ]);
+        expect(reports[0]?.message).toContain('The index has no module node for assets/logo.svg');
+        expect(reports[1]?.message).toContain('could not read src/ui/http_server.c');
+    });
+
+    it('nothing when the file loads', async () => {
+        const reports: ErrorReport[] = [];
+        const stop = observeErrors((report) => reports.push(report));
+        try {
+            const { client } = clientFor([
+                moduleRoute('probe-small.src.types', 3),
+                snippetRoute({ start_line: 1, end_line: 3, source_mode: 'full', source: 'a\nb\nc' }),
+            ]);
+            await loadFileDocument(client, PROJECT, 'src/types.ts');
+        } finally {
+            stop();
+        }
+        expect(reports).toEqual([]);
     });
 });
 

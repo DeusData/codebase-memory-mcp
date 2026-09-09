@@ -73,15 +73,18 @@ fuer W1; die daraus folgenden Luecken stehen in UPSTREAM-ASKS.md.
   (src/mcp/mcp.c:376-711) plus Alias trace_call_path (mcp.c:11564); drei
   Tool-Profile all/analysis/scout; tools/list paginiert (Seitengroesse 8).
 
-## 3. /api-Routen (28 benannte Routen plus / und /assets/*)
+## 3. /api-Routen (30 benannte Routen plus / und /assets/*)
 
 GET-Routen (src/ui/http_server.c:2545-2714): /__cbm/ui-readiness
 (HMAC-Challenge), /api/layout, /api/tree, /api/symbol-history, /api/who,
 /api/symbol, /api/metrics, /api/why, /api/handout, /api/blast, /api/bridges,
 /api/scent, /api/trace, /api/impact, /api/flows, /api/flow, /api/repo-info,
 /api/index-status, /api/ui-config, /api/browse, /api/adr,
-/api/project-health, /api/processes, /api/logs. POST: /rpc, /api/index,
-/api/adr. DELETE: /api/project. Dazu / und /assets/* aus dem Embedding.
+/api/project-health, /api/processes, /api/logs, /api/ui-log (Schwanz der
+Frontend-Logdatei). POST: /rpc, /api/index, /api/adr, /api/ui-log (das
+Frontend schreibt Konsole, Fehler und gescheiterte Anfragen in
+`<cache_dir>/logs/ui.log`). DELETE: /api/project. Dazu / und /assets/* aus
+dem Embedding.
 - /api/tree liefert den indexierten Datei-Baum aus dem Graphen (empirisch
   bestaetigt), NICHT das Dateisystem.
 - /api/browse ist ein Verzeichnis-Picker fuer die Index-Anlage (empirisch:

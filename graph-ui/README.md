@@ -20,6 +20,15 @@ What the maintainers added on top:
   check or remove an index, edit the decision record, read the server's
   processes and log. It is the one surface that asks the server to write,
   and it names every route it uses.
+- **The frontend log** (`src/app/ui-log.ts`, installed in `src/main.tsx`):
+  the console keeps printing, and a copy of every console line, uncaught
+  error, unhandled rejection and failed `/rpc` or `/api` call is batched
+  to `POST /api/ui-log`, which the server appends as JSON lines to
+  `<cache_dir>/logs/ui.log` (rotating once at 5 MiB). `GET /api/ui-log`
+  tails it, the projects panel shows it under "This server", and a bug
+  report attaches the file. The caught request failures reach the log
+  through `src/provider/error-observer.ts`, the seam the two clients
+  announce on before they throw.
 - **Gates in CI** (`.github/workflows/_test.yml`, job `test-ui`, which
   runs `scripts/ci/test-ui.sh`; run that script locally for the identical
   leg): `npm run test:unit`, `npm run check:style`,

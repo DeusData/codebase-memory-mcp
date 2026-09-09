@@ -11,6 +11,8 @@
  * was gerade schiefging.
  */
 
+import { hasErrorObservers, reportError, stackOf } from './error-observer';
+
 /**
  * Woran der Aufruf gescheitert ist.
  *
@@ -155,6 +157,49 @@ export async function callTool(
     args: Record<string, unknown> = {},
     opts: CallToolOptions = {},
 ): Promise<McpToolResult> {
+    try {
+        return await callToolUnobserved(name, args, opts);
+    } catch (err) {
+        announceFailure(name, err);
+        throw err;
+    }
+}
+
+/**
+ * Announce a failed call to whoever listens (provider/error-observer.ts)
+ * before it is thrown. The level tells the cases apart the way the
+ * surface does: a tool this server does not offer is a fact about the
+ * server (info), a tool that said no is a fact about the question (warn),
+ * everything else is a failure (error). An aborted call is the caller's own
+ * doing and is not announced.
+ */
+function announceFailure(name: string, err: unknown): void {
+    if (!hasErrorObservers()) {
+        return;
+    }
+    if (err instanceof Error && err.name === 'AbortError') {
+        return;
+    }
+    if (err instanceof RpcError) {
+        const level = err.notAllowed ? 'info' : err.kind === 'tool' ? 'warn' : 'error';
+        reportError({
+            source: 'rpc',
+            level,
+            message: err.message,
+            detail: err.bodyText,
+            stack: stackOf(err),
+        });
+        return;
+    }
+    const message = err instanceof Error ? err.message : String(err);
+    reportError({ source: 'rpc', level: 'error', message: `/rpc ${name}: ${message}`, stack: stackOf(err) });
+}
+
+async function callToolUnobserved(
+    name: string,
+    args: Record<string, unknown>,
+    opts: CallToolOptions,
+): Promise<McpToolResult> {
     const base = opts.base ?? '';
     const doFetch = opts.fetch ?? globalThis.fetch;
     const url = `${base}/rpc`;
@@ -282,11 +327,13 @@ export async function callToolJson<T = unknown>(
     try {
         return JSON.parse(text) as T;
     } catch (err) {
-        throw new RpcError(
+        const shape = new RpcError(
             'shape',
             name,
             `/rpc ${name}: Antworttext war kein JSON (${(err as Error).message})`,
             { bodyText: truncate(text) },
         );
+        announceFailure(name, shape);
+        throw shape;
     }
 }

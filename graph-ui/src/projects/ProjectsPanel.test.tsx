@@ -62,6 +62,17 @@ function fakeSource(jobs: () => IndexJob[] = () => []): ProjectsSource & { calls
         adr: record('adr', async () => ({ hasAdr: true, content: '# old record', updatedAt: '2026-09-05 10:00' })),
         saveAdr: record('saveAdr', async () => undefined),
         logs: record('logs', async () => ({ lines: ['line one', 'line two'], total: 40 })),
+        uiLogTail: record('uiLogTail', async () => ({
+            path: '/cache/logs/ui.log',
+            previousPath: '',
+            sizeBytes: 512,
+            partial: false,
+            lines: [
+                '{"received":"2026-09-08T10:00:00Z","ts":"2026-09-08T10:00:00.000Z","level":"error","source":"rpc","message":"get_code_snippet: HTTP 500","detail":"oom"}',
+                'not json at all',
+            ],
+            total: 2,
+        })),
         processes: record('processes', async () => ({
             selfPid: 42,
             selfRssMb: 120.5,
@@ -308,6 +319,27 @@ describe('the server block', () => {
         expect(container.textContent).toContain(messages.projects.logsSource(2, 40));
     });
 
+    it('shows the frontend log as sentences and names the file to attach', async () => {
+        await render();
+        expect(byTestId('atlas-projects-ui-log-source')?.textContent)
+            .toBe(messages.projects.uiLogSource(2, 2, '/cache/logs/ui.log'));
+        expect(byTestId('atlas-projects-ui-log')?.textContent).toBe(
+            '2026-09-08T10:00:00.000Z error rpc: get_code_snippet: HTTP 500 (oom)\nnot json at all',
+        );
+        expect(container.textContent).toContain(messages.projects.uiLogAbout);
+        expect(container.textContent).not.toContain(messages.projects.uiLogPrevious(''));
+    });
+
+    it('says when the frontend log did not arrive, and still shows the rest', async () => {
+        const source = fakeSource();
+        source.uiLogTail = async () => {
+            throw new AtlasApiError('/api/ui-log', 500, '/api/ui-log antwortete mit HTTP 500: no');
+        };
+        await render({ source });
+        expect(container.textContent).toContain(messages.projects.uiLogError('/api/ui-log antwortete mit HTTP 500: no'));
+        expect(byTestId('atlas-projects-logs')?.textContent).toBe('line one\nline two');
+    });
+
     it('asks again on reload', async () => {
         const props = await render();
         const source = props.source as ReturnType<typeof fakeSource>;
@@ -315,6 +347,7 @@ describe('the server block', () => {
         await click(byTestId('atlas-projects-server-reload'));
         expect(source.calls['logs']?.length).toBe(before + 1);
         expect(source.calls['processes']?.length).toBe(before + 1);
+        expect(source.calls['uiLogTail']?.length).toBe(before + 1);
     });
 });
 
