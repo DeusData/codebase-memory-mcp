@@ -172,9 +172,19 @@
 .atlas-chat-column { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
 .atlas-chat-column > .cbm-chat-dock { flex: 1; height: auto; min-height: 0; }
 .atlas-chat-column[data-graph=true] { overflow-y: auto; }
-.atlas-chat-column[data-graph=true] > .cbm-chat-dock { flex: 1 0 260px; }
+.atlas-chat-column[data-graph=true] > .cbm-chat-dock { flex: 1 0 440px; min-height: 440px; }
 .atlas-chat-column[data-graph=true] > .atlas-galaxy-host { flex: 0 0 var(--atlas-chat-graph-height); min-height: 320px; border-left: 1px solid var(--atlas-line); }
 .atlas-chat-column > .atlas-splitter { flex: 0 0 8px; }
+.atlas-selection-host { flex: 0 0 auto; min-width: 0; min-height: 0; max-height: min(300px, 34vh); overflow: auto; border-bottom: 1px solid var(--atlas-line); }
+.atlas-selection-host[hidden] { display: none; }
+.atlas-selection-mount { min-width: 0; }
+.atlas-chat-column[data-selection-inspector=true] { overflow-y: auto; }
+.atlas-chat-column[data-selection-inspector=true] > .cbm-chat-dock { flex: 1 0 440px; min-height: 440px; }
+.atlas-chat-column:is([data-graph=true], [data-selection-inspector=true]) > .cbm-chat-dock:has(> .cbm-chat-settings) { flex-basis: 740px; min-height: 740px; }
+.atlas-chat-column:is([data-graph=true], [data-selection-inspector=true]) :is(.cbm-chat-header, .cbm-chat-modelbar) { flex-shrink: 0; }
+.atlas-chat-column:is([data-graph=true], [data-selection-inspector=true]) .cbm-chat-settings { flex-shrink: 0; max-height: 260px; }
+.atlas-chat-column:is([data-graph=true], [data-selection-inspector=true]) .cbm-chat-composer { max-height: min(50%, 240px); }
+.atlas-side[data-selection-inspector=true] > .atlas-galaxy-host { border-top: none; }
 .atlas-chat-column .atlas-galaxy { min-height: 0; height: 100%; }
 .atlas-chat-column .atlas-galaxy-title, .atlas-chat-column .atlas-galaxy-edgenote { display: none; }
 /* Keep the canvas usable in both Explore hosts, including short windows. */

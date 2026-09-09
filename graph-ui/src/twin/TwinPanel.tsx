@@ -578,7 +578,7 @@ interface SectionProps {
     activeStepRow?: number | undefined;
 }
 
-function SectionView(props: SectionProps): JSX.Element {
+export function SectionView(props: SectionProps): JSX.Element {
     const { section } = props;
     const allChips = section.rows.length > 0 && section.rows.every((row) => row.display === 'chip');
     return (
@@ -1066,7 +1066,7 @@ function LimitsView(props: { limits: readonly TwinLimit[]; say: SayFn }): JSX.El
  * Schrittliste waere. Der Block zeigt jeden Schritt, den das Dokument traegt,
  * bei zwei Schritten wie bei zwanzig.
  */
-function PseudocodeView(props: {
+export function PseudocodeView(props: {
     document: PseudocodeDocument;
     imports?: ImportsGroup | undefined;
     onOpenLine?: ((ref: PseudocodeSourceRef) => void) | undefined;

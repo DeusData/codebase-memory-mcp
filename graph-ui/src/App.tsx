@@ -172,8 +172,10 @@ import { badgesForLines } from './core/step-badge-decorator';
 import type { SymbolRef } from './core/focus-protocol';
 import type { SemanticIR } from './core/semantic-ir';
 import { buildIr } from './ir/semantic-ir-builder';
-import TwinPanel from './twin/TwinPanel';
-import type { TwinBodyView, TwinStatus } from './twin/TwinPanel';
+import { PseudocodeView, type TwinStatus } from './twin/TwinPanel';
+import SelectedCodePanel from './twin/SelectedCodePanel';
+import { loadFileSymbols, type FileSymbolResult } from './twin/selected-code-context';
+import { inspectorChatContext, matchingInspectorIr, type SelectedCodeSnapshot } from './twin/selected-code-snapshot';
 import { IrCache } from './twin/ir-cache';
 import { ATLAS_WORKSPACE_ROOT, twinLocationOf, twinTargetOf, workspacePathOf } from './twin/twin-target';
 import GalaxyPanel from './galaxy/GalaxyPanel';
@@ -206,11 +208,11 @@ import {
     searchRows,
 } from './search/overlay-model';
 import type { SearchRow, SearchRowSource } from './search/overlay-model';
-import { Facet, resolvePresentation } from './twin/presentation-profile';
-import type { PresentationOverrides, PresentationProfile } from './twin/presentation-profile';
+import { Facet } from './twin/presentation-profile';
+import type { PresentationProfile } from './twin/presentation-profile';
 import type { TwinRow } from './twin/twin-view-model';
 import WhyPanel from './why/WhyPanel';
-import { WHY_MENU_LABEL, profileFor } from './why/why-model';
+import { WHY_MENU_LABEL } from './why/why-model';
 import type { WhyIntent } from './why/why-model';
 import { readWhyAnswer, recordWhyAnswer } from './why/why-store';
 import type { WhyAnswer } from './why/why-store';
@@ -263,20 +265,15 @@ import { readImpact } from './impact/impact-source';
 import { refRejection } from './impact/impact-model';
 import type { ImpactModel, ImpactTarget } from './impact/impact-model';
 import { IMPACT_MENU_LABEL, impactRefRejected } from './impact/impact-strings';
-import SidecarPanel from './llm/SidecarPanel';
-import { probeSidecar, SIDECAR_ORIGIN, SIDECAR_POLL_MS } from './llm/sidecar';
+import { SIDECAR_ORIGIN } from './llm/sidecar';
 import type { CacheModel, SidecarReading, SidecarState } from './llm/sidecar';
 import AtlasChatPanel from './chat/AtlasChatPanel';
 import { askAtlas } from './chat/ask-atlas';
 import type { ChatTurn } from './chat/ask-atlas';
-import { askModel } from './chat/chat-client';
 import { commandIntent } from './chat/command-intent';
 import {
     CHAT_HINT_OFF,
     CHAT_HINT_READY,
-    REFINE_APPLIED,
-    REFINE_RUNNING,
-    refineRejected,
 } from './chat/chat-strings';
 import ExplainZone from './layout/ExplainZone';
 import Splitter from './layout/Splitter';
@@ -299,13 +296,11 @@ import { NEIGHBOR_DEPTHS, NEIGHBOR_DEPTH_DEFAULT } from './compiler/fact-recipes
 import type { NeighborDepth, ObservedFact, SubjectCandidate } from './compiler/fact-recipes';
 import { modelClassOf } from './compiler/card-compiler';
 import type { CardSource } from './compiler/card-compiler';
-import { buildRefinePrompt, nonThinkingFor, REFINE_SYSTEM_PROMPT } from './compiler/prompt-contract';
-import { applyRefinement, refineMaxTokens, refineSubjectText } from './pseudocode/refine';
+import { applyRefinement } from './pseudocode/refine';
 import { readLlmPolicy } from './llm/policy';
 import type { PolicyReading } from './llm/policy';
 import { resolveLlmState } from './llm/llm-state';
-import { readLlmPreference, recordLlmPreference } from './llm/preference';
-import { llmChipValue, llmMenuLabel, llmMenuTitle } from './llm/strings';
+import { llmChipValue } from './llm/strings';
 import SettingsPanel from './settings/SettingsPanel';
 import type { SettingsMeasurement } from './settings/SettingsPanel';
 import ProjectsPanel from './projects/ProjectsPanel';
@@ -762,6 +757,8 @@ export default function App(): JSX.Element {
     });
     const [browserAiOpen, setBrowserAiOpen] = useState(false);
     const [readerSelection, setReaderSelection] = useState<ReaderSelection>();
+    const [pinnedCode, setPinnedCode] = useState<SelectedCodeSnapshot>();
+    const [fileSymbols, setFileSymbols] = useState<FileSymbolResult & { project: string; path: string; status: 'loading' | 'ready' | 'error' }>({ project: '', path: '', symbols: [], message: '', status: 'ready' });
     const [chatAttachment, setChatAttachment] = useState<BrowserChatAttachment>();
     const [chatGraphSelection, setChatGraphSelection] = useState<BrowserChatContext>();
     const [galaxySelection, setGalaxySelection] = useState<GraphNode>();
@@ -840,6 +837,20 @@ export default function App(): JSX.Element {
     const [readerMessage, setReaderMessage] = useState('pick a file in the explorer');
     const [command, setCommand] = useState('');
 
+    useEffect(() => { setPinnedCode(undefined); }, [project]);
+    useEffect(() => {
+        if (!project || !activePath) return;
+        let cancelled = false;
+        setFileSymbols({ project, path: activePath, symbols: [], message: '', status: 'loading' });
+        void loadFileSymbols(client, project, activePath).then(result => {
+            if (!cancelled) setFileSymbols({ ...result, project, path: activePath, status: 'ready' });
+        }).catch((error: unknown) => {
+            if (!cancelled) setFileSymbols({ project, path: activePath, symbols: [], status: 'error',
+                message: error instanceof Error ? error.message : String(error) });
+        });
+        return () => { cancelled = true; };
+    }, [client, project, activePath]);
+
     // Zaehler gegen Wettlaeufe: klickt jemand schnell durch zwei Dateien, darf
     // die langsamere Antwort die schnellere nicht ueberschreiben.
     const loadTicket = useRef(0);
@@ -855,14 +866,11 @@ export default function App(): JSX.Element {
     // ------------------------------------------------------- Twin ----------
 
     const provider = useMemo(() => new CbmRpcProvider(client, { generation: 1 }), [client]);
-    const [overrides, setOverrides] = useState<PresentationOverrides>({});
     // Das Profil ist seit W4a beweglich: die Antwort auf "warum bist du hier"
     // setzt es. Die Regler des Lesers liegen als Overlay darauf, so wie vorher,
     // und werden beim Profilwechsel geleert: eine abgeschaltete Linse, die ueber
     // ein neues Profil hinweg abgeschaltet bliebe, waere eine Sektion, die
     // fehlt, ohne dass jemand sagt warum.
-    const [profile, setProfile] = useState<PresentationProfile>(TWIN_PROFILE);
-    const presentation = useMemo(() => resolvePresentation(profile, overrides), [profile, overrides]);
 
     const [twinSymbol, setTwinSymbol] = useState<SymbolRef | undefined>(undefined);
     const [twinIr, setTwinIr] = useState<SemanticIR | undefined>(undefined);
@@ -980,7 +988,6 @@ export default function App(): JSX.Element {
     const [flowView, setFlowView] = useState<FlowView | undefined>(undefined);
     const [flowStep, setFlowStep] = useState(-1);
     const [flowMessage, setFlowMessage] = useState(FLOW_LOADING);
-    const [twinView, setTwinView] = useState<TwinBodyView>('facts');
     const [imports, setImports] = useState<ImportsGroup | undefined>(undefined);
     const [pseudocode, setPseudocode] = useState<PseudocodeDocument | undefined>(undefined);
     const flowTicket = useRef(0);
@@ -1407,7 +1414,7 @@ export default function App(): JSX.Element {
      * src/llm/llm-state.ts, Regel 3.
      */
     const [llmPolicy, setLlmPolicy] = useState<PolicyReading | undefined>(undefined);
-    const [llmPreferenceOn, setLlmPreferenceOn] = useState(false);
+    const llmPreferenceOn = false;
     const [llmProbe, setLlmProbe] = useState<SidecarReading>(EMPTY_SIDECAR_READING);
     const llmProbes = useRef(0);
 
@@ -1425,7 +1432,6 @@ export default function App(): JSX.Element {
     const [selectedModel, setSelectedModel] = useState('');
     const selectedModelRef = useRef('');
     selectedModelRef.current = selectedModel;
-    const askSidecarRef = useRef<((model?: string) => void) | undefined>(undefined);
 
     // ------------------------------------------- Der Atlas-Chat (W5b) ------
 
@@ -1459,7 +1465,6 @@ export default function App(): JSX.Element {
      * ihn zu ersetzen: das Original muss jederzeit zurueckholbar sein, und ein
      * ueberschriebener Block waere genau das nicht mehr.
      */
-    const [refined, setRefined] = useState<PseudocodeDocument | undefined>(undefined);
     const [refineState, setRefineState] = useState<'idle' | 'running' | 'applied' | 'refused'>('idle');
     const [refineMessage, setRefineMessage] = useState('');
 
@@ -1759,6 +1764,16 @@ export default function App(): JSX.Element {
             setWhyDismissed(true);
             setTabs((current) => (current.includes(path) ? current : [...current, path]));
             setActivePath(path);
+            setReaderSelection(undefined);
+            // Flow steps retain their root across files. Reloading the same
+            // document also keeps ready facts until the caret resolves again.
+            if (!flowPinned.current && documentRef.current?.path !== path) {
+                setTwinSymbol(undefined);
+                setTwinIr(undefined);
+                setTwinStatus('empty');
+                setTwinName(messages.twin.noSymbol);
+            }
+            setImports(undefined);
             setDocument(undefined);
             loadTicket.current += 1;
             const ticket = loadTicket.current;
@@ -1931,6 +1946,7 @@ export default function App(): JSX.Element {
                 return;
             }
             setTwinSymbol(symbol);
+            setTwinIr(undefined);
             setTwinName(symbol.name);
             setTwinStatus('loading');
             setTwinMessage(TWIN_LOADING);
@@ -1958,7 +1974,7 @@ export default function App(): JSX.Element {
         // dieses Effekts, und eine Abhaengigkeit darauf waere eine Schleife.
         // Gelesen wird es nur, um zu entscheiden, ob schon etwas dasteht.
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [provider, irCache, project, activePath, settledCaret]);
+    }, [provider, irCache, project, activePath, settledCaret, flowStep]);
 
     /**
      * Einem Ziel folgen: das Subjekt wechselt sofort, der Editor kommt nach.
@@ -1998,6 +2014,8 @@ export default function App(): JSX.Element {
     const followTarget = useCallback(
         (target: SymbolRef) => {
             setWorkspace('explore');
+            setFlowStep(-1);
+            flowPinned.current = false;
             markFollowed(target);
             const location = twinLocationOf(target);
             const keepReadyTwin = location.path.length > 0
@@ -2020,6 +2038,7 @@ export default function App(): JSX.Element {
                 openFile(location.path);
             }
             setReveal((previous) => ({ line: location.line, nonce: (previous?.nonce ?? 0) + 1 }));
+            if (location.path === activePath) setSettledCaret(location.line);
         },
         [activePath, markFollowed, openFile, twinStatus],
     );
@@ -2070,6 +2089,7 @@ export default function App(): JSX.Element {
                 return;
             }
             setFlowStep(index);
+            flowPinned.current = true;
             if (step.line.sourceRef !== undefined) {
                 openLine(step.line.sourceRef);
             }
@@ -2140,7 +2160,6 @@ export default function App(): JSX.Element {
      */
     useEffect(() => {
         const ir = twinIr;
-        setRefined(undefined);
         setRefineState('idle');
         setRefineMessage('');
         if (ir === undefined) {
@@ -2157,8 +2176,9 @@ export default function App(): JSX.Element {
     // ist der Text, den der Reader ohnehin schon geladen hat; siehe
     // src/pseudocode/imports-source.ts.
     useEffect(() => {
-        const ir = twinIr;
-        if (ir === undefined || project.length === 0 || activePath.length === 0) {
+        const ir = matchingInspectorIr(twinIr, twinSymbol, project, activePath);
+        const uri = ir?.symbol.uri ?? twinTargetOf({ name: baseName(activePath), filePath: activePath, kind: 'module' })?.uri;
+        if (!uri || project.length === 0 || activePath.length === 0) {
             setImports(undefined);
             return;
         }
@@ -2174,7 +2194,7 @@ export default function App(): JSX.Element {
                 if (cancelled || ticket !== importsTicket.current) {
                     return;
                 }
-                setImports(buildImportsGroup({ imports: answer, irs: [ir], uri: ir.symbol.uri }));
+                setImports(buildImportsGroup({ imports: answer, irs: ir ? [ir] : [], uri }));
             })
             .catch(() => {
                 if (!cancelled && ticket === importsTicket.current) {
@@ -2186,7 +2206,7 @@ export default function App(): JSX.Element {
         return () => {
             cancelled = true;
         };
-    }, [activePath, document, project, provider, twinIr]);
+    }, [activePath, document, project, provider, twinIr, twinSymbol]);
 
     /*
      * Der Walk hinter dem Kasten.
@@ -2739,8 +2759,6 @@ export default function App(): JSX.Element {
 
     const chooseIntent = useCallback(
         (intent: WhyIntent) => {
-            setProfile(profileFor(intent, TWIN_PROFILE));
-            setOverrides({});
             setWhyAnswer(recordWhyAnswer(store, project, intent));
             setWhyReopened(false);
             if (intent === 'understand') {
@@ -3122,7 +3140,6 @@ export default function App(): JSX.Element {
      * und an nichts sonst.
      */
     useEffect(() => {
-        setLlmPreferenceOn(readLlmPreference(store, project).on);
         setLlmPolicy(undefined);
         setLlmProbe(EMPTY_SIDECAR_READING);
         // Die Modellwahl und die Anzeige haengen am selben Projekt und werden
@@ -3173,56 +3190,8 @@ export default function App(): JSX.Element {
         };
     }, [client, project]);
 
-    const llmMode = resolveLlmState(llmPolicy?.verdict, llmPreferenceOn);
-
-    /*
-     * Die Probe. Der ganze Opt-out haengt an der ersten Zeile dieses Effekts.
-     *
-     * Ist das LLM nicht an, wird der Timer gar nicht erst aufgehaengt und
-     * `probeSidecar` nie gerufen. Es gibt keinen zweiten Aufrufer: der Zaehler
-     * `llmProbes` steht hier und nur hier, und der Beweislauf liest ihn neben
-     * dem Netz-Mitschnitt, damit "null Anfragen" von zwei Seiten belegt ist.
-     */
-    useEffect(() => {
-        if (llmMode !== 'on') {
-            askSidecarRef.current = undefined;
-            return;
-        }
-        let cancelled = false;
-        const ask = (model = selectedModelRef.current): void => {
-            llmProbes.current += 1;
-            /*
-             * Die Modellwahl geht mit, und nur im Router-Modus wirkt sie
-             * (src/llm/sidecar.ts). Sie kommt aus dem Ref und nicht aus der
-             * Abhaengigkeitsliste: an ihr zu haengen hiesse, den Timer bei jeder
-             * Wahl ab- und wieder aufzuhaengen.
-             */
-            void probeSidecar((url) => window.fetch(url), SIDECAR_ORIGIN, {
-                model,
-            })
-                .then((reading) => {
-                    if (!cancelled) {
-                        setLlmProbe(reading);
-                    }
-                })
-                .catch(() => {
-                    if (!cancelled) {
-                        setLlmProbe(EMPTY_SIDECAR_READING);
-                    }
-                });
-        };
-        // Der Griff fuer den Aktualisieren-Knopf des Panels. Er zeigt auf
-        // dieselbe Funktion, damit jede Anfrage des Panels im selben Zaehler
-        // landet wie die des Managers.
-        askSidecarRef.current = ask;
-        ask();
-        const timer = window.setInterval(ask, SIDECAR_POLL_MS);
-        return () => {
-            cancelled = true;
-            askSidecarRef.current = undefined;
-            window.clearInterval(timer);
-        };
-    }, [llmMode]);
+    // Browser models have their own explicit opt-in. Saved sidecar settings cannot enable them.
+    const llmMode = resolveLlmState(llmPolicy?.verdict, false);
 
     const llmState: SidecarState =
         llmMode === 'disabled-by-policy' ? 'disabled-by-policy' : llmMode === 'off' ? 'off' : llmProbe.state;
@@ -3260,7 +3229,6 @@ export default function App(): JSX.Element {
              * on the same router id. */
             selectedModelRef.current = selected;
             setSelectedModel(selected);
-            askSidecarRef.current?.(selected);
         },
         [project, store],
     );
@@ -3282,15 +3250,8 @@ export default function App(): JSX.Element {
      * ploetzlich etwas einschaltet, um das an dieser Stelle niemand gebeten hat.
      */
     const toggleLlm = useCallback(() => {
-        if (llmMode === 'disabled-by-policy') {
-            return;
-        }
-        const next = !llmPreferenceOn;
-        setLlmPreferenceOn(recordLlmPreference(store, project, next).on);
-        if (!next) {
-            setLlmProbe(EMPTY_SIDECAR_READING);
-        }
-    }, [llmMode, llmPreferenceOn, project, store]);
+        setBrowserAiOpen(open => !open);
+    }, []);
 
     // ------------------------------------------- Der Atlas-Chat (W5b) ------
 
@@ -3447,59 +3408,6 @@ export default function App(): JSX.Element {
         },
         [askQuestion],
     );
-
-    /**
-     * Der Knopf am Pseudocode-Block.
-     *
-     * Er existiert nur, wenn das Modell bereit ist (die Anzeige entscheidet
-     * das), und er ersetzt nichts: das Ergebnis liegt neben dem Original, und
-     * eine abgelehnte Antwort laesst das Original stehen und sagt den Grund.
-     */
-    const refinePseudocode = useCallback(() => {
-        const document = pseudocode;
-        if (document === undefined || llmState !== 'ready') {
-            return;
-        }
-        setRefineState('running');
-        setRefineMessage(REFINE_RUNNING);
-        void askModel({
-            origin: SIDECAR_ORIGIN,
-            system: REFINE_SYSTEM_PROMPT,
-            user: buildRefinePrompt(refineSubjectText(document)),
-            chatTemplateKwargs: nonThinkingFor(llmModel).chatTemplateKwargs,
-            maxTokens: refineMaxTokens(document),
-            fetch: (url, init) => window.fetch(url, init),
-            // Dieselbe Wahl wie im Chat: es ist derselbe Sidecar und dieselbe
-            // Route, und ein Pfad, der ein anderes Modell benutzt als der
-            // andere, waere ein Panel, das aus einem zweiten Modell erklaert.
-            ...(requestModel === undefined ? {} : { model: requestModel }),
-        })
-            .then((reply) => {
-                const outcome = applyRefinement(document, reply.content);
-                if (outcome.kind === 'applied') {
-                    setRefined(outcome.document);
-                    setRefineState('applied');
-                    setRefineMessage(REFINE_APPLIED);
-                    return;
-                }
-                setRefined(undefined);
-                setRefineState('refused');
-                setRefineMessage(refineRejected(outcome.reason));
-            })
-            .catch((error: unknown) => {
-                setRefined(undefined);
-                setRefineState('refused');
-                setRefineMessage(
-                    refineRejected(error instanceof Error ? error.message : String(error)),
-                );
-            });
-    }, [llmModel, llmState, pseudocode, requestModel]);
-
-    const restorePseudocode = useCallback(() => {
-        setRefined(undefined);
-        setRefineState('idle');
-        setRefineMessage('');
-    }, []);
 
     /*
      * Der Layout-Griff, bei jedem Bild neu geschrieben.
@@ -4496,8 +4404,8 @@ export default function App(): JSX.Element {
         {
             key: 'llm',
             shortcut: 'l',
-            label: llmMenuLabel(llmState),
-            title: llmMenuTitle(llmState),
+            label: messages.browserChat.menuLabel,
+            title: messages.browserChat.menuTitle,
             onSelect: toggleLlm,
         },
         /*
@@ -4714,61 +4622,62 @@ export default function App(): JSX.Element {
         />
     );
 
-    const llm = (
-        <SidecarPanel
-            explained={guidance === 'explained'}
-            state={llmState}
-            facts={llmFacts}
-            project={project}
-            policyDetail={llmPolicy?.detail ?? ''}
-            detail={llmProbe.detail}
-            onToggle={toggleLlm}
-        />
-    );
-
-    const twin = (
-        <TwinPanel
-            status={twinStatus}
-            message={twinMessage}
-            hint={twinHint}
-            symbolName={twinName}
-            symbolQualifiedName={twinSymbol?.qualifiedName}
-            ir={twinIr}
-            presentation={presentation}
-            caretLine={caretLine}
-            onDepth={(depth) => setOverrides((current) => ({ ...current, depth }))}
-            onToggleFacet={(facet) =>
-                setOverrides((current) => {
-                    const on = presentation.facets.has(facet);
-                    const added = (current.facetsAdded ?? []).filter((entry) => entry !== facet);
-                    const removed = (current.facetsRemoved ?? []).filter((entry) => entry !== facet);
-                    return {
-                        ...current,
-                        facetsAdded: on ? added : [...added, facet],
-                        facetsRemoved: on ? [...removed, facet] : removed,
-                    };
-                })
-            }
-            onFollow={followTarget}
-            onPointRow={pointRow}
-            imports={imports}
-            flow={flowView}
-            flowOpen={flowOpen}
-            onToggleFlow={toggleFlow}
-            flowStep={flowStep}
-            view={twinView}
-            onView={setTwinView}
-            pseudocode={refined ?? pseudocode}
-            onOpenLine={openLine}
-            refineAvailable={llmState === 'ready'}
-            refineState={refineState}
-            refineMessage={refineMessage}
-            onRefine={refinePseudocode}
-            onRestoreOriginal={restorePseudocode}
-            voiceModel={selectedModelName}
-            voiceRequestModel={requestModel}
-        />
-    );
+    const liveIr = matchingInspectorIr(twinIr, readerFocusSymbol, project, activePath);
+    const liveOutline = useMemo(() => liveIr ? buildPseudocode(
+        { kind: 'symbol', label: liveIr.symbol.name },
+        { irs: [liveIr], ...(layout === undefined ? {} : { graph: layout }) },
+    ) : undefined, [liveIr, layout]);
+    const liveSelection = readerSelection?.path === activePath && document?.path === activePath
+        ? readerSelection : undefined;
+    const symbolList = fileSymbols.project === project && fileSymbols.path === activePath ? fileSymbols : undefined;
+    const liveCode: SelectedCodeSnapshot = {
+        project, filePath: activePath, symbol: readerFocusSymbol, ir: liveIr,
+        selection: liveSelection, document: document?.path === activePath ? document : undefined,
+        imports: activePath ? imports : undefined,
+        pseudocode: liveOutline,
+        status: liveIr ? 'ready' : readerStatus === 'loading' ? 'loading'
+            : twinStatus === 'failed' ? 'failed' : twinStatus === 'not-indexed' ? 'not-indexed'
+                : readerFocusSymbol ? 'loading' : 'empty',
+        message: twinHint || twinMessage,
+        coverageNote: coverageNote?.text,
+        fileSymbols: symbolList?.symbols,
+        fileSymbolsStatus: symbolList?.status ?? (activePath ? 'loading' : 'ready'),
+        fileSymbolsMessage: symbolList?.message,
+    };
+    const inspector = pinnedCode?.project === project ? pinnedCode : liveCode;
+    const followInspectorTarget = (target: SymbolRef): void => {
+        setPinnedCode(undefined);
+        followTarget(target);
+    };
+    const askInspector = (): void => {
+        if (!inspector.filePath) return;
+        setChatAttachment(inspector.selection ? { ...inspector.selection, project: inspector.project, id: crypto.randomUUID() } : undefined);
+        setChatGraphSelection(inspectorChatContext(inspector, crypto.randomUUID()));
+        setBrowserAiOpen(true);
+    };
+    const showInspectorGraph = (): void => {
+        const node = layout?.nodes.find(entry => inspector.symbol?.qualifiedName
+            ? entry.qualified_name === inspector.symbol.qualifiedName
+            : entry.file_path === inspector.filePath && (entry.label === 'File' || entry.label === 'Module'));
+        if (node) {
+            setGalaxySelection(node);
+            setGalaxySelectionProject(project);
+            changeWorkspace('galaxy');
+        } else {
+            setGalaxyOn(true);
+            if (inspector.symbol) followTarget(inspector.symbol);
+            else if (inspector.filePath) openFile(inspector.filePath);
+        }
+    };
+    const selectedCode = <SelectedCodePanel {...inspector}
+        pinned={pinnedCode?.project === project}
+        onTogglePin={() => setPinnedCode(current => current?.project === project ? undefined : { ...liveCode,
+            selection: liveCode.selection ? { ...liveCode.selection } : undefined })}
+        onAsk={askInspector} onShowGraph={showInspectorGraph} onFollow={followInspectorTarget}
+        onPointRow={inspector.filePath === activePath ? pointRow : undefined}
+        onOpenFlow={inspector.symbol && inspector.symbol.qualifiedName === twinSymbol?.qualifiedName ? toggleFlow : undefined}
+        callOutline={inspector.pseudocode && inspector.symbol ? <PseudocodeView document={inspector.pseudocode}
+            symbolName={inspector.symbol.name} imports={inspector.imports} onOpenLine={openLine} /> : undefined} />;
 
     /*
      * Die fuenf Reiter des Erklaeren-Bereichs, und was gerade dahinter liegt.
@@ -4919,9 +4828,9 @@ export default function App(): JSX.Element {
                 testId={testId}
                 orientation={orientation}
                 label={label}
-                value={shownZones[key]}
-                min={bounds.min}
-                max={bounds.max}
+                value={key === 'rightWidth' ? Math.max(360, shownZones[key]) : shownZones[key]}
+                min={key === 'rightWidth' ? Math.max(360, bounds.min) : bounds.min}
+                max={key === 'rightWidth' ? Math.max(360, bounds.max) : bounds.max}
                 invert={invert}
                 onChange={(value) => changeZone(key, value)}
                 onReset={() => resetZone(key)}
@@ -4930,7 +4839,13 @@ export default function App(): JSX.Element {
     };
 
     const attachSelection = (selection: ReaderSelection): void => {
+        if (selection.path !== activePath || document?.path !== activePath) return;
+        const range = { startLine: selection.startLine, endLine: selection.endLine
+            - (selection.endColumn === 1 && selection.endLine > selection.startLine ? 1 : 0) };
+        const symbol = symbolMatchesReader(liveCode.symbol, selection.path, range) ? liveCode.symbol : undefined;
         setChatAttachment({ ...selection, project, id: crypto.randomUUID() });
+        setChatGraphSelection(inspectorChatContext({ ...liveCode, symbol,
+            ir: matchingInspectorIr(liveCode.ir, symbol, project, activePath), selection }, crypto.randomUUID()));
         setBrowserAiOpen(true);
     };
     const clearAttachment = (id: string): void => {
@@ -4952,12 +4867,11 @@ export default function App(): JSX.Element {
             chatOpen={browserAiOpen}
             chatDock={<BrowserChatDock open={browserAiOpen} onClose={() => setBrowserAiOpen(false)}
                 pendingContext={chatGraphSelection} onContextConsumed={clearGraphSelection} onContextRemoved={clearGraphSelection}
-                context={browserGraphContext(twinIr, project, activePath, twinPath)}
+                context={browserGraphContext(inspector.ir, project, inspector.filePath, inspector.symbol ? workspacePathOf(inspector.symbol.uri) : '')}
                 attachment={chatAttachment} onAttachmentConsumed={clearAttachment} onAttachmentRemoved={clearAttachment} />}
             readerActions={<>
-                {browserAiOpen && <button type="button" onClick={() => setBrowserAiOpen(false)}>{workspaceText.graphContext}</button>}
-                <button type="button" disabled={!readerSelection} aria-keyshortcuts="Control+Shift+L Meta+Shift+L"
-                    onClick={() => { if (readerSelection) attachSelection(readerSelection); }}>{workspaceText.askSelection}</button>
+                <button type="button" disabled={!liveSelection} aria-keyshortcuts="Control+Shift+L Meta+Shift+L"
+                    onClick={() => { if (liveSelection) attachSelection(liveSelection); }}>{workspaceText.askSelection}</button>
             </>}
             globalOverlay={<>{welcomeOpen && <WelcomePanel workspace={workspace} guidance={guidance}
                 onWorkspace={changeWorkspace} onGuidance={changeGuidance} onContinue={finishSetup}
@@ -4966,9 +4880,9 @@ export default function App(): JSX.Element {
                     onOpenProject={openProject} onClose={() => setProjectsOpen(false)} />}
                 {helpOpen && <HelpOverlay onClose={() => setHelpOpen(false)} />}
                 {settingsOpen && <SettingsPanel project={project} state={llmState} facts={llmFacts}
+                    onOpenBrowserModels={() => { setSettingsOpen(false); setBrowserAiOpen(true); }}
                     router={llmRouter} models={llmModels} selectedModel={selectedModel}
                     onSelectModel={chooseModel}
-                    onRefresh={llmMode === 'on' ? () => askSidecarRef.current?.() : undefined}
                     display={display} onDisplay={changeDisplay}
                     onMeasurement={(measurement) => setMeasurements((current) => ({
                         ...current, [measurement.setting]: measurement,
@@ -5046,8 +4960,7 @@ export default function App(): JSX.Element {
             }
             menus={menus}
             status={status}
-            llm={llm}
-            twin={twin}
+            selectionInspector={selectedCode}
             galaxy={galaxy}
             zones={{
                 leftWidth: shownZones.leftWidth,

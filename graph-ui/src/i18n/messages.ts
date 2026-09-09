@@ -58,6 +58,14 @@ const CLOSE = 'close';
 const TOUR_FAILED_TEXT = 'the walk could not be prepared';
 
 export const messages = {
+    browserChat: {
+        menuLabel: '[l]ocal chat',
+        menuTitle: 'Open local browser chat',
+        subtitle: 'Graph display and local browser models',
+        title: 'Browser models',
+        detail: 'Choose or download an optional model in chat settings. Answers run locally in this browser; code exploration works without a model.',
+        open: 'Open local chat',
+    },
     /** Die Kopfzeile und die Flaechen, die zu keinem Panel gehoeren. */
     app: {
         brand: 'CODEATLAS',

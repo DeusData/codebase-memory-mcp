@@ -142,6 +142,8 @@ export interface AtlasChromeProps {
     onOpenBrowserAi?: () => void;
     chatOpen?: boolean;
     chatDock?: ReactNode;
+    /** Persistent code context, shared by the Explore sidebar and chat column. */
+    selectionInspector?: ReactNode;
     readerActions?: ReactNode;
     onOpenSystem?: () => void;
     daemonState?: 'connected' | 'disconnected' | 'checking';
@@ -538,6 +540,23 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
     const searchOpener = useRef<HTMLElement | null>(null);
     const inlineGalaxyHost = useRef<HTMLDivElement>(null);
     const chatGalaxyHost = useRef<HTMLDivElement>(null);
+    const inlineInspectorHost = useRef<HTMLDivElement>(null);
+    const chatInspectorHost = useRef<HTMLDivElement>(null);
+    const hasInspector = props.selectionInspector !== undefined;
+    const isExplore = (props.workspace ?? 'explore') === 'explore';
+    const inspectorAboveChat = props.chatOpen === true && isExplore && hasInspector;
+    // Moving the portal host preserves disclosures and focusable context controls.
+    const [inspectorMount] = useState(() => {
+        if (typeof document === 'undefined') return null;
+        const element = document.createElement('div');
+        element.className = 'atlas-selection-mount';
+        return element;
+    });
+    useLayoutEffect(() => {
+        const host = inspectorAboveChat ? chatInspectorHost.current : inlineInspectorHost.current;
+        if (host !== null && inspectorMount !== null) host.appendChild(inspectorMount);
+        return () => { inspectorMount?.remove(); };
+    }, [hasInspector, inspectorAboveChat, inspectorMount]);
     // A stable portal keeps the WebGL canvas and its camera alive between hosts.
     const [galaxyMount] = useState(() => {
         if (typeof document === 'undefined') return null;
@@ -610,7 +629,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
      */
     const zones = props.zones ?? LAYOUT_DEFAULT;
     const hasSide =
-        props.twin !== undefined || props.galaxy !== undefined || props.llm !== undefined;
+        hasInspector || props.twin !== undefined || props.galaxy !== undefined || props.llm !== undefined;
 
     const stopTabKeys = (event: KeyboardEvent<HTMLInputElement>): void => {
         if (event.key === 'Escape') {
@@ -793,7 +812,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                 data-twin={hasSide}
                 style={{
                     '--atlas-left-w': `${zones.leftWidth}px`,
-                    '--atlas-right-w': `${zones.rightWidth}px`,
+                    '--atlas-right-w': `${hasInspector ? Math.max(360, zones.rightWidth) : zones.rightWidth}px`,
                     '--atlas-twin-h': `${zones.twinHeight}px`,
                 } as CSSProperties}
             >
@@ -846,10 +865,13 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                 {hasSide && (
                     <>
                         {props.splitRight}
-                        <div className="atlas-side" data-galaxy={props.galaxy !== undefined}>
-                            {props.llm}
-                            {props.twin}
-                            {props.splitTwin}
+                        <div className="atlas-side" data-galaxy={props.galaxy !== undefined} data-selection-inspector={hasInspector}>
+                            <div ref={inlineInspectorHost} className="atlas-selection-host" hidden={!isExplore || !hasInspector || inspectorAboveChat}>
+                                {inspectorMount === null && props.selectionInspector}
+                            </div>
+                            {!hasInspector && props.llm}
+                            {!hasInspector && props.twin}
+                            {!hasInspector && props.splitTwin}
                             <div ref={inlineGalaxyHost} className="atlas-galaxy-host">{galaxyMount === null && props.galaxy}</div>
                         </div>
                     </>
@@ -861,8 +883,9 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
             </div>
             {props.chatOpen === true && <Splitter testId="atlas-split-chat" orientation="vertical" label={workspaceStrings.chatWidth} value={chatWidth}
                 min={300} max={600} invert onChange={setChatWidth} onReset={() => setChatWidth(420)} />}
-            <div className="atlas-chat-column" hidden={props.chatOpen !== true} data-graph={graphBelowChat}
+            <div className="atlas-chat-column" hidden={props.chatOpen !== true} data-graph={graphBelowChat} data-selection-inspector={inspectorAboveChat}
                 style={{ '--atlas-chat-graph-height': `${graphHeight}px` } as CSSProperties}>
+                <div ref={chatInspectorHost} className="atlas-selection-host" hidden={!inspectorAboveChat} />
                 {props.chatDock}
                 {graphBelowChat && <Splitter testId="atlas-split-chat-graph" orientation="horizontal"
                     label={workspaceStrings.chatGraphHeight} value={graphHeight} min={320} max={640} invert
@@ -870,6 +893,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                 <div ref={chatGalaxyHost} className="atlas-galaxy-host" hidden={!graphBelowChat} />
             </div>
             {galaxyMount !== null && createPortal(props.galaxy, galaxyMount)}
+            {inspectorMount !== null && createPortal(props.selectionInspector, inspectorMount)}
             </div>
 
             {/*

@@ -79,6 +79,7 @@ import {
 import { modelKey } from './model-preference';
 
 const text = messages.settings;
+const browserModelsText = messages.browserChat;
 
 /** Der Router-Aufruf, den die Meldung "kein Router" vorschlaegt. */
 export const ROUTER_START_COMMAND = 'llm/start.sh';
@@ -117,6 +118,8 @@ export interface SettingsMeasurement {
 }
 
 export interface SettingsPanelProps {
+    /** Opens local browser chat instead of the legacy sidecar setup. */
+    onOpenBrowserModels?: () => void;
     /** Das Projekt, dessen Wahl gespeichert wird. Leer heisst: nichts wird gemerkt. */
     project: string;
     /** Die Lage des Sidecars, so wie die Karte in der Seitenleiste sie zeigt. */
@@ -470,8 +473,8 @@ export default function SettingsPanel(props: SettingsPanelProps): JSX.Element {
             aria-modal="false"
             tabIndex={-1}
             ref={root}
-            data-llm={props.state}
-            data-router={props.router}
+            data-llm={props.onOpenBrowserModels === undefined ? props.state : 'browser'}
+            data-router={props.onOpenBrowserModels === undefined ? props.router : undefined}
             onKeyDown={(event) => {
                 if (event.key === 'Escape') {
                     event.preventDefault();
@@ -483,7 +486,7 @@ export default function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 <span className="atlas-settings-title" data-testid="atlas-settings-title">
                     {text.title}
                 </span>
-                <span className="atlas-settings-subtitle">{text.subtitle}</span>
+                <span className="atlas-settings-subtitle">{props.onOpenBrowserModels === undefined ? text.subtitle : browserModelsText.subtitle}</span>
                 <button
                     type="button"
                     className="atlas-settings-close"
@@ -495,6 +498,15 @@ export default function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 </button>
             </header>
 
+            {props.onOpenBrowserModels !== undefined ? (
+                <Section name="browser-models" title={browserModelsText.title}>
+                    <p className="atlas-settings-text">{browserModelsText.detail}</p>
+                    <button type="button" className="atlas-settings-refresh"
+                        data-testid="atlas-settings-browser-models" onClick={props.onOpenBrowserModels}>
+                        {browserModelsText.open}
+                    </button>
+                </Section>
+            ) : <>
             {/* ---------------------------------------- das laufende Modell */}
             <Section name="model-running" title={text.modelTitle}>
                 {!llmOn && (
@@ -842,6 +854,7 @@ export default function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                     )}
                 </div>
             </Section>
+            </>}
 
             {/* ---------------------------------------- Darstellung und Leistung */}
             <Section name="display" title={text.displayTitle}>
@@ -1107,9 +1120,9 @@ export default function SettingsPanel(props: SettingsPanelProps): JSX.Element {
                 <p className="atlas-settings-note-line" data-testid="atlas-settings-storage">
                     {text.displayStored(displayKey(props.project))}
                 </p>
-                <p className="atlas-settings-note-line" data-testid="atlas-settings-model-storage">
+                {props.onOpenBrowserModels === undefined && <p className="atlas-settings-note-line" data-testid="atlas-settings-model-storage">
                     {text.displayStored(modelKey(props.project))}
-                </p>
+                </p>}
 
                 <h4 className="atlas-settings-subtitle-inline">{text.keepsTitle}</h4>
                 <p className="atlas-settings-text" data-testid="atlas-settings-keeps">

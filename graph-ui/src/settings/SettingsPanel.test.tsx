@@ -136,6 +136,38 @@ describe('das Panel als Ganzes', () => {
     });
 });
 
+describe('browser model settings', () => {
+    it.each(['off', 'not-running', 'ready'] as const)('replaces sidecar setup with one browser model entry when sidecar state is %s', async (state) => {
+        await render({ state, onOpenBrowserModels: vi.fn() });
+        expect(all('atlas-settings-section').map((node) => node.getAttribute('data-section')))
+            .toEqual(['browser-models', 'display']);
+        expect(find('atlas-settings-browser-models')).not.toBeNull();
+        expect(find('atlas-settings-running')).toBeNull();
+        expect(find('atlas-settings-models')).toBeNull();
+        expect(find('atlas-settings-repo-input')).toBeNull();
+        expect(find('atlas-settings-model-storage')).toBeNull();
+        expect(container.textContent).not.toMatch(/llm\/start|llm\/fetch|GGUF|\.gguf|atlas-model:/);
+    });
+
+    it('opens local chat and preserves the graph display controls', async () => {
+        const onOpenBrowserModels = vi.fn();
+        const props = await render({ onOpenBrowserModels });
+        expect(textOf(find('atlas-settings-browser-models'))).toBe('Open local chat');
+        await act(async () => (find('atlas-settings-browser-models') as HTMLButtonElement).click());
+        expect(onOpenBrowserModels).toHaveBeenCalledOnce();
+        expect(props.onSelectModel).not.toHaveBeenCalled();
+        expect(props.onRefresh).not.toHaveBeenCalled();
+        expect(find('atlas-settings-perf')).not.toBeNull();
+        expect(textOf(find('atlas-settings-storage'))).toContain('atlas-display:atlas-sample');
+        const halos = all('atlas-settings-effect')
+            .find((node) => node.getAttribute('data-effect') === 'halos');
+        const off = halos?.querySelector<HTMLButtonElement>('[data-option="false"]');
+        expect(off).not.toBeNull();
+        await act(async () => off!.click());
+        expect(props.onDisplay).toHaveBeenCalledWith({ ...DEFAULT_GRAPH_DISPLAY, halos: false });
+    });
+});
+
 describe('das laufende Modell', () => {
     it('zeigt die vier Zahlen, jede mit ihrer Herkunft', async () => {
         await render();

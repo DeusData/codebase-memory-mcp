@@ -80,6 +80,73 @@ it('moves the same live galaxy below Explore chat and back into Galaxy', async (
     expect(host.querySelector('[aria-label="Local question"]')).toBe(draft);
 });
 
+it('keeps one selected-code inspector and its open details when chat opens and closes', async () => {
+    const props = makeProps();
+    const inspector = <section data-testid="selected-code"><details><summary>Calls</summary>Source-linked calls</details></section>;
+    const galaxy = <section className="atlas-galaxy"><canvas /></section>;
+    const chatDock = <input aria-label="Selection question" defaultValue="explain the selection" />;
+    const render = (chatOpen: boolean) => root.render(<AtlasChrome {...props} selectionInspector={inspector}
+        galaxy={galaxy} chatDock={chatDock} chatOpen={chatOpen} workspace="explore" />);
+    await act(async () => render(false));
+    const panel = host.querySelector('[data-testid="selected-code"]');
+    const details = panel!.querySelector('details')!;
+    const canvas = host.querySelector('canvas');
+    details.open = true;
+    expect(panel?.closest('.atlas-side')).not.toBeNull();
+    expect(panel?.closest('[hidden]')).toBeNull();
+
+    await act(async () => render(true));
+    const chatColumn = host.querySelector('.atlas-chat-column')!;
+    const draft = chatColumn.querySelector('[aria-label="Selection question"]')!;
+    expect(host.querySelectorAll('[data-testid="selected-code"]')).toHaveLength(1);
+    expect(host.querySelector('[data-testid="selected-code"]')).toBe(panel);
+    expect(details.open).toBe(true);
+    expect(panel?.closest('.atlas-chat-column')).toBe(chatColumn);
+    expect(panel?.closest('[hidden]')).toBeNull();
+    expect(canvas?.closest('.atlas-chat-column')).toBe(chatColumn);
+    expect(canvas?.closest('[hidden]')).toBeNull();
+    expect(panel!.compareDocumentPosition(draft) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(draft.compareDocumentPosition(canvas!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    await act(async () => render(false));
+    expect(host.querySelector('[data-testid="selected-code"]')).toBe(panel);
+    expect(details.open).toBe(true);
+    expect(panel?.closest('.atlas-side')).not.toBeNull();
+    expect(panel?.closest('[hidden]')).toBeNull();
+    expect(host.querySelector('canvas')).toBe(canvas);
+});
+
+it('hides selected-code context outside Explore without losing its state', async () => {
+    const props = makeProps();
+    const inspector = <input aria-label="Pinned code context" defaultValue="keep context" />;
+    await act(async () => root.render(<AtlasChrome {...props} selectionInspector={inspector} chatOpen workspace="explore" />));
+    const panel = host.querySelector('[aria-label="Pinned code context"]');
+    for (const workspace of ['galaxy', 'architecture', 'agents', 'system'] as const) {
+        await act(async () => root.render(<AtlasChrome {...props} selectionInspector={inspector} chatOpen workspace={workspace} />));
+        expect(host.querySelector('[aria-label="Pinned code context"]')).toBe(panel);
+        expect(panel?.closest('[hidden]')).not.toBeNull();
+        expect(host.querySelector('.atlas-chat-column')?.hasAttribute('hidden')).toBe(false);
+    }
+    await act(async () => root.render(<AtlasChrome {...props} selectionInspector={inspector} chatOpen workspace="explore" />));
+    expect(host.querySelector('[aria-label="Pinned code context"]')).toBe(panel);
+    expect(panel?.closest('[hidden]')).toBeNull();
+});
+
+it('replaces legacy model and twin controls when selected-code context is supplied', async () => {
+    const props = { ...makeProps(), twin: <div>Legacy twin</div>, llm: <div>Legacy sidecar</div>,
+        splitTwin: <div data-testid="legacy-twin-splitter" /> };
+    await act(async () => root.render(<AtlasChrome {...props} selectionInspector={<div>Selected context</div>} />));
+    expect(host.textContent).toContain('Selected context');
+    expect(host.textContent).not.toContain('Legacy twin');
+    expect(host.textContent).not.toContain('Legacy sidecar');
+    expect(host.querySelector('[data-testid="legacy-twin-splitter"]')).toBeNull();
+
+    await act(async () => root.render(<AtlasChrome {...props} />));
+    expect(host.textContent).toContain('Legacy twin');
+    expect(host.textContent).toContain('Legacy sidecar');
+    expect(host.querySelector('[data-testid="legacy-twin-splitter"]')).not.toBeNull();
+});
+
 it('opens search on demand, retains its query, and returns keyboard focus on Escape', async () => {
     const props = { ...makeProps(), commandValue: 'index', onCommandKeyDown: vi.fn() };
     await act(async () => root.render(<AtlasChrome {...props} />));

@@ -139,8 +139,8 @@
       "reason": "Docblocks und Zeilenkommentare sind kein Bildschirmtext. Der Parser sieht den Unterschied, ein regulaerer Ausdruck koennte ihn nicht sehen."
     }
   ],
-  "filesConsidered": 720,
-  "textFiles": 565,
+  "filesConsidered": 727,
+  "textFiles": 572,
   "binaryFiles": 155,
-  "generatedAt": "2026-09-09T05:07:43.722Z"
+  "generatedAt": "2026-09-09T17:46:30.681Z"
 }
