@@ -53,6 +53,28 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
+
+typedef enum {
+    CBM_PIPELINE_STORAGE_PREFLIGHT = 0,
+    CBM_PIPELINE_STORAGE_GROWTH,
+    CBM_PIPELINE_STORAGE_PREPUBLISH,
+} cbm_pipeline_storage_checkpoint_t;
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef bool (*cbm_pipeline_storage_probe_fn)(cbm_pipeline_storage_checkpoint_t checkpoint,
+                                              const char *final_db_path,
+                                              const char *staging_db_path,
+                                              cbm_index_storage_sample_t *sample,
+                                              cbm_index_resource_t *failed_resource, void *context);
+void cbm_pipeline_set_storage_probe_for_testing(cbm_pipeline_t *p,
+                                                cbm_pipeline_storage_probe_fn probe, void *context);
+#endif
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -71,6 +93,8 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * written, the previous DB is intact (#1997 #832). Distinct from the cancel
  * sentinel so callers can name the cause instead of "pipeline failed". */
 #define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
+/* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
+#define CBM_PIPELINE_RESOURCE_LIMIT (-6)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
