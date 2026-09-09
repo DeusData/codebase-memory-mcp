@@ -153,6 +153,12 @@ TEST(skip_fast_e2e) {
     ASSERT_TRUE(cbm_should_skip_dir("e2e", CBM_MODE_FAST));
     PASS();
 }
+TEST(no_skip_fast_external) {
+    ASSERT_FALSE(cbm_should_skip_dir("external", CBM_MODE_FAST));
+    ASSERT_FALSE(cbm_should_skip_dir("external", CBM_MODE_MODERATE));
+    ASSERT_FALSE(cbm_should_skip_dir("shop-external-api", CBM_MODE_FAST));
+    PASS();
+}
 
 /* ── Suffix filters ────────────────────────────────────────────── */
 
@@ -1867,6 +1873,7 @@ SUITE(discover) {
     RUN_TEST(skip_fast_assets);
     RUN_TEST(skip_fast_3rdparty);
     RUN_TEST(skip_fast_e2e);
+    RUN_TEST(no_skip_fast_external);
 
     /* Suffix filters */
     RUN_TEST(suffix_pyc);
