@@ -1,0 +1,15 @@
+export const projectSwitcherStrings = {
+    project: 'Project',
+    choose: 'Choose project',
+    switchProject: (name: string) => `Switch project: ${name}`,
+    search: 'Find a project',
+    searchPlaceholder: 'Search projects or paths',
+    loading: 'Loading projects...',
+    failed: 'Could not load projects.',
+    empty: 'No indexed projects yet.',
+    noMatches: 'No matching projects.',
+    current: 'Current',
+    retry: 'Try again',
+    refresh: 'Refresh projects',
+    manage: 'Manage projects',
+};

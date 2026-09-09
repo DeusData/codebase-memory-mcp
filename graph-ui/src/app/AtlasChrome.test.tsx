@@ -95,6 +95,17 @@ describe('AtlasChrome', () => {
         expect(testId('atlas-version')?.textContent).toBe('v0.0.0-dirty');
     });
 
+    it('keeps project switching at the end of the header without a duplicate project chip', async () => {
+        await render(props({
+            chips: [{ label: 'project', value: 'atlas-sample' }, { label: 'sym', value: '76' }],
+            ...{ projectSwitcher: <button type="button">Switch project: atlas-sample</button> },
+        }));
+        const header = testId('atlas-header');
+        expect(header?.lastElementChild?.textContent).toBe('Switch project: atlas-sample');
+        expect(header?.querySelector('[data-chip="project"]')).toBeNull();
+        expect(header?.querySelector('[data-chip="sym"]')?.textContent).toContain('76');
+    });
+
     /*
      * Der Zustand des Arbeitsbaums steht neben der Fassung, nicht in ihr.
      *

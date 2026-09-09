@@ -171,12 +171,30 @@
 .atlas-galaxy-host[hidden], .atlas-chat-column[hidden] { display: none; }
 .atlas-chat-column { display: flex; flex-direction: column; min-height: 0; min-width: 0; overflow: hidden; }
 .atlas-chat-column > .cbm-chat-dock { flex: 1; height: auto; min-height: 0; }
-.atlas-chat-column[data-graph=true] > .atlas-galaxy-host { flex: 0 1 min(var(--atlas-chat-graph-height), 45%); min-height: 160px; border-left: 1px solid var(--atlas-line); }
+.atlas-chat-column[data-graph=true] { overflow-y: auto; }
+.atlas-chat-column[data-graph=true] > .cbm-chat-dock { flex: 1 0 260px; }
+.atlas-chat-column[data-graph=true] > .atlas-galaxy-host { flex: 0 0 var(--atlas-chat-graph-height); min-height: 320px; border-left: 1px solid var(--atlas-line); }
 .atlas-chat-column > .atlas-splitter { flex: 0 0 8px; }
 .atlas-chat-column .atlas-galaxy { min-height: 0; height: 100%; }
-.atlas-chat-column .atlas-galaxy-head { padding: 8px 10px; }
 .atlas-chat-column .atlas-galaxy-title, .atlas-chat-column .atlas-galaxy-edgenote { display: none; }
-.atlas-chat-column .atlas-galaxy-navigator { margin: 4px 0; }
+/* Keep the canvas usable in both Explore hosts, including short windows. */
+.atlas-shell[data-workspace=explore] .atlas-side { overflow-y: auto; }
+.atlas-shell[data-workspace=explore] .atlas-side .atlas-twin { min-height: 180px; max-height: max(180px, calc(100% - 340px)); }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-host:has(.atlas-galaxy[data-visible=true]) { min-height: 320px; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy { position: relative; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-head { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 4px 8px; padding: 8px; overflow: visible; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-head-row { grid-column: 2; grid-row: 1; gap: 4px; align-items: center; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-title { display: none; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-navigator { position: static; grid-column: 1; grid-row: 1; min-width: 0; margin: 0; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-navigator > summary { box-sizing: border-box; max-width: 100%; padding: 5px 6px; font-size: 11px; white-space: normal; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-node-picker { top: 48px; right: 8px; left: 8px; width: auto; max-height: calc(100% - 60px); box-sizing: border-box; z-index: 8; }
+.atlas-shell[data-workspace=explore] :is(.atlas-galaxy-selected, .atlas-galaxy-coverage-key, .atlas-galaxy-headline, .atlas-galaxy-edgenote) { grid-column: 1 / -1; min-width: 0; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-selected { font-size: 11px; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-selected span { flex: 1; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-coverage-key { margin: 0; font-size: 10px; white-space: normal; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-legend-frame { max-height: 18%; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-legend { padding: 4px 8px; }
+.atlas-shell[data-workspace=explore] .atlas-galaxy-note { flex: 0 0 auto; max-height: 3.2em; padding: 4px 8px; white-space: normal; overflow: auto; font-size: 10px; }
 .atlas-search-action { display: inline-flex; align-items: center; gap: 10px; background: transparent; color: var(--atlas-fg); border: 1px solid var(--atlas-line); border-radius: 5px; padding: 7px 10px; font: inherit; cursor: pointer; }
 .atlas-search-action kbd { font: 9px var(--atlas-mono); color: var(--atlas-dim); white-space: nowrap; }
 .atlas-search-action + .atlas-tools-menu { margin-left: 0; }

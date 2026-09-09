@@ -111,9 +111,9 @@ it('resizes local chat by keyboard and exposes daemon navigation', async () => {
     await act(async () => root.render(<AtlasChrome {...makeProps()} chatOpen chatDock={<div>Local chat</div>}
         onOpenSystem={onOpenSystem} daemonState="disconnected" />));
     const separator = host.querySelector('[data-testid="atlas-split-chat"]')!;
-    expect(separator.getAttribute('aria-valuenow')).toBe('380');
+    expect(separator.getAttribute('aria-valuenow')).toBe('420');
     await act(async () => separator.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowLeft', bubbles: true })));
-    expect(Number(separator.getAttribute('aria-valuenow'))).toBeGreaterThan(380);
+    expect(Number(separator.getAttribute('aria-valuenow'))).toBeGreaterThan(420);
     await act(async () => host.querySelector<HTMLButtonElement>('[aria-label="Open System: daemon disconnected"]')!.click());
     expect(onOpenSystem).toHaveBeenCalledOnce();
 });

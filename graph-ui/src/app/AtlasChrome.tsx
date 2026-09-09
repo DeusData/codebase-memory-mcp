@@ -138,6 +138,7 @@ export interface TabDescriptor {
 }
 
 export interface AtlasChromeProps {
+    projectSwitcher?: ReactNode;
     onOpenBrowserAi?: () => void;
     chatOpen?: boolean;
     chatDock?: ReactNode;
@@ -529,8 +530,8 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
      * koennen soll, was die Oberflaeche ueber sich behauptet.
      */
     const [commandFocused, setCommandFocused] = useState(false);
-    const [chatWidth, setChatWidth] = useState(380);
-    const [graphHeight, setGraphHeight] = useState(260);
+    const [chatWidth, setChatWidth] = useState(420);
+    const [graphHeight, setGraphHeight] = useState(380);
     const [searchOpen, setSearchOpen] = useState(false);
     const searchDialog = useRef<HTMLDialogElement>(null);
     const searchButton = useRef<HTMLButtonElement>(null);
@@ -762,10 +763,11 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                     </select>
                 )}
                 <div className="atlas-chips">
-                    {props.chips.map((chip) => (
+                    {props.chips.filter(chip => props.projectSwitcher === undefined || chip.label !== messages.statusbar.chipProject).map((chip) => (
                         <ChipView key={chip.label} chip={chip} />
                     ))}
                 </div>
+                {props.projectSwitcher}
             </header>
 
             <div className="atlas-workspace-content" style={{ '--atlas-chat-width': `${chatWidth}px` } as CSSProperties}>
@@ -858,13 +860,13 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
             <main className="atlas-alternate-workspace" hidden={props.workspace === undefined || props.workspace === 'explore' || props.workspace === 'galaxy'}>{props.workspacePanel}</main>
             </div>
             {props.chatOpen === true && <Splitter testId="atlas-split-chat" orientation="vertical" label={workspaceStrings.chatWidth} value={chatWidth}
-                min={300} max={600} invert onChange={setChatWidth} onReset={() => setChatWidth(380)} />}
+                min={300} max={600} invert onChange={setChatWidth} onReset={() => setChatWidth(420)} />}
             <div className="atlas-chat-column" hidden={props.chatOpen !== true} data-graph={graphBelowChat}
                 style={{ '--atlas-chat-graph-height': `${graphHeight}px` } as CSSProperties}>
                 {props.chatDock}
                 {graphBelowChat && <Splitter testId="atlas-split-chat-graph" orientation="horizontal"
-                    label={workspaceStrings.chatGraphHeight} value={graphHeight} min={160} max={480} invert
-                    onChange={setGraphHeight} onReset={() => setGraphHeight(260)} />}
+                    label={workspaceStrings.chatGraphHeight} value={graphHeight} min={320} max={640} invert
+                    onChange={setGraphHeight} onReset={() => setGraphHeight(380)} />}
                 <div ref={chatGalaxyHost} className="atlas-galaxy-host" hidden={!graphBelowChat} />
             </div>
             {galaxyMount !== null && createPortal(props.galaxy, galaxyMount)}

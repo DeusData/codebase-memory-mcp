@@ -309,6 +309,7 @@ import { llmChipValue, llmMenuLabel, llmMenuTitle } from './llm/strings';
 import SettingsPanel from './settings/SettingsPanel';
 import type { SettingsMeasurement } from './settings/SettingsPanel';
 import ProjectsPanel from './projects/ProjectsPanel';
+import ProjectSwitcher from './projects/ProjectSwitcher';
 import type { ProjectsSource } from './projects/ProjectsPanel';
 import { projectHref } from './projects/projects-model';
 import { MODEL_SUGGESTIONS, fetchCommand } from './settings/model-catalog';
@@ -4942,6 +4943,8 @@ export default function App(): JSX.Element {
     return (
         <AtlasChrome
             workspace={workspace}
+            projectSwitcher={<ProjectSwitcher currentProject={project} listProjects={projectsSource.listProjects}
+                onSelectProject={openProject} onManageProjects={() => setProjectsOpen(true)} />}
             onWorkspaceChange={changeWorkspace}
             onOpenBrowserAi={() => setBrowserAiOpen(open => !open)}
             onOpenSystem={() => changeWorkspace('system')}
