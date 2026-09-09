@@ -486,6 +486,29 @@ TEST(handles_jaxrs_java) {
     PASS();
 }
 
+/* JAX-RS (Scala): class-level @Path must be composed with both an empty
+ * method path and a non-empty one.  Without the Scala branch in
+ * push_method_def, unrelated resources collapse onto the global verb/root
+ * Route node. */
+TEST(handles_jaxrs_scala) {
+    static const char *routes[] = {"/billingAccount", "/billingAccount/{id}",
+                                   "/billingAccount/{id}/attachment/{attachmentId}/content", NULL};
+    static const EtFile f[] = {
+        {"BillingAccountApiController.scala",
+         "package com.example\n\n"
+         "import jakarta.ws.rs.{GET, POST, Path}\n\n"
+         "@Path(\"/billingAccount\")\nclass BillingAccountApiController {\n"
+         "  @POST\n  @Path(\"\")\n"
+         "  def createBillingAccount(): String = \"created\"\n\n"
+         "  @GET\n  @Path(\"{id}\")\n"
+         "  def retrieveBillingAccount(): String = \"account\"\n\n"
+         "  @GET\n  @Path(\"{id}/attachment/{attachmentId}/content\")\n"
+         "  def retrieveAttachment(): String = \"attachment\"\n}\n"}};
+    ASSERT_TRUE(et_edge_present(f, 1, "HANDLES", 3));
+    ASSERT_TRUE(et_routes_exact(f, 1, routes));
+    PASS();
+}
+
 /* ASP.NET Minimal API (C#) — route registration via static MapGet/MapPost calls
  * with identifier handlers, under a Microsoft/AspNetCore path so the resolved
  * callee QN carries the "MapGet"/"Microsoft.AspNetCore" route-reg substrings.
@@ -1605,6 +1628,7 @@ SUITE(edge_types_probe) {
     RUN_TEST(handles_spring_java_path_attribute_fourth);
     RUN_TEST(handles_spring_kotlin);
     RUN_TEST(handles_jaxrs_java);
+    RUN_TEST(handles_jaxrs_scala);
     RUN_TEST(handles_aspnet_csharp);
     RUN_TEST(handles_laravel_php);
     RUN_TEST(handles_laravel_facade_routes_issue952);
