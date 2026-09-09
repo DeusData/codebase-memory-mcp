@@ -673,6 +673,9 @@ static const tool_def_t TOOLS[] = {
     {"delete_project", "Delete a project from the index",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
+    {"prune_projects", "Find cached projects whose recorded roots are missing; dry-run by default",
+     "{\"type\":\"object\",\"properties\":{\"dry_run\":{\"type\":\"boolean\",\"default\":true,"
+     "\"description\":\"Report missing-root candidates without deleting them.\"}}}"},
 
     {"index_status",
      "Project readiness, counts, root, and coverage gaps. diagnostics adds coverage rows; verbose "
@@ -782,6 +785,7 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"search_code", true, false, true, false},
     {"list_projects", true, false, true, false},
     {"delete_project", false, true, true, false},
+    {"prune_projects", false, true, true, false},
     {"index_status", true, false, true, false},
     {"check_index_coverage", true, false, true, false},
     {"detect_changes", true, false, true, false},
@@ -2851,6 +2855,266 @@ static void add_project_record_json(yyjson_mut_doc *doc, yyjson_mut_val *arr,
 
 /* list_projects: scan cache directory for .db files.
  * Each project is a single .db file — no central registry needed. */
+static int project_root_status(const char *root_path) {
+    struct stat st;
+    if (root_path && root_path[0] && stat(root_path, &st) == 0) {
+        return 0;
+    }
+    return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+}
+
+static int64_t project_cache_bytes(const char *dir_path, const mcp_project_record_t *record) {
+    int64_t total = record->size_bytes > 0 ? record->size_bytes : 0;
+    const char *suffixes[] = {"-wal", "-shm"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char path[CBM_SZ_2K];
+        snprintf(path, sizeof(path), "%s/%s%s", dir_path, record->db_file, suffixes[i]);
+        int64_t size = cbm_file_size(path);
+        if (size > 0) {
+            total += size;
+        }
+    }
+    return total;
+}
+
+static const char *prune_project_cache(cbm_mcp_server_t *srv, const char *dir_path,
+                                       const mcp_project_record_t *record, bool dry_run,
+                                       int64_t *reclaimed_bytes) {
+    int root_status = project_root_status(record->root_path);
+    if (root_status == 0) {
+        return "root_present";
+    }
+    if (root_status < 0) {
+        return "root_uncertain";
+    }
+    if (dry_run) {
+        *reclaimed_bytes += project_cache_bytes(dir_path, record);
+        return "candidate";
+    }
+    if (!mcp_project_mutation_begin(srv, record->name)) {
+        return "blocked";
+    }
+
+    const char *status = "delete_failed";
+    int final_root_status = project_root_status(record->root_path);
+    if (final_root_status == 1) {
+        int64_t bytes_before = project_cache_bytes(dir_path, record);
+        if (srv->current_project && strcmp(srv->current_project, record->name) == 0 &&
+            srv->owns_store && srv->store) {
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+            free(srv->current_project);
+            srv->current_project = NULL;
+        }
+
+        char db_path[CBM_SZ_2K];
+        snprintf(db_path, sizeof(db_path), "%s/%s", dir_path, record->db_file);
+        char wal_path[CBM_SZ_2K];
+        char shm_path[CBM_SZ_2K];
+        snprintf(wal_path, sizeof(wal_path), "%s-wal", db_path);
+        snprintf(shm_path, sizeof(shm_path), "%s-shm", db_path);
+
+        cbm_pipeline_lock();
+        int unlink_rc = cbm_unlink(db_path);
+        int unlink_errno = errno;
+        if (unlink_rc == 0 || unlink_errno == ENOENT) {
+            bool sidecars_ok = true;
+            int64_t wal_bytes = cbm_file_size(wal_path);
+            int64_t shm_bytes = cbm_file_size(shm_path);
+            int wal_rc = cbm_unlink(wal_path);
+            int wal_errno = errno;
+            int shm_rc = cbm_unlink(shm_path);
+            int shm_errno = errno;
+            if (wal_rc == 0 && wal_bytes > 0) {
+                *reclaimed_bytes += wal_bytes;
+            } else if (wal_rc != 0 && wal_errno != ENOENT) {
+                sidecars_ok = false;
+            }
+            if (shm_rc == 0 && shm_bytes > 0) {
+                *reclaimed_bytes += shm_bytes;
+            } else if (shm_rc != 0 && shm_errno != ENOENT) {
+                sidecars_ok = false;
+            }
+            if (unlink_rc == 0) {
+                *reclaimed_bytes += bytes_before - (wal_bytes > 0 ? wal_bytes : 0) -
+                                    (shm_bytes > 0 ? shm_bytes : 0);
+                status = sidecars_ok ? "deleted" : "partial";
+            } else {
+                status = sidecars_ok ? "already_deleted" : "partial";
+            }
+        }
+        cbm_pipeline_unlock();
+        if (strcmp(status, "deleted") == 0 || strcmp(status, "already_deleted") == 0 ||
+            strcmp(status, "partial") == 0) {
+            if (srv->watcher) {
+                cbm_watcher_unwatch(srv->watcher, record->name);
+            }
+        }
+    } else if (final_root_status == 0) {
+        status = "root_restored";
+    } else {
+        status = "root_uncertain";
+    }
+
+    cbm_mem_collect();
+    mcp_project_mutation_end(srv, record->name);
+    return status;
+}
+
+static char *handle_prune_projects(cbm_mcp_server_t *srv, const char *args) {
+    bool dry_run = true;
+    yyjson_doc *args_doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    if (args && !args_doc) {
+        return cbm_mcp_text_result("invalid JSON arguments", true);
+    }
+    yyjson_val *args_root = args_doc ? yyjson_doc_get_root(args_doc) : NULL;
+    if (args_root && !yyjson_is_obj(args_root)) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("arguments must be an object", true);
+    }
+    yyjson_val *dry_run_value =
+        args_root && yyjson_is_obj(args_root) ? yyjson_obj_get(args_root, "dry_run") : NULL;
+    if (dry_run_value && !yyjson_is_bool(dry_run_value)) {
+        yyjson_doc_free(args_doc);
+        return cbm_mcp_text_result("dry_run must be a boolean", true);
+    }
+    if (dry_run_value) {
+        dry_run = yyjson_get_bool(dry_run_value);
+    }
+    if (args_doc) {
+        yyjson_doc_free(args_doc);
+    }
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return cbm_mcp_text_result("cannot read cache directory", true);
+    }
+
+    mcp_project_record_t *records = NULL;
+    int record_count = 0;
+    int record_cap = 0;
+    bool oom = false;
+    bool scan_incomplete = false;
+    cbm_dirent_t *entry;
+    for (;;) {
+        errno = 0;
+        entry = cbm_readdir(dir);
+        if (!entry) {
+            if (errno != 0) {
+                scan_incomplete = true;
+            }
+            break;
+        }
+        size_t name_len = strlen(entry->name);
+        if (!is_project_db_file(entry->name, name_len)) {
+            continue;
+        }
+        char db_path[CBM_SZ_2K];
+        snprintf(db_path, sizeof(db_path), "%s/%s", dir_path, entry->name);
+        int64_t size_bytes = cbm_file_size(db_path);
+        if (size_bytes < 0) {
+            scan_incomplete = true;
+            continue;
+        }
+        mcp_project_record_t record;
+        project_record_status_t read_status =
+            read_project_record_identity(dir_path, entry->name, size_bytes, &record);
+        if (read_status == PROJECT_RECORD_OOM) {
+            oom = true;
+            break;
+        }
+        if (read_status != PROJECT_RECORD_OK) {
+            continue;
+        }
+        if (record_count == record_cap) {
+            int new_cap = record_cap ? record_cap * 2 : 16;
+            void *grown = realloc(records, (size_t)new_cap * sizeof(*records));
+            if (!grown) {
+                project_record_clear(&record);
+                oom = true;
+                break;
+            }
+            records = grown;
+            record_cap = new_cap;
+        }
+        records[record_count++] = record;
+    }
+    cbm_closedir(dir);
+    if (oom) {
+        for (int i = 0; i < record_count; i++) {
+            project_record_clear(&records[i]);
+        }
+        free(records);
+        return cbm_mcp_text_result("out of memory while scanning projects", true);
+    }
+    qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_val *projects = yyjson_mut_arr(doc);
+    if (!doc || !root || !projects) {
+        yyjson_mut_doc_free(doc);
+        for (int i = 0; i < record_count; i++) {
+            project_record_clear(&records[i]);
+        }
+        free(records);
+        return cbm_mcp_text_result("out of memory while building prune response", true);
+    }
+    yyjson_mut_doc_set_root(doc, root);
+    int candidate_count = 0;
+    int deleted_count = 0;
+    int64_t reclaimed_bytes = 0;
+    bool response_error = false;
+    for (int i = 0; i < record_count; i++) {
+        int root_status = project_root_status(records[i].root_path);
+        if (root_status != 1) {
+            continue;
+        }
+        candidate_count++;
+        int64_t candidate_bytes = project_cache_bytes(dir_path, &records[i]);
+        const char *status =
+            prune_project_cache(srv, dir_path, &records[i], dry_run, &reclaimed_bytes);
+        if (strcmp(status, "deleted") == 0 || strcmp(status, "already_deleted") == 0) {
+            deleted_count++;
+        }
+        yyjson_mut_val *item = yyjson_mut_obj(doc);
+        if (!item || !yyjson_mut_obj_add_strcpy(doc, item, "project", records[i].name) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "root_path", records[i].root_path) ||
+            !yyjson_mut_obj_add_strcpy(doc, item, "status", status) ||
+            !yyjson_mut_obj_add_int(doc, item, "bytes", candidate_bytes) ||
+            !yyjson_mut_arr_add_val(projects, item)) {
+            response_error = true;
+            break;
+        }
+    }
+    if (response_error || !yyjson_mut_obj_add_bool(doc, root, "dry_run", dry_run) ||
+        !yyjson_mut_obj_add_int(doc, root, "candidate_count", candidate_count) ||
+        !yyjson_mut_obj_add_int(doc, root, "deleted_count", deleted_count) ||
+        !yyjson_mut_obj_add_int(doc, root, "reclaimable_bytes", reclaimed_bytes) ||
+        !yyjson_mut_obj_add_bool(doc, root, "scan_incomplete", scan_incomplete) ||
+        !yyjson_mut_obj_add_val(doc, root, "projects", projects)) {
+        yyjson_mut_doc_free(doc);
+        for (int i = 0; i < record_count; i++) {
+            project_record_clear(&records[i]);
+        }
+        free(records);
+        return cbm_mcp_text_result("out of memory while building prune response", true);
+    }
+    char *json = yy_doc_to_str(doc);
+    yyjson_mut_doc_free(doc);
+    for (int i = 0; i < record_count; i++) {
+        project_record_clear(&records[i]);
+    }
+    free(records);
+    if (!json) {
+        return cbm_mcp_text_result("out of memory while serializing prune response", true);
+    }
+    char *result = cbm_mcp_text_result(json, false);
+    free(json);
+    return result;
+}
+
 static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
     (void)srv;
     bool metadata_only = false;
@@ -17284,6 +17548,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "delete_project") == 0) {
         return handle_delete_project(srv, args_json);
+    }
+    if (strcmp(tool_name, "prune_projects") == 0) {
+        return handle_prune_projects(srv, args_json);
     }
     if (strcmp(tool_name, "trace_path") == 0 || strcmp(tool_name, "trace_call_path") == 0) {
         return handle_trace_call_path(srv, args_json);

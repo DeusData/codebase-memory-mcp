@@ -1410,6 +1410,7 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"search_code", true, false, true, false},
         {"list_projects", true, false, true, false},
         {"delete_project", false, true, true, false},
+        {"prune_projects", false, true, true, false},
         {"index_status", true, false, true, false},
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
@@ -7819,6 +7820,78 @@ TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
 
     cbm_mcp_server_free(srv);
     cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
+TEST(tool_prune_projects_discovers_inactive_missing_roots) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-prune-XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char live_root[CBM_SZ_1K];
+    snprintf(live_root, sizeof(live_root), "%s/live-root", cache);
+    ASSERT_EQ(cbm_mkdir(live_root), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *stale = "inactive-stale-project";
+    const char *live = "inactive-live-project";
+    char stale_path[CBM_SZ_1K];
+    char live_path[CBM_SZ_1K];
+    snprintf(stale_path, sizeof(stale_path), "%s/%s.db", cache, stale);
+    snprintf(live_path, sizeof(live_path), "%s/%s.db", cache, live);
+    cbm_store_t *stale_store = cbm_store_open_path(stale_path);
+    cbm_store_t *live_store = cbm_store_open_path(live_path);
+    ASSERT_NOT_NULL(stale_store);
+    ASSERT_NOT_NULL(live_store);
+    ASSERT_EQ(cbm_store_upsert_project(stale_store, stale, "/tmp/cbm-root-that-is-gone"),
+              CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_upsert_project(live_store, live, live_root), CBM_STORE_OK);
+    cbm_store_close(stale_store);
+    cbm_store_close(live_store);
+
+    char stale_wal[CBM_SZ_1K];
+    char stale_shm[CBM_SZ_1K];
+    snprintf(stale_wal, sizeof(stale_wal), "%s-wal", stale_path);
+    snprintf(stale_shm, sizeof(stale_shm), "%s-shm", stale_path);
+    FILE *fixture = fopen(stale_wal, "wb");
+    ASSERT_NOT_NULL(fixture);
+    fclose(fixture);
+    fixture = fopen(stale_shm, "wb");
+    ASSERT_NOT_NULL(fixture);
+    fclose(fixture);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(
+        srv, "prune_projects", "{\"format\":\"json\",\"dry_run\":true}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "inactive-stale-project"));
+    ASSERT_NOT_NULL(strstr(resp, "candidate_count"));
+    ASSERT_NOT_NULL(strstr(resp, "dry_run"));
+    ASSERT_TRUE(cbm_file_exists(stale_path));
+    ASSERT_TRUE(cbm_file_exists(stale_wal));
+    ASSERT_TRUE(cbm_file_exists(stale_shm));
+    ASSERT_TRUE(cbm_file_exists(live_path));
+    free(resp);
+
+    resp = cbm_mcp_handle_tool(srv, "prune_projects", "{\"format\":\"json\",\"dry_run\":false}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    ASSERT_FALSE(cbm_file_exists(stale_path));
+    ASSERT_FALSE(cbm_file_exists(stale_wal));
+    ASSERT_FALSE(cbm_file_exists(stale_shm));
+    ASSERT_TRUE(cbm_file_exists(live_path));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, live);
+    cbm_rmdir(live_root);
     cbm_rmdir(cache);
     restore_cache_dir(saved_cache_copy);
     free(saved_cache_copy);
@@ -20483,6 +20556,7 @@ SUITE(mcp) {
  * running the much larger MCP behavior suite. */
 SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+    RUN_TEST(tool_prune_projects_discovers_inactive_missing_roots);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
     RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);
