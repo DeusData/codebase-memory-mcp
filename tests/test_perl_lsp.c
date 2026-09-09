@@ -1739,6 +1739,47 @@ TEST(perllsp_cross_return_type_class_inherited_method) {
     PASS();
 }
 
+/* Structural / duck typing: a typeless accessor `acc` (has [qw(acc)], no
+ * return type) whose `$self->acc->METHOD` usage set {foo,bar,baz} is UNIQUELY
+ * covered by class Target among project classes → acc's return type is inferred
+ * as Target, so `$self->acc->foo` dispatches to Target::foo. Gated: unique
+ * match + >=3 distinct non-universal methods (Widget below is a decoy that
+ * covers only {foo}, so it must NOT ambiguate). */
+TEST(perllsp_cross_duck_typed_accessor) {
+    const char *source = "package Thing;\n"
+                         "use Mojo::Base -base;\n"
+                         "sub acc { return $_[0]->{acc} }\n"
+                         "sub u1 { my $self = shift; $self->acc->foo; }\n"
+                         "sub u2 { my $self = shift; $self->acc->bar; $self->acc->baz; }\n";
+    CBMLSPDef defs[] = {
+        {.qualified_name = "test.lib.Thing.acc", .short_name = "acc", .label = "Method",
+         .def_module_qn = "test.lib.Thing"},
+        {.qualified_name = "test.lib.Thing.u1", .short_name = "u1", .label = "Function",
+         .def_module_qn = "test.lib.Thing"},
+        {.qualified_name = "test.lib.Thing.u2", .short_name = "u2", .label = "Function",
+         .def_module_qn = "test.lib.Thing"},
+        {.qualified_name = "test.lib.Target.foo", .short_name = "foo", .label = "Function",
+         .def_module_qn = "test.lib.Target"},
+        {.qualified_name = "test.lib.Target.bar", .short_name = "bar", .label = "Function",
+         .def_module_qn = "test.lib.Target"},
+        {.qualified_name = "test.lib.Target.baz", .short_name = "baz", .label = "Function",
+         .def_module_qn = "test.lib.Target"},
+        {.qualified_name = "test.lib.Widget.foo", .short_name = "foo", .label = "Function",
+         .def_module_qn = "test.lib.Widget"},
+    };
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_perl_lsp_cross(&arena, source, (int)strlen(source), "test.lib.Thing", defs, 7, NULL,
+                           NULL, 0, NULL, &out, NULL, defs, 7);
+    int idx = find_resolved_arr(&out, "Thing.u1", "Target.foo");
+    if (idx < 0)
+        dump_resolved_arr(&out);
+    ASSERT(idx >= 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* ── Suite registration ────────────────────────────────────────── */
 
 SUITE(perl_lsp) {
@@ -1799,6 +1840,7 @@ SUITE(perl_lsp) {
     RUN_TEST(perllsp_cross_multilevel_inherited_method);
     RUN_TEST(perllsp_cross_constructor_typed_inherited_method);
     RUN_TEST(perllsp_cross_return_type_class_inherited_method);
+    RUN_TEST(perllsp_cross_duck_typed_accessor);
     RUN_TEST(perllsp_cross_require_package_dispatch);
     RUN_TEST(perllsp_cross_default_exports);
     RUN_TEST(perllsp_cross_export_ok_not_default);
