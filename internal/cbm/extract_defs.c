@@ -5014,6 +5014,27 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     cbm_defs_push(&ctx->result->defs, a, def);
 }
 
+/* Older C# grammars parse an extension declaration as a constructor whose body
+ * contains local functions. Recover those members without descending into
+ * ordinary C# method bodies. */
+static void extract_csharp_extension_members(CBMExtractCtx *ctx, TSNode node, TSNode class_node,
+                                             const char *class_qn, const CBMLangSpec *spec) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "local_function_statement") == 0 || strcmp(kind, "method_declaration") == 0) {
+        TSNode name_node = resolve_method_name(node, ctx->language);
+        if (!ts_node_is_null(name_node)) {
+            push_method_def(ctx, node, class_node, class_qn, spec, name_node);
+        }
+        return;
+    }
+
+    uint32_t count = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < count; i++) {
+        extract_csharp_extension_members(ctx, ts_node_named_child(node, i), class_node, class_qn,
+                                         spec);
+    }
+}
+
 // Extract methods from an ObjC implementation_definition node.
 static void extract_objc_impl_methods(CBMExtractCtx *ctx, TSNode impl_node, const char *class_qn,
                                       const CBMLangSpec *spec) {
@@ -5132,6 +5153,14 @@ static void extract_class_methods(CBMExtractCtx *ctx, TSNode class_node, const c
             continue;
         }
 
+        if (ctx->language == CBM_LANG_CSHARP &&
+            strcmp(ts_node_type(method_node), "constructor_declaration") == 0) {
+            char *name = cbm_func_name_node_text(ctx->arena, name_node, ctx->source, ctx->language);
+            if (name && strcmp(name, "extension") == 0) {
+                extract_csharp_extension_members(ctx, method_node, class_node, class_qn, spec);
+                continue;
+            }
+        }
         push_method_def(ctx, method_node, class_node, class_qn, spec, name_node);
     }
 }
