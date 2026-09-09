@@ -2,6 +2,11 @@
 export const architectureText = {
     title: 'Architecture',
     subtitle: 'Understand the structure. Follow the evidence.',
+    summaryDetails: 'Index summary, layers and communities',
+    importWalk: 'Read by import order',
+    inspectEdges: 'Inspect edges',
+    retainedEdges: (count: number, reported: number) => `${count} retained edges from a boundary reporting ${reported} calls. Package membership uses the same index rule as the summary. Counts may differ across bounds or index updates.`,
+    edgeEvidenceUnavailable: 'No constituent edge is available in the loaded map snapshot. The summary count alone cannot establish a path or source location; refresh or inspect the source area.',
     views: { overview: 'Overview', dependencies: 'Dependencies', entryPoints: 'Entry points', routes: 'Routes', hotspots: 'Hotspots' },
     navigation: 'Architecture views',
     refresh: 'Refresh',

@@ -12,9 +12,8 @@ What the maintainers added on top:
   embeds `dist/` into the binary. The dev server (`npm run dev`) listens on
   5173 and proxies `/rpc` and `/api` to a server on 9749, which is the
   contract `tests/test_ui_dev_proxy_security.sh` pins.
-- **CSP.** The served page may reach the server itself plus two loopback
-  services the reader can start: the local-model sidecar on 127.0.0.1:4141
-  and the agent bridge on 127.0.0.1:4142 (`src/ui/http_server.h`,
+- **CSP.** The served page may reach the server itself plus the loopback
+  service explicitly allowed for optional local inference (`src/ui/http_server.h`,
   `CBM_UI_CSP_VALUE`). Nothing else, and a test holds that.
 - **The `[p]rojects` panel** (alt+p, `src/projects/`): index a repository,
   check or remove an index, edit the decision record, read the server's
@@ -106,90 +105,98 @@ Agent ein kleiner leuchtender Koerper, der den Symbolknoten umkreist, an dem er
 gerade arbeitet, und unten rechts ein kompaktes Instrument, das erklaert, was
 man sieht. Der Weg dorthin hat drei Stationen.
 
-### 1. Die Quelle: eine Ereignisdatei
+### Recorded tool activity through the daemon
 
-Ein Werkzeug-Hook schreibt eine JSON-Zeile je Werkzeugaufruf, angehaengt an eine
-Datei (JSONL). Die Hook-Skripte dieses Repositories liegen unter
-`agents/hooks/`:
+`agents/hooks/atlas-trace.py` is the supported PostToolUse producer. Configure
+`ATLAS_PROJECT` to the exact indexed project name, `ATLAS_AGENT_NAME` for its
+label, and (only for a custom port) `ATLAS_DAEMON_URL=http://127.0.0.1:PORT`.
+The **Connect your agent** disclosure in Agent activity downloads this exact
+hook and generates a project-specific install command using `/api/repo-info`.
+On macOS/Linux with Python 3, run the reviewed command:
 
-- `agents/hooks/atlas-trace.py` als PostToolUse-Hook. Er endet unter allen
-  Umstaenden mit 0: ein Protokoll, das die Arbeit aufhalten kann, waere
-  schlimmer als kein Protokoll.
-- `agents/hooks/atlas-trace-watch.mjs` als zweite Quelle. Sie beobachtet
-  Schreibvorgaenge auf der Platte, sieht also **nur** Schreiben und weder Lesen
-  noch Suchen noch Testlaeufe, und kennzeichnet jedes Ereignis entsprechend
-  (`source: "fs"`).
-
-Wohin geschrieben wird, sagt `ATLAS_TRACE_FILE`; ohne die Variable ist es
-`~/.atlas-trace/events.jsonl`. Wie der Agent heisst, sagt `ATLAS_AGENT_NAME`.
-
-Einrichtung in der Hook-Konfiguration des Agenten-Werkzeugs (bei Werkzeugen mit
-einem `PostToolUse`-Hook ist das eine `settings.json` in deren
-Heimatverzeichnis):
-
-```json
-{
-  "hooks": {
-    "PostToolUse": [
-      { "matcher": "*",
-        "hooks": [{ "type": "command",
-                    "command": "python3 <repo>/agents/hooks/atlas-trace.py" }] }
-    ]
-  }
-}
+```sh
+python3 ~/Downloads/cbm-atlas-trace.py --install-claude --root /absolute/repository --project INDEXED_NAME --daemon-url http://127.0.0.1:9749
 ```
 
-**Das Format**, eine Zeile je Ereignis:
+Installation is explicit and local: it preserves unrelated Claude settings,
+adds a PostToolUse entry to `.claude/settings.local.json`, and copies the hook
+into `.claude/hooks/`. It refuses conflicting hooks, symlinks and malformed
+configuration. It makes no network request or account change. Start a new Claude
+Code session after installation, then load recorded activity in the browser.
+Other coding clients require their own event adapter; they are not automatically
+observed. For manual configuration, run `python3 <path>/atlas-trace.py` in the
+client's PostToolUse hook. Its JSON tool event arrives on stdin. During normal
+hook execution it always exits zero and does not change the tool call's result.
 
-| Feld | Bedeutung |
-| --- | --- |
-| `ts` | Millisekunden seit 1970 |
-| `agent` | Anzeigename des Agenten |
-| `run` | Kennung eines Laufs |
-| `seq` | fortlaufend je Lauf |
-| `phase` | `start` oder `end` |
-| `tool` | Werkzeugname |
-| `path` | optional, repo-relativer Pfad |
-| `lines` | optional, `[von, bis]` |
-| `detail` | optional, Befehl oder Suchmuster |
-| `intent` | optional, Selbstauskunft des Agenten |
+The hook records timestamp, tool name, run ID, sequence number, path and optional
+line span/command. The hook records no file contents and no tool output. Commands
+and paths may still contain sensitive information: the entire data path stays
+on this workstation. The hook refuses external destinations, proxies and redirects.
 
-Unbekannte Felder werden durchgereicht und nicht als Fehler behandelt: jede
-andere Quelle, die dasselbe Format schreibt, wird gelesen.
+A transactional SQLite outbox at `~/.atlas-trace/events.jsonl.outbox.sqlite3`
+allocates sequence numbers safely across concurrent hooks. `ATLAS_TRACE_FILE`
+changes this path prefix. Up to 10,000 pending events survive daemon downtime;
+old pending entries expire at that limit. Delivery retries on the next hook,
+or explicitly with `python3 <repo>/graph-ui/agents/hooks/atlas-trace.py --flush`.
+A flush delivers up to 100 pending events from one project. No background bridge
+or additional listener is required. The old JSONL watcher and replay bridge remain
+historical fixture tools; they are not connected to the application by default.
 
-**Die Ereignisdatei enthaelt Pfade, Zeilenbereiche und Werkzeugnamen und
-keine Dateiinhalte.** Kein Quelltext, kein Ausgabetext, kein Diff. Das ist die
-Grenze des Formats und keine Einstellung daran: wer die Datei liest, liest, WO
-gearbeitet wurde, und nicht, WAS dort steht. Sie kann trotzdem verraten, an
-welchen Dateien jemand arbeitet und welche Befehle er faehrt; sie gehoert
-deshalb nicht in ein Repository und steht in `.gitignore`.
+Daemon log provenance is explicit. `GET /api/logs?project=NAME&min_level=warn`
+returns only records attributed to that exact indexed project; the filter applies
+before pagination and counts. Omitting `project` keeps the daemon-wide history;
+`scope=unattributed` shows records without known project ownership. Migration v3
+adds a nullable project column without assigning old records to the current
+repository. Paths, page URLs and message text are never used to guess ownership.
+Each record exposes `project: string | null`; responses expose `scope` and the
+selected `project`. A failed scoped database read returns an error instead of
+substituting unrelated memory-ring logs. New UI entries capture optional project
+ownership when recorded, before buffering; an explicit empty/null entry project
+stays unattributed even if a batch carries a project.
 
-### 2. Die Bruecke
+`POST /api/agent-events` accepts `{project, events: [...]}` with at most 100 events.
+Required event fields are `ts`, `agent`, `run`, integer `seq`, `phase: start|end`
+and `tool`. Optional fields include `path`, `lines`, `detail`, `source`, `intent`
+(self-report), and explicit `replay`. Unknown fields are discarded.
 
-```
-node tools/agent-bridge.mjs                  # Vorgabe: ~/.atlas-trace/events.jsonl, Port 4142
-node tools/agent-bridge.mjs --file <pfad> --port <port>
-node tools/agent-bridge.mjs --replay fixtures/agent-events/w11a-replay.jsonl --port <port>
-```
+The daemon owns `<cache>/activity.db`, independent of replaceable project indexes.
+Its additive migrations use SQLite WAL and a busy timeout. Events have monotonic
+daemon cursors and unique `(project, run, seq)` identities. A small per-run retired sequence floor prevents expired events from reappearing after a delayed retry.
+10,000 events are retained globally; expired history is explicitly incomplete.
+A database generation distinguishes a restart (same state) from a replaced database.
 
-Sie verfolgt die Datei und reicht sie als Server-Sent-Events weiter. Sie **liest
-nur**: es gibt keine Route, die etwas hinzufuegt, sie legt die Datei nicht an
-und sie loescht sie nicht. Sie spricht ausschliesslich Loopback und weist jede
-Verbindung ab, die nicht von 127.0.0.1 kommt.
+### The view and logs
 
-Der Wiedergabemodus (`--replay`) liest die Datei einmal und schweigt danach, bis
-jemand `POST /replay/advance?count=N` ruft. Das ist die Naht, mit der der
-Beweislauf den Takt setzt, statt auf eine Wanduhr zu warten.
+Agent activity is off until enabled by the reader. It then polls
+`GET /api/agent-events?project=NAME&after=CURSOR&limit=200` over the same origin and
+port as the graph and MCP HTTP API. Failed requests retain the last accepted
+cursor; reconnects do not duplicate retained rows. Changing repositories resets
+the browser's activity state. `?agents=PORT` no longer selects another server.
 
-### 3. Die Ansicht
+Daemon log callbacks and every accepted frontend log level persist in the same SQLite
+journal. `GET /api/logs` preserves its `lines`/`total` response and adds structured
+`records`, receipt timestamps, severity, source, durable IDs and a database
+generation. `min_level=warn` selects warnings and errors, `min_level=error` only errors.
+`q=TEXT` applies a literal, ASCII case-insensitive substring search to timestamps,
+sources, messages and explicit project names. Scope, severity, search, counts and
+cursors all apply before the display limit. System Logs uses these same filters; 2,000 warning/error records
+are reserved independently of 3,000 routine records. `after=CURSOR` reads forward,
+while requests without a cursor return a recent snapshot. A failed SQLite store
+is reported as `persistent:false`, with the bounded in-memory fallback available.
+`GET /api/ui-log` now reads frontend JSON lines from that same journal. Its
+`path` names `activity.db`, `export_path` names the compatibility JSONL file, and
+`source: "sqlite"` / `persistent: true` identify the source. Version 4 adds explicit
+frontend origin and retains full bounded JSON evidence. On first open, at most the
+last 256 KiB of each old `ui.log.1` and `ui.log` are imported in one transaction;
+original receipt timestamps are preserved, project ownership remains unknown,
+and a partial import is disclosed. No log is reassigned to the selected project.
 
-Der Live-Modus ist **aus**, bis der Leser ihn einschaltet: im Menue mit
-`[g] live agents` (alt+g) oder mit der Zeile `live agents` in der
-Kommandozeile. Solange er aus ist, geht keine einzige Anfrage an die Bruecke.
-Eingeschaltet ohne laufende Bruecke sagt das Instrument den Zustand und nennt
-den Befehl, der sie startet.
-
-Einen anderen Port als 4142 nennt die Adresszeile: `?agents=<port>`.
+UI posts retain the existing `accepted`, `dropped`, `path` and `file_error` fields,
+adding `duplicates`, `persistent` and `storage_error`; a failed journal write
+returns HTTP 503 for retry. A retired per-session sequence floor prevents expired
+UI events from returning on an old retry. JSONL remains a rotating local export
+for existing `tail` workflows; changing it does not change the HTTP history.
+No local report or event is published externally by these routes.
 
 Was die Ansicht zeigt und was sie ausdruecklich nicht zeigt:
 

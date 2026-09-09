@@ -720,6 +720,7 @@ export interface GalaxyPanelProps {
     fullscreenToggle?: number;
     /** Der Speicher fuer die Lage des Instruments. Ersetzbar fuer Tests. */
     agentStore?: Storage | undefined;
+    selectionPanel?: import('react').ReactNode;
 }
 
 /** Wie lange die Zeitangaben im Instrument stehen, bis sie neu gerechnet werden. */
@@ -2402,6 +2403,7 @@ export default function GalaxyPanel(props: GalaxyPanelProps): JSX.Element {
                     </div>
                 )}
             </div>
+            {props.selectionPanel && <aside className="galaxy-selection-evidence" aria-label="Selection evidence">{props.selectionPanel}</aside>}
             {note.length > 0 && (
                 <p className="atlas-galaxy-note" data-testid="atlas-galaxy-note">
                     {props.workspaceExpanded && note === GALAXY_NO_FOCUS_NOTE

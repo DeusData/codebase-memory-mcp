@@ -8,13 +8,18 @@ import {
 import type { ArchitectureView, ConfigStorage } from './architecture-model';
 import { architectureText as text } from './strings';
 import './architecture.css';
+import RepositoryMapView, { RelationshipEvidence } from './RepositoryMap';
+import type { RepositoryMapProps } from './RepositoryMap';
+import { repositoryMap } from './repository-map';
 
-export interface ArchitecturePanelProps {
+export interface ArchitecturePanelProps extends Pick<RepositoryMapProps, 'graph' | 'selection' | 'selectionPanel' | 'onSelect' | 'graphNote' | 'readSource'> {
     projectName: string;
+    graphGeneration?: string;
     overview?: ArchitectureOverviewDto;
     loading?: boolean;
     error?: string;
     onRefresh?: () => void;
+    onProjectWalk?: () => void;
     /** The declaration line is 1-based, as returned by the provider. */
     onNavigate: (filePath: string, line?: number, name?: string) => void;
 }
@@ -161,8 +166,11 @@ function Overview({ data, filtered, filter, onGroup, onNavigate }: {
     </>;
 }
 
-function Dependencies({ data, empty, onGroup }: { data: ArchitectureOverviewDto; empty: string; onGroup: (group: string) => void }): JSX.Element {
+function Dependencies({ data, empty, onGroup, graph, onNavigate }: { data: ArchitectureOverviewDto; empty: string; onGroup: (group: string) => void } & Pick<ArchitecturePanelProps, 'graph' | 'onNavigate'>): JSX.Element {
     const boundaries = useMemo(() => [...data.boundaries].sort((a, b) => b.callCount - a.callCount), [data.boundaries]);
+    const [chosen, setChosen] = useState<ArchitectureBoundary>();
+    const edges = useMemo(() => graph && chosen ? repositoryMap(graph).evidence.filter(edge => edge.type === 'CALLS'
+        && edge.source.package_name === chosen.from && edge.target.package_name === chosen.to) : [], [graph, chosen]);
     return <>
         <section><SectionHeading title={text.dependencyTitle} note={text.dependencyNote} />
             <BoundaryDiagram boundaries={boundaries} onGroup={onGroup} />
@@ -170,14 +178,18 @@ function Dependencies({ data, empty, onGroup }: { data: ArchitectureOverviewDto;
         <section><SectionHeading title={text.tableTitle} />
             <Collection items={boundaries} empty={empty} pageSize={24}>{rows =>
                 <div className="atlas-arch-table-wrap"><table className="atlas-arch-table"><thead><tr>
-                    <th scope="col">{text.from}</th><th scope="col">{text.to}</th><th scope="col" className="atlas-arch-number">{text.calls}</th>
+                    <th scope="col">{text.from}</th><th scope="col">{text.to}</th><th scope="col" className="atlas-arch-number">{text.calls}</th><th scope="col">{text.evidence}</th>
                 </tr></thead><tbody>{rows.map((boundary, index) => <tr key={`${boundary.from}:${boundary.to}:${index}`}>
                     <td><button className="atlas-arch-link" onClick={() => onGroup(boundary.from)}>{boundary.from}</button></td>
                     <td><button className="atlas-arch-link" onClick={() => onGroup(boundary.to)}>{boundary.to}</button></td>
                     <td className="atlas-arch-number">{boundary.callCount.toLocaleString()}</td>
+                    <td><button className="atlas-arch-link" onClick={() => setChosen(boundary)}>{text.inspectEdges}</button></td>
                 </tr>)}</tbody></table></div>}
             </Collection>
         </section>
+        {chosen && <section key={`${chosen.from}:${chosen.to}`}><SectionHeading title={`${chosen.from} → ${chosen.to}`} note={text.retainedEdges(edges.length, chosen.callCount)} />
+            {edges.length ? <RelationshipEvidence edges={edges} onNavigate={onNavigate} /> : <Empty>{text.edgeEvidenceUnavailable}</Empty>}
+        </section>}
     </>;
 }
 
@@ -224,7 +236,7 @@ function Findings({ view, data, empty, onNavigate }: {
     </section>;
 }
 
-function ArchitectureWorkspace({ projectName, overview, loading = false, error, onRefresh, onNavigate }: ArchitecturePanelProps): JSX.Element {
+function ArchitectureWorkspace({ projectName, overview, loading = false, error, onRefresh, onProjectWalk, onNavigate, graph, selection, selectionPanel, onSelect, graphNote, graphGeneration, readSource }: ArchitecturePanelProps): JSX.Element {
     const storage = useMemo(browserStorage, []);
     const [config, setConfig] = useState(() => readArchitectureConfig(storage, projectName));
     const [saved, setSaved] = useState(true);
@@ -238,7 +250,8 @@ function ArchitectureWorkspace({ projectName, overview, loading = false, error, 
     return <section className="atlas-architecture" data-testid="atlas-architecture" aria-label={text.title} aria-busy={loading}>
         <header className="atlas-arch-heading"><div><span className="atlas-arch-project">{projectName}</span>
             <h1>{text.title}</h1><p>{text.subtitle}</p></div>
-            {onRefresh && <button className="atlas-arch-action" onClick={onRefresh} disabled={loading || !projectName}>{text.refresh}</button>}
+            <div className="repo-map-directions">{onProjectWalk && <button onClick={onProjectWalk} disabled={!projectName}>{text.importWalk}</button>}
+                {onRefresh && <button className="atlas-arch-action" onClick={onRefresh} disabled={loading || !projectName}>{text.refresh}</button>}</div>
         </header>
         <nav className="atlas-arch-tabs" aria-label={text.navigation}>{ARCHITECTURE_VIEWS.map(view =>
             <button className="atlas-arch-tab" key={view} aria-pressed={config.view === view} data-view={view}
@@ -254,9 +267,10 @@ function ArchitectureWorkspace({ projectName, overview, loading = false, error, 
             : error ? <div role="alert" className="atlas-arch-empty" data-error="true"><p>{text.loadFailed}</p><p className="atlas-arch-error-detail">{error}</p>
                 {onRefresh && <button className="atlas-arch-action" onClick={onRefresh}>{text.retry}</button>}</div>
                 : !data ? <Empty>{text.unavailable}</Empty> : null}
-        {ready && data && filtered && <div className="atlas-arch-content" key={`${config.view}:${config.filter}`} data-testid="atlas-architecture-content">
-            {config.view === 'overview' ? <Overview data={data} filtered={filtered} filter={config.filter} onGroup={onGroup} onNavigate={onNavigate} />
-                : config.view === 'dependencies' ? <Dependencies data={filtered} empty={empty} onGroup={onGroup} />
+        {ready && data && filtered && <div className="atlas-arch-content" key={`${config.view}:${config.filter}:${graphGeneration ?? ""}`} data-testid="atlas-architecture-content">
+            {config.view === 'overview' ? <><RepositoryMapView graph={graph} graphNote={graphNote} overview={data} filter={config.filter} onNavigate={onNavigate} onSelect={onSelect} selection={selection} selectionPanel={selectionPanel} readSource={readSource} />
+                <details><summary>{text.summaryDetails}</summary><Overview data={data} filtered={filtered} filter={config.filter} onGroup={onGroup} onNavigate={onNavigate} /></details></>
+                : config.view === 'dependencies' ? <Dependencies data={filtered} empty={empty} onGroup={onGroup} graph={graph} onNavigate={onNavigate} />
                     : <Findings view={config.view} data={filtered} empty={empty} onNavigate={onNavigate} />}
         </div>}
         {ready && <details className="atlas-arch-evidence"><summary>{text.evidenceSummary}</summary><p>{text.evidenceDetail}</p></details>}

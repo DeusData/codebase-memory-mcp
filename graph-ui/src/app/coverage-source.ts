@@ -62,6 +62,7 @@ export async function loadCoverage(
 
     const scopes: CoverageScope[] = [];
     let answer = readCoverageAnswer(undefined);
+    let generation: string | undefined;
     let offset = 0;
     for (let page = 0; page < COVERAGE_MAX_PAGES; page += 1) {
         answer = readCoverageAnswer(
@@ -71,9 +72,14 @@ export async function loadCoverage(
                 scopeOffset: offset,
             }),
         );
+        if ((status.generation && answer.metadata.generation && status.generation !== answer.metadata.generation)
+            || (generation !== undefined && generation !== answer.metadata.generation)) {
+            throw new Error('Index generation changed while reading coverage. Run the local diagnosis again.');
+        }
+        generation = answer.metadata.generation;
         const scope = answer.scopes[0];
         if (scope === undefined) {
-            break;
+            throw new Error('The daemon returned no root coverage scope. Coverage completeness is unknown.');
         }
         scopes.push(scope);
         if (!scope.hasMore) {

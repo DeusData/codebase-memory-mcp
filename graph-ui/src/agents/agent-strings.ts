@@ -70,14 +70,13 @@ export const agentStrings = {
 
     sourceOff: 'live mode is off, and nothing is asked',
     sourceOffDetail:
-        'not one request goes to the bridge while this is off. Turn it on in the atlas menu with '
+        'not one request goes to the daemon while this is off. Turn it on in the atlas menu with '
         + '[g] live agents, or type "live agents" in the command line.',
-    sourceConnecting: 'connecting to the bridge',
-    sourceNone: 'live mode is on and no bridge is answering',
+    sourceConnecting: 'connecting to the daemon',
+    sourceNone: 'live mode is on and no daemon is answering',
     sourceNoneDetail:
-        'this window has no backend and cannot start one. The bridge reads the event file and hands '
-        + 'it on; without it there is no source, and an empty graph here would be the claim that '
-        + 'nobody is working:',
+        'check that the local daemon is running. It stores tool events in SQLite and serves them '
+        + 'on the same port as this map. Recorded history is retained locally while the connection retries.',
     sourceConnected: (file: string): string => `reading ${file}`,
     sourceReplay: (file: string): string => `replaying ${file}`,
     replayNote:

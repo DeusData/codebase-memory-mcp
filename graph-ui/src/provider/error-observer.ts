@@ -19,6 +19,8 @@ export type ReportSource = 'rpc' | 'api' | 'reader' | 'ui';
 export type ReportLevel = 'info' | 'warn' | 'error';
 
 export interface ErrorReport {
+    /** Request ownership, retained even if a different project opens before failure. */
+    project?: string;
     source: ReportSource;
     level: ReportLevel;
     message: string;

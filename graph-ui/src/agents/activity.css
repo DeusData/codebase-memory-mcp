@@ -37,3 +37,12 @@
 .cbm-activity-inspector pre { white-space: pre-wrap; font: 11px var(--atlas-mono); }
 .cbm-activity-inspector > button { margin-top: 12px; }
 @media(max-width: 850px) { .cbm-activity { padding: 16px; } .cbm-activity-body { grid-template-columns: 1fr; } .cbm-activity-inspector { border-left: 0; border-top: 1px solid var(--atlas-line); } .cbm-activity-metrics { grid-template-columns: repeat(2, 1fr); } }
+
+.cbm-agent-setup { border: 1px solid #365548; border-radius: 7px; padding: 9px 12px; background: #101b16; margin: 12px 0; }
+.cbm-agent-setup > summary { cursor: pointer; color: #99e7be; font-weight: 600; }
+.cbm-agent-setup p, .cbm-agent-setup li { color: #bbcec3; font-size: 13px; line-height: 1.5; }
+.cbm-agent-setup li { margin: 12px 0; }.cbm-agent-setup code { overflow-wrap: anywhere; }
+.cbm-agent-setup pre { white-space: pre-wrap; overflow-wrap: anywhere; padding: 12px; background: #07100b; border-radius: 5px; }
+.cbm-agent-setup button { border: 1px solid #496b59; background: #182d21; color: #dbf3e4; padding: 5px 9px; border-radius: 4px; cursor: pointer; }
+.cbm-agent-setup :focus-visible { outline: 2px solid #69ddbe; outline-offset: 3px; }
+.cbm-activity-source-status { color: #a7bfb0; font-size: 12px; line-height: 1.5; }

@@ -119,7 +119,8 @@ function withRun(runs: readonly RunState[], event: AgentEvent): {
             missed: 0,
         };
     }
-    const gap = event.seq > found.lastSeq + 1 ? event.seq - found.lastSeq - 1 : 0;
+    const gap = event.seq > found.lastSeq + 1 ? event.seq - found.lastSeq - 1
+        : event.seq > found.joinedAt && event.seq < found.lastSeq && found.missed > 0 ? -1 : 0;
     return {
         runs: runs.map((entry) =>
             (entry.run === event.run
@@ -131,6 +132,10 @@ function withRun(runs: readonly RunState[], event: AgentEvent): {
 
 /** Ein Ereignis in den Zustand aufnehmen. Rein, damit ein Test ihn nachbauen kann. */
 export function withEvent(state: AgentsState, event: AgentEvent): AgentsState {
+    // A retry must not increment counts or append another timeline row. Lower
+    // sequence numbers are still accepted when they arrive late.
+    if (state.actors.some((actor) => actor.events.some((seenEvent) =>
+        seenEvent.run === event.run && seenEvent.seq === event.seq))) return state;
     const id = event.agent;
     const existing = state.actors.find((actor) => actor.id === id);
     const seen = new Map(state.seen);

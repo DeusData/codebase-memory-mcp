@@ -210,8 +210,8 @@ export class RpcIntelligenceClient {
      * schreibt an derselben Stelle `""`, und ohne die Uebersetzung wuerde ein
      * Bindestrich als Dateiname durch das Produkt wandern.
      */
-    async queryGraph(project: string, query: string): Promise<QueryGraphResult> {
-        const text = await this.text('query_graph', { project, query });
+    async queryGraph(project: string, query: string, cursor?: string): Promise<QueryGraphResult> {
+        const text = await this.text('query_graph', { project, query, ...(cursor ? { cursor } : {}) });
         let parsed: CompactRows;
         try {
             parsed = parseCompactRows(text);
@@ -219,16 +219,33 @@ export class RpcIntelligenceClient {
             throw asParseFailure('query_graph', error);
         }
         return {
-            columns: parsed.columns,
+            ...parsed,
             rows: parsed.rows.map((cells) => cells.map(normalizeCell)),
-            total: parsed.total,
         };
     }
 
     /** Tabellarische Abfrage, schon als ein Objekt je Zeile. */
     async queryRows(project: string, query: string): Promise<Record<string, string>[]> {
         const result = await this.queryGraph(project, query);
-        return rowsToObjects(result.columns, result.rows);
+        const rows = [...result.rows];
+        let page = result;
+        const cursors = new Set<string>();
+        while (page.hasMore || page.truncated || page.nextCursor) {
+            if (!page.nextCursor || cursors.has(page.nextCursor) || cursors.size >= 20 || rows.length >= 10000) {
+                throw new EngineError('query_graph', `Incomplete query results: ${page.truncationReason ?? 'retrieval bound reached'} (${rows.length} rows read).`);
+            }
+            if (page.nextOffset !== undefined && page.nextOffset !== rows.length)
+                throw new EngineError('query_graph', 'Query continuation does not follow the returned rows.');
+            cursors.add(page.nextCursor);
+            page = await this.queryGraph(project, query, page.nextCursor);
+            if (page.offset !== rows.length || page.total !== result.total
+                || JSON.stringify(page.columns) !== JSON.stringify(result.columns) || page.rows.length === 0)
+                throw new EngineError('query_graph', 'Query pages disagree about their result snapshot.');
+            rows.push(...page.rows);
+        }
+        if (page.totalRelation === 'gte' || (result.total !== undefined && result.total > rows.length))
+            throw new EngineError('query_graph', `Incomplete query results (${rows.length} rows read).`);
+        return rowsToObjects(result.columns, rows);
     }
 
     async listProjects(): Promise<ListProjectsResult> {
@@ -386,7 +403,9 @@ export class RpcIntelligenceClient {
     ): Promise<DetectChangesResult> {
         return readDetectChanges(await this.json('detect_changes', {
             project,
-            ...(sinceRef ? { since: sinceRef } : {}),
+            // The UI's default is the working tree. Omitting the ref asks the
+            // daemon to compare with main, which may not exist in this clone.
+            since: sinceRef || 'HEAD',
             ...(args.depth !== undefined ? { depth: args.depth } : {}),
         }));
     }

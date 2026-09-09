@@ -37,6 +37,14 @@ export interface InstallUiLogOptions {
     transport?: UiLogTransport;
     buffer?: UiLogBuffer;
     session?: string;
+    getProject?: () => string;
+}
+
+let activeProject: string | undefined;
+
+/** The application also resolves projects without changing the page URL. */
+export function setUiLogProject(project: string): void {
+    activeProject = project;
 }
 
 export interface UiLogHandle {
@@ -129,8 +137,10 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
     const con = options.console ?? console;
     const session = options.session ?? newSessionId();
     const page = `${target.location.pathname}${target.location.search}`;
+    const getProject = options.getProject ?? (() => activeProject
+        ?? new URLSearchParams(target.location.search).get('project') ?? '');
     const buffer = options.buffer
-        ?? new UiLogBuffer({ page, session, transport: options.transport ?? httpUiLogTransport() });
+        ?? new UiLogBuffer({ page, session, getProject, transport: options.transport ?? httpUiLogTransport() });
 
     let recording = false;
     const guarded = (fn: () => void): void => {
@@ -155,8 +165,9 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
             original.apply(con, args);
             guarded(() => {
                 const described = describeArgs(args);
-                buffer.record(level, 'console', described.message,
-                    described.stack === undefined ? {} : { stack: described.stack });
+                buffer.record(level, 'console', described.message, {
+                    project: getProject(), stack: described.stack,
+                });
             });
         };
     }
@@ -165,6 +176,7 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
         guarded(() => {
             const described = describeReason(event.error);
             buffer.record('error', 'window', event.message.length > 0 ? event.message : described.message, {
+                project: getProject(),
                 stack: described.stack,
                 url: event.filename,
                 line: event.lineno,
@@ -175,8 +187,9 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
     const onRejection = (event: PromiseRejectionEvent): void => {
         guarded(() => {
             const described = describeReason(event.reason);
-            buffer.record('error', 'promise', described.message,
-                described.stack === undefined ? {} : { stack: described.stack });
+            buffer.record('error', 'promise', described.message, {
+                project: getProject(), stack: described.stack,
+            });
         });
     };
     const onHide = (): void => {
@@ -190,6 +203,7 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
     const stopObserving = observeErrors((report) => {
         guarded(() => {
             buffer.record(report.level, report.source, report.message, {
+                project: report.project ?? getProject(),
                 detail: report.detail,
                 stack: report.stack,
             });
@@ -203,6 +217,7 @@ export function installUiLog(options: InstallUiLogOptions = {}): UiLogHandle {
 
     const userAgent = (target.navigator as Navigator | undefined)?.userAgent ?? '';
     buffer.record('info', 'ui-log', `session ${session} started on ${page}`, {
+        project: getProject(),
         detail: `build ${ATLAS_VERSION}${ATLAS_BUILD_SUFFIX.length > 0 ? `-${ATLAS_BUILD_SUFFIX}` : ''}; ${userAgent}`,
         url: target.location.href,
     });

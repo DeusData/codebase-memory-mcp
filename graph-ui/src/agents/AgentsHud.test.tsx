@@ -255,14 +255,14 @@ describe('die Quelle', () => {
         expect(one('atlas-agents-source')?.getAttribute('data-state')).toBe('off');
     });
 
-    it('nennt ohne Bruecke den Befehl, der sie startet', async () => {
+    it('nennt bei fehlender Verbindung den vorhandenen Daemon', async () => {
         await render({
             status: status({ state: 'no-source', hello: undefined, error: 'refused' }),
             port: 4711,
         });
-        expect(textOf('atlas-agents-reading')).toContain('no bridge is answering');
+        expect(textOf('atlas-agents-reading')).toContain('no daemon is answering');
         expect(one('atlas-agents-command')?.getAttribute('data-command'))
-            .toBe('node tools/agent-bridge.mjs --port 4711');
+            .toBe('codebase-memory-mcp --ui');
     });
 
     it('gibt eine Wiedergabe als Wiedergabe aus und nicht als Gegenwart', async () => {

@@ -291,7 +291,7 @@ export const messages = {
             'mnemonic:a': 'show or hide the galaxy',
             'mnemonic:w': 'ask again where to start, and walk from there',
             'mnemonic:b': 'open the BUG hunt on the symbol in the twin',
-            'mnemonic:c': 'open the change scope',
+            'mnemonic:c': 'open change impact',
             'mnemonic:l': 'turn the local model on or off',
             'mnemonic:r': 'put every zone back to the width and height it starts with',
             'mnemonic:s': 'open or close the settings: the model, and what the drawing costs',
@@ -584,7 +584,7 @@ export const messages = {
             walk: 'walk',
             chat: 'chat',
             bug: 'bug hunt',
-            change: 'change scope',
+            change: 'change impact',
         },
         tabTitle: {
             flow: 'the recorded calls of the symbol in the twin, as a sequence and as steps',
@@ -598,7 +598,7 @@ export const messages = {
                 'No symbol in the twin yet, so there is no sequence to draw. Open a file and put '
                 + 'the caret in a function; the twin follows it, and this tab follows the twin.',
             walk:
-                'No walk is running. Start one from the atlas menu ("why am I here") and its steps '
+                'No walk is running. Start one from the atlas menu ("Choose a starting point") and its steps '
                 + 'appear here.',
             chat:
                 'Nothing was asked in this session yet. Type a question in the command line and '
@@ -619,7 +619,7 @@ export const messages = {
                 turns === 1 ? '1 question in this session' : `${turns} questions in this session`,
             chatIdle: 'nothing asked yet',
             bug: 'bug hunt',
-            change: 'change scope',
+            change: 'change impact',
         },
         /**
          * Die vier Griffe.
@@ -1092,10 +1092,10 @@ export const messages = {
         uiLogTitle: 'Frontend log',
         uiLogSource: (shown: number, total: number, path: string): string =>
             `read from GET /api/ui-log: ${shown} of ${total} lines of ${path}`,
-        uiLogPrevious: (path: string): string => `rotated once; the lines before these are in ${path}`,
+        uiLogPrevious: (path: string): string => `Local compatibility export archive: ${path}; retained history is read from SQLite.`,
         uiLogAbout:
-            'This page sends its console output, uncaught errors and failed requests to that file as '
-            + 'they happen. Attach the file to a bug report; an agent can read it with the same route.',
+            'This page records console output, uncaught errors and failed requests in the daemon’s local SQLite journal. '
+            + 'The JSONL file remains a bounded compatibility export. Review any content before sharing it; nothing is published automatically.',
         uiLogEmpty: 'nothing recorded yet',
         uiLogError: (detail: string): string => `the frontend log did not arrive: ${detail}`,
         reload: 'reload',

@@ -84,6 +84,7 @@ function announce(error: AtlasApiError, detail?: string): AtlasApiError {
         const refused = error.status >= 400 && error.status < 500;
         reportError({
             source: 'api',
+            project: new URL(error.route, 'http://daemon.invalid').searchParams.get('project') ?? '',
             level: refused ? 'warn' : 'error',
             message: error.message,
             detail,
@@ -225,8 +226,13 @@ export class AtlasApi {
     }
 
     /** The last `lines` lines of the server log. */
-    async logs(lines: number): Promise<LogTail> {
-        return readLogs(await this.getJson(`/api/logs?${new URLSearchParams({ lines: String(lines) }).toString()}`));
+    async logs(lines: number, minLevel?: 'debug' | 'info' | 'warn' | 'error', project?: string, filters?: { scope?: 'unattributed'; query?: string }): Promise<LogTail> {
+        const query = new URLSearchParams({ lines: String(lines) });
+        if (minLevel) query.set('min_level', minLevel);
+        if (project !== undefined) query.set('project', project);
+        if (filters?.scope) query.set('scope', filters.scope);
+        if (filters?.query?.trim()) query.set('q', filters.query.trim());
+        return readLogs(await this.getJson(`/api/logs?${query.toString()}`));
     }
 
     /** The codebase-memory-mcp processes on this machine, as the server sees them. */

@@ -473,6 +473,11 @@ void cbm_pipeline_add_file_error(cbm_pipeline_t *p, const char *path, const char
     e->reason = fe_strdup(reason);
     e->phase = fe_strdup(phase);
     p->file_errors_count++;
+    bool failed = phase && (!strcmp(phase, "read") || !strcmp(phase, "extract"));
+    cbm_log(failed ? CBM_LOG_ERROR : CBM_LOG_WARN,
+            failed ? "index.file.failed" : "index.file.diagnostic", "project", p->project_name,
+            "path", path ? path : "", "phase", phase ? phase : "", "reason", reason ? reason : "",
+            NULL);
 }
 
 void cbm_pipeline_get_file_errors(const cbm_pipeline_t *p, cbm_file_error_t **out, int *count) {

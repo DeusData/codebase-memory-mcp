@@ -1,8 +1,9 @@
 /**
  * Was ein Ereignis ist, und welche Art von Arbeit es zeigt.
  *
- * Die Ereignisse kommen von der Bruecke (tools/agent-bridge.mjs) und damit aus
- * einer Datei, die ein Hook geschrieben hat. Dieses Modul ist die einzige
+ * Die Ereignisse kommen aus dem SQLite-Journal desselben Daemons; lokale
+ * Werkzeug-Hooks senden ihre Metadaten an /api/agent-events. Historische
+ * Fixture-Bruecken bleiben separate Testwerkzeuge. Dieses Modul ist die einzige
  * Stelle, die aus einer fremden JSON-Zeile ein Ereignis dieses Produkts macht,
  * und es hat dabei genau zwei Aufgaben.
  *
@@ -60,7 +61,7 @@ export interface AgentEvent {
     intent?: string;
     /** Woher das Ereignis kommt, wenn die Quelle es sagt (etwa `fs`). */
     source: string;
-    /** Ob die Bruecke dieses Ereignis als Wiedergabe gekennzeichnet hat. */
+    /** Ob die Quelle dieses Ereignis als Wiedergabe gekennzeichnet hat. */
     replay: boolean;
     /** Die aufgezeichnete Zeit, wenn die Wiedergabe sie verschoben hat. */
     recordedTs?: number;

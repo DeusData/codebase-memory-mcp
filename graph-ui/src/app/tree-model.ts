@@ -418,6 +418,8 @@ export interface NotIndexedFileEntry {
 
 /** Die Coverage-Beilage von `index_status`, so wie der Server sie schreibt. */
 export interface IndexStatusCoverage {
+    /** The index generation whose summary counts were read, when reported. */
+    generation?: string;
     parsePartial: PartialFileEntry[];
     parsePartialCount: number;
     parsePartialTruncated: boolean;
@@ -501,6 +503,7 @@ export function readIndexStatusCoverage(payload: unknown): IndexStatusCoverage {
     }
 
     return {
+        ...(coverageString(raw['indexed_at']) ? { generation: coverageString(raw['indexed_at']) } : {}),
         parsePartial: partialFiles,
         parsePartialCount: asNumber(partial['count']),
         parsePartialTruncated: partial['truncated'] === true,
@@ -590,6 +593,19 @@ function readCoverageRows(value: unknown): CoverageRow[] {
             kind: coverageString(entry['kind']),
             detail: coverageString(entry['detail']),
         };
+        // The current MCP encoder replaces parse_partial's stored detail with
+        // structured ranges. Preserve that source evidence in the shared join.
+        if (row.kind === 'parse_partial' && !row.detail) {
+            const ranges = coverageArray(entry['ranges']).flatMap((range) => {
+                if (!isRecord(range)) return [];
+                const start = range['start'];
+                const end = range['end'];
+                return typeof start === 'number' && typeof end === 'number'
+                    && Number.isSafeInteger(start) && Number.isSafeInteger(end)
+                    && start > 0 && end >= start ? [`${start}-${end}`] : [];
+            });
+            if (ranges.length > 0) row.detail = `Source lines: ${ranges.join(', ')}`;
+        }
         const match = coverageString(entry['match']);
         if (match.length > 0) {
             row.match = match;
@@ -620,7 +636,8 @@ export function readCoverageAnswer(payload: unknown): CoverageAnswer {
     }
 
     const scopes: CoverageScope[] = [];
-    for (const entry of coverageArray(raw['scopes'])) {
+    const rawScopes = coverageArray(raw['scopes']);
+    for (const entry of rawScopes) {
         if (!isRecord(entry)) {
             continue;
         }
@@ -629,11 +646,17 @@ export function readCoverageAnswer(payload: unknown): CoverageAnswer {
             scope: coverageString(entry['scope']),
             status: coverageString(entry['status']),
             total: asNumber(entry['total']),
-            hasMore: entry['has_more'] === true,
+            // Production reports continuation on the response envelope. A
+            // scope's `truncated` also remains true on its final partial page,
+            // so that flag cannot determine whether another page is needed.
+            hasMore: typeof entry['has_more'] === 'boolean' ? entry['has_more']
+                : rawScopes.length === 1 && raw['has_more'] === true,
             entries: readCoverageRows(entry['entries']),
         };
         if (entry['next_offset'] !== undefined) {
             scope.nextOffset = asNumber(entry['next_offset']);
+        } else if (rawScopes.length === 1 && raw['next_offset'] !== undefined) {
+            scope.nextOffset = asNumber(raw['next_offset']);
         }
         scopes.push(scope);
     }
@@ -676,6 +699,8 @@ export interface CoverageIndex {
     records: ReadonlyMap<string, CoverageRecord>;
     /** Ehrliche Zeilen ueber Listen, die der Server gekappt hat. */
     truncations: string[];
+    /** All recorded root-scope rows were returned, not all repository files indexed. */
+    listingComplete?: boolean;
     counts: {
         partial: number;
         skipped: number;
@@ -743,6 +768,22 @@ export function buildCoverageIndex(input: {
     const records = new Map<string, CoverageRecord>();
     const truncations: string[] = [];
     const counts = { partial: 0, skipped: 0, notIndexedDirs: 0, notIndexedFiles: 0, scopeEntries: 0 };
+    const scopeReadings = new Map<string, { last: CoverageScope; total: number; consistent: boolean; rows: Map<string, CoverageRow> }>();
+    for (const scope of input.scopes ?? []) {
+        const key = scope.scope || '.';
+        const reading = scopeReadings.get(key) ?? { last: scope, total: scope.total, consistent: true, rows: new Map<string, CoverageRow>() };
+        reading.consistent &&= scope.total === reading.total
+            && ['known_gaps', 'no_recorded_issue', 'complete'].includes(scope.status);
+        reading.last = scope;
+        for (const row of scope.entries) reading.rows.set(`${row.path}\0${row.kind}`, row);
+        scopeReadings.set(key, reading);
+    }
+    const complete = (reading: NonNullable<ReturnType<typeof scopeReadings.get>>) =>
+        reading.consistent && !reading.last.hasMore && reading.rows.size === reading.total;
+    const rootReading = scopeReadings.get('.');
+    const listingComplete = rootReading !== undefined && complete(rootReading);
+    const rootRows = listingComplete ? [...rootReading!.rows.values()] : [];
+    const listedKind = (kind: string) => rootRows.filter((row) => row.kind === kind).length;
 
     const status = input.status;
     if (status !== undefined) {
@@ -787,17 +828,18 @@ export function buildCoverageIndex(input: {
         counts.notIndexedDirs = status.notIndexedDirsCount;
         counts.notIndexedFiles = status.notIndexedFilesCount;
 
-        if (status.parsePartialTruncated) {
+        if (status.parsePartialTruncated && (!listingComplete || listedKind('parse_partial') < status.parsePartialCount)) {
             truncations.push(
                 `the server cut the parse_partial list: ${status.parsePartialCount} recorded, fewer listed`,
             );
         }
-        if (status.skippedTruncated) {
+        const listedSkipped = rootRows.filter((row) => coverageStateForKind(row.kind) === 'skipped').length;
+        if (status.skippedTruncated && (!listingComplete || listedSkipped < status.skippedCount)) {
             truncations.push(
                 `the server cut the skipped list: ${status.skippedCount} recorded, fewer listed`,
             );
         }
-        if (status.notIndexedTruncated) {
+        if (status.notIndexedTruncated && (!listingComplete || listedKind('not_indexed_dir') < status.notIndexedDirsCount || listedKind('not_indexed_file') < status.notIndexedFilesCount)) {
             truncations.push(
                 'the server cut the not_indexed list: '
                 + `${status.notIndexedDirsCount} folders and ${status.notIndexedFilesCount} files recorded, fewer listed`,
@@ -817,15 +859,17 @@ export function buildCoverageIndex(input: {
             });
             counts.scopeEntries += 1;
         }
-        if (scope.hasMore) {
+    }
+    for (const [scope, reading] of scopeReadings) {
+        if (!complete(reading)) {
             truncations.push(
-                `the coverage store has more entries under "${scope.scope.length > 0 ? scope.scope : '.'}" `
-                + `than were fetched: ${scope.total} recorded`,
+                `the coverage reading under "${scope}" is incomplete or inconsistent: `
+                + `${reading.total} recorded, ${reading.rows.size} distinct rows loaded`,
             );
         }
     }
 
-    return { records, truncations, counts };
+    return { records, truncations, counts, listingComplete };
 }
 
 /**

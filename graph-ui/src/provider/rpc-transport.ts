@@ -160,7 +160,7 @@ export async function callTool(
     try {
         return await callToolUnobserved(name, args, opts);
     } catch (err) {
-        announceFailure(name, err);
+        announceFailure(name, err, args);
         throw err;
     }
 }
@@ -173,16 +173,19 @@ export async function callTool(
  * everything else is a failure (error). An aborted call is the caller's own
  * doing and is not announced.
  */
-function announceFailure(name: string, err: unknown): void {
+function announceFailure(name: string, err: unknown, args: Record<string, unknown>): void {
     if (!hasErrorObservers()) {
         return;
     }
     if (err instanceof Error && err.name === 'AbortError') {
         return;
     }
+    const project = typeof args['project'] === 'string' ? args['project']
+        : typeof args['project_name'] === 'string' ? args['project_name'] : '';
     if (err instanceof RpcError) {
         const level = err.notAllowed ? 'info' : err.kind === 'tool' ? 'warn' : 'error';
         reportError({
+            project,
             source: 'rpc',
             level,
             message: err.message,
@@ -192,7 +195,7 @@ function announceFailure(name: string, err: unknown): void {
         return;
     }
     const message = err instanceof Error ? err.message : String(err);
-    reportError({ source: 'rpc', level: 'error', message: `/rpc ${name}: ${message}`, stack: stackOf(err) });
+    reportError({ project, source: 'rpc', level: 'error', message: `/rpc ${name}: ${message}`, stack: stackOf(err) });
 }
 
 async function callToolUnobserved(
@@ -333,7 +336,7 @@ export async function callToolJson<T = unknown>(
             `/rpc ${name}: Antworttext war kein JSON (${(err as Error).message})`,
             { bodyText: truncate(text) },
         );
-        announceFailure(name, shape);
+        announceFailure(name, shape, args);
         throw shape;
     }
 }

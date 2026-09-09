@@ -46,6 +46,7 @@ import type { CodeAtlasSymbolKind } from '../core/focus-protocol';
 import type { SymbolSearchHit } from '../core/intelligence-provider';
 import type { RankedHit } from './semantic-search';
 import { rankHits } from './semantic-search';
+import { fileQueryPath } from './path-query';
 
 /** Wie viele Sofort-Vorschlaege hoechstens gerechnet werden. */
 export const MAX_LOCAL_SUGGESTIONS = 10;
@@ -66,6 +67,9 @@ export function settledSearchHits(indexed: RankedHit[], loaded: RankedHit[]): {
     hits: RankedHit[];
     source: 'index' | 'loaded';
 } {
+    if (loaded[0]?.pathMatch === 'file' && indexed[0]?.pathMatch !== 'file') {
+        return { hits: loaded, source: 'loaded' };
+    }
     if (indexed.length === 0 && loaded.length > 0) {
         return { hits: loaded, source: 'loaded' };
     }
@@ -116,6 +120,21 @@ export function localCandidates(index: LocalIndex): SymbolSearchHit[] {
     return [...index.symbols, ...fileCandidates(index.files)];
 }
 
+/** Rank the immediate local/cache pool without substituting a different file.
+ * A full path may be typed before the corresponding tree branch has loaded.
+ * Empty provisional results let the UI show its pending index lookup, so Enter
+ * cannot open an unrelated token match while that exact request is in flight.
+ */
+export function rankLocalCandidates(
+    candidates: readonly SymbolSearchHit[], query: string,
+    fanInOf: (hit: SymbolSearchHit) => number = () => 0,
+    limit: number = MAX_LOCAL_SUGGESTIONS,
+): RankedHit[] {
+    const path = fileQueryPath(query);
+    const eligible = path ? candidates.filter(hit => hit.filePath === path) : candidates;
+    return rankHits(eligible, query, fanInOf).slice(0, limit);
+}
+
 /**
  * Die Sofort-Vorschlaege zu einer Anfrage, ohne einen einzigen Serverweg.
  *
@@ -131,5 +150,5 @@ export function localSuggestions(
     if (index.symbols.length === 0 && index.files.length === 0) {
         return [];
     }
-    return rankHits(localCandidates(index), query, fanInOf).slice(0, limit);
+    return rankLocalCandidates(localCandidates(index), query, fanInOf, limit);
 }

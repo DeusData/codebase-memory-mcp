@@ -42,12 +42,12 @@ import type { PresentationProfile } from '../twin/presentation-profile';
 export type WhyIntent = 'bug' | 'change' | 'understand' | 'entry';
 
 /** What the panel asks. */
-export const WHY_HEADLINE = 'Why are you here?';
+export const WHY_HEADLINE = 'Choose a starting point';
 
 /** The sentence under the headline: where the answer goes and what it costs. */
 export const WHY_SUBLINE =
-    'Your answer sets what the twin shows on the right. It is kept in this browser only, '
-    + 'so the question is not asked again for this project.';
+    'Open a repository map, inspect a change, or follow indexed calls. '
+    + 'Select code to see Selection context with its graph evidence and recorded activity.';
 
 /**
  * What the button under the cards says, and why it stopped saying "Not now".
@@ -61,7 +61,7 @@ export const WHY_SUBLINE =
  * The other three causes are fixed in App.tsx: opening a file, choosing a
  * symbol or asking a question closes it, and Escape closes it too.
  */
-export const WHY_DECLINE_LABEL = 'Close this question';
+export const WHY_DECLINE_LABEL = 'Continue exploring';
 
 /** What the button says when it is touched: what closing costs, which is nothing. */
 export const WHY_DECLINE_TOOLTIP =
@@ -77,7 +77,7 @@ export const WHY_DECLINE_TOOLTIP =
  * its shortcut, and a keyboard-first surface with four mouse-only entries is
  * keyboard-first for the top row only.
  */
-export const WHY_MENU_LABEL = '[w]hy am I here';
+export const WHY_MENU_LABEL = '[w]here to start';
 
 /** One card. `stub` is the honest sentence a card that does not open anything owes. */
 export interface WhyCard {
@@ -110,7 +110,7 @@ export const WHY_CARDS: readonly WhyCard[] = [
     {
         intent: 'understand',
         label: 'Understand the project',
-        detail: 'Walk the files in the order the imports put them in: what everything rests on comes first.',
+        detail: 'Open the repository map, find an entry point, and follow relationships to their source.',
     },
     {
         intent: 'entry',

@@ -8,7 +8,8 @@
  * into the failure had nothing to read. This buffer is the second copy: every
  * console call, every uncaught error, every rejected promise and every failed
  * /rpc or /api request is queued here and posted to POST /api/ui-log, which
- * appends it to <cache_dir>/logs/ui.log on the server (src/ui/http_server.c).
+ * persists it in the local SQLite journal and a bounded compatibility JSONL
+ * export on the same daemon (src/ui/http_server.c).
  * The file is what a bug report attaches and what `tail -f` reads.
  *
  * The rules of the buffer, and why each is there:
@@ -36,6 +37,8 @@
 export type UiLogLevel = 'debug' | 'log' | 'info' | 'warn' | 'error';
 
 export interface UiLogEntry {
+    /** Project at recording time; an empty string explicitly means daemon-wide. */
+    project?: string;
     /** When the entry was recorded on the page, ISO 8601. */
     ts: string;
     /** Position in this page's sequence, from 1. Gaps mean dropped entries. */
@@ -66,6 +69,7 @@ export interface UiLogTransport {
 }
 
 export interface UiLogExtra {
+    project?: string;
     detail?: string;
     stack?: string;
     url?: string;
@@ -93,6 +97,8 @@ export interface UiLogOptions {
     page: string;
     session: string;
     transport: UiLogTransport;
+    /** Sampled when recording, never when sending a delayed or retried batch. */
+    getProject?: () => string;
     now?: () => Date;
     schedule?: (fn: () => void, ms: number) => unknown;
     cancel?: (handle: unknown) => void;
@@ -153,6 +159,10 @@ export class UiLogBuffer {
             source: source.slice(0, 64),
             message: capField(message),
         };
+        const project = extra.project ?? this.options.getProject?.();
+        if (project !== undefined) {
+            entry.project = project;
+        }
         if (extra.detail !== undefined && extra.detail.length > 0) {
             entry.detail = capField(extra.detail);
         }
@@ -202,6 +212,9 @@ export class UiLogBuffer {
             const lost = this.droppedSinceFlush;
             this.droppedSinceFlush = 0;
             batch.unshift({
+                // Loss can span several projects. Do not attribute the aggregate
+                // to whichever project happens to be open when delivery resumes.
+                project: '',
                 ts: this.now().toISOString(),
                 seq: ++this.seq,
                 level: 'warn',

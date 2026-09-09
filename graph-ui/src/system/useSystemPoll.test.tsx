@@ -1,5 +1,5 @@
 // @vitest-environment jsdom
-import { act } from 'react';
+import { act, useLayoutEffect } from 'react';
 import { createRoot, type Root } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { useSystemPoll } from './useSystemPoll';
@@ -100,6 +100,23 @@ describe('System polling lifecycle', () => {
         expect(read).toHaveBeenCalledTimes(1);
         await visible('visible');
         expect(state().data).toBe(5);
+    });
+    it('never exposes the previous scope before passive effects or while paused', async () => {
+        const seen: Array<number | null> = [];
+        function Observer({ read, paused }: { read: () => Promise<number>; paused: boolean }) {
+            const reading = useSystemPoll(read, true, paused, 100);
+            useLayoutEffect(() => { seen.push(reading.data); });
+            return <output>{JSON.stringify(reading)}</output>;
+        }
+        const readA = vi.fn().mockResolvedValue(42), readB = vi.fn().mockResolvedValue(99);
+        await act(async () => { root.render(<Observer read={readA} paused={false} />); });
+        expect(state().data).toBe(42);
+        seen.length = 0;
+        await act(async () => { root.render(<Observer read={readB} paused />); });
+        expect(seen.every(value => value === null)).toBe(true);
+        expect(readB).not.toHaveBeenCalled();
+        await act(async () => { root.render(<Observer read={readB} paused={false} />); });
+        expect(state().data).toBe(99);
     });
     it('cleans up timers and visibility listeners on unmount', async () => {
         const read = vi.fn().mockResolvedValue(1);

@@ -353,6 +353,18 @@ describe('readCoverageAnswer', () => {
 
     const answer = readCoverageAnswer(SCOPE_PAYLOAD);
 
+    it('preserves structured parser ranges from the real coverage RPC in the shared evidence', () => {
+        const parsed = readCoverageAnswer({ scopes: [{ scope: '.', entries: [
+            { path: 'partial.c', kind: 'parse_partial', ranges: [{ start: 2, end: 2 }, { start: 5, end: 8 }, { start: 0, end: 4 }, { start: 7, end: 3 }, { start: '1', end: 2 }] },
+            { path: 'explicit.c', kind: 'parse_partial', detail: 'original detail', ranges: [{ start: 1, end: 2 }] },
+            { path: 'unknown.c', kind: 'parse_partial', ranges: [{ start: -1, end: 2 }] },
+        ] }] });
+        const index = buildCoverageIndex({ scopes: parsed.scopes });
+        expect(index.records.get('partial.c')?.reason).toBe('Source lines: 2-2, 5-8');
+        expect(index.records.get('explicit.c')?.reason).toBe('original detail');
+        expect(index.records.get('unknown.c')?.reason).toBe('');
+    });
+
     it('liest den Scope samt Seitenansage', () => {
         expect(answer.scopes[0]?.scope).toBe('.');
         expect(answer.scopes[0]?.total).toBe(3);
@@ -389,6 +401,26 @@ describe('readCoverageAnswer', () => {
 });
 
 describe('buildCoverageIndex', () => {
+
+    it('keeps unresolved status omissions when pages repeat rows, change totals, or cover only a subtree', () => {
+        const status = readIndexStatusCoverage({ parse_partial: { files: [], count: 2, truncated: true } });
+        const page = { requestedScope: '.', scope: '.', status: 'known_gaps', total: 2, hasMore: true, entries: [{ path: 'partial.c', kind: 'parse_partial', detail: '1-2' }] };
+        const repeated = buildCoverageIndex({ status, scopes: [page, { ...page, hasMore: false }] });
+        expect(repeated.listingComplete).toBe(false);
+        expect(repeated.truncations.some((line) => line.includes('cut the parse_partial'))).toBe(true);
+        expect(repeated.truncations.some((line) => line.includes('1 distinct rows loaded'))).toBe(true);
+        const changed = buildCoverageIndex({ scopes: [page, { ...page, total: 1, hasMore: false }] });
+        expect(changed.listingComplete).toBe(false);
+        const subtree = buildCoverageIndex({ status, scopes: [{ ...page, scope: 'src', total: 1, hasMore: false }] });
+        expect(subtree.listingComplete).toBe(false);
+        expect(subtree.truncations.some((line) => line.includes('cut the parse_partial'))).toBe(true);
+    });
+
+    it('does not call unavailable coverage complete even when its empty count agrees', () => {
+        const index = buildCoverageIndex({ scopes: [{ requestedScope: '.', scope: '.', status: 'coverage_unavailable', total: 0, hasMore: false, entries: [] }] });
+        expect(index.listingComplete).toBe(false);
+        expect(index.truncations).toHaveLength(1);
+    });
 
     const index = buildCoverageIndex({
         status: readIndexStatusCoverage(STATUS_PAYLOAD),

@@ -9,10 +9,17 @@ export interface SystemReading<T> {
 
 /** Read-only polling. Each lifecycle owns its responses; hidden views never commit them. */
 export function useSystemPoll<T>(read: () => Promise<T>, active: boolean, paused: boolean, intervalMs: number) {
-    const [reading, setReading] = useState<SystemReading<T>>({ data: null, updatedAt: null, error: null, loading: false });
+    const empty: SystemReading<T> = { data: null, updatedAt: null, error: null, loading: false };
+    const [owned, setOwned] = useState({ owner: read, reading: empty });
     const refreshRef = useRef<() => void>(() => {});
 
     useEffect(() => {
+        const setReading = (update: SystemReading<T> | ((previous: SystemReading<T>) => SystemReading<T>)) => {
+            setOwned(previous => {
+                const current = previous.owner === read ? previous.reading : { data: null, updatedAt: null, error: null, loading: false };
+                return { owner: read, reading: typeof update === 'function' ? update(current) : update };
+            });
+        };
         let disposed = false;
         let generation = 0;
         let timer: ReturnType<typeof setTimeout> | undefined;
@@ -62,5 +69,5 @@ export function useSystemPoll<T>(read: () => Promise<T>, active: boolean, paused
         };
     }, [read, active, paused, intervalMs]);
 
-    return { ...reading, refresh: useCallback(() => refreshRef.current(), []) };
+    return { ...(owned.owner === read ? owned.reading : empty), refresh: useCallback(() => refreshRef.current(), []) };
 }

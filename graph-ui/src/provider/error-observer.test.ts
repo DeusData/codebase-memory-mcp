@@ -50,6 +50,16 @@ describe('reportError', () => {
 });
 
 describe('the /rpc client announces', () => {
+    it('retains request ownership for transport and payload failures and marks project-free calls global', async () => {
+        const reports = listen();
+        await expect(callToolText('query_graph', { project: 'A' }, { fetch: replying(500, 'oom') })).rejects.toThrow();
+        await expect(callToolJson('index_status', { project: 'B' }, {
+            fetch: replying(200, '{"jsonrpc":"2.0","id":2,"result":{"content":[{"type":"text","text":"not json"}]}}'),
+        })).rejects.toThrow();
+        await expect(callToolText('list_projects', {}, { fetch: replying(500, 'down') })).rejects.toThrow();
+        expect(reports.map((report) => report.project)).toEqual(['A', 'B', '']);
+    });
+
     it('a refused tool as info, with the tool name in the message', async () => {
         const reports = listen();
         await expect(callToolText('index_repository', {}, {

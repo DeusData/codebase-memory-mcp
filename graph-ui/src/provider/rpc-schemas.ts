@@ -157,6 +157,15 @@ export interface QueryGraphResult {
     columns: string[];
     rows: string[][];
     total?: number;
+    returned?: number;
+    totalRelation?: string;
+    hasMore?: boolean;
+    truncated?: boolean;
+    offset?: number;
+    nextOffset?: number;
+    nextCursor?: string;
+    truncationReason?: string;
+    warning?: string;
 }
 
 /** Ein Kandidat, wenn ein blosser Name auf mehr als ein Symbol passte. */

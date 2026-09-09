@@ -34,6 +34,17 @@ function api(reply: { ok?: boolean; status?: number; body: string }): { api: Atl
 }
 
 describe('AtlasApi, the projects routes', () => {
+    it('encodes history filters without interpreting search as URL parameters', async () => {
+        const { api: client, calls } = api({ body: '{"lines":[],"total":0,"query":"path&level=info"}' });
+        const result = await client.logs(200, 'error', undefined, { scope: 'unattributed', query: 'path&level=info' });
+        const url = new URL(calls[0]!.url);
+        expect(url.searchParams.get('scope')).toBe('unattributed');
+        expect(url.searchParams.get('min_level')).toBe('error');
+        expect(url.searchParams.get('q')).toBe('path&level=info');
+        expect(url.searchParams.has('level')).toBe(false);
+        expect(result.query).toBe('path&level=info');
+    });
+
     it('starts an index job with a JSON body over POST', async () => {
         const { api: client, calls } = api({ status: 202, body: '{"status":"indexing","slot":1,"path":"/repo"}' });
         const started = await client.startIndex('/repo', 'repo');

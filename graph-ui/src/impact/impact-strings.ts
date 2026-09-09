@@ -171,6 +171,14 @@ export function impactEvidenceValue(
 
 /** Die Ueberschrift der Flaeche. */
 export const IMPACT_TITLE = 'What would this change reach?';
+export const IMPACT_RISK_UNRESOLVED = 'RISK UNRESOLVED';
+export const IMPACT_NO_ELEVATED_SIGNAL = 'NO ELEVATED SIGNAL';
+export const IMPACT_UNRESOLVED_TOOLTIP =
+    'Some risk inputs are missing. No elevated rule fired; this does not establish low risk.';
+export function impactUnresolvedInputs(unmeasured: number, total: number): string {
+    return `Risk inputs are missing for ${unmeasured} of ${total} symbols. `
+        + 'No elevated signal is not evidence of safety. Open an affected file to inspect its revision, dependency paths and local Git evidence.';
+}
 
 /**
  * Wie das [a]tlas-Menue den Weg hierher nennt, mit seinem Buchstaben

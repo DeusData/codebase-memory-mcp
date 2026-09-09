@@ -77,6 +77,34 @@ function fakeClient(pages: unknown[], status: unknown = STATUS) {
 
 describe('loadCoverage', () => {
 
+    it('follows the real envelope cursor and resolves abbreviated status lists after all pages arrive', async () => {
+        const summary = { ...STATUS, indexed_at: 'g', parse_partial: { files: [], count: 1, truncated: true }, not_indexed: { dirs: [], dirs_count: 1, files: [], files_count: 1, truncated: true } };
+        const entries = [{ path: 'partial.c', kind: 'parse_partial' }, { path: 'build', kind: 'not_indexed_dir' }, { path: 'image.png', kind: 'not_indexed_file' }];
+        const envelope = (start: number, end: number) => ({
+            project: 'p', metadata: METADATA, has_more: end < entries.length,
+            ...(end < entries.length ? { next_offset: end } : {}),
+            scopes: [{ scope: '.', status: 'known_gaps', total: 3, returned: end - start, truncated: true, entries: entries.slice(start, end) }],
+        });
+        const { client, calls } = fakeClient([envelope(0, 2), envelope(2, 3)], summary);
+        const reading = await loadCoverage(client, 'p');
+        expect(calls.filter((call) => call.tool === 'check_index_coverage').map((call) => call.scopeOffset)).toEqual([0, 2]);
+        expect(reading.index.records.size).toBe(3);
+        expect(reading.index.records.get('partial.c')?.state).toBe('partial');
+        expect(reading.index.listingComplete).toBe(true);
+        expect(reading.index.truncations).toEqual([]);
+    });
+
+    it('rejects an index generation change across coverage pages or after the summary', async () => {
+        const first = page([{ path: 'a.c', kind: 'parse_partial' }], true, 1);
+        const second = { ...page([{ path: 'b.c', kind: 'parse_partial' }], false), metadata: { ...METADATA, generation: 'other' } };
+        await expect(loadCoverage(fakeClient([first, second]).client, 'p')).rejects.toThrow('Index generation changed');
+        await expect(loadCoverage(fakeClient([first], { ...STATUS, indexed_at: 'old' }).client, 'p')).rejects.toThrow('Index generation changed');
+    });
+
+    it('does not turn a missing root scope into a successful empty reading', async () => {
+        await expect(loadCoverage(fakeClient([{ scopes: [], metadata: METADATA }]).client, 'p')).rejects.toThrow('no root coverage scope');
+    });
+
     it('fragt beide Quellen und legt sie zusammen', async () => {
         const { client, calls } = fakeClient([page([{ path: 'src/b.ts', kind: 'discovery' }], false)]);
         const reading = await loadCoverage(client, 'p');

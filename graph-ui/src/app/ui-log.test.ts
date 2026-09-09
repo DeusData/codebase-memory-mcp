@@ -57,6 +57,29 @@ function harness(answers: () => boolean = () => true) {
 }
 
 describe('UiLogBuffer', () => {
+    it('preserves the recorded project across project changes and failed batch retries', async () => {
+        let project = 'project-A';
+        let accepted = false;
+        const posts: UiLogPayload[] = [];
+        const buffer = new UiLogBuffer({
+            page: '/', session: 'projects', getProject: () => project,
+            transport: { send: async (payload) => { posts.push(payload); return accepted; } },
+            schedule: () => 0, cancel: () => undefined,
+        });
+        buffer.record('error', 'console', 'A failed');
+        await buffer.flush();
+        project = 'project-B';
+        buffer.record('warn', 'console', 'B warning');
+        buffer.record('error', 'rpc', 'late A request failed', { project: 'project-A' });
+        buffer.record('error', 'api', 'daemon request failed', { project: '' });
+        accepted = true;
+        await buffer.flush();
+        expect(posts[1]?.entries.map((entry) => [entry.message, entry.project])).toEqual([
+            ['A failed', 'project-A'], ['B warning', 'project-B'],
+            ['late A request failed', 'project-A'], ['daemon request failed', ''],
+        ]);
+    });
+
     it('queues entries with a sequence and a timestamp, and posts them as one batch on the timer', async () => {
         const { buffer, posts, timers, fire } = harness();
         buffer.record('error', 'rpc', 'get_code_snippet returned no source', { detail: 'HTTP 200' });

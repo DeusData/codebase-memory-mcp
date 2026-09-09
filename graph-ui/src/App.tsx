@@ -119,6 +119,15 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import AtlasChrome, { CLOSE_COMMAND_SEARCH_EVENT, OPEN_COMMAND_SEARCH_EVENT } from './app/AtlasChrome';
 import ArchitecturePanel from './architecture/ArchitecturePanel';
+import SelectionContextPanel from './why/SelectionContext';
+import ChangeAnalysisWorkspace from './impact/ChangeAnalysisWorkspace';
+import type { SelectionImpactTarget } from './impact/selection-impact';
+import SourceEvidenceDrawer, { fileQualifiedName, type SourceEvidenceTarget } from './architecture/SourceEvidenceDrawer';
+import { setUiLogProject } from './app/ui-log-install';
+import DaemonAlerts from './diagnostics/DaemonAlerts';
+import DiagnosticsPanel from './diagnostics/DiagnosticsPanel';
+import { useDaemonLogFeed } from './diagnostics/useDaemonLogFeed';
+import { resolveRepositorySelection, useRepositorySnapshot } from './architecture/repository-source';
 import ActivityPanel from './agents/ActivityPanel';
 import WelcomePanel from './app/WelcomePanel';
 import BrowserChatDock from './browser-ai/BrowserChatDock';
@@ -192,12 +201,11 @@ import {
     searchByMeaning,
 } from './search/find-by-meaning';
 import type { RankedHit } from './search/semantic-search';
-import { rankHits } from './search/semantic-search';
 import {
     commandExamplesFor,
     exampleSymbolOf,
 } from './search/command-examples';
-import { EMPTY_LOCAL_INDEX, localCandidates, settledSearchHits } from './search/local-suggestions';
+import { EMPTY_LOCAL_INDEX, localCandidates, rankLocalCandidates, settledSearchHits } from './search/local-suggestions';
 import type { LocalIndex } from './search/local-suggestions';
 import {
     isSearchable,
@@ -259,12 +267,7 @@ import type { BugWizardStatus } from './traces/BugWizard';
 import { bugPaths, resolveHop } from './traces/bug-paths';
 import type { BugPathNode, BugPathsDto } from './traces/bug-paths';
 import { BUG_WIZARD_MENU_LABEL } from './traces/bug-wizard-strings';
-import ImpactPanel from './impact/ImpactPanel';
-import type { ImpactMode, ImpactStatus } from './impact/ImpactPanel';
-import { readImpact } from './impact/impact-source';
-import { refRejection } from './impact/impact-model';
-import type { ImpactModel, ImpactTarget } from './impact/impact-model';
-import { IMPACT_MENU_LABEL, impactRefRejected } from './impact/impact-strings';
+import { IMPACT_MENU_LABEL } from './impact/impact-strings';
 import { SIDECAR_ORIGIN } from './llm/sidecar';
 import type { CacheModel, SidecarReading, SidecarState } from './llm/sidecar';
 import AtlasChatPanel from './chat/AtlasChatPanel';
@@ -744,12 +747,17 @@ declare global {
 export default function App(): JSX.Element {
     const [workspace, setWorkspace] = useState<Workspace>(() => {
         try {
+            const requested = new URLSearchParams(window.location.search).get('workspace');
+            if (requested === 'explore' || requested === 'galaxy' || requested === 'architecture' || requested === 'agents' || requested === 'system') return requested;
             const saved = localStorage.getItem('cbm.workspace');
             return saved === 'explore' || saved === 'galaxy' || saved === 'agents' || saved === 'system' ? saved : 'architecture';
         } catch { return 'architecture'; }
     });
     const changeWorkspace = (value: Workspace): void => {
         setWorkspace(value);
+        const url = new URL(window.location.href);
+        url.searchParams.set('workspace', value);
+        window.history.replaceState(window.history.state, '', url);
         try { localStorage.setItem('cbm.workspace', value); } catch { /* Session-only preference. */ }
     };
     const [welcomeOpen, setWelcomeOpen] = useState(() => {
@@ -778,6 +786,7 @@ export default function App(): JSX.Element {
     };
     const client = useMemo(() => new RpcIntelligenceClient({}), []);
     const api = useMemo(() => new AtlasApi({}), []);
+    const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
 
     /*
      * What the projects panel asks the server. The list comes over /rpc like
@@ -807,6 +816,9 @@ export default function App(): JSX.Element {
     }, []);
 
     const [project, setProject] = useState('');
+    const [logScopeChoice, setLogScopeChoice] = useState<{ project: string; scope: 'project' | 'daemon' }>();
+    const logScope = logScopeChoice?.project === project ? logScopeChoice.scope : 'project';
+    const daemonLogFeed = useDaemonLogFeed(api, Boolean(project), 3000, logScope === 'project' ? project : undefined);
     const [projectDetail, setProjectDetail] = useState('resolving project ...');
     const [serverOk, setServerOk] = useState<boolean | undefined>(undefined);
     const [counts, setCounts] = useState<{ nodes?: number; edges?: number }>({});
@@ -951,8 +963,8 @@ export default function App(): JSX.Element {
      * Der Live-Modus der Agenten (W11a).
      *
      * AUS per Vorgabe, und er wird auch nicht gespeichert. Dieselbe Regel wie
-     * beim lokalen Modell: solange er aus ist, geht keine einzige Anfrage an die
-     * Bruecke, und eine Seite, die nach dem naechsten Laden von selbst wieder zu
+     * beim lokalen Modell: solange er aus ist, geht keine einzige Agentenabfrage an den
+     * Daemon, und eine Seite, die nach dem naechsten Laden von selbst wieder zu
      * reden anfaengt, waere ein Schalter, ueber den der Leser nur einmal
      * entschieden hat. Er steht hier und nicht im Graph-Panel, weil ihn zwei
      * Wege umlegen: der Menuepunkt und die Kommandozeile.
@@ -967,19 +979,12 @@ export default function App(): JSX.Element {
      * das ganze Fenster fuellt.
      */
     const [fullscreenToggle, setFullscreenToggle] = useState(0);
-    /*
-     * Der Port der Bruecke, aus der Adresszeile.
-     *
-     * `?agents=<port>` und sonst 4142. Aus der Adresse und nicht aus einer
-     * Einstellung, weil es keine Wahl des Lesers ist, sondern die Lage seiner
-     * Maschine: wer eine zweite Bruecke auf einem anderen Port faehrt, sagt es
-     * beim Aufrufen, und ein Beweislauf tut dasselbe.
-     */
+    // Compatibility prop for existing HUD consumers; the stream uses this daemon origin.
     const bridgePort = useMemo(
         () => bridgePortFromSearch(typeof location === 'undefined' ? '' : location.search),
         [],
     );
-    const agentStream = useAgentStream({ on: liveAgentsOn, port: bridgePort });
+    const agentStream = useAgentStream({ on: liveAgentsOn, project });
     const agents = useMemo(
         () => ({ ...agentStream, port: bridgePort, on: liveAgentsOn }),
         [agentStream, bridgePort, liveAgentsOn],
@@ -1108,6 +1113,8 @@ export default function App(): JSX.Element {
 
     const [galaxyOn, setGalaxyOn] = useState(true);
     const [layout, setLayout] = useState<GraphData | undefined>(undefined);
+    const [analysisSelection, setAnalysisSelection] = useState<{ project: string; target?: SelectionImpactTarget }>();
+    const [sourceEvidence, setSourceEvidence] = useState<{ project: string; target: SourceEvidenceTarget }>();
     const [hits, setHits] = useState<RankedHit[]>(noHits);
     const [selectedHit, setSelectedHit] = useState(0);
     const [searchStatus, setSearchStatus] = useState<SearchOverlayStatus>('ready');
@@ -1358,6 +1365,7 @@ export default function App(): JSX.Element {
     const [overviewLoading, setOverviewLoading] = useState(false);
     const [overviewError, setOverviewError] = useState<string | undefined>();
     const [overviewRevision, setOverviewRevision] = useState(0);
+    const repositoryReading = useRepositorySnapshot(project, overviewRevision);
     const [entryQuery, setEntryQuery] = useState('');
     const [entryHits, setEntryHits] = useState<RankedHit[]>(noHits);
     const [entryStatus, setEntryStatus] = useState<EntrySearchStatus>('idle');
@@ -1384,24 +1392,6 @@ export default function App(): JSX.Element {
     const bugTicket = useRef(0);
 
     const impactOpen = explainOpen && explainTab === 'change';
-    const [impactMode, setImpactMode] = useState<ImpactMode>('worktree');
-    const [impactModel, setImpactModel] = useState<ImpactModel | undefined>(undefined);
-    const [impactStatus, setImpactStatus] = useState<ImpactStatus>('idle');
-    const [impactMessage, setImpactMessage] = useState('');
-    const [impactRouteNote, setImpactRouteNote] = useState('');
-    const [refDraft, setRefDraft] = useState('');
-    const [refError, setRefError] = useState('');
-    /**
-     * Der Vergleichspunkt, gegen den die angezeigte Lesung wirklich gefahren
-     * wurde.
-     *
-     * Getrennt vom Feldinhalt, und das ist der Punkt: wer tippt, aendert nicht
-     * die Frage, die auf dem Bildschirm beantwortet ist. Erst der Knopf setzt
-     * ihn, und nur ein Ref, dessen Form geprueft wurde, kommt hier an.
-     */
-    const [appliedRef, setAppliedRef] = useState<string | undefined>(undefined);
-    const impactTicket = useRef(0);
-
     // ------------------------------------------ Das lokale Modell (W5a) ----
 
     /*
@@ -1518,7 +1508,11 @@ export default function App(): JSX.Element {
     const readerFocusRange = useMemo(() => readerSelection?.path === activePath
         ? { startLine: readerSelection.startLine, endLine: readerSelection.endLine > readerSelection.startLine && readerSelection.endColumn === 1 ? readerSelection.endLine - 1 : readerSelection.endLine }
         : caretLine !== undefined && caretLine > 0 ? { startLine: caretLine, endLine: caretLine } : undefined, [readerSelection, activePath, caretLine]);
-    const activeGalaxySelection = galaxySelectionProject === project ? galaxySelection : undefined;
+    const activeGalaxySelection = useMemo(() => resolveRepositorySelection(
+        galaxySelectionProject === project ? galaxySelection : undefined, repositoryReading.snapshot,
+    ), [galaxySelectionProject, project, galaxySelection, repositoryReading.snapshot]);
+    const selectionUnavailable = Boolean(galaxySelectionProject === project && galaxySelection && repositoryReading.snapshot && !activeGalaxySelection);
+    const selectionUnavailableText = 'The previous selection is absent from this bounded index snapshot. Choose a source element again to inspect its current evidence.';
     const selectedGraphSymbol = useMemo(() => hierarchySymbolOf(activeGalaxySelection, project), [activeGalaxySelection, project]);
     const readerFocusSymbol = (twinSymbol?.projectName === undefined || twinSymbol.projectName === project) && symbolMatchesReader(twinSymbol, activePath, readerFocusRange)
         ? twinSymbol : symbolMatchesReader(selectedGraphSymbol, activePath, readerFocusRange) ? selectedGraphSymbol : undefined;
@@ -1532,6 +1526,7 @@ export default function App(): JSX.Element {
     useEffect(() => {
         const fromUrl = new URLSearchParams(window.location.search).get('project') ?? '';
         if (fromUrl.length > 0) {
+            setUiLogProject(fromUrl);
             setProject(fromUrl);
             setProjectDetail('');
             return;
@@ -1548,7 +1543,8 @@ export default function App(): JSX.Element {
                     setProjectDetail(messages.statusbar.noProjectIndexed);
                     return;
                 }
-                setProject(first.name);
+                setUiLogProject(first.name);
+                    setProject(first.name);
                 setProjectDetail('');
             })
             .catch((error: unknown) => {
@@ -1594,7 +1590,7 @@ export default function App(): JSX.Element {
         return () => {
             cancelled = true;
         };
-    }, [client, project]);
+    }, [client, project, overviewRevision]);
 
     // ------------------------------------------------------- Baum ----------
 
@@ -1640,7 +1636,7 @@ export default function App(): JSX.Element {
         return () => {
             cancelled = true;
         };
-    }, [api, project]);
+    }, [api, project, overviewRevision]);
 
     /*
      * Die zweite Baumquelle: der Coverage-Store.
@@ -1683,7 +1679,7 @@ export default function App(): JSX.Element {
         return () => {
             cancelled = true;
         };
-    }, [client, project]);
+    }, [client, project, overviewRevision]);
 
     /**
      * Die Vereinigung, aus der der Explorer zeichnet.
@@ -2305,7 +2301,7 @@ export default function App(): JSX.Element {
 
     const onLayout = useCallback((loaded: GraphData) => {
         setLayout(loaded);
-    }, []);
+    }, [project]);
 
     /**
      * Ein Klick in die Galaxie.
@@ -2429,7 +2425,7 @@ export default function App(): JSX.Element {
                 : localPool;
             return pool.length === 0
                 ? noHits
-                : rankHits(pool, query, fanInOf).slice(0, MAX_SEARCH_ROWS);
+                : rankLocalCandidates(pool, query, fanInOf, MAX_SEARCH_ROWS);
         },
         [fanInOf, localPool],
     );
@@ -2471,9 +2467,12 @@ export default function App(): JSX.Element {
      */
     useEffect(() => {
         const query = command.trim();
+        // Retire the previous response before the next debounce window begins.
+        searchTicket.current += 1;
+        const ticket = searchTicket.current;
+        searchAbort.current?.abort();
+        searchAbort.current = undefined;
         if (project.length === 0 || !isSearchable(query, SEARCH_MIN_QUERY)) {
-            searchAbort.current?.abort();
-            searchAbort.current = undefined;
             setHits(noHits);
             setAnsweredQuery('');
             setHitSource('index');
@@ -2499,8 +2498,6 @@ export default function App(): JSX.Element {
             searchAbort.current?.abort();
             const controller = new AbortController();
             searchAbort.current = controller;
-            searchTicket.current += 1;
-            const ticket = searchTicket.current;
             searchStats.current.serverRequests += 1;
             const started = performance.now();
             searchByMeaning(
@@ -2561,11 +2558,16 @@ export default function App(): JSX.Element {
                     );
                 });
         }, SEARCH_DEBOUNCE_MS);
-        return () => window.clearTimeout(timer);
+        return () => {
+            window.clearTimeout(timer);
+            searchTicket.current += 1;
+            searchAbort.current?.abort();
+        };
     }, [command, project, provider, fanInOf]);
 
     const closeSearch = useCallback(() => {
         window.dispatchEvent(new Event(CLOSE_COMMAND_SEARCH_EVENT));
+        searchTicket.current += 1;
         searchAbort.current?.abort();
         searchAbort.current = undefined;
         setCommand('');
@@ -2763,7 +2765,7 @@ export default function App(): JSX.Element {
             setWhyAnswer(recordWhyAnswer(store, project, intent));
             setWhyReopened(false);
             if (intent === 'understand') {
-                void startProjectTour();
+                changeWorkspace('architecture');
             } else if (intent === 'entry') {
                 setEntryOpen(true);
             } else if (intent === 'bug') {
@@ -2772,7 +2774,7 @@ export default function App(): JSX.Element {
                 openExplain('change');
             }
         },
-        [openExplain, project, startProjectTour, store],
+        [openExplain, project, changeWorkspace, store],
     );
 
     const declineWhy = useCallback(() => {
@@ -3042,95 +3044,6 @@ export default function App(): JSX.Element {
                 });
         },
         [project, provider],
-    );
-
-    // ----------------------------- Die Aenderungsansicht: Modus, Ref, Lesung -
-
-    const chooseImpactMode = useCallback((mode: ImpactMode) => {
-        setImpactMode(mode);
-        setRefError('');
-        if (mode === 'worktree') {
-            setAppliedRef(undefined);
-        }
-    }, []);
-
-    /**
-     * Der Knopf neben dem Ref-Feld.
-     *
-     * Die Form wird hier geprueft und der Aufruf unterbleibt, wenn sie nicht
-     * stimmt. Warum nicht die Engine gefragt wird, steht bei `refRejection`: sie
-     * nimmt ein unbekanntes `since` kommentarlos an und antwortet ueber den
-     * Arbeitsbaum, also waere ein Tippfehler eine plausible Antwort auf eine
-     * andere Frage.
-     */
-    const applyRef = useCallback(() => {
-        const value = refDraft.trim();
-        const rejection = refRejection(value);
-        if (rejection !== undefined) {
-            setRefError(impactRefRejected(value, rejection));
-            return;
-        }
-        setRefError('');
-        setAppliedRef(value);
-    }, [refDraft]);
-
-    useEffect(() => {
-        if (!impactOpen || project.length === 0) {
-            return;
-        }
-        impactTicket.current += 1;
-        const ticket = impactTicket.current;
-        setImpactStatus('loading');
-        setImpactMessage('');
-        readImpact(provider, ATLAS_WORKSPACE_ROOT, {
-            projectName: project,
-            generation: 1,
-            ...(appliedRef === undefined ? {} : { sinceRef: appliedRef }),
-            // Der Routen-Scan liest den Quelltext ueber denselben Weg wie der
-            // Reader. Einen zweiten Weg zu einer Datei gaebe es hier nicht, und
-            // ein zweiter waere eine zweite Stelle, an der eine Kappung
-            // interpretiert wird.
-            readSource: async (filePath) => {
-                const loaded = await loadFileDocument(client, project, filePath).catch(() => undefined);
-                return loaded === undefined
-                    ? undefined
-                    : { source: loaded.source, truncated: loaded.truncated };
-            },
-        })
-            .then((reading) => {
-                if (ticket !== impactTicket.current) {
-                    return;
-                }
-                setImpactModel(reading.model);
-                setImpactRouteNote(reading.routeNote);
-                setImpactStatus('ready');
-            })
-            .catch((error: unknown) => {
-                if (ticket !== impactTicket.current) {
-                    return;
-                }
-                setImpactModel(undefined);
-                setImpactStatus('failed');
-                setImpactMessage(error instanceof Error ? error.message : String(error));
-            });
-    }, [appliedRef, client, impactOpen, project, provider]);
-
-    /** Eine Zeile der Aenderungsansicht oeffnen: derselbe Weg wie jeder Klick. */
-    const openImpactRow = useCallback(
-        (target: ImpactTarget) => {
-            const ref = twinTargetOf({
-                name: target.name,
-                qualifiedName: target.qualifiedName,
-                kind: 'unknown',
-                filePath: target.filePath,
-                startLine: target.line,
-            });
-            if (ref === undefined) {
-                return;
-            }
-            followRef.current(ref);
-        },
-        [],
     );
 
     // ------------------------------------------ Das lokale Modell (W5a) ----
@@ -4570,9 +4483,109 @@ export default function App(): JSX.Element {
     const walkStepQualifiedName =
         walkStep !== undefined && walkStep.kind === 'symbol' ? walkStep.qualifiedName : undefined;
 
+    const liveIr = matchingInspectorIr(twinIr, readerFocusSymbol, project, activePath);
+    const liveOutline = useMemo(() => liveIr ? buildPseudocode(
+        { kind: 'symbol', label: liveIr.symbol.name },
+        { irs: [liveIr], ...(layout === undefined ? {} : { graph: layout }) },
+    ) : undefined, [liveIr, layout]);
+    const liveSelection = readerSelection?.path === activePath && document?.path === activePath
+        ? readerSelection : undefined;
+    const symbolList = fileSymbols.project === project && fileSymbols.path === activePath ? fileSymbols : undefined;
+    const liveCode: SelectedCodeSnapshot = {
+        project, filePath: activePath, symbol: readerFocusSymbol, ir: liveIr,
+        selection: liveSelection, document: document?.path === activePath ? document : undefined,
+        imports: activePath ? imports : undefined,
+        pseudocode: liveOutline,
+        status: liveIr ? 'ready' : readerStatus === 'loading' ? 'loading'
+            : twinStatus === 'failed' ? 'failed' : twinStatus === 'not-indexed' ? 'not-indexed'
+                : readerFocusSymbol ? 'loading' : 'empty',
+        message: twinHint || twinMessage,
+        coverageNote: coverageNote?.text,
+        fileSymbols: symbolList?.symbols,
+        fileSymbolsStatus: symbolList?.status ?? (activePath ? 'loading' : 'ready'),
+        fileSymbolsMessage: symbolList?.message,
+    };
+    const inspector = pinnedCode?.project === project ? pinnedCode : liveCode;
+    const evidenceGraph = repositoryReading.snapshot;
+    const inspectorNode = evidenceGraph?.nodes.find(node => inspector.symbol?.qualifiedName
+        ? node.qualified_name === inspector.symbol.qualifiedName
+        : node.file_path === inspector.filePath && (node.label === 'File' || node.label === 'Module'));
+    const exploreEvidence = ({ filePath, line, name }: SourceEvidenceTarget): void => {
+        setSourceEvidence(undefined);
+        setAnalysisSelection(undefined);
+        if (impactOpen) collapseExplain();
+        changeWorkspace('explore');
+        setPinnedCode(undefined);
+        const target = twinTargetOf({ filePath, startLine: line, name: name ?? filePath, kind: 'unknown' });
+        if (target) followTarget(target);
+    };
+    const navigateEvidence = (filePath: string, line?: number, name?: string): void => {
+        setSourceEvidence({ project, target: { filePath, line, name } });
+    };
+    const readMapSource = useCallback(async (path: string, startLine = 1, maxLines = 65) => {
+        const qualifiedName = fileQualifiedName(repositoryReading.snapshot, path);
+        if (!qualifiedName) throw new Error(workspaceText.sourceOutsideSnapshot);
+        return client.getCodeSnippet(project, qualifiedName, { startLine, maxLines });
+    }, [client, project, repositoryReading.snapshot]);
+    const inspectorImpactTarget = inspector.filePath ? { filePath: inspector.filePath,
+        qualifiedName: inspector.symbol?.qualifiedName, id: inspector.symbol ? inspectorNode?.id : undefined,
+        name: inspector.symbol?.name, line: inspectorNode?.start_line } : undefined;
+    const mapImpactTarget = activeGalaxySelection?.file_path ? { filePath: activeGalaxySelection.file_path,
+        qualifiedName: ['File', 'Module'].includes(activeGalaxySelection.label) ? undefined : activeGalaxySelection.qualified_name,
+        id: ['File', 'Module'].includes(activeGalaxySelection.label) ? undefined : activeGalaxySelection.id,
+        name: activeGalaxySelection.name, line: activeGalaxySelection.start_line } : undefined;
+    const openSelectionImpact = (target?: SelectionImpactTarget) => setAnalysisSelection({ project, target });
+    const selectMapNode = (node: GraphNode): void => {
+        setGalaxySelection(node);
+        setGalaxySelectionProject(project);
+    };
+    const mapSelectionPanel = selectionUnavailable ? <p role="status" className="repo-map-note">{selectionUnavailableText}</p> : activeGalaxySelection && (workspace === 'architecture' || workspace === 'galaxy') && <>
+        <SelectionContextPanel graph={evidenceGraph} selected={activeGalaxySelection}
+            path={activeGalaxySelection.file_path ?? ''} agents={agents.state} onNavigate={navigateEvidence}
+            onImpact={() => openSelectionImpact(mapImpactTarget)} />
+    </>;
+    const followInspectorTarget = (target: SymbolRef): void => {
+        setPinnedCode(undefined);
+        followTarget(target);
+    };
+    const askInspector = (): void => {
+        if (!inspector.filePath) return;
+        setChatAttachment(inspector.selection ? { ...inspector.selection, project: inspector.project, id: crypto.randomUUID() } : undefined);
+        setChatGraphSelection(inspectorChatContext(inspector, crypto.randomUUID()));
+        setBrowserAiOpen(true);
+    };
+    const showInspectorGraph = (): void => {
+        const node = layout?.nodes.find(entry => inspector.symbol?.qualifiedName
+            ? entry.qualified_name === inspector.symbol.qualifiedName
+            : entry.file_path === inspector.filePath && (entry.label === 'File' || entry.label === 'Module'));
+        if (node) {
+            setGalaxySelection(node);
+            setGalaxySelectionProject(project);
+            changeWorkspace('galaxy');
+        } else {
+            setGalaxyOn(true);
+            if (inspector.symbol) followTarget(inspector.symbol);
+            else if (inspector.filePath) openFile(inspector.filePath);
+        }
+    };
+    const selectedCode = <SelectedCodePanel {...inspector}
+        selectionContext={<SelectionContextPanel graph={evidenceGraph}
+            selected={inspector.symbol ? inspectorNode : undefined} path={inspector.filePath}
+            agents={agents.state} onNavigate={navigateEvidence} />}
+        impact={<button className="atlas-analysis-action" disabled={!inspector.filePath} onClick={() => openSelectionImpact(inspectorImpactTarget)}>{workspaceText.selectionImpact} →</button>}
+        pinned={pinnedCode?.project === project}
+        onTogglePin={() => setPinnedCode(current => current?.project === project ? undefined : { ...liveCode,
+            selection: liveCode.selection ? { ...liveCode.selection } : undefined })}
+        onAsk={askInspector} onShowGraph={showInspectorGraph} onFollow={followInspectorTarget}
+        onPointRow={inspector.filePath === activePath ? pointRow : undefined}
+        onOpenFlow={inspector.symbol && inspector.symbol.qualifiedName === twinSymbol?.qualifiedName ? toggleFlow : undefined}
+        callOutline={inspector.pseudocode && inspector.symbol ? <PseudocodeView document={inspector.pseudocode}
+            symbolName={inspector.symbol.name} imports={inspector.imports} onOpenLine={openLine} /> : undefined} />;
+
     const galaxy = (
         <GalaxyPanel
             project={project}
+            selectionPanel={workspace === 'galaxy' ? mapSelectionPanel : undefined}
             visible={workspace === 'galaxy' || (workspace === 'explore' && galaxyOn)}
             workspaceExpanded={workspace === 'galaxy'}
             focusQualifiedName={workspace === 'galaxy' ? activeGalaxySelection?.qualified_name : readerFocusSymbol?.qualifiedName}
@@ -4585,7 +4598,6 @@ export default function App(): JSX.Element {
                 setGalaxySelection(node);
                 setGalaxySelectionProject(project);
                 setChatGraphSelection(selectedGraphContext(layout, node, project, crypto.randomUUID()));
-                setBrowserAiOpen(true);
             } : undefined}
             onSelectShadowNode={(node) => {
                 setGalaxySelection(undefined);
@@ -4622,63 +4634,6 @@ export default function App(): JSX.Element {
             fullscreenToggle={fullscreenToggle}
         />
     );
-
-    const liveIr = matchingInspectorIr(twinIr, readerFocusSymbol, project, activePath);
-    const liveOutline = useMemo(() => liveIr ? buildPseudocode(
-        { kind: 'symbol', label: liveIr.symbol.name },
-        { irs: [liveIr], ...(layout === undefined ? {} : { graph: layout }) },
-    ) : undefined, [liveIr, layout]);
-    const liveSelection = readerSelection?.path === activePath && document?.path === activePath
-        ? readerSelection : undefined;
-    const symbolList = fileSymbols.project === project && fileSymbols.path === activePath ? fileSymbols : undefined;
-    const liveCode: SelectedCodeSnapshot = {
-        project, filePath: activePath, symbol: readerFocusSymbol, ir: liveIr,
-        selection: liveSelection, document: document?.path === activePath ? document : undefined,
-        imports: activePath ? imports : undefined,
-        pseudocode: liveOutline,
-        status: liveIr ? 'ready' : readerStatus === 'loading' ? 'loading'
-            : twinStatus === 'failed' ? 'failed' : twinStatus === 'not-indexed' ? 'not-indexed'
-                : readerFocusSymbol ? 'loading' : 'empty',
-        message: twinHint || twinMessage,
-        coverageNote: coverageNote?.text,
-        fileSymbols: symbolList?.symbols,
-        fileSymbolsStatus: symbolList?.status ?? (activePath ? 'loading' : 'ready'),
-        fileSymbolsMessage: symbolList?.message,
-    };
-    const inspector = pinnedCode?.project === project ? pinnedCode : liveCode;
-    const followInspectorTarget = (target: SymbolRef): void => {
-        setPinnedCode(undefined);
-        followTarget(target);
-    };
-    const askInspector = (): void => {
-        if (!inspector.filePath) return;
-        setChatAttachment(inspector.selection ? { ...inspector.selection, project: inspector.project, id: crypto.randomUUID() } : undefined);
-        setChatGraphSelection(inspectorChatContext(inspector, crypto.randomUUID()));
-        setBrowserAiOpen(true);
-    };
-    const showInspectorGraph = (): void => {
-        const node = layout?.nodes.find(entry => inspector.symbol?.qualifiedName
-            ? entry.qualified_name === inspector.symbol.qualifiedName
-            : entry.file_path === inspector.filePath && (entry.label === 'File' || entry.label === 'Module'));
-        if (node) {
-            setGalaxySelection(node);
-            setGalaxySelectionProject(project);
-            changeWorkspace('galaxy');
-        } else {
-            setGalaxyOn(true);
-            if (inspector.symbol) followTarget(inspector.symbol);
-            else if (inspector.filePath) openFile(inspector.filePath);
-        }
-    };
-    const selectedCode = <SelectedCodePanel {...inspector}
-        pinned={pinnedCode?.project === project}
-        onTogglePin={() => setPinnedCode(current => current?.project === project ? undefined : { ...liveCode,
-            selection: liveCode.selection ? { ...liveCode.selection } : undefined })}
-        onAsk={askInspector} onShowGraph={showInspectorGraph} onFollow={followInspectorTarget}
-        onPointRow={inspector.filePath === activePath ? pointRow : undefined}
-        onOpenFlow={inspector.symbol && inspector.symbol.qualifiedName === twinSymbol?.qualifiedName ? toggleFlow : undefined}
-        callOutline={inspector.pseudocode && inspector.symbol ? <PseudocodeView document={inspector.pseudocode}
-            symbolName={inspector.symbol.name} imports={inspector.imports} onOpenLine={openLine} /> : undefined} />;
 
     /*
      * Die fuenf Reiter des Erklaeren-Bereichs, und was gerade dahinter liegt.
@@ -4794,25 +4749,6 @@ export default function App(): JSX.Element {
                 }}
                 onClose={collapseExplain}
             />
-        ) : explainTab === 'change' && project.length > 0 ? (
-            <ImpactPanel
-                project={project}
-                mode={impactMode}
-                onMode={chooseImpactMode}
-                refDraft={refDraft}
-                onRefDraft={(value) => {
-                    setRefDraft(value);
-                    setRefError('');
-                }}
-                onGo={applyRef}
-                refError={refError}
-                model={impactModel}
-                status={impactStatus}
-                message={impactMessage}
-                routeNote={impactRouteNote}
-                onOpen={openImpactRow}
-                onClose={collapseExplain}
-            />
         ) : undefined;
 
     /** Ein Griff, mit seinen Grenzen aus dem Modell. */
@@ -4858,6 +4794,8 @@ export default function App(): JSX.Element {
 
     return (
         <AtlasChrome
+            workspaceStatus={<DaemonAlerts key={`${project}:${logScope}`} project={project} scope={logScope}
+                onScopeChange={scope => setLogScopeChoice({ project, scope })} reading={daemonLogFeed} coverage={coverage} coverageKnown={coverageAsked} coverageError={coverageError} onDiagnose={() => setDiagnosticsOpen(true)} />}
             workspace={workspace}
             projectSwitcher={<ProjectSwitcher currentProject={project} listProjects={projectsSource.listProjects}
                 onSelectProject={openProject} onManageProjects={() => setProjectsOpen(true)} />}
@@ -4874,7 +4812,23 @@ export default function App(): JSX.Element {
                 <button type="button" disabled={!liveSelection} aria-keyshortcuts="Control+Shift+L Meta+Shift+L"
                     onClick={() => { if (liveSelection) attachSelection(liveSelection); }}>{workspaceText.askSelection}</button>
             </>}
-            globalOverlay={<>{welcomeOpen && <WelcomePanel workspace={workspace} guidance={guidance}
+            globalOverlay={<><DiagnosticsPanel project={project} client={client} coverage={coverageAsked ? coverage : undefined}
+                coverageError={coverageError} active={diagnosticsOpen} onClose={() => setDiagnosticsOpen(false)}
+                path={(workspace === 'architecture' || workspace === 'galaxy') ? activeGalaxySelection?.file_path : activePath || undefined}
+                onNavigate={path => { setDiagnosticsOpen(false); navigateEvidence(path); }}
+                onCoverage={reading => { setCoverage(reading.index); setCoverageMeta({ ...reading.answer.metadata }); setCoverageAsked(true); setCoverageError(''); setOverviewRevision(value => value + 1); }} />
+                {(impactOpen || analysisSelection?.project === project) && <div className="atlas-analysis-overlay" role="dialog" aria-label={workspaceText.changeAnalysis} onKeyDown={event => {
+                    event.stopPropagation();
+                    if (event.key === 'Escape') { setAnalysisSelection(undefined); if (impactOpen) collapseExplain(); }
+                }}><ChangeAnalysisWorkspace key={project} project={project} client={client}
+                    selectedTarget={analysisSelection?.project === project ? analysisSelection.target : (workspace === 'architecture' || workspace === 'galaxy') ? mapImpactTarget : inspectorImpactTarget}
+                    initialMode={analysisSelection?.project === project ? 'selection' : 'worktree'} expectedGeneration={repositoryReading.snapshot?.generation}
+                    onOpenSource={target => navigateEvidence(target.filePath, target.line, target.name)}
+                    onDiagnose={() => setDiagnosticsOpen(true)} onClose={() => { setAnalysisSelection(undefined); if (impactOpen) collapseExplain(); }} /></div>}
+                {sourceEvidence?.project === project && <SourceEvidenceDrawer key={`${project}:${sourceEvidence.target.filePath}:${sourceEvidence.target.line ?? 1}`}
+                    project={project} target={sourceEvidence.target} graph={evidenceGraph} client={client}
+                    onClose={() => setSourceEvidence(undefined)} onExplore={exploreEvidence} />}
+                {welcomeOpen && <WelcomePanel workspace={workspace} guidance={guidance}
                 onWorkspace={changeWorkspace} onGuidance={changeGuidance} onContinue={finishSetup}
                 onLocalAi={() => { finishSetup(); setBrowserAiOpen(true); }} />}
                 {projectsOpen && <ProjectsPanel project={project} source={projectsSource}
@@ -4895,21 +4849,24 @@ export default function App(): JSX.Element {
             workspacePanel={<>
                 <div hidden={workspace !== 'architecture'}>
                 <ArchitecturePanel projectName={project} overview={overview}
+                    readSource={readMapSource}
+                    graph={repositoryReading.snapshot} graphGeneration={repositoryReading.snapshot?.generation} selection={activeGalaxySelection} selectionPanel={mapSelectionPanel}
+                    graphNote={repositoryReading.error ?? (repositoryReading.snapshot
+                        ? `Index: ${repositoryReading.snapshot.indexedAt || 'timestamp unknown'} · snapshot ${repositoryReading.snapshot.generation}. ${repositoryReading.snapshot.nodesTruncated || repositoryReading.snapshot.edgesTruncated ? 'The architecture query reached a bound; some evidence is omitted.' : 'All matching source symbols and dependency edges in this index snapshot were read.'}${selectionUnavailable ? ` ${selectionUnavailableText}` : ''}`
+                        : undefined)}
+                    onSelect={selectMapNode}
+                    onProjectWalk={() => { changeWorkspace('explore'); void startProjectTour(); }}
                     loading={overviewLoading} error={overviewError}
                     onRefresh={() => setOverviewRevision((value) => value + 1)}
-                    onNavigate={(filePath, line, name) => {
-                        setWorkspace('explore');
-                        const target = twinTargetOf({ filePath, startLine: line, name: name ?? filePath, kind: 'unknown' });
-                        if (target !== undefined) followTarget(target);
-                    }} />
+                    onNavigate={navigateEvidence} />
                 </div>
                 <div hidden={workspace !== 'agents'}>
-                <ActivityPanel state={agents.state} status={agents.status} on={liveAgentsOn} port={bridgePort}
-                    graph={layout} onToggle={() => setLiveAgentsOn((value) => !value)}
+                <ActivityPanel project={project} api={api} state={agents.state} status={agents.status} on={liveAgentsOn} port={bridgePort}
+                    graph={evidenceGraph} onToggle={() => setLiveAgentsOn((value) => !value)}
                     onOpenNode={(node) => { setWorkspace('explore'); openGalaxyNode(node); }} />
                 </div>
                 <div hidden={workspace !== 'system'}>
-                    <SystemWorkspace api={api} active={workspace === 'system'} version={ATLAS_VERSION}
+                    <SystemWorkspace api={api} project={project} active={workspace === 'system'} version={ATLAS_VERSION}
                         onOpenProjects={() => setProjectsOpen(true)} />
                 </div>
             </>}

@@ -19,16 +19,13 @@
 /* Content-Security-Policy directives for the served UI (the value only; the
  * server prepends the header name). External connections are limited to the
  * pinned opt-in browser model on Hugging Face and its verified download host.
- * connect-src admits the server itself plus the two loopback services the UI
- * may talk to when the reader starts them: the local-model sidecar on
- * 127.0.0.1:4141 (graph-ui/llm/start.sh) and the agent-event bridge on
- * 127.0.0.1:4142 (graph-ui/tools/agent-bridge.mjs). A bridge on any other
- * port (?agents=<port>) stays blocked by this policy on purpose. The other
+ * Agent activity and logs use this same daemon origin. The optional local
+ * inference sidecar remains on 127.0.0.1:4141. The other
  * allowances cover the bundled app's own needs (inline styles, three.js
  * textures, Monaco workers, WASM). */
 #define CBM_UI_CSP_VALUE                                                 \
     "default-src 'self'; "                                               \
-    "connect-src 'self' http://127.0.0.1:4141 http://127.0.0.1:4142 "    \
+    "connect-src 'self' http://127.0.0.1:4141 "                          \
     "https://huggingface.co https://us.aws.cdn.hf.co; "                  \
     "img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; " \
     "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
@@ -104,11 +101,11 @@ void cbm_http_server_set_readiness_secret(cbm_http_server_t *srv,
 /* Initialize the log ring buffer mutex. Must be called once before any threads. */
 void cbm_ui_log_init(void);
 
-/* Append a log line to the UI ring buffer (called from log hook). */
+/* Persist a daemon log line in SQLite and the emergency memory ring. */
 void cbm_ui_log_append(const char *line);
 
-/* Where the frontend's log file lives: <cache_dir>/logs/ui.log, one JSON
- * line per entry. Written by POST /api/ui-log, read by GET /api/ui-log.
+/* Frontend compatibility export: <cache_dir>/logs/ui.log, one JSON line
+ * per accepted entry. Both HTTP log readers use the SQLite journal.
  * Returns false when the path does not fit in out. */
 bool cbm_ui_log_file_path(char *out, size_t outsz);
 

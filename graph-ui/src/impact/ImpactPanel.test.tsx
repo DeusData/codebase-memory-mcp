@@ -160,6 +160,13 @@ describe('ImpactPanel', () => {
         }
     });
 
+    it('does not display low risk when the rule inputs were not measured', async () => {
+        await render({ model: { ...MODEL, risk: 'low', completeness: { measured: 0, unmeasured: 2, total: 2 } } });
+        expect(at('atlas-impact-badge')?.textContent).toBe('RISK UNRESOLVED');
+        expect(at('atlas-impact-badge')?.getAttribute('data-level')).toBe('unresolved');
+        expect(container.textContent).toContain('Risk inputs are missing for 2 of 2 symbols');
+    });
+
     it('draws the four lists and names the endpoints it reached', async () => {
         await render();
         expect(all('atlas-impact-direct-row')).toHaveLength(1);

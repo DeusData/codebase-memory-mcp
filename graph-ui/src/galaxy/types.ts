@@ -35,6 +35,9 @@ export interface GraphNode {
     status?: NodeStatus;
     in_calls?: number;
     out_calls?: number;
+    /** Indexed documentation when supplied by the logical repository map. */
+    documentation?: string;
+    package_name?: string;
 }
 
 export type NodeStatus =
@@ -47,6 +50,12 @@ export type NodeStatus =
     | 'structural';
 
 export interface GraphEdge {
+    id?: number;
+    /** Recorded representative callsite, when present; not the declaration. */
+    line?: number;
+    /** Resolution provenance supplied by the index, when available. */
+    strategy?: string;
+    confidence?: number;
     source: number;
     target: number;
     type: string;

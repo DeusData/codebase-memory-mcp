@@ -7,8 +7,9 @@
  * Bedeutungen von "passt am besten" zu haben, und die Abweichung faende
  * niemand, weil beide Listen plausibel aussehen.
  *
- * Aenderungen gegenueber dem Original: nur der Importpfad von
- * SymbolSearchHit. Was diese Datei an Signalen NICHT bekommt, entscheidet der
+ * Aenderungen gegenueber dem Original: Importpfad von SymbolSearchHit und
+ * explizite Dateipfad-Anfragen vor der Wort-Rangfolge (PR 2068).
+ * Was diese Datei an Signalen NICHT bekommt, entscheidet der
  * Aufrufer: an diesem Backend bleiben `isTest` und `isExported` undefiniert,
  * weil die flache search_graph-Form sie nicht traegt (UPSTREAM-ASKS.md,
  * Ask 5). Undefiniert heisst hier weder wahr noch falsch: der Bonus und der
@@ -69,6 +70,7 @@
  */
 
 import type { SymbolSearchHit } from '../core/intelligence-provider';
+import { fileQueryPath } from './path-query';
 
 /**
  * How many words one query may carry.
@@ -125,6 +127,8 @@ export interface RankedHit {
     matched: string[];
     /** How many symbols reach it, when the index measured that. */
     fanIn: number;
+    /** Exact file requests outrank token matches, independently of popularity. */
+    pathMatch?: 'file' | 'symbol';
 }
 
 /**
@@ -284,21 +288,30 @@ export function rankHits(
     fanInOf: (hit: SymbolSearchHit) => number = () => 0
 ): RankedHit[] {
     const terms = queryTerms(query);
-    if (terms.length === 0) {
+    const exactPath = fileQueryPath(query);
+    if (terms.length === 0 && !exactPath) {
         return [];
     }
     const ranked: RankedHit[] = [];
     const seen = new Set<string>();
     for (const hit of hits) {
-        if (!isNavigable(hit)) {
+        const pathMatches = exactPath !== undefined && hit.filePath === exactPath;
+        const fileMatch = pathMatches && (hit.kind === 'module'
+            || (hit.kind === 'unknown' && !hit.qualifiedName && hit.line === undefined)
+            || hit.name === exactPath || hit.name === exactPath.split('/').at(-1));
+        if (!fileMatch && !isNavigable(hit)) {
             continue;
         }
-        const key = hit.qualifiedName ?? `${hit.filePath ?? ''}#${hit.name}`;
+        const key = fileMatch ? `file:${hit.filePath}` : hit.qualifiedName ?? `${hit.filePath ?? ''}#${hit.name}`;
         if (seen.has(key)) {
             continue;
         }
         seen.add(key);
         const scored = scoreHit(hit, terms, fanInOf(hit));
+        if (pathMatches) {
+            scored.pathMatch = fileMatch ? 'file' : 'symbol';
+            scored.matched = [fileMatch ? 'exact file path' : 'symbol in requested file'];
+        }
         if (scored.matched.length === 0) {
             continue;
         }
@@ -315,7 +328,8 @@ export function rankHits(
  * whatever the index happened to return, which is not a promise it makes.
  */
 export function compareRanked(a: RankedHit, b: RankedHit): number {
-    return b.score - a.score
+    const priority = (entry: RankedHit) => entry.pathMatch === 'file' ? 2 : entry.pathMatch === 'symbol' ? 1 : 0;
+    return priority(b) - priority(a) || b.score - a.score
         || b.fanIn - a.fanIn
         || (a.hit.qualifiedName ?? a.hit.name).localeCompare(b.hit.qualifiedName ?? b.hit.name);
 }

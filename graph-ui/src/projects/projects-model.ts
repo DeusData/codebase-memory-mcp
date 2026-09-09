@@ -174,14 +174,57 @@ export function readAdr(raw: unknown): AdrRecord {
 // ------------------------------------------------------------------ logs --
 
 export interface LogTail {
+    query?: string;
+    scope?: 'project' | 'daemon' | 'unattributed';
+    project?: string | null;
     lines: string[];
     total: number;
+    /** Absent on older daemons and when persistent storage is unavailable. */
+    records?: DaemonLogRecord[];
+    persistent?: boolean;
+    generation?: string;
+    retentionLimit?: number;
+    oldestCursor?: number;
+    cursor?: number;
+    hasMore?: boolean;
+}
+
+export interface DaemonLogRecord {
+    project?: string | null;
+    id: number;
+    ts: string;
+    level: string;
+    source: string;
+    message: string;
 }
 
 export function readLogs(raw: unknown): LogTail {
     const record = isRecord(raw) ? raw : {};
     const lines = strings(record['lines']);
-    return { lines, total: optionalNumber(record['total']) ?? lines.length };
+    const result: LogTail = { lines, total: optionalNumber(record['total']) ?? lines.length };
+    if (typeof record['query'] === 'string') result.query = record['query'];
+    if (Array.isArray(record['records'])) {
+        // A snapshot replaces the previous snapshot. Stable IDs also collapse a
+        // repeated row within one response; never append replayed records.
+        const rows = new Map<number, DaemonLogRecord>();
+        for (const entry of record['records']) {
+            if (!isRecord(entry)) continue;
+            const id = optionalNumber(entry['id']);
+            if (id === undefined || !Number.isSafeInteger(id) || id < 0 || typeof entry['message'] !== 'string') continue;
+            rows.set(id, { id, ts: text(entry['ts']), level: text(entry['level']), source: text(entry['source']), message: entry['message'], ...(typeof entry['project'] === 'string' || entry['project'] === null ? { project: entry['project'] } : {}) });
+        }
+        result.records = [...rows.values()].sort((left, right) => left.id - right.id);
+    }
+    if (['project', 'daemon', 'unattributed'].includes(String(record['scope']))) result.scope = record['scope'] as LogTail['scope'];
+    if (typeof record['project'] === 'string' || record['project'] === null) result.project = record['project'];
+    if (typeof record['persistent'] === 'boolean') result.persistent = record['persistent'];
+    if (typeof record['generation'] === 'string') result.generation = record['generation'];
+    if (typeof record['has_more'] === 'boolean') result.hasMore = record['has_more'];
+    for (const [input, output] of [['retention_limit', 'retentionLimit'], ['oldest_cursor', 'oldestCursor'], ['cursor', 'cursor']] as const) {
+        const value = optionalNumber(record[input]);
+        if (value !== undefined) result[output] = value;
+    }
+    return result;
 }
 
 // ------------------------------------------------------------- processes --
@@ -200,14 +243,14 @@ export interface ServerProcess {
 export type ProcessCpuUnit = 'percent' | 'seconds' | 'unknown';
 export type ProcessMemoryKind = 'resident' | 'working_set' | 'peak_resident' | 'unknown';
 
-/** The tail of the frontend log file the server keeps (POST /api/ui-log). */
+/** Original frontend JSON lines from the daemon journal (POST /api/ui-log). */
 export interface UiLogTail {
-    /** The file on the server; what a bug report attaches. */
+    /** The authoritative local storage path reported by this daemon. */
     path: string;
-    /** The rotated file before it, when there is one. Empty otherwise. */
+    /** A legacy local export archive, when there is one. Empty otherwise. */
     previousPath: string;
     sizeBytes: number;
-    /** True when the lines do not start at the first line of the file. */
+    /** True when the displayed window or legacy import is partial. */
     partial: boolean;
     /** One JSON object per line, as written by the server. */
     lines: string[];

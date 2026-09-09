@@ -281,6 +281,12 @@ describe('die Werkzeuge, die erst auf Bitte JSON liefern', () => {
         expect(rpc.calls[0].args['since']).toBe('HEAD~3');
         expect(rpc.calls[0].args['depth']).toBe(2);
     });
+
+    it('vergleicht den Working tree explizit mit HEAD, auch ohne lokalen main-Branch', async () => {
+        const { client: c, rpc } = client([{ tool: 'detect_changes', json: { changed_files: [] } }]);
+        await c.detectChanges(RECORDED_PROJECT);
+        expect(rpc.calls[0].args['since']).toBe('HEAD');
+    });
 });
 
 describe('Suche', () => {

@@ -39,6 +39,8 @@ export interface SelectedCodePanelProps {
     onOpenFlow?: () => void;
     callOutline?: ReactNode;
     imports?: ImportsGroup;
+    selectionContext?: ReactNode;
+    impact?: ReactNode;
 }
 
 const SECTION_TITLES: Readonly<Record<string, string>> = {
@@ -163,6 +165,8 @@ export default function SelectedCodePanel(props: SelectedCodePanelProps) {
                         <button type="button" className="selected-code-ask" onClick={props.onAsk}>Ask about this</button>
                         <button type="button" onClick={props.onShowGraph}>Show in graph</button>
                     </div>
+                    {props.selectionContext}
+                    {props.impact}
                     {noSymbolMessage && <p className="selected-code-message" role="status">{noSymbolMessage}</p>}
                     {!symbol && (
                         <div className="selected-code-file" data-testid="selected-code-file">

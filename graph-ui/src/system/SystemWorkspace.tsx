@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react';
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import type { AtlasApi } from '../app/atlas-api';
-import { cpuText, filterLogs, logLevel, memoryLabel, memoryText, type LogLevel } from './system-model';
+import { cpuText, logLevel, memoryLabel, memoryText } from './system-model';
 import { useSystemPoll, type SystemReading } from './useSystemPoll';
 import './system.css';
 
@@ -10,6 +10,7 @@ export interface SystemWorkspaceProps {
     active?: boolean;
     version?: string;
     pollMs?: number;
+    project?: string;
 }
 
 type SystemTab = 'overview' | 'indexes' | 'logs';
@@ -26,34 +27,50 @@ function ReadStatus({ reading, paused }: { reading: SystemReading<unknown>; paus
 }
 
 /** Read-only daemon dashboard; project mutations stay in the existing dialog. */
-export default function SystemWorkspace({ api, onOpenProjects, active = true, version, pollMs = 3000 }: SystemWorkspaceProps) {
+export default function SystemWorkspace({ api, onOpenProjects, active = true, version, pollMs = 3000, project }: SystemWorkspaceProps) {
     const [tab, setTab] = useState<SystemTab>('overview');
     const [paused, setPaused] = useState(false);
     const [query, setQuery] = useState('');
-    const [level, setLevel] = useState<LogLevel | 'all'>('all');
+    const [level, setLevel] = useState<'all' | 'error' | 'warn' | 'info'>('all');
+    const [scope, setScope] = useState<'daemon' | 'project' | 'unattributed'>('daemon');
+    const [search, setSearch] = useState('');
+    useEffect(() => { const timer = setTimeout(() => setSearch(query.trim()), 250); return () => clearTimeout(timer); }, [query]);
     const [copyStatus, setCopyStatus] = useState('');
     const [followTail, setFollowTail] = useState(true);
     const logRef = useRef<HTMLDivElement>(null);
     const readProcesses = useCallback(() => api.processes(), [api]);
-    const readLogs = useCallback(() => api.logs(200), [api]);
+    const selectedProject = scope === 'project' ? project : undefined;
+    const readLogs = useCallback(async () => {
+        if (scope === 'project' && !selectedProject) throw new Error('Select a project to read its attributed events.');
+        const data = await api.logs(200, level === 'all' ? undefined : level, selectedProject, {
+            ...(scope === 'unattributed' ? { scope: 'unattributed' as const } : {}),
+            ...(search ? { query: search } : {}),
+        });
+        if ((scope !== 'daemon' || level !== 'all' || search) && data.persistent !== true) throw new Error('Persistent history is unavailable. Filters require the daemon journal.');
+        if (scope === 'project' && (data.scope !== 'project' || data.project !== selectedProject)) throw new Error('The daemon did not confirm this project scope.');
+        if (scope === 'unattributed' && data.scope !== 'unattributed') throw new Error('The daemon did not confirm unattributed scope.');
+        if (search && data.query !== search) throw new Error('This daemon does not confirm full-history search. Refresh the daemon before using this filter.');
+        return data;
+    }, [api, level, selectedProject, scope, search]);
     const readJobs = useCallback(() => api.indexJobs(), [api]);
     const processes = useSystemPoll(readProcesses, active, paused, pollMs);
     const logs = useSystemPoll(readLogs, active && tab === 'logs', paused, pollMs);
     const jobs = useSystemPoll(readJobs, active && tab === 'indexes', paused, pollMs);
     const report = processes.data;
     const self = report?.processes.find((process) => process.isSelf);
-    const visibleLines = useMemo(() => filterLogs(logs.data?.lines ?? [], query, level), [logs.data, query, level]);
+    const visibleLines = logs.data?.lines ?? [];
+    const visibleRecords = logs.data?.records;
     const selectedReading = tab === 'logs' ? logs : tab === 'indexes' ? jobs : processes;
 
     useEffect(() => {
         if (followTail && logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
-    }, [visibleLines, followTail, tab]);
+    }, [logs.data, followTail, tab]);
     useEffect(() => { setCopyStatus(''); }, [query, level, logs.data]);
 
     const copyLogs = async () => {
         try {
             if (!navigator.clipboard?.writeText) throw new Error('Clipboard access is unavailable. Select and copy the visible text.');
-            await navigator.clipboard.writeText(visibleLines.join('\n'));
+            await navigator.clipboard.writeText(visibleRecords ? visibleRecords.map((record) => `${record.ts} ${record.level.toUpperCase()} ${record.source} #${record.id}\n${record.message}`).join('\n') : visibleLines.join('\n'));
             setCopyStatus('Visible lines copied');
         } catch (error) {
             setCopyStatus(error instanceof Error ? error.message : 'Could not copy the log.');
@@ -118,19 +135,29 @@ export default function SystemWorkspace({ api, onOpenProjects, active = true, ve
 
         <div id="system-panel-logs" role="tabpanel" aria-labelledby="system-tab-logs" hidden={tab !== 'logs'}>
             <section className="system-section">
-                <div className="system-section-heading"><div><h2>Daemon log</h2><p>{report && report.selfPid > 0 ? `Serving process ${report.selfPid}` : 'Serving daemon'} · Latest 200 lines</p></div><button type="button" disabled={visibleLines.length === 0} onClick={() => { void copyLogs(); }}>Copy visible</button></div>
+                <div className="system-section-heading"><div><h2>Daemon log</h2><p>{report && report.selfPid > 0 ? `Serving process ${report.selfPid}` : 'Serving daemon'} · Latest 200 matching events</p></div><button type="button" disabled={(visibleRecords?.length ?? visibleLines.length) === 0} onClick={() => { void copyLogs(); }}>Copy visible</button></div>
+                {logs.data && <p className="system-muted">{logs.data.persistent === true ? `SQLite history · ${logs.data.retentionLimit ?? 'bounded'} event retention limit · survives daemon restarts` : 'Persistent history unavailable; this tail may not survive a restart.'} Events identify affected paths or jobs only when the daemon recorded them.</p>}
                 <div className="system-log-controls">
-                    <label><span>Filter</span><input type="search" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Find in this tail…" /></label>
-                    <label><span>Level</span><select value={level} onChange={(event) => setLevel(event.currentTarget.value as LogLevel | 'all')}>{(['all', 'error', 'warn', 'info', 'debug', 'trace', 'other'] as const).map((value) => <option value={value} key={value}>{value === 'all' ? 'All levels' : value === 'other' ? 'Unclassified' : value.toUpperCase()}</option>)}</select></label>
+                    <label><span>Scope</span><select aria-label="Log scope" value={scope} onChange={(event) => setScope(event.currentTarget.value as typeof scope)}>
+                        <option value="daemon">All daemon projects</option>
+                        <option value="project" disabled={!project}>Current project{project ? ` · ${project}` : ' · none selected'}</option>
+                        <option value="unattributed">Unattributed events</option>
+                    </select></label>
+                    <label><span>Search retained history</span><input type="search" maxLength={256} value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="Find a source, path or message…" /></label>
+                    <label><span>Severity</span><select aria-label="Log severity" value={level} onChange={(event) => setLevel(event.currentTarget.value as typeof level)}>
+                        <option value="all">All levels</option><option value="info">Info and above</option>
+                        <option value="warn">Warnings and errors</option><option value="error">Errors</option>
+                    </select></label>
                     <label className="system-tail-toggle"><input type="checkbox" checked={followTail} onChange={(event) => setFollowTail(event.currentTarget.checked)} /> Follow tail</label>
                 </div>
-                <div className="system-log-meta"><span>{visibleLines.length} shown · {logs.data?.total ?? 'Unknown'} lines reported</span><span role="status">{copyStatus}</span></div>
+                <p className="system-muted">Scope, severity and search filter the retained SQLite history before the 200-event display limit. {scope === 'project' ? `Only explicitly attributed events for ${project ?? 'the selected project'}.` : scope === 'unattributed' ? 'Project ownership was not recorded; no project is inferred from a path.' : 'Includes all projects and events with unknown ownership.'}</p>
+                <div className="system-log-meta"><span>{visibleRecords?.length ?? visibleLines.length} shown · {logs.data?.total ?? 'Unknown'} matching retained events</span><span role="status">{copyStatus}</span></div>
                 <div className="system-log" aria-label="Daemon log lines" tabIndex={0} ref={logRef} onScroll={() => {
                     const element = logRef.current;
                     if (element && element.scrollHeight - element.scrollTop - element.clientHeight > 32) setFollowTail(false);
                 }}>
-                    {visibleLines.map((line, index) => <div className={`system-log-line system-log-${logLevel(line)}`} key={index}>{line || '\u00a0'}</div>)}
-                    {visibleLines.length === 0 && <p>{logs.loading ? 'Reading log…' : !logs.data ? 'No log reading available.' : logs.data.lines.length === 0 ? 'The daemon returned an empty log tail.' : 'No lines match these filters.'}</p>}
+                    {visibleRecords ? visibleRecords.map((record) => <div className={`system-log-line system-log-record system-log-${logLevel(`level=${record.level}`)}`} key={`${logs.data?.generation ?? ''}:${record.id}`}><strong>{record.level.toUpperCase() || 'UNCLASSIFIED'}</strong> · <time dateTime={record.ts}>{record.ts || 'Time unavailable'}</time> · {record.source || 'Source unavailable'} · Event #{record.id} · {record.project ? `Project: ${record.project}` : 'Project not recorded'}<pre>{record.message}</pre></div>) : visibleLines.map((line, index) => <div className={`system-log-line system-log-${logLevel(line)}`} key={index}>{line || '\u00a0'}</div>)}
+                    {(visibleRecords?.length ?? visibleLines.length) === 0 && <p>{logs.loading ? 'Reading log…' : !logs.data ? 'No log reading available.' : 'No retained events match these filters.'}</p>}
                 </div>
             </section>
         </div>

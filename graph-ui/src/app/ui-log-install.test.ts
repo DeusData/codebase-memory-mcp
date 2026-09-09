@@ -22,7 +22,7 @@ afterEach(() => {
     handle = undefined;
 });
 
-function install() {
+function install(getProject?: () => string) {
     const posts: { payload: UiLogPayload; final: boolean }[] = [];
     const buffer = new UiLogBuffer({
         page: '/?project=demo',
@@ -44,7 +44,7 @@ function install() {
         warn: (...args: unknown[]) => printed.push(['warn', ...args]),
         error: (...args: unknown[]) => printed.push(['error', ...args]),
     } as unknown as Console;
-    handle = installUiLog({ buffer, console: fakeConsole, session: 'test' });
+    handle = installUiLog({ buffer, console: fakeConsole, session: 'test', getProject });
     return { buffer, posts, printed, fakeConsole };
 }
 
@@ -54,6 +54,21 @@ async function entries(buffer: UiLogBuffer, posts: { payload: UiLogPayload }[]) 
 }
 
 describe('installUiLog', () => {
+    it('captures console ownership before flushing and retains the failed request project', async () => {
+        let project = 'A';
+        const { buffer, posts, fakeConsole } = install(() => project);
+        fakeConsole.warn('A warning');
+        project = 'B';
+        fakeConsole.error('B error');
+        reportError({ project: 'A', source: 'rpc', level: 'error', message: 'late A request' });
+        reportError({ project: '', source: 'api', level: 'error', message: 'daemon request' });
+        const all = await entries(buffer, posts);
+        expect(all.map((entry) => [entry.message, entry.project])).toEqual([
+            ['session test started on /', 'A'], ['A warning', 'A'], ['B error', 'B'],
+            ['late A request', 'A'], ['daemon request', ''],
+        ]);
+    });
+
     it('starts the session with a line that names page, build and browser', async () => {
         const { buffer, posts } = install();
         const all = await entries(buffer, posts);

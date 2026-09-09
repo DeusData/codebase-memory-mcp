@@ -1647,6 +1647,16 @@ export class CbmRpcProvider implements IntelligenceProvider {
      * ein Tastendruck ueberholt, bevor er beantwortet ist. Wer sie nicht
      * mitgibt, bekommt das Verhalten von vorher.
      */
+    async searchFile(root: string, path: string, opts?: ProviderQueryOptions & { signal?: AbortSignal }): Promise<SymbolSearchHit | undefined> {
+        if (opts?.signal?.aborted) return undefined;
+        const project = await this.projectFor(root, opts);
+        if (!project || opts?.signal?.aborted) return undefined;
+        const rows = await this.client.queryRows(project, fileExists(path));
+        if (opts?.signal?.aborted) return undefined;
+        const row = rows.find(row => row[COLUMNS.fileExists[1]] === path);
+        return row ? { name: path.split('/').at(-1) ?? path, kind: 'unknown', filePath: path } : undefined;
+    }
+
     async searchSymbols(
         root: string,
         pattern: string,

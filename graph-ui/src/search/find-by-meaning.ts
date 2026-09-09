@@ -31,6 +31,7 @@
 import type { SymbolSearchHit } from '../core/intelligence-provider';
 import type { RankedHit } from './semantic-search';
 import { queryTerms, rankHits } from './semantic-search';
+import { fileQueryPath } from './path-query';
 
 /**
  * Wie viele Kandidaten ein Wort beitragen darf.
@@ -66,6 +67,8 @@ export const SEARCH_MIN_QUERY = 2;
  * Server, ohne Transport und ohne dass ein Test wissen muss, wie /rpc redet.
  */
 export interface SymbolSearcher {
+    /** Exact File-node lookup; optional for providers that only offer symbol search. */
+    searchFile?(root: string, path: string, opts?: MeaningOptions): Promise<SymbolSearchHit | undefined>;
     searchSymbols(
         root: string,
         pattern: string,
@@ -147,6 +150,17 @@ export async function searchByMeaning(
     opts: MeaningOptions = {},
     fanInOf: (hit: SymbolSearchHit) => number = () => 0,
 ): Promise<MeaningAnswer> {
+    const path = fileQueryPath(query);
+    if (path && searcher.searchFile) {
+        if (opts.signal?.aborted) return { hits: [], candidates: [], complete: false, aborted: true };
+        try {
+            const file = await searcher.searchFile(root, path, opts);
+            if (opts.signal?.aborted) return { hits: [], candidates: [], complete: false, aborted: true };
+            if (file?.filePath === path) {
+                return { hits: rankHits([file], query, fanInOf), candidates: [file], complete: false, aborted: false };
+            }
+        } catch { /* Keep available token matches; never invent the requested file. */ }
+    }
     const terms = queryTerms(query);
     if (terms.length === 0) {
         return { hits: [], candidates: [], complete: true, aborted: false };

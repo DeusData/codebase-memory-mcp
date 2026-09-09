@@ -63,6 +63,10 @@ import {
     IMPACT_TESTS_EMPTY,
     IMPACT_TESTS_TITLE,
     IMPACT_TITLE,
+    IMPACT_RISK_UNRESOLVED,
+    IMPACT_NO_ELEVATED_SIGNAL,
+    IMPACT_UNRESOLVED_TOOLTIP,
+    impactUnresolvedInputs,
     RISK_LABELS,
     impactEvidenceValue,
     impactRiskTooltip,
@@ -162,6 +166,8 @@ export default function ImpactPanel(props: ImpactPanelProps): JSX.Element {
     const tiles = model?.summaryTiles;
     const rules = model === undefined ? [] : badgeRules(model);
     const testCount = (model?.tests.covering.length ?? 0) + (model?.tests.missing.length ?? 0);
+    const unresolved = model?.risk === 'low'
+        && (model.completeness.total === 0 || model.completeness.unmeasured > 0);
 
     return (
         <div
@@ -171,7 +177,7 @@ export default function ImpactPanel(props: ImpactPanelProps): JSX.Element {
             aria-label={IMPACT_TITLE}
             data-mode={props.mode}
             data-status={props.status}
-            data-badge={model?.risk ?? ''}
+            data-badge={unresolved ? 'unresolved' : model?.risk ?? ''}
             data-tiles={tiles === undefined ? 0 : 5 + tiles.indirect.length}
             data-direct={model?.direct.length ?? 0}
             data-downstream={model?.downstream.reduce((sum, group) => sum + group.symbols.length, 0) ?? 0}
@@ -292,17 +298,22 @@ export default function ImpactPanel(props: ImpactPanelProps): JSX.Element {
                         </div>
 
                         <div className="atlas-impact-badge-row">
-                            <Hint name="impact-badge" text={IMPACT_BADGE_TOOLTIP}>
+                            <Hint name="impact-badge" text={unresolved
+                                ? IMPACT_UNRESOLVED_TOOLTIP
+                                : IMPACT_BADGE_TOOLTIP}>
                                 <span
                                     className="atlas-impact-badge"
                                     data-testid="atlas-impact-badge"
-                                    data-level={model.risk}
+                                    data-level={unresolved ? 'unresolved' : model.risk}
                                 >
-                                    {RISK_LABELS[model.risk]}
+                                    {unresolved ? IMPACT_RISK_UNRESOLVED : model.risk === 'low' ? IMPACT_NO_ELEVATED_SIGNAL : RISK_LABELS[model.risk]}
                                 </span>
                             </Hint>
                             <div className="atlas-impact-badge-why">
                                 <span className="atlas-impact-eyebrow">{IMPACT_BADGE_WHY_TITLE}</span>
+                                {unresolved && <p className="atlas-impact-rule" role="status">
+                                    {impactUnresolvedInputs(model.completeness.unmeasured, model.completeness.total)}
+                                </p>}
                                 {rules.length === 0 ? (
                                     <p className="atlas-impact-rule" data-testid="atlas-impact-badge-rule">
                                         {IMPACT_BADGE_WHY_NONE}
@@ -361,8 +372,8 @@ export default function ImpactPanel(props: ImpactPanelProps): JSX.Element {
                                         </RowButton>
                                         <span className="atlas-impact-where">{row.filePath ?? ''}</span>
                                         <Hint name="impact-risk" text={impactRiskTooltip(row.risk, row.reasons)}>
-                                            <span className="atlas-impact-chip" data-level={row.risk}>
-                                                {RISK_LABELS[row.risk]}
+                                            <span className="atlas-impact-chip" data-level={row.risk === 'low' && unresolved ? 'unresolved' : row.risk}>
+                                                {row.risk === 'low' ? IMPACT_NO_ELEVATED_SIGNAL : RISK_LABELS[row.risk]}
                                             </span>
                                         </Hint>
                                     </li>
@@ -403,9 +414,9 @@ export default function ImpactPanel(props: ImpactPanelProps): JSX.Element {
                                                     >
                                                         <span
                                                             className="atlas-impact-chip"
-                                                            data-level={row.risk}
+                                                            data-level={row.risk === 'low' && unresolved ? 'unresolved' : row.risk}
                                                         >
-                                                            {RISK_LABELS[row.risk]}
+                                                            {row.risk === 'low' ? IMPACT_NO_ELEVATED_SIGNAL : RISK_LABELS[row.risk]}
                                                         </span>
                                                     </Hint>
                                                 </li>

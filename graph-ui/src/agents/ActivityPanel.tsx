@@ -10,9 +10,12 @@ import { activityRows } from './activity-model';
 import type { ActivityFilter } from './activity-model';
 import { activityStrings as s } from './activity-strings';
 import './activity.css';
+import AgentSetup from './AgentSetup';
+import type { AtlasApi } from '../app/atlas-api';
 
 interface Props {
     state: AgentsState; status: AgentSourceStatus; on: boolean; port: number;
+    project?: string; api?: Pick<AtlasApi, 'repoInfo'>;
     graph?: GraphData; onToggle: () => void; onOpenNode: (node: GraphNode) => void;
 }
 const emptyFilter: ActivityFilter = { agent: '', run: '', kind: '', query: '' };
@@ -36,6 +39,8 @@ export default function ActivityPanel(props: Props): JSX.Element {
             <div className="cbm-activity-connection"><span data-state={props.status.state}>{props.status.state}</span>
                 <button type="button" onClick={props.onToggle}>{props.on ? s.disconnect : s.connect}</button></div>
         </header>
+        <AgentSetup api={props.api} project={props.project} port={props.port} />
+        <p className="cbm-activity-source-status">{props.on ? props.status.state === 'connected' ? 'History polling connected' : 'Waiting for daemon history' : 'History polling off'} · {all.length ? <>Latest recorded tool call: <time dateTime={new Date(Math.max(...all.map(row => row.ts))).toISOString()}>{new Date(Math.max(...all.map(row => row.ts))).toLocaleString()}</time>. This does not mean an agent is currently working.</> : 'No recorded tool call has been received for this project.'}</p>
         <div className="cbm-activity-metrics">
             {[[s.events, props.state.actors.filter((actor) => !actor.you).reduce((sum, actor) => sum + actor.count, 0)], [s.actors, props.state.actors.filter((actor) => !actor.you).length],
                 [s.gaps, props.state.missed], [s.dropped, props.status.drops]].map(([label, value]) =>

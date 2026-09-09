@@ -54,6 +54,14 @@ describe('der Zustand des Stroms', () => {
         expect(state.actors[0]?.missed).toBe(2);
     });
 
+    it('reconciles a late missing sequence and ignores duplicate deliveries', () => {
+        const state = fold([event({ seq: 1 }), event({ seq: 4 }), event({ seq: 2 }),
+            event({ seq: 2 }), event({ seq: 3 })]);
+        expect(state.events).toBe(4);
+        expect(state.missed).toBe(0);
+        expect(state.actors[0]?.missed).toBe(0);
+    });
+
     it('haelt das erste Ereignis eines Laufs NIE fuer eine Luecke', () => {
         // Die Oberflaeche ist bei Nummer 40 eingestiegen. Das sind keine
         // verlorenen Nachrichten, das ist ein spaeter Zuhoerer.

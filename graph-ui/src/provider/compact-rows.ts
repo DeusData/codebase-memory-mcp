@@ -40,6 +40,11 @@ export interface CompactRows {
     totalRelation?: string;
     hasMore?: boolean;
     truncated?: boolean;
+    offset?: number;
+    nextOffset?: number;
+    nextCursor?: string;
+    truncationReason?: string;
+    warning?: string;
 }
 
 /** Eine geparste search_graph-Antwort. */
@@ -73,7 +78,12 @@ const DATA_LINE = /^ {2}\S/;
 
 /** Zerlegt eine Datenzeile in Zellen und nimmt Anfuehrungszeichen weg. */
 export function splitCells(line: string): string[] {
-    const cells: string[] = [];
+    return cellTokens(line).map(cell => cell.value);
+}
+
+/** Quoted @N+ values are literals; retain that distinction until expansion. */
+function cellTokens(line: string): { value: string; quoted: boolean }[] {
+    const cells: { value: string; quoted: boolean }[] = [];
     let i = 0;
     while (i < line.length) {
         while (i < line.length && (line[i] === ' ' || line[i] === '\t')) {
@@ -106,14 +116,14 @@ export function splitCells(line: string): string[] {
                     `kompakte Zeile hat ein nicht geschlossenes Anfuehrungszeichen: ${line.trim()}`,
                 );
             }
-            cells.push(buf);
+            cells.push({ value: buf, quoted: true });
             continue;
         }
         const start = i;
         while (i < line.length && line[i] !== ' ' && line[i] !== '\t') {
             i += 1;
         }
-        cells.push(line.slice(start, i));
+        cells.push({ value: line.slice(start, i), quoted: false });
     }
     return cells;
 }
@@ -139,11 +149,19 @@ function collectRows(
     from: number,
     columns: string[],
     label: string,
+    refs?: ReadonlyMap<number, string>,
 ): { rows: string[][]; next: number } {
     const rows: string[][] = [];
     let i = from;
     while (i < lines.length && DATA_LINE.test(lines[i])) {
-        const cells = splitCells(lines[i].slice(2));
+        const cells = cellTokens(lines[i].slice(2)).map(cell => {
+            const ref = !cell.quoted && refs ? /^@(\d+)\+(.*)$/.exec(cell.value) : null;
+            if (!ref) return cell.value;
+            const prefix = refs!.get(Number(ref[1]));
+            if (prefix === undefined) throw new Error(`${label}: unknown reference @${ref[1]}`);
+            // Prefix entries are declarations, never recursively expanded.
+            return prefix + ref[2];
+        });
         if (cells.length !== columns.length) {
             throw new Error(
                 `${label}: Zeile ${i + 1} hat ${cells.length} Zellen, der Kopf nennt ` +
@@ -154,6 +172,38 @@ function collectRows(
         i += 1;
     }
     return { rows, next: i };
+}
+
+function readReferences(lines: string[], from: number, key: 'rows' | 'results'):
+    { refs?: ReadonlyMap<number, string>; next: number } {
+    const head = new RegExp(`^${key}_refs:\\s*(\\d+)\\s*\\(cols:\\s*id\\s+prefix\\)\\s*$`).exec(lines[from]);
+    if (!head) return { next: from };
+    const count = Number(head[1]);
+    const collected = collectRows(lines, from + 1, ['id', 'prefix'], `${key}_refs`);
+    if (!Number.isSafeInteger(count) || collected.rows.length !== count)
+        throw new Error(`${key}_refs: declared count does not match reference rows`);
+    const refs = new Map<number, string>();
+    for (const [id, prefix] of collected.rows) {
+        const number = Number(id);
+        if (!/^\d+$/.test(id) || !Number.isSafeInteger(number) || refs.has(number))
+            throw new Error(`${key}_refs: invalid or duplicate reference id ${id}`);
+        refs.set(number, prefix);
+    }
+    if (lines[collected.next]?.trim() !== `${key}_ref_rule: @N+suffix=prefix+suffix`)
+        throw new Error(`${key}_refs: missing or unsupported reference rule`);
+    return { refs, next: collected.next + 1 };
+}
+
+function validateCounts(parsed: CompactRows | SearchResults): void {
+    for (const value of [parsed.total, parsed.returned, 'offset' in parsed ? parsed.offset : undefined,
+        'nextOffset' in parsed ? parsed.nextOffset : undefined]) {
+        if (value !== undefined && (!Number.isSafeInteger(value) || value < 0))
+            throw new Error('Invalid compact response count');
+    }
+    if (parsed.total < parsed.rows.length || (parsed.returned !== undefined && parsed.returned !== parsed.rows.length))
+        throw new Error('Compact response counts contradict returned rows');
+    if (parsed.totalRelation !== undefined && parsed.totalRelation !== 'eq' && parsed.totalRelation !== 'gte')
+        throw new Error('Unknown total_relation');
 }
 
 /**
@@ -172,7 +222,9 @@ export function parseCompactRows(text: string): CompactRows {
         throw new Error('kompakte Antwort war leer');
     }
 
-    const head = ROWS_HEAD.exec(lines[i]);
+    const directory = readReferences(lines, i, 'rows');
+    i = directory.next;
+    const head = ROWS_HEAD.exec(lines[i] ?? '');
     if (head === null) {
         throw new Error(
             `unbekannter Kopf einer kompakten Antwort, erwartet "rows: N  (cols: ...)": ` +
@@ -183,7 +235,7 @@ export function parseCompactRows(text: string): CompactRows {
     const columns = readColumns(head[2]);
     i += 1;
 
-    const collected = collectRows(lines, i, columns, 'kompakte Antwort');
+    const collected = collectRows(lines, i, columns, 'kompakte Antwort', directory.refs);
     const rows = collected.rows;
     i = collected.next;
 
@@ -199,6 +251,7 @@ export function parseCompactRows(text: string): CompactRows {
     let totalRelation: string | undefined;
     let hasMore: boolean | undefined;
     let truncated: boolean | undefined;
+    const metadata: Pick<CompactRows, 'offset' | 'nextOffset' | 'nextCursor' | 'truncationReason' | 'warning'> = {};
     for (; i < lines.length; i += 1) {
         const line = lines[i];
         if (line.trim().length === 0) {
@@ -234,6 +287,17 @@ export function parseCompactRows(text: string): CompactRows {
             truncated = truncatedMatch[1] === 'true';
             continue;
         }
+        const extra = /^(offset|next_offset|next_cursor|truncation_reason|warning):\s*(.*)$/.exec(line);
+        if (extra) {
+            const value = unquote(extra[2]);
+            if (extra[1] === 'offset' || extra[1] === 'next_offset') {
+                if (!/^\d+$/.test(value)) throw new Error(`Invalid ${extra[1]}`);
+                metadata[extra[1] === 'offset' ? 'offset' : 'nextOffset'] = Number(value);
+            } else if (extra[1] === 'next_cursor') metadata.nextCursor = value;
+            else if (extra[1] === 'truncation_reason') metadata.truncationReason = value;
+            else metadata.warning = value;
+            continue;
+        }
         throw new Error(`unbekannte Fusszeile einer kompakten Antwort: ${line.trim()}`);
     }
 
@@ -241,7 +305,7 @@ export function parseCompactRows(text: string): CompactRows {
         throw new Error('kompakte Antwort ohne total-Zeile');
     }
 
-    const out: CompactRows = { columns, rows, total };
+    const out: CompactRows = { columns, rows, total, ...metadata };
     if (hint !== undefined) {
         out.hint = hint;
     }
@@ -257,6 +321,7 @@ export function parseCompactRows(text: string): CompactRows {
     if (truncated !== undefined) {
         out.truncated = truncated;
     }
+    validateCounts(out);
     return out;
 }
 
@@ -275,12 +340,21 @@ export function parseSearchResults(text: string): SearchResults {
     let returned: number | undefined;
     let totalRelation: string | undefined;
     let truncated: boolean | undefined;
+    let refs: ReadonlyMap<number, string> | undefined;
 
     let i = 0;
     while (i < lines.length) {
         const line = lines[i];
         if (line.trim().length === 0) {
             i += 1;
+            continue;
+        }
+        if (line.startsWith('results_refs:')) {
+            if (refs || rows) throw new Error('Duplicate or misplaced results_refs');
+            const directory = readReferences(lines, i, 'results');
+            if (!directory.refs) throw new Error('Malformed results_refs');
+            refs = directory.refs;
+            i = directory.next;
             continue;
         }
 
@@ -324,7 +398,7 @@ export function parseSearchResults(text: string): SearchResults {
         if (head !== null) {
             declared = Number.parseInt(head[1], 10);
             columns = readColumns(head[2]);
-            const collected = collectRows(lines, i + 1, columns, 'Suchantwort');
+            const collected = collectRows(lines, i + 1, columns, 'Suchantwort', refs);
             rows = collected.rows;
             i = collected.next;
             continue;
@@ -362,6 +436,7 @@ export function parseSearchResults(text: string): SearchResults {
     if (truncated !== undefined) {
         out.truncated = truncated;
     }
+    validateCounts(out);
     return out;
 }
 

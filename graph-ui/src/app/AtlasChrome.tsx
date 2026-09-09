@@ -151,6 +151,7 @@ export interface AtlasChromeProps {
     workspace?: Workspace;
     onWorkspaceChange?: (workspace: Workspace) => void;
     workspacePanel?: ReactNode;
+    workspaceStatus?: ReactNode;
     guidance?: Guidance;
     onGuidanceChange?: (guidance: Guidance) => void;
     /** Versions-Chip, zur Buildzeit injiziert. Nur die Fassung, ohne Zusatz. */
@@ -642,7 +643,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
     };
 
     return (
-        <div className="atlas-shell" data-workspace={props.workspace ?? 'explore'} data-guidance={props.guidance ?? 'brief'} data-chat-open={props.chatOpen === true}>
+        <div className="atlas-shell" data-workspace={props.workspace ?? 'explore'} data-guidance={props.guidance ?? 'brief'} data-chat-open={props.chatOpen === true} data-has-status={props.workspaceStatus !== undefined}>
             <header className="atlas-header" data-testid="atlas-header">
                 <h1 className="atlas-brand">{messages.app.brand}</h1>
                 <span className="atlas-version" data-testid="atlas-version">
@@ -789,6 +790,7 @@ export default function AtlasChrome(props: AtlasChromeProps): JSX.Element {
                 {props.projectSwitcher}
             </header>
 
+            {props.workspaceStatus}
             <div className="atlas-workspace-content" style={{ '--atlas-chat-width': `${chatWidth}px` } as CSSProperties}>
             <div className="atlas-workspace-stage">
             <div className="atlas-exploration-workspace" data-testid="atlas-exploration-workspace" hidden={props.workspace !== undefined && props.workspace !== 'explore' && props.workspace !== 'galaxy'}>

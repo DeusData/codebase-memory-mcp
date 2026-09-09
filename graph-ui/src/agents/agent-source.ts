@@ -1,58 +1,20 @@
-/**
- * Die Verbindung zur Bruecke, und der Zustand, wenn es keine gibt.
- *
- * ## Aus heisst aus
- *
- * Solange der Live-Modus aus ist, geht von hier KEINE Anfrage hinaus. Nicht
- * eine Probe, nicht ein `HEAD`, nicht ein Versuch herauszufinden, ob eine
- * Bruecke laeuft. Dasselbe Versprechen wie beim lokalen Modell (src/llm), und
- * derselbe Grund: ein Schalter, der im Hintergrund weiter fragt, ist kein
- * Schalter, sondern eine Farbe. Der Zaehler {@link AgentSourceStatus.requests}
- * steht im Testgriff, damit die Null gemessen werden kann und nicht geglaubt
- * werden muss.
- *
- * ## Und ohne Bruecke heisst ohne Bruecke
- *
- * Ist der Modus an und antwortet niemand, sagt der Zustand `no-source`, und das
- * Instrument zeigt den Befehl, der die Bruecke startet. Ein leerer Graph waere
- * an dieser Stelle die Behauptung, es arbeite gerade niemand, und das ist eine
- * Aussage, die dieses Fenster nicht treffen kann.
- *
- * ## Warum `fetch` und nicht `EventSource`
- *
- * Der Draht ist Server-Sent-Events, das Lesen ist ein `fetch` mit einem
- * Stroem-Leser. Drei Gruende, in dieser Reihenfolge:
- *
- *  1. **Wiederaufnahme.** Die Bruecke nimmt die zuletzt gesehene Nummer je Lauf
- *     als Abfrageparameter. `EventSource` schickt beim Wiederverbinden seine
- *     eigene `Last-Event-ID` und sonst nichts; die Nummern MEHRERER Laeufe
- *     passen dort nicht hinein.
- *  2. **Abbrechen.** Ein `AbortController` beendet die Verbindung in dem
- *     Augenblick, in dem der Schalter faellt. `EventSource.close()` tut das auch,
- *     verbindet aber vorher von selbst neu, und "von selbst" ist genau das, was
- *     ein ausgeschalteter Modus nicht tun darf.
- *  3. **Messbarkeit.** Ein `fetch` ist eine Anfrage, die man zaehlen kann, und
- *     die Zusicherung dieses Moduls ist eine Zahl.
- */
+/** Same-origin daemon polling over the existing sequential HTTP transport.
+ * Off means zero requests. Cursors are committed only after a validated page;
+ * reconnects retain state, and a replaced SQLite database resets its generation. */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { AgentEvent } from './agent-event';
-import { readAgentEvent, sinceParameter } from './agent-event';
+import { readAgentEvent } from './agent-event';
 import { emptyAgentsState, withEvent } from './agent-store';
 import type { AgentsState } from './agent-store';
 
-/** Der Vorgabeport der Bruecke. Derselbe wie in tools/agent-bridge.mjs. */
-export const DEFAULT_BRIDGE_PORT = 4142;
-
-/** Wie lange nach einem Abriss gewartet wird, bevor neu verbunden wird. */
+/** Kept as a source compatibility name; the current daemon port is used. */
+export const DEFAULT_BRIDGE_PORT = 9749;
 export const RECONNECT_MS = 3000;
-
-/** Was der Zustand `no-source` als Weg nach vorn nennt. */
-export function bridgeCommand(port: number): string {
-    return port === DEFAULT_BRIDGE_PORT
-        ? 'node tools/agent-bridge.mjs'
-        : `node tools/agent-bridge.mjs --port ${port}`;
+export const POLL_MS = 1000;
+export function bridgeCommand(_port: number): string {
+    return 'codebase-memory-mcp --ui';
 }
 
 /** Die Lage der Quelle. */
@@ -61,20 +23,20 @@ export type SourceState =
     | 'off'
     /** Eine Verbindung laeuft gerade an. */
     | 'connecting'
-    /** Die Bruecke antwortet und schickt Ereignisse. */
+    /** Der Daemon antwortet mit gespeicherten Ereignissen. */
     | 'connected'
     /** Der Modus ist an und niemand antwortet. */
     | 'no-source';
 
-/** Was die Bruecke ueber sich gesagt hat. */
+/** Quelleninformation des Daemons (Feldnamen kompatibel zum bisherigen HUD). */
 export interface BridgeHello {
-    /** `live` verfolgt eine Datei, `replay` spielt eine Aufzeichnung ab. */
+    /** `live` liest die lokale SQLite-Historie, `replay` bezeichnet Testaufzeichnungen. */
     mode: string;
-    /** Die Datei, die sie liest. */
+    /** Lesbare Bezeichnung der Datenquelle. */
     file: string;
-    /** Wie viele Zeilen sie gelesen hat. */
+    /** Wie viele Ereignisse der Daemon aktuell aufbewahrt. */
     events: number;
-    /** Wie viele Zeilen kein JSON waren. */
+    /** Wie viele empfangene Ereignisse nicht lesbar waren. */
     unreadable: number;
 }
 
@@ -87,7 +49,7 @@ export interface AgentSourceStatus {
     requests: number;
     /** Wie oft die Verbindung abgerissen ist. */
     drops: number;
-    /** Was die Bruecke ueber sich gesagt hat, wenn sie es gesagt hat. */
+    /** Metadaten der zuletzt gelesenen Daemon-Antwort. */
     hello: BridgeHello | undefined;
     /** Der letzte Fehler, woertlich. Leer, wenn keiner. */
     error: string;
@@ -124,22 +86,17 @@ export function parseSseFrame(raw: string): SseFrame | undefined {
     return data.length === 0 ? undefined : { event: name, data: data.join('\n') };
 }
 
-/** Der Port der Bruecke, wie die Adresszeile ihn nennt. */
-export function bridgePortFromSearch(search: string): number {
-    try {
-        const raw = new URLSearchParams(search).get('agents');
-        const port = Number(raw);
-        return Number.isFinite(port) && port > 0 && port < 65536 ? port : DEFAULT_BRIDGE_PORT;
-    } catch {
-        return DEFAULT_BRIDGE_PORT;
-    }
+/** Der aktuelle Daemon-Port; ein alter agents-Parameter hat keine Wirkung. */
+export function bridgePortFromSearch(_search: string): number {
+    return typeof location === 'undefined' ? DEFAULT_BRIDGE_PORT : Number(location.port) || 80;
 }
 
 export interface AgentStreamOptions {
     /** Ob der Live-Modus an ist. Aus heisst: keine Anfrage. */
     on: boolean;
-    /** Der Port der Bruecke. */
+    /** Kompatibilitaetsfeld fuer alte Aufrufer; der Transport verwendet same-origin. */
     port?: number;
+    project?: string;
     /** Ersetzbares fetch, damit Tests ohne Netz laufen. */
     fetch?: typeof globalThis.fetch | undefined;
 }
@@ -148,13 +105,13 @@ export interface AgentStreamOptions {
 export interface AgentStream {
     state: AgentsState;
     status: AgentSourceStatus;
-    /** Ein eigenes Ereignis dazulegen, ohne die Bruecke zu fragen. */
+    /** Ein eigenes Browsereignis lokal dazulegen. */
     push: (event: AgentEvent, you: boolean) => void;
 }
 
 /**
  * Der Strom, wie ihn die Panels bekommen: samt Port, damit das Instrument den
- * Befehl nennen kann, der die Bruecke startet.
+ * vorhandenen Daemon-Port anzeigen kann.
  */
 export interface AgentsRuntime extends AgentStream {
     port: number;
@@ -170,24 +127,29 @@ export interface AgentsRuntime extends AgentStream {
  * zwanzig Zustandsketten aufmachen, aus denen jede die vorige ueberschreibt.
  */
 export function useAgentStream(options: AgentStreamOptions): AgentStream {
-    const port = options.port ?? DEFAULT_BRIDGE_PORT;
+    const project = options.project ?? '';
     const fetchImpl = options.fetch;
     const on = options.on;
 
     const stateRef = useRef<AgentsState>(emptyAgentsState());
-    const [state, setState] = useState<AgentsState>(stateRef.current);
+    const [reading, setReading] = useState({ project, value: stateRef.current });
     const requests = useRef(0);
     const drops = useRef(0);
-    const [status, setStatus] = useState<AgentSourceStatus>({
+    const cursor = useRef(0);
+    const incomplete = useRef(false);
+    const generation = useRef<string | undefined>(undefined);
+    const previousProject = useRef(project);
+    const [source, setSource] = useState<{ project: string; value: AgentSourceStatus }>({ project, value: {
         state: 'off',
         origin: '',
         requests: 0,
         drops: 0,
         hello: undefined,
         error: '',
-    });
+    } });
 
     const push = useCallback((event: AgentEvent, you: boolean) => {
+        if (previousProject.current !== project) return;
         const next = withEvent(stateRef.current, event);
         stateRef.current = you
             ? {
@@ -196,35 +158,43 @@ export function useAgentStream(options: AgentStreamOptions): AgentStream {
                     (actor.id === event.agent ? { ...actor, you: true } : actor)),
             }
             : next;
-        setState(stateRef.current);
-    }, []);
+        setReading({ project, value: stateRef.current });
+    }, [project]);
 
     useEffect(() => {
+        if (previousProject.current !== project) {
+            previousProject.current = project;
+            cursor.current = 0;
+            generation.current = undefined;
+            incomplete.current = false;
+            stateRef.current = emptyAgentsState();
+            setReading({ project, value: stateRef.current });
+        }
         if (!on) {
-            setStatus({
+            setSource({ project, value: {
                 state: 'off',
                 origin: '',
                 requests: requests.current,
                 drops: drops.current,
                 hello: undefined,
                 error: '',
-            });
+            } });
             return;
         }
-        const origin = `http://127.0.0.1:${port}`;
+        const origin = typeof location === 'undefined' ? '' : location.origin;
         const doFetch = fetchImpl ?? globalThis.fetch;
         let stopped = false;
         let controller: AbortController | null = null;
         let timer: ReturnType<typeof setTimeout> | undefined;
 
         const announce = (patch: Partial<AgentSourceStatus>): void => {
-            setStatus((current) => ({
-                ...current,
+            setSource((current) => ({ project, value: {
+                ...(current.project === project ? current.value : { state: 'connecting', hello: undefined, error: '' }),
                 origin,
                 requests: requests.current,
                 drops: drops.current,
                 ...patch,
-            }));
+            } }));
         };
 
         const connect = async (): Promise<void> => {
@@ -232,78 +202,49 @@ export function useAgentStream(options: AgentStreamOptions): AgentStream {
                 return;
             }
             controller = new AbortController();
-            const since = sinceParameter(stateRef.current.seen);
-            const url = `${origin}/events${since.length > 0 ? `?since=${encodeURIComponent(since)}` : ''}`;
+            const url = `/api/agent-events?project=${encodeURIComponent(project)}&after=${cursor.current}&limit=200`;
             requests.current += 1;
-            announce({ state: 'connecting', error: '' });
+            if (cursor.current === 0) announce({ state: 'connecting', error: '' });
             try {
-                const response = await doFetch(url, {
-                    headers: { Accept: 'text/event-stream' },
-                    signal: controller.signal,
-                });
-                if (!response.ok || response.body === null) {
-                    throw new Error(`the bridge answered with HTTP ${response.status}`);
+                const response = await doFetch(url, { signal: controller.signal });
+                if (!response.ok) throw new Error(`daemon activity: HTTP ${response.status}`);
+                const page = await response.json() as {
+                    events: unknown[]; cursor: number; generation: string; reset: boolean;
+                    has_more: boolean; truncated: boolean; retained: number;
+                };
+                if (!Array.isArray(page.events) || !Number.isSafeInteger(page.cursor)
+                    || page.cursor < 0 || typeof page.generation !== 'string') {
+                    throw new Error('Invalid daemon activity response');
                 }
-                announce({ state: 'connected', error: '' });
-                const reader = response.body.getReader();
-                const decoder = new TextDecoder();
-                let buffer = '';
-                for (;;) {
-                    const chunk = await reader.read();
-                    if (chunk.done) {
-                        break;
-                    }
-                    buffer += decoder.decode(chunk.value, { stream: true });
-                    const parts = buffer.split('\n\n');
-                    buffer = parts.pop() ?? '';
-                    let changed = false;
-                    for (const part of parts) {
-                        const frame = parseSseFrame(part);
-                        if (frame === undefined) {
-                            continue;
-                        }
-                        if (frame.event === 'hello') {
-                            try {
-                                const hello = JSON.parse(frame.data) as BridgeHello;
-                                announce({ state: 'connected', hello });
-                                stateRef.current = {
-                                    ...stateRef.current,
-                                    unreadable: Number(hello.unreadable) || 0,
-                                };
-                                changed = true;
-                            } catch {
-                                /* Ein unlesbarer Gruss aendert nichts an den Ereignissen. */
-                            }
-                            continue;
-                        }
-                        if (frame.event !== 'trace') {
-                            continue;
-                        }
-                        try {
-                            const event = readAgentEvent(JSON.parse(frame.data));
-                            if (event !== undefined) {
-                                stateRef.current = withEvent(stateRef.current, event);
-                                changed = true;
-                            }
-                        } catch {
-                            /* Eine unlesbare Zeile ist eine Zeile weniger, kein Abbruch. */
-                        }
-                    }
-                    if (changed && !stopped) {
-                        setState(stateRef.current);
-                    }
-                }
-                if (!stopped) {
-                    drops.current += 1;
-                    announce({ state: 'no-source', error: 'the bridge closed the stream' });
-                    timer = setTimeout(() => void connect(), RECONNECT_MS);
-                }
-            } catch (failure) {
-                if (stopped) {
+                if (stopped) return;
+                if (page.reset || (generation.current !== undefined && generation.current !== page.generation)) {
+                    stateRef.current = emptyAgentsState();
+                    cursor.current = 0;
+                    incomplete.current = false;
+                    generation.current = page.generation;
+                    setReading({ project, value: stateRef.current });
+                    timer = setTimeout(() => void connect(), 0);
                     return;
                 }
-                const message = failure instanceof Error ? failure.message : String(failure);
-                announce({ state: 'no-source', error: message });
+                generation.current = page.generation;
+                let next = stateRef.current;
+                for (const raw of page.events) {
+                    const event = readAgentEvent(raw);
+                    if (event !== undefined) next = withEvent(next, event);
+                    else next = { ...next, unreadable: next.unreadable + 1 };
+                }
+                stateRef.current = next;
+                cursor.current = page.cursor;
+                incomplete.current ||= page.truncated;
+                setReading({ project, value: next });
+                announce({ state: 'connected', error: incomplete.current
+                    ? 'Older activity expired from local retention; this history is incomplete.' : '',
+                    hello: { mode: 'live', file: 'daemon SQLite activity', events: page.retained, unreadable: next.unreadable } });
+                timer = setTimeout(() => void connect(), page.has_more ? 0 : POLL_MS);
+            } catch (failure) {
+                if (stopped) return;
+                drops.current += 1;
+                announce({ state: 'no-source', error: failure instanceof Error ? failure.message : String(failure) });
                 timer = setTimeout(() => void connect(), RECONNECT_MS);
             }
         };
@@ -316,7 +257,16 @@ export function useAgentStream(options: AgentStreamOptions): AgentStream {
             }
             controller?.abort();
         };
-    }, [on, port, fetchImpl]);
+    }, [on, project, fetchImpl]);
 
-    return useMemo(() => ({ state, status, push }), [state, status, push]);
+    // A passive effect resets the cursor, but the first render of another
+    // project must already hide the previous project's events and provenance.
+    return useMemo(() => ({
+        state: reading.project === project ? reading.value : emptyAgentsState(),
+        status: source.project === project ? source.value : {
+            state: on ? 'connecting' as const : 'off' as const, origin: '',
+            requests: requests.current, drops: drops.current, hello: undefined, error: '',
+        },
+        push,
+    }), [reading, source, project, on, push]);
 }
