@@ -15426,6 +15426,81 @@ TEST(cli_build_args_json_repeated_array_issue680) {
     PASS();
 }
 
+/* An array-typed flag also accepts the JSON-array spelling shown by the MCP
+ * schemas, expanding it into individual items instead of one opaque keyword. */
+TEST(cli_build_args_json_array_literal) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"create\",\"billing\",\"account\"]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"create\",\"billing\",\"account\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* An explicit empty JSON array contributes no items; it must not turn into
+ * the literal keyword "[]". */
+TEST(cli_build_args_json_array_literal_empty) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[]") != NULL);
+    ASSERT(strstr(json, "\"[]\"") == NULL);
+    free(json);
+    PASS();
+}
+
+/* Malformed JSON keeps the pre-existing behaviour: the value stays one
+ * literal string and no error is raised. */
+TEST(cli_build_args_json_array_literal_malformed) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"create\","};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"semantic_query\":[\"[\\\"create\\\",\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* Non-string items of a well-formed JSON array are copied as typed values,
+ * not stringified and not collapsed into one literal element. */
+TEST(cli_build_args_json_array_literal_non_string_items) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[1,2]"};
+    char *json = cbm_cli_build_args_json("search_graph", 2, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[1,2]") != NULL);
+    ASSERT(strstr(json, "\"[1,2]\"") == NULL);
+    free(json);
+    PASS();
+}
+
+/* Repeated flags and array literals may be mixed; items accumulate in
+ * argument order. */
+TEST(cli_build_args_json_array_literal_mixed_with_repeated) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "send",  "--semantic-query", "[\"publish\",\"emit\"]",
+                    "--semantic-query", "notify"};
+    char *json = cbm_cli_build_args_json("search_graph", 6, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\",\"emit\",\"notify\"]") != NULL);
+    free(json);
+    PASS();
+}
+
+/* A repeated array literal accumulates into one array. */
+TEST(cli_build_args_json_array_literal_repeated) {
+    char *err = NULL;
+    char *argv[] = {"--semantic-query", "[\"send\"]", "--semantic-query", "[\"publish\"]"};
+    char *json = cbm_cli_build_args_json("search_graph", 4, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"semantic_query\":[\"send\",\"publish\"]") != NULL);
+    free(json);
+    PASS();
+}
+
 /* kebab-case flag names map to snake_case JSON keys. */
 TEST(cli_build_args_json_kebab_to_snake_issue680) {
     char *err = NULL;
@@ -16560,6 +16635,12 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
+    RUN_TEST(cli_build_args_json_array_literal);
+    RUN_TEST(cli_build_args_json_array_literal_empty);
+    RUN_TEST(cli_build_args_json_array_literal_malformed);
+    RUN_TEST(cli_build_args_json_array_literal_non_string_items);
+    RUN_TEST(cli_build_args_json_array_literal_mixed_with_repeated);
+    RUN_TEST(cli_build_args_json_array_literal_repeated);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
