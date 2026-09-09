@@ -11,6 +11,7 @@
 
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
@@ -66,7 +67,16 @@ void cbm_config_edit_target_close(cbm_config_edit_target_t *target) {
 
 #ifndef _WIN32
 
-static CBM_TLS char edit_path_roots[EDIT_PATH_MAX_ROOTS][CBM_CONFIG_EDIT_PATH_MAX];
+/* The opted-in follow-roots are per-thread (test isolation), but the storage
+ * is a heap buffer behind a thread-local POINTER, not a thread-local array.
+ * A `_Thread_local char[4][4096]` sits in the binary's static TLS block, and
+ * glibc carves that block out of every thread's stack allocation — including
+ * the parent-death watchdog's deliberately tiny 64 KiB stack (main.c). The
+ * 16 KiB array pushed the watchdog's pthread_create over the static-TLS +
+ * guard budget, so it failed with EINVAL on glibc/x86-64 (green on macOS,
+ * whose TLS is not stack-carved): #2110 CI. The pointer keeps the static TLS
+ * block at 8 bytes; the buffer is allocated on first add and freed by clear. */
+static CBM_TLS char (*edit_path_roots)[CBM_CONFIG_EDIT_PATH_MAX] = NULL;
 static CBM_TLS size_t edit_path_root_count = 0U;
 
 #ifdef CBM_CONFIG_EDIT_PATH_ENABLE_TEST_API
@@ -101,6 +111,12 @@ int cbm_config_edit_path_follow_add_root(const char *root) {
     if (!cbm_canonical_path(root, canonical, sizeof(canonical))) {
         return -1;
     }
+    if (!edit_path_roots) {
+        edit_path_roots = calloc(EDIT_PATH_MAX_ROOTS, sizeof(*edit_path_roots));
+        if (!edit_path_roots) {
+            return -1;
+        }
+    }
     if (edit_path_copy(canonical, edit_path_roots[edit_path_root_count],
                        sizeof(edit_path_roots[0])) != 0) {
         return -1;
@@ -111,6 +127,8 @@ int cbm_config_edit_path_follow_add_root(const char *root) {
 
 void cbm_config_edit_path_follow_clear(void) {
     edit_path_root_count = 0U;
+    free(edit_path_roots);
+    edit_path_roots = NULL;
 }
 
 static int edit_path_under_root(const char *canonical) {
