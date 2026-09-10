@@ -4848,7 +4848,7 @@ export default function App(): JSX.Element {
             onGuidanceChange={changeGuidance}
             workspacePanel={<>
                 <div hidden={workspace !== 'architecture'}>
-                <ArchitecturePanel projectName={project} overview={overview}
+                <ArchitecturePanel projectName={project} overview={overview} active={workspace === 'architecture'}
                     readSource={readMapSource}
                     graph={repositoryReading.snapshot} graphGeneration={repositoryReading.snapshot?.generation} selection={activeGalaxySelection} selectionPanel={mapSelectionPanel}
                     graphNote={repositoryReading.error ?? (repositoryReading.snapshot

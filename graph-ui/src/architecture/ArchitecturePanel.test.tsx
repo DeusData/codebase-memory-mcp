@@ -64,13 +64,25 @@ async function filter(value: string): Promise<void> {
 }
 
 describe('architecture workspace', () => {
+    it('keeps a spatial exploration surface across architecture, dependencies, routes and entry points', async () => {
+        await render({ graph: { nodes: [], edges: [], total_nodes: 0 } });
+        const surface = container.querySelector('[data-testid="spatial-architecture"]');
+        expect(surface).not.toBeNull();
+        for (const view of ['dependencies', 'routes', 'entryPoints']) {
+            await click(`[data-view="${view}"]`);
+            expect(container.querySelector('[data-testid="spatial-architecture"]')).toBe(surface);
+            expect(container.querySelector('[aria-label="Architecture relationships"]')).not.toBeNull();
+        }
+    });
+
     it('keeps module, layer, community and indexed-file evidence available in Overview', async () => {
         await render();
         expect(container.textContent).toContain('41');
         expect(container.textContent).toContain('Registered route handlers');
         expect(container.textContent).toContain('persist');
         expect(container.textContent).toContain('src/storage.ts');
-        expect(container.querySelector('details')?.open).toBe(false);
+        const statistics = [...container.querySelectorAll('details')].find(details => details.querySelector('summary')?.textContent === text.summaryDetails);
+        expect(statistics?.open).toBe(false);
     });
 
     it('opens a source location at the exact provider line and leaves unknown locations unlinked', async () => {

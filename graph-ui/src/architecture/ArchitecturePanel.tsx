@@ -11,10 +11,12 @@ import './architecture.css';
 import RepositoryMapView, { RelationshipEvidence } from './RepositoryMap';
 import type { RepositoryMapProps } from './RepositoryMap';
 import { repositoryMap } from './repository-map';
+import SpatialArchitecture from './SpatialArchitecture';
 
 export interface ArchitecturePanelProps extends Pick<RepositoryMapProps, 'graph' | 'selection' | 'selectionPanel' | 'onSelect' | 'graphNote' | 'readSource'> {
     projectName: string;
     graphGeneration?: string;
+    active?: boolean;
     overview?: ArchitectureOverviewDto;
     loading?: boolean;
     error?: string;
@@ -236,7 +238,7 @@ function Findings({ view, data, empty, onNavigate }: {
     </section>;
 }
 
-function ArchitectureWorkspace({ projectName, overview, loading = false, error, onRefresh, onProjectWalk, onNavigate, graph, selection, selectionPanel, onSelect, graphNote, graphGeneration, readSource }: ArchitecturePanelProps): JSX.Element {
+function ArchitectureWorkspace({ projectName, overview, loading = false, error, onRefresh, onProjectWalk, onNavigate, graph, selection, selectionPanel, onSelect, graphNote, graphGeneration, readSource, active = true }: ArchitecturePanelProps): JSX.Element {
     const storage = useMemo(browserStorage, []);
     const [config, setConfig] = useState(() => readArchitectureConfig(storage, projectName));
     const [saved, setSaved] = useState(true);
@@ -267,11 +269,16 @@ function ArchitectureWorkspace({ projectName, overview, loading = false, error, 
             : error ? <div role="alert" className="atlas-arch-empty" data-error="true"><p>{text.loadFailed}</p><p className="atlas-arch-error-detail">{error}</p>
                 {onRefresh && <button className="atlas-arch-action" onClick={onRefresh}>{text.retry}</button>}</div>
                 : !data ? <Empty>{text.unavailable}</Empty> : null}
+        {ready && data && graph && <div hidden={config.view === 'hotspots'}><SpatialArchitecture project={projectName} generation={graphGeneration} graph={graph} overview={data}
+            view={config.view === 'hotspots' ? 'overview' : config.view} filter={config.filter} active={active && config.view !== 'hotspots'}
+            graphNote={graphNote} onSelect={onSelect} selectionPanel={selectionPanel} onNavigate={onNavigate} onView={view => setConfig(current => ({ ...current, view }))} /></div>}
         {ready && data && filtered && <div className="atlas-arch-content" key={`${config.view}:${config.filter}:${graphGeneration ?? ""}`} data-testid="atlas-architecture-content">
+            <details open={!graph || config.view === 'hotspots'}><summary>Source guide and complete findings</summary>
             {config.view === 'overview' ? <><RepositoryMapView graph={graph} graphNote={graphNote} overview={data} filter={config.filter} onNavigate={onNavigate} onSelect={onSelect} selection={selection} selectionPanel={selectionPanel} readSource={readSource} />
                 <details><summary>{text.summaryDetails}</summary><Overview data={data} filtered={filtered} filter={config.filter} onGroup={onGroup} onNavigate={onNavigate} /></details></>
                 : config.view === 'dependencies' ? <Dependencies data={filtered} empty={empty} onGroup={onGroup} graph={graph} onNavigate={onNavigate} />
                     : <Findings view={config.view} data={filtered} empty={empty} onNavigate={onNavigate} />}
+            </details>
         </div>}
         {ready && <details className="atlas-arch-evidence"><summary>{text.evidenceSummary}</summary><p>{text.evidenceDetail}</p></details>}
     </section>;
