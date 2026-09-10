@@ -654,13 +654,7 @@ static bool client_start_parent_watchdog(DWORD initial_ppid) {
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE                                                                             \
-    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
-    "[json_args]\n"                                                                           \
-    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
-    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
-    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
-    "  --json      Print the raw MCP result envelope\n"
+#define CLI_USAGE CBM_CLI_USAGE /* `cli --help`; wording lives in cli.h (#2102) */
 
 /* Extract text content from MCP tool result envelope and print it.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
