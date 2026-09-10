@@ -4,6 +4,16 @@ Campaign: raise Hybrid LSP + extraction for **Perl 5.38, Go 1.25, Rust 1.97/e202
 Method: 5 senior language analysts → 2 independent adversarial reviewers each (feasibility-skeptic 对拍位A, depth-completeness 对拍位B) → this adjudication. 15 agents, 57 proposals, 1 refuted, ~50 additional missed-item candidates.
 Branch: `feat/lang-lsp-uplift`. Verification: `make -f Makefile.cbm test-focused TEST_SUITES=<suite>` per batch, full `test-par` before each push. See `SOP.md` for the iteration harness.
 
+## Retro (2026-09-10) — Perl axis concluded
+
+**`perl-cross-file-lsp` (P0/L) ✅ shipped** and extended well past its original scope. Perl Mojolicious `CALLS` **2216 → 4660 (+110%)**, every edge sound. Two chapters:
+- **Cross-file inheritance foundation** (`use Mojo::Base`, cross-file inherited dispatch): 2218 → 3331. Write-up: `PERL-CROSS-FILE-INHERITANCE.md`.
+- **Typed-receiver chains + structural (duck) typing + cross-file pre-pass**: 3331 → 4660. Biggest levers: @ISA-on-used-modules (+173, `363f9584`), cross-file duck-typing pre-pass (+54, `daaf538c`). Write-up + full troubleshooting + every reverted dead-end: **`PERL-DUCK-TYPING-AND-CROSS-LANG-AUDIT.md`**.
+
+**Four-language real-repo audit done** (fresh index): Java(gson) 9545, Rust(ripgrep) 6690, Python(Django) 62084 / (Flask) 1408, Perl(Mojolicious) 4660 — all four axes mature. **The unresolved tail on every axis is external/stdlib by construction** (`suffix_match`/`unique_name` heuristics have no in-repo target; `candidate_count_penalty` floors their conf by design). No additive coverage lever remains; the sound frontier is exhausted. Remaining Perl chains (`$tx->req/res`) are blocked by typeless polymorphic `tx` + monkey-patched `$ua->get` — structural limits of sound static analysis, not missing features.
+
+**Standing precedent:** a correct-on-target increment whose *mechanism* is not sound-by-construction is rejected (the maintainer chose to hold discipline over a measured +5). Engine soundness > marginal edge count. Past this point needs a real Mojo *application* repo as the target, or a maintainer-gated precision pass.
+
 ## Wave assignments
 
 - **Wave 1** — per-language S-size consensus wins (both reviewers confirm, high edge-value).
@@ -33,7 +43,7 @@ Test coverage: Suite "perl_lsp" (tests/test_perl_lsp.c, 587 lines, registered te
 | perl-package-class-nodes | P2 | M | confirm | confirm | 4 |
 | perl-dynamic-dispatch | P2 | S | confirm | modify | 4 |
 
-### perl-cross-file-lsp  (P0/L, wave 3)
+### perl-cross-file-lsp  (P0/L, wave 3) — ✅ done (foundation + duck-typing era, through `daaf538c`; see Retro + `PERL-DUCK-TYPING-AND-CROSS-LANG-AUDIT.md`)
 
 **Implement cbm_run_perl_lsp_cross and wire Perl into the cross-file LSP pass**
 
