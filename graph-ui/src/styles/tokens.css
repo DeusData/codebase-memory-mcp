@@ -1,0 +1,51 @@
+/*
+ * Die Farben und der Schriftstapel des CODEATLAS-Terminals, an einer Stelle.
+ *
+ * Vorlage ist design/design.png und PLAN.md Abschnitt 4. Die Werte stehen hier
+ * als Tokens und nicht in den Komponenten, weil das Design in W2b (Twin) und
+ * W3 (Galaxy) weitere Flaechen bekommt und eine zweite Farbtabelle die erste
+ * still falsch machen wuerde.
+ *
+ * Die Namen sind Rollen, keine Farben: --atlas-phosphor ist "der eine Akzent,
+ * den das Auge sucht", nicht "gruen". Wer eine Flaeche neu baut, greift die
+ * Rolle und nicht den Hexwert.
+ *
+ * Source, paths, and aligned technical values retain monospace. Interface
+ * controls and explanations use the system font for readable navigation.
+ */
+
+:root {
+    /* Grundflaechen: fast schwarz, die Panels nur eine Spur abgesetzt. */
+    --atlas-bg: #0a0e0d;
+    --atlas-panel: #0f1513;
+    --atlas-panel-raised: #131b18;
+    --atlas-line: #243a30;
+
+    /* Der eine Akzent. Marke, aktiver Tab, Primaeraktionen, Schritt-Badges. */
+    --atlas-phosphor: #33ff99;
+    --atlas-phosphor-mute: #1f7f4c;
+    --atlas-grid: color-mix(in srgb, var(--atlas-phosphor) 4%, transparent);
+    --atlas-glow: color-mix(in srgb, var(--atlas-phosphor) 16%, transparent);
+
+    /* Gedaempftes Gruen-Grau: alles, was da ist, aber nicht ruft. */
+    --atlas-dim: #9eb5a8;
+    --atlas-fg: #dce8e1;
+
+    /* Sekundaerakzent: Symbolnamen, Bezeichner, Verweise. */
+    --atlas-cyan: #66d9e8;
+
+    /* Sparsam: Fehlerpfade, "may raise", verweigerte Faehigkeiten. */
+    --atlas-alarm: #ff5f8f;
+
+    /* Aktive Zeile im Baum und im Editor: dunkelgruener Balken. */
+    --atlas-select: #12251d;
+
+    --atlas-mono: ui-monospace, SFMono-Regular, "SF Mono", "JetBrains Mono",
+        Menlo, Consolas, "Liberation Mono", monospace;
+    --atlas-ui-font: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    --atlas-font: var(--atlas-ui-font);
+    --atlas-font-size: 13px;
+    --atlas-line-height: 1.6;
+
+    color-scheme: dark;
+}

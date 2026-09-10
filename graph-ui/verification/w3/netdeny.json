@@ -1,0 +1,33 @@
+{
+  "command": "node tools/smoke-w3.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 63,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 34258,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [
+    {
+      "endpoint": "TCP 127.0.0.1:4251",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49376",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49377",
+      "seen": 1
+    },
+    {
+      "endpoint": "TCP 127.0.0.1:49412",
+      "seen": 1
+    }
+  ],
+  "generatedAt": "2026-08-29T13:48:48.179Z"
+}

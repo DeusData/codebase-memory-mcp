@@ -71,6 +71,39 @@ SEC_CREDS=$(mktemp)
 trap 'rm -f "$STRINGS_FILE" "$SEC_CMDS" "$SEC_CREDS"' EXIT
 strings -n 4 "$BINARY" | sort -u > "$STRINGS_FILE"
 
+# Remove only byte-for-byte reviewed strings from the named detector candidates.
+# Hash the entire extracted line, excluding its line terminator, without trimming
+# or normalizing. A rebuilt dependency that changes even one byte requires review.
+# Never filter STRINGS_FILE: URL and base64 checks must still inspect these lines.
+filter_reviewed_lines() {
+    local candidates="$1"; shift
+    local line digest expected allowed
+    local -a hash_command
+    if command -v sha256sum &>/dev/null; then
+        hash_command=(sha256sum)
+    elif command -v shasum &>/dev/null; then
+        hash_command=(shasum -a 256)
+    else
+        echo "FAIL: SHA-256 utility required to verify reviewed binary strings" >&2
+        return 1
+    fi
+    while IFS= read -r line; do
+        digest=$(printf '%s' "$line" | "${hash_command[@]}")
+        digest=${digest%% *}
+        allowed=false
+        for expected in "$@"; do
+            if [[ "$digest" == "$expected" ]]; then
+                allowed=true
+                break
+            fi
+        done
+        if ! $allowed; then
+            printf '%s\n' "$line"
+        fi
+    done < "$candidates" > "${candidates}.tmp"
+    mv "${candidates}.tmp" "$candidates"
+}
+
 # ── 1. URL audit (binary only — scripts handled via VT + PR review) ────
 
 if $IS_SCRIPT; then
@@ -116,12 +149,54 @@ ALLOWED_URLS=(
     "https://github.com/lojjic"
 )
 
+# Exact documentation/license/example tokens embedded by pinned UI dependencies:
+# Monaco 0.56.0, Transformers.js 4.2.0, ONNX Runtime, and the Markdown renderer.
+# The URL extractor retains closing Markdown punctuation; keep those exact bytes
+# too. These are references in diagnostics, editor help, and operator schemas,
+# not download-host permissions. No sibling path or hostname inherits an entry.
+ALLOWED_UI_REFERENCE_URLS=(
+    "https://web.dev/cross-origin-isolation-guide/"
+    "https://code.visualstudio.com/docs/editor/codebasics#_multicursor-modifier)."
+    "https://developer.mozilla.org/en-US/docs/Web/API/Cache"
+    "https://github.com/huggingface/transformers.js/issues/new/choose"
+    "https://github.com/microsoft/vscode/issues/103170"
+    "https://github.com/markedjs/marked."
+    # Numerical-overflow reference in the ONNX attention schema.
+    "https://tinyurl.com/sudb9s96),"
+    "https://ieeexplore.ieee.org/document/1163711"
+    "https://code.visualstudio.com/docs/editor/codebasics#_find-and-replace)"
+    # Sample link insertion text in the Monaco Markdown editor.
+    "https://microsoft.com)"
+    "https://github.com/syntax-tree/hast-util-to-jsx-runtime"
+    "https://github.com/microsoft/vscode/issues/new"
+    "https://github.com/microsoft/vscode/blob/main/LICENSE.txt"
+    "https://github.com/microsoft/monaco-editor#faq"
+    "https://gist.github.com/hollance/42e32852f24243b748ae6bc1f985b13a"
+    "https://github.com/remarkjs/react-markdown/blob/main/changelog.md"
+    "https://docs.nvidia.com/cuda/cublas/index.html#cublasLtOrder_t"
+    "https://arxiv.org/abs/1502.03167."
+)
+
 while IFS= read -r url; do
     # Skip short false positives from binary data (e.g. "https://H9")
     if [[ ${#url} -lt 15 ]]; then
         continue
     fi
     allowed=false
+    # The pinned, opt-in browser model uses these two verified download hosts.
+    # Match host boundaries; a similar hostname must not inherit permission.
+    case "$url" in
+        "https://huggingface.co"|"https://huggingface.co/"*|"https://huggingface.co;"|\
+        "https://us.aws.cdn.hf.co"|"https://us.aws.cdn.hf.co/"*|"https://us.aws.cdn.hf.co;")
+            allowed=true
+            ;;
+    esac
+    for reference in "${ALLOWED_UI_REFERENCE_URLS[@]}"; do
+        if [[ "$url" == "$reference" ]]; then
+            allowed=true
+            break
+        fi
+    done
     for prefix in "${ALLOWED_URLS[@]}"; do
         if [[ "$url" == "$prefix"* ]]; then
             allowed=true
@@ -177,6 +252,10 @@ if grep -wE "$DANGEROUS_CMDS" "$STRINGS_FILE" > "$SEC_CMDS" 2>/dev/null && [ -s 
         grep -vE "$allow" "$SEC_CMDS" > "${SEC_CMDS}.tmp" || true
         mv "${SEC_CMDS}.tmp" "$SEC_CMDS"
     done
+    # Monaco 0.56.0 shell tokenizer: wget/telnet occur in its command keyword
+    # array. Reviewed full line: assets/shell-DiJ1NA_G.js:1 (2,934 bytes).
+    filter_reviewed_lines "$SEC_CMDS" \
+        0d9431238bb1665cc08548a02889077577f6a5e2f7f945ccc8c5128cefa7d688
 fi
 if [ -s "$SEC_CMDS" ]; then
     echo "BLOCKED: Dangerous commands found in binary:"
@@ -194,6 +273,14 @@ echo "--- Credential pattern detection ---"
 
 CRED_PATTERNS='password=|secret=|api_key=|apikey=|auth_token=|private_key='
 if grep -iE "$CRED_PATTERNS" "$STRINGS_FILE" > "$SEC_CREDS" 2>/dev/null; then
+    # Monaco 0.56.0 quick-input password mode is a boolean/UI property, not a
+    # credential. Reviewed full lines: assets/index-B4p3fUhm.js:938 (15,643
+    # bytes) and :940 (72,461 bytes). These hashes exempt no command or URL.
+    filter_reviewed_lines "$SEC_CREDS" \
+        91e70ce96dc9392c3091e0e06a838ad43a0c625b007e9e2ff6256a6d4824e9f2 \
+        6e393242a92967b3d1bd03420d0bdfc42b80f18407ef393652580483d2177633
+fi
+if [ -s "$SEC_CREDS" ]; then
     echo "BLOCKED: Credential patterns found in binary:"
     cat "$SEC_CREDS"
     FAIL=1

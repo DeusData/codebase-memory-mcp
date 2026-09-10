@@ -1,0 +1,1927 @@
+{
+  "splitterTooltips": 0,
+  "splitterKeyboardStillWorks": true,
+  "splitterAriaKept": true,
+  "splitterCount": 4,
+  "toggleCollapsesActive": true,
+  "toggleOpensFromCollapsed": true,
+  "toggleSwitchesView": true,
+  "toggleAgreesWithLabelledButton": true,
+  "hierarchyFromFocus": true,
+  "hierarchyHeadNamesRoot": true,
+  "hierarchyDisabledExplains": true,
+  "hierarchyDeterminismUnchanged": true,
+  "previewFlowDocumented": true,
+  "previewBundleCheckWorks": true,
+  "graphFitsOnOpen": true,
+  "allNodesInsideViewport": true,
+  "fitMarginPx": 11.32,
+  "cameraOnLargestFace": true,
+  "refitControlWorks": true,
+  "resetLayoutRefits": true,
+  "fitMeasuredInSizes": 3,
+  "fitMeasurements": 12,
+  "nodesOutsideBeforeRefit": 2,
+  "bigGraphNodes": 5000,
+  "bigGraphFits": true,
+  "bigGraphMarginPx": 18.51,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "screenshotsAtRest": true,
+  "port": 4641,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w10b",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "focusTarget": "createUser",
+  "viewports": [
+    {
+      "width": 1680,
+      "height": 1050
+    },
+    {
+      "width": 1400,
+      "height": 880
+    },
+    {
+      "width": 1180,
+      "height": 1360
+    }
+  ],
+  "method": "Die Einpassung wird am BILD gemessen: die Szene projiziert jeden Knoten mit genau der Kamera, die gerade zeichnet, in die Zeichenflaeche (globalThis.__atlasGalaxyFit in src/galaxy/GraphScene.tsx). Gezaehlt werden die Knoten ausserhalb und der kleinste verbleibende Rand in Pixeln. Die AUSRICHTUNG wird unabhaengig geprueft: dieser Lauf rechnet die Hauptachsen der geladenen Positionen selbst (Jacobi, principalAxes in dieser Datei) und haelt die duennste Achse gegen die gemeldete Blickrichtung. Dass die Messung ueberhaupt etwas sieht, wird vorher gezeigt: die Kamera wird mit Zug und Rad verdreht, bis Knoten aus dem Bild fallen.",
+  "timings": {
+    "buildMs": 11078,
+    "totalMs": 66651
+  },
+  "generatedAt": "2026-08-30T17:36:40.388Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "Ruhezustand, Griffe ohne Kasten",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Hierarchie aus dem Fokus",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 170,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 147,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "Graph zugeklappt",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 189,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 167,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "5000 Knoten, eingepasst",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        },
+        "bottom": {
+          "candidates": 148,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "fits": [
+      {
+        "where": "galaxy 1680x1050",
+        "viewport": {
+          "width": 1680,
+          "height": 1050
+        },
+        "view": "galaxy",
+        "atOpen": true,
+        "mode": "galaxy",
+        "fits": 2,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.5963636363636364,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 76,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 18.21,
+          "box": {
+            "left": 86.83,
+            "right": 354.25,
+            "top": 18.21,
+            "bottom": 253.19
+          },
+          "fill": {
+            "horizontal": 0.6091,
+            "vertical": 0.8552
+          },
+          "viewport": {
+            "width": 439,
+            "height": 274.75
+          },
+          "camera": {
+            "position": [
+              -77.14513923852127,
+              -81.54094295348585,
+              -1141.4553384398607
+            ],
+            "direction": [
+              -0.00010093004798615576,
+              -0.02055361622179354,
+              0.9997887470227562
+            ],
+            "up": [
+              0.9550471424287821,
+              0.29638934683901574,
+              0.006189573406881578
+            ],
+            "fov": 50,
+            "aspect": 1.5978161965423112
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.create",
+              "x": 255.83641756965724,
+              "y": 18.20867454422677,
+              "margin": 18.20867454422677
+            },
+            {
+              "name": "codeatlasweb-w10b.src.server.Route",
+              "x": 168.59186530309438,
+              "y": 253.18543981691056,
+              "margin": 21.56456018308944
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.getOrder",
+              "x": 254.2001083938267,
+              "y": 23.99269035657795,
+              "margin": 23.99269035657795
+            },
+            {
+              "name": "codeatlasweb-w10b.src.routes.orders",
+              "x": 221.25306617336193,
+              "y": 249.29220461888667,
+              "margin": 25.45779538111333
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT",
+              "x": 133.97962168184426,
+              "y": 26.14613399155164,
+              "margin": 26.14613399155164
+            }
+          ]
+        }
+      },
+      {
+        "where": "galaxy 1400x880",
+        "viewport": {
+          "width": 1400,
+          "height": 880
+        },
+        "view": "galaxy",
+        "atOpen": true,
+        "mode": "galaxy",
+        "fits": 3,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 2.5672514619883042,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 76,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 11.32,
+          "box": {
+            "left": 137.01,
+            "right": 303.28,
+            "top": 11.32,
+            "bottom": 157.42
+          },
+          "fill": {
+            "horizontal": 0.3787,
+            "vertical": 0.8552
+          },
+          "viewport": {
+            "width": 439,
+            "height": 170.828125
+          },
+          "camera": {
+            "position": [
+              -77.14513923852127,
+              -81.54094295348585,
+              -1141.4553384398607
+            ],
+            "direction": [
+              -0.00010093004798615576,
+              -0.02055361622179354,
+              0.9997887470227562
+            ],
+            "up": [
+              0.9550471424287821,
+              0.29638934683901574,
+              0.006189573406881578
+            ],
+            "fov": 50,
+            "aspect": 2.5698344461721394
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.create",
+              "x": 242.09247345820418,
+              "y": 11.321396655597775,
+              "margin": 11.321396655597775
+            },
+            {
+              "name": "codeatlasweb-w10b.src.server.Route",
+              "x": 187.84743877153838,
+              "y": 157.4201782028141,
+              "margin": 13.4079467971859
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.getOrder",
+              "x": 241.0750844557386,
+              "y": 14.917657169498789,
+              "margin": 14.917657169498789
+            },
+            {
+              "name": "codeatlasweb-w10b.src.routes.orders",
+              "x": 220.58998364839437,
+              "y": 154.99952645008463,
+              "margin": 15.82859854991537
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT",
+              "x": 166.32698497768448,
+              "y": 16.25657887452423,
+              "margin": 16.25657887452423
+            }
+          ]
+        }
+      },
+      {
+        "where": "galaxy 1180x1360",
+        "viewport": {
+          "width": 1180,
+          "height": 1360
+        },
+        "view": "galaxy",
+        "atOpen": true,
+        "mode": "galaxy",
+        "fits": 4,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 0.8190298507462687,
+          "nodes": 76,
+          "distance": 1518.5529640577715,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 76,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 27.99,
+          "box": {
+            "left": 30.15,
+            "right": 411.01,
+            "top": 98.86,
+            "bottom": 433.8
+          },
+          "fill": {
+            "horizontal": 0.8676,
+            "vertical": 0.6247
+          },
+          "viewport": {
+            "width": 439,
+            "height": 536.15625
+          },
+          "camera": {
+            "position": [
+              -77.10376689089206,
+              -73.1157873894839,
+              -1551.2798498012137
+            ],
+            "direction": [
+              -0.00010093004798615055,
+              -0.020553616221793535,
+              0.9997887470227562
+            ],
+            "up": [
+              0.9550471424287821,
+              0.29638934683901574,
+              0.006189573406881578
+            ],
+            "fov": 50,
+            "aspect": 0.8187911639564026
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.repo.db.walk",
+              "x": 411.01183951022097,
+              "y": 322.87903227801274,
+              "margin": 27.988160489779034
+            },
+            {
+              "name": "codeatlasweb-w10b.src.types.UserEntity.label",
+              "x": 30.15013978489157,
+              "y": 286.5936659981278,
+              "margin": 30.15013978489157
+            },
+            {
+              "name": "codeatlasweb-w10b.src.types.UserEntity.constructor",
+              "x": 30.539060422100484,
+              "y": 282.26500377932484,
+              "margin": 30.539060422100484
+            },
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.ValidationError.constructor",
+              "x": 35.76887211330636,
+              "y": 337.8342522565154,
+              "margin": 35.76887211330636
+            },
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.UserInput",
+              "x": 35.826896264607306,
+              "y": 341.73829911515503,
+              "margin": 35.826896264607306
+            }
+          ]
+        }
+      },
+      {
+        "where": "hierarchy 1680x1050",
+        "viewport": {
+          "width": 1680,
+          "height": 1050
+        },
+        "view": "hierarchy",
+        "atOpen": true,
+        "mode": "hierarchy",
+        "fits": 10,
+        "lastFit": {
+          "mode": "hierarchy",
+          "kind": "frontal",
+          "aspect": 1.448844884488449,
+          "nodes": 8,
+          "distance": 513.9954187077311,
+          "width": 350,
+          "height": 428,
+          "depth": 0,
+          "normal": [
+            0,
+            0,
+            1
+          ],
+          "up": [
+            0,
+            1,
+            0
+          ]
+        },
+        "measured": {
+          "nodes": 8,
+          "inside": 8,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 30.17,
+          "box": {
+            "left": 143.56,
+            "right": 295.44,
+            "top": 45.36,
+            "bottom": 273.17
+          },
+          "fill": {
+            "horizontal": 0.346,
+            "vertical": 0.751
+          },
+          "viewport": {
+            "width": 439,
+            "height": 303.34375
+          },
+          "camera": {
+            "position": [
+              120,
+              12.000000000000032,
+              513.9954187077311
+            ],
+            "direction": [
+              0,
+              -6.220760330820352e-17,
+              -1
+            ],
+            "up": [
+              0,
+              1,
+              0
+            ],
+            "fov": 50,
+            "aspect": 1.447203049345833
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.validateUser",
+              "x": 219.5,
+              "y": 273.17137433244324,
+              "margin": 30.172375667556764
+            },
+            {
+              "name": "codeatlasweb-w10b.src.types.UserEntity",
+              "x": 219.5,
+              "y": 45.35981308411217,
+              "margin": 45.35981308411217
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.userService.toUser",
+              "x": 219.5,
+              "y": 227.609062082777,
+              "margin": 75.734687917223
+            },
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.ValidationError",
+              "x": 219.5,
+              "y": 90.92212533377838,
+              "margin": 90.92212533377838
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.userService.listUsers",
+              "x": 219.5,
+              "y": 182.0467498331108,
+              "margin": 121.2970001668892
+            }
+          ]
+        }
+      },
+      {
+        "where": "hierarchy 1400x880",
+        "viewport": {
+          "width": 1400,
+          "height": 880
+        },
+        "view": "hierarchy",
+        "atOpen": true,
+        "mode": "hierarchy",
+        "fits": 11,
+        "lastFit": {
+          "mode": "hierarchy",
+          "kind": "frontal",
+          "aspect": 2.2060301507537687,
+          "nodes": 8,
+          "distance": 513.9954187077311,
+          "width": 350,
+          "height": 428,
+          "depth": 0,
+          "normal": [
+            0,
+            0,
+            1
+          ],
+          "up": [
+            0,
+            1,
+            0
+          ]
+        },
+        "measured": {
+          "nodes": 8,
+          "inside": 8,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 19.84,
+          "box": {
+            "left": 169.58,
+            "right": 269.42,
+            "top": 29.82,
+            "bottom": 179.59
+          },
+          "fill": {
+            "horizontal": 0.2274,
+            "vertical": 0.751
+          },
+          "viewport": {
+            "width": 439,
+            "height": 199.421875
+          },
+          "camera": {
+            "position": [
+              120,
+              12.000000000000032,
+              513.9954187077311
+            ],
+            "direction": [
+              0,
+              -6.220760330820352e-17,
+              -1
+            ],
+            "up": [
+              0,
+              1,
+              0
+            ],
+            "fov": 50,
+            "aspect": 2.201363315834835
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.validateUser",
+              "x": 219.5,
+              "y": 179.58618783377835,
+              "margin": 19.835687166221646
+            },
+            {
+              "name": "codeatlasweb-w10b.src.types.UserEntity",
+              "x": 219.5,
+              "y": 29.82009345794394,
+              "margin": 29.82009345794394
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.userService.toUser",
+              "x": 219.5,
+              "y": 149.63296895861146,
+              "margin": 49.78890604138854
+            },
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.ValidationError",
+              "x": 219.5,
+              "y": 59.77331233311082,
+              "margin": 59.77331233311082
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.userService.listUsers",
+              "x": 219.5,
+              "y": 119.67975008344459,
+              "margin": 79.74212491655541
+            }
+          ]
+        }
+      },
+      {
+        "where": "hierarchy 1180x1360",
+        "viewport": {
+          "width": 1180,
+          "height": 1360
+        },
+        "view": "hierarchy",
+        "atOpen": true,
+        "mode": "hierarchy",
+        "fits": 12,
+        "lastFit": {
+          "mode": "hierarchy",
+          "kind": "frontal",
+          "aspect": 0.7769911504424779,
+          "nodes": 8,
+          "distance": 540.9628619071265,
+          "width": 350,
+          "height": 428,
+          "depth": 0,
+          "normal": [
+            0,
+            0,
+            1
+          ],
+          "up": [
+            0,
+            1,
+            0
+          ]
+        },
+        "measured": {
+          "nodes": 8,
+          "inside": 8,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 67.45,
+          "box": {
+            "left": 85.17,
+            "right": 353.83,
+            "top": 94.32,
+            "bottom": 497.3
+          },
+          "fill": {
+            "horizontal": 0.612,
+            "vertical": 0.7136
+          },
+          "viewport": {
+            "width": 439,
+            "height": 564.75
+          },
+          "camera": {
+            "position": [
+              120,
+              12.000000000000034,
+              540.9628619071265
+            ],
+            "direction": [
+              0,
+              -6.239019778477725e-17,
+              -1
+            ],
+            "up": [
+              0,
+              1,
+              0
+            ],
+            "fov": 50,
+            "aspect": 0.7773351040283312
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.util.validate.validateUser",
+              "x": 219.5,
+              "y": 497.30026638974175,
+              "margin": 67.44973361025825
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.userService.createUser",
+              "x": 85.17170850641142,
+              "y": 295.80782914935884,
+              "margin": 85.17170850641142
+            },
+            {
+              "name": "codeatlasweb-w10b.src.repo.db.query",
+              "x": 353.82829149358855,
+              "y": 295.80782914935884,
+              "margin": 85.17170850641145
+            },
+            {
+              "name": "codeatlasweb-w10b.src.types.UserEntity",
+              "x": 219.5,
+              "y": 94.31539190897594,
+              "margin": 94.31539190897594
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.userService.toUser",
+              "x": 219.5,
+              "y": 416.7032914935886,
+              "margin": 148.0467085064114
+            }
+          ]
+        }
+      },
+      {
+        "where": "galaxy nach dem Aufklappen",
+        "view": "galaxy",
+        "mode": "galaxy",
+        "fits": 18,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.448844884488449,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 76,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 12.12,
+          "box": {
+            "left": 163.51,
+            "right": 342.74,
+            "top": 12.12,
+            "bottom": 194.25
+          },
+          "fill": {
+            "horizontal": 0.4083,
+            "vertical": 0.6004
+          },
+          "viewport": {
+            "width": 439,
+            "height": 303.34375
+          },
+          "camera": {
+            "position": [
+              149.0493338668859,
+              -140.00366400170572,
+              1672.0281202014335
+            ],
+            "direction": [
+              -0.19194447208134305,
+              -0.1439583540610073,
+              -0.970790045238135
+            ],
+            "up": [
+              0,
+              1,
+              0
+            ],
+            "fov": 50,
+            "aspect": 1.447203049345833
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.repo.db.walk",
+              "x": 186.30834087406106,
+              "y": 12.121313620412543,
+              "margin": 12.121313620412543
+            },
+            {
+              "name": "codeatlasweb-w10b.src.routes",
+              "x": 214.92094535841846,
+              "y": 13.145478444307773,
+              "margin": 13.145478444307773
+            },
+            {
+              "name": "codeatlasweb-w10b.src.repo.db.TreeNode",
+              "x": 186.84057746930193,
+              "y": 17.012148933213194,
+              "margin": 17.012148933213194
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services",
+              "x": 238.1745807244614,
+              "y": 18.539543938488645,
+              "margin": 18.539543938488645
+            },
+            {
+              "name": "codeatlasweb-w10b.src.repo.db.ts.__file__",
+              "x": 190.68388415595646,
+              "y": 24.49477299216028,
+              "margin": 24.49477299216028
+            }
+          ]
+        }
+      },
+      {
+        "where": "nach dem Verdrehen und Heranzoomen",
+        "view": "galaxy",
+        "turned": true,
+        "mode": "galaxy",
+        "fits": 18,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.448844884488449,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 74,
+          "outside": 2,
+          "behind": 0,
+          "marginPx": -12.27,
+          "box": {
+            "left": 26.04,
+            "right": 323.26,
+            "top": 86.37,
+            "bottom": 315.61
+          },
+          "fill": {
+            "horizontal": 0.677,
+            "vertical": 0.7557
+          },
+          "viewport": {
+            "width": 439,
+            "height": 303.34375
+          },
+          "camera": {
+            "position": [
+              -189.72058849570666,
+              -1095.138216084636,
+              -41.353700767349785
+            ],
+            "direction": [
+              5.980282906103974e-7,
+              0.9999999999995002,
+              8.014749930396194e-7
+            ],
+            "up": [
+              0,
+              1,
+              0
+            ],
+            "fov": 50,
+            "aspect": 1.447203049345833
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT",
+              "x": 26.23167363543164,
+              "y": 315.6127136489502,
+              "margin": -12.268963648950205
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT.Herkunft-dieses-Korpus",
+              "x": 26.039513721206422,
+              "y": 306.2626431169892,
+              "margin": -2.9188931169891816
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT.md.__file__",
+              "x": 48.60300574844281,
+              "y": 297.6006963205321,
+              "margin": 5.7430536794678915
+            },
+            {
+              "name": "codeatlasweb-w10b.src.config.AppConfig",
+              "x": 45.998454480524764,
+              "y": 279.12702932307513,
+              "margin": 24.216720676924865
+            },
+            {
+              "name": "codeatlasweb-w10b.src.config.ts.__file__",
+              "x": 67.5563483611107,
+              "y": 273.41942277565533,
+              "margin": 29.924327224344665
+            }
+          ]
+        }
+      },
+      {
+        "where": "nach \"fit view\"",
+        "view": "galaxy",
+        "mode": "galaxy",
+        "fits": 19,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.448844884488449,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 76,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 20.1,
+          "box": {
+            "left": 73.03,
+            "right": 368.27,
+            "top": 20.1,
+            "bottom": 279.53
+          },
+          "fill": {
+            "horizontal": 0.6725,
+            "vertical": 0.8552
+          },
+          "viewport": {
+            "width": 439,
+            "height": 303.34375
+          },
+          "camera": {
+            "position": [
+              -77.14514003646224,
+              -81.54094528180191,
+              -1141.4553384878086
+            ],
+            "direction": [
+              -0.00010092932823977348,
+              -0.020553614121641826,
+              0.9997887470660036
+            ],
+            "up": [
+              0.9550471424287821,
+              0.29638934683901574,
+              0.006189573406881578
+            ],
+            "fov": 50,
+            "aspect": 1.447203049345833
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.create",
+              "x": 259.61801696387016,
+              "y": 20.103685694251958,
+              "margin": 20.103685694251958
+            },
+            {
+              "name": "codeatlasweb-w10b.src.server.Route",
+              "x": 163.29375978230178,
+              "y": 279.5349255335578,
+              "margin": 23.808824466442218
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.getOrder",
+              "x": 257.811414015298,
+              "y": 26.489654915473903,
+              "margin": 26.489654915473903
+            },
+            {
+              "name": "codeatlasweb-w10b.src.routes.orders",
+              "x": 221.43551105768108,
+              "y": 275.2365139743572,
+              "margin": 28.107236025642806
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT",
+              "x": 125.07935481000672,
+              "y": 28.867211412782396,
+              "margin": 28.867211412782396
+            }
+          ]
+        }
+      },
+      {
+        "where": "vor \"reset layout\"",
+        "view": "galaxy",
+        "turned": true,
+        "mode": "galaxy",
+        "fits": 19,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.448844884488449,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 45,
+          "outside": 31,
+          "behind": 1,
+          "marginPx": -12119,
+          "box": {
+            "left": -1815.22,
+            "right": 12558,
+            "top": -69.09,
+            "bottom": 1047.18
+          },
+          "fill": {
+            "horizontal": 32.7408,
+            "vertical": 3.6799
+          },
+          "viewport": {
+            "width": 439,
+            "height": 303.34375
+          },
+          "camera": {
+            "position": [
+              343.31556246266666,
+              26.192970160195074,
+              -30.321551586049615
+            ],
+            "direction": [
+              -0.9550471331076882,
+              -0.2963893559909557,
+              -0.006190573321796025
+            ],
+            "up": [
+              0.9550471424287821,
+              0.29638934683901574,
+              0.006189573406881578
+            ],
+            "fov": 50,
+            "aspect": 1.447203049345833
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT",
+              "x": 12558.000201327599,
+              "y": 1047.1817176745728,
+              "margin": -12119.000201327599
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT.Herkunft-dieses-Korpus",
+              "x": 6046.370952474743,
+              "y": 252.2445891105055,
+              "margin": -5607.370952474743
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.getOrder",
+              "x": -1815.2205780628474,
+              "y": -69.09022762478278,
+              "margin": -1815.2205780628474
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService",
+              "x": -1304.210326924389,
+              "y": 409.7343170295464,
+              "margin": -1304.210326924389
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT.md.__file__",
+              "x": 1482.3706499967261,
+              "y": 239.4871389995775,
+              "margin": -1043.3706499967261
+            }
+          ]
+        }
+      },
+      {
+        "where": "nach \"reset layout\"",
+        "view": "galaxy",
+        "mode": "galaxy",
+        "fits": 20,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.448844884488449,
+          "nodes": 76,
+          "distance": 1108.6418577548068,
+          "width": 1005.2786162673676,
+          "height": 886.0718817638563,
+          "depth": 89.07395909671412,
+          "normal": [
+            0.00010093004798606819,
+            0.020553616221793622,
+            -0.9997887470227562
+          ],
+          "up": [
+            0.9550471424287821,
+            0.29638934683901574,
+            0.006189573406881578
+          ]
+        },
+        "measured": {
+          "nodes": 76,
+          "inside": 76,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 20.1,
+          "box": {
+            "left": 73.03,
+            "right": 368.27,
+            "top": 20.1,
+            "bottom": 279.53
+          },
+          "fill": {
+            "horizontal": 0.6725,
+            "vertical": 0.8552
+          },
+          "viewport": {
+            "width": 439,
+            "height": 303.34375
+          },
+          "camera": {
+            "position": [
+              -77.14513257531554,
+              -81.54090812276954,
+              -1141.455337723132
+            ],
+            "direction": [
+              -0.0001009360582280346,
+              -0.020553647639258266,
+              0.99978874637627
+            ],
+            "up": [
+              0.9550471424287821,
+              0.29638934683901574,
+              0.006189573406881578
+            ],
+            "fov": 50,
+            "aspect": 1.447203049345833
+          },
+          "worst": [
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.create",
+              "x": 259.61801725877615,
+              "y": 20.103684401063738,
+              "margin": 20.103684401063738
+            },
+            {
+              "name": "codeatlasweb-w10b.src.server.Route",
+              "x": 163.29376059463198,
+              "y": 279.53492396084255,
+              "margin": 23.808826039157452
+            },
+            {
+              "name": "codeatlasweb-w10b.src.services.orderService.getOrder",
+              "x": 257.81141423096676,
+              "y": 26.489653772141015,
+              "margin": 26.489653772141015
+            },
+            {
+              "name": "codeatlasweb-w10b.src.routes.orders",
+              "x": 221.43551130118627,
+              "y": 275.23651308907944,
+              "margin": 28.107236910920562
+            },
+            {
+              "name": "codeatlasweb-w10b.HERKUNFT",
+              "x": 125.07935534408975,
+              "y": 28.867211563637913,
+              "margin": 28.867211563637913
+            }
+          ]
+        }
+      },
+      {
+        "where": "galaxy mit 5000 Knoten (synthetisch)",
+        "view": "galaxy",
+        "synthetic": true,
+        "mode": "galaxy",
+        "fits": 2,
+        "lastFit": {
+          "mode": "galaxy",
+          "kind": "principal",
+          "aspect": 1.5963636363636364,
+          "nodes": 5000,
+          "distance": 2346.7396633638355,
+          "width": 2991.5329052674724,
+          "height": 1838.2482644428628,
+          "depth": 192.49570570335663,
+          "normal": [
+            0.0007842062929586668,
+            -0.39096444231338195,
+            0.9204054486296116
+          ],
+          "up": [
+            -0.6377483153087798,
+            0.7087420680970266,
+            0.3015986857238658
+          ]
+        },
+        "measured": {
+          "nodes": 5000,
+          "inside": 5000,
+          "outside": 0,
+          "behind": 0,
+          "marginPx": 18.51,
+          "box": {
+            "left": 26.16,
+            "right": 413.79,
+            "top": 18.7,
+            "bottom": 256.24
+          },
+          "fill": {
+            "horizontal": 0.883,
+            "vertical": 0.8646
+          },
+          "viewport": {
+            "width": 439,
+            "height": 274.75
+          },
+          "camera": {
+            "position": [
+              1.8455296894391178,
+              -918.7697001915453,
+              2159.5825567320508
+            ],
+            "direction": [
+              -0.0007842062929583477,
+              0.39096444231338223,
+              -0.9204054486296114
+            ],
+            "up": [
+              -0.6377483153087798,
+              0.7087420680970266,
+              0.3015986857238658
+            ],
+            "fov": 50,
+            "aspect": 1.5978161965423112
+          },
+          "worst": [
+            {
+              "name": "synthetic.symbol3636",
+              "x": 221.02740556396438,
+              "y": 256.24115392463034,
+              "margin": 18.50884607536966
+            },
+            {
+              "name": "synthetic.symbol1518",
+              "x": 223.55513282182514,
+              "y": 18.695639826397507,
+              "margin": 18.695639826397507
+            },
+            {
+              "name": "synthetic.symbol442",
+              "x": 253.69387468121886,
+              "y": 18.93463846317503,
+              "margin": 18.93463846317503
+            },
+            {
+              "name": "synthetic.symbol4625",
+              "x": 181.65198972937165,
+              "y": 255.6701697203063,
+              "margin": 19.07983027969371
+            },
+            {
+              "name": "synthetic.symbol913",
+              "x": 223.8851314522714,
+              "y": 255.54884383164955,
+              "margin": 19.20115616835045
+            }
+          ]
+        }
+      }
+    ],
+    "shots": [
+      {
+        "name": "handles.png",
+        "atRest": true,
+        "openHints": 0,
+        "regions": []
+      },
+      {
+        "name": "hierarchy-from-focus.png",
+        "atRest": true,
+        "openHints": 0,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 904
+          }
+        ]
+      },
+      {
+        "name": "graph-collapsed.png",
+        "atRest": true,
+        "openHints": 0,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 591
+          }
+        ]
+      }
+    ],
+    "toggle": [
+      {
+        "where": "ohne Fokus",
+        "state": {
+          "role": "group",
+          "groupOpen": "true",
+          "visible": "true",
+          "mode": "galaxy",
+          "foldLabel": "collapse galaxy",
+          "foldExpanded": "true",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "true",
+              "active": true,
+              "action": "collapse",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "galaxy is already showing: click to fold the graph away"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "false",
+              "active": false,
+              "action": "none",
+              "available": false,
+              "ariaDisabled": "true",
+              "hint": "hierarchy: open a symbol or pick a way in first, then this shows what it reaches"
+            }
+          ]
+        }
+      },
+      {
+        "where": "mit Fokus, vor dem Umschalten",
+        "state": {
+          "role": "group",
+          "groupOpen": "true",
+          "visible": "true",
+          "mode": "galaxy",
+          "foldLabel": "collapse galaxy",
+          "foldExpanded": "true",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "true",
+              "active": true,
+              "action": "collapse",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "galaxy is already showing: click to fold the graph away"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "false",
+              "active": false,
+              "action": "switch",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "hierarchy: what the chosen symbol reaches, one column per call depth"
+            }
+          ]
+        }
+      },
+      {
+        "where": "nach Klick auf den aktiven Chip",
+        "state": {
+          "role": "group",
+          "groupOpen": "false",
+          "visible": "false",
+          "mode": "hierarchy",
+          "foldLabel": "open hierarchy",
+          "foldExpanded": "false",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "false",
+              "active": false,
+              "action": "open",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "open the graph again and show galaxy"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "true",
+              "active": true,
+              "action": "open",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "open the graph again and show hierarchy"
+            }
+          ]
+        }
+      },
+      {
+        "where": "nach Klick bei zugeklappter Sektion",
+        "state": {
+          "role": "group",
+          "groupOpen": "true",
+          "visible": "true",
+          "mode": "galaxy",
+          "foldLabel": "collapse galaxy",
+          "foldExpanded": "true",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "true",
+              "active": true,
+              "action": "collapse",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "galaxy is already showing: click to fold the graph away"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "false",
+              "active": false,
+              "action": "switch",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "hierarchy: what the chosen symbol reaches, one column per call depth"
+            }
+          ]
+        }
+      },
+      {
+        "where": "nach Klick auf den anderen Chip",
+        "state": {
+          "role": "group",
+          "groupOpen": "true",
+          "visible": "true",
+          "mode": "hierarchy",
+          "foldLabel": "collapse hierarchy",
+          "foldExpanded": "true",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "false",
+              "active": false,
+              "action": "switch",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "galaxy: the whole project, laid out by the server"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "true",
+              "active": true,
+              "action": "collapse",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "hierarchy is already showing: click to fold the graph away"
+            }
+          ]
+        }
+      },
+      {
+        "where": "zwei Wege",
+        "closedByLabel": {
+          "role": "group",
+          "groupOpen": "false",
+          "visible": "false",
+          "mode": "hierarchy",
+          "foldLabel": "open hierarchy",
+          "foldExpanded": "false",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "false",
+              "active": false,
+              "action": "open",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "open the graph again and show galaxy"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "true",
+              "active": true,
+              "action": "open",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "open the graph again and show hierarchy"
+            }
+          ]
+        },
+        "closedByChip": {
+          "role": "group",
+          "groupOpen": "false",
+          "visible": "false",
+          "mode": "hierarchy",
+          "foldLabel": "open hierarchy",
+          "foldExpanded": "false",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "false",
+              "active": false,
+              "action": "open",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "open the graph again and show galaxy"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "true",
+              "active": true,
+              "action": "open",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "open the graph again and show hierarchy"
+            }
+          ]
+        },
+        "openedByLabel": {
+          "role": "group",
+          "groupOpen": "true",
+          "visible": "true",
+          "mode": "hierarchy",
+          "foldLabel": "collapse hierarchy",
+          "foldExpanded": "true",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "false",
+              "active": false,
+              "action": "switch",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "galaxy: the whole project, laid out by the server"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "true",
+              "active": true,
+              "action": "collapse",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "hierarchy is already showing: click to fold the graph away"
+            }
+          ]
+        },
+        "openedAgainByChip": {
+          "role": "group",
+          "groupOpen": "true",
+          "visible": "true",
+          "mode": "hierarchy",
+          "foldLabel": "collapse hierarchy",
+          "foldExpanded": "true",
+          "chips": [
+            {
+              "mode": "galaxy",
+              "pressed": "false",
+              "active": false,
+              "action": "switch",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "galaxy: the whole project, laid out by the server"
+            },
+            {
+              "mode": "hierarchy",
+              "pressed": "true",
+              "active": true,
+              "action": "collapse",
+              "available": true,
+              "ariaDisabled": "false",
+              "hint": "hierarchy is already showing: click to fold the graph away"
+            }
+          ]
+        }
+      }
+    ],
+    "separators": [
+      {
+        "testId": "atlas-split-left",
+        "orientation": "vertical",
+        "label": "width of the explorer",
+        "valueText": "260 pixels",
+        "valueNow": "260",
+        "valueMin": "180",
+        "valueMax": "470",
+        "tabIndex": 0,
+        "hint": "",
+        "title": "",
+        "describedBy": ""
+      },
+      {
+        "testId": "atlas-split-explain",
+        "orientation": "horizontal",
+        "label": "height of the explain area",
+        "valueText": "340 pixels",
+        "valueNow": "340",
+        "valueMin": "150",
+        "valueMax": "578",
+        "tabIndex": 0,
+        "hint": "",
+        "title": "",
+        "describedBy": ""
+      },
+      {
+        "testId": "atlas-split-right",
+        "orientation": "vertical",
+        "label": "width of the understanding column",
+        "valueText": "440 pixels",
+        "valueNow": "440",
+        "valueMin": "320",
+        "valueMax": "706",
+        "tabIndex": 0,
+        "hint": "",
+        "title": "",
+        "describedBy": ""
+      },
+      {
+        "testId": "atlas-split-twin",
+        "orientation": "horizontal",
+        "label": "height of the twin against the graph",
+        "valueText": "360 pixels",
+        "valueNow": "360",
+        "valueMin": "170",
+        "valueMax": "441",
+        "tabIndex": 0,
+        "hint": "",
+        "title": "",
+        "describedBy": ""
+      }
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4640,
+    "layout": {
+      "url": "/api/layout?project=codeatlasweb-w10b&max_nodes=5000",
+      "nodes": 76,
+      "edges": 178,
+      "extents": {
+        "widest": 1005.28,
+        "middle": 886.07,
+        "thinnest": 89.07
+      },
+      "thinnestAxis": [
+        -0.00010093004798607018,
+        -0.020553616221793615,
+        0.999788747022756
+      ]
+    },
+    "hintsInDocument": 50,
+    "keyboard": {
+      "keyBefore": {
+        "value": 260,
+        "width": 260
+      },
+      "afterStep": {
+        "value": 276,
+        "width": 276
+      },
+      "afterBigStep": {
+        "value": 340,
+        "width": 340
+      },
+      "afterBack": {
+        "value": 260,
+        "width": 260
+      }
+    },
+    "disabledChip": {
+      "chip": {
+        "mode": "hierarchy",
+        "pressed": "false",
+        "active": false,
+        "action": "none",
+        "available": false,
+        "ariaDisabled": "true",
+        "hint": "hierarchy: open a symbol or pick a way in first, then this shows what it reaches"
+      },
+      "note": "hierarchy: open a symbol or pick a way in first, then this shows what it reaches",
+      "stillGalaxy": true
+    },
+    "alignment": {
+      "measured": [
+        {
+          "where": "galaxy 1680x1050",
+          "toThinnest": 1,
+          "toWidest": 0
+        },
+        {
+          "where": "galaxy 1400x880",
+          "toThinnest": 1,
+          "toWidest": 0
+        },
+        {
+          "where": "galaxy 1180x1360",
+          "toThinnest": 1,
+          "toWidest": 0
+        }
+      ],
+      "method": "eigene Jacobi-Rechnung, siehe principalAxes"
+    },
+    "headline": {
+      "text": "hierarchy of createUser (in focus): 8 symbols, depth 3",
+      "clipped": false,
+      "visibleChars": 54,
+      "fontSize": "11px"
+    },
+    "hierarchy": {
+      "stayedInGalaxy": true,
+      "origin": "focus",
+      "headline": "hierarchy of createUser (in focus): 8 symbols, depth 3",
+      "nodes": 8,
+      "depth": 3,
+      "root": "codeatlasweb-w10b.src.services.userService.createUser",
+      "placements": [
+        {
+          "key": "codeatlasweb-w10b.src.services.userService.createUser",
+          "name": "createUser",
+          "file": "src/services/userService.ts",
+          "hop": 0,
+          "x": 0,
+          "y": 0
+        },
+        {
+          "key": "codeatlasweb-w10b.src.types.UserEntity",
+          "name": "UserEntity",
+          "file": "src/types.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 180
+        },
+        {
+          "key": "codeatlasweb-w10b.src.util.validate.ValidationError",
+          "name": "ValidationError",
+          "file": "src/util/validate.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 108
+        },
+        {
+          "key": "codeatlasweb-w10b.src.repo.db.insert",
+          "name": "insert",
+          "file": "src/repo/db.ts",
+          "hop": 1,
+          "x": 120,
+          "y": 36
+        },
+        {
+          "key": "codeatlasweb-w10b.src.services.userService.listUsers",
+          "name": "listUsers",
+          "file": "src/services/userService.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -36
+        },
+        {
+          "key": "codeatlasweb-w10b.src.services.userService.toUser",
+          "name": "toUser",
+          "file": "src/services/userService.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -108
+        },
+        {
+          "key": "codeatlasweb-w10b.src.util.validate.validateUser",
+          "name": "validateUser",
+          "file": "src/util/validate.ts",
+          "hop": 1,
+          "x": 120,
+          "y": -180
+        },
+        {
+          "key": "codeatlasweb-w10b.src.repo.db.query",
+          "name": "query",
+          "file": "src/repo/db.ts",
+          "hop": 2,
+          "x": 240,
+          "y": 0
+        }
+      ]
+    },
+    "determinism": {
+      "columnWidth": 120,
+      "columnsOk": true,
+      "sortedOk": true,
+      "reachedByWalk": true,
+      "sameTwice": true
+    },
+    "sceneRect": {
+      "x": 1241,
+      "y": 684,
+      "width": 439,
+      "height": 303
+    },
+    "reset": {
+      "outsideBefore": 31,
+      "facingBefore": 0,
+      "fillBefore": {
+        "horizontal": 32.7408,
+        "vertical": 3.6799
+      },
+      "outsideAfter": 0,
+      "facingAfter": 1,
+      "fillAfter": {
+        "horizontal": 0.6725,
+        "vertical": 0.8552
+      }
+    },
+    "bigGraph": {
+      "note": "Die Antwort ist ERZEUGT und nicht indiziert: 5000 Knoten, 5209 Kanten, 17 Kantenarten, eine gedrehte Scheibe. Sie kommt ueber dieselbe Route in dieselbe Oberflaeche wie eine echte Antwort. Gemessen wird die Einpassung, nicht der Index.",
+      "nodes": 5000,
+      "edges": 5209,
+      "kinds": 17,
+      "seamNodes": 5000,
+      "lastFit": {
+        "mode": "galaxy",
+        "kind": "principal",
+        "aspect": 1.5963636363636364,
+        "nodes": 5000,
+        "distance": 2346.7396633638355,
+        "width": 2991.5329052674724,
+        "height": 1838.2482644428628,
+        "depth": 192.49570570335663,
+        "normal": [
+          0.0007842062929586668,
+          -0.39096444231338195,
+          0.9204054486296116
+        ],
+        "up": [
+          -0.6377483153087798,
+          0.7087420680970266,
+          0.3015986857238658
+        ]
+      },
+      "alignmentToThinnest": 1
+    },
+    "preview": {
+      "builtBundle": "index-DCASwcWN.js",
+      "servedBundle": "index-DCASwcWN.js",
+      "documented": true
+    },
+    "apiRoutes": {
+      "/api/layout": 2,
+      "/api/tree": 14
+    },
+    "rpcTools": {
+      "index_status": 4,
+      "query_graph": 53,
+      "check_index_coverage": 3,
+      "search_graph": 2,
+      "get_code_snippet": 2
+    },
+    "leftovers": [
+      {
+        "port": 4640,
+        "listeners": 0,
+        "waitedMs": 103
+      },
+      {
+        "port": 4641,
+        "listeners": 0,
+        "waitedMs": 98
+      }
+    ]
+  }
+}

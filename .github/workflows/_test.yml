@@ -205,6 +205,28 @@ jobs:
         shell: bash
         run: scripts/ci/test-package-wrappers.sh
 
+  # CodeAtlasWeb (graph-ui) leg: the frontend's own vitest suite (2000+
+  # tests; the render tests run under jsdom), its hardcoded-string and
+  # promise scans, its portable frozen acceptance checks, and a production
+  # build with the same npm ci the product build runs. One canonical script
+  # (scripts/ci/test-ui.sh) is the whole leg, here and locally. No browser
+  # is downloaded: the browser proofs (graph-ui/tools/smoke-*.mjs) need a
+  # running server and Playwright browsers, and they stay a local, manually
+  # dispatched venue documented in graph-ui/README.md rather than a hosted
+  # gate.
+  test-ui:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+
+      - name: CodeAtlasWeb leg (install, unit, style, promises, acceptance, build)
+        run: scripts/ci/test-ui.sh
+
   # ThreadSanitizer data-race gate. The threaded production surfaces (watcher,
   # subprocess, httpd, pipeline, mcp, worker pool, diagnostics, the runnable
   # daemon-coordination paths) plus allocator concurrency all run under TSan

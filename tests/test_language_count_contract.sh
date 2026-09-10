@@ -67,6 +67,7 @@ EXEMPT=(
     'tests/repro/repro_grammar_scripting.c'    # scripting-grammar probe scope (12)
     'tests/test_grammar_probe_b.c'             # grammar probe scope (12)
     'tests/test_language_count_contract.sh'    # this file, which names the numbers above
+    'graph-ui/verification/pr-2068/audit-architecture.json' # captured README badges in the dated PR browser audit, not current support claims
     'pkg/winget/manifests/'                    # version-pinned published manifests: 0.8.1
                                                # really did ship 155, and rewriting a
                                                # released manifest would falsify it

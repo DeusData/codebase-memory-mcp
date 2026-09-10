@@ -15,6 +15,8 @@
  */
 #include "ui/http_server.h"
 #include "ui/httpd.h"
+#include "ui/activity.h"
+#include "pipeline/pipeline.h" /* canonical project identity for job logs */
 #include "ui/embedded_assets.h"
 #include "ui/layout3d.h"
 #include "ui/atlas.h"
@@ -51,6 +53,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 #include <windows.h>
 #include <process.h>
@@ -202,18 +205,9 @@ struct cbm_http_server {
 
 /* ── Serve embedded asset ─────────────────────────────────────── */
 
-/* Content-Security-Policy for the served UI. No external host appears in any
- * directive, so the browser cannot load or connect to anything off-origin —
- * this ENFORCES the airgap (the code makes no external calls; this stops a
- * future dependency or injected content from doing so). connect-src 'self'
- * confines fetch/XHR/WebSocket to the local server. The 'self'/data:/blob:/
- * 'unsafe-inline'-style/'wasm-unsafe-eval' allowances cover the bundled app's
- * own needs (React inline styles, three.js textures/workers/WASM). */
-#define CBM_UI_CSP                                                       \
-    "Content-Security-Policy: default-src 'self'; connect-src 'self'; "  \
-    "img-src 'self' data: blob:; script-src 'self' 'wasm-unsafe-eval'; " \
-    "style-src 'self' 'unsafe-inline'; font-src 'self' data:; "          \
-    "worker-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'\r\n"
+/* Content-Security-Policy for the served UI. The directives live in
+ * http_server.h (CBM_UI_CSP_VALUE) so the loopback-only contract is testable. */
+#define CBM_UI_CSP "Content-Security-Policy: " CBM_UI_CSP_VALUE "\r\n"
 
 static bool serve_embedded(cbm_http_conn_t *c, const char *path) {
     const cbm_embedded_file_t *f = cbm_embedded_lookup(path);
@@ -419,6 +413,9 @@ static char g_log_ring[LOG_RING_SIZE][LOG_LINE_MAX];
 static int g_log_head = 0;
 static int g_log_count = 0;
 static cbm_mutex_t g_log_mutex;
+static sqlite3 *g_activity_db;
+static char g_activity_path[CBM_SZ_2K];
+static cbm_mutex_t g_ui_log_mutex; /* the frontend log file, further down */
 
 enum { CBM_LOG_MUTEX_UNINIT = 0, CBM_LOG_MUTEX_INITING = 1, CBM_LOG_MUTEX_INITED = 2 };
 static atomic_int g_log_mutex_init = CBM_LOG_MUTEX_UNINIT;
@@ -433,6 +430,7 @@ void cbm_ui_log_init(void) {
     state = CBM_LOG_MUTEX_UNINIT;
     if (atomic_compare_exchange_strong(&g_log_mutex_init, &state, CBM_LOG_MUTEX_INITING)) {
         cbm_mutex_init(&g_log_mutex);
+        cbm_mutex_init(&g_ui_log_mutex);
         atomic_store(&g_log_mutex_init, CBM_LOG_MUTEX_INITED);
         return;
     }
@@ -443,19 +441,50 @@ void cbm_ui_log_init(void) {
     }
 }
 
+/* Called only under g_log_mutex. Cache-directory changes are used by isolated
+ * tests; production has one daemon-owned path for its lifetime. */
+static bool ui_log_import_legacy(sqlite3 *db, const char *cache);
+
+static sqlite3 *activity_db_locked(void) {
+    char path[CBM_SZ_2K];
+    const char *cache = cbm_resolve_cache_dir();
+    int n = snprintf(path, sizeof(path), "%s/activity.db", cache ? cache : "");
+    if (!cache || !*cache || n < 0 || (size_t)n >= sizeof(path))
+        return NULL;
+    if (strcmp(path, g_activity_path)) {
+        sqlite3_close(g_activity_db);
+        g_activity_db = NULL;
+        snprintf(g_activity_path, sizeof(g_activity_path), "%s", path);
+    }
+    if (!g_activity_db) {
+        cbm_mkdir_p(cache, 0700);
+        g_activity_db = cbm_activity_open(path);
+        if (g_activity_db && !ui_log_import_legacy(g_activity_db, cache)) {
+            sqlite3_close(g_activity_db);
+            g_activity_db = NULL;
+        }
+    }
+    return g_activity_db;
+}
+
 /* Called from a log hook — appends a line to the ring buffer (thread-safe) */
-void cbm_ui_log_append(const char *line) {
+static void ui_log_append_record(const char *line, const char *record) {
     if (!line)
         return;
     /* Ensure mutex is initialized (safe for early single-threaded logging
      * and concurrent calls via atomic_exchange once-init pattern). */
     cbm_ui_log_init();
     cbm_mutex_lock(&g_log_mutex);
+    (void)cbm_activity_log(activity_db_locked(), record);
     snprintf(g_log_ring[g_log_head], LOG_LINE_MAX, "%s", line);
     g_log_head = (g_log_head + 1) % LOG_RING_SIZE;
     if (g_log_count < LOG_RING_SIZE)
         g_log_count++;
     cbm_mutex_unlock(&g_log_mutex);
+}
+
+void cbm_ui_log_append(const char *line) {
+    ui_log_append_record(line, line);
 }
 
 /* Append a printf-formatted fragment at *pos within a bufsz buffer, never
@@ -488,6 +517,19 @@ static void http_appendf(char *buf, size_t bufsz, int *pos, const char *fmt, ...
 }
 
 /* GET /api/logs?lines=N — returns last N log lines */
+static bool log_query_has_key(const char *query, const char *key) {
+    for (const char *part = query; part && *part;) {
+        size_t size = strcspn(part, "&");
+        size_t key_size = strcspn(part, "=&");
+        if (key_size == strlen(key) && !strncmp(part, key, key_size))
+            return true;
+        part += size;
+        if (*part == '&')
+            part++;
+    }
+    return false;
+}
+
 static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char lines_str[16] = {0};
     int max_lines = 100;
@@ -497,6 +539,53 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
             max_lines = v;
     }
 
+    char after_str[32] = {0}, severity[16] = {0};
+    int64_t after = -1;
+    if (cbm_http_query_param(req->query, "after", after_str, sizeof(after_str)))
+        after = strtoll(after_str, NULL, 10);
+    int min_level = 0;
+    if (cbm_http_query_param(req->query, "min_level", severity, sizeof(severity)) ||
+        cbm_http_query_param(req->query, "level", severity, sizeof(severity))) {
+        if (!strcmp(severity, "error"))
+            min_level = 3;
+        else if (!strcmp(severity, "warn"))
+            min_level = 2;
+        else if (!strcmp(severity, "info"))
+            min_level = 1;
+    }
+    char project[256] = {0}, scope[32] = {0}, query[257] = {0};
+    bool has_query = cbm_http_query_param(req->query, "q", query, sizeof(query));
+    bool has_project = cbm_http_query_param(req->query, "project", project, sizeof(project));
+    bool has_scope = cbm_http_query_param(req->query, "scope", scope, sizeof(scope));
+    bool unattributed = has_scope && !strcmp(scope, "unattributed");
+    if ((log_query_has_key(req->query, "q") && !has_query) ||
+        (log_query_has_key(req->query, "project") && !has_project) ||
+        (log_query_has_key(req->query, "scope") && !has_scope) ||
+        (has_scope && strcmp(scope, "daemon") && !unattributed) || (has_project && has_scope)) {
+        cbm_http_replyf(c, 400, g_cors_json,
+                        "{\"error\":\"choose an exact project or unattributed scope\"}");
+        return;
+    }
+    cbm_ui_log_init();
+    cbm_mutex_lock(&g_log_mutex);
+    char *persistent =
+        cbm_activity_logs_filtered(activity_db_locked(), after, max_lines, min_level,
+                                   has_project ? project : NULL, unattributed, query);
+    cbm_mutex_unlock(&g_log_mutex);
+    if (persistent) {
+        cbm_http_replyf(c, 200, g_cors_json, "%s", persistent);
+        free(persistent);
+        return;
+    }
+    /* The legacy memory ring has no trustworthy project provenance. Never
+     * substitute daemon-wide rows for a failed project-scoped SQLite read. */
+    if (has_project || unattributed || has_query || min_level > 0) {
+        cbm_http_replyf(c, 503, g_cors_json,
+                        "{\"error\":\"scoped log storage unavailable\",\"persistent\":false}");
+        return;
+    }
+    /* Keep the established endpoint usable if local storage is unavailable.
+     * The frontend sees persistent=false and must report the limitation. */
     cbm_mutex_lock(&g_log_mutex);
     int count = g_log_count < max_lines ? g_log_count : max_lines;
     int start = (g_log_head - count + LOG_RING_SIZE) % LOG_RING_SIZE;
@@ -547,7 +636,7 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         http_appendf(buf, buf_size, &pos, "\"");
     }
     cbm_mutex_unlock(&g_log_mutex);
-    http_appendf(buf, buf_size, &pos, "],\"total\":%d}", total);
+    http_appendf(buf, buf_size, &pos, "],\"persistent\":false,\"total\":%d}", total);
 
     /* http_appendf pins pos to buf_size on truncation and then writes nothing,
      * so a saturated buffer would reach the "%s" reply with no terminator in
@@ -559,6 +648,400 @@ static void handle_logs(cbm_http_conn_t *c, const cbm_http_req_t *req) {
 
     cbm_http_replyf(c, 200, g_cors_json, "%s", buf);
     free(buf);
+}
+
+/* Short polling requests keep the sequential HTTP transport available for
+ * graph/MCP requests. SQLite is persistence, never a streaming connection. */
+static void handle_agent_events(cbm_http_conn_t *c, const cbm_http_req_t *req, bool post) {
+    cbm_ui_log_init();
+    char *json = NULL;
+    int status = 200;
+    cbm_mutex_lock(&g_log_mutex);
+    sqlite3 *db = activity_db_locked();
+    if (post) {
+        status = cbm_activity_ingest(db, req->body, &json);
+    } else {
+        char project[256] = {0}, cursor[32] = {0}, limit[16] = {0};
+        cbm_http_query_param(req->query, "project", project, sizeof(project));
+        cbm_http_query_param(req->query, "after", cursor, sizeof(cursor));
+        cbm_http_query_param(req->query, "limit", limit, sizeof(limit));
+        json = cbm_activity_agents(db, project, strtoll(cursor, NULL, 10), atoi(limit));
+        if (!json)
+            status = 503;
+    }
+    cbm_mutex_unlock(&g_log_mutex);
+    cbm_http_replyf(c, status, g_cors_json, "%s",
+                    json            ? json
+                    : status == 400 ? "{\"error\":\"invalid event batch\"}"
+                                    : "{\"error\":\"activity storage unavailable\"}");
+    free(json);
+}
+
+/* ── Frontend log file ────────────────────────────────────────── */
+
+/* POST /api/ui-log persists every accepted frontend level in activity.db.
+ * JSONL is a bounded compatibility export for existing local tail workflows;
+ * both HTTP log readers use SQLite. A failed journal write is retryable (503),
+ * and session/seq deduplication also prevents duplicate export lines on retry.
+ * The browser's existing per-field and per-batch bounds remain unchanged. */
+#define UI_LOG_BODY_MAX (64 * 1024)
+#define UI_LOG_ENTRIES_MAX 100
+#define UI_LOG_FIELD_MAX 4096
+#define UI_LOG_ROTATE_DEFAULT (5 * 1024 * 1024)
+#define UI_LOG_TAIL_DEFAULT_LINES 200
+#define UI_LOG_TAIL_MAX_LINES 1000
+#define UI_LOG_TAIL_READ_BYTES (256 * 1024)
+/* One JSON line: three long fields escaped at up to 6x, plus the short ones. */
+#define UI_LOG_LINE_CAP (3 * 6 * UI_LOG_FIELD_MAX + 4096)
+
+bool cbm_ui_log_file_path(char *out, size_t outsz) {
+    const char *dir = cbm_resolve_cache_dir();
+    if (!dir || dir[0] == '\0')
+        dir = cbm_tmpdir();
+    int n = snprintf(out, outsz, "%s/logs/ui.log", dir);
+    return n > 0 && (size_t)n < outsz;
+}
+
+static int64_t ui_log_rotate_bytes(void) {
+    const char *env = getenv("CBM_UI_LOG_ROTATE_BYTES");
+    if (env && env[0] != '\0') {
+        long long v = atoll(env);
+        if (v > 0)
+            return (int64_t)v;
+    }
+    return UI_LOG_ROTATE_DEFAULT;
+}
+
+/* One-time, bounded migration of old file-only info records. Preserve original
+ * timestamps and leave project provenance unknown; no current project is inferred.
+ * Read oldest archive before current file. The checkpoint and inserts commit
+ * together, so restart/retry cannot import an unkeyed legacy row twice. */
+static bool ui_log_import_legacy(sqlite3 *db, const char *cache) {
+    sqlite3_stmt *st = NULL;
+    if (sqlite3_prepare_v2(db, "SELECT 1 FROM activity_meta WHERE key='ui_legacy_import'", -1, &st,
+                           NULL) != SQLITE_OK)
+        return false;
+    int rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_ROW)
+        return true;
+    if (rc != SQLITE_DONE || sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK)
+        return false;
+    bool ok = true, partial = false;
+    for (int archive = 1; archive >= 0 && ok; archive--) {
+        char path[CBM_SZ_2K];
+        int n = snprintf(path, sizeof(path), "%s/logs/ui.log%s", cache, archive ? ".1" : "");
+        if (n < 0 || (size_t)n >= sizeof(path)) {
+            ok = false;
+            break;
+        }
+        int64_t size = cbm_file_size(path);
+        if (size <= 0)
+            continue;
+        FILE *file = cbm_fopen(path, "rb");
+        if (!file) {
+            ok = false;
+            break;
+        }
+        size_t length = size > UI_LOG_TAIL_READ_BYTES ? UI_LOG_TAIL_READ_BYTES : (size_t)size;
+        char *data = malloc(length + 1);
+        if (!data || (size > (int64_t)length &&
+                      fseek(file, (long)(size - (int64_t)length), SEEK_SET) != 0)) {
+            free(data);
+            fclose(file);
+            ok = false;
+            break;
+        }
+        size_t got = fread(data, 1, length, file);
+        ok = !ferror(file);
+        fclose(file);
+        data[got] = '\0';
+        char *line = data;
+        if (size > (int64_t)length) {
+            partial = true;
+            char *end = strchr(line, '\n');
+            line = end ? end + 1 : data + got;
+        }
+        while (ok && *line) {
+            char *end = strchr(line, '\n');
+            if (!end) {
+                partial = true; /* Incomplete final write, never import torn JSON. */
+                break;
+            }
+            *end = '\0';
+            yyjson_doc *record = yyjson_read(line, strlen(line), 0);
+            yyjson_val *root = record ? yyjson_doc_get_root(record) : NULL;
+            if (yyjson_is_obj(root) && yyjson_is_str(yyjson_obj_get(root, "received")) &&
+                yyjson_is_str(yyjson_obj_get(root, "page")) &&
+                yyjson_is_str(yyjson_obj_get(root, "session")))
+                ok = cbm_activity_ui_log(db, line, true) >= 0;
+            else
+                partial = true;
+            yyjson_doc_free(record);
+            line = end + 1;
+        }
+        free(data);
+    }
+    if (ok)
+        ok = sqlite3_exec(db,
+                          partial
+                              ? "INSERT INTO activity_meta VALUES('ui_legacy_import','bounded')"
+                              : "INSERT INTO activity_meta VALUES('ui_legacy_import','complete')",
+                          NULL, NULL, NULL) == SQLITE_OK;
+    if (ok)
+        ok = sqlite3_exec(db, "COMMIT", NULL, NULL, NULL) == SQLITE_OK;
+    if (!ok)
+        sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
+    return ok;
+}
+
+typedef struct {
+    char field[UI_LOG_FIELD_MAX + 32];
+    char esc[6 * UI_LOG_FIELD_MAX + 64];
+    char page[6 * 256 + 64];
+    char session[6 * 128 + 64];
+    char line[UI_LOG_LINE_CAP];
+} ui_log_scratch_t;
+
+/* Copy a text field under a cap, cutting on a UTF-8 boundary and saying so. */
+static void ui_log_copy_field(char *out, size_t outsz, const char *in, size_t cap) {
+    size_t n = strlen(in);
+    bool cut = false;
+    if (n > cap) {
+        n = cap;
+        cut = true;
+        while (n > 0 && ((unsigned char)in[n] & 0xC0) == 0x80)
+            n--;
+    }
+    if (n >= outsz)
+        n = outsz - 1;
+    memcpy(out, in, n);
+    out[n] = '\0';
+    if (cut)
+        snprintf(out + n, outsz - n, " [cut at %d]", (int)cap);
+}
+
+static const char *ui_log_level_name(yyjson_val *v) {
+    static const char *const known[] = {"debug", "log", "info", "warn", "error"};
+    const char *s = (v && yyjson_is_str(v)) ? yyjson_get_str(v) : "";
+    for (size_t i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        if (strcmp(s, known[i]) == 0)
+            return known[i];
+    }
+    return "log";
+}
+
+/* Append `,"key":"<escaped value>"` for a string member, or nothing when the
+ * member is absent or not a string (required ones are written empty). */
+static void ui_log_add_str(ui_log_scratch_t *s, int *pos, const char *key, yyjson_val *v,
+                           bool required) {
+    if (!v || !yyjson_is_str(v)) {
+        if (required)
+            http_appendf(s->line, sizeof(s->line), pos, ",\"%s\":\"\"", key);
+        return;
+    }
+    ui_log_copy_field(s->field, sizeof(s->field), yyjson_get_str(v), UI_LOG_FIELD_MAX);
+    cbm_json_escape(s->esc, (int)sizeof(s->esc), s->field);
+    http_appendf(s->line, sizeof(s->line), pos, ",\"%s\":\"%s\"", key, s->esc);
+}
+
+static void ui_log_add_int(ui_log_scratch_t *s, int *pos, const char *key, yyjson_val *v) {
+    if (!v || !yyjson_is_num(v))
+        return;
+    http_appendf(s->line, sizeof(s->line), pos, ",\"%s\":%lld", key, (long long)yyjson_get_sint(v));
+}
+
+static void ui_log_utc_now(char *out, size_t outsz) {
+    time_t now = time(NULL);
+    struct tm tm_utc;
+    if (cbm_gmtime_r(&now, &tm_utc) && strftime(out, outsz, "%Y-%m-%dT%H:%M:%SZ", &tm_utc) > 0)
+        return;
+    snprintf(out, outsz, "%lld", (long long)now);
+}
+
+static void handle_ui_log_post(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    if (req->body_len > UI_LOG_BODY_MAX) {
+        cbm_http_replyf(c, 413, g_cors_json, "{\"error\":\"body exceeds %d bytes\"}",
+                        UI_LOG_BODY_MAX);
+        return;
+    }
+    if (req->body_len == 0) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid body\"}");
+        return;
+    }
+    yyjson_doc *doc = yyjson_read(req->body, req->body_len, 0);
+    if (!doc) {
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"invalid json\"}");
+        return;
+    }
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *entries = root ? yyjson_obj_get(root, "entries") : NULL;
+    if (!root || !yyjson_is_obj(root) || !entries || !yyjson_is_arr(entries)) {
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 400, g_cors_json, "{\"error\":\"entries[] required\"}");
+        return;
+    }
+
+    ui_log_scratch_t *s = calloc(1, sizeof(*s));
+    char path[CBM_SZ_1K];
+    if (!s || !cbm_ui_log_file_path(path, sizeof(path))) {
+        free(s);
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"no log path\"}");
+        return;
+    }
+
+    /* Page and session are the same for every entry of a post. */
+    yyjson_val *v_page = yyjson_obj_get(root, "page");
+    yyjson_val *v_session = yyjson_obj_get(root, "session");
+    ui_log_copy_field(s->field, sizeof(s->field),
+                      (v_page && yyjson_is_str(v_page)) ? yyjson_get_str(v_page) : "", 256);
+    cbm_json_escape(s->page, (int)sizeof(s->page), s->field);
+    ui_log_copy_field(s->field, sizeof(s->field),
+                      (v_session && yyjson_is_str(v_session)) ? yyjson_get_str(v_session) : "",
+                      128);
+    cbm_json_escape(s->session, (int)sizeof(s->session), s->field);
+
+    char received[40];
+    ui_log_utc_now(received, sizeof(received));
+
+    int accepted = 0;
+    int duplicates = 0;
+    int dropped = 0;
+    bool file_error = false, storage_error = false;
+
+    cbm_ui_log_init();
+    cbm_mutex_lock(&g_log_mutex);
+    sqlite3 *db = activity_db_locked();
+    if (!db) {
+        cbm_mutex_unlock(&g_log_mutex);
+        free(s);
+        yyjson_doc_free(doc);
+        cbm_http_replyf(c, 503, g_cors_json, "{\"error\":\"activity storage unavailable\"}");
+        return;
+    }
+    cbm_mutex_lock(&g_ui_log_mutex);
+    int64_t size = cbm_file_size(path);
+    if (size >= ui_log_rotate_bytes()) {
+        char previous[CBM_SZ_1K + 8];
+        snprintf(previous, sizeof(previous), "%s.1", path);
+        (void)cbm_rename_replace(path, previous);
+    }
+    FILE *f = cbm_fopen(path, "ab");
+    if (!f) {
+        char logdir[CBM_SZ_1K];
+        snprintf(logdir, sizeof(logdir), "%s", path);
+        char *slash = strrchr(logdir, '/');
+        if (slash) {
+            *slash = '\0';
+            cbm_mkdir_p(logdir, 0755);
+        }
+        f = cbm_fopen(path, "ab");
+    }
+    file_error = f == NULL;
+
+    size_t idx, max;
+    yyjson_val *entry;
+    yyjson_arr_foreach(entries, idx, max, entry) {
+        if (!yyjson_is_obj(entry) || accepted + duplicates >= UI_LOG_ENTRIES_MAX) {
+            dropped++;
+            continue;
+        }
+        const char *level = ui_log_level_name(yyjson_obj_get(entry, "level"));
+        yyjson_val *v_source = yyjson_obj_get(entry, "source");
+        yyjson_val *v_message = yyjson_obj_get(entry, "message");
+
+        int pos = 0;
+        http_appendf(s->line, sizeof(s->line), &pos,
+                     "{\"received\":\"%s\",\"page\":\"%s\",\"session\":\"%s\"", received, s->page,
+                     s->session);
+        ui_log_add_int(s, &pos, "seq", yyjson_obj_get(entry, "seq"));
+        ui_log_add_str(s, &pos, "ts", yyjson_obj_get(entry, "ts"), false);
+        http_appendf(s->line, sizeof(s->line), &pos, ",\"level\":\"%s\"", level);
+        ui_log_add_str(s, &pos, "source", v_source, true);
+        ui_log_add_str(s, &pos, "message", v_message, true);
+        ui_log_add_str(s, &pos, "detail", yyjson_obj_get(entry, "detail"), false);
+        ui_log_add_str(s, &pos, "stack", yyjson_obj_get(entry, "stack"), false);
+        ui_log_add_str(s, &pos, "url", yyjson_obj_get(entry, "url"), false);
+        ui_log_add_int(s, &pos, "line", yyjson_obj_get(entry, "line"));
+        ui_log_add_int(s, &pos, "col", yyjson_obj_get(entry, "col"));
+        /* Entry ownership is captured when the event occurs, before a later
+         * batch flush can cross a project switch. Explicit null means unknown. */
+        yyjson_val *v_project = yyjson_obj_get(entry, "project");
+        if (!v_project)
+            v_project = yyjson_obj_get(root, "project");
+        if (yyjson_is_str(v_project) && yyjson_get_len(v_project) > 0 &&
+            yyjson_get_len(v_project) < 256)
+            ui_log_add_str(s, &pos, "project", v_project, false);
+        http_appendf(s->line, sizeof(s->line), &pos, "}\n");
+        if ((size_t)pos >= sizeof(s->line)) {
+            /* Cannot happen with the field caps above; never write a torn line. */
+            dropped++;
+            continue;
+        }
+        int inserted = cbm_activity_ui_log(db, s->line, false);
+        if (inserted < 0) {
+            storage_error = true;
+            break;
+        }
+        if (!inserted) {
+            duplicates++;
+            continue;
+        }
+        if (f && fputs(s->line, f) == EOF)
+            file_error = true;
+        accepted++;
+        /* The old ring remains a best-effort emergency fallback only. */
+        snprintf(g_log_ring[g_log_head], LOG_LINE_MAX, "ui.%s %.48s: %.400s", level,
+                 (v_source && yyjson_is_str(v_source)) ? yyjson_get_str(v_source) : "",
+                 (v_message && yyjson_is_str(v_message)) ? yyjson_get_str(v_message) : "");
+        g_log_head = (g_log_head + 1) % LOG_RING_SIZE;
+        if (g_log_count < LOG_RING_SIZE)
+            g_log_count++;
+    }
+    if (f) {
+        if (fflush(f) != 0)
+            file_error = true;
+        fclose(f);
+    }
+    cbm_mutex_unlock(&g_ui_log_mutex);
+    cbm_mutex_unlock(&g_log_mutex);
+
+    cbm_json_escape(s->esc, (int)sizeof(s->esc), path);
+    cbm_http_replyf(c, storage_error ? 503 : 200, g_cors_json,
+                    "{\"accepted\":%d,\"dropped\":%d,\"duplicates\":%d,\"path\":\"%s\","
+                    "\"persistent\":true,\"storage_error\":%s,\"file_error\":%s}",
+                    accepted, dropped, duplicates, s->esc, storage_error ? "true" : "false",
+                    file_error ? "true" : "false");
+    free(s);
+    yyjson_doc_free(doc);
+}
+
+/* GET /api/ui-log preserves the original lines[] contract, read from SQLite.
+ * The JSONL paths are compatibility exports, never an independent status source. */
+static void handle_ui_log_get(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char lines_str[16] = {0};
+    int max_lines = UI_LOG_TAIL_DEFAULT_LINES;
+    if (cbm_http_query_param(req->query, "lines", lines_str, (int)sizeof(lines_str))) {
+        int v = atoi(lines_str);
+        if (v > 0 && v <= UI_LOG_TAIL_MAX_LINES)
+            max_lines = v;
+    }
+    char path[CBM_SZ_1K], previous[CBM_SZ_1K + 8];
+    if (!cbm_ui_log_file_path(path, sizeof(path))) {
+        cbm_http_replyf(c, 500, g_cors_json, "{\"error\":\"no log path\"}");
+        return;
+    }
+    snprintf(previous, sizeof(previous), "%s.1", path);
+    cbm_ui_log_init();
+    cbm_mutex_lock(&g_log_mutex);
+    sqlite3 *db = activity_db_locked();
+    char *json = cbm_activity_ui_logs(db, max_lines, g_activity_path, path,
+                                      cbm_file_exists(previous) ? previous : NULL);
+    cbm_mutex_unlock(&g_log_mutex);
+    cbm_http_replyf(c, json ? 200 : 503, g_cors_json, "%s",
+                    json ? json : "{\"error\":\"activity storage unavailable\"}");
+    free(json);
 }
 
 /* ── Process monitoring ───────────────────────────────────────── */
@@ -579,7 +1062,8 @@ static void handle_processes(cbm_http_conn_t *c) {
     FILETIME ft_create, ft_exit, ft_kernel, ft_user;
     double user_s = 0, sys_s = 0;
     size_t rss_bytes = 0;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+    BOOL self_memory_available = GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc));
+    if (self_memory_available)
         rss_bytes = pmc.WorkingSetSize;
     if (GetProcessTimes(GetCurrentProcess(), &ft_create, &ft_exit, &ft_kernel, &ft_user)) {
         ULARGE_INTEGER u, k;
@@ -590,10 +1074,14 @@ static void handle_processes(cbm_http_conn_t *c) {
         user_s = (double)u.QuadPart / 1e7;
         sys_s = (double)k.QuadPart / 1e7;
     }
-    http_appendf(buf, sizeof(buf), &pos,
-                 "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
-                 (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s);
+    http_appendf(
+        buf, sizeof(buf), &pos,
+        "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
+        "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,"
+        "\"cpu_unit\":\"seconds\",\"memory_kind\":\"working_set\","
+        "\"self_memory_kind\":\"working_set\",\"self_memory_available\":%s,\"processes\":[",
+        (int)_getpid(), (double)rss_bytes / (1024.0 * 1024.0), user_s, sys_s,
+        self_memory_available ? "true" : "false");
 
     /* Enumerate all codebase-memory-mcp.exe processes via toolhelp snapshot */
     int proc_count = 0;
@@ -612,10 +1100,12 @@ static void handle_processes(cbm_http_conn_t *c) {
                     size_t proc_rss = 0;
                     DWORD elapsed_sec = 0;
 
-                    if (GetProcessMemoryInfo(hProc, &ppmc, sizeof(ppmc)))
+                    BOOL memory_available = GetProcessMemoryInfo(hProc, &ppmc, sizeof(ppmc));
+                    BOOL cpu_available = GetProcessTimes(hProc, &ftc, &fte, &ftk, &ftu);
+                    if (memory_available)
                         proc_rss = ppmc.WorkingSetSize;
 
-                    if (GetProcessTimes(hProc, &ftc, &fte, &ftk, &ftu)) {
+                    if (cpu_available) {
                         ULARGE_INTEGER pu, pk;
                         pu.LowPart = ftu.dwLowDateTime;
                         pu.HighPart = ftu.dwHighDateTime;
@@ -641,16 +1131,17 @@ static void handle_processes(cbm_http_conn_t *c) {
 
                     if (proc_count > 0)
                         buf[pos++] = ',';
-                    http_appendf(buf, sizeof(buf), &pos,
-                                 "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
-                                 "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
-                                 "\"command\":\"codebase-memory-mcp\","
-                                 "\"is_self\":%s}",
-                                 pe.th32ProcessID, cpu_user + cpu_sys,
-                                 (double)proc_rss / (1024.0 * 1024.0), elapsed_sec / 86400,
-                                 (elapsed_sec % 86400) / 3600, (elapsed_sec % 3600) / 60,
-                                 elapsed_sec % 60,
-                                 pe.th32ProcessID == (DWORD)_getpid() ? "true" : "false");
+                    http_appendf(
+                        buf, sizeof(buf), &pos,
+                        "{\"pid\":%lu,\"cpu\":%.1f,\"rss_mb\":%.1f,"
+                        "\"elapsed\":\"%lu-%02lu:%02lu:%02lu\","
+                        "\"command\":\"codebase-memory-mcp\","
+                        "\"is_self\":%s,\"cpu_available\":%s,\"memory_available\":%s}",
+                        pe.th32ProcessID, cpu_user + cpu_sys, (double)proc_rss / (1024.0 * 1024.0),
+                        elapsed_sec / 86400, (elapsed_sec % 86400) / 3600,
+                        (elapsed_sec % 3600) / 60, elapsed_sec % 60,
+                        pe.th32ProcessID == (DWORD)_getpid() ? "true" : "false",
+                        cpu_available ? "true" : "false", memory_available ? "true" : "false");
                     if (pos >= (int)sizeof(buf)) {
                         pos = (int)sizeof(buf) - 1;
                     }
@@ -664,18 +1155,22 @@ static void handle_processes(cbm_http_conn_t *c) {
 
     http_appendf(buf, sizeof(buf), &pos, "]}");
 #else
-    struct rusage ru;
-    getrusage(RUSAGE_SELF, &ru);
+    struct rusage ru = {0};
+    bool self_memory_available = getrusage(RUSAGE_SELF, &ru) == 0;
     long rss_kb = ru.ru_maxrss;
 #ifdef __APPLE__
     rss_kb /= 1024;
 #endif
-    http_appendf(buf, sizeof(buf), &pos,
-                 "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
-                 "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,\"processes\":[",
-                 (int)getpid(), (double)rss_kb / 1024.0,
-                 (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
-                 (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6);
+    http_appendf(
+        buf, sizeof(buf), &pos,
+        "{\"self_pid\":%d,\"self_rss_mb\":%.1f,"
+        "\"self_user_cpu_s\":%.1f,\"self_sys_cpu_s\":%.1f,"
+        "\"cpu_unit\":\"percent\",\"memory_kind\":\"resident\","
+        "\"self_memory_kind\":\"peak_resident\",\"self_memory_available\":%s,\"processes\":[",
+        (int)getpid(), (double)rss_kb / 1024.0,
+        (double)ru.ru_utime.tv_sec + (double)ru.ru_utime.tv_usec / 1e6,
+        (double)ru.ru_stime.tv_sec + (double)ru.ru_stime.tv_usec / 1e6,
+        self_memory_available ? "true" : "false");
 
     FILE *fp = popen("LC_ALL=C ps -eo pid,pcpu,rss,etime,comm 2>/dev/null"
                      " | grep '[c]odebase-memory-mcp'",
@@ -1124,7 +1619,9 @@ void cbm_http_server_set_binary_path(const char *path) {
  * daemon application that owns its callback context. */
 static void *index_thread_fn(void *arg) {
     index_job_t *job = arg;
-    cbm_log_info("ui.index.start", "path", job->root_path);
+    char *project =
+        cbm_project_name_from_path(job->project_name[0] ? job->project_name : job->root_path);
+    cbm_log_info("ui.index.start", "project", project ? project : "", "path", job->root_path);
     cbm_http_server_t *server = job->server;
     int result = server && server->index_executor
                      ? server->index_executor(server->index_executor_context, job->root_path,
@@ -1136,7 +1633,9 @@ static void *index_thread_fn(void *arg) {
     } else {
         atomic_store(&job->status, 2);
     }
-    cbm_log_info("ui.index.done", "path", job->root_path, "rc", result == 0 ? "ok" : "err");
+    cbm_log(result == 0 ? CBM_LOG_INFO : CBM_LOG_ERROR, "ui.index.done", "project",
+            project ? project : "", "path", job->root_path, "rc", result == 0 ? "ok" : "err", NULL);
+    free(project);
     atomic_store_explicit(&job->completed, 1, memory_order_release);
     return NULL;
 }
@@ -1866,6 +2365,42 @@ static void handle_atlas_symbol(cbm_http_conn_t *c, const cbm_http_req_t *req) {
     char *json = cbm_atlas_symbol_json(store, project, id, qn[0] ? qn : NULL, limit, offset);
     cbm_store_close(store);
     atlas_reply_json(c, json, 404, "{\"error\":\"symbol not found\"}");
+}
+
+static void handle_atlas_repository(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    char *json = cbm_atlas_repository_json(store, project);
+    cbm_store_close(store);
+    if (!json) {
+        atlas_reply_json(c, NULL, 500, "{\"error\":\"repository map unavailable\"}");
+        return;
+    }
+    size_t length = strlen(json);
+    /* A full 20k-node map can exceed 10 MiB. Busy browsers need more than the
+     * ordinary one-second budget to consume it; retain a strict five-second
+     * bound and the transport's immediate daemon-shutdown interrupt. */
+    if (length > 1024 * 1024)
+        cbm_http_conn_set_send_deadline_ms(c, 5000);
+    cbm_http_reply_buf(c, 200, g_cors_json, json, length);
+    free(json);
+}
+
+static void handle_atlas_impact_analysis(cbm_http_conn_t *c, const cbm_http_req_t *req) {
+    char project[256] = {0}, file[CBM_SZ_2K] = {0}, node[CBM_SZ_2K] = {0}, refresh[8] = {0};
+    cbm_store_t *store = atlas_open_project(c, req, project, sizeof(project));
+    if (!store)
+        return;
+    cbm_http_query_param(req->query, "file", file, sizeof(file));
+    cbm_http_query_param(req->query, "node", node, sizeof(node));
+    cbm_http_query_param(req->query, "refresh", refresh, sizeof(refresh));
+    int64_t id = node[0] == '#' ? strtoll(node + 1, NULL, 10) : -1;
+    char *json = cbm_atlas_impact_analysis_request(
+        store, project, file, id, node[0] && node[0] != '#' ? node : NULL, !strcmp(refresh, "1"));
+    cbm_store_close(store);
+    atlas_reply_json(c, json, 500, "{\"error\":\"impact analysis unavailable\"}");
 }
 
 /* GET /api/metrics?project=X — the Dashboard payload. */
@@ -2680,6 +3215,14 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
     }
 
     /* GET /api/impact → CBM Atlas reverse reachability from one symbol */
+    if (is_get && cbm_http_path_match(req->path, "/api/repository-map")) {
+        handle_atlas_repository(c, req);
+        return;
+    }
+    if (is_get && cbm_http_path_match(req->path, "/api/impact-analysis")) {
+        handle_atlas_impact_analysis(c, req);
+        return;
+    }
     if (is_get && cbm_http_path_match(req->path, "/api/impact*")) {
         handle_atlas_impact(c, req);
         return;
@@ -2757,9 +3300,26 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
         return;
     }
 
+    if ((is_get || is_post) && cbm_http_path_match(req->path, "/api/agent-events")) {
+        handle_agent_events(c, req, is_post);
+        return;
+    }
+
     /* GET /api/logs → recent log lines */
     if (is_get && cbm_http_path_match(req->path, "/api/logs*")) {
         handle_logs(c, req);
+        return;
+    }
+
+    /* POST /api/ui-log → the frontend's console and errors, to a file */
+    if (is_post && cbm_http_path_match(req->path, "/api/ui-log")) {
+        handle_ui_log_post(c, req);
+        return;
+    }
+
+    /* GET /api/ui-log → the tail of that file */
+    if (is_get && cbm_http_path_match(req->path, "/api/ui-log*")) {
+        handle_ui_log_get(c, req);
         return;
     }
 
@@ -2857,7 +3417,13 @@ bool cbm_http_server_free(cbm_http_server_t *srv) {
     }
     if (!cbm_httpd_close(srv->listener))
         return false;
+    cbm_atlas_impact_analysis_shutdown();
     cbm_mcp_server_free(srv->mcp);
+    cbm_ui_log_init();
+    cbm_mutex_lock(&g_log_mutex);
+    sqlite3_close(g_activity_db);
+    g_activity_db = NULL;
+    cbm_mutex_unlock(&g_log_mutex);
     cbm_secure_zero(srv->readiness_secret, sizeof(srv->readiness_secret));
     free(srv);
     return true;

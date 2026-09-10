@@ -1,0 +1,1166 @@
+{
+  "startedAt": "2026-09-09T20:28:13.713Z",
+  "method": "Independent observation: fresh browser contexts, normal onboarding and navigation clicks; no workspace storage presets, product edits, new events, restarts or index jobs.",
+  "fixtures": "The four existing cbm-pr2068 events are explicitly named PR2068 verification fixture. They are prior synthetic verification data, not genuine current agent work.",
+  "legacyBridgeBoundary": "Requests to unrelated user bridge port4142 are recorded then blocked. Its availability and contents were not tested.",
+  "views": [
+    {
+      "label": "before",
+      "port": 9751,
+      "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+      "requests": [
+        {
+          "url": "http://127.0.0.1:9751/?project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/assets/index-BByjaIk0.js",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/assets/index-BnfK9-0O.css",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/layout?project=cbm-pr2068&max_nodes=5000",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "index_status"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "index_status"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "get_architecture"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=.github",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "check_index_coverage"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=docs",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=internal",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=test-infrastructure",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=tests",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=tools",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=.github%2FISSUE_TEMPLATE",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=.github%2Fworkflows",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=docs%2Fdevelopment",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fagents",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/ui-log",
+          "method": "POST"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fdocs",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Feval",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Ffixtures",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fllm",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fspike",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Ftests",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Ftools",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=graph-ui%2Fverification",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=internal%2Fcbm",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fchocolatey",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fglama",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fgo",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fhomebrew",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fnpm",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fpypi",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fscoop",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=pkg%2Fwinget",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts%2Fci",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts%2Fgit-hooks",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=scripts%2Fhooks",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fcli",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fcypher",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fdaemon",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/tree?project=cbm-pr2068&path=src%2Fdiscover",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:4142/events",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:4142/events",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/processes",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/logs?lines=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/processes",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9751/api/index-status",
+          "method": "GET"
+        }
+      ],
+      "blocked": [
+        "http://127.0.0.1:4142/events",
+        "http://127.0.0.1:4142/events"
+      ],
+      "errors": [],
+      "clicks": [
+        "Start exploring",
+        "Agents",
+        "Connect stream",
+        "Disconnect live activity",
+        "System",
+        "System: Logs",
+        "System Logs: ERROR",
+        "System: Indexes"
+      ],
+      "screenshots": [
+        "audit-before-agents-off.png",
+        "audit-before-agents.png",
+        "audit-before-system.png",
+        "audit-before-system-logs.png",
+        "audit-before-system-errors-filter.png"
+      ],
+      "agentsOffText": "LIVE\n\nAgent activity\n\nFollow recorded work and inspect the code it touches.\n\noff\nConnect stream\n0\nRECORDED EVENTS\n0\nAGENTS SEEN\n0\nMISSING SEQUENCE NUMBERS\n0\nCONNECTION DROPS\n\nConnect the local agent bridge to start observing activity. 127.0.0.1:4142\n\nAll agents\nAll runs\nAll activity\nread\nwrite\nsearch\ntest\nother\nClear filters\nNo recorded activity yet.\nEVENT EVIDENCE\n\nSelect an event to inspect its evidence.\n\nShowing retained history: up to 80 events per agent. Counts are observed totals, not task progress.",
+      "agentsOnText": "LIVE\n\nAgent activity\n\nFollow recorded work and inspect the code it touches.\n\nno-source\nDisconnect\n0\nRECORDED EVENTS\n0\nAGENTS SEEN\n0\nMISSING SEQUENCE NUMBERS\n0\nCONNECTION DROPS\n\nFailed to fetch\n\nAll agents\nAll runs\nAll activity\nread\nwrite\nsearch\ntest\nother\nClear filters\nNo recorded activity yet.\nEVENT EVIDENCE\n\nSelect an event to inspect its evidence.\n\nShowing retained history: up to 80 events per agent. Counts are observed totals, not task progress.",
+      "agentRows": 0,
+      "agentsInspectorText": "EVENT EVIDENCE\n\nSelect an event to inspect its evidence.",
+      "systemText": "CODEATLAS\nv0.0.1\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n\u2318 / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n\u2304\n\nDAEMON\n\nSystem\n\nProcesses, indexes, and the serving daemon log.\n\nv0.0.1\nRefresh\nPause live\nOverview\nIndexes\nLogs\nLive updates on\nUpdated 10:28:19 PM\nServing process\nPID 85719\nRunning 15:28\nPeak resident memory\n555.4 MiB\nServing daemon\nCPU\n0.4%\nReported by the host process monitor\nProcesses listed\n7\nVisible to the serving daemon\nProcesses\nResident memory \u00b7 MiB\nProcess\tCPU\tMemory\tUptime\tCommand\n85718\t0.0%\t2.0 MiB\t15:33\t/Users/bernhard/Desktop/codebasememorymcp_branch\n85719 Serving\t0.4%\t39.6 MiB\t15:28\t/Users/bernhard/Desktop/codebasememorymcp_branch\n91946\t0.0%\t1.5 MiB\t07:45:02\t/Users/bernhard/.local/bin/codebase-memory-mcp\n12213\t0.0%\t0.6 MiB\t06:36:59\t/Users/bernhard/.local/bin/codebase-memory-mcp\n62965\t0.0%\t0.7 MiB\t01-09:18:59\t/Users/bernhard/.local/bin/codebase-memory-mcp\n86270\t0.0%\t0.7 MiB\t10:56:03\t/Users/bernhard/.local/bin/codebase-memory-mcp\n57823\t0.0%\t0.2 MiB\t07-05:47:46\t/Users/bernhard/.local/bin/codebase-memory-mcp\nserver ready\nConnection details",
+      "systemVisibleControls": [
+        "Daemon",
+        "Chat",
+        "Search\u2318 / Ctrl K",
+        "Refresh",
+        "Pause live"
+      ],
+      "systemLogsText": "Daemon log\n\nServing process 85719 \u00b7 Latest 200 lines\n\nCopy visible\nFilter\nLevel\nAll levels\nERROR\nWARN\nINFO\nDEBUG\nTRACE\nUnclassified\nFollow tail\n200 shown \u00b7 3339 lines reported\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=70 request_bytes=319 response_bytes=14652\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=37\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=39 request_bytes=317 response_bytes=14694\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=4\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=6 request_bytes=235 response_bytes=262\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=26\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=28 request_bytes=271 response_bytes=357\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=269 response_bytes=357\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=268 response_bytes=357\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=272 response_bytes=357\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=1\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=267 response_bytes=357\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=2 request_bytes=163 response_bytes=1913\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=1\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=317 response_bytes=335\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=270\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=271 request_bytes=196 response_bytes=7559\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_code_snippet status=ok duration_ms=2\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=195 response_bytes=76465\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=25\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=27 request_bytes=319 response_bytes=335\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=40 request_bytes=0 response_bytes=1144\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_code_snippet status=ok duration_ms=3\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=228 response_bytes=83045\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=1\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=316 response_bytes=335\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=210 response_bytes=228\nlevel=info msg=http.request component=graph_ui method=GET path=/assets/markdown-BFxVWTOG.js status=200 duration_ms=0 request_bytes=0 response_bytes=3650\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=282\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=284 request_bytes=196 response_bytes=7559\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=41 request_bytes=0 response_bytes=1143\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/assets/powershell-COWaemsV.js status=200 duration_ms=0 request_bytes=0 response_bytes=3131\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_architecture status=ok duration_ms=239\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=241 request_bytes=155 response_bytes=106163\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=5\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=7 request_bytes=171 response_bytes=4886\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=73\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=75 request_bytes=319 response_bytes=14652\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=37\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=38 request_bytes=317 response_bytes=14694\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=44 request_bytes=0 response_bytes=1143\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=116 request_bytes=0 response_bytes=1143\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=42 request_bytes=0 response_bytes=1143\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=41 request_bytes=0 response_bytes=1142\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=52 request_bytes=0 response_bytes=1142\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=56 request_bytes=0 response_bytes=1142\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=2 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=2 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9223\nlevel=info msg=http.request component=graph_ui method=GET path=/api/layout status=200 duration_ms=893 request_bytes=0 response_bytes=1858719\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=15\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=18 request_bytes=132 response_bytes=1002\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=15 request_bytes=0 response_bytes=3157\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=12\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=18 request_bytes=132 response_bytes=1002\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=5\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=8 request_bytes=247 response_bytes=327\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_architecture status=ok duration_ms=241\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=244 request_bytes=154 response_bytes=106162\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1038\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=191 response_bytes=83536\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=219 response_bytes=303\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=5 request_bytes=170 response_bytes=4885\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1213\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=108\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=111 request_bytes=318 response_bytes=14651\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2716\nui.warn reader: The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here.\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=691 response_bytes=94\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=45\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=48 request_bytes=316 response_bytes=14693\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=244\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=8 request_bytes=0 response_bytes=1419\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=9 request_bytes=0 response_bytes=7392\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=13 request_bytes=0 response_bytes=2873\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=812\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=20244\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=996\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=434\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2518\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=568\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=253\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=240\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=171\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=763\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=368\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=267\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=6201\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=266\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=5777\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=4192\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=9 request_bytes=0 response_bytes=23158\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=260\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=39 request_bytes=0 response_bytes=254\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=310\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=251\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=513\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=608\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=185\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=255\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=3459\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=171\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=163\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2522\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=266\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2573\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=702\nui.warn console: THREE.THREE.Clock: This module has been deprecated. Please use THREE.Timer instead.\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=236 response_bytes=94\nlevel=info msg=http.request component=graph_ui method=GET path=/api/layout status=200 duration_ms=820 request_bytes=0 response_bytes=1858719\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=6\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=8 request_bytes=132 response_bytes=1002\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=3157\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=5\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=7 request_bytes=132 response_bytes=1002\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=4\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=6 request_bytes=247 response_bytes=327\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_architecture status=ok duration_ms=231\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=234 request_bytes=154 response_bytes=106162\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1038\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=191 response_bytes=83536\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=219 response_bytes=303\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=9 request_bytes=170 response_bytes=4885\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1213\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=83\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=85 request_bytes=318 response_bytes=14651\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2716\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=41\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=43 request_bytes=316 response_bytes=14693\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=244\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1419\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=7392\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2873\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=812\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=20244\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=996\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=434\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2518\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=568\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=253\nui.warn reader: The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here.\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=691 response_bytes=94\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=240\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=171\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=763\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=368\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=267\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=6201\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=266\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=5777\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=4192\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=23158\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=260\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=254\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=310\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=251\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=513\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=608\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=9 request_bytes=0 response_bytes=185\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=255\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=3459\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=171\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=163\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=2522\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=266\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2573\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=702\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=70 request_bytes=0 response_bytes=1142",
+      "systemErrorFilterText": "Daemon log\n\nServing process 85719 \u00b7 Latest 200 lines\n\nCopy visible\nFilter\nLevel\nAll levels\nERROR\nWARN\nINFO\nDEBUG\nTRACE\nUnclassified\nFollow tail\n0 shown \u00b7 3339 lines reported\n\nNo lines match these filters.",
+      "systemIndexesText": "Indexes\n\nOpen, add, reindex, or inspect your projects.\n\nManage indexes\nIndex activity\n\nCurrent daemon job slots. Slots may be reused; this is not a complete history.\n\nRepository\tState\tDetails\n/tmp/cbm-2068-error-fixture\tFailed\tdaemon index operation failed"
+    },
+    {
+      "label": "after",
+      "port": 9749,
+      "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+      "requests": [
+        {
+          "url": "http://127.0.0.1:9749/?project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/assets/index-BUsVgQwH.js",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/assets/index-DxDVy-h7.css",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/layout?project=cbm-pr2068&max_nodes=5000",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn&project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/repository-map?project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "index_status"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "index_status"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "get_architecture"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/ui-log",
+          "method": "POST"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "check_index_coverage"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/agent-events?project=cbm-pr2068&after=0&limit=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=test-infrastructure",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tests",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=tools",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2FISSUE_TEMPLATE",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=.github%2Fworkflows",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=docs%2Fdevelopment",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fagents",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fdocs",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Feval",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ffixtures",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fllm",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fspike",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftests",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Ftools",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=graph-ui%2Fverification",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=internal%2Fcbm",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fchocolatey",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fglama",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fgo",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fhomebrew",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fnpm",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fpypi",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fscoop",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=pkg%2Fwinget",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts%2Fci",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts%2Fgit-hooks",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=scripts%2Fhooks",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fcli",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fcypher",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fdaemon",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=cbm-pr2068&path=src%2Fdiscover",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/agent-events?project=cbm-pr2068&after=6&limit=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/ui-log",
+          "method": "POST"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/agent-events?project=cbm-pr2068&after=6&limit=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn&project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/agent-events?project=cbm-pr2068&after=6&limit=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/processes",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn&project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/logs?lines=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/processes",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/index-status",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn&project=cbm-pr2068",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "list_projects"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/processes",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/?project=showcase-service",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/assets/index-BUsVgQwH.js",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/assets/index-DxDVy-h7.css",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/processes",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/layout?project=showcase-service&max_nodes=5000",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/logs?lines=200&min_level=warn&project=showcase-service",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/repository-map?project=showcase-service",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "index_status"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "index_status"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/agent-events?project=showcase-service&after=0&limit=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "check_index_coverage"
+        },
+        {
+          "url": "http://127.0.0.1:9749/rpc",
+          "method": "POST",
+          "rpc": "query_graph"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=docker",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=e2e",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fweb",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fworker",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fai",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fbilling",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fcore",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fdb",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Feditor",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fplanner",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fprompt-engine",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Freplicate",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fstorage",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fvideo",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fweb%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fworker%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fai%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fbilling%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fcore%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fdb%2Fprisma",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fdb%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Feditor%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fplanner%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fprompt-engine%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Freplicate%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fstorage%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fvideo%2Fsrc",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fweb%2Fsrc%2Fapp",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fweb%2Fsrc%2Fcomponents",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fweb%2Fsrc%2Flib",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fweb%2Fsrc%2Fserver",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=apps%2Fworker%2Fsrc%2Fjobs",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fai%2Fsrc%2Ftesting",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fbilling%2Fsrc%2Ftesting",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fdb%2Fprisma%2Fmigrations",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Fdb%2Fsrc%2Ftesting",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/tree?project=showcase-service&path=packages%2Freplicate%2Fsrc%2Ftesting",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/agent-events?project=showcase-service&after=0&limit=200",
+          "method": "GET"
+        },
+        {
+          "url": "http://127.0.0.1:9749/api/ui-log",
+          "method": "POST"
+        }
+      ],
+      "blocked": [],
+      "errors": [],
+      "clicks": [
+        "Start exploring",
+        "Agents",
+        "Load live activity",
+        "Oldest existing PR2068 verification-fixture event",
+        "Disconnect live activity",
+        "System",
+        "System: Logs",
+        "System Logs: ERROR",
+        "System: Indexes",
+        "Open project switcher",
+        "Project: showcase-service",
+        "Agents (showcase-service)",
+        "Load live activity (showcase-service)"
+      ],
+      "screenshots": [
+        "audit-after-agents-off.png",
+        "audit-after-agents.png",
+        "audit-after-system.png",
+        "audit-after-system-logs.png",
+        "audit-after-system-errors-filter.png",
+        "audit-after-agents-other-project-empty.png"
+      ],
+      "agentsOffText": "LIVE\n\nAgent activity\n\nFollow recorded work and inspect the code it touches.\n\noff\nLoad live activity\n0\nRECORDED EVENTS\n0\nAGENTS SEEN\n0\nMISSING SEQUENCE NUMBERS\n0\nCONNECTION DROPS\n\nLoad recorded activity from this daemon. Hooks send events to /api/agent-events on the same port. 127.0.0.1:9749\n\nAll agents\nAll runs\nAll activity\nread\nwrite\nsearch\ntest\nother\nClear filters\nNo recorded activity for this repository. Configure the tool hook with the indexed project name; tool calls are observed, never inferred.\nEVENT EVIDENCE\n\nSelect an event to inspect its evidence.\n\nShowing retained history: up to 80 events per agent. Counts are observed totals, not task progress.",
+      "agentsOnText": "LIVE\n\nAgent activity\n\nFollow recorded work and inspect the code it touches.\n\nconnected\nDisconnect\n4\nRECORDED EVENTS\n1\nAGENTS SEEN\n0\nMISSING SEQUENCE NUMBERS\n0\nCONNECTION DROPS\nAll agents\nPR2068 verification fixture (pr2068-verification-1788982342942)\nAll runs\npr2068-verification-1788982342942\nAll activity\nread\nwrite\nsearch\ntest\nother\nClear filters\nPR2068 verification fixture (pr2068-verification-1788982342942)Read\nsrc/ui/atlas_api.c\npr2068-verification-1788982342942 \u00b7 end \u00b7 Live\n9:32:59 PM\nPR2068 verification fixture (pr2068-verification-1788982342942)Read\nsrc/daemon/host.c\npr2068-verification-1788982342942 \u00b7 end \u00b7 Live\n9:32:58 PM\nPR2068 verification fixture (pr2068-verification-1788982342942)Read\nsrc/store/store.c\npr2068-verification-1788982342942 \u00b7 end \u00b7 Live\n9:32:23 PM\nPR2068 verification fixture (pr2068-verification-1788982342942)Read\nsrc/ui/http_server.c\npr2068-verification-1788982342942 \u00b7 end \u00b7 Live\n9:32:23 PM\nEVENT EVIDENCE\n\nSelect an event to inspect its evidence.\n\nShowing retained history: up to 80 events per agent. Counts are observed totals, not task progress.",
+      "agentRows": 4,
+      "agentsInspectorText": "EVENT EVIDENCE\nRead\n\nPR2068 verification fixture (pr2068-verification-1788982342942) \u00b7 pr2068-verification-1788982342942\n\nRecorded time\n9/9/2026, 9:32:23 PM\nPhase\nend\nSource\ntool-hook\nMapping\nrange\nsrc/ui/http_server.c:1-3Open source\nDetails\nNot reported\n\nAn end event records the end of a tool call. Its result is not reported by this stream.",
+      "systemText": "CODEATLAS\nv0.0.1\ndirty\nExplore\nGalaxy\nArchitecture\nAgents\nSystem\nDaemon\nChat\nSearch\n\u2318 / Ctrl K\nTools\nBrief\nExplained\nsym 40226\nedg 173902\nProject\ncbm-pr2068\n\u2304\nProject events \u00b7 cbm-pr2068\nLast checked 10:28:32 PM\nHistory (14 retained)\nAll daemon history\nRefresh events\nInspect index coverage\n\nIndex coverage: 85 partially parsed paths \u00b7 0 skipped \u00b7 196 intentionally excluded.\n\nEarlier events are in history; these records do not describe current frontend health.\n\nDAEMON\n\nSystem\n\nProcesses, indexes, and the serving daemon log.\n\nv0.0.1\nRefresh\nPause live\nOverview\nIndexes\nLogs\nLive updates on\nUpdated 10:28:31 PM\nServing process\nPID 85719\nRunning 15:40\nPeak resident memory\n555.4 MiB\nServing daemon\nCPU\n0.8%\nReported by the host process monitor\nProcesses listed\n7\nVisible to the serving daemon\nProcesses\nResident memory \u00b7 MiB\nProcess\tCPU\tMemory\tUptime\tCommand\n85718\t0.0%\t1.9 MiB\t15:45\t/Users/bernhard/Desktop/codebasememorymcp_branch\n85719 Serving\t0.8%\t75.1 MiB\t15:40\t/Users/bernhard/Desktop/codebasememorymcp_branch\n91946\t0.0%\t1.1 MiB\t07:45:14\t/Users/bernhard/.local/bin/codebase-memory-mcp\n12213\t0.0%\t0.8 MiB\t06:37:11\t/Users/bernhard/.local/bin/codebase-memory-mcp\n62965\t0.0%\t0.7 MiB\t01-09:19:11\t/Users/bernhard/.local/bin/codebase-memory-mcp\n86270\t0.0%\t0.7 MiB\t10:56:15\t/Users/bernhard/.local/bin/codebase-memory-mcp\n57823\t0.0%\t0.2 MiB\t07-05:47:58\t/Users/bernhard/.local/bin/codebase-memory-mcp\nserver ready\nConnection details",
+      "systemVisibleControls": [
+        "Daemon",
+        "Chat",
+        "Search\u2318 / Ctrl K",
+        "History (14 retained)",
+        "All daemon history",
+        "Refresh events",
+        "Inspect index coverage",
+        "Refresh",
+        "Pause live"
+      ],
+      "systemLogsText": "Daemon log\n\nServing process 85719 \u00b7 Latest 200 events\n\nCopy visible\n\nSQLite history \u00b7 5000 event retention limit \u00b7 survives daemon restarts Events identify affected paths or jobs only when the daemon recorded them.\n\nFilter\nLevel\nAll levels\nERROR\nWARN\nINFO\nDEBUG\nTRACE\nUnclassified\nFollow tail\n200 shown \u00b7 3340 events reported\nINFO \u00b7 2026-09-09T20:28:07.352Z \u00b7 mcp.request \u00b7 Event #5931\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=12\nINFO \u00b7 2026-09-09T20:28:07.357Z \u00b7 http.request \u00b7 Event #5932\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=18 request_bytes=132 response_bytes=1002\nINFO \u00b7 2026-09-09T20:28:07.364Z \u00b7 mcp.request \u00b7 Event #5933\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=5\nINFO \u00b7 2026-09-09T20:28:07.366Z \u00b7 http.request \u00b7 Event #5934\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=8 request_bytes=247 response_bytes=327\nINFO \u00b7 2026-09-09T20:28:07.608Z \u00b7 mcp.request \u00b7 Event #5935\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_architecture status=ok duration_ms=241\nINFO \u00b7 2026-09-09T20:28:07.611Z \u00b7 http.request \u00b7 Event #5936\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=244 request_bytes=154 response_bytes=106162\nINFO \u00b7 2026-09-09T20:28:07.616Z \u00b7 http.request \u00b7 Event #5937\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1038\nINFO \u00b7 2026-09-09T20:28:07.619Z \u00b7 mcp.request \u00b7 Event #5938\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1\nINFO \u00b7 2026-09-09T20:28:07.620Z \u00b7 http.request \u00b7 Event #5939\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=191 response_bytes=83536\nINFO \u00b7 2026-09-09T20:28:07.624Z \u00b7 mcp.request \u00b7 Event #5940\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nINFO \u00b7 2026-09-09T20:28:07.625Z \u00b7 http.request \u00b7 Event #5941\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=219 response_bytes=303\nINFO \u00b7 2026-09-09T20:28:07.630Z \u00b7 mcp.request \u00b7 Event #5942\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3\nINFO \u00b7 2026-09-09T20:28:07.631Z \u00b7 http.request \u00b7 Event #5943\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=5 request_bytes=170 response_bytes=4885\nINFO \u00b7 2026-09-09T20:28:07.637Z \u00b7 http.request \u00b7 Event #5944\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1213\nINFO \u00b7 2026-09-09T20:28:07.747Z \u00b7 mcp.request \u00b7 Event #5945\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=108\nINFO \u00b7 2026-09-09T20:28:07.749Z \u00b7 http.request \u00b7 Event #5946\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=111 request_bytes=318 response_bytes=14651\nINFO \u00b7 2026-09-09T20:28:07.756Z \u00b7 http.request \u00b7 Event #5947\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2716\nWARN \u00b7 2026-09-09T20:28:07.759Z \u00b7 reader \u00b7 Event #5948\n{\"received\":\"2026-09-09T20:28:07Z\",\"page\":\"/?project=cbm-pr2068\",\"session\":\"875a0e8b\",\"seq\":2,\"ts\":\"2026-09-09T20:28:07.628Z\",\"level\":\"warn\",\"source\":\"reader\",\"message\":\"The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here.\"}\n\nINFO \u00b7 2026-09-09T20:28:07.760Z \u00b7 http.request \u00b7 Event #5949\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=691 response_bytes=94\nINFO \u00b7 2026-09-09T20:28:07.807Z \u00b7 mcp.request \u00b7 Event #5950\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=45\nINFO \u00b7 2026-09-09T20:28:07.809Z \u00b7 http.request \u00b7 Event #5951\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=48 request_bytes=316 response_bytes=14693\nINFO \u00b7 2026-09-09T20:28:07.816Z \u00b7 http.request \u00b7 Event #5952\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=244\nINFO \u00b7 2026-09-09T20:28:07.851Z \u00b7 http.request \u00b7 Event #5953\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=8 request_bytes=0 response_bytes=1419\nINFO \u00b7 2026-09-09T20:28:07.863Z \u00b7 http.request \u00b7 Event #5954\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=9 request_bytes=0 response_bytes=7392\nINFO \u00b7 2026-09-09T20:28:07.886Z \u00b7 http.request \u00b7 Event #5955\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=13 request_bytes=0 response_bytes=2873\nINFO \u00b7 2026-09-09T20:28:07.892Z \u00b7 http.request \u00b7 Event #5956\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=812\nINFO \u00b7 2026-09-09T20:28:07.899Z \u00b7 http.request \u00b7 Event #5957\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=20244\nINFO \u00b7 2026-09-09T20:28:07.906Z \u00b7 http.request \u00b7 Event #5958\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=996\nINFO \u00b7 2026-09-09T20:28:07.912Z \u00b7 http.request \u00b7 Event #5959\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=434\nINFO \u00b7 2026-09-09T20:28:07.918Z \u00b7 http.request \u00b7 Event #5960\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2518\nINFO \u00b7 2026-09-09T20:28:07.925Z \u00b7 http.request \u00b7 Event #5961\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=568\nINFO \u00b7 2026-09-09T20:28:07.932Z \u00b7 http.request \u00b7 Event #5962\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=253\nINFO \u00b7 2026-09-09T20:28:07.938Z \u00b7 http.request \u00b7 Event #5963\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=240\nINFO \u00b7 2026-09-09T20:28:07.946Z \u00b7 http.request \u00b7 Event #5964\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=171\nINFO \u00b7 2026-09-09T20:28:07.955Z \u00b7 http.request \u00b7 Event #5965\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=763\nINFO \u00b7 2026-09-09T20:28:07.962Z \u00b7 http.request \u00b7 Event #5966\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=368\nINFO \u00b7 2026-09-09T20:28:07.968Z \u00b7 http.request \u00b7 Event #5967\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=267\nINFO \u00b7 2026-09-09T20:28:07.976Z \u00b7 http.request \u00b7 Event #5968\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=6201\nINFO \u00b7 2026-09-09T20:28:07.982Z \u00b7 http.request \u00b7 Event #5969\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=266\nINFO \u00b7 2026-09-09T20:28:07.990Z \u00b7 http.request \u00b7 Event #5970\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=5777\nINFO \u00b7 2026-09-09T20:28:08.000Z \u00b7 http.request \u00b7 Event #5971\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=4192\nINFO \u00b7 2026-09-09T20:28:08.013Z \u00b7 http.request \u00b7 Event #5972\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=9 request_bytes=0 response_bytes=23158\nINFO \u00b7 2026-09-09T20:28:08.022Z \u00b7 http.request \u00b7 Event #5973\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=260\nINFO \u00b7 2026-09-09T20:28:08.064Z \u00b7 http.request \u00b7 Event #5974\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=39 request_bytes=0 response_bytes=254\nINFO \u00b7 2026-09-09T20:28:08.070Z \u00b7 http.request \u00b7 Event #5975\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=310\nINFO \u00b7 2026-09-09T20:28:08.078Z \u00b7 http.request \u00b7 Event #5976\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=251\nINFO \u00b7 2026-09-09T20:28:08.084Z \u00b7 http.request \u00b7 Event #5977\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=513\nINFO \u00b7 2026-09-09T20:28:08.090Z \u00b7 http.request \u00b7 Event #5978\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=608\nINFO \u00b7 2026-09-09T20:28:08.096Z \u00b7 http.request \u00b7 Event #5979\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=185\nINFO \u00b7 2026-09-09T20:28:08.101Z \u00b7 http.request \u00b7 Event #5980\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=255\nINFO \u00b7 2026-09-09T20:28:08.107Z \u00b7 http.request \u00b7 Event #5981\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=3459\nINFO \u00b7 2026-09-09T20:28:08.113Z \u00b7 http.request \u00b7 Event #5982\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=171\nINFO \u00b7 2026-09-09T20:28:08.118Z \u00b7 http.request \u00b7 Event #5983\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=163\nINFO \u00b7 2026-09-09T20:28:08.123Z \u00b7 http.request \u00b7 Event #5984\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2522\nINFO \u00b7 2026-09-09T20:28:08.129Z \u00b7 http.request \u00b7 Event #5985\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=266\nINFO \u00b7 2026-09-09T20:28:08.135Z \u00b7 http.request \u00b7 Event #5986\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2573\nINFO \u00b7 2026-09-09T20:28:08.141Z \u00b7 http.request \u00b7 Event #5987\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=702\nWARN \u00b7 2026-09-09T20:28:11.093Z \u00b7 console \u00b7 Event #5988\n{\"received\":\"2026-09-09T20:28:11Z\",\"page\":\"/?project=cbm-pr2068\",\"session\":\"875a0e8b\",\"seq\":3,\"ts\":\"2026-09-09T20:28:08.360Z\",\"level\":\"warn\",\"source\":\"console\",\"message\":\"THREE.THREE.Clock: This module has been deprecated. Please use THREE.Timer instead.\"}\n\nINFO \u00b7 2026-09-09T20:28:11.094Z \u00b7 http.request \u00b7 Event #5989\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=236 response_bytes=94\nINFO \u00b7 2026-09-09T20:28:15.079Z \u00b7 http.request \u00b7 Event #5990\nlevel=info msg=http.request component=graph_ui method=GET path=/api/layout status=200 duration_ms=820 request_bytes=0 response_bytes=1858719\nINFO \u00b7 2026-09-09T20:28:15.088Z \u00b7 mcp.request \u00b7 Event #5991\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=6\nINFO \u00b7 2026-09-09T20:28:15.089Z \u00b7 http.request \u00b7 Event #5992\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=8 request_bytes=132 response_bytes=1002\nINFO \u00b7 2026-09-09T20:28:15.097Z \u00b7 http.request \u00b7 Event #5993\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=3157\nINFO \u00b7 2026-09-09T20:28:15.105Z \u00b7 mcp.request \u00b7 Event #5994\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=5\nINFO \u00b7 2026-09-09T20:28:15.106Z \u00b7 http.request \u00b7 Event #5995\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=7 request_bytes=132 response_bytes=1002\nINFO \u00b7 2026-09-09T20:28:15.113Z \u00b7 mcp.request \u00b7 Event #5996\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=4\nINFO \u00b7 2026-09-09T20:28:15.114Z \u00b7 http.request \u00b7 Event #5997\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=6 request_bytes=247 response_bytes=327\nINFO \u00b7 2026-09-09T20:28:15.347Z \u00b7 mcp.request \u00b7 Event #5998\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_architecture status=ok duration_ms=231\nINFO \u00b7 2026-09-09T20:28:15.349Z \u00b7 http.request \u00b7 Event #5999\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=234 request_bytes=154 response_bytes=106162\nINFO \u00b7 2026-09-09T20:28:15.354Z \u00b7 http.request \u00b7 Event #6000\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1038\nINFO \u00b7 2026-09-09T20:28:15.357Z \u00b7 mcp.request \u00b7 Event #6001\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1\nINFO \u00b7 2026-09-09T20:28:15.358Z \u00b7 http.request \u00b7 Event #6002\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=191 response_bytes=83536\nINFO \u00b7 2026-09-09T20:28:15.362Z \u00b7 mcp.request \u00b7 Event #6003\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=2\nINFO \u00b7 2026-09-09T20:28:15.363Z \u00b7 http.request \u00b7 Event #6004\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=4 request_bytes=219 response_bytes=303\nINFO \u00b7 2026-09-09T20:28:15.368Z \u00b7 mcp.request \u00b7 Event #6005\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3\nINFO \u00b7 2026-09-09T20:28:15.374Z \u00b7 http.request \u00b7 Event #6006\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=9 request_bytes=170 response_bytes=4885\nINFO \u00b7 2026-09-09T20:28:15.379Z \u00b7 http.request \u00b7 Event #6007\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1213\nINFO \u00b7 2026-09-09T20:28:15.464Z \u00b7 mcp.request \u00b7 Event #6008\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=83\nINFO \u00b7 2026-09-09T20:28:15.466Z \u00b7 http.request \u00b7 Event #6009\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=85 request_bytes=318 response_bytes=14651\nINFO \u00b7 2026-09-09T20:28:15.473Z \u00b7 http.request \u00b7 Event #6010\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2716\nINFO \u00b7 2026-09-09T20:28:15.517Z \u00b7 mcp.request \u00b7 Event #6011\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=41\nINFO \u00b7 2026-09-09T20:28:15.518Z \u00b7 http.request \u00b7 Event #6012\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=43 request_bytes=316 response_bytes=14693\nINFO \u00b7 2026-09-09T20:28:15.528Z \u00b7 http.request \u00b7 Event #6013\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=244\nINFO \u00b7 2026-09-09T20:28:15.536Z \u00b7 http.request \u00b7 Event #6014\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1419\nINFO \u00b7 2026-09-09T20:28:15.545Z \u00b7 http.request \u00b7 Event #6015\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=7392\nINFO \u00b7 2026-09-09T20:28:15.555Z \u00b7 http.request \u00b7 Event #6016\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2873\nINFO \u00b7 2026-09-09T20:28:15.567Z \u00b7 http.request \u00b7 Event #6017\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=812\nINFO \u00b7 2026-09-09T20:28:15.577Z \u00b7 http.request \u00b7 Event #6018\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=20244\nINFO \u00b7 2026-09-09T20:28:15.585Z \u00b7 http.request \u00b7 Event #6019\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=996\nINFO \u00b7 2026-09-09T20:28:15.592Z \u00b7 http.request \u00b7 Event #6020\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=434\nINFO \u00b7 2026-09-09T20:28:15.601Z \u00b7 http.request \u00b7 Event #6021\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=2518\nINFO \u00b7 2026-09-09T20:28:15.610Z \u00b7 http.request \u00b7 Event #6022\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=568\nINFO \u00b7 2026-09-09T20:28:15.619Z \u00b7 http.request \u00b7 Event #6023\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=253\nWARN \u00b7 2026-09-09T20:28:15.620Z \u00b7 reader \u00b7 Event #6024\n{\"received\":\"2026-09-09T20:28:15Z\",\"page\":\"/?project=cbm-pr2068\",\"session\":\"04d96c0d\",\"seq\":2,\"ts\":\"2026-09-09T20:28:15.365Z\",\"level\":\"warn\",\"source\":\"reader\",\"message\":\"The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here.\"}\n\nINFO \u00b7 2026-09-09T20:28:15.621Z \u00b7 http.request \u00b7 Event #6025\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=691 response_bytes=94\nINFO \u00b7 2026-09-09T20:28:15.627Z \u00b7 http.request \u00b7 Event #6026\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=240\nINFO \u00b7 2026-09-09T20:28:15.634Z \u00b7 http.request \u00b7 Event #6027\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=171\nINFO \u00b7 2026-09-09T20:28:15.641Z \u00b7 http.request \u00b7 Event #6028\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=763\nINFO \u00b7 2026-09-09T20:28:15.648Z \u00b7 http.request \u00b7 Event #6029\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=368\nINFO \u00b7 2026-09-09T20:28:15.655Z \u00b7 http.request \u00b7 Event #6030\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=267\nINFO \u00b7 2026-09-09T20:28:15.663Z \u00b7 http.request \u00b7 Event #6031\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=6201\nINFO \u00b7 2026-09-09T20:28:15.671Z \u00b7 http.request \u00b7 Event #6032\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=266\nINFO \u00b7 2026-09-09T20:28:15.679Z \u00b7 http.request \u00b7 Event #6033\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=5777\nINFO \u00b7 2026-09-09T20:28:15.687Z \u00b7 http.request \u00b7 Event #6034\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=4192\nINFO \u00b7 2026-09-09T20:28:15.695Z \u00b7 http.request \u00b7 Event #6035\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=23158\nINFO \u00b7 2026-09-09T20:28:15.702Z \u00b7 http.request \u00b7 Event #6036\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=260\nINFO \u00b7 2026-09-09T20:28:15.710Z \u00b7 http.request \u00b7 Event #6037\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=254\nINFO \u00b7 2026-09-09T20:28:15.717Z \u00b7 http.request \u00b7 Event #6038\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=310\nINFO \u00b7 2026-09-09T20:28:15.724Z \u00b7 http.request \u00b7 Event #6039\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=251\nINFO \u00b7 2026-09-09T20:28:15.730Z \u00b7 http.request \u00b7 Event #6040\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=513\nINFO \u00b7 2026-09-09T20:28:15.738Z \u00b7 http.request \u00b7 Event #6041\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=608\nINFO \u00b7 2026-09-09T20:28:15.755Z \u00b7 http.request \u00b7 Event #6042\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=9 request_bytes=0 response_bytes=185\nINFO \u00b7 2026-09-09T20:28:15.764Z \u00b7 http.request \u00b7 Event #6043\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=255\nINFO \u00b7 2026-09-09T20:28:15.771Z \u00b7 http.request \u00b7 Event #6044\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=3459\nINFO \u00b7 2026-09-09T20:28:15.779Z \u00b7 http.request \u00b7 Event #6045\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=171\nINFO \u00b7 2026-09-09T20:28:15.787Z \u00b7 http.request \u00b7 Event #6046\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=163\nINFO \u00b7 2026-09-09T20:28:15.796Z \u00b7 http.request \u00b7 Event #6047\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=2522\nINFO \u00b7 2026-09-09T20:28:15.806Z \u00b7 http.request \u00b7 Event #6048\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=266\nINFO \u00b7 2026-09-09T20:28:15.815Z \u00b7 http.request \u00b7 Event #6049\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2573\nINFO \u00b7 2026-09-09T20:28:15.822Z \u00b7 http.request \u00b7 Event #6050\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=702\nINFO \u00b7 2026-09-09T20:28:19.681Z \u00b7 http.request \u00b7 Event #6051\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=70 request_bytes=0 response_bytes=1142\nINFO \u00b7 2026-09-09T20:28:22.241Z \u00b7 http.request \u00b7 Event #6052\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=74826\nINFO \u00b7 2026-09-09T20:28:22.734Z \u00b7 http.request \u00b7 Event #6053\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=48 request_bytes=0 response_bytes=1142\nINFO \u00b7 2026-09-09T20:28:24.361Z \u00b7 http.request \u00b7 Event #6054\nlevel=info msg=http.request component=graph_ui method=GET path=/api/index-status status=200 duration_ms=0 request_bytes=0 response_bytes=106\nINFO \u00b7 2026-09-09T20:28:25.428Z \u00b7 http.request \u00b7 Event #6055\nlevel=info msg=http.request component=graph_ui method=GET path=/ status=200 duration_ms=0 request_bytes=0 response_bytes=704\nINFO \u00b7 2026-09-09T20:28:25.434Z \u00b7 http.request \u00b7 Event #6056\nlevel=info msg=http.request component=graph_ui method=GET path=/assets/index-DxDVy-h7.css status=200 duration_ms=0 request_bytes=0 response_bytes=230592\nINFO \u00b7 2026-09-09T20:28:25.439Z \u00b7 http.request \u00b7 Event #6057\nlevel=info msg=http.request component=graph_ui method=GET path=/assets/index-BUsVgQwH.js status=200 duration_ms=3 request_bytes=0 response_bytes=4688903\nINFO \u00b7 2026-09-09T20:28:26.803Z \u00b7 http.request \u00b7 Event #6058\nlevel=info msg=http.request component=graph_ui method=GET path=/api/layout status=200 duration_ms=1084 request_bytes=0 response_bytes=1858719\nINFO \u00b7 2026-09-09T20:28:26.806Z \u00b7 http.request \u00b7 Event #6059\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nINFO \u00b7 2026-09-09T20:28:27.057Z \u00b7 http.request \u00b7 Event #6060\nlevel=info msg=http.request component=graph_ui method=GET path=/api/repository-map status=200 duration_ms=249 request_bytes=0 response_bytes=11070807\nINFO \u00b7 2026-09-09T20:28:27.069Z \u00b7 mcp.request \u00b7 Event #6061\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=10\nINFO \u00b7 2026-09-09T20:28:27.070Z \u00b7 http.request \u00b7 Event #6062\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=12 request_bytes=132 response_bytes=1002\nINFO \u00b7 2026-09-09T20:28:27.079Z \u00b7 http.request \u00b7 Event #6063\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=7 request_bytes=0 response_bytes=3157\nINFO \u00b7 2026-09-09T20:28:27.086Z \u00b7 mcp.request \u00b7 Event #6064\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=index_status status=ok duration_ms=5\nINFO \u00b7 2026-09-09T20:28:27.087Z \u00b7 http.request \u00b7 Event #6065\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=7 request_bytes=132 response_bytes=1002\nINFO \u00b7 2026-09-09T20:28:27.089Z \u00b7 http.request \u00b7 Event #6066\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9223\nINFO \u00b7 2026-09-09T20:28:27.096Z \u00b7 mcp.request \u00b7 Event #6067\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=4\nINFO \u00b7 2026-09-09T20:28:27.097Z \u00b7 http.request \u00b7 Event #6068\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=5 request_bytes=247 response_bytes=327\nINFO \u00b7 2026-09-09T20:28:27.379Z \u00b7 mcp.request \u00b7 Event #6069\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=get_architecture status=ok duration_ms=280\nINFO \u00b7 2026-09-09T20:28:27.381Z \u00b7 http.request \u00b7 Event #6070\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=282 request_bytes=154 response_bytes=106162\nINFO \u00b7 2026-09-09T20:28:27.383Z \u00b7 http.request \u00b7 Event #6071\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=434 response_bytes=94\nINFO \u00b7 2026-09-09T20:28:27.389Z \u00b7 http.request \u00b7 Event #6072\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1038\nINFO \u00b7 2026-09-09T20:28:27.391Z \u00b7 mcp.request \u00b7 Event #6073\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=check_index_coverage status=ok duration_ms=1\nINFO \u00b7 2026-09-09T20:28:27.393Z \u00b7 http.request \u00b7 Event #6074\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=191 response_bytes=83536\nINFO \u00b7 2026-09-09T20:28:27.396Z \u00b7 mcp.request \u00b7 Event #6075\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=1\nINFO \u00b7 2026-09-09T20:28:27.397Z \u00b7 http.request \u00b7 Event #6076\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=3 request_bytes=219 response_bytes=303\nINFO \u00b7 2026-09-09T20:28:27.399Z \u00b7 http.request \u00b7 Event #6077\nlevel=info msg=http.request component=graph_ui method=GET path=/api/agent-events status=200 duration_ms=0 request_bytes=0 response_bytes=1189\nINFO \u00b7 2026-09-09T20:28:27.404Z \u00b7 mcp.request \u00b7 Event #6078\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=3\nINFO \u00b7 2026-09-09T20:28:27.405Z \u00b7 http.request \u00b7 Event #6079\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=5 request_bytes=170 response_bytes=4885\nINFO \u00b7 2026-09-09T20:28:27.410Z \u00b7 http.request \u00b7 Event #6080\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=1213\nINFO \u00b7 2026-09-09T20:28:27.500Z \u00b7 mcp.request \u00b7 Event #6081\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=89\nINFO \u00b7 2026-09-09T20:28:27.502Z \u00b7 http.request \u00b7 Event #6082\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=91 request_bytes=318 response_bytes=14651\nINFO \u00b7 2026-09-09T20:28:27.509Z \u00b7 http.request \u00b7 Event #6083\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2716\nINFO \u00b7 2026-09-09T20:28:27.548Z \u00b7 mcp.request \u00b7 Event #6084\nlevel=info msg=mcp.request protocol=jsonrpc method=tools/call tool=query_graph status=ok duration_ms=37\nINFO \u00b7 2026-09-09T20:28:27.550Z \u00b7 http.request \u00b7 Event #6085\nlevel=info msg=http.request component=graph_ui method=POST path=/rpc status=200 duration_ms=39 request_bytes=316 response_bytes=14693\nINFO \u00b7 2026-09-09T20:28:27.556Z \u00b7 http.request \u00b7 Event #6086\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=244\nINFO \u00b7 2026-09-09T20:28:27.563Z \u00b7 http.request \u00b7 Event #6087\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=1419\nINFO \u00b7 2026-09-09T20:28:27.569Z \u00b7 http.request \u00b7 Event #6088\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=7392\nINFO \u00b7 2026-09-09T20:28:27.576Z \u00b7 http.request \u00b7 Event #6089\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2873\nINFO \u00b7 2026-09-09T20:28:27.582Z \u00b7 http.request \u00b7 Event #6090\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=812\nINFO \u00b7 2026-09-09T20:28:27.590Z \u00b7 http.request \u00b7 Event #6091\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=6 request_bytes=0 response_bytes=20244\nINFO \u00b7 2026-09-09T20:28:27.596Z \u00b7 http.request \u00b7 Event #6092\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=996\nINFO \u00b7 2026-09-09T20:28:27.602Z \u00b7 http.request \u00b7 Event #6093\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=434\nINFO \u00b7 2026-09-09T20:28:27.609Z \u00b7 http.request \u00b7 Event #6094\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=2518\nINFO \u00b7 2026-09-09T20:28:27.615Z \u00b7 http.request \u00b7 Event #6095\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=568\nINFO \u00b7 2026-09-09T20:28:27.621Z \u00b7 http.request \u00b7 Event #6096\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=253\nINFO \u00b7 2026-09-09T20:28:27.627Z \u00b7 http.request \u00b7 Event #6097\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=240\nINFO \u00b7 2026-09-09T20:28:27.633Z \u00b7 http.request \u00b7 Event #6098\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=171\nINFO \u00b7 2026-09-09T20:28:27.639Z \u00b7 http.request \u00b7 Event #6099\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=763\nINFO \u00b7 2026-09-09T20:28:27.645Z \u00b7 http.request \u00b7 Event #6100\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=368\nINFO \u00b7 2026-09-09T20:28:27.651Z \u00b7 http.request \u00b7 Event #6101\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=267\nINFO \u00b7 2026-09-09T20:28:27.658Z \u00b7 http.request \u00b7 Event #6102\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=6201\nINFO \u00b7 2026-09-09T20:28:27.665Z \u00b7 http.request \u00b7 Event #6103\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=266\nINFO \u00b7 2026-09-09T20:28:27.671Z \u00b7 http.request \u00b7 Event #6104\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=5777\nINFO \u00b7 2026-09-09T20:28:27.677Z \u00b7 http.request \u00b7 Event #6105\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=4192\nINFO \u00b7 2026-09-09T20:28:27.684Z \u00b7 http.request \u00b7 Event #6106\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=23158\nINFO \u00b7 2026-09-09T20:28:27.690Z \u00b7 http.request \u00b7 Event #6107\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=260\nINFO \u00b7 2026-09-09T20:28:27.697Z \u00b7 http.request \u00b7 Event #6108\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=254\nINFO \u00b7 2026-09-09T20:28:27.703Z \u00b7 http.request \u00b7 Event #6109\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=310\nINFO \u00b7 2026-09-09T20:28:27.710Z \u00b7 http.request \u00b7 Event #6110\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=251\nINFO \u00b7 2026-09-09T20:28:27.717Z \u00b7 http.request \u00b7 Event #6111\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=513\nINFO \u00b7 2026-09-09T20:28:27.724Z \u00b7 http.request \u00b7 Event #6112\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=608\nINFO \u00b7 2026-09-09T20:28:27.730Z \u00b7 http.request \u00b7 Event #6113\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=185\nINFO \u00b7 2026-09-09T20:28:27.736Z \u00b7 http.request \u00b7 Event #6114\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=255\nINFO \u00b7 2026-09-09T20:28:27.742Z \u00b7 http.request \u00b7 Event #6115\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=3459\nINFO \u00b7 2026-09-09T20:28:27.748Z \u00b7 http.request \u00b7 Event #6116\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=5 request_bytes=0 response_bytes=171\nINFO \u00b7 2026-09-09T20:28:27.754Z \u00b7 http.request \u00b7 Event #6117\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=163\nINFO \u00b7 2026-09-09T20:28:27.760Z \u00b7 http.request \u00b7 Event #6118\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2522\nINFO \u00b7 2026-09-09T20:28:27.766Z \u00b7 http.request \u00b7 Event #6119\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=266\nINFO \u00b7 2026-09-09T20:28:27.772Z \u00b7 http.request \u00b7 Event #6120\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=2573\nINFO \u00b7 2026-09-09T20:28:27.779Z \u00b7 http.request \u00b7 Event #6121\nlevel=info msg=http.request component=graph_ui method=GET path=/api/tree status=200 duration_ms=4 request_bytes=0 response_bytes=702\nINFO \u00b7 2026-09-09T20:28:28.404Z \u00b7 http.request \u00b7 Event #6122\nlevel=info msg=http.request component=graph_ui method=GET path=/api/agent-events status=200 duration_ms=1 request_bytes=0 response_bytes=176\nWARN \u00b7 2026-09-09T20:28:28.905Z \u00b7 reader \u00b7 Event #6123\n{\"received\":\"2026-09-09T20:28:28Z\",\"page\":\"/?project=cbm-pr2068\",\"session\":\"9bc39561\",\"seq\":2,\"ts\":\"2026-09-09T20:28:27.401Z\",\"level\":\"warn\",\"source\":\"reader\",\"message\":\"The index has no module node for .codeatlas/policy.json. This server delivers file content only through get_code_snippet on an indexed symbol, so a file the index did not record cannot be read here.\",\"project\":\"cbm-pr2068\"}\n\nINFO \u00b7 2026-09-09T20:28:28.906Z \u00b7 http.request \u00b7 Event #6124\nlevel=info msg=http.request component=graph_ui method=POST path=/api/ui-log status=200 duration_ms=1 request_bytes=373 response_bytes=94\nINFO \u00b7 2026-09-09T20:28:29.409Z \u00b7 http.request \u00b7 Event #6125\nlevel=info msg=http.request component=graph_ui method=GET path=/api/agent-events status=200 duration_ms=0 request_bytes=0 response_bytes=176\nINFO \u00b7 2026-09-09T20:28:29.828Z \u00b7 http.request \u00b7 Event #6126\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=0 request_bytes=0 response_bytes=9982\nINFO \u00b7 2026-09-09T20:28:30.413Z \u00b7 http.request \u00b7 Event #6127\nlevel=info msg=http.request component=graph_ui method=GET path=/api/agent-events status=200 duration_ms=1 request_bytes=0 response_bytes=176\nINFO \u00b7 2026-09-09T20:28:30.859Z \u00b7 http.request \u00b7 Event #6128\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=5 request_bytes=0 response_bytes=9982\nINFO \u00b7 2026-09-09T20:28:31.117Z \u00b7 http.request \u00b7 Event #6129\nlevel=info msg=http.request component=graph_ui method=GET path=/api/processes status=200 duration_ms=67 request_bytes=0 response_bytes=1142\nINFO \u00b7 2026-09-09T20:28:32.840Z \u00b7 http.request \u00b7 Event #6130\nlevel=info msg=http.request component=graph_ui method=GET path=/api/logs status=200 duration_ms=1 request_bytes=0 response_bytes=9982",
+      "systemErrorFilterText": "Daemon log\n\nServing process 85719 \u00b7 Latest 200 events\n\nCopy visible\n\nSQLite history \u00b7 5000 event retention limit \u00b7 survives daemon restarts Events identify affected paths or jobs only when the daemon recorded them.\n\nFilter\nLevel\nAll levels\nERROR\nWARN\nINFO\nDEBUG\nTRACE\nUnclassified\nFollow tail\n0 shown \u00b7 3340 events reported\n\nNo lines match these filters.",
+      "systemIndexesText": "Indexes\n\nOpen, add, reindex, or inspect your projects.\n\nManage indexes\nIndex activity\n\nCurrent daemon job slots. Slots may be reused; this is not a complete history.\n\nRepository\tState\tDetails\n/tmp/cbm-2068-error-fixture\tFailed\tdaemon index operation failed",
+      "projectOptions": [
+        "cbm-pr2068Current/Users/bernhard/Desktop/codebasememorymcp_branch 2068",
+        "pr2068-error-fixture/private/tmp/cbm-2068-error-fixture",
+        "showcase-service/Users/bernhard/Desktop/showcase-service"
+      ],
+      "showcaseAgentsText": "LIVE\n\nAgent activity\n\nFollow recorded work and inspect the code it touches.\n\nconnected\nDisconnect\n0\nRECORDED EVENTS\n0\nAGENTS SEEN\n0\nMISSING SEQUENCE NUMBERS\n0\nCONNECTION DROPS\nAll agents\nAll runs\nAll activity\nread\nwrite\nsearch\ntest\nother\nClear filters\nNo recorded activity for this repository. Configure the tool hook with the indexed project name; tool calls are observed, never inferred.\nEVENT EVIDENCE\n\nSelect an event to inspect its evidence.\n\nShowing retained history: up to 80 events per agent. Counts are observed totals, not task progress."
+    }
+  ],
+  "backend": {
+    "cbm-pr2068": {
+      "status": 200,
+      "events": [
+        {
+          "ts": 1788982343109,
+          "agent": "PR2068 verification fixture (pr2068-verification-1788982342942)",
+          "run": "pr2068-verification-1788982342942",
+          "seq": 1,
+          "phase": "end",
+          "tool": "Read",
+          "path": "src/ui/http_server.c",
+          "lines": [
+            1,
+            3
+          ],
+          "detail": "",
+          "source": "tool-hook"
+        },
+        {
+          "ts": 1788982343198,
+          "agent": "PR2068 verification fixture (pr2068-verification-1788982342942)",
+          "run": "pr2068-verification-1788982342942",
+          "seq": 2,
+          "phase": "end",
+          "tool": "Read",
+          "path": "src/store/store.c",
+          "lines": [
+            1,
+            3
+          ],
+          "detail": "",
+          "source": "tool-hook"
+        },
+        {
+          "ts": 1788982379139,
+          "agent": "PR2068 verification fixture (pr2068-verification-1788982342942)",
+          "run": "pr2068-verification-1788982342942",
+          "seq": 4,
+          "phase": "end",
+          "tool": "Read",
+          "path": "src/ui/atlas_api.c",
+          "lines": [
+            1,
+            3
+          ],
+          "detail": "",
+          "source": "verification-fixture"
+        },
+        {
+          "ts": 1788982378139,
+          "agent": "PR2068 verification fixture (pr2068-verification-1788982342942)",
+          "run": "pr2068-verification-1788982342942",
+          "seq": 3,
+          "phase": "end",
+          "tool": "Read",
+          "path": "src/daemon/host.c",
+          "lines": [
+            1,
+            3
+          ],
+          "detail": "",
+          "source": "verification-fixture"
+        }
+      ],
+      "generation": "9c6e02a31c8712115131afa1f33cc0b3",
+      "cursor": 6,
+      "oldest_cursor": 1,
+      "retained": 4,
+      "retention_limit": 10000,
+      "has_more": false,
+      "reset": false,
+      "truncated": false
+    },
+    "showcase-service": {
+      "status": 200,
+      "events": [],
+      "generation": "9c6e02a31c8712115131afa1f33cc0b3",
+      "cursor": 0,
+      "oldest_cursor": 0,
+      "retained": 0,
+      "retention_limit": 10000,
+      "has_more": false,
+      "reset": false,
+      "truncated": false
+    },
+    "pr2068-error-fixture": {
+      "status": 200,
+      "events": [],
+      "generation": "9c6e02a31c8712115131afa1f33cc0b3",
+      "cursor": 0,
+      "oldest_cursor": 0,
+      "retained": 0,
+      "retention_limit": 10000,
+      "has_more": false,
+      "reset": false,
+      "truncated": false
+    }
+  },
+  "finishedAt": "2026-09-09T20:28:39.975Z",
+  "backendAudit": {
+    "observedAt": "2026-09-09T20:29:57.812673+00:00",
+    "sqlite": {
+      "path": "/tmp/cbm-2068-cache/activity.db",
+      "readOnly": true,
+      "schemaVersion": 3,
+      "journalMode": "wal",
+      "permissions": "0o600",
+      "eventCountsByProject": [
+        [
+          "cbm-pr2068",
+          4,
+          1,
+          6
+        ]
+      ],
+      "agentRecords": [
+        [
+          1,
+          "cbm-pr2068",
+          "pr2068-verification-1788982342942",
+          1
+        ],
+        [
+          2,
+          "cbm-pr2068",
+          "pr2068-verification-1788982342942",
+          2
+        ],
+        [
+          5,
+          "cbm-pr2068",
+          "pr2068-verification-1788982342942",
+          4
+        ],
+        [
+          6,
+          "cbm-pr2068",
+          "pr2068-verification-1788982342942",
+          3
+        ]
+      ],
+      "logCountsByProjectAndLevel": [
+        [
+          null,
+          1,
+          2995
+        ],
+        [
+          null,
+          2,
+          270
+        ],
+        [
+          null,
+          3,
+          41
+        ],
+        [
+          "cbm-pr206",
+          2,
+          5
+        ],
+        [
+          "cbm-pr2068",
+          2,
+          14
+        ],
+        [
+          "pr2068-error-fixture",
+          1,
+          5
+        ],
+        [
+          "pr2068-error-fixture",
+          2,
+          4
+        ],
+        [
+          "pr2068-error-fixture",
+          3,
+          8
+        ],
+        [
+          "showcase-service",
+          2,
+          1
+        ]
+      ]
+    },
+    "daemonErrorHistory": {
+      "total": 49,
+      "latest": {
+        "id": 4412,
+        "ts": "2026-09-09T20:16:20.618Z",
+        "level": "error",
+        "source": "ui.index.done",
+        "message": "level=error msg=ui.index.done project=pr2068-error-fixture path=/tmp/cbm-2068-error-fixture rc=err",
+        "project": "pr2068-error-fixture"
+      },
+      "endpoint": "/api/logs?lines=1&min_level=error"
+    },
+    "unfilteredRecent200": {
+      "count": 200,
+      "errors": 0,
+      "endpoint": "/api/logs?lines=200"
+    },
+    "listeners": "COMMAND     PID     USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME\nnode      55078 bernhard   15u  IPv4 0x1db6032ed5e5037d      0t0  TCP 127.0.0.1:4142 (LISTEN)\ncodebase- 85719 bernhard   18u  IPv4 0x2ff0016f29be9472      0t0  TCP 127.0.0.1:9749 (LISTEN)\nnode      88603 bernhard   18u  IPv4 0x800f4c2c2202265a      0t0  TCP 127.0.0.1:9751 (LISTEN)\n",
+    "priorLifecycleEvidence": {
+      "file": "agents-after-restart.json",
+      "currentRowsMatchPrior": true,
+      "note": "Current IDs read only. Duplicate retry/reconnect/restart are documented prior synthetic verification runs, not re-executed in this audit."
+    },
+    "legacyUiLog": {
+      "status": 200,
+      "endpoint": "/api/ui-log?lines=1",
+      "keys": [
+        "path",
+        "size_bytes",
+        "partial",
+        "lines",
+        "persistent",
+        "total"
+      ],
+      "path": "/private/tmp/cbm-2068-cache/logs/ui.log",
+      "total": 229,
+      "note": "Read-only API verified; ProjectsPanel frontend-log view was source-inspected, not opened in the browser audit."
+    }
+  },
+  "findings": [
+    {
+      "severity": "product-gap",
+      "finding": "No genuine current agent activity is present. The only four stored events are the explicitly named prior PR2068 verification fixture; showcase-service and error fixture have zero. Hook transport works, but repository onboarding does not itself install/configure an actual producer.",
+      "evidence": [
+        "backend",
+        "backendAudit.sqlite",
+        "audit-after-agents.png",
+        "audit-after-agents-other-project-empty.png"
+      ]
+    },
+    {
+      "severity": "verified-backend-value",
+      "finding": "Current Agents polls same-origin9749 with project and cursor and maps an existing fixture path to real source range. Original Agents instead requests4142/events. This is a transport/evidence integration improvement; the main agent list, filters, metrics and inspector already existed before.",
+      "evidence": [
+        "views[0].requests",
+        "views[1].requests",
+        "views[1].agentsInspectorText",
+        "audit-before-agents-off.png",
+        "audit-after-agents.png"
+      ]
+    },
+    {
+      "severity": "product-gap",
+      "finding": "System Logs ERROR filter shows zero in both frontends, although daemon-wide durable history retains 49 ERROR events. The tab fetches latest200 unfiltered records, then filters locally. The new shared All daemon history control can reach priority history, but the Logs tab itself still loses older errors to routine traffic.",
+      "evidence": [
+        "views[0].systemErrorFilterText",
+        "views[1].systemErrorFilterText",
+        "backendAudit.daemonErrorHistory",
+        "audit-after-system-errors-filter.png",
+        "graph-ui/src/system/SystemWorkspace.tsx:38"
+      ]
+    },
+    {
+      "severity": "limited-visible-change",
+      "finding": "System Overview and Indexes are materially the existing dashboard: process/CPU/memory table, refresh/pause and current job slots. New visible additions are the shared scoped history/coverage strip and timestamps, severity/source/ID plus SQLite retention disclosure inside Logs. Neither overview explains an architecture nor supplies a complete persistent job history.",
+      "evidence": [
+        "audit-before-system.png",
+        "audit-after-system.png",
+        "views[1].systemIndexesText",
+        "audit-before-system-logs.png",
+        "audit-after-system-logs.png"
+      ]
+    },
+    {
+      "severity": "ux-gap",
+      "finding": "Approximately hour-old persisted fixture events are labeled Live while the source is connected; this means polling recorded history, not proof an agent is currently working. The inspector honestly states that tool outcome is not recorded.",
+      "evidence": [
+        "views[1].agentsOnText",
+        "views[1].agentsInspectorText"
+      ]
+    },
+    {
+      "severity": "legacy-surface",
+      "finding": "Legacy bridge files and compatibility names remain; current regular Agent source does not contact them. Rotating JSONL /api/ui-log and frontend-log view in ProjectsPanel remain alongside the SQLite journal; only frontend warnings/errors are mirrored to the journal.",
+      "evidence": [
+        "graph-ui/src/agents/agent-source.ts",
+        "graph-ui/src/agents/agent-event.ts:4",
+        "graph-ui/src/projects/ProjectsPanel.tsx:823",
+        "src/ui/http_server.c:handle_ui_log_post"
+      ]
+    }
+  ],
+  "additionalProjectProvenance": "showcase-service is another locally indexed repository returned by the real daemon. This audit did not verify whether its source originated as an application or demonstration; zero recorded agent events is the only claim."
+}

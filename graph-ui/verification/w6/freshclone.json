@@ -1,0 +1,351 @@
+{
+  "cloneOk": true,
+  "npmCiOk": true,
+  "scaffoldPass": true,
+  "unitPass": true,
+  "durationMs": 6721,
+  "source": "file:///Users/bernhard/Desktop/CodeAtlasWeb",
+  "cacheMiss": false,
+  "generatedAt": "2026-08-29T01:58:15.094Z",
+  "error": null,
+  "extras": {
+    "workingTreeOverlay": [
+      {
+        "code": " M",
+        "path": "package.json"
+      },
+      {
+        "code": " M",
+        "path": "src/App.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/app/AtlasChrome.test.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/app/AtlasChrome.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/app/AtlasTree.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/app/build-info.ts"
+      },
+      {
+        "code": " M",
+        "path": "src/chat/AtlasChatPanel.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/entry/EntryPointDialog.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/impact/ImpactPanel.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/llm/SidecarPanel.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/search/SearchOverlay.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/styles/terminal.css"
+      },
+      {
+        "code": " M",
+        "path": "src/tours/TourCard.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/traces/BugWizard.tsx"
+      },
+      {
+        "code": " M",
+        "path": "src/why/WhyPanel.tsx"
+      },
+      {
+        "code": "A ",
+        "path": "tests/scaffold/w6a.test.mjs"
+      },
+      {
+        "code": " M",
+        "path": "verification/w1/netdeny.json"
+      },
+      {
+        "code": " M",
+        "path": "verification/w1/scaffold.json"
+      },
+      {
+        "code": " M",
+        "path": "verification/w2/app-chrome.png"
+      },
+      {
+        "code": " M",
+        "path": "verification/w2/netdeny.json"
+      },
+      {
+        "code": " M",
+        "path": "verification/w2/reader-truncated.png"
+      },
+      {
+        "code": " M",
+        "path": "verification/w2/reader.json"
+      },
+      {
+        "code": " M",
+        "path": "verification/w2/reader.png"
+      },
+      {
+        "code": " M",
+        "path": "verification/w4/netdeny.json"
+      },
+      {
+        "code": " M",
+        "path": "verification/w4/tour.png"
+      },
+      {
+        "code": " M",
+        "path": "verification/w4/tours.json"
+      },
+      {
+        "code": " M",
+        "path": "verification/w4/why.png"
+      },
+      {
+        "code": "??",
+        "path": "src/i18n/messages.test.ts"
+      },
+      {
+        "code": "??",
+        "path": "src/i18n/messages.ts"
+      },
+      {
+        "code": "??",
+        "path": "tools/freshclone-check.mjs"
+      },
+      {
+        "code": "??",
+        "path": "tools/lib/chrome-scan.d.mts"
+      },
+      {
+        "code": "??",
+        "path": "tools/lib/chrome-scan.mjs"
+      },
+      {
+        "code": "??",
+        "path": "tools/lib/forbidden-names.mjs"
+      },
+      {
+        "code": "??",
+        "path": "tools/lib/readability.mjs"
+      },
+      {
+        "code": "??",
+        "path": "tools/lib/socket-sampler.mjs"
+      },
+      {
+        "code": "??",
+        "path": "tools/smoke-w6-full.mjs"
+      },
+      {
+        "code": "??",
+        "path": "tools/style-gate.mjs"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/airgap.json"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/budgets.json"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/netdeny.json"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/stylegate.json"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/01-app-open.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/02-explorer-expanded.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/03-explorer-coverage-legend.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/04-reader-open-file.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/05-reader-capped-file.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/06-search-overlay.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/07-twin-depth-3.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/08-twin-evidence.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/09-flow-overlay.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/10-flow-stepper.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/11-pseudocode.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/12-search-enter.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/13-twin-warm.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/14-galaxy-legend.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/15-tour-step-1.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/16-tour-step-3.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/17-entry-dialog.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/18-entry-walk-hierarchy.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/19-graph-mode-galaxy.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/20-bugwizard-no-traces.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/21-bugwizard-divergence.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/22-impact.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/23-sidecar-off.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/24-sidecar-ready.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/25-chat-answer.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/26-chat-citation.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/27-chat-cards.png"
+      },
+      {
+        "code": "??",
+        "path": "verification/w6/walk/28-sidecar-off-again.png"
+      }
+    ],
+    "cacheMiss": false,
+    "clone": {
+      "exit": 0,
+      "ms": 706,
+      "out": [
+        ""
+      ]
+    },
+    "npmCiOffline": {
+      "exit": 0,
+      "ms": 2764,
+      "out": [
+        "npm warn deprecated whatwg-encoding@3.1.1: Use @exodus/bytes instead for a more spec-conformant and faster implementation",
+        "",
+        "added 228 packages in 3s"
+      ]
+    },
+    "unit": {
+      "exit": 0,
+      "ms": 3068,
+      "out": [
+        "> codeatlasweb@1.0.0 test:unit",
+        "> vitest run",
+        "",
+        "",
+        " RUN  v4.1.11 /private/tmp/codeatlasweb-freshclone-y3BZhN/clone",
+        "",
+        "",
+        " Test Files  77 passed (77)",
+        "      Tests  1367 passed (1367)",
+        "   Start at  03:58:12",
+        "   Duration  2.35s (transform 3.13s, setup 0ms, import 5.90s, tests 2.98s, environment 2.69s)"
+      ]
+    },
+    "scaffold": {
+      "exit": 0,
+      "ms": 126,
+      "out": [
+        "  ...",
+        "# Subtest: AC5: style, attribution and version gates",
+        "ok 72 - AC5: style, attribution and version gates",
+        "  ---",
+        "  duration_ms: 0.40025",
+        "  ...",
+        "# Subtest: AC6: wiring and net deny",
+        "ok 73 - AC6: wiring and net deny",
+        "  ---",
+        "  duration_ms: 0.258375",
+        "  ...",
+        "1..73",
+        "# tests 73",
+        "# suites 0",
+        "# pass 73",
+        "# fail 0",
+        "# cancelled 0",
+        "# skipped 0",
+        "# todo 0",
+        "# duration_ms 97.573792"
+      ]
+    }
+  }
+}

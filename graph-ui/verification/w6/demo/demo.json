@@ -1,0 +1,342 @@
+{
+  "steps": [
+    {
+      "step": 1,
+      "name": "start-chrome-and-galaxy",
+      "atMs": 1871
+    },
+    {
+      "step": 2,
+      "name": "explorer-tree-expanded",
+      "atMs": 7374
+    },
+    {
+      "step": 3,
+      "name": "why-panel-open",
+      "atMs": 11464
+    },
+    {
+      "step": 4,
+      "name": "why-understand-starts-the-tour",
+      "atMs": 15624
+    },
+    {
+      "step": 5,
+      "name": "tour-step-2",
+      "atMs": 21205
+    },
+    {
+      "step": 6,
+      "name": "tour-step-3",
+      "atMs": 26792
+    },
+    {
+      "step": 7,
+      "name": "tour-left-with-q",
+      "atMs": 32385
+    },
+    {
+      "step": 8,
+      "name": "reader-opens-the-route-file",
+      "atMs": 34544
+    },
+    {
+      "step": 9,
+      "name": "twin-follows-the-caret",
+      "atMs": 38633
+    },
+    {
+      "step": 10,
+      "name": "twin-depth-0",
+      "atMs": 42641
+    },
+    {
+      "step": 11,
+      "name": "twin-depth-1",
+      "atMs": 46647
+    },
+    {
+      "step": 12,
+      "name": "twin-depth-2",
+      "atMs": 50655
+    },
+    {
+      "step": 13,
+      "name": "twin-depth-3",
+      "atMs": 54666
+    },
+    {
+      "step": 14,
+      "name": "flow-box-open",
+      "atMs": 58872
+    },
+    {
+      "step": 15,
+      "name": "flow-stepper-step-1",
+      "atMs": 64469
+    },
+    {
+      "step": 16,
+      "name": "flow-stepper-step-2",
+      "atMs": 68518
+    },
+    {
+      "step": 17,
+      "name": "pseudocode-tab",
+      "atMs": 72584
+    },
+    {
+      "step": 18,
+      "name": "search-createUser",
+      "atMs": 80781
+    },
+    {
+      "step": 19,
+      "name": "search-enter-opens-createUser",
+      "atMs": 83191
+    },
+    {
+      "step": 20,
+      "name": "galaxy-flies-to-the-symbol",
+      "atMs": 87195
+    },
+    {
+      "step": 21,
+      "name": "entry-mode-dialog",
+      "atMs": 94436
+    },
+    {
+      "step": 22,
+      "name": "hierarchy-view-of-the-walk",
+      "atMs": 100494
+    },
+    {
+      "step": 23,
+      "name": "hierarchy-walk-step-2",
+      "atMs": 107551
+    },
+    {
+      "step": 24,
+      "name": "bug-wizard-shows-the-divergence",
+      "atMs": 115779
+    },
+    {
+      "step": 25,
+      "name": "impact-blast-radius",
+      "atMs": 124289
+    },
+    {
+      "step": 26,
+      "name": "chat-sidecar-still-off",
+      "atMs": 133621
+    },
+    {
+      "step": 27,
+      "name": "chat-sidecar-ready",
+      "atMs": 137789
+    },
+    {
+      "step": 28,
+      "name": "chat-answer-with-citations",
+      "atMs": 144437
+    },
+    {
+      "step": 29,
+      "name": "chat-citation-opens-the-source",
+      "atMs": 154005
+    },
+    {
+      "step": 30,
+      "name": "chat-sidecar-off-again",
+      "atMs": 161061
+    }
+  ],
+  "durationMs": 166563,
+  "leftoverProcesses": 0,
+  "videoBytes": 16919603,
+  "outboundViolations": 0,
+  "samples": 172,
+  "pageErrors": 0,
+  "consoleErrors": 0,
+  "citationFollowed": true,
+  "video": {
+    "path": "verification/w6/demo/demo.webm",
+    "width": 1680,
+    "height": 1050,
+    "bytes": 16919603
+  },
+  "timeline": "atMs zaehlt ab dem ersten Bild der Aufzeichnung, nicht ab dem Start des Laufs: so ist jeder Halt im Video an seiner Marke zu finden.",
+  "projects": {
+    "main": "codeatlasweb-demo",
+    "impact": "codeatlasweb-demo-arbeitskopie"
+  },
+  "fixture": "fixtures/atlas-sample (nur gelesen), plus eine Kopie mit eigenem git-Repository und einer echten Aenderung fuer den Blast-Radius",
+  "question": "Wer ruft createUser?",
+  "sidecar": {
+    "port": 4141,
+    "note": "llama-server laeuft vor der Aufzeichnung; im Video ist nur der Schalter der Oberflaeche zu sehen und nicht das Laden des Modells."
+  },
+  "timings": {
+    "buildMs": 9307,
+    "sidecarReadyMs": 1109,
+    "answerMs": 2644,
+    "totalMs": 208846
+  },
+  "generatedAt": "2026-08-29T03:05:29.047Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "failedResponses": [],
+    "model": {
+      "name": "Qwen3.5-2B",
+      "choice": "class-a"
+    },
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "indexedImpact": {
+      "nodes": 77,
+      "edges": 180
+    },
+    "ingest": {
+      "status": "stored",
+      "label": "demo-run",
+      "pairs_stored": 3,
+      "paths_stored": 1,
+      "pairs_unmatched": 0,
+      "unmatched_sample": [],
+      "pair_total": 3
+    },
+    "serverPort": 4350,
+    "uiPort": 4351,
+    "tour": {
+      "kind": "project",
+      "steps": 11,
+      "index": 2,
+      "title": "Getting started"
+    },
+    "flow": {
+      "arrows": 2,
+      "steps": 11,
+      "title": "Flow from registerUserRoutes"
+    },
+    "pseudocode": {
+      "lines": 2,
+      "imports": 5
+    },
+    "flyTo": {
+      "targetChanges": 4,
+      "lastTargetQn": "codeatlasweb-demo.src.services.userService.createUser",
+      "highlightedCount": 12,
+      "from": "codeatlasweb-demo.src.routes.users.registerUserRoutes"
+    },
+    "hierarchy": {
+      "mode": "hierarchy",
+      "nodes": 8,
+      "depth": 3
+    },
+    "wizard": {
+      "events": 2,
+      "staticPaths": 2,
+      "observedPaths": 1,
+      "staticOnly": 4,
+      "runtimeOnly": 1
+    },
+    "impact": {
+      "badge": "high",
+      "direct": 5,
+      "downstream": 2,
+      "endpoints": 2
+    },
+    "llmReady": {
+      "state": "ready",
+      "preferenceOn": true,
+      "policyVerdict": "absent",
+      "policyPath": ".codeatlas/policy.json",
+      "policyDetail": "",
+      "model": "Qwen3.5-2B",
+      "chip": "ready: Qwen3.5-2B",
+      "probes": 1
+    },
+    "answer": {
+      "klass": "who-calls",
+      "cards": 12,
+      "citations": [
+        "K3",
+        "K5",
+        "K6",
+        "K7",
+        "K8",
+        "K9",
+        "K10",
+        "K12"
+      ],
+      "answerLength": 96,
+      "tokensPerSecond": 51.55875299760192
+    },
+    "citationClick": {
+      "before": {
+        "path": "src/services/userService.ts",
+        "line": 24
+      },
+      "after": {
+        "path": "src/services/userService.ts",
+        "line": 41
+      }
+    },
+    "stopScript": {
+      "exit": 0,
+      "out": [
+        "Sidecar beendet (pid 57837)."
+      ]
+    },
+    "leftovers": [
+      {
+        "port": 4350,
+        "listeners": 0
+      },
+      {
+        "port": 4351,
+        "listeners": 0
+      },
+      {
+        "port": 4141,
+        "listeners": 0
+      }
+    ],
+    "net": {
+      "samples": 172,
+      "intervalMs": 1000,
+      "durationMs": 208838,
+      "maxProcessTreeSize": 9,
+      "lsofErrors": 0,
+      "outboundViolations": 0,
+      "violations": [],
+      "loopbackConnections": [
+        {
+          "endpoint": "TCP 127.0.0.1:4141",
+          "seen": 32
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:4351",
+          "seen": 6
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:61514",
+          "seen": 1
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:61560",
+          "seen": 5
+        },
+        {
+          "endpoint": "TCP 127.0.0.1:62092",
+          "seen": 1
+        }
+      ]
+    }
+  }
+}
