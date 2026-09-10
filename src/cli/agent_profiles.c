@@ -547,6 +547,17 @@ static bool render_profile_text(profile_buffer_t *buffer, cbm_graph_profile_dial
         }
         return true;
     case CBM_GRAPH_DIALECT_OPENCODE:
+        if (!profile_buffer_append(buffer, "---\ndescription: ") ||
+            !profile_buffer_append(buffer, description) ||
+            !profile_buffer_append(
+                buffer, "\nmode: subagent\npermission:\n  \"*\": deny\n  read: allow\n  grep: "
+                        "allow\n  glob: allow\n  tool_search: allow\n  tool_search_regex: "
+                        "allow\n") ||
+            (direct && !append_permission_mcp_tools(buffer, dialect, tier)) ||
+            !profile_buffer_append(buffer, "---\n") || !profile_buffer_append(buffer, prompt)) {
+            return false;
+        }
+        return true;
     case CBM_GRAPH_DIALECT_KILO:
         if (!profile_buffer_append(buffer, "---\ndescription: ") ||
             !profile_buffer_append(buffer, description) ||

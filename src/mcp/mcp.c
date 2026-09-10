@@ -10262,7 +10262,7 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         }
         char logdir[CBM_SZ_1K];
         snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
+        cbm_mkdir_p_ex(logdir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
                  (long long)time(NULL));
     }
@@ -10481,7 +10481,7 @@ static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
     if (cdir && cdir[0]) {
         char logdir[CBM_SZ_1K];
         snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
+        cbm_mkdir_p_ex(logdir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
     } else {
         snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
@@ -14860,7 +14860,8 @@ static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
     int written;
     if (cache && cache[0]) {
         written = snprintf(directory, sizeof(directory), "%s/logs", cache);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
     } else {
