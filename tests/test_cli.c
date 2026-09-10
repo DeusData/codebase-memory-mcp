@@ -14280,8 +14280,8 @@ TEST(cli_usage_points_to_tool_format_json_issue2102) {
     ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "payload JSON"));
     ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "full MCP envelope"));
     ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--json      Print the raw MCP result envelope"));
-    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE,
-                          "cli [--quiet] [--progress] [--verbose] [--json] <tool_name>"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "cli [--quiet] [--progress] [--verbose] [--json] "
+                                          "<tool_name>"));
     ASSERT_NULL(strstr(CBM_CLI_USAGE, "[--format"));
     ASSERT_NULL(strstr(CBM_CLI_USAGE, "CBM_CLI_FORMAT"));
     PASS();

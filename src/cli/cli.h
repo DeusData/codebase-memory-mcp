@@ -27,14 +27,14 @@ const char *cbm_cli_get_version(void);
 
 /* Top-level `cli --help` text printed by run_cli() in src/main.c.
  * Documents tool-level --format without adding a session-wide flag (#2102). */
-#define CBM_CLI_USAGE \
+#define CBM_CLI_USAGE                                                                         \
     "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
-    "[json_args]\n" \
-    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n" \
-    "  --progress  Show lifecycle progress even when stderr is redirected\n" \
-    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n" \
-    "  --json      Print the raw MCP result envelope\n" \
-    "  Tools that accept format support --format tree|json (default: tree).\n" \
+    "[json_args]\n"                                                                           \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
+    "  --json      Print the raw MCP result envelope\n"                                       \
+    "  Tools that accept format support --format tree|json (default: tree).\n"                \
     "  --format json prints payload JSON; outer --json prints the full MCP envelope.\n"
 
 /* Convert `--flag value` / `--flag=value` / bare-boolean `--flag` arguments for
