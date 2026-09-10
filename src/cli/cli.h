@@ -25,6 +25,18 @@ const char *cbm_cli_get_version(void);
 
 /* ── CLI tool arguments (flags / --args-file / --help) ────────── */
 
+/* Top-level `cli --help` text printed by run_cli() in src/main.c.
+ * Documents tool-level --format without adding a session-wide flag (#2102). */
+#define CBM_CLI_USAGE \
+    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
+    "[json_args]\n" \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n" \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n" \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n" \
+    "  --json      Print the raw MCP result envelope\n" \
+    "  Tools that accept format support --format tree|json (default: tree).\n" \
+    "  --format json prints payload JSON; outer --json prints the full MCP envelope.\n"
+
 /* Convert `--flag value` / `--flag=value` / bare-boolean `--flag` arguments for
  * a tool into a JSON arguments object string, using the tool's input_schema to
  * type values (string/integer/boolean) and to collect repeated flags into
