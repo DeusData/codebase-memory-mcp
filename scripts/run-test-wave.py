@@ -28,6 +28,15 @@ FAILED = re.compile(r"(?:^|, )(?P<failed>[0-9]+) failed")
 SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
 SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime"))
 POLL_SECONDS = 0.05
+# Floor for how long the external Windows kill helper (taskkill.exe /T /F) may
+# take to answer. This is deliberately NOT --kill-grace: that flag budgets how
+# long a doomed process may take to die, while this budgets spawning the helper
+# on a loaded runner, which routinely exceeds a second. Wiring the two together
+# made a small kill grace flake the whole wave -- a timed-out taskkill is
+# reported as "could not prove cleanup", which raises out of the wave loop and
+# re-enters cleanup with the leader already dead. kill_grace still governs every
+# actual death wait. The descendant probe has its own budget below.
+WINDOWS_HELPER_TIMEOUT_SECONDS = 30
 
 # WHY: the Windows descendant probe below is a cold `powershell.exe` + CIM
 # start. On a GitHub Windows runner that routinely costs seconds -- interpreter
@@ -163,6 +172,10 @@ def start_suite(
     )
 
 
+def windows_helper_timeout(kill_grace: int) -> int:
+    return max(kill_grace, WINDOWS_HELPER_TIMEOUT_SECONDS)
+
+
 def windows_tree_cleanup_blocker(pid: int) -> str | None:
     """Why `pid`'s tree cannot be called clean, or None when it provably is.
 
@@ -244,7 +257,7 @@ def terminate_process_tree(active: ActiveSuite, kill_grace: int) -> None:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                timeout=kill_grace,
+                timeout=windows_helper_timeout(kill_grace),
             )
         except (OSError, subprocess.TimeoutExpired):
             completed = None
