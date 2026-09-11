@@ -10262,7 +10262,7 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         }
         char logdir[CBM_SZ_1K];
         snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
+        cbm_mkdir_p_ex(logdir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
                  (long long)time(NULL));
     }
@@ -10481,7 +10481,7 @@ static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
     if (cdir && cdir[0]) {
         char logdir[CBM_SZ_1K];
         snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
+        cbm_mkdir_p_ex(logdir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
     } else {
         snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
@@ -14860,7 +14860,8 @@ static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
     int written;
     if (cache && cache[0]) {
         written = snprintf(directory, sizeof(directory), "%s/logs", cache);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
     } else {
@@ -17426,6 +17427,16 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
 }
 
 /* Background auto-index thread function */
+/* Extraction builds a THREAD-LOCAL node-type bitset cache (cbm_kind_in_set).
+ * Every worker thread that runs extraction must free that cache before it exits,
+ * or the calloc'd bitsets are orphaned when the thread's TLS is torn down and
+ * LeakSanitizer reports them at process exit. Parallel workers do this in
+ * pass_parallel.c; the in-process (sequential) auto-index runs extraction on
+ * THIS short-lived thread, so it must free its own cache too. Declared extern
+ * (not via internal/cbm/helpers.h) to avoid pulling the extraction layer's
+ * header into the MCP TU — the same pattern test_main.c uses for teardown. */
+extern void cbm_kind_in_set_free_cache(void);
+
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
@@ -17465,7 +17476,8 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
-    cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
+    cbm_kind_in_set_free_cache(); /* free THIS thread's extraction bitset cache (see above) */
+    cbm_mem_collect();            /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
         cbm_log_info("autoindex.done", "project", srv->session_project);
@@ -17564,9 +17576,13 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char limit[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);
         (void)snprintf(limit, sizeof(limit), "%d", file_limit);
+        char root_disp[CBM_SZ_1K];
+        (void)snprintf(root_disp, sizeof(root_disp), "%s", srv->session_root);
+        cbm_normalize_path_sep(
+            root_disp); /* forward-slash paths in diagnostics (Windows \\ -> /) */
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", limit);
+                     files, "limit", limit, "root", root_disp);
         return;
     }
 

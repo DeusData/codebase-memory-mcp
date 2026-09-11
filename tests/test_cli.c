@@ -3863,6 +3863,251 @@ TEST(cli_openclaw_uninstall_removes_compaction_when_workspace_is_ambiguous) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  OpenHands settings.json + agent-profiles registration (#1826)
+ *
+ *  A bare ~/.openhands/mcp.json is not enough: OpenHands registers global MCP
+ *  servers under settings.json → mcp_config, and every agent profile under
+ *  agent-profiles/ must list the server in mcp_server_refs before that agent
+ *  may use it. Foreign content survives byte-for-byte; uninstall removes
+ *  exactly what install added.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    char home[256];
+    char binary[512]; /* the path `uninstall` expects: <home>/.local/bin/... */
+    char settings[640];
+    char mcp[640];
+    char profiles_dir[640];
+    char default_profile[768];
+    char custom_profile[768];
+    char note[768];
+    char *saved_home;
+    char *saved_path;
+    char *saved_cache;
+} openhands_fixture_t;
+
+static bool openhands_fixture_open(openhands_fixture_t *fx, bool with_profiles) {
+    snprintf(fx->home, sizeof(fx->home), "/tmp/cli-openhands-XXXXXX");
+    if (!cbm_mkdtemp(fx->home)) {
+        return false;
+    }
+    snprintf(fx->settings, sizeof(fx->settings), "%s/.openhands/settings.json", fx->home);
+#ifdef _WIN32
+    snprintf(fx->binary, sizeof(fx->binary), "%s/.local/bin/codebase-memory-mcp.exe", fx->home);
+#else
+    snprintf(fx->binary, sizeof(fx->binary), "%s/.local/bin/codebase-memory-mcp", fx->home);
+#endif
+    snprintf(fx->mcp, sizeof(fx->mcp), "%s/.openhands/mcp.json", fx->home);
+    snprintf(fx->profiles_dir, sizeof(fx->profiles_dir), "%s/.openhands/agent-profiles", fx->home);
+    snprintf(fx->default_profile, sizeof(fx->default_profile), "%s/default.json", fx->profiles_dir);
+    snprintf(fx->custom_profile, sizeof(fx->custom_profile), "%s/custom.json", fx->profiles_dir);
+    snprintf(fx->note, sizeof(fx->note), "%s/README.txt", fx->profiles_dir);
+    char openhands_dir[512];
+    snprintf(openhands_dir, sizeof(openhands_dir), "%s/.openhands", fx->home);
+    test_mkdirp(with_profiles ? fx->profiles_dir : openhands_dir);
+    fx->saved_home = save_test_env("HOME");
+    fx->saved_path = save_test_env("PATH");
+    fx->saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("HOME", fx->home, 1);
+    cbm_setenv("PATH", fx->home, 1);
+    cbm_unsetenv("CBM_CACHE_DIR");
+    return true;
+}
+
+static void openhands_fixture_close(openhands_fixture_t *fx) {
+    restore_test_env("HOME", fx->saved_home);
+    restore_test_env("PATH", fx->saved_path);
+    restore_test_env("CBM_CACHE_DIR", fx->saved_cache);
+    test_rmdir_r(fx->home);
+}
+
+static yyjson_doc *openhands_read_doc(const char *path) {
+    char *data = read_test_file_alloc(path);
+    if (!data) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(data, strlen(data), 0);
+    free(data);
+    return doc;
+}
+
+/* settings.json → mcp_config.<name> must be {transport:"stdio", command:<binary>,
+ * enabled:true}; returns false for any deviation. */
+static bool openhands_settings_entry_ok(const char *settings_path, const char *name,
+                                        const char *binary) {
+    yyjson_doc *doc = openhands_read_doc(settings_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *mcp_config = root ? yyjson_obj_get(root, "mcp_config") : NULL;
+    yyjson_val *entry = mcp_config ? yyjson_obj_get(mcp_config, name) : NULL;
+    bool ok = entry && yyjson_is_obj(entry) && yyjson_obj_size(entry) == 3U;
+    yyjson_val *transport = ok ? yyjson_obj_get(entry, "transport") : NULL;
+    yyjson_val *command = ok ? yyjson_obj_get(entry, "command") : NULL;
+    yyjson_val *enabled = ok ? yyjson_obj_get(entry, "enabled") : NULL;
+    ok = ok && transport && yyjson_is_str(transport) &&
+         strcmp(yyjson_get_str(transport), "stdio") == 0;
+    ok = ok && command && yyjson_is_str(command) && strcmp(yyjson_get_str(command), binary) == 0;
+    ok = ok && enabled && yyjson_is_true(enabled);
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+static bool openhands_settings_entry_absent(const char *settings_path, const char *name) {
+    yyjson_doc *doc = openhands_read_doc(settings_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *mcp_config = root ? yyjson_obj_get(root, "mcp_config") : NULL;
+    bool absent = root && (!mcp_config || !yyjson_obj_get(mcp_config, name));
+    yyjson_doc_free(doc);
+    return absent;
+}
+
+/* profile → mcp_server_refs must be exactly the given strings in order. */
+static bool openhands_profile_refs_equal(const char *profile_path, const char *const *expected,
+                                         size_t expected_count) {
+    yyjson_doc *doc = openhands_read_doc(profile_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *refs = root ? yyjson_obj_get(root, "mcp_server_refs") : NULL;
+    bool ok = refs && yyjson_is_arr(refs) && yyjson_arr_size(refs) == expected_count;
+    for (size_t i = 0; ok && i < expected_count; i++) {
+        yyjson_val *item = yyjson_arr_get(refs, i);
+        ok = item && yyjson_is_str(item) && strcmp(yyjson_get_str(item), expected[i]) == 0;
+    }
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+static bool openhands_file_equals(const char *path, const char *expected) {
+    char *data = read_test_file_alloc(path);
+    bool equal = data && expected && strcmp(data, expected) == 0;
+    free(data);
+    return equal;
+}
+
+static const char openhands_settings_before[] = "{\n"
+                                                "  \"language\": \"en\",\n"
+                                                "  \"mcp_config\": {\n"
+                                                "    \"other-mcp\": {\"transport\": \"stdio\", "
+                                                "\"command\": \"/opt/other\", \"enabled\": false}\n"
+                                                "  },\n"
+                                                "  \"llm_model\": \"gpt-x\"\n"
+                                                "}\n";
+static const char openhands_default_profile_before[] = "{\n"
+                                                       "  \"name\": \"default\",\n"
+                                                       "  \"mcp_server_refs\": null,\n"
+                                                       "  \"tools\": [\"bash\"]\n"
+                                                       "}\n";
+static const char openhands_custom_profile_before[] =
+    "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\"]}\n";
+static const char openhands_note_before[] = "not a profile\n";
+
+/* Foreign settings keys and a foreign mcp_config sibling survive verbatim;
+ * a null profile ref list becomes ours, an existing list is appended once;
+ * a second install is byte-idempotent; uninstall restores the foreign files
+ * byte-for-byte and removes only our ref. */
+TEST(cli_openhands_registers_settings_mcp_config_and_profile_refs_issue1826) {
+    openhands_fixture_t fx;
+    if (!openhands_fixture_open(&fx, true))
+        FAIL("cbm_mkdtemp failed");
+    write_test_file(fx.settings, openhands_settings_before);
+    write_test_file(fx.default_profile, openhands_default_profile_before);
+    write_test_file(fx.custom_profile, openhands_custom_profile_before);
+    write_test_file(fx.note, openhands_note_before);
+
+    cbm_install_agent_configs(fx.home, fx.binary, false, false);
+
+    const char *const only_ours[] = {"codebase-memory-mcp"};
+    const char *const appended[] = {"other-mcp", "codebase-memory-mcp"};
+    bool ours_ok = openhands_settings_entry_ok(fx.settings, "codebase-memory-mcp", fx.binary);
+    char *settings_after = read_test_file_alloc(fx.settings);
+    bool foreign_ok =
+        settings_after && strstr(settings_after, "\"language\": \"en\"") &&
+        strstr(settings_after, "\"llm_model\": \"gpt-x\"") &&
+        strstr(settings_after, "\"other-mcp\": {\"transport\": \"stdio\", \"command\": "
+                               "\"/opt/other\", \"enabled\": false}");
+    bool default_ok = openhands_profile_refs_equal(fx.default_profile, only_ours, 1U);
+    bool custom_ok = openhands_profile_refs_equal(fx.custom_profile, appended, 2U);
+    char *default_after = read_test_file_alloc(fx.default_profile);
+    bool default_foreign_ok = default_after && strstr(default_after, "\"name\": \"default\"") &&
+                              strstr(default_after, "\"tools\": [\"bash\"]");
+    bool note_ok = openhands_file_equals(fx.note, openhands_note_before);
+    const char *const standard_json[] = {"mcpServers", "codebase-memory-mcp", fx.binary};
+    bool mcp_json_ok = test_file_contains_all(fx.mcp, standard_json, 3);
+    char *custom_after = read_test_file_alloc(fx.custom_profile);
+
+    /* Second install: byte-idempotent on every touched file. */
+    cbm_install_agent_configs(fx.home, fx.binary, false, false);
+    bool idempotent = openhands_file_equals(fx.settings, settings_after) &&
+                      openhands_file_equals(fx.default_profile, default_after) &&
+                      openhands_file_equals(fx.custom_profile, custom_after);
+    free(settings_after);
+    free(default_after);
+    free(custom_after);
+
+    char *argv[] = {"uninstall", "--yes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
+    bool settings_restored = openhands_file_equals(fx.settings, openhands_settings_before);
+    bool custom_restored =
+        openhands_file_equals(fx.custom_profile, openhands_custom_profile_before);
+    /* null → ["codebase-memory-mcp"] → [] : the ref is gone; an empty list is
+     * the minimal edit (the editor cannot know the list was null before). */
+    bool default_cleared = openhands_profile_refs_equal(fx.default_profile, only_ours, 0U);
+    bool note_restored = openhands_file_equals(fx.note, openhands_note_before);
+    openhands_fixture_close(&fx);
+
+    if (!ours_ok)
+        FAIL("settings.json must register mcp_config.codebase-memory-mcp {stdio, binary, enabled}");
+    if (!foreign_ok)
+        FAIL("settings.json foreign keys and the foreign mcp_config sibling must survive verbatim");
+    if (!default_ok)
+        FAIL("a null mcp_server_refs must become [\"codebase-memory-mcp\"]");
+    if (!custom_ok)
+        FAIL("an existing mcp_server_refs list must gain codebase-memory-mcp exactly once");
+    if (!default_foreign_ok)
+        FAIL("profile keys around mcp_server_refs must survive verbatim");
+    if (!note_ok)
+        FAIL("non-JSON files under agent-profiles must not be touched");
+    if (!mcp_json_ok)
+        FAIL("the existing ~/.openhands/mcp.json registration must be kept");
+    if (!idempotent)
+        FAIL("a second install must be byte-idempotent");
+    if (rc != 0 || !settings_restored)
+        FAIL("uninstall must restore settings.json byte-for-byte");
+    if (!custom_restored)
+        FAIL("uninstall must restore a profile with foreign refs byte-for-byte");
+    if (!default_cleared)
+        FAIL("uninstall must remove our ref from the null-origin profile");
+    if (!note_restored)
+        FAIL("uninstall must not touch non-JSON files under agent-profiles");
+    PASS();
+}
+
+/* Fresh ~/.openhands without settings.json or agent-profiles: settings.json is
+ * created with only our entry, no profile directory is invented, and uninstall
+ * removes the entry again. */
+TEST(cli_openhands_creates_settings_and_skips_missing_profiles_issue1826) {
+    openhands_fixture_t fx;
+    if (!openhands_fixture_open(&fx, false))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_install_agent_configs(fx.home, fx.binary, false, false);
+    bool ours_ok = openhands_settings_entry_ok(fx.settings, "codebase-memory-mcp", fx.binary);
+    struct stat st;
+    bool no_profiles_invented = stat(fx.profiles_dir, &st) != 0;
+
+    char *argv[] = {"uninstall", "--yes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
+    bool removed = openhands_settings_entry_absent(fx.settings, "codebase-memory-mcp");
+    openhands_fixture_close(&fx);
+
+    if (!ours_ok)
+        FAIL("a missing settings.json must be created with mcp_config.codebase-memory-mcp");
+    if (!no_profiles_invented)
+        FAIL("install must never create ~/.openhands/agent-profiles");
+    if (rc != 0 || !removed)
+        FAIL("uninstall must remove mcp_config.codebase-memory-mcp from settings.json");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  VS Code MCP config tests
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -5216,6 +5461,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "/.hermes/skills/codebase-memory/SKILL.md",
         "\"openhands\"",
         "/.openhands/mcp.json",
+        "/.openhands/settings.json",
         "/.agents/skills/codebase-memory/SKILL.md",
         "\"cline\"",
         "/.cline/mcp.json",
@@ -10461,32 +10707,37 @@ TEST(cli_mcp_installers_preserve_foreign_same_name_entries) {
     PASS();
 }
 
-TEST(cli_installer_rejects_symlinked_agent_roots) {
+/* Agent roots reached through a symlink. A link the invoking account owns is
+ * that account's own arrangement -- a dotfile manager, or a config tree kept
+ * on another volume (~/.config/opencode -> /mnt/...) -- and the installer
+ * follows it; refusing it failed every write under such a root with an opaque
+ * agent_config error. Root-owned links are trusted as infrastructure (distro
+ * /home indirection, macOS /tmp): only root can create them, so they are
+ * outside the attacker model. A link owned by ANY OTHER account is the
+ * planted-link case the O_NOFOLLOW parent-chain walk exists for, and stays
+ * refused, and so is a user-owned link when the installer itself runs as
+ * root. Only root can create a link owned by someone else, so both refusal
+ * legs are exercised when the suite runs as root (containers); the follow leg
+ * runs everywhere. */
+TEST(cli_installer_follows_symlinked_agent_roots_only_for_trusted_owners) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX symlink parent-chain contract");
 #else
     char tmpdir[256];
-    char qoder_target[256];
-    char junie_target[256];
+    char own_target[256];
+    char foreign_target[256];
+    char user_target[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-linked-roots-XXXXXX");
-    snprintf(qoder_target, sizeof(qoder_target), "/tmp/cli-linked-qoder-XXXXXX");
-    snprintf(junie_target, sizeof(junie_target), "/tmp/cli-linked-junie-XXXXXX");
-    if (!cbm_mkdtemp(tmpdir) || !cbm_mkdtemp(qoder_target) || !cbm_mkdtemp(junie_target))
+    snprintf(own_target, sizeof(own_target), "/tmp/cli-linked-own-XXXXXX");
+    snprintf(foreign_target, sizeof(foreign_target), "/tmp/cli-linked-foreign-XXXXXX");
+    snprintf(user_target, sizeof(user_target), "/tmp/cli-linked-user-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir) || !cbm_mkdtemp(own_target) || !cbm_mkdtemp(foreign_target) ||
+        !cbm_mkdtemp(user_target))
         FAIL("cbm_mkdtemp failed");
     char qoder_link[512];
-    char junie_link[512];
     snprintf(qoder_link, sizeof(qoder_link), "%s/.qoder", tmpdir);
-    snprintf(junie_link, sizeof(junie_link), "%s/.junie", tmpdir);
-    if (symlink(qoder_target, qoder_link) != 0 || symlink(junie_target, junie_link) != 0)
+    if (symlink(own_target, qoder_link) != 0)
         FAIL("symlink failed");
-    /* Root-owned symlinks are deliberately trusted as infrastructure (distro
-     * /home indirection, macOS /tmp) — only root can create them, so they are
-     * outside the attacker model. The contract under test is refusal of
-     * USER-planted links; a root test run (containers) must demote its links
-     * to an unprivileged owner or it would assert against the wrong model. */
-    if (geteuid() == 0 &&
-        (lchown(qoder_link, 65534, 65534) != 0 || lchown(junie_link, 65534, 65534) != 0))
-        FAIL("lchown to unprivileged owner failed");
 
     char qoder_executable[512];
     snprintf(qoder_executable, sizeof(qoder_executable), "%s/qodercli", tmpdir);
@@ -10498,33 +10749,80 @@ TEST(cli_installer_rejects_symlinked_agent_roots) {
     char *saved_path = save_test_env("PATH");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
-    (void)cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int own_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
-    char outside_qoder_settings[512];
-    char outside_qoder_skill[512];
-    char outside_junie_mcp[512];
-    char outside_junie_agent[512];
-    snprintf(outside_qoder_settings, sizeof(outside_qoder_settings), "%s/settings.json",
-             qoder_target);
-    snprintf(outside_qoder_skill, sizeof(outside_qoder_skill), "%s/skills/codebase-memory/SKILL.md",
-             qoder_target);
-    snprintf(outside_junie_mcp, sizeof(outside_junie_mcp), "%s/mcp/mcp.json", junie_target);
-    snprintf(outside_junie_agent, sizeof(outside_junie_agent), "%s/agents/codebase-memory.md",
-             junie_target);
+    char own_settings[512];
+    char own_skill[512];
+    snprintf(own_settings, sizeof(own_settings), "%s/settings.json", own_target);
+    snprintf(own_skill, sizeof(own_skill), "%s/skills/codebase-memory/SKILL.md", own_target);
     struct stat state;
-    bool refused = stat(outside_qoder_settings, &state) != 0 &&
-                   stat(outside_qoder_skill, &state) != 0 && stat(outside_junie_mcp, &state) != 0 &&
-                   stat(outside_junie_agent, &state) != 0;
+    bool followed = stat(own_settings, &state) == 0 && S_ISREG(state.st_mode) &&
+                    stat(own_skill, &state) == 0 && S_ISREG(state.st_mode);
+
+    /* Refusal leg: the same root, now a link some other account planted. */
+    bool foreign_refused = true;
+    bool foreign_setup_ok = true;
+    if (geteuid() == 0) {
+        foreign_setup_ok = cbm_unlink(qoder_link) == 0 &&
+                           symlink(foreign_target, qoder_link) == 0 &&
+                           lchown(qoder_link, 65534, 65534) == 0;
+        if (foreign_setup_ok) {
+            int foreign_rc =
+                cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+            char foreign_settings[512];
+            char foreign_skill[512];
+            snprintf(foreign_settings, sizeof(foreign_settings), "%s/settings.json",
+                     foreign_target);
+            snprintf(foreign_skill, sizeof(foreign_skill), "%s/skills/codebase-memory/SKILL.md",
+                     foreign_target);
+            foreign_refused = foreign_rc != 0 && stat(foreign_settings, &state) != 0 &&
+                              stat(foreign_skill, &state) != 0;
+        }
+    }
+
+    /* Refusal leg (root only): a privileged install into another account's
+     * home. Home, link and target are all owned by that account and the walk
+     * runs as euid 0, which trusts only root-owned links, so the user's link
+     * is refused and nothing lands in the target. This pins the claim that
+     * following user-owned links never extends to a root-run install. */
+    bool user_refused = true;
+    bool user_setup_ok = true;
+    if (geteuid() == 0) {
+        enum { LINKED_HOME_UID = 65533 };
+        user_setup_ok = cbm_unlink(qoder_link) == 0 && symlink(user_target, qoder_link) == 0 &&
+                        lchown(qoder_link, LINKED_HOME_UID, LINKED_HOME_UID) == 0 &&
+                        chown(user_target, LINKED_HOME_UID, LINKED_HOME_UID) == 0 &&
+                        chown(tmpdir, LINKED_HOME_UID, LINKED_HOME_UID) == 0;
+        if (user_setup_ok) {
+            int user_rc =
+                cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+            char user_settings[512];
+            char user_skill[512];
+            snprintf(user_settings, sizeof(user_settings), "%s/settings.json", user_target);
+            snprintf(user_skill, sizeof(user_skill), "%s/skills/codebase-memory/SKILL.md",
+                     user_target);
+            user_refused =
+                user_rc != 0 && stat(user_settings, &state) != 0 && stat(user_skill, &state) != 0;
+        }
+    }
 
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     cbm_unlink(qoder_link);
-    cbm_unlink(junie_link);
     test_rmdir_r(tmpdir);
-    test_rmdir_r(qoder_target);
-    test_rmdir_r(junie_target);
-    if (!refused)
-        FAIL("installer must not follow symlinked agent roots outside the selected home");
+    test_rmdir_r(own_target);
+    test_rmdir_r(foreign_target);
+    test_rmdir_r(user_target);
+    if (!foreign_setup_ok)
+        FAIL("could not plant a foreign-owned link while running as root");
+    if (!user_setup_ok)
+        FAIL("could not plant a user-owned link and home while running as root");
+    if (own_rc != 0 || !followed)
+        FAIL("installer must follow an agent root symlinked by the invoking account");
+    if (!foreign_refused)
+        FAIL("installer must not follow an agent root symlinked by another account");
+    if (!user_refused)
+        FAIL("a root-run installer must not follow an agent root symlinked by the home's owner");
     PASS();
 #endif
 }
@@ -15012,6 +15310,8 @@ SUITE(cli) {
     RUN_TEST(cli_openclaw_mcp_preserves_valid_json5);
     RUN_TEST(cli_openclaw_mcp_uninstall_uses_nested_servers);
     RUN_TEST(cli_openclaw_compaction_preserves_user_owned_section);
+    RUN_TEST(cli_openhands_registers_settings_mcp_config_and_profile_refs_issue1826);
+    RUN_TEST(cli_openhands_creates_settings_and_skips_missing_profiles_issue1826);
     RUN_TEST(cli_openclaw_profile_uses_profile_state_and_default_workspace);
     RUN_TEST(cli_openclaw_uninstall_removes_compaction_when_workspace_is_ambiguous);
 
@@ -15159,7 +15459,7 @@ SUITE(cli) {
     RUN_TEST(cli_read_only_agents_do_not_receive_mutating_mcp_server);
     RUN_TEST(cli_junie_foreign_analysis_alias_falls_back_to_parent_handoff);
     RUN_TEST(cli_mcp_installers_preserve_foreign_same_name_entries);
-    RUN_TEST(cli_installer_rejects_symlinked_agent_roots);
+    RUN_TEST(cli_installer_follows_symlinked_agent_roots_only_for_trusted_owners);
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);

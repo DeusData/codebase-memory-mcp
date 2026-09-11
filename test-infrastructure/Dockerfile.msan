@@ -39,21 +39,27 @@ RUN printf '%s\n' \
     > /usr/local/bin/retry \
     && chmod 0755 /usr/local/bin/retry
 
-# clang 22 from apt.llvm.org, matching the diag and analyzer lanes. Noble's
-# default is clang 18 — four majors behind everything else here, which is both
-# an inconsistency and a bad vantage point for debugging sanitizer behaviour.
+# clang 21 from apt.llvm.org — a modern sanitizer toolchain well ahead of
+# Noble's default clang 18 (three majors back), a better vantage point for
+# debugging sanitizer behaviour. We track the highest *stable* noble channel
+# apt.llvm.org serves rather than its bleeding edge: apt.llvm.org keeps only
+# the last few majors and rotates newer ones in and out, and the -22 channel
+# was transiently pulled out from under this build (#2123: "Unable to locate
+# package clang-22"), reddening test-msan repo-wide. Bump deliberately, and
+# only to a channel proven installable (and with a matching llvmorg-*.*.* tag
+# for the runtimes build below), never automatically to the newest number.
 # The key is fetched with `wget -O <file>` rather than `-qO- > <file>`: under
 # retry a redirect is opened once for all attempts, so a partial write from a
 # failed attempt would be prepended to the output of a later successful one.
 RUN retry apt-get -o Acquire::Retries=3 update \
     && retry apt-get -o Acquire::Retries=3 install -y --no-install-recommends wget gnupg ca-certificates \
     && retry wget -q -O /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key \
-    && echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" > /etc/apt/sources.list.d/llvm-22.list \
+    && echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" > /etc/apt/sources.list.d/llvm-21.list \
     && retry apt-get -o Acquire::Retries=3 update \
     && retry apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
-       clang-22 libclang-rt-22-dev llvm-22 \
-    && ln -sf /usr/bin/clang-22 /usr/bin/clang \
-    && ln -sf /usr/bin/clang++-22 /usr/bin/clang++
+       clang-21 libclang-rt-21-dev llvm-21 \
+    && ln -sf /usr/bin/clang-21 /usr/bin/clang \
+    && ln -sf /usr/bin/clang++-21 /usr/bin/clang++
 
 RUN retry apt-get -o Acquire::Retries=3 update \
     && retry apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
@@ -72,7 +78,7 @@ RUN retry apt-get -o Acquire::Retries=3 update \
 # the compiler above — a runtimes build must match its clang. The clone clears
 # its destination first: a half-finished clone would make every later attempt
 # fail on "destination path already exists".
-RUN retry sh -c 'rm -rf /tmp/llvm-project && git clone --depth 1 --branch llvmorg-22.1.0 https://github.com/llvm/llvm-project.git /tmp/llvm-project' \
+RUN retry sh -c 'rm -rf /tmp/llvm-project && git clone --depth 1 --branch llvmorg-21.1.8 https://github.com/llvm/llvm-project.git /tmp/llvm-project' \
     && cmake -G Ninja -S /tmp/llvm-project/runtimes -B /tmp/llvm-msan \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_C_COMPILER=clang \
@@ -97,11 +103,11 @@ RUN retry sh -c 'rm -rf /tmp/zlib && git clone --depth 1 --branch v1.3.1 https:/
     && rm -rf /tmp/zlib
 
 # Symbolizer path in its own (last) layer so adding tools never invalidates
-# the expensive libc++ build layers above. libclang-rt-22-dev is installed
+# the expensive libc++ build layers above. libclang-rt-21-dev is installed
 # explicitly with the compiler: it is only a Recommends of clang, which
 # --no-install-recommends drops, and the link then fails to find
 # libclang_rt.msan-*.a.
-ENV MSAN_SYMBOLIZER_PATH=/usr/lib/llvm-22/bin/llvm-symbolizer
+ENV MSAN_SYMBOLIZER_PATH=/usr/lib/llvm-21/bin/llvm-symbolizer
 
 WORKDIR /src
 ENTRYPOINT ["scripts/msan.sh"]

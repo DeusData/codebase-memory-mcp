@@ -1372,7 +1372,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * only the resulting canonical path, so retargeting the original alias
      * cannot move storage after cohort admission. */
     bool cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
-    if (!cache_ready && cbm_mkdir_p(cache, 0700)) {
+    if (!cache_ready && cbm_mkdir_p_ex(cache, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
         cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
     }
     if (!cache_ready || !cbm_is_dir(canonical_cache)) {
