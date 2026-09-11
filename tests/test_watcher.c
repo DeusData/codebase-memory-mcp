@@ -12,6 +12,7 @@
 #include "test_helpers.h"
 #include <daemon/application.h>
 #include <watcher/watcher.h>
+#include <pipeline/artifact.h>
 #include <store/store.h>
 #include <errno.h>
 #include <stdatomic.h>
@@ -1570,6 +1571,133 @@ TEST(watcher_no_change_no_reindex) {
     /* Cleanup */
     cbm_watcher_free(w);
     cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* #1953: the reindex's OWN OUTPUT must never count as a change. After every
+ * publish the pipeline re-exports <root>/.codebase-memory/graph.db.zst (plus
+ * artifact.json) whenever an artifact already lives there — a `persistence:
+ * true` index leaves one behind, and a linked worktree checks the team's
+ * committed one out. The dirty signature folded that file's (size, mtime)
+ * in, so each successful reindex rewrote it, the next poll saw a "new" dirty
+ * state, and the daemon re-triggered itself forever: `index.supervisor.reap
+ * outcome=clean` immediately followed by `watcher.changed strategy=git`, 100+
+ * times in 15 minutes with two index workers pinned. Nothing under .git moved
+ * and no source changed, which is why the reporters blamed their long
+ * hyphenated worktree branch names (#1254's retracted theory). The scenario is
+ * built exactly that way to show the branch is irrelevant: the artifact write
+ * is the trigger. Untracked (`??`) and committed (` M`) artifacts both looped. */
+static const char *exporting_index_db_path = NULL;
+static int exporting_index_export_rc = 0;
+static int exporting_index_callback(const char *name, const char *path, void *ud) {
+    (void)ud;
+    index_call_count++;
+    /* What the daemon's index worker does after publish: export_after_publish
+     * re-exports FAST because cbm_artifact_exists(root). */
+    int rc = cbm_artifact_export(exporting_index_db_path, path, name, CBM_ARTIFACT_FAST);
+    if (rc != 0) {
+        exporting_index_export_rc = rc;
+    }
+    return 0;
+}
+
+TEST(watcher_own_artifact_export_does_not_retrigger_issue1953) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_1953_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char main_repo[400];
+    char worktree[400];
+    char db_path[400];
+    snprintf(main_repo, sizeof(main_repo), "%s/main", tmpdir);
+    snprintf(worktree, sizeof(worktree), "%s/4385-auditable-patreon-manual-grants", tmpdir);
+    snprintf(db_path, sizeof(db_path), "%s/graph.db", tmpdir);
+    if (!cbm_mkdir_p(main_repo, 0755) || wt_git(main_repo, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    {
+        char p[500];
+        th_write_file(wt_path(p, sizeof(p), main_repo, "file.txt"), "hello\n");
+    }
+    wt_git(main_repo, "add file.txt");
+    wt_git(main_repo, "commit -q -m init");
+
+    /* Linked worktree on the reporters' branch profile (>= 25 chars, hyphens). */
+    {
+        char args[600];
+        snprintf(args, sizeof(args),
+                 "worktree add -q -b 4385-auditable-patreon-manual-grants \"%s\"", worktree);
+        if (wt_git(main_repo, args) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("git worktree add failed");
+        }
+    }
+
+    /* A minimal but valid store standing in for the project's cache DB. */
+    {
+        cbm_store_t *db = cbm_store_open_path(db_path);
+        if (!db) {
+            th_rmtree(tmpdir);
+            FAIL("cbm_store_open_path failed");
+        }
+        cbm_store_exec(db, "INSERT OR IGNORE INTO projects(name, indexed_at, root_path) "
+                           "VALUES('wt-1953', '2026-01-01', '/tmp/wt-1953');");
+        cbm_store_close(db);
+    }
+
+    /* The artifact is already there — as after any persisted index. */
+    ASSERT_EQ(cbm_artifact_export(db_path, worktree, "wt-1953", CBM_ARTIFACT_FAST), 0);
+    ASSERT_TRUE(cbm_artifact_exists(worktree));
+
+    cbm_store_t *store = cbm_store_open_memory();
+    exporting_index_db_path = db_path;
+    exporting_index_export_rc = 0;
+    cbm_watcher_t *w = cbm_watcher_new(store, exporting_index_callback, NULL);
+    cbm_watcher_watch(w, "wt-1953", worktree);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Idle worktree: nothing but the tool's own artifact directory differs
+     * from HEAD. Every poll used to reindex — and re-export, feeding the next. */
+    for (int i = 0; i < 4; i++) {
+        cbm_watcher_touch(w, "wt-1953");
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(exporting_index_export_rc, 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    /* Committed artifact (team sharing): the export now MODIFIES tracked files
+     * instead of leaving untracked ones. The commit is a real HEAD change and
+     * reindexes once; the re-export that reindex performs must not. */
+    wt_git(worktree, "add -A");
+    wt_git(worktree, "commit -q -m share-artifact");
+    cbm_watcher_touch(w, "wt-1953");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 1);
+    for (int i = 0; i < 4; i++) {
+        cbm_watcher_touch(w, "wt-1953");
+        cbm_watcher_poll_once(w);
+    }
+    ASSERT_EQ(exporting_index_export_rc, 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* A real edit in the worktree is still seen. */
+    {
+        char p[500];
+        th_append_file(wt_path(p, sizeof(p), worktree, "file.txt"), "edit\n");
+    }
+    cbm_watcher_touch(w, "wt-1953");
+    cbm_watcher_poll_once(w);
+    ASSERT_EQ(index_call_count, 2);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    exporting_index_db_path = NULL;
     th_rmtree(tmpdir);
     PASS();
 }
@@ -3176,6 +3304,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_identical_watch_preserves_dirty_baseline);
     RUN_TEST(watcher_detects_new_file);
     RUN_TEST(watcher_no_change_no_reindex);
+    RUN_TEST(watcher_own_artifact_export_does_not_retrigger_issue1953);
     RUN_TEST(watcher_dirty_state_reindexes_once_issue937);
     RUN_TEST(watcher_failed_reindex_retries_issue937);
     RUN_TEST(watcher_multiple_projects);

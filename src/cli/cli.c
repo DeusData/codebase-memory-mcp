@@ -648,7 +648,7 @@ static bool cli_activation_production_context_init(cli_activation_production_con
                        cbm_canonical_path(requested_cache, context->canonical_cache,
                                           sizeof(context->canonical_cache));
     if (!cache_ready && requested_cache && requested_cache[0] &&
-        cbm_mkdir_p(requested_cache, 0700)) {
+        cbm_mkdir_p_ex(requested_cache, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
         cache_ready = cbm_canonical_path(requested_cache, context->canonical_cache,
                                          sizeof(context->canonical_cache));
     }
@@ -1419,8 +1419,12 @@ const char *cbm_get_codex_instructions(void) {
 
 /* ── Recursive mkdir (via compat_fs) ──────────────────────────── */
 
+/* Every caller here creates a directory under the user's own configuration
+ * (skills, instruction files, the cache), so a symlink the user owns on the
+ * way there is the user's own arrangement and is followed. Repository-derived
+ * paths never come through this wrapper. */
 static int mkdirp(const char *path, int mode) {
-    return (int)cbm_mkdir_p(path, mode) ? 0 : CLI_ERR;
+    return (int)cbm_mkdir_p_ex(path, mode, CBM_MKDIR_FOLLOW_OWNED) ? 0 : CLI_ERR;
 }
 
 /* Legacy migration may remove an empty directory, but never recursively
@@ -2281,6 +2285,140 @@ static int cbm_remove_openclaw_compaction(const char *config_path) {
                                                cbm_openclaw_compaction_section) == 0
                ? CLI_OK
                : CLI_ERR;
+}
+
+/* ── OpenHands settings.json mcp_config (#1826) ───────────────
+ * The mcpServers-style config installed above (cbm_install_editor_mcp into
+ * ~/.openhands/mcp.json) is not enough: OpenHands only loads a global MCP
+ * server it finds registered under settings.json -> mcp_config, in its own
+ * shape ({transport, command, enabled} — no args array). Agent profiles then
+ * opt in individually via mcp_server_refs (below). */
+
+static size_t cbm_openhands_ownership_fields(cbm_json_like_object_field_t fields[3]) {
+    fields[0] = (cbm_json_like_object_field_t){
+        .key = "transport",
+        .shape = CBM_JSON_LIKE_VALUE_STRING,
+        .expected_string = "stdio",
+        .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+    };
+    fields[1] = (cbm_json_like_object_field_t){
+        .key = "command",
+        .shape = CBM_JSON_LIKE_VALUE_STRING,
+        .expected_string = NULL,
+        .flags = CBM_JSON_LIKE_FIELD_REQUIRED | CBM_JSON_LIKE_FIELD_CAPTURE_STRING,
+    };
+    fields[2] = (cbm_json_like_object_field_t){
+        .key = "enabled",
+        .shape = CBM_JSON_LIKE_VALUE_LITERAL,
+        .expected_string = "true",
+        .flags = CBM_JSON_LIKE_FIELD_REQUIRED,
+    };
+    return 3U;
+}
+
+static char *cbm_build_openhands_mcp_entry(const char *binary_path) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    bool ok = root && yyjson_mut_obj_add_strcpy(doc, root, "transport", "stdio") &&
+              yyjson_mut_obj_add_strcpy(doc, root, "command", binary_path) &&
+              yyjson_mut_obj_add_bool(doc, root, "enabled", true);
+    char *json = NULL;
+    if (ok) {
+        yyjson_mut_doc_set_root(doc, root);
+        json = yyjson_mut_write(doc, YYJSON_WRITE_NOFLAG, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+/* Insert or leave alone: an already-owned entry (exact match, or annotated
+ * with extra keys the client added) needs no write. A same-named entry that
+ * does not match our shape is left untouched and reported as an error rather
+ * than overwritten, matching cbm_upsert_json_named_mcp's fail-closed rule for
+ * every other editor client. */
+static int cbm_upsert_openhands_settings_mcp(const char *binary_path, const char *settings_path) {
+    if (!binary_path || !settings_path) {
+        return CLI_ERR;
+    }
+    static const char *const path[] = {"mcp_config"};
+    char *document = NULL;
+    size_t document_length = 0U;
+    int read_result = cbm_json_like_read_document(settings_path, &document, &document_length);
+    if (read_result < 0) {
+        return CLI_ERR;
+    }
+    if (read_result == 0) {
+        cbm_json_like_object_field_t fields[3];
+        size_t field_count = cbm_openhands_ownership_fields(fields);
+        char *command = NULL;
+        int ownership = cbm_json_like_match_object_entry(document, document_length, path, 1U,
+                                                         CBM_DEFAULT_MCP_SERVER_NAME, fields,
+                                                         field_count, &command);
+        free(command);
+        if (ownership == CBM_JSON_LIKE_OBJECT_MATCH ||
+            ownership == CBM_JSON_LIKE_OBJECT_MATCH_WITH_EXTRAS) {
+            free(document);
+            return CLI_OK;
+        }
+        if (ownership != CBM_JSON_LIKE_OBJECT_MISSING) {
+            free(document);
+            return CLI_ERR;
+        }
+    }
+    char *entry = cbm_build_openhands_mcp_entry(binary_path);
+    if (!entry) {
+        free(document);
+        return CLI_ERR;
+    }
+    int edit_result = cbm_json_like_upsert_entry_if_unchanged(
+        settings_path, path, 1U, CBM_DEFAULT_MCP_SERVER_NAME, entry,
+        read_result == 1 ? NULL : document, document_length);
+    free(entry);
+    free(document);
+    return edit_result == 0 ? CLI_OK : CLI_ERR;
+}
+
+/* Remove only an entry that is still recognisably ours (an annotated entry is
+ * left in place and reported, same rule as insertion above); a missing file,
+ * path, or entry is a successful no-op. */
+static int cbm_remove_openhands_settings_mcp(const char *settings_path) {
+    if (!settings_path) {
+        return CLI_ERR;
+    }
+    static const char *const path[] = {"mcp_config"};
+    char *document = NULL;
+    size_t document_length = 0U;
+    int read_result = cbm_json_like_read_document(settings_path, &document, &document_length);
+    if (read_result == 1) {
+        free(document);
+        return CLI_OK;
+    }
+    if (read_result < 0) {
+        free(document);
+        return CLI_ERR;
+    }
+    cbm_json_like_object_field_t fields[3];
+    size_t field_count = cbm_openhands_ownership_fields(fields);
+    char *command = NULL;
+    int ownership = cbm_json_like_match_object_entry(document, document_length, path, 1U,
+                                                     CBM_DEFAULT_MCP_SERVER_NAME, fields,
+                                                     field_count, &command);
+    free(command);
+    if (ownership == CBM_JSON_LIKE_OBJECT_MISSING || ownership == CBM_JSON_LIKE_OBJECT_MISMATCH) {
+        free(document);
+        return CLI_OK;
+    }
+    if (ownership != CBM_JSON_LIKE_OBJECT_MATCH) {
+        free(document);
+        return CLI_ERR;
+    }
+    int edit_result = cbm_json_like_remove_entry_if_unchanged(
+        settings_path, path, 1U, CBM_DEFAULT_MCP_SERVER_NAME, document, document_length);
+    free(document);
+    return edit_result == 0 ? CLI_OK : CLI_ERR;
 }
 
 /* ── VS Code MCP (servers key with type:stdio) ────────────────── */
@@ -5431,7 +5569,7 @@ bool cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -5484,7 +5622,7 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -5719,7 +5857,7 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -6491,6 +6629,127 @@ static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     }
     return CLI_OK;
 }
+
+/* Uninstall counterpart to cli_ensure_windows_user_path: remove exactly the
+ * install-dir segment install added, leaving every other segment byte-for-byte
+ * intact. Without this, every install/uninstall cycle leaves its entry behind
+ * and the current-user PATH grows without bound (#2117). Segment identity uses
+ * the same case- and trailing-separator-insensitive comparison as the install
+ * `present` scan, so we remove precisely what install would have de-duplicated.
+ * Returns CLI_OK when a segment was removed, CLI_TRUE when the directory was
+ * not present (nothing to do), CLI_ERR on a registry failure. dry_run reports
+ * without mutating. */
+static int cli_remove_windows_user_path(const char *bin_dir, bool dry_run) {
+    wchar_t *wide_dir = cli_windows_utf8_to_wide(bin_dir);
+    HKEY environment = NULL;
+    if (!wide_dir || cli_windows_open_user_path_key(&environment) != CLI_OK) {
+        free(wide_dir);
+        return CLI_ERR;
+    }
+
+    DWORD type = REG_EXPAND_SZ;
+    DWORD bytes = 0;
+    LONG queried = RegQueryValueExW(environment, L"Path", NULL, &type, NULL, &bytes);
+    if (queried == ERROR_FILE_NOT_FOUND) {
+        /* No user PATH value at all — nothing of ours to remove. */
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_TRUE;
+    }
+    if (queried != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    size_t existing_capacity = (size_t)bytes / sizeof(wchar_t) + 1U;
+    wchar_t *existing = calloc(existing_capacity, sizeof(*existing));
+    if (!existing) {
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    DWORD read_bytes = bytes;
+    if (RegQueryValueExW(environment, L"Path", NULL, &type, (BYTE *)existing, &read_bytes) !=
+        ERROR_SUCCESS) {
+        RegCloseKey(environment);
+        free(existing);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    existing[existing_capacity - 1U] = L'\0';
+
+    /* Rebuild the value from every segment that is NOT our directory. Kept
+     * segments keep their exact original characters; a single ';' rejoins
+     * consecutive kept segments so unrelated entries survive byte-for-byte and
+     * no stray separator is left where our entry used to be. The result is
+     * never longer than the input, so the input length bounds the buffer. */
+    size_t existing_length = wcslen(existing);
+    wchar_t *rebuilt = calloc(existing_length + 1U, sizeof(*rebuilt));
+    if (!rebuilt) {
+        RegCloseKey(environment);
+        free(existing);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    size_t out = 0;
+    bool removed = false;
+    bool wrote_segment = false;
+    const wchar_t *cursor = existing;
+    while (*cursor) {
+        const wchar_t *separator = wcschr(cursor, L';');
+        size_t length = separator ? (size_t)(separator - cursor) : wcslen(cursor);
+        if (cli_windows_path_segment_equal(cursor, length, wide_dir)) {
+            removed = true;
+        } else {
+            if (wrote_segment) {
+                rebuilt[out++] = L';';
+            }
+            memcpy(rebuilt + out, cursor, length * sizeof(*rebuilt));
+            out += length;
+            wrote_segment = true;
+        }
+        cursor = separator ? separator + 1 : cursor + length;
+    }
+    rebuilt[out] = L'\0';
+
+    if (!removed) {
+        RegCloseKey(environment);
+        free(rebuilt);
+        free(existing);
+        free(wide_dir);
+        return CLI_TRUE;
+    }
+    if (dry_run) {
+        RegCloseKey(environment);
+        free(rebuilt);
+        free(existing);
+        free(wide_dir);
+        return CLI_OK;
+    }
+    DWORD output_bytes = (DWORD)((out + 1U) * sizeof(*rebuilt));
+    LONG stored =
+        RegSetValueExW(environment, L"Path", 0, type, (const BYTE *)rebuilt, output_bytes);
+    RegCloseKey(environment);
+    free(rebuilt);
+    free(existing);
+    free(wide_dir);
+    if (stored != ERROR_SUCCESS) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Thin seams so the hermetic Windows PATH unit test can drive the append and
+ * remove logic against a GUID-scoped scratch key (the CBM_TEST_WINDOWS_USER_
+ * PATH_RUN_ID seam) without touching the developer's live HKCU PATH. */
+int cbm_cli_ensure_windows_user_path_for_test(const char *bin_dir, bool dry_run) {
+    return cli_ensure_windows_user_path(bin_dir, dry_run);
+}
+int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run) {
+    return cli_remove_windows_user_path(bin_dir, dry_run);
+}
+#endif
 
 #endif
 
@@ -7911,7 +8170,9 @@ static bool prepare_config_parent(const char *path) {
         return slash != NULL;
     }
     *slash = '\0';
-    return cbm_mkdir_p(parent, CLI_OCTAL_PERM);
+    /* Agent roots live under HOME / XDG / the client's own config-dir
+     * variable, so a symlink the user owns on the way is followed (#1722). */
+    return cbm_mkdir_p_ex(parent, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
 }
 
 typedef struct {
@@ -8469,7 +8730,7 @@ static void install_copilot_durable_context(const char *home, const char *binary
         return;
     }
     bool hook_ok = true;
-    if (!dry_run && (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM) ||
+    if (!dry_run && (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED) ||
                      cbm_upsert_copilot_hooks(binary_path, hook_path) != CLI_OK)) {
         hook_ok = false;
         record_agent_config_error(false, "Copilot", "lifecycle_hook_install", hook_path);
@@ -9223,7 +9484,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         if (!dry_run && !g_install_plan) {
             char cfg_dir[CLI_BUF_1K];
             snprintf(cfg_dir, sizeof(cfg_dir), "%s/.gemini/config", home);
-            cbm_mkdir_p(cfg_dir, CLI_OCTAL_PERM);
+            cbm_mkdir_p_ex(cfg_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
         }
         install_generic_agent_config("Antigravity", binary_path, cp, ip, dry_run,
                                      cbm_upsert_antigravity_mcp);
@@ -9322,6 +9583,47 @@ static void uninstall_vscode_profile_configs(const char *code_user, const char *
         }
     }
     cbm_closedir(directory);
+}
+
+static bool cbm_filename_has_suffix(const char *name, const char *suffix) {
+    size_t name_len = strlen(name);
+    size_t suffix_len = strlen(suffix);
+    return name_len >= suffix_len && strcmp(name + (name_len - suffix_len), suffix) == 0;
+}
+
+/* Register or unregister our server against every existing OpenHands agent
+ * profile's mcp_server_refs array (#1826). A missing agent-profiles/
+ * directory is a silent no-op in both directions — install must never invent
+ * it, and uninstall has nothing to undo there. Only *.json entries are
+ * touched; a profile directory may hold arbitrary notes alongside profiles. */
+static void openhands_update_profile_refs(const char *profiles_dir, bool installing, bool dry_run) {
+    cbm_dir_t *d = cbm_opendir(profiles_dir);
+    if (!d) {
+        return;
+    }
+    cbm_dirent_t *ent;
+    while ((ent = cbm_readdir(d)) != NULL) {
+        if (strcmp(ent->name, ".") == 0 || strcmp(ent->name, "..") == 0 ||
+            !cbm_filename_has_suffix(ent->name, ".json")) {
+            continue;
+        }
+        char profile_path[CLI_BUF_1K];
+        snprintf(profile_path, sizeof(profile_path), "%s/%s", profiles_dir, ent->name);
+        struct stat state;
+        if (stat(profile_path, &state) != 0 || !S_ISREG(state.st_mode) || dry_run) {
+            continue;
+        }
+        int result = installing ? cbm_json_like_add_unique_string(profile_path, "mcp_server_refs",
+                                                                  CBM_DEFAULT_MCP_SERVER_NAME)
+                                : cbm_json_like_remove_string(profile_path, "mcp_server_refs",
+                                                              CBM_DEFAULT_MCP_SERVER_NAME);
+        if (result != CLI_OK) {
+            record_agent_config_error(
+                !installing, "OpenHands",
+                installing ? "profile_refs_install" : "profile_refs_uninstall", profile_path);
+        }
+    }
+    cbm_closedir(d);
 }
 
 /* Install MCP configs for editor-based agents (Zed, KiloCode, VS Code, OpenClaw). */
@@ -9532,7 +9834,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         snprintf(skills_dir, sizeof(skills_dir), "%s/.junie/skills", home);
         snprintf(agent_path, sizeof(agent_path), "%s/.junie/agents/codebase-memory.md", home);
         if (!dry_run && !g_install_plan) {
-            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+            cbm_mkdir_p_ex(sd, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
         }
         bool direct_profiles_ready = install_generic_agent_config("Junie", binary_path, cp, NULL,
                                                                   dry_run, cbm_upsert_junie_mcp);
@@ -9586,11 +9888,32 @@ static void install_additional_agent_configs(const cbm_detected_agents_t *agents
     if (agents->openhands) {
         char cp[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
+        char settings_path[CLI_BUF_1K];
+        char profiles_dir[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openhands/mcp.json", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
+        snprintf(settings_path, sizeof(settings_path), "%s/.openhands/settings.json", home);
+        snprintf(profiles_dir, sizeof(profiles_dir), "%s/.openhands/agent-profiles", home);
         install_generic_agent_config("OpenHands", binary_path, cp, NULL, dry_run,
                                      cbm_install_editor_mcp);
         install_agent_skill("OpenHands", skills_dir, force, dry_run);
+        /* #1826: the mcpServers-shaped mcp.json above is not enough — OpenHands
+         * only loads a server registered under settings.json -> mcp_config, and
+         * only for agent profiles that reference it. agent-profiles/ is never
+         * invented; a missing directory means nothing to register into yet. */
+        if (g_install_plan) {
+            plan_record("OpenHands", "mcp_config", settings_path);
+        } else {
+            if (!dry_run) {
+                if (!prepare_config_parent(settings_path) ||
+                    cbm_upsert_openhands_settings_mcp(binary_path, settings_path) != CLI_OK) {
+                    record_agent_config_error(false, "OpenHands", "settings_mcp_install",
+                                              settings_path);
+                }
+            }
+            printf("  settings mcp_config: %s\n", settings_path);
+            openhands_update_profile_refs(profiles_dir, true, dry_run);
+        }
     }
     if (agents->augment) {
         char cp[CLI_BUF_1K];
@@ -11858,11 +12181,21 @@ static void uninstall_additional_agents(const cbm_detected_agents_t *agents, con
     if (agents->openhands) {
         char cp[CLI_BUF_1K];
         char skills_dir[CLI_BUF_1K];
+        char settings_path[CLI_BUF_1K];
+        char profiles_dir[CLI_BUF_1K];
         snprintf(cp, sizeof(cp), "%s/.openhands/mcp.json", home);
         snprintf(skills_dir, sizeof(skills_dir), "%s/.agents/skills", home);
+        snprintf(settings_path, sizeof(settings_path), "%s/.openhands/settings.json", home);
+        snprintf(profiles_dir, sizeof(profiles_dir), "%s/.openhands/agent-profiles", home);
         uninstall_agent_mcp_instr((mcp_uninstall_args_t){"OpenHands", cp, NULL}, dry_run,
                                   cbm_remove_editor_mcp_owned);
         printf("  removed %d skill(s)\n", cbm_remove_skills(skills_dir, dry_run));
+        /* #1826 counterpart: undo the settings.json registration and every
+         * agent profile's mcp_server_refs entry the install above added. */
+        if (!dry_run && cbm_remove_openhands_settings_mcp(settings_path) != CLI_OK) {
+            record_agent_config_error(true, "OpenHands", "settings_mcp_uninstall", settings_path);
+        }
+        openhands_update_profile_refs(profiles_dir, false, dry_run);
     }
     if (agents->augment) {
         char cp[CLI_BUF_1K];
@@ -12189,6 +12522,43 @@ static int cli_uninstall_activate(void *opaque) {
      * plus every index behind because of it is the data-loss shape of #1954.
      * The indexes and the executable go now; the failures are listed at the
      * end and decide the exit code. */
+
+#ifdef _WIN32
+    /* #2117: install registers the install directory in the persistent
+     * current-user PATH; uninstall must take it back out, or every cycle leaves
+     * a stale entry and the PATH grows without bound. Remove only our segment.
+     * A registry hiccup here is a warning, never a hard failure: the user is
+     * removing the tool and must not be blocked from finishing over a cosmetic
+     * PATH edit. Suppress the mutation under the test-ops seam exactly as
+     * install does, so the CLI suite never touches the developer's real PATH. */
+    if (activation->bin_path && activation->bin_path[0]) {
+        const char *slash = strrchr(activation->bin_path, '/');
+        const char *backslash = strrchr(activation->bin_path, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (slash && slash != activation->bin_path) {
+            size_t dir_len = (size_t)(slash - activation->bin_path);
+            char bin_dir[CLI_BUF_1K];
+            if (dir_len < sizeof(bin_dir)) {
+                memcpy(bin_dir, activation->bin_path, dir_len);
+                bin_dir[dir_len] = '\0';
+                int path_rc = cli_remove_windows_user_path(
+                    bin_dir, activation->dry_run || g_cli_activation_test_ops_set);
+                if (path_rc == CLI_OK) {
+                    printf(activation->dry_run ? "\nWould remove %s from the current-user PATH\n"
+                                               : "\nRemoved %s from the current-user PATH\n",
+                           bin_dir);
+                } else if (path_rc == CLI_ERR) {
+                    (void)fprintf(stderr,
+                                  "warning: could not update the current-user PATH; %s may "
+                                  "remain on it\n",
+                                  bin_dir);
+                }
+            }
+        }
+    }
+#endif
 
     if (activation->delete_indexes && !activation->dry_run) {
         int expected = count_db_indexes(activation->home);
