@@ -904,6 +904,10 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
             return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);
+        /* Retire an ephemeral generation that lingered for cold-storm cohort
+         * participants once they drain, or once its bounded linger elapses.
+         * A no-op unless a cohort-participant hook armed a linger. */
+        cbm_daemon_runtime_service_reconcile_lifetime(service);
         (void)cbm_daemon_runtime_service_wait_exited(service, HOST_WAIT_TICK_MS);
     }
 }

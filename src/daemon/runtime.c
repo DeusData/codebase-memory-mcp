@@ -49,6 +49,16 @@ void cbm_daemon_runtime_set_containment_hook_for_testing(
     cbm_daemon_runtime_containment_hook_t hook) {
     atomic_store(&runtime_containment_hook_seam, hook);
 }
+
+/* Cold-storm ephemeral-linger seam (2026-09). Overrides the bounded linger
+ * window that ephemeral last-committed-client retirement grants while cohort
+ * participants are still mid-bootstrap, so a test can drive both the linger and
+ * its expiry backstop in test time. UINT32_MAX leaves the production constant;
+ * any other value (0 = expire immediately) overrides. */
+static _Atomic uint32_t runtime_ephemeral_linger_timeout_seam = UINT32_MAX;
+void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms) {
+    atomic_store(&runtime_ephemeral_linger_timeout_seam, timeout_ms);
+}
 #endif
 
 #ifdef _WIN32
@@ -95,6 +105,14 @@ enum {
      * wedged behind it, and the dead generation held the endpoint pipes and
      * the UI port for nine hours with nothing logged. */
     RUNTIME_ABANDONED_REQUEST_JOIN_TIMEOUT_MS = 30000,
+    /* Cold-storm race (2026-09): when the final committed client of an
+     * ephemeral generation disconnects while cohort participants are still
+     * admitted but mid-bootstrap (racing connect()), the generation lingers
+     * this long for them to connect instead of retiring out from under them.
+     * Mirrors the host initial-client window; the linger is always bounded so
+     * a participant that never connects cannot wedge the generation (the
+     * 900s host_serving hang). */
+    RUNTIME_EPHEMERAL_LINGER_MS = 10000,
     RUNTIME_PATH_CAP = 4096,
 
     RENDEZVOUS_REQUEST_ABI_OFFSET = 0,
@@ -231,6 +249,12 @@ struct cbm_daemon_runtime_service {
     /* Owned only by the convenience start() path. start_reserved() callers
      * retain their externally managed participant guard. */
     cbm_daemon_ipc_participant_guard_t *owned_participant_guard;
+    /* Cold-storm ephemeral-retirement gate (2026-09). When the final committed
+     * client disconnects while cohort participants are still admitted but not
+     * yet committed, the generation lingers until this bounded deadline instead
+     * of retiring; reconcile_lifetime retires it once that window elapses with
+     * no new client committing. Zero means no linger is armed. */
+    uint64_t ephemeral_linger_deadline_ms;
 };
 
 struct cbm_daemon_runtime_worker {
@@ -287,6 +311,16 @@ static uint64_t runtime_deadline_after(uint32_t timeout_ms) {
         return UINT64_MAX;
     }
     return now_ms + (uint64_t)timeout_ms;
+}
+
+static uint32_t runtime_ephemeral_linger_timeout_ms(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    uint32_t seam = atomic_load(&runtime_ephemeral_linger_timeout_seam);
+    if (seam != UINT32_MAX) {
+        return seam;
+    }
+#endif
+    return RUNTIME_EPHEMERAL_LINGER_MS;
 }
 
 static void runtime_wait_tick(uint64_t deadline_ms) {
@@ -1174,10 +1208,32 @@ static void runtime_service_interrupt_connections(cbm_daemon_runtime_service_t *
     runtime_service_interrupt_connections_except(service, NULL, false);
 }
 
+/* A cold-storm racer is a connection that has been ACCEPTED but has not yet
+ * passed HELLO admission (in_use with a live connection, not yet admitted, not
+ * tearing down) -- a one-shot client still mid-bootstrap. This deliberately
+ * does NOT count an already-admitted provisional session (HELLO done, app
+ * session opening): a provisional coordinator client must not keep a retiring
+ * generation alive (see runtime_worker_disconnect below and the
+ * daemon_runtime_final_disconnect_rejects_blocked_provisional_session guard).
+ * Caller holds service->mutex. `except` excludes the departing worker. */
+static bool runtime_has_pending_hello_peer_locked(const cbm_daemon_runtime_service_t *service,
+                                                  const cbm_daemon_runtime_worker_t *except) {
+    for (size_t i = 0; i < service->worker_capacity; i++) {
+        const cbm_daemon_runtime_worker_t *worker = &service->workers[i];
+        if (worker != except && worker->in_use && worker->connection && !worker->admitted &&
+            !atomic_load_explicit(&worker->disconnecting, memory_order_acquire)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
     cbm_daemon_runtime_service_t *service = worker->service;
     cbm_daemon_client_id_t client_id = CBM_DAEMON_CLIENT_ID_INVALID;
     uint64_t shutdown_deadline = runtime_deadline_after(service->shutdown_timeout_ms);
+    bool last_committed_left = false;
+    bool linger_armed = false;
     atomic_store_explicit(&worker->disconnecting, true, memory_order_release);
     cbm_mutex_lock(&service->mutex);
     if (worker->admitted) {
@@ -1195,13 +1251,46 @@ static void runtime_worker_disconnect(cbm_daemon_runtime_worker_t *worker) {
              * alive after the final fully committed frontend disconnects.
              * A permanent generation (`daemon start`) deliberately survives
              * this: only the stop/drain ops or a process kill end it. */
-            runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
-                                                  "last_committed_client_disconnected");
+            last_committed_left = true;
+            /* Cold-storm race (2026-09): if another connection is already
+             * accepted and still mid-HELLO (not yet admitted) when the last
+             * committed client leaves, it is a one-shot peer racing to commit —
+             * retiring now strands it on a STOPPING daemon and forces a full
+             * cold respawn ("cold-storm client failed (racing daemon spawn)").
+             * Linger a bounded window for it; the accept loop retires the
+             * generation once that racer drains without committing or the window
+             * elapses, and a racer that does commit clears the linger
+             * (runtime_worker_commit_admission). This deliberately lingers ONLY
+             * for a pre-HELLO racer, never for an already-admitted provisional
+             * session (HELLO done, app session opening): the contract that a
+             * provisional coordinator client cannot keep a retiring generation
+             * alive is preserved (the reject-blocked-provisional-session guard).
+             * With no such racer — the common single-client case — retire
+             * immediately, unchanged. (A cross-process cohort peer count is
+             * unavailable: advisory locks expose presence, not a holder count,
+             * and Windows LockFileEx has no non-owning probe.) */
+            if (runtime_has_pending_hello_peer_locked(service, worker)) {
+                service->ephemeral_linger_deadline_ms =
+                    runtime_deadline_after(runtime_ephemeral_linger_timeout_ms());
+                linger_armed = true;
+            } else {
+                service->ephemeral_linger_deadline_ms = 0;
+                runtime_service_begin_stopping_locked(service, shutdown_deadline, false,
+                                                      "last_committed_client_disconnected");
+            }
         }
     }
     cbm_mutex_unlock(&service->mutex);
     if (client_id == CBM_DAEMON_CLIENT_ID_INVALID) {
         return;
+    }
+    /* Set the coordinator hold BEFORE releasing this client so its last-client
+     * self-transition to STOPPING is suppressed while a racing peer is still
+     * mid-HELLO; when no peer is present the hold stays clear so the release
+     * retires the coordinator normally. last_committed_left implies a committed (hence
+     * admitted) client, so client_id is always valid here. */
+    if (last_committed_left) {
+        cbm_daemon_coordinator_set_linger(service->coordinator, linger_armed);
     }
     (void)cbm_daemon_client_disconnected(service->coordinator, client_id, cbm_now_ms());
     if (worker->application_session_opened && !worker->application_cancelled) {
@@ -1250,8 +1339,18 @@ static bool runtime_worker_commit_admission(cbm_daemon_runtime_worker_t *worker)
     if (committed) {
         worker->admission_committed = true;
         service->committed_clients++;
+        /* A freshly committed client ends any last-client linger window; the
+         * next drop to zero re-arms it against the participants outstanding
+         * then. */
+        service->ephemeral_linger_deadline_ms = 0;
     }
     cbm_mutex_unlock(&service->mutex);
+    if (committed) {
+        /* Mirror the cleared linger onto the coordinator. client_count is
+         * already nonzero (admission incremented it), so this only resets the
+         * hold for the next idle window — it never retires a live coordinator. */
+        cbm_daemon_coordinator_set_linger(service->coordinator, false);
+    }
     return committed;
 }
 
@@ -2183,6 +2282,11 @@ static void *runtime_accept_loop(void *opaque) {
             continue;
         }
 
+        /* Self-retire a generation lingering for a cold-storm peer once the peer
+         * drains or the bounded window elapses, without an external driver. A
+         * no-op unless a last-committed-client linger is armed. */
+        cbm_daemon_runtime_service_reconcile_lifetime(service);
+
         cbm_daemon_ipc_connection_t *connection = NULL;
         int accepted =
             cbm_daemon_ipc_accept(service->listener, RUNTIME_ACCEPT_POLL_MS, &connection);
@@ -2472,6 +2576,36 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
     size_t count = service->active_connections;
     cbm_mutex_unlock(&service->mutex);
     return count;
+}
+
+void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service) {
+    if (!service) {
+        return;
+    }
+    bool retired = false;
+    cbm_mutex_lock(&service->mutex);
+    if (service->state == CBM_DAEMON_RUNTIME_SERVICE_RUNNING && !service->permanent &&
+        service->committed_clients == 0 && service->ephemeral_linger_deadline_ms != 0) {
+        bool peers_drained = !runtime_has_pending_hello_peer_locked(service, NULL);
+        bool window_elapsed = cbm_now_ms() >= service->ephemeral_linger_deadline_ms;
+        if (peers_drained || window_elapsed) {
+            /* The racing peer drained without committing (retire now), or never
+             * committed within the bounded window (the backstop that rules out
+             * an unbounded idle hang — the host_serving 900s mode). */
+            service->ephemeral_linger_deadline_ms = 0;
+            runtime_service_begin_stopping_locked(
+                service, runtime_deadline_after(service->shutdown_timeout_ms), false,
+                peers_drained ? "ephemeral_peer_drained" : "ephemeral_linger_expired");
+            retired = true;
+        }
+    }
+    cbm_mutex_unlock(&service->mutex);
+    if (retired) {
+        /* Release the coordinator hold now that the linger has resolved. With
+         * no client left this transitions the coordinator to STOPPING, so the
+         * service drains and exits cleanly rather than only on the deadline. */
+        cbm_daemon_coordinator_set_linger(service->coordinator, false);
+    }
 }
 
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,

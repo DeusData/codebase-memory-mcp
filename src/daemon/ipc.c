@@ -1453,14 +1453,191 @@ static char *private_log_directory_path_copy(const char *directory_path) {
     return string_copy(directory_path);
 }
 
-static bool posix_directory_owner_trusted(uid_t owner) {
-    return owner == (uid_t)0 || owner == geteuid();
+/* #1830 — single-uid user-namespace ancestors.
+ *
+ * Inside a 1:1 user namespace (for example `podman --userns=keep-id` or
+ * `unshare -U --map-current-user`), ancestors whose real owner is unmapped —
+ * the root-owned /, /tmp and the like — appear owned by the kernel overflow
+ * uid (`/proc/sys/kernel/overflowuid`, conventionally 65534). Refusing every
+ * overflow-owned ancestor made the daemon unusable in that legitimate setup.
+ *
+ * The overflow owner is tolerated for ANCESTORS ONLY, and ONLY when
+ * /proc/self/uid_map is a single-uid map whose sole inside id is our euid. In
+ * that shape no in-namespace principal can be the overflow owner, so an
+ * overflow-owned ancestor is exactly as safe as a root-owned one on the host:
+ * nobody reachable can have created it or can mutate it. A multi-uid map
+ * (rootless podman with subuids) still shows host root as overflow and is
+ * refused — conservative scope, not the safety argument. There is deliberately
+ * no environment escape hatch.
+ *
+ * The private directory itself is never tolerated as overflow: it is created by
+ * us (euid-owned) and re-checked `== geteuid()` by the created/final/snapshot
+ * gates, which stay strict. A host-squatted /tmp/cbm-daemon-<uid> appears
+ * overflow-owned and is refused there. */
+#define POSIX_NO_OVERFLOW_UID ((uid_t) - 1)
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_posix_overflow_override_active;
+static uid_t g_posix_overflow_override_uid = POSIX_NO_OVERFLOW_UID;
+void cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(bool active,
+                                                             unsigned long overflow_uid) {
+    g_posix_overflow_override_active = active;
+    g_posix_overflow_override_uid = active ? (uid_t)overflow_uid : POSIX_NO_OVERFLOW_UID;
 }
+#endif
+
+#if defined(__linux__) || defined(CBM_ENABLE_TEST_SEAMS)
+/* Parse a /proc/self/uid_map image. True iff it is exactly one mapping line
+ * "<inside> <outside> <count>" with count == 1 and inside == euid. Extra lines,
+ * a count other than 1, a different inside id, or malformed input all yield
+ * false (no tolerance). */
+static bool posix_uid_map_is_single_uid(const char *uid_map, uid_t euid) {
+    if (!uid_map) {
+        return false;
+    }
+    unsigned long inside = 0;
+    unsigned long outside = 0;
+    unsigned long count = 0;
+    int consumed = 0;
+    if (sscanf(uid_map, " %lu %lu %lu %n", &inside, &outside, &count, &consumed) != 3) {
+        return false;
+    }
+    if (count != 1UL || (uid_t)inside != euid) {
+        return false;
+    }
+    (void)outside;
+    /* Reject a second mapping line: a single-uid map has exactly one. */
+    const char *rest = uid_map + consumed;
+    while (*rest == ' ' || *rest == '\t' || *rest == '\n' || *rest == '\r') {
+        rest++;
+    }
+    return *rest == '\0';
+}
+#endif
+
+#if defined(__linux__)
+static bool posix_read_small_proc_file(const char *path, char *buffer, size_t capacity) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    size_t total = 0;
+    bool ok = true;
+    while (total + 1 < capacity) {
+        ssize_t got = read(fd, buffer + total, capacity - 1 - total);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = false;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        total += (size_t)got;
+    }
+    (void)close(fd);
+    if (!ok) {
+        return false;
+    }
+    buffer[total] = '\0';
+    return true;
+}
+
+static uid_t posix_compute_ancestor_overflow_uid(void) {
+    char map[256];
+    if (!posix_read_small_proc_file("/proc/self/uid_map", map, sizeof(map)) ||
+        !posix_uid_map_is_single_uid(map, geteuid())) {
+        return POSIX_NO_OVERFLOW_UID;
+    }
+    char overflow_text[32];
+    /* Unreadable → no tolerance; never hardcode 65534. */
+    if (!posix_read_small_proc_file("/proc/sys/kernel/overflowuid", overflow_text,
+                                    sizeof(overflow_text))) {
+        return POSIX_NO_OVERFLOW_UID;
+    }
+    unsigned long overflow = 0;
+    if (sscanf(overflow_text, " %lu", &overflow) != 1) {
+        return POSIX_NO_OVERFLOW_UID;
+    }
+    return (uid_t)overflow;
+}
+
+static uid_t g_posix_overflow_cached = POSIX_NO_OVERFLOW_UID;
+static pthread_once_t g_posix_overflow_once = PTHREAD_ONCE_INIT;
+static void posix_overflow_init_once(void) {
+    g_posix_overflow_cached = posix_compute_ancestor_overflow_uid();
+}
+#endif /* __linux__ */
+
+/* The overflow uid tolerated for ancestors in this process, or
+ * POSIX_NO_OVERFLOW_UID when none. Derived once from immutable /proc state. */
+static uid_t posix_ancestor_overflow_uid(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_posix_overflow_override_active) {
+        return g_posix_overflow_override_uid;
+    }
+#endif
+#if defined(__linux__)
+    (void)pthread_once(&g_posix_overflow_once, posix_overflow_init_once);
+    return g_posix_overflow_cached;
+#else
+    return POSIX_NO_OVERFLOW_UID;
+#endif
+}
+
+/* Ancestor owner acceptance. euid and root are always trusted; the namespace
+ * overflow uid is trusted only when overflow_uid != POSIX_NO_OVERFLOW_UID. */
+static bool posix_ancestor_owner_ok(uid_t owner, uid_t euid, uid_t overflow_uid) {
+    return owner == (uid_t)0 || owner == euid ||
+           (overflow_uid != POSIX_NO_OVERFLOW_UID && owner == overflow_uid);
+}
+
+/* Pure ancestor accept/refuse over (owner, mode). Mirrors the owner + write-bit
+ * policy of posix_directory_parent_secure so the decision is unit-testable
+ * without a chown-able overflow-owned directory (unprivileged tests cannot
+ * create one). The ACL and fstat checks stay in the caller. */
+static bool posix_ancestor_stat_ok(uid_t owner, mode_t mode, uid_t euid, uid_t overflow_uid) {
+    if (!posix_ancestor_owner_ok(owner, euid, overflow_uid)) {
+        return false;
+    }
+    bool owner_is_overflow = overflow_uid != POSIX_NO_OVERFLOW_UID && owner == overflow_uid &&
+                             owner != euid && owner != (uid_t)0;
+    if ((mode & 0002) != 0) {
+        /* World-writable ancestor: only the root/overflow-owned sticky pattern
+         * (for example /tmp). A plain writable ancestor lets any local user swap
+         * a path component. */
+        return (owner == (uid_t)0 || owner_is_overflow) && (mode & S_ISVTX) != 0;
+    }
+    if ((mode & 0020) != 0 && owner_is_overflow) {
+        /* Group-writable is admitted with a warning for euid/root owners where
+         * the group is knowable (#1537); for an unmapped overflow owner the
+         * host-side group membership is unknown, so refuse. */
+        return false;
+    }
+    return true;
+}
+
+static bool posix_directory_ancestor_owner_trusted(uid_t owner) {
+    return posix_ancestor_owner_ok(owner, geteuid(), posix_ancestor_overflow_uid());
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, unsigned long euid) {
+    return posix_uid_map_is_single_uid(uid_map, (uid_t)euid);
+}
+bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
+                                                    unsigned long euid, bool overflow_active,
+                                                    unsigned long overflow_uid) {
+    return posix_ancestor_stat_ok((uid_t)owner, (mode_t)mode, (uid_t)euid,
+                                  overflow_active ? (uid_t)overflow_uid : POSIX_NO_OVERFLOW_UID);
+}
+#endif
 
 static bool posix_directory_parent_secure(int directory_fd) {
     struct stat status;
     if (directory_fd < 0 || fstat(directory_fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
-        !posix_directory_owner_trusted(status.st_uid) ||
         !cbm_macos_extended_acl_fd_is_deny_only(directory_fd)) {
         return false;
     }
@@ -1471,14 +1648,18 @@ static bool posix_directory_parent_secure(int directory_fd) {
      * with a shared primary group), and refusing it here made the daemon
      * unusable with no way for the reader to see why.
      *
-     * WORLD-writable is still refused: any local user could swap a path
-     * component. Group-writable is admitted for ancestors only — the private
-     * directory itself is chmod'd to 0700 and verified after this walk, so the
-     * thing that actually holds data stays owner-private either way. */
-    if ((status.st_mode & 0002) != 0) {
-        return status.st_uid == (uid_t)0 && (status.st_mode & S_ISVTX) != 0;
+     * WORLD-writable is still refused (apart from the root/overflow-owned sticky
+     * pattern such as /tmp): any local user could swap a path component.
+     * Group-writable is admitted for ancestors only — the private directory
+     * itself is chmod'd to 0700 and verified after this walk, so the thing that
+     * actually holds data stays owner-private either way. #1830 extends the
+     * accepted owner set to the single-uid user-namespace overflow uid; see
+     * posix_ancestor_stat_ok. */
+    if (!posix_ancestor_stat_ok(status.st_uid, status.st_mode, geteuid(),
+                                posix_ancestor_overflow_uid())) {
+        return false;
     }
-    if ((status.st_mode & 0020) != 0) {
+    if ((status.st_mode & 0020) != 0 && (status.st_mode & 0002) == 0) {
         char mode_text[16];
         (void)snprintf(mode_text, sizeof(mode_text), "%04o", (unsigned)(status.st_mode & 07777));
         cbm_log_warn("daemon.private_dir_group_writable_ancestor", "mode", mode_text);
@@ -1488,17 +1669,20 @@ static bool posix_directory_parent_secure(int directory_fd) {
 
 /* Validate a path transition only through the two already-open directory
  * handles.  A group/other-writable parent is unsafe unless it is the standard
- * root-owned sticky-directory pattern (for example /tmp) and the selected
- * child is itself root/current-user owned.  Existing ancestors are observed,
- * never chmod'd or ACL-rewritten. */
+ * root/overflow-owned sticky-directory pattern (for example /tmp) and both the
+ * parent and the selected child are trusted-owned (euid/root, or the single-uid
+ * user-namespace overflow uid for #1830).  Existing ancestors are observed,
+ * never chmod'd or ACL-rewritten.  The euid-only enforcement that stops a
+ * squatted private directory lives in the created/final/snapshot checks, not
+ * here — this only walks ancestors. */
 static bool posix_directory_transition_secure(int parent_fd, int child_fd) {
     struct stat parent;
     struct stat child;
     if (parent_fd < 0 || child_fd < 0 || !posix_directory_parent_secure(parent_fd) ||
         fstat(parent_fd, &parent) != 0 || fstat(child_fd, &child) != 0 ||
         !S_ISDIR(parent.st_mode) || !S_ISDIR(child.st_mode) ||
-        !posix_directory_owner_trusted(parent.st_uid) ||
-        !posix_directory_owner_trusted(child.st_uid)) {
+        !posix_directory_ancestor_owner_trusted(parent.st_uid) ||
+        !posix_directory_ancestor_owner_trusted(child.st_uid)) {
         return false;
     }
     return true;
