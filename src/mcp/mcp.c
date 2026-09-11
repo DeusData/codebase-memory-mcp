@@ -17532,9 +17532,13 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char limit[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);
         (void)snprintf(limit, sizeof(limit), "%d", file_limit);
+        char root_disp[CBM_SZ_1K];
+        (void)snprintf(root_disp, sizeof(root_disp), "%s", srv->session_root);
+        cbm_normalize_path_sep(
+            root_disp); /* forward-slash paths in diagnostics (Windows \\ -> /) */
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", limit, "root", srv->session_root);
+                     files, "limit", limit, "root", root_disp);
         return;
     }
 
