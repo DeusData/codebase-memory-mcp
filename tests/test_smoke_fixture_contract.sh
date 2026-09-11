@@ -265,6 +265,13 @@ require(
     and "CbmSmokeRunId" in cli_source,
     "the Windows PATH test seam must be run-ID-only, sentinel-bound, and loopback-gated",
 )
+require(
+    "cli_remove_windows_user_path" in cli_source
+    and "Removed %s from the current-user PATH" in cli_source
+    and "Would remove %s from the current-user PATH" in cli_source,
+    "uninstall must remove exactly its own segment from the current-user PATH (#2117), "
+    "or repeated install/uninstall cycles grow the User PATH without bound",
+)
 
 # Every maintained local/PR native leg enters through the fixture wrapper.
 for service in ("smoke:", "smoke-amd64:"):
