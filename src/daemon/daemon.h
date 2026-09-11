@@ -74,6 +74,14 @@ cbm_daemon_coordinator_t *cbm_daemon_coordinator_new(uint64_t lease_timeout_ms);
  * self-transitions to STOPPING when its client count reaches zero; only the
  * explicit stop/drain paths end it. */
 void cbm_daemon_coordinator_set_permanent(cbm_daemon_coordinator_t *coordinator, bool permanent);
+/* Transient, runtime-driven hold (distinct from `permanent`) that keeps an
+ * ephemeral coordinator RUNNING — still admitting new clients — after its last
+ * client disconnects, while cohort participants are still mid-bootstrap racing
+ * connect() (cold-storm race, 2026-09). Setting it before the last disconnect
+ * suppresses the self-transition to STOPPING; clearing it while the coordinator
+ * is already idle transitions to STOPPING at once, so retirement stays prompt
+ * and bounded. Has no effect on a permanent coordinator. */
+void cbm_daemon_coordinator_set_linger(cbm_daemon_coordinator_t *coordinator, bool linger);
 /* The caller must first quiesce coordinator calls and hook invocations. */
 void cbm_daemon_coordinator_free(cbm_daemon_coordinator_t *coordinator);
 
