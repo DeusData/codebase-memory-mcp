@@ -1223,8 +1223,19 @@ static int jl_make_insertion(const char *text, size_t length, size_t object_star
         return 0;
     }
 
-    if (object->close_pos == gap_start ||
-        !jl_is_space((unsigned char)text[object->close_pos - 1U])) {
+    /* Zero-width insertion right at close_pos: whatever byte already sits at
+     * close_pos - 1 is untouched and stays in the output. When the original
+     * had a real gap there (close_pos != gap_start, e.g. "[ \"a\" ]"), that
+     * preserved byte already supplies a separator on the leading side, so
+     * mirroring it on the trailing side (space before the bracket) matches
+     * the array's own loose style. The fully tight case ("[\"a\"]", nothing
+     * at all between the last value and the bracket) has no such byte to
+     * lean on: manufacture ONE space so `,new` reads `, new` — the
+     * comma-spacing convention every other insertion path uses — and add
+     * nothing after, so `new]` stays `new]` rather than gaining a trailing
+     * space the original never had (#1826 byte-for-byte round-trip). */
+    bool tight = object->close_pos == gap_start;
+    if (tight || !jl_is_space((unsigned char)text[object->close_pos - 1U])) {
         if (jl_buffer_char(insertion, ' ') != 0) {
             return -1;
         }
@@ -1235,7 +1246,7 @@ static int jl_make_insertion(const char *text, size_t length, size_t object_star
     if (object->trailing_comma && jl_buffer_char(insertion, ',') != 0) {
         return -1;
     }
-    return jl_buffer_char(insertion, ' ');
+    return tight ? 0 : jl_buffer_char(insertion, ' ');
 }
 
 static int jl_apply_edits(const char *source, size_t source_length, jl_edit_t *edits,
@@ -2411,6 +2422,13 @@ int cbm_json_like_remove_entry_if_unchanged(const char *file_path, const char *c
                            expected_length);
 }
 
+/* True when [start, end) is the bare 4-byte literal token null (never a
+ * quoted "null" string, which is 6 bytes with the quotes) — the documented
+ * OpenHands "no list yet" shape for mcp_server_refs (#1826). */
+static bool jl_is_null_literal(const char *text, size_t start, size_t end) {
+    return end - start == 4U && memcmp(text + start, "null", 4U) == 0;
+}
+
 int cbm_json_like_add_unique_string_at_path(const char *file_path, const char *const *object_path,
                                             size_t path_len, const char *array_key,
                                             const char *string_value) {
@@ -2502,6 +2520,24 @@ int cbm_json_like_add_unique_string_at_path(const char *file_path, const char *c
         result = jl_insert_member(source, source_length, object_start, &object, object_path,
                                   path_len, SIZE_MAX, array_key, array_json.data, array_json.length,
                                   &updated, &updated_length);
+    } else if (jl_is_null_literal(source, object.match.value_start, object.match.value_end)) {
+        /* OpenHands profiles ship `"mcp_server_refs": null` as the documented
+         * "no list yet" shape (#1826). Splice the built one-element array over
+         * the bare null token in place, preserving every other byte (trailing
+         * comments included) the way the object-member and array-element
+         * edits below already do for their own value spans. */
+        size_t head = object.match.value_start;
+        size_t tail = object.match.value_end;
+        updated_length = head + array_json.length + (source_length - tail);
+        updated = (char *)malloc(updated_length + 1U);
+        if (!updated) {
+            result = -1;
+        } else {
+            memcpy(updated, source, head);
+            memcpy(updated + head, array_json.data, array_json.length);
+            memcpy(updated + head + array_json.length, source + tail, source_length - tail);
+            updated[updated_length] = '\0';
+        }
     } else if (source[object.match.value_start] != '[') {
         result = -1;
     } else {
@@ -2764,6 +2800,24 @@ static int jl_decode_field_string(const char *text, size_t start, size_t end,
         }
         return jl_decode_string_value(text, start, end, value_out) == 0 ? 0 : 1;
     }
+    if (shape == CBM_JSON_LIKE_VALUE_LITERAL) {
+        /* The value's token boundaries already exclude surrounding trivia
+         * (jl_parse_value advances pos past exactly the token). Copy the raw
+         * bytes verbatim so a quoted "true" never equals the bare literal
+         * true, and the caller's expected_string comparison decides match. */
+        if (start >= end) {
+            return 1;
+        }
+        size_t length = end - start;
+        char *copy = (char *)malloc(length + 1U);
+        if (!copy) {
+            return 1;
+        }
+        memcpy(copy, text + start, length);
+        copy[length] = '\0';
+        *value_out = copy;
+        return 0;
+    }
     if (shape != CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY || start >= end || text[start] != '[') {
         return 1;
     }
@@ -2832,11 +2886,13 @@ int cbm_json_like_match_object_entry(const char *document, size_t document_lengt
     size_t capture_count = 0U;
     for (size_t i = 0U; i < field_count; ++i) {
         if (!fields[i].key || fields[i].key[0] == '\0' ||
-            fields[i].shape > CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY ||
+            fields[i].shape > CBM_JSON_LIKE_VALUE_LITERAL ||
             (fields[i].flags &
              ~(CBM_JSON_LIKE_FIELD_REQUIRED | CBM_JSON_LIKE_FIELD_CAPTURE_STRING)) != 0U ||
             ((fields[i].flags & CBM_JSON_LIKE_FIELD_CAPTURE_STRING) != 0U &&
-             fields[i].shape == CBM_JSON_LIKE_VALUE_EMPTY_ARRAY)) {
+             (fields[i].shape == CBM_JSON_LIKE_VALUE_EMPTY_ARRAY ||
+              fields[i].shape == CBM_JSON_LIKE_VALUE_LITERAL)) ||
+            (fields[i].shape == CBM_JSON_LIKE_VALUE_LITERAL && !fields[i].expected_string)) {
             return -1;
         }
         capture_count += (fields[i].flags & CBM_JSON_LIKE_FIELD_CAPTURE_STRING) != 0U ? 1U : 0U;

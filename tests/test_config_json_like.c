@@ -671,6 +671,176 @@ TEST(config_json_like_top_level_array_unique_string) {
     PASS();
 }
 
+/* OpenHands profiles ship `"mcp_server_refs": null` (#1826). A null value is
+ * the documented "no list yet" shape, so adding a unique string must replace
+ * exactly that token with a one-element array, preserving everything around
+ * it, and stay idempotent. Removal leaves the minimal edit: an empty array. */
+TEST(config_json_like_array_add_replaces_null_value_issue1826) {
+    jl_fixture_t fixture;
+    ASSERT_EQ(jl_fixture_open(&fixture), 0);
+    const char *original = "{\n"
+                           "  \"name\": \"default\",\n"
+                           "  \"mcp_server_refs\": null, // keep this user comment\n"
+                           "  \"tools\": [\"bash\"]\n"
+                           "}\n";
+    ASSERT_EQ(jl_write(fixture.path, original), 0);
+    ASSERT_EQ(
+        cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp"), 0);
+    char *first = jl_read(fixture.path);
+    ASSERT_NOT_NULL(first);
+    ASSERT_STR_EQ(first,
+                  "{\n"
+                  "  \"name\": \"default\",\n"
+                  "  \"mcp_server_refs\": [\"codebase-memory-mcp\"], // keep this user comment\n"
+                  "  \"tools\": [\"bash\"]\n"
+                  "}\n");
+
+    ASSERT_EQ(
+        cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp"), 0);
+    char *second = jl_read(fixture.path);
+    ASSERT_NOT_NULL(second);
+    ASSERT_STR_EQ(second, first);
+    free(first);
+    free(second);
+
+    ASSERT_EQ(cbm_json_like_remove_string(fixture.path, "mcp_server_refs", "codebase-memory-mcp"),
+              0);
+    char *removed = jl_read(fixture.path);
+    ASSERT_NOT_NULL(removed);
+    ASSERT_STR_EQ(removed, "{\n"
+                           "  \"name\": \"default\",\n"
+                           "  \"mcp_server_refs\": [], // keep this user comment\n"
+                           "  \"tools\": [\"bash\"]\n"
+                           "}\n");
+    free(removed);
+
+    /* Only the literal null converts; any other non-array value still fails
+     * closed byte-identically. */
+    const char *wrong_type = "{\"mcp_server_refs\": \"null\", \"keep\": true}\n";
+    ASSERT_EQ(jl_write(fixture.path, wrong_type), 0);
+    ASSERT_EQ(cbm_json_like_add_unique_string(fixture.path, "mcp_server_refs", "x"), -1);
+    char *content = jl_read(fixture.path);
+    ASSERT_NOT_NULL(content);
+    ASSERT_STR_EQ(content, wrong_type);
+    free(content);
+    jl_fixture_close(&fixture);
+    PASS();
+}
+
+/* The OpenHands settings entry carries `enabled: true` (#1826). A literal shape
+ * lets ownership matching require that token exactly, so uninstall recognises
+ * our own entry instead of treating the boolean as a foreign annotation. */
+static int jl_match_openhands_entry(const char *document,
+                                    const cbm_json_like_object_field_t *fields, size_t field_count,
+                                    char **captured) {
+    static const char *const path[] = {"mcp_config"};
+    return cbm_json_like_match_object_entry(document, strlen(document), path, 1U,
+                                            "codebase-memory-mcp", fields, field_count, captured);
+}
+
+TEST(config_json_like_match_object_entry_literal_shape_issue1826) {
+    const cbm_json_like_object_field_t fields[] = {
+        {.key = "command",
+         .shape = CBM_JSON_LIKE_VALUE_STRING,
+         .expected_string = NULL,
+         .flags = CBM_JSON_LIKE_FIELD_REQUIRED | CBM_JSON_LIKE_FIELD_CAPTURE_STRING},
+        {.key = "transport",
+         .shape = CBM_JSON_LIKE_VALUE_STRING,
+         .expected_string = "stdio",
+         .flags = CBM_JSON_LIKE_FIELD_REQUIRED},
+        {.key = "enabled",
+         .shape = CBM_JSON_LIKE_VALUE_LITERAL,
+         .expected_string = "true",
+         .flags = CBM_JSON_LIKE_FIELD_REQUIRED},
+    };
+    char *captured = NULL;
+    const char *ours = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+                       "\"command\": \"/x/cbm\", \"enabled\": true}}}\n";
+    ASSERT_EQ(jl_match_openhands_entry(ours, fields, 3U, &captured), CBM_JSON_LIKE_OBJECT_MATCH);
+    ASSERT_NOT_NULL(captured);
+    ASSERT_STR_EQ(captured, "/x/cbm");
+    free(captured);
+
+    /* Trivia around the token is not part of the value. */
+    const char *spaced = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+                         "\"command\": \"/x/cbm\", \"enabled\" :  true /* on */ }}}\n";
+    ASSERT_EQ(jl_match_openhands_entry(spaced, fields, 3U, &captured), CBM_JSON_LIKE_OBJECT_MATCH);
+    free(captured);
+
+    const char *disabled = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+                           "\"command\": \"/x/cbm\", \"enabled\": false}}}\n";
+    ASSERT_EQ(jl_match_openhands_entry(disabled, fields, 3U, &captured),
+              CBM_JSON_LIKE_OBJECT_MISMATCH);
+    ASSERT_NULL(captured);
+
+    const char *quoted = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+                         "\"command\": \"/x/cbm\", \"enabled\": \"true\"}}}\n";
+    ASSERT_EQ(jl_match_openhands_entry(quoted, fields, 3U, &captured),
+              CBM_JSON_LIKE_OBJECT_MISMATCH);
+    ASSERT_NULL(captured);
+
+    const char *missing = "{\"mcp_config\": {\"codebase-memory-mcp\": {\"transport\": \"stdio\", "
+                          "\"command\": \"/x/cbm\"}}}\n";
+    ASSERT_EQ(jl_match_openhands_entry(missing, fields, 3U, &captured),
+              CBM_JSON_LIKE_OBJECT_MISMATCH);
+    ASSERT_NULL(captured);
+
+    /* A literal field can neither lack its token nor be captured. */
+    const cbm_json_like_object_field_t no_token[] = {
+        fields[0],
+        {.key = "enabled",
+         .shape = CBM_JSON_LIKE_VALUE_LITERAL,
+         .expected_string = NULL,
+         .flags = CBM_JSON_LIKE_FIELD_REQUIRED},
+    };
+    ASSERT_EQ(jl_match_openhands_entry(ours, no_token, 2U, &captured), -1);
+    const cbm_json_like_object_field_t captured_literal[] = {
+        {.key = "enabled",
+         .shape = CBM_JSON_LIKE_VALUE_LITERAL,
+         .expected_string = "true",
+         .flags = CBM_JSON_LIKE_FIELD_REQUIRED | CBM_JSON_LIKE_FIELD_CAPTURE_STRING},
+    };
+    ASSERT_EQ(jl_match_openhands_entry(ours, captured_literal, 1U, &captured), -1);
+    PASS();
+}
+
+/* An OpenHands profile with an existing single-line list (#1826): the added
+ * name follows the list's own spacing, and removing it again restores the
+ * original bytes exactly — no stray space before the closing bracket. */
+static bool jl_round_trips(jl_fixture_t *fixture, const char *original, const char *expected) {
+    if (jl_write(fixture->path, original) != 0 ||
+        cbm_json_like_add_unique_string(fixture->path, "mcp_server_refs", "codebase-memory-mcp") !=
+            0) {
+        return false;
+    }
+    char *added = jl_read(fixture->path);
+    bool ok = added && strcmp(added, expected) == 0;
+    free(added);
+    if (!ok ||
+        cbm_json_like_remove_string(fixture->path, "mcp_server_refs", "codebase-memory-mcp") != 0) {
+        return false;
+    }
+    char *restored = jl_read(fixture->path);
+    ok = restored && strcmp(restored, original) == 0;
+    free(restored);
+    return ok;
+}
+
+TEST(config_json_like_single_line_array_round_trips_byte_for_byte_issue1826) {
+    jl_fixture_t fixture;
+    ASSERT_EQ(jl_fixture_open(&fixture), 0);
+    ASSERT_TRUE(jl_round_trips(
+        &fixture, "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\"]}\n",
+        "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\", \"codebase-memory-mcp\"]}\n"));
+    ASSERT_TRUE(
+        jl_round_trips(&fixture, "{ \"mcp_server_refs\": [ \"other-mcp\" ] }\n",
+                       "{ \"mcp_server_refs\": [ \"other-mcp\", \"codebase-memory-mcp\" ] }\n"));
+    ASSERT_TRUE(jl_round_trips(&fixture, "{\"mcp_server_refs\": [ ]}\n",
+                               "{\"mcp_server_refs\": [ \"codebase-memory-mcp\" ]}\n"));
+    jl_fixture_close(&fixture);
+    PASS();
+}
+
 TEST(config_json_like_top_level_array_create_escape_and_fail_closed) {
     jl_fixture_t fixture;
     ASSERT_EQ(jl_fixture_open(&fixture), 0);
@@ -1025,6 +1195,9 @@ SUITE(config_json_like) {
     RUN_TEST(config_json_like_removes_first_middle_last_and_only);
     RUN_TEST(config_json_like_removal_preserves_comments_and_siblings);
     RUN_TEST(config_json_like_top_level_array_unique_string);
+    RUN_TEST(config_json_like_array_add_replaces_null_value_issue1826);
+    RUN_TEST(config_json_like_match_object_entry_literal_shape_issue1826);
+    RUN_TEST(config_json_like_single_line_array_round_trips_byte_for_byte_issue1826);
     RUN_TEST(config_json_like_top_level_array_create_escape_and_fail_closed);
     RUN_TEST(config_json_like_nested_array_creates_missing_path_and_escapes);
     RUN_TEST(config_json_like_nested_array_preserves_jsonc_and_is_idempotent);
