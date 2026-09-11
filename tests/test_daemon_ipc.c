@@ -49,6 +49,9 @@
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <sched.h> /* #1830 userns real smoke: unshare(CLONE_NEWUSER). */
+#endif
 #ifdef __APPLE__
 #include <membership.h>
 #include <sys/acl.h>
@@ -4950,6 +4953,124 @@ TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
     ASSERT_TRUE(refused);
     PASS();
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1830: /proc/self/uid_map single-uid detection. A single-uid map is exactly
+ * one line "<inside> <outside> 1" whose inside id is our euid; anything else —
+ * the init map, a count other than 1, a foreign inside id, extra lines, or junk
+ * — must read as "not single-uid" so the overflow tolerance never engages. */
+TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830) {
+    const unsigned long me = 1000;
+    ASSERT_TRUE(cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 1000 1\n", me));
+    ASSERT_TRUE(cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 0 1", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("0 0 4294967295\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 1000 2\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("42 1000 1\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("1000 1000 1\n0 0 1\n", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("", me));
+    ASSERT_TRUE(!cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test("not a map", me));
+    PASS();
+}
+
+/* #1830: the ancestor accept/refuse decision. The overflow uid is tolerable for
+ * an ancestor ONLY when the single-uid tolerance is engaged, and even then only
+ * where a root owner would be: not world-writable unless sticky, and never
+ * group-writable (the unmapped owner's host group is unknown). With tolerance
+ * OFF (init/multi-uid/unreadable map) an overflow-owned ancestor is refused
+ * exactly as before #1830 — that OFF row is what a revert of the tolerance
+ * would collapse the ON rows to, so it pins the fix. euid/root/foreign owners
+ * behave identically with tolerance on or off. */
+TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830) {
+    const unsigned long euid = 1000;
+    const unsigned long ovf = 65534;
+    const unsigned long foreign = 4242;
+#define ANCESTOR_OK(owner, mode, on, ovfuid) \
+    cbm_daemon_ipc_posix_ancestor_stat_ok_for_test((owner), (mode), euid, (on), (ovfuid))
+
+    /* Overflow-owned ancestors, single-uid tolerance ENGAGED. */
+    ASSERT_TRUE(ANCESTOR_OK(ovf, 0755, true, ovf));
+    ASSERT_TRUE(ANCESTOR_OK(ovf, 0700, true, ovf));
+    ASSERT_TRUE(ANCESTOR_OK(ovf, 01777, true, ovf)); /* sticky /tmp shape */
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 0777, true, ovf)); /* world-writable, no sticky */
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 0775, true, ovf)); /* group-writable overflow owner */
+
+    /* Same ancestors, tolerance OFF — the pre-#1830 refusal (and the multi-uid /
+     * unreadable-map path). A revert of the fix makes the ON rows read like these. */
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 0755, false, 0));
+    ASSERT_TRUE(!ANCESTOR_OK(ovf, 01777, false, 0));
+
+    /* Controls unaffected by the tolerance. */
+    ASSERT_TRUE(ANCESTOR_OK(euid, 0755, true, ovf));
+    ASSERT_TRUE(ANCESTOR_OK(euid, 0700, false, 0));
+    ASSERT_TRUE(ANCESTOR_OK(0, 01777, true, ovf));       /* root-owned sticky /tmp */
+    ASSERT_TRUE(!ANCESTOR_OK(0, 0777, true, ovf));       /* root world-writable, no sticky */
+    ASSERT_TRUE(!ANCESTOR_OK(foreign, 0755, true, ovf)); /* a mapped-out foreign uid */
+#undef ANCESTOR_OK
+    PASS();
+}
+
+/* #1830 real end-to-end smoke: inside a single-uid user namespace the
+ * root-owned ancestors (/, /tmp) are overflow-owned, and the daemon must still
+ * create its private directory there. An overflow-owned ancestor cannot be
+ * fabricated unprivileged, so this runs the real path only when a user
+ * namespace is actually available. O10 whitelisted-skip everywhere it is not:
+ * macOS has no user namespaces (compile-gated out); Docker's default seccomp
+ * blocks unshare(CLONE_NEWUSER) on the Colima container leg; some kernels ship
+ * user namespaces disabled. WHAT WAS TRIED when it skips: fork + unshare
+ * CLONE_NEWUSER + a 1:1 uid_map write, which the sandbox denied (EPERM). The
+ * deterministic decision coverage above is what binds the fix. */
+TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
+#if defined(__linux__)
+    uid_t host_uid = geteuid();
+    char probe[TEST_PATH_CAP];
+    (void)snprintf(probe, sizeof(probe), "/tmp/cbm-userns-smoke-%ld/x", (long)getpid());
+    char probe_dir[TEST_PATH_CAP];
+    (void)snprintf(probe_dir, sizeof(probe_dir), "/tmp/cbm-userns-smoke-%ld", (long)getpid());
+
+    pid_t child = fork();
+    if (child == 0) {
+        /* Child: enter a single-uid user namespace mapping host_uid 1:1. */
+        if (unshare(CLONE_NEWUSER) != 0) {
+            _exit(2); /* userns unavailable → signal skip to the parent. */
+        }
+        int sg = open("/proc/self/setgroups", O_WRONLY | O_CLOEXEC);
+        if (sg >= 0) {
+            (void)!write(sg, "deny", 4);
+            (void)close(sg);
+        }
+        int mf = open("/proc/self/uid_map", O_WRONLY | O_CLOEXEC);
+        char line[64];
+        int n = snprintf(line, sizeof(line), "%ld %ld 1", (long)host_uid, (long)host_uid);
+        bool mapped = mf >= 0 && n > 0 && write(mf, line, (size_t)n) == n;
+        if (mf >= 0) {
+            (void)close(mf);
+        }
+        if (!mapped) {
+            _exit(2);
+        }
+        /* Inside the ns / and /tmp now show the overflow uid. With #1830 the
+         * daemon can still build its private tree there; without it, refused. */
+        bool secured = cbm_daemon_ipc_private_directory_secure(probe);
+        _exit(secured ? 0 : 1);
+    }
+    if (child < 0) {
+        FAIL("fork failed for userns smoke");
+    }
+    int status = 0;
+    while (waitpid(child, &status, 0) < 0 && errno == EINTR) {}
+    (void)rmdir(probe);
+    (void)rmdir(probe_dir);
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
+        SKIP_PLATFORM("user namespaces unavailable (no CLONE_NEWUSER / seccomp-blocked)");
+    }
+    ASSERT_TRUE(WIFEXITED(status));
+    ASSERT_EQ(0, WEXITSTATUS(status));
+    PASS();
+#else
+    SKIP_PLATFORM("user namespaces are Linux-only");
+#endif
+}
+#endif /* CBM_ENABLE_TEST_SEAMS */
 #endif /* !_WIN32 */
 
 SUITE(daemon_ipc) {
@@ -4992,6 +5113,11 @@ SUITE(daemon_ipc) {
 #ifndef _WIN32
     RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
     RUN_TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
+    RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
+    RUN_TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830);
+#endif
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
     RUN_TEST(daemon_ipc_posix_lifetime_reservation_rejects_fork_inheritance);
     RUN_TEST(daemon_ipc_posix_child_participant_handoff_retains_legacy_bridge);

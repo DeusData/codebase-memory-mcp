@@ -561,6 +561,13 @@ bool cbm_mkdir_p(const char *path, int mode) {
     return ok;
 }
 
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy) {
+    /* The Windows walk has its own reparse-point policy (see
+     * cbm_windows_mkdir_component); the POSIX symlink policy does not apply. */
+    (void)policy;
+    return cbm_mkdir_p(path, mode);
+}
+
 int cbm_unlink(const char *path) {
     wchar_t *wpath = cbm_path_to_wide(path);
     if (!wpath) {
@@ -841,24 +848,131 @@ FILE *cbm_fopen(const char *path, const char *mode) {
     return fopen(path, mode);
 }
 
-static int cbm_open_directory_component(int parent, const char *component, int flags) {
+/* Symlink policy for the parent-chain walk. Every component is opened with
+ * O_NOFOLLOW; a symlink is followed only when its OWNER is trusted, never by
+ * default. Root-owned links are trusted everywhere (distro /home indirection,
+ * macOS /tmp: only root can create those, so they are outside the attacker
+ * model). A link owned by the invoking account is trusted only where the
+ * caller opted in with CBM_MKDIR_FOLLOW_OWNED: for a path rooted in the user's
+ * own configuration such a link is the user's own arrangement (a dotfile
+ * manager, ~/.config/opencode -> /mnt/...), and refusing it made every
+ * agent-config write under such a root fail with an opaque agent_config
+ * error. It is not trusted for a path derived from a repository, where git
+ * creates symlinks owned by whoever cloned, so "user-owned" says nothing about
+ * "user-intended". The rule is the one the Linux kernel's
+ * fs.protected_symlinks applies, and the ancestor policy the activation
+ * transaction already uses. A link owned by any OTHER account (planted in a
+ * group- or world-writable ancestor) stays refused, and a privileged walk
+ * (euid 0) still refuses user-owned links.
+ *
+ * Inspecting the link and following it are two steps, so what the follow
+ * lands on is checked as well: the opened target must be a directory owned by
+ * root or the invoking user, and not world-writable unless sticky. An account
+ * that can write the parent cannot steer the walk into a directory it
+ * controls or into one where anyone can pre-plant entries, and because the
+ * judgement and the follow are bound to one inode (cbm_read_trusted_link) it
+ * cannot substitute a link of its own between them either. */
+static bool cbm_walk_link_trusted(uid_t owner, bool follow_owned) {
+    return owner == 0U || (follow_owned && owner == geteuid());
+}
+
+static bool cbm_walk_target_trusted(const struct stat *target) {
+    bool trusted_owner = target->st_uid == 0U || target->st_uid == geteuid();
+    bool world_writable = (target->st_mode & S_IWOTH) != 0;
+    bool sticky = (target->st_mode & S_ISVTX) != 0;
+    return S_ISDIR(target->st_mode) && trusted_owner && (!world_writable || sticky);
+}
+
+/* Read the target text of the symlink at `component`, but only if the link's
+ * owner is trusted -- and read it from the SAME inode the judgement was made
+ * on. Judging by name and then opening by name is a check-then-use pair: an
+ * account that can write the parent could swap the entry in between, so the
+ * link that gets followed is never the one that was judged (demonstrated
+ * against an earlier head with an LD_PRELOAD shim). The link is therefore
+ * never opened by name after the judgement: on Linux an O_PATH|O_NOFOLLOW
+ * descriptor pins the inode, and both the fstat and the readlinkat operate on
+ * it; elsewhere the link is stat'ed by name before and after the readlinkat
+ * and both must be the same inode with the same owner. What is followed
+ * afterwards is the text this function returns, resolved from the parent. */
+static bool cbm_read_trusted_link(int parent, const char *component, bool follow_owned, char *text,
+                                  size_t text_size) {
+    ssize_t length = 0; /* nothing read yet: refused below unless a read succeeds */
+#if defined(__linux__) && defined(O_PATH)
+    int link = openat(parent, component, O_PATH | O_NOFOLLOW | O_CLOEXEC);
+    if (link < 0) {
+        return false;
+    }
+    struct stat state;
+    if (fstat(link, &state) == 0 && S_ISLNK(state.st_mode) &&
+        cbm_walk_link_trusted(state.st_uid, follow_owned)) {
+        /* An empty path names the link the descriptor itself refers to. */
+        length = readlinkat(link, "", text, text_size);
+    }
+    (void)close(link);
+#else
+    struct stat before;
+    struct stat after;
+    if (fstatat(parent, component, &before, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(before.st_mode) ||
+        !cbm_walk_link_trusted(before.st_uid, follow_owned)) {
+        return false;
+    }
+    length = readlinkat(parent, component, text, text_size);
+    if (fstatat(parent, component, &after, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISLNK(after.st_mode) ||
+        after.st_dev != before.st_dev || after.st_ino != before.st_ino ||
+        after.st_uid != before.st_uid) {
+        return false;
+    }
+#endif
+    /* Empty or truncated text is refused rather than guessed at. */
+    if (length <= 0 || (size_t)length >= text_size) {
+        return false;
+    }
+    text[length] = '\0';
+    return true;
+}
+
+static int cbm_open_directory_component(int parent, const char *component, int flags,
+                                        bool follow_owned) {
     int descriptor = openat(parent, component, flags);
 #if defined(O_NOFOLLOW) && defined(AT_SYMLINK_NOFOLLOW)
     if (descriptor < 0) {
-        struct stat state;
-        if (fstatat(parent, component, &state, AT_SYMLINK_NOFOLLOW) == 0 &&
-            S_ISLNK(state.st_mode) && state.st_uid == 0U) {
-            descriptor = openat(parent, component, flags & ~O_NOFOLLOW);
+        /* The caller decides on errno from the FIRST open (ENOENT means
+         * "create it"); a refused link must not leak a later call's errno. */
+        int open_errno = errno;
+        char text[CBM_SZ_4K];
+        if (cbm_read_trusted_link(parent, component, follow_owned, text, sizeof(text))) {
+            /* The judged link's own text, resolved from the parent exactly as
+             * the kernel would resolve it (relative texts against the link's
+             * directory). Links inside the text are resolved by the kernel as
+             * before; the target check bounds where the walk lands. */
+            int followed = openat(parent, text, flags & ~O_NOFOLLOW);
+            struct stat target;
+            if (followed >= 0 && fstat(followed, &target) == 0 &&
+                cbm_walk_target_trusted(&target)) {
+                descriptor = followed;
+            } else if (followed >= 0) {
+                (void)close(followed);
+            }
+        }
+        if (descriptor < 0) {
+            errno = open_errno;
         }
     }
+#else
+    (void)follow_owned;
 #endif
     return descriptor;
 }
 
 bool cbm_mkdir_p(const char *path, int mode) {
+    return cbm_mkdir_p_ex(path, mode, 0U);
+}
+
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy) {
     if (!path || path[0] == '\0') {
         return false;
     }
+    bool follow_owned = (policy & CBM_MKDIR_FOLLOW_OWNED) != 0U;
     char *tmp = strdup(path);
     if (!tmp) {
         return false;
@@ -891,12 +1005,12 @@ bool cbm_mkdir_p(const char *path, int mode) {
             *separator = '\0';
         }
         if (cursor[0] != '\0' && strcmp(cursor, ".") != 0) {
-            int next = cbm_open_directory_component(directory, cursor, flags);
+            int next = cbm_open_directory_component(directory, cursor, flags, follow_owned);
             if (next < 0 && errno == ENOENT) {
                 if (mkdirat(directory, cursor, (mode_t)mode) != 0 && errno != EEXIST) {
                     ok = false;
                 } else {
-                    next = cbm_open_directory_component(directory, cursor, flags);
+                    next = cbm_open_directory_component(directory, cursor, flags, follow_owned);
                 }
             }
             if (ok && next < 0) {

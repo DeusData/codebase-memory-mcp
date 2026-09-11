@@ -647,7 +647,7 @@ static bool cli_activation_production_context_init(cli_activation_production_con
                        cbm_canonical_path(requested_cache, context->canonical_cache,
                                           sizeof(context->canonical_cache));
     if (!cache_ready && requested_cache && requested_cache[0] &&
-        cbm_mkdir_p(requested_cache, 0700)) {
+        cbm_mkdir_p_ex(requested_cache, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
         cache_ready = cbm_canonical_path(requested_cache, context->canonical_cache,
                                          sizeof(context->canonical_cache));
     }
@@ -1418,8 +1418,12 @@ const char *cbm_get_codex_instructions(void) {
 
 /* ── Recursive mkdir (via compat_fs) ──────────────────────────── */
 
+/* Every caller here creates a directory under the user's own configuration
+ * (skills, instruction files, the cache), so a symlink the user owns on the
+ * way there is the user's own arrangement and is followed. Repository-derived
+ * paths never come through this wrapper. */
 static int mkdirp(const char *path, int mode) {
-    return (int)cbm_mkdir_p(path, mode) ? 0 : CLI_ERR;
+    return (int)cbm_mkdir_p_ex(path, mode, CBM_MKDIR_FOLLOW_OWNED) ? 0 : CLI_ERR;
 }
 
 /* Legacy migration may remove an empty directory, but never recursively
@@ -5430,7 +5434,7 @@ bool cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -5483,7 +5487,7 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -5718,7 +5722,7 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -7936,7 +7940,9 @@ static bool prepare_config_parent(const char *path) {
         return slash != NULL;
     }
     *slash = '\0';
-    return cbm_mkdir_p(parent, CLI_OCTAL_PERM);
+    /* Agent roots live under HOME / XDG / the client's own config-dir
+     * variable, so a symlink the user owns on the way is followed (#1722). */
+    return cbm_mkdir_p_ex(parent, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
 }
 
 typedef struct {
@@ -8494,7 +8500,7 @@ static void install_copilot_durable_context(const char *home, const char *binary
         return;
     }
     bool hook_ok = true;
-    if (!dry_run && (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM) ||
+    if (!dry_run && (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED) ||
                      cbm_upsert_copilot_hooks(binary_path, hook_path) != CLI_OK)) {
         hook_ok = false;
         record_agent_config_error(false, "Copilot", "lifecycle_hook_install", hook_path);
@@ -9248,7 +9254,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         if (!dry_run && !g_install_plan) {
             char cfg_dir[CLI_BUF_1K];
             snprintf(cfg_dir, sizeof(cfg_dir), "%s/.gemini/config", home);
-            cbm_mkdir_p(cfg_dir, CLI_OCTAL_PERM);
+            cbm_mkdir_p_ex(cfg_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
         }
         install_generic_agent_config("Antigravity", binary_path, cp, ip, dry_run,
                                      cbm_upsert_antigravity_mcp);
@@ -9557,7 +9563,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         snprintf(skills_dir, sizeof(skills_dir), "%s/.junie/skills", home);
         snprintf(agent_path, sizeof(agent_path), "%s/.junie/agents/codebase-memory.md", home);
         if (!dry_run && !g_install_plan) {
-            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+            cbm_mkdir_p_ex(sd, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
         }
         bool direct_profiles_ready = install_generic_agent_config("Junie", binary_path, cp, NULL,
                                                                   dry_run, cbm_upsert_junie_mcp);
