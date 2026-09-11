@@ -574,7 +574,8 @@ static bool worker_unique_file(char *out, size_t out_size, const char *kind) {
     if (have_cache) {
         char directory[INDEX_WORKER_PATH_CAP];
         written = snprintf(directory, sizeof(directory), "%s/logs", cache_copy);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
         written = snprintf(out, out_size, "%s/.worker-%s-XXXXXX", directory, kind);

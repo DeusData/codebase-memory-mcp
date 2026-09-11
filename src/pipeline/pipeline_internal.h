@@ -29,12 +29,12 @@
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */
 #define CBM_ROUTE_QN_SIZE 768
 
-/* Incremental integrity failure: abort the run and preserve the existing DB.
- * Distinct from CBM_NOT_FOUND, which the orchestrator uses as the normal
+/* CBM_PIPELINE_ABORT_PRESERVE_DB / CBM_PIPELINE_PERSIST_FAILED moved to
+ * pipeline.h — callers legitimately distinguish them (the header's contract
+ * always said so). FORCE_FULL_REINDEX never escapes the orchestrator and
+ * stays internal. All three are distinct from CBM_NOT_FOUND, the normal
  * "no incremental route; continue with a full index" sentinel. */
-#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2)
 #define CBM_PIPELINE_FORCE_FULL_REINDEX (-3)
-#define CBM_PIPELINE_PERSIST_FAILED (-4)
 
 /* Canonicalize route-path parameter placeholders (":id", "{id}", "<id>",
  * "${...}") to a single "{}" token so that client call sites and server
