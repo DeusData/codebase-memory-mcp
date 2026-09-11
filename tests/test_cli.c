@@ -2278,6 +2278,198 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     PASS();
 }
 
+/* #1954: one agent config that cannot be cleaned up must not keep the
+ * executable and the indexes on disk.
+ *
+ * The fixture is the reporter's own setup: ~/.cursor/mcp.json is a symlink into
+ * a dotfiles directory, which the JSON editors refuse to write through. Before
+ * the fix that single refusal returned early, so a run that printed
+ * "Uninstall complete" left a 282 MB executable and the whole index cache
+ * behind. PATH moves with HOME so a real agent binary on the developer's
+ * machine cannot add a second, unrelated failure. */
+#ifndef _WIN32
+TEST(cli_uninstall_removes_binary_and_index_despite_agent_config_failure) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-linked-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char dotfiles_dir[512];
+    char cursor_dir[512];
+    char link_target[640];
+    char cursor_config[640];
+    snprintf(dotfiles_dir, sizeof(dotfiles_dir), "%s/dotfiles", tmpdir);
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    test_mkdirp(dotfiles_dir);
+    test_mkdirp(cursor_dir);
+    snprintf(link_target, sizeof(link_target), "%s/mcp.json", dotfiles_dir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    write_test_file(link_target, "{\"mcpServers\":{}}\n");
+    if (symlink(link_target, cursor_config) != 0) {
+        cli_activation_restore_env(old_home, old_cache);
+        restore_test_env("PATH", old_path);
+        test_rmdir_r(tmpdir);
+        FAIL("failed to create the linked Cursor config fixture");
+    }
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must not survive a linked agent config");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(bin_target, "binary must not survive a linked agent config");
+
+    cli_activation_fake_t fake = {
+        .participants_active = true,
+        .mutation_reserve_result = 1,
+    };
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
+    int rc = -1;
+    if (capture && saved_stdout >= 0 && saved_stderr >= 0) {
+        fflush(NULL);
+        if (dup2(fileno(capture), STDOUT_FILENO) >= 0 &&
+            dup2(fileno(capture), STDERR_FILENO) >= 0) {
+            char *argv[] = {"--yes"};
+            rc = cli_test_cmd_uninstall(1, argv);
+        }
+        fflush(NULL);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        close(saved_stderr);
+    }
+    char output[8192] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    bool index_left = read_test_file(index_path) != NULL;
+    bool binary_left = read_test_file(bin_target) != NULL;
+    bool link_intact = read_test_file(link_target) != NULL;
+    bool cleanup_failure_reported =
+        strstr(output, "agent configuration cleanup step(s) failed") != NULL;
+    bool old_abort_message =
+        strstr(output, "executable and index removal were not started") != NULL;
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+
+    /* The failed config cleanup still fails the run. */
+    ASSERT_EQ(rc, 1);
+    ASSERT_FALSE(index_left);
+    ASSERT_FALSE(binary_left);
+    /* The link's target was never written through. */
+    ASSERT_TRUE(link_intact);
+    ASSERT_TRUE(cleanup_failure_reported);
+    ASSERT_FALSE(old_abort_message);
+    PASS();
+}
+#endif
+
+/* #1954, second half: a --dry-run must not describe removals it did not make.
+ * Every per-client line used to be written in the past tense, so a dry run read
+ * as a report of a dozen rewritten configuration files. */
+TEST(cli_uninstall_dry_run_report_uses_the_future_tense) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-tense-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    test_mkdirp(cursor_dir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    const char *before = "{\"mcpServers\":{}}\n";
+    write_test_file(cursor_config, before);
+
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    FILE *capture = tmpfile();
+    int saved_stdout = capture ? dup(STDOUT_FILENO) : -1;
+    int saved_stderr = capture ? dup(STDERR_FILENO) : -1;
+    int rc = -1;
+    if (capture && saved_stdout >= 0 && saved_stderr >= 0) {
+        fflush(NULL);
+        if (dup2(fileno(capture), STDOUT_FILENO) >= 0 &&
+            dup2(fileno(capture), STDERR_FILENO) >= 0) {
+            char *argv[] = {"--dry-run", "--yes"};
+            rc = cli_test_cmd_uninstall(2, argv);
+        }
+        fflush(NULL);
+        (void)dup2(saved_stdout, STDOUT_FILENO);
+        (void)dup2(saved_stderr, STDERR_FILENO);
+    }
+    if (saved_stdout >= 0) {
+        close(saved_stdout);
+    }
+    if (saved_stderr >= 0) {
+        close(saved_stderr);
+    }
+    char output[8192] = {0};
+    if (capture) {
+        rewind(capture);
+        size_t count = fread(output, 1, sizeof(output) - 1U, capture);
+        output[count] = '\0';
+        fclose(capture);
+    }
+    cbm_set_auto_answer_for_test(0);
+
+    char *after = read_test_file_alloc(cursor_config);
+    bool config_untouched = after && strcmp(after, before) == 0;
+    free(after);
+    bool says_would_remove = strstr(output, "Cursor: would remove MCP config entry") != NULL;
+    bool claims_a_past_removal = strstr(output, "Cursor: removed MCP config entry") != NULL;
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(config_untouched);
+    ASSERT_TRUE(says_would_remove);
+    ASSERT_FALSE(claims_a_past_removal);
+    PASS();
+}
+
 TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-stateless-XXXXXX");
@@ -4614,6 +4806,11 @@ TEST(cli_agent_install_reports_safe_editor_refusal) {
     PASS();
 }
 
+/* A safe-editor refusal still fails the run, and it no longer keeps the
+ * executable. Removing an agent's configuration and removing this tool's own
+ * files are separate jobs, so one malformed OpenClaw config does not cancel the
+ * other (#1954). The two claims that mattered before are unchanged: the exit
+ * code is non-zero, and the malformed file is never written through. */
 TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-refusal-XXXXXX");
@@ -4636,7 +4833,7 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
 #else
     snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp", bin_dir);
 #endif
-    write_test_file(bin_path, "installed binary must remain live\n");
+    write_test_file(bin_path, "installed binary must not outlive the uninstall\n");
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -4660,9 +4857,10 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     test_rmdir_r(tmpdir);
-    if (rc == 0 || !preserved || !binary_preserved || fake.mutation_reserve_count != 1 ||
-        fake.mutation_lease_release_count != 1 || !strstr(fake.diagnostic, "executable was kept"))
-        FAIL("agent uninstall refusal must fail before removing the live binary");
+    if (rc == 0 || !preserved || binary_preserved || fake.mutation_reserve_count != 1 ||
+        fake.mutation_lease_release_count != 1 || fake.diagnostic[0] != '\0')
+        FAIL("agent uninstall refusal must fail the run, keep the malformed config untouched, "
+             "and still remove the executable");
     PASS();
 }
 
@@ -10671,7 +10869,8 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
 #else
     snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
 #endif
-    write_test_file(binary_path, "installed binary must survive failed cleanup\n");
+    /* #1954: a failed agent-config cleanup no longer keeps the executable. */
+    write_test_file(binary_path, "installed binary must not survive a failed cleanup\n");
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -10726,7 +10925,7 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     struct stat state;
     hooks = read_test_file_alloc(hooks_path);
     char *agents_after_uninstall = read_test_file_alloc(agents_path);
-    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) == 0 &&
+    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) != 0 &&
                                stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0 &&
                                hooks && !strstr(hooks, "hook-augment") && agents_after_uninstall &&
                                agents_after_uninstall[0] == '\0';
@@ -14950,6 +15149,10 @@ SUITE(cli) {
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
+#ifndef _WIN32
+    RUN_TEST(cli_uninstall_removes_binary_and_index_despite_agent_config_failure);
+#endif
+    RUN_TEST(cli_uninstall_dry_run_report_uses_the_future_tense);
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
     RUN_TEST(cli_windows_update_hands_off_to_install_script);
