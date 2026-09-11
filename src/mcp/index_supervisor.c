@@ -606,8 +606,9 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
                        handle->process_result.job_memory_limit_bytes);
         (void)snprintf(peak_text, sizeof(peak_text), "%zu",
                        handle->process_result.peak_job_memory_bytes);
-        /* A rejected allocation can leave peak commit BELOW the cap. Report
-         * evidence, not an inferred OOM classification or a file to quarantine. */
+        /* Peak accounting may include a denied allocation and exceed the cap,
+         * or remain below it. Report evidence, not an inferred OOM classification
+         * or a file to quarantine. */
         cbm_log_warn("index.supervisor.worker_memory", "job_limit_bytes", limit_text,
                      "peak_job_memory_bytes",
                      handle->process_result.job_memory_available ? peak_text : "unavailable");

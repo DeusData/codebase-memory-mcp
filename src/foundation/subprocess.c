@@ -445,6 +445,9 @@ static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->forced = false;
     result->tree_quiesced = false;
     result->supervision_failed = false;
+    result->job_memory_limit_bytes = 0;
+    result->peak_job_memory_bytes = 0;
+    result->job_memory_available = false;
 }
 
 static void cbm_subprocess_free_config(cbm_subprocess_t *process) {

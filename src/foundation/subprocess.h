@@ -43,8 +43,8 @@ typedef struct {
     bool tree_quiesced;      /* the owned process tree has no surviving processes */
     bool supervision_failed; /* the bounded containment deadline expired; tree_quiesced is false */
     size_t job_memory_limit_bytes; /* Windows Job Object commit cap; zero on POSIX or uncapped */
-    size_t peak_job_memory_bytes; /* Windows peak commit, not RSS or proof of a limit hit */
-    bool job_memory_available; /* terminal Job Object memory query succeeded */
+    size_t peak_job_memory_bytes;  /* Windows peak commit, not RSS or proof of a limit hit */
+    bool job_memory_available;     /* terminal Job Object memory query succeeded */
 } cbm_proc_result_t;
 
 /* Called synchronously for each newly-completed log chunk while the child runs.
