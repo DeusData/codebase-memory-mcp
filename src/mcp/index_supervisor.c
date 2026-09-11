@@ -639,10 +639,10 @@ size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
      * needs memory). Keep their argv value but leave the OS cap disabled below
      * 512 MiB. KILL_ON_JOB_CLOSE remains in force regardless of the cap.
      *
-     * The cooperative RSS budget, including its fail-whole over-budget gate,
-     * gets first chance to recover/abort. Windows charges job-wide COMMIT, not
-     * RSS, so this 1.5x limit is a looser last-resort backstop for descendants
-     * too, not an exact enforcement of the worker's accounting budget. */
+     * Windows charges job-wide COMMIT, not RSS. This 1.5x limit leaves room
+     * for the cooperative budget's recovery/abort gate, but an allocation can
+     * still be denied before the next cooperative check. It is a backstop for
+     * descendants too, not exact enforcement of the accounting budget. */
     const size_t minimum_budget = (size_t)512U * 1024U * 1024U;
     if (memory_budget_bytes < minimum_budget) {
         return 0;
