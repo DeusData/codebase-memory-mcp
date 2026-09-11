@@ -1829,6 +1829,16 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
     }
     cbm_log_info("publish.timing", "block", "fts", "elapsed_ms", itoa_buf((int)elapsed_ms(t_pub)));
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
+    /* This is the shared commit tail for complete rebuilds and isolated
+     * deltas. Stamp only after every graph/metadata/FTS mutation: a fresh
+     * staging file receives a new uid, while a cloned delta keeps its uid and
+     * advances the mutation counter. A failure discards the private stage. */
+    if (ok && cbm_store_generation_advance(store) != CBM_STORE_OK) {
+        ok = false;
+    }
+    cbm_log_info("publish.timing", "block", "generation", "elapsed_ms",
+                 itoa_buf((int)elapsed_ms(t_pub)));
+    cbm_clock_gettime(CLOCK_MONOTONIC, &t_pub);
     if (ok && !cbm_store_check_integrity(store)) {
         ok = false;
     }
@@ -1960,7 +1970,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 #endif
     if (last_slash) {
         *last_slash = '\0';
-        cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
+        cbm_mkdir_p_ex(db_dir, CBM_DIR_PERMS, CBM_MKDIR_FOLLOW_OWNED);
     }
 
     cbm_file_hash_t *manifest = NULL;
@@ -2414,7 +2424,7 @@ static bool ensure_db_parent(const char *path) {
         return true;
     }
     *slash = '\0';
-    bool ok = dir[0] == '\0' || cbm_mkdir_p(dir, CBM_DIR_PERMS);
+    bool ok = dir[0] == '\0' || cbm_mkdir_p_ex(dir, CBM_DIR_PERMS, CBM_MKDIR_FOLLOW_OWNED);
     free(dir);
     return ok;
 }

@@ -643,6 +643,50 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     PASS();
 }
 
+TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat) {
+    char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-index-heartbeat-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    const char *old_log_level = getenv("CBM_LOG_LEVEL");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    char *saved_log_level = old_log_level ? cbm_strdup(old_log_level) : NULL;
+    (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    (void)cbm_unsetenv("CBM_LOG_LEVEL");
+
+    cbm_index_worker_handle_t *handle = NULL;
+    int start_rc = cbm_index_worker_start("{\"__cbm_test_worker\":\"heartbeat\"}", 0, false,
+                                          NULL, NULL, &handle);
+    char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP] = {0};
+    if (handle) {
+        (void)snprintf(log_path, sizeof(log_path), "%s", cbm_index_worker_log_path(handle));
+    }
+    bool ready = log_path[0] && index_supervisor_test_wait_file_text(
+                                    log_path, "async worker heartbeat probe ready",
+                                    INDEX_SUPERVISOR_TEST_READY_MS);
+    bool heartbeat = ready && index_supervisor_test_wait_file_text(
+                                  log_path, "msg=pipeline.discover", 1000);
+    const cbm_index_worker_result_t *result = NULL;
+    bool terminal = handle && index_supervisor_test_poll_terminal(
+                                  handle, INDEX_SUPERVISOR_TEST_TERMINAL_MS, &result);
+    bool clean = terminal && result && result->outcome == CBM_PROC_CLEAN && result->response;
+    if (terminal) {
+        cbm_index_worker_destroy(handle);
+    } else {
+        index_supervisor_test_dump("heartbeat worker log", log_path);
+        index_supervisor_test_cleanup_handle(handle);
+    }
+    index_supervisor_test_restore_env("CBM_LOG_LEVEL", saved_log_level);
+    index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
+    (void)th_rmtree(cache);
+
+    ASSERT_EQ(start_rc, 0);
+    ASSERT_TRUE(ready);
+    ASSERT_TRUE(heartbeat);
+    ASSERT_TRUE(clean);
+    PASS();
+}
+
 TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback) {
     char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-index-relay-XXXXXX", cbm_tmpdir());
@@ -854,6 +898,7 @@ SUITE(index_supervisor) {
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
     RUN_TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree);
     RUN_TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling);
+    RUN_TEST(index_supervisor_worker_keeps_default_info_liveness_heartbeat);
     RUN_TEST(index_supervisor_drains_terminal_backlog_into_request_progress_callback);
     RUN_TEST(index_supervisor_oversized_response_is_contained_and_log_is_retained);
     RUN_TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run);

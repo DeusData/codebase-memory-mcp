@@ -60,6 +60,45 @@ TEST(log_level_default) {
     PASS();
 }
 
+TEST(log_level_env_keeps_info_and_debug_opt_in) {
+    CBMLogLevel saved = cbm_log_get_level();
+    cbm_setenv("CBM_LOG_LEVEL", "info", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_from_env();
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    /* Restore what the process had: later suites observe INFO records. */
+    cbm_log_set_level(saved);
+    PASS();
+}
+
+TEST(log_startup_policy_keeps_frontends_quiet_and_workers_live) {
+    CBMLogLevel saved = cbm_log_get_level();
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    cbm_log_init_for_process(true, false);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
+
+    cbm_log_init_for_process(false, true);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "none", 1);
+    cbm_log_init_for_process(false, true);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_INFO);
+
+    cbm_setenv("CBM_LOG_LEVEL", "debug", 1);
+    cbm_log_init_for_process(true, false);
+    ASSERT_EQ(cbm_log_get_level(), CBM_LOG_DEBUG);
+
+    cbm_unsetenv("CBM_LOG_LEVEL");
+    /* Restore what the process had: later suites observe INFO records. */
+    cbm_log_set_level(saved);
+    PASS();
+}
+
 TEST(log_level_set) {
     cbm_log_set_level(CBM_LOG_WARN);
     ASSERT_EQ(cbm_log_get_level(), CBM_LOG_WARN);
@@ -285,6 +324,8 @@ TEST(log_level_from_env_invalid_ignored) {
 
 SUITE(log) {
     RUN_TEST(log_level_default);
+    RUN_TEST(log_level_env_keeps_info_and_debug_opt_in);
+    RUN_TEST(log_startup_policy_keeps_frontends_quiet_and_workers_live);
     RUN_TEST(log_level_set);
     RUN_TEST(log_info_output);
     RUN_TEST(log_filtered_by_level);

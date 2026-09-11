@@ -1498,12 +1498,17 @@ static char *jl_parent_directory(const char *path) {
     return cbm_strndup(path, (size_t)(separator - path));
 }
 
+/* Every document written through this editor is a client's own configuration
+ * file under HOME / XDG / the client's config-dir variable, so a symlink the
+ * user owns on the way to it is followed. Repository-derived paths are never
+ * edited here. */
 static int jl_ensure_parent(const char *path) {
     char *parent = jl_parent_directory(path);
     if (!parent) {
         return -1;
     }
-    int result = strcmp(parent, ".") == 0 || cbm_mkdir_p(parent, 0755) ? 0 : -1;
+    int result =
+        strcmp(parent, ".") == 0 || cbm_mkdir_p_ex(parent, 0755, CBM_MKDIR_FOLLOW_OWNED) ? 0 : -1;
     free(parent);
     return result;
 }

@@ -391,7 +391,7 @@ bool cbm_ui_config_save(const cbm_ui_config_t *cfg) {
     char dir[CBM_SZ_1K];
     bool directory_ready = config_parent_directory(path, dir, sizeof(dir));
     if (directory_ready && !cbm_is_dir(dir)) {
-        directory_ready = cbm_mkdir_p(dir, 0750) || cbm_is_dir(dir);
+        directory_ready = cbm_mkdir_p_ex(dir, 0750, CBM_MKDIR_FOLLOW_OWNED) || cbm_is_dir(dir);
     }
     if (!directory_ready) {
         cbm_log_error("ui.config.write_fail", "path", path, "reason", "create_directory");

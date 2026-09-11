@@ -992,9 +992,9 @@ static int phase1_scan_functions(cbm_gbuf_t *gbuf, cbm_sem_func_t **out_funcs,
      * sequence — so an unstable order changes WHICH semantic edges are
      * emitted. Sort the cheap pointer array by qualified name (unique) and
      * re-derive the three fields set so far; the heavy per-func payloads are
-     * filled in later phases, so no 12.7 KB structs are moved. */
-    /* A repo with zero Function/Method nodes leaves node_ptrs NULL — qsort
-     * with a null base is UB even at count 0. */
+     * filled in later phases, so no 12.7 KB structs are moved.
+     * A graph with no Function/Method nodes never allocates node_ptrs, and
+     * qsort's base is declared nonnull (glibc), so skip the sort outright. */
     if (func_count > 0) {
         qsort(node_ptrs, (size_t)func_count, sizeof(node_ptrs[0]), cmp_node_ptr_by_qn);
     }

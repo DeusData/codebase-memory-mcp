@@ -94,6 +94,18 @@ const char *cbm_daemon_ipc_validation_detail(void);
 #ifdef CBM_ENABLE_TEST_SEAMS
 /* #1537: seed the detail so a test can prove the CLI refusal surfaces it. */
 void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail);
+#ifndef _WIN32
+/* #1830 seams (POSIX). Override the single-uid user-namespace overflow uid that
+ * ancestors may be owned by (active=false restores the real /proc-derived
+ * value); and expose the pure uid_map-parse and ancestor accept/refuse decision
+ * so they can be tested without a chown-able overflow-owned directory. */
+void cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(bool active,
+                                                             unsigned long overflow_uid);
+bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, unsigned long euid);
+bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
+                                                    unsigned long euid, bool overflow_active,
+                                                    unsigned long overflow_uid);
+#endif
 #endif
 
 /* Create/validate an owner-only directory and securely open one regular
@@ -131,9 +143,11 @@ int cbm_daemon_ipc_lifetime_reservation_probe(const cbm_daemon_ipc_endpoint_t *e
 /* Remove only a provably current-generation stale Unix socket identity. The
  * caller must first observe an absent lifetime reservation and retain the
  * matching startup lock for the complete call; the implementation rechecks
- * both conditions. Stable deletion requires a committed marker whose named
- * anchor and stable path are the same secure socket inode; pending alone may
- * only complete that commit when both paths independently corroborate it.
+ * both conditions. Stable deletion normally requires a committed marker whose
+ * named anchor and stable path are the same secure socket inode; pending alone
+ * may only complete that commit when both paths independently corroborate it.
+ * With both records absent, the exact owner-private two-name/two-link stable
+ * socket and anchor shape is also recoverable after immediate revalidation.
  * A differing stable replacement is preserved while owned anchor/records are
  * collected. Returns 1 when the stable endpoint is absent and all owned
  * artifacts are absent or were removed, 0 when cleanup is refused for a live,
@@ -193,8 +207,10 @@ int cbm_daemon_ipc_startup_lock_try_acquire(const cbm_daemon_ipc_endpoint_t *end
                                             cbm_daemon_ipc_startup_lock_t **lock_out);
 /* Activation-only no-spawn generation probe under the exact matching,
  * retained, unprepared startup lock. It ignores the caller's own startup-v2
- * and frozen-legacy startup claims, and reports only a live daemon lifetime,
- * stable current transport, or deterministic legacy/current sentinel.
+ * and frozen-legacy startup claims, serially cleans a provable stale POSIX
+ * generation under a temporary lifetime reservation, and reports only a live
+ * daemon lifetime, remaining stable transport, or deterministic
+ * legacy/current sentinel.
  * Returns 1 when active, 0 when authoritatively absent, and -1 when the lock,
  * endpoint, transport, or ownership cannot be validated. */
 int cbm_daemon_ipc_generation_probe_under_startup_lock(

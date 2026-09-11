@@ -36,7 +36,15 @@ typedef struct {
     int64_t mtime_ns;
 } cbm_path_info_t;
 
-/* Returns 0 on success and -1 when the path cannot be inspected. */
+enum {
+    CBM_PATH_INFO_OK = 0,
+    CBM_PATH_INFO_UNAVAILABLE = -1,
+    CBM_PATH_INFO_ABSENT = -2,
+};
+
+/* Distinguishes a proven absent path from permission, encoding, and transient
+ * inspection failures. Existing callers that only test zero/nonzero retain
+ * their behavior. */
 int cbm_path_info_utf8(const char *path, cbm_path_info_t *out);
 
 /* Open a directory for iteration. Returns NULL on error. */
@@ -56,8 +64,24 @@ int cbm_pclose(FILE *f);
 
 /* ── File operations ──────────────────────────────────────────── */
 
-/* Create directory (and parents). mode is ignored on Windows. Returns true on success. */
+/* Create directory (and parents). mode is ignored on Windows. Returns true on success.
+ * A symlink component is followed only when root owns it (cbm_mkdir_p_ex). */
 bool cbm_mkdir_p(const char *path, int mode);
+
+/* cbm_mkdir_p with a per-call-site symlink policy.
+ *
+ * CBM_MKDIR_FOLLOW_OWNED also follows a symlink component owned by the invoking
+ * user. Opt in ONLY for paths rooted in the user's own configuration -- HOME,
+ * XDG, CBM_CACHE_DIR: agent roots, config, cache and log directories -- where a
+ * link the user owns is the user's own arrangement (a dotfile manager, a config
+ * tree kept on another volume). Never for a path derived from a repository:
+ * git creates symlinks owned by whoever cloned, so a checked-in
+ * `.codebase-memory -> ~/.ssh` is user-owned without being user-intended.
+ * Whatever a followed link lands on must itself be a directory owned by root
+ * or the invoking user and not world-writable unless sticky. Windows ignores
+ * the policy. */
+enum { CBM_MKDIR_FOLLOW_OWNED = 1U << 0 };
+bool cbm_mkdir_p_ex(const char *path, int mode, unsigned int policy);
 
 /* Delete a file. Returns 0 on success. */
 int cbm_unlink(const char *path);

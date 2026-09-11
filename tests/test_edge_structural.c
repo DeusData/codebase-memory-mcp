@@ -420,6 +420,19 @@ TEST(es_calls_vue_embedded_issue1410) {
     PASS();
 }
 
+TEST(es_calls_svelte_embedded_issue1807) {
+    static const ES_LangFile f[] = {
+        {"Toggle.svelte",
+         "<script lang=\"ts\">\n"
+         "function callee(): number { return 42; }\n"
+         "function caller(): number { return callee(); }\n"
+         "</script>\n"
+         "<button on:click={caller}>Toggle</button>\n"},
+    };
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
+    PASS();
+}
+
 /* Java: caller in Main.java calls static method from Util.java (same package). */
 TEST(es_calls_crossfile_java) {
     static const ES_LangFile f[] = {
@@ -927,6 +940,7 @@ SUITE(edge_structural) {
     RUN_TEST(es_calls_crossfile_kotlin);
     RUN_TEST(es_calls_crossfile_csharp);
     RUN_TEST(es_calls_vue_embedded_issue1410);
+    RUN_TEST(es_calls_svelte_embedded_issue1807);
 
     /* ── FAMILY 2: INHERITS cross-file ────────────────────────── */
     /* GREEN: Java, C#, C++ (extraction confirmed correct). */

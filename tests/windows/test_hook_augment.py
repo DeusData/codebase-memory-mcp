@@ -124,7 +124,9 @@ def main():
             return 2
 
         # Control: prove the symbol is indexed and queryable.
-        lp = run_cli(binary, cache, ["cli", "list_projects", "{}"])
+        # The CLI answers in the lean tree form by default; this guard parses the
+        # JSON projection, so it asks for it.
+        lp = run_cli(binary, cache, ["cli", "list_projects", "{\"format\":\"json\"}"])
         projects = json.loads((lp.stdout or b"").decode("utf-8", "replace"))["projects"]
         name = projects[0]["name"]
         sg = run_cli(binary, cache, ["cli", "search_graph",

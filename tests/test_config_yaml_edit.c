@@ -2,6 +2,7 @@
  * test_config_yaml_edit.c — Conservative YAML config editor tests.
  */
 #include "../src/foundation/compat.h"
+#include "../src/foundation/compat_fs.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 
@@ -1095,6 +1096,109 @@ TEST(config_yaml_edit_bom_before_our_own_section_stays_single_issue1656) {
     PASS();
 }
 
+/* ── #1924: block/flow indicators are indicators only where a value begins ──
+ *
+ * The sequence-document scan (the pre_llm_hook_install path) refused `>`,
+ * `|`, `[` and `]` at ANY position of a plain scalar, so a Hermes persona
+ * such as `probe: kaomoji face >w< here` made the hook op fail while the
+ * mcp_servers op on the same file succeeded (bisected to two persona strings
+ * by @ukind). YAML reads them as indicators only where a value begins — the
+ * rule the `*`/`&` fix and the quote fix (#1631) already apply. Both real
+ * Hermes ops run here; our blocks append, so the original document must
+ * survive as an untouched prefix. */
+
+TEST(config_yaml_edit_hermes_accepts_interior_gt_in_plain_scalar_issue1924) {
+    const char *initial = "agent:\n"
+                          "  personalities:\n"
+                          "    probe: kaomoji face >w< here\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(strncmp(after, initial, strlen(initial)), 0);
+    ASSERT_NOT_NULL(strstr(after, "cbm-context"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_accepts_interior_pipe_in_plain_scalar_issue1924) {
+    const char *initial = "agent:\n"
+                          "  personalities:\n"
+                          "    probe: pipe char | mid value\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(strncmp(after, initial, strlen(initial)), 0);
+    ASSERT_NOT_NULL(strstr(after, "cbm-context"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_accepts_interior_brackets_in_plain_scalar_issue1924) {
+    /* In block context `[`/`]` inside a plain scalar are ordinary text; only
+     * a value-start `[` opens a flow sequence. */
+    const char *initial = "agent:\n"
+                          "  personalities:\n"
+                          "    probe: see docs[1] and args[] here\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_OK);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_EQ(strncmp(after, initial, strlen(initial)), 0);
+    ASSERT_NOT_NULL(strstr(after, "cbm-context"));
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_hook_still_refuses_block_scalar_value_issue1924) {
+    /* A `>` or `|` that BEGINS a value is a real block scalar whose
+     * indentation contract this editor does not model: the fail-closed
+     * refusal stays, and the file stays byte-identical. */
+    static const char *const initials[] = {
+        "agent:\n  personalities:\n    probe: >\n      folded face\n",
+        "agent:\n  personalities:\n    probe: |\n      literal face\n",
+        "agent:\n  personalities:\n    probe: >-\n      chomped face\n",
+    };
+    for (size_t i = 0U; i < sizeof(initials) / sizeof(initials[0]); i++) {
+        yaml_fixture_t fixture;
+        ASSERT_EQ(yaml_fixture_init(&fixture, initials[i]), 0);
+        ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_ERROR);
+        char *after = yaml_read_alloc(fixture.path);
+        ASSERT_NOT_NULL(after);
+        ASSERT_STR_EQ(after, initials[i]);
+        free(after);
+        th_cleanup(fixture.dir);
+    }
+    PASS();
+}
+
+TEST(config_yaml_edit_hermes_hook_still_refuses_nonempty_flow_sequence_value_issue1924) {
+    /* Pins the #1631 line: exact `[]` is accepted, a non-empty flow sequence
+     * value is still unsupported in the sequence-document scan. */
+    const char *initial = "agent:\n"
+                          "  personalities:\n"
+                          "    probe: [a, b]\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, initial), 0);
+    ASSERT_EQ(yaml_hermes_hook_upsert(&fixture), CBM_YAML_IDENTITY_EDIT_ERROR);
+    char *after = yaml_read_alloc(fixture.path);
+    ASSERT_NOT_NULL(after);
+    ASSERT_STR_EQ(after, initial);
+    free(after);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 /* ── Owned-entry repair (#1631 galaxy + goose upgrades) ──────────────────────
  *
  * Byte-identity alone freezes users on any OLD canonical our past writers
@@ -1826,6 +1930,37 @@ TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item) {
     PASS();
 }
 
+/* Uninstall must be idempotent against a config that was never written. Hermes
+ * is detected by its binary on PATH, so a HOME without `.hermes/` reached the
+ * YAML removers with an absent target — and they failed acquiring the lock
+ * beside a file whose directory does not exist, which `uninstall` then
+ * counted as an agent cleanup error and refused to remove the executable.
+ * Every remover answers OK for a genuinely absent path and creates nothing.
+ * Runs on every platform: the fix has a separate Windows branch. */
+TEST(config_yaml_edit_remove_on_absent_config_is_a_no_op) {
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, NULL), 0);
+    char absent[sizeof(fixture.path) + 32U];
+    ASSERT(snprintf(absent, sizeof(absent), "%s/no-such-dir/config.yaml", fixture.dir) > 0);
+
+    ASSERT_EQ(cbm_yaml_remove_mapping_sequence_item(absent, yaml_hook_sequence_path, 2U, "id",
+                                                    yaml_hook_identity, yaml_hook_canonical_item),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(cbm_yaml_remove_owned_mapping_entry(absent, "mcp_servers", "codebase-memory-mcp",
+                                                  "    command: \"/opt/cbm\"\n"),
+              CBM_YAML_IDENTITY_EDIT_OK);
+    ASSERT_EQ(cbm_yaml_remove_mapping_entry(absent, "hooks", "pre_llm_call"), 0);
+    ASSERT_EQ(cbm_yaml_remove_string_list_item(absent, "read", "AGENTS.md"), 0);
+
+    /* Nothing was created. cbm_path_info_utf8 rather than lstat: same meaning
+     * — it reports the link instead of following it — and it compiles on
+     * Windows, which is exactly where the fix has its own branch. */
+    cbm_path_info_t absent_info;
+    ASSERT(cbm_path_info_utf8(absent, &absent_info) != 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
 TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically) {
     const char *cases[] = {
         "hooks:\n   pre_llm_call:\n    - id: \"bad-indent\"\n",
@@ -1957,6 +2092,11 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_hermes_accepts_interior_apostrophe_and_plain_wrap_issue1631);
     RUN_TEST(config_yaml_edit_accepts_utf8_bom_issue1656);
     RUN_TEST(config_yaml_edit_bom_before_our_own_section_stays_single_issue1656);
+    RUN_TEST(config_yaml_edit_hermes_accepts_interior_gt_in_plain_scalar_issue1924);
+    RUN_TEST(config_yaml_edit_hermes_accepts_interior_pipe_in_plain_scalar_issue1924);
+    RUN_TEST(config_yaml_edit_hermes_accepts_interior_brackets_in_plain_scalar_issue1924);
+    RUN_TEST(config_yaml_edit_hermes_hook_still_refuses_block_scalar_value_issue1924);
+    RUN_TEST(config_yaml_edit_hermes_hook_still_refuses_nonempty_flow_sequence_value_issue1924);
     RUN_TEST(config_yaml_edit_repairs_prior_unquoted_command_entry_issue1631);
     RUN_TEST(config_yaml_edit_repairs_prior_goose_block_without_name);
     RUN_TEST(config_yaml_edit_still_refuses_truly_foreign_entry_under_our_key);
@@ -1980,6 +2120,7 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_nested_sequence_foreign_identity_is_preserved);
     RUN_TEST(config_yaml_edit_nested_sequence_removes_only_exact_canonical_item);
     RUN_TEST(config_yaml_edit_nested_sequence_ambiguity_fails_byte_identically);
+    RUN_TEST(config_yaml_edit_remove_on_absent_config_is_a_no_op);
 #ifndef _WIN32
     RUN_TEST(config_yaml_edit_accepts_interior_asterisk_in_plain_scalar_issue1631);
     RUN_TEST(config_yaml_edit_still_refuses_leading_alias_issue1631);

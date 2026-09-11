@@ -7,6 +7,7 @@
  */
 #include "cypher/cypher.h"
 #include "foundation/compat.h"
+#include "foundation/constants.h"
 #include "store/store.h"
 #include "foundation/platform.h"
 #include "foundation/limits.h"
@@ -35,6 +36,10 @@ enum {
     /* search miss sentinel */ /* mask for ebuf ring buffer (8 entries) */
 };
 #define CYP_DBL_MAX 1e308
+/* execute_single binds the first pattern's leading node even when the query
+ * leaves it unnamed, so the engine needs a name for it. The binding slot is
+ * real, which is why check_pattern_var_capacity counts it. */
+#define CYP_ANON_HEAD_VAR "_n0"
 
 #include <ctype.h>
 #include <limits.h> // INT_MAX
@@ -2880,6 +2885,9 @@ static void rb_add_row(result_builder_t *rb, const char **values) {
 
 static _Thread_local uint64_t g_cypher_deadline_ms = 0; /* absolute; 0 = disarmed */
 static _Thread_local bool g_cypher_timed_out = false;
+/* Sticky for one cbm_cypher_execute call. Unlike row_count, this survives caps
+ * that happen before DISTINCT, aggregation, ORDER BY, or the final projection. */
+static _Thread_local bool g_cypher_truncated = false;
 static _Thread_local int64_t g_cypher_deadline_override_ms = -1; /* test hook; <0 = default */
 
 static void cypher_deadline_arm(void) {
@@ -3237,6 +3245,10 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
      * clamp — never a silent truncation. */
     int depth_cap = cbm_cypher_max_depth();
     int max_depth = rel->max_hops > 0 ? rel->max_hops : depth_cap;
+    /* A range clamped to the engine ceiling (or an unbounded one) is probed one
+     * hop beyond it: a candidate out there means the clamp hid real rows, so the
+     * result is reported truncated; a clamp on a shallow graph stays a warning. */
+    bool probe_beyond_depth_cap = rel->max_hops <= 0 || max_depth > depth_cap;
     if (max_depth > depth_cap) {
         char req_buf[16];
         char cap_buf[16];
@@ -3248,8 +3260,9 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
     }
     cbm_traverse_result_t tr = {0};
     const char *dir = rel->direction ? rel->direction : "outbound";
-    cbm_store_bfs_trail(store, src->id, dir, rel->types, rel->type_count, max_depth, CBM_PERCENT,
-                        &tr);
+    int traversal_depth = probe_beyond_depth_cap ? depth_cap + SKIP_ONE : max_depth;
+    cbm_store_bfs_trail(store, src->id, dir, rel->types, rel->type_count, traversal_depth,
+                        CBM_PERCENT, &tr);
     if (tr.truncated) {
         g_cypher_trail_truncated = 1;
     }
@@ -3260,6 +3273,10 @@ static void expand_var_length(cbm_store_t *store, cbm_rel_pattern_t *rel,
      * fabricated OPTIONAL "no match" row. */
     for (int v = 0; v < tr.visited_count; v++) {
         cbm_node_hop_t *hop = &tr.visited[v];
+        if (hop->hop > max_depth) {
+            g_cypher_truncated = true; /* the probe hop found a candidate past the cap */
+            continue;
+        }
         if (hop->hop < rel->min_hops) {
             continue;
         }
@@ -3494,7 +3511,8 @@ static void rb_apply_order_by(result_builder_t *rb, const cbm_return_clause_t *r
     }
 }
 
-static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
+static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit,
+                                bool limit_is_engine_budget) {
     /* Skip */
     if (skip_n > 0 && skip_n < rb->row_count) {
         for (int i = 0; i < skip_n; i++) {
@@ -3516,6 +3534,9 @@ static void rb_apply_skip_limit(result_builder_t *rb, int skip_n, int limit) {
     }
     /* Limit */
     if (limit >= 0 && rb->row_count > limit) {
+        if (limit_is_engine_budget) {
+            g_cypher_truncated = true;
+        }
         for (int i = limit; i < rb->row_count; i++) {
             for (int c = 0; c < rb->col_count; c++) {
                 safe_str_free(&rb->rows[i][c]);
@@ -3758,6 +3779,25 @@ static const char *project_item(binding_t *b, cbm_return_item_t *item, char *fun
     const char *raw = binding_get_virtual(b, item->variable, item->property);
     if (is_scalar_value_func(item->func)) {
         return apply_string_func(item->func, raw, func_buf, buf_sz);
+    }
+    /* Direct node/edge fields live in the binding until this row has been
+     * copied by rb_add_row. Keep those allocation-backed values intact: the
+     * fixed per-column scratch buffer exists only to stabilize computed and
+     * JSON-derived rotating-buffer values. Copying every value through it
+     * silently clipped long qualified names and paths to 511 bytes before the
+     * MCP response budget or prefix directory ever saw them. */
+    for (int i = 0; raw && raw[0] && i < b->var_count; i++) {
+        const cbm_node_t *node = &b->var_nodes[i];
+        if (raw == node->project || raw == node->label || raw == node->name ||
+            raw == node->qualified_name || raw == node->file_path || raw == node->properties_json) {
+            return raw;
+        }
+    }
+    for (int i = 0; raw && raw[0] && i < b->edge_var_count; i++) {
+        const cbm_edge_t *edge = &b->edge_vars[i];
+        if (raw == edge->project || raw == edge->type || raw == edge->properties_json) {
+            return raw;
+        }
     }
     /* Copy into the caller's per-column buffer. `raw` may point to node_prop's
      * rotating scratch buffer, which the next column's projection would overwrite
@@ -4320,10 +4360,21 @@ static void execute_return_star(cbm_query_t *q, binding_t *bindings, int bind_co
     const char *vars[CBM_SZ_32];
     int vc = collect_pattern_vars(q, vars, CBM_SZ_32);
     build_star_columns(rb, vars, vc);
-    for (int bi = 0; bi < bind_count && rb->row_count < max_rows; bi++) {
+    int projection_cap = max_rows;
+    bool cap_is_engine_budget = true;
+    cbm_return_clause_t *ret = q->ret;
+    if (ret && ret->limit >= 0 && ret->limit <= max_rows && !ret->distinct &&
+        ret->order_key_count == 0 && ret->skip <= 0) {
+        projection_cap = ret->limit;
+        cap_is_engine_budget = false;
+    }
+    for (int bi = 0; bi < bind_count && rb->row_count < projection_cap; bi++) {
         const char *vals[CBM_SZ_128];
         project_star_row(&bindings[bi], vars, vc, vals);
         rb_add_row(rb, vals);
+    }
+    if (cap_is_engine_budget && bind_count > projection_cap) {
+        g_cypher_truncated = true;
     }
 }
 
@@ -4570,8 +4621,10 @@ static void build_return_columns(result_builder_t *rb, cbm_return_clause_t *ret)
 static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings, int bind_count,
                                   int max_rows, result_builder_t *rb) {
     int proj_cap = max_rows;
-    if (ret->limit > 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
+    bool cap_is_engine_budget = true;
+    if (ret->limit >= 0 && !ret->distinct && ret->order_key_count == 0 && ret->skip <= 0) {
         proj_cap = ret->limit;
+        cap_is_engine_budget = false;
     }
     for (int bi = 0; bi < bind_count && rb->row_count < proj_cap; bi++) {
         const char *vals[CBM_SZ_32];
@@ -4581,6 +4634,9 @@ static void execute_return_simple(cbm_return_clause_t *ret, binding_t *bindings,
                 project_item(&bindings[bi], &ret->items[ci], func_bufs[ci], sizeof(func_bufs[ci]));
         }
         rb_add_row(rb, vals);
+    }
+    if (cap_is_engine_budget && bind_count > proj_cap) {
+        g_cypher_truncated = true;
     }
 }
 
@@ -4608,9 +4664,13 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
                                        int max_rows, result_builder_t *rb) {
     const char *vars[CYP_MAX_VARS];
     int vc = 0;
-    for (int ni = 0; ni < pat0->node_count && vc < CYP_MAX_VARS; ni++) {
+    for (int ni = 0; ni < pat0->node_count; ni++) {
         if (pat0->nodes[ni].variable) {
-            vars[vc++] = pat0->nodes[ni].variable;
+            if (vc < CYP_MAX_VARS) {
+                vars[vc++] = pat0->nodes[ni].variable;
+            } else {
+                g_cypher_truncated = true;
+            }
         }
     }
     build_default_columns(rb, vars, vc);
@@ -4624,6 +4684,9 @@ static void execute_default_projection(cbm_pattern_t *pat0, binding_t *bindings,
             vals[((size_t)v * CYP_EDGE_COLS) + PAIR_LEN] = n && n->label ? n->label : "";
         }
         rb_add_row(rb, vals);
+    }
+    if (bind_count > max_rows) {
+        g_cypher_truncated = true;
     }
 }
 
@@ -4917,7 +4980,9 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
         rb_apply_distinct(rb);
     }
     rb_apply_order_by(rb, ret);
-    rb_apply_skip_limit(rb, ret->skip, ret->limit >= 0 ? ret->limit : max_rows);
+    bool limit_is_engine_budget = ret->limit < 0;
+    rb_apply_skip_limit(rb, ret->skip, limit_is_engine_budget ? max_rows : ret->limit,
+                        limit_is_engine_budget);
 }
 
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
@@ -4933,7 +4998,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
     int bind_cap = scan_count > max_rows ? scan_count : (max_rows > 0 ? max_rows : SKIP_ONE);
     binding_t *bindings = malloc((bind_cap + SKIP_ONE) * sizeof(binding_t));
     int bind_count = 0;
-    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : "_n0";
+    const char *var_name = pat0->nodes[0].variable ? pat0->nodes[0].variable : CYP_ANON_HEAD_VAR;
 
     for (int i = 0; i < scan_count && bind_count < bind_cap; i++) {
         if ((i & CYPHER_DEADLINE_CHECK_MASK) == 0 && cypher_deadline_exceeded()) {
@@ -5103,13 +5168,98 @@ static const char *scope_checkable_var(const cbm_return_item_t *item) {
     return item->variable;
 }
 
+/* Says which limit the query passed and how to get under it. An unnamed node
+ * takes no slot — except the head of the first pattern, which the engine binds
+ * either way — so dropping a name the query never uses is the cheap way out.
+ * Splitting the MATCH is NOT — every pattern of one query shares one binding,
+ * which is why the caller counts across all of them. Separate queries do work,
+ * because each gets a binding of its own. */
+static char *var_capacity_error(const char *kind, int limit) {
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf),
+             "too many %s variables: a query can name at most %d — "
+             "leave the name off the ones you do not use, or run separate queries",
+             kind, limit);
+    return heap_strdup(buf);
+}
+
+/* A binding holds a fixed number of variables: CYP_MAX_VARS node variables and
+ * CYP_MAX_EDGE_VARS edge variables, both in plain arrays (see binding_t).
+ * binding_set and binding_set_edge drop anything past those without a word, so
+ * a query naming more variables than a binding holds cannot be answered — the
+ * extra names bind to nothing and project as empty strings, which reads as
+ * "the graph holds no such data" rather than "this query is too wide".
+ *
+ * Refuse such a query instead, before any row is touched. Bounding the input
+ * here is also what stops collect_declared_names below overflowing its array:
+ * the patterns contribute at most CYP_MAX_VARS + CYP_MAX_EDGE_VARS names, plus
+ * one UNWIND alias, which is well inside CYP_SCOPE_MAX_NAMES.
+ *
+ * Counts DISTINCT variables across every pattern, because they all land in the
+ * same binding: a multi-MATCH query shares one, and an OPTIONAL MATCH pattern
+ * sits in this same array (q->pattern_optional marks which). A node variable
+ * and an edge variable may share a name and each take a slot, because the
+ * binding keeps the two in separate arrays. */
+static char *check_pattern_var_capacity(const cbm_query_t *q) {
+    /* Initialized because cppcheck cannot see that scope_holds reads only the
+     * node_n / edge_n entries already written, and reports the first call as a
+     * read of an uninitialized array. */
+    const char *node_vars[CYP_MAX_VARS] = {NULL};
+    const char *edge_vars[CYP_MAX_EDGE_VARS] = {NULL};
+    int node_n = 0;
+    int edge_n = 0;
+    /* The head of the first pattern always takes a node slot, named or not:
+     * execute_single binds it under CYP_ANON_HEAD_VAR when the query leaves it
+     * unnamed. Count it first, or a query with an unnamed head and CYP_MAX_VARS
+     * named nodes passes this check and still loses its last name in
+     * binding_set — the exact silence this guard exists to remove. */
+    if (q->pattern_count > 0 && q->patterns[0].node_count > 0 &&
+        !q->patterns[0].nodes[0].variable) {
+        node_vars[node_n++] = CYP_ANON_HEAD_VAR;
+    }
+    for (int pi = 0; pi < q->pattern_count; pi++) {
+        const cbm_pattern_t *pat = &q->patterns[pi];
+        for (int ni = 0; ni < pat->node_count; ni++) {
+            const char *var = pat->nodes[ni].variable;
+            if (!var || scope_holds(node_vars, node_n, var)) {
+                continue;
+            }
+            if (node_n >= CYP_MAX_VARS) {
+                return var_capacity_error("node", CYP_MAX_VARS);
+            }
+            node_vars[node_n++] = var;
+        }
+        for (int ri = 0; ri < pat->rel_count; ri++) {
+            const char *var = pat->rels[ri].variable;
+            if (!var || scope_holds(edge_vars, edge_n, var)) {
+                continue;
+            }
+            if (edge_n >= CYP_MAX_EDGE_VARS) {
+                return var_capacity_error("edge", CYP_MAX_EDGE_VARS);
+            }
+            edge_vars[edge_n++] = var;
+        }
+    }
+    return NULL;
+}
+
 /* Answers NULL when the query is fine, or a heap message naming the first
  * variable that is not in scope. Checks one query; the caller walks a UNION. */
 static char *check_projection_scope(const cbm_query_t *q) {
+    /* Runs first, so the rest of this function can trust that the query names
+     * no more variables than the arrays below can model. */
+    char *capacity_err = check_pattern_var_capacity(q);
+    if (capacity_err) {
+        return capacity_err;
+    }
+
     const char *declared[CYP_SCOPE_MAX_NAMES];
     int declared_n = collect_declared_names(q, declared, CYP_SCOPE_MAX_NAMES);
     if (declared_n < 0) {
-        return NULL; /* too many names to model — stay quiet rather than guess */
+        /* Unreachable while the capacity check above holds. Kept so the guard
+         * still stands if either bound ever moves. Skipping the check was the
+         * old behaviour, and it let an out-of-scope name through in silence. */
+        return NULL;
     }
 
     /* A WITH still reads the pattern variables. */
@@ -5133,7 +5283,7 @@ static char *check_projection_scope(const cbm_query_t *q) {
     if (q->with_clause) {
         scope_n = collect_with_names(q->with_clause, after_with, CYP_SCOPE_MAX_NAMES);
         if (scope_n < 0) {
-            return NULL;
+            return NULL; /* unreachable: a WITH holds at most CYP_SCOPE_MAX_NAMES items */
         }
         scope = after_with;
     }
@@ -5154,6 +5304,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     memset(out, 0, sizeof(*out));
     g_cypher_depth_clamped = 0;
     g_cypher_trail_truncated = 0;
+    g_cypher_truncated = false;
     cypher_deadline_arm(); /* #601: start the wall-clock budget for this query */
     if (max_rows <= 0) {
         max_rows = CYPHER_RESULT_CEILING;
@@ -5179,6 +5330,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (execute_single(store, q, project, max_rows, &rb) < 0) {
         rb_free(&rb);
         cbm_query_free(q);
+        out->truncated = g_cypher_truncated;
         out->error = heap_strdup("query aborted: out of memory or an allocation limit was reached");
         return CBM_NOT_FOUND;
     }
@@ -5191,6 +5343,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
             rb_free(&rb);
             rb_free(&rb2);
             cbm_query_free(q);
+            out->truncated = g_cypher_truncated;
             out->error =
                 heap_strdup("query aborted: out of memory or an allocation limit was reached");
             return CBM_NOT_FOUND;
@@ -5214,6 +5367,7 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     if (g_cypher_timed_out) {
         rb_free(&rb);
         cbm_query_free(q);
+        out->truncated = g_cypher_truncated;
         out->error =
             heap_strdup("query exceeded the execution time limit — narrow the pattern with a WHERE "
                         "filter, use a directed MATCH instead of an unbounded OPTIONAL MATCH, or "
@@ -5223,8 +5377,10 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
 
     /* Check ceiling */
     if (rb.row_count >= CYPHER_RESULT_CEILING) {
+        g_cypher_truncated = true;
         rb_free(&rb);
         cbm_query_free(q);
+        out->truncated = true;
         out->error = heap_strdup("result exceeded 100k rows — use narrower filters or add LIMIT");
         return CBM_NOT_FOUND;
     }
@@ -5233,6 +5389,9 @@ int cbm_cypher_execute(cbm_store_t *store, const char *query, const char *projec
     out->col_count = rb.col_count;
     out->rows = rb.rows;
     out->row_count = rb.row_count;
+    /* Any internal ceiling that prevented exhaustive evaluation: a candidate or
+     * traversal budget, or a variable-length range clamped to the engine cap. */
+    out->truncated = g_cypher_truncated || g_cypher_trail_truncated != 0;
     if (g_cypher_depth_clamped > 0 || g_cypher_trail_truncated) {
         char wbuf[CBM_SZ_256];
         if (g_cypher_depth_clamped > 0 && g_cypher_trail_truncated) {

@@ -483,6 +483,7 @@ void cbm_cli_set_activation_ops_for_test(const cbm_cli_activation_ops_t *ops);
  * private runtime parent. NULL restores the platform default. This is not a
  * command-line or environment override. */
 void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent);
+const char *cbm_cli_activation_runtime_parent_for_test(void);
 
 /* ── Subcommands (wired from main.c) ─────────────────────────── */
 

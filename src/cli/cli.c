@@ -322,6 +322,10 @@ void cbm_cli_set_activation_runtime_parent_for_test(const char *runtime_parent) 
     g_cli_activation_runtime_parent_for_test = runtime_parent;
 }
 
+const char *cbm_cli_activation_runtime_parent_for_test(void) {
+    return g_cli_activation_runtime_parent_for_test;
+}
+
 static const char *cli_activation_action_text(cbm_daemon_runtime_activation_action_t action) {
     switch (action) {
     case CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL:
@@ -643,7 +647,7 @@ static bool cli_activation_production_context_init(cli_activation_production_con
                        cbm_canonical_path(requested_cache, context->canonical_cache,
                                           sizeof(context->canonical_cache));
     if (!cache_ready && requested_cache && requested_cache[0] &&
-        cbm_mkdir_p(requested_cache, 0700)) {
+        cbm_mkdir_p_ex(requested_cache, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
         cache_ready = cbm_canonical_path(requested_cache, context->canonical_cache,
                                          sizeof(context->canonical_cache));
     }
@@ -1389,18 +1393,7 @@ static const char skill_content[] =
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
 
 static const char codex_instructions_content[] =
-    "# Codebase Knowledge Graph\n"
-    "\n"
-    "This project uses codebase-memory-mcp to maintain a knowledge graph of the codebase.\n"
-    "Use the MCP tools to explore and understand the code:\n"
-    "\n"
-    "- `search_graph` — find functions, classes, routes by pattern\n"
-    "- `trace_path` — trace who calls a function or what it calls\n"
-    "- `get_code_snippet` — read function source code\n"
-    "- `query_graph` — run Cypher queries for complex patterns\n"
-    "- `get_architecture` — high-level project summary\n"
-    "\n"
-    "Always prefer graph tools over grep for code discovery.\n";
+    "For structural codebase exploration, use the installed `codebase-memory` skill.\n";
 
 /* Old skill names — cleaned up during install to remove stale directories. */
 static const char *old_skill_names[] = {
@@ -1425,8 +1418,12 @@ const char *cbm_get_codex_instructions(void) {
 
 /* ── Recursive mkdir (via compat_fs) ──────────────────────────── */
 
+/* Every caller here creates a directory under the user's own configuration
+ * (skills, instruction files, the cache), so a symlink the user owns on the
+ * way there is the user's own arrangement and is followed. Repository-derived
+ * paths never come through this wrapper. */
 static int mkdirp(const char *path, int mode) {
-    return (int)cbm_mkdir_p(path, mode) ? 0 : CLI_ERR;
+    return (int)cbm_mkdir_p_ex(path, mode, CBM_MKDIR_FOLLOW_OWNED) ? 0 : CLI_ERR;
 }
 
 /* Legacy migration may remove an empty directory, but never recursively
@@ -5437,7 +5434,7 @@ bool cbm_install_hook_gate_script(const char *home, const char *binary_path) {
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -5490,7 +5487,7 @@ static bool cbm_install_session_reminder_script(const char *home, const char *bi
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -5725,7 +5722,7 @@ static bool cbm_install_subagent_reminder_script(const char *home, const char *b
     if (hooks_written <= 0 || (size_t)hooks_written >= sizeof(hooks_dir)) {
         return false;
     }
-    if (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM)) {
+    if (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED)) {
         return false;
     }
 
@@ -6497,6 +6494,127 @@ static int cli_ensure_windows_user_path(const char *bin_dir, bool dry_run) {
     }
     return CLI_OK;
 }
+
+/* Uninstall counterpart to cli_ensure_windows_user_path: remove exactly the
+ * install-dir segment install added, leaving every other segment byte-for-byte
+ * intact. Without this, every install/uninstall cycle leaves its entry behind
+ * and the current-user PATH grows without bound (#2117). Segment identity uses
+ * the same case- and trailing-separator-insensitive comparison as the install
+ * `present` scan, so we remove precisely what install would have de-duplicated.
+ * Returns CLI_OK when a segment was removed, CLI_TRUE when the directory was
+ * not present (nothing to do), CLI_ERR on a registry failure. dry_run reports
+ * without mutating. */
+static int cli_remove_windows_user_path(const char *bin_dir, bool dry_run) {
+    wchar_t *wide_dir = cli_windows_utf8_to_wide(bin_dir);
+    HKEY environment = NULL;
+    if (!wide_dir || cli_windows_open_user_path_key(&environment) != CLI_OK) {
+        free(wide_dir);
+        return CLI_ERR;
+    }
+
+    DWORD type = REG_EXPAND_SZ;
+    DWORD bytes = 0;
+    LONG queried = RegQueryValueExW(environment, L"Path", NULL, &type, NULL, &bytes);
+    if (queried == ERROR_FILE_NOT_FOUND) {
+        /* No user PATH value at all — nothing of ours to remove. */
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_TRUE;
+    }
+    if (queried != ERROR_SUCCESS || (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    size_t existing_capacity = (size_t)bytes / sizeof(wchar_t) + 1U;
+    wchar_t *existing = calloc(existing_capacity, sizeof(*existing));
+    if (!existing) {
+        RegCloseKey(environment);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    DWORD read_bytes = bytes;
+    if (RegQueryValueExW(environment, L"Path", NULL, &type, (BYTE *)existing, &read_bytes) !=
+        ERROR_SUCCESS) {
+        RegCloseKey(environment);
+        free(existing);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    existing[existing_capacity - 1U] = L'\0';
+
+    /* Rebuild the value from every segment that is NOT our directory. Kept
+     * segments keep their exact original characters; a single ';' rejoins
+     * consecutive kept segments so unrelated entries survive byte-for-byte and
+     * no stray separator is left where our entry used to be. The result is
+     * never longer than the input, so the input length bounds the buffer. */
+    size_t existing_length = wcslen(existing);
+    wchar_t *rebuilt = calloc(existing_length + 1U, sizeof(*rebuilt));
+    if (!rebuilt) {
+        RegCloseKey(environment);
+        free(existing);
+        free(wide_dir);
+        return CLI_ERR;
+    }
+    size_t out = 0;
+    bool removed = false;
+    bool wrote_segment = false;
+    const wchar_t *cursor = existing;
+    while (*cursor) {
+        const wchar_t *separator = wcschr(cursor, L';');
+        size_t length = separator ? (size_t)(separator - cursor) : wcslen(cursor);
+        if (cli_windows_path_segment_equal(cursor, length, wide_dir)) {
+            removed = true;
+        } else {
+            if (wrote_segment) {
+                rebuilt[out++] = L';';
+            }
+            memcpy(rebuilt + out, cursor, length * sizeof(*rebuilt));
+            out += length;
+            wrote_segment = true;
+        }
+        cursor = separator ? separator + 1 : cursor + length;
+    }
+    rebuilt[out] = L'\0';
+
+    if (!removed) {
+        RegCloseKey(environment);
+        free(rebuilt);
+        free(existing);
+        free(wide_dir);
+        return CLI_TRUE;
+    }
+    if (dry_run) {
+        RegCloseKey(environment);
+        free(rebuilt);
+        free(existing);
+        free(wide_dir);
+        return CLI_OK;
+    }
+    DWORD output_bytes = (DWORD)((out + 1U) * sizeof(*rebuilt));
+    LONG stored =
+        RegSetValueExW(environment, L"Path", 0, type, (const BYTE *)rebuilt, output_bytes);
+    RegCloseKey(environment);
+    free(rebuilt);
+    free(existing);
+    free(wide_dir);
+    if (stored != ERROR_SUCCESS) {
+        return CLI_ERR;
+    }
+    return CLI_OK;
+}
+
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Thin seams so the hermetic Windows PATH unit test can drive the append and
+ * remove logic against a GUID-scoped scratch key (the CBM_TEST_WINDOWS_USER_
+ * PATH_RUN_ID seam) without touching the developer's live HKCU PATH. */
+int cbm_cli_ensure_windows_user_path_for_test(const char *bin_dir, bool dry_run) {
+    return cli_ensure_windows_user_path(bin_dir, dry_run);
+}
+int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run) {
+    return cli_remove_windows_user_path(bin_dir, dry_run);
+}
+#endif
 
 #endif
 
@@ -7822,7 +7940,9 @@ static bool prepare_config_parent(const char *path) {
         return slash != NULL;
     }
     *slash = '\0';
-    return cbm_mkdir_p(parent, CLI_OCTAL_PERM);
+    /* Agent roots live under HOME / XDG / the client's own config-dir
+     * variable, so a symlink the user owns on the way is followed (#1722). */
+    return cbm_mkdir_p_ex(parent, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
 }
 
 typedef struct {
@@ -8048,6 +8168,24 @@ static bool install_generic_agent_config(const char *label, const char *binary_p
         printf("  instructions: %s\n", instr_path);
     }
     return mcp_installed;
+}
+
+static bool install_codex_activation_pointer(const char *path, bool dry_run) {
+    if (!path) {
+        return false;
+    }
+    if (g_install_plan) {
+        plan_record("Codex CLI", "instructions", path);
+        return true;
+    }
+    return dry_run || cbm_upsert_instructions(path, codex_instructions_content) == CLI_OK;
+}
+
+static void report_codex_activation_pointer_install(const char *path, bool installed) {
+    printf("  instructions: %s (managed activation pointer)\n", path);
+    if (!installed) {
+        record_agent_config_error(false, "Codex CLI", "instructions_install", path);
+    }
 }
 
 static void install_windsurf_config(const char *binary_path, const char *config_path,
@@ -8362,7 +8500,7 @@ static void install_copilot_durable_context(const char *home, const char *binary
         return;
     }
     bool hook_ok = true;
-    if (!dry_run && (!cbm_mkdir_p(hooks_dir, CLI_OCTAL_PERM) ||
+    if (!dry_run && (!cbm_mkdir_p_ex(hooks_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED) ||
                      cbm_upsert_copilot_hooks(binary_path, hook_path) != CLI_OK)) {
         hook_ok = false;
         record_agent_config_error(false, "Copilot", "lifecycle_hook_install", hook_path);
@@ -8993,6 +9131,8 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        /* A broken hook config must not keep legacy full guidance active. */
+        bool pointer_installed = install_codex_activation_pointer(ip, dry_run);
         char command[CLI_BUF_8K];
         char command_windows[CLI_BUF_8K];
         char hooks_json[CLI_BUF_1K];
@@ -9020,10 +9160,16 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
             record_agent_config_error_with_reason(
                 false, "Codex CLI", commands_ok ? "hook_preflight" : "hook_command_build", cp,
                 reason);
+            if (!g_install_plan) {
+                report_codex_activation_pointer_install(ip, pointer_installed);
+            }
             goto codex_install_done;
         }
-        install_generic_agent_config("Codex CLI", binary_path, cp, ip, dry_run,
+        install_generic_agent_config("Codex CLI", binary_path, cp, NULL, dry_run,
                                      cbm_upsert_codex_mcp);
+        if (!g_install_plan) {
+            report_codex_activation_pointer_install(ip, pointer_installed);
+        }
         install_agent_skill("Codex CLI", skills_dir, force, dry_run);
         install_tiered_agent_profiles(
             (cbm_tiered_profile_set_t){
@@ -9108,7 +9254,7 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
         if (!dry_run && !g_install_plan) {
             char cfg_dir[CLI_BUF_1K];
             snprintf(cfg_dir, sizeof(cfg_dir), "%s/.gemini/config", home);
-            cbm_mkdir_p(cfg_dir, CLI_OCTAL_PERM);
+            cbm_mkdir_p_ex(cfg_dir, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
         }
         install_generic_agent_config("Antigravity", binary_path, cp, ip, dry_run,
                                      cbm_upsert_antigravity_mcp);
@@ -9417,7 +9563,7 @@ static void install_editor_agent_configs(const cbm_detected_agents_t *agents, co
         snprintf(skills_dir, sizeof(skills_dir), "%s/.junie/skills", home);
         snprintf(agent_path, sizeof(agent_path), "%s/.junie/agents/codebase-memory.md", home);
         if (!dry_run && !g_install_plan) {
-            cbm_mkdir_p(sd, CLI_OCTAL_PERM);
+            cbm_mkdir_p_ex(sd, CLI_OCTAL_PERM, CBM_MKDIR_FOLLOW_OWNED);
         }
         bool direct_profiles_ready = install_generic_agent_config("Junie", binary_path, cp, NULL,
                                                                   dry_run, cbm_upsert_junie_mcp);
@@ -10949,6 +11095,17 @@ static void uninstall_agent_mcp_instr(mcp_uninstall_args_t paths, bool dry_run,
     }
 }
 
+static bool uninstall_codex_activation_pointer(const char *path, bool dry_run) {
+    return path && (dry_run || cbm_remove_instructions(path) == CLI_OK);
+}
+
+static void report_codex_activation_pointer_uninstall(const char *path, bool removed) {
+    printf("  instructions: removed managed activation pointer\n");
+    if (!removed) {
+        record_agent_config_error(true, "Codex CLI", "instructions_uninstall", path);
+    }
+}
+
 static void uninstall_agent_skill(const char *label, const char *skills_dir, bool dry_run) {
     int removed = cbm_remove_skills(skills_dir, dry_run);
     printf("  %s skill: %d removed\n", label, removed);
@@ -11383,6 +11540,7 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
         snprintf(ip, sizeof(ip), "%s/AGENTS.md", config_dir);
         snprintf(skills_dir, sizeof(skills_dir), "%s/skills", config_dir);
         snprintf(ap, sizeof(ap), "%s/agents/codebase-memory.toml", config_dir);
+        bool pointer_removed = uninstall_codex_activation_pointer(ip, dry_run);
         cbm_agent_installed_binary_path(home, installed_binary, sizeof(installed_binary));
         char hook_command[CLI_BUF_8K];
         char hook_command_windows[CLI_BUF_8K];
@@ -11403,10 +11561,12 @@ static void uninstall_cli_agents(const cbm_detected_agents_t *agents, const char
                                      ? NULL
                                      : cbm_toml_codex_hook_failure_name(preflight_failure);
             record_agent_config_error_with_reason(true, "Codex CLI", "hook_preflight", cp, reason);
+            report_codex_activation_pointer_uninstall(ip, pointer_removed);
             goto codex_toml_done;
         }
-        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, ip}, dry_run,
+        uninstall_agent_mcp_instr((mcp_uninstall_args_t){"Codex CLI", cp, NULL}, dry_run,
                                   cbm_remove_codex_mcp_owned);
+        report_codex_activation_pointer_uninstall(ip, pointer_removed);
         if (!dry_run &&
             cbm_reconcile_codex_hooks_command(cp, hook_command, hook_command_windows,
                                               CBM_TOML_CODEX_HOOK_REMOVE, false) != CLI_OK) {
@@ -12047,6 +12207,43 @@ static int cli_uninstall_activate(void *opaque) {
                               "and index removal were not started\n");
         return CLI_ACTIVATION_PARTIAL;
     }
+
+#ifdef _WIN32
+    /* #2117: install registers the install directory in the persistent
+     * current-user PATH; uninstall must take it back out, or every cycle leaves
+     * a stale entry and the PATH grows without bound. Remove only our segment.
+     * A registry hiccup here is a warning, never a hard failure: the user is
+     * removing the tool and must not be blocked from finishing over a cosmetic
+     * PATH edit. Suppress the mutation under the test-ops seam exactly as
+     * install does, so the CLI suite never touches the developer's real PATH. */
+    if (activation->bin_path && activation->bin_path[0]) {
+        const char *slash = strrchr(activation->bin_path, '/');
+        const char *backslash = strrchr(activation->bin_path, '\\');
+        if (backslash && (!slash || backslash > slash)) {
+            slash = backslash;
+        }
+        if (slash && slash != activation->bin_path) {
+            size_t dir_len = (size_t)(slash - activation->bin_path);
+            char bin_dir[CLI_BUF_1K];
+            if (dir_len < sizeof(bin_dir)) {
+                memcpy(bin_dir, activation->bin_path, dir_len);
+                bin_dir[dir_len] = '\0';
+                int path_rc = cli_remove_windows_user_path(
+                    bin_dir, activation->dry_run || g_cli_activation_test_ops_set);
+                if (path_rc == CLI_OK) {
+                    printf(activation->dry_run ? "\nWould remove %s from the current-user PATH\n"
+                                               : "\nRemoved %s from the current-user PATH\n",
+                           bin_dir);
+                } else if (path_rc == CLI_ERR) {
+                    (void)fprintf(stderr,
+                                  "warning: could not update the current-user PATH; %s may "
+                                  "remain on it\n",
+                                  bin_dir);
+                }
+            }
+        }
+    }
+#endif
 
     if (activation->delete_indexes && !activation->dry_run) {
         int expected = count_db_indexes(activation->home);
@@ -13235,6 +13432,18 @@ char *cbm_cli_build_args_json(const char *tool_name, int argc, char **argv, char
     return result;
 }
 
+static void cli_print_schema_value(const yyjson_val *value) {
+    if (yyjson_is_str(value)) {
+        fputs(yyjson_get_str(value), stdout);
+        return;
+    }
+    char *json = yyjson_val_write(value, 0, NULL);
+    if (json) {
+        fputs(json, stdout);
+        free(json);
+    }
+}
+
 int cbm_cli_print_tool_help(const char *tool_name) {
     const char *schema_str = cbm_mcp_tool_input_schema(tool_name);
     if (!schema_str) {
@@ -13265,6 +13474,8 @@ int cbm_cli_print_tool_help(const char *tool_name) {
             }
             const char *type = "string";
             const char *desc = "";
+            yyjson_val *choices = NULL;
+            yyjson_val *default_value = NULL;
             if (yyjson_is_obj(pval)) {
                 yyjson_val *t = yyjson_obj_get(pval, "type");
                 if (t && yyjson_is_str(t)) {
@@ -13274,12 +13485,36 @@ int cbm_cli_print_tool_help(const char *tool_name) {
                 if (d && yyjson_is_str(d)) {
                     desc = yyjson_get_str(d);
                 }
+                choices = yyjson_obj_get(pval, "enum");
+                default_value = yyjson_obj_get(pval, "default");
             }
             char flag[CLI_BUF_256];
             snprintf(flag, sizeof(flag), "%s", name);
             cli_snake_to_kebab(flag);
             bool req = cli_schema_required_has(required, name);
-            printf("  --%s <%s>%s", flag, type, req ? " [required]" : "");
+            printf("  --%s <", flag);
+            if (choices && yyjson_is_arr(choices) && yyjson_arr_size(choices) > 0) {
+                size_t idx;
+                size_t max;
+                yyjson_val *choice;
+                yyjson_arr_foreach(choices, idx, max, choice) {
+                    if (idx > 0) {
+                        fputc('|', stdout);
+                    }
+                    cli_print_schema_value(choice);
+                }
+            } else {
+                fputs(type, stdout);
+            }
+            fputc('>', stdout);
+            if (req) {
+                fputs(" [required]", stdout);
+            }
+            if (default_value) {
+                fputs(" [default: ", stdout);
+                cli_print_schema_value(default_value);
+                fputc(']', stdout);
+            }
             if (desc[0]) {
                 printf("  %s", desc);
             }
