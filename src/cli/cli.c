@@ -215,6 +215,12 @@ typedef struct {
     bool cleanup_ok;
     bool original_cache_environment_present;
     bool cache_environment_overridden;
+    /* Scope: what THIS activation replaces decides whether any session must
+     * be quiesced at all, and the target cache namespace decides WHICH
+     * cohort. A skipped coordination holds no lock and drains nobody. */
+    bool quiesce_required;
+    bool coordination_skipped;
+    char scope_detail[CBM_SZ_1K];
 } cli_activation_production_context_t;
 
 static cbm_cli_activation_ops_t g_cli_activation_test_ops;
@@ -531,6 +537,91 @@ static void cli_activation_release_cleanup_lease(cli_activation_production_conte
     }
 }
 
+typedef enum {
+    CLI_ACTIVATION_SCOPE_ACTIVE = 0,
+    CLI_ACTIVATION_SCOPE_NOTHING_TO_REPLACE,
+    CLI_ACTIVATION_SCOPE_FOREIGN_COHORT,
+    CLI_ACTIVATION_SCOPE_ERROR,
+} cli_activation_scope_t;
+
+static void cli_activation_log_guard_decision(const cli_activation_production_context_t *context,
+                                              const char *decision, const char *active_cache) {
+    char clients[32];
+    (void)snprintf(clients, sizeof(clients), "%llu",
+                   (unsigned long long)context->daemon_result.active_clients);
+    const char *scope = cbm_daemon_ipc_endpoint_runtime_dir(context->endpoint);
+    cbm_log_info("activation.guard", "scope", scope ? scope : "", "cache",
+                 context->cache_fingerprint, "clients", clients, "decision", decision,
+                 "active_cache", active_cache ? active_cache : "");
+}
+
+/* Whose sessions does this activation have to stop? The rendezvous directory
+ * is per OS account (service.h), so the host daemon of another HOME /
+ * CBM_CACHE_DIR meets this activation at the very same endpoint; only the
+ * cache fingerprint in the cohort identity separates the namespaces. An
+ * `install` into a sandbox HOME used to drain the host daemon and every MCP
+ * client behind it although nothing it touched belonged to the host.
+ *
+ * Two questions, answered from the activation's own target: does it replace
+ * anything at all (a --skip-binary install without an index reset publishes
+ * nothing), and whose cohort is active. Admission with an immediate deadline
+ * is the cheapest authoritative read of the active lifetime record: OK means
+ * the cohort is ours or empty, CONFLICT names the active identity (its cache
+ * fingerprint is filled for every conflict kind), BUSY means another
+ * activation holds maintenance and the barrier waits for it as before. */
+static cli_activation_scope_t cli_activation_resolve_scope(
+    cli_activation_production_context_t *context) {
+    const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(context->endpoint);
+    const char *scope = runtime_dir ? runtime_dir : "";
+    const char *action = cli_activation_action_text(context->action);
+    if (!context->quiesce_required) {
+        (void)snprintf(context->scope_detail, sizeof(context->scope_detail),
+                       "nothing to quiesce: published binary and indexes unchanged; scope=%s",
+                       scope);
+        cli_activation_log_guard_decision(context, "nothing_to_replace", NULL);
+        printf("No CBM session needs to stop for %s: the published binary and indexes are "
+               "unchanged.\n",
+               action);
+        (void)fflush(stdout);
+        return CLI_ACTIVATION_SCOPE_NOTHING_TO_REPLACE;
+    }
+    cbm_version_cohort_lease_t *lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    memset(&conflict, 0, sizeof(conflict));
+    cbm_version_cohort_status_t status = cbm_version_cohort_acquire(
+        context->cohort_manager, &context->identity, cbm_now_ms(), &lease, &conflict);
+    cli_activation_release_cleanup_lease(context, &lease);
+    if (lease) {
+        return CLI_ACTIVATION_SCOPE_ERROR;
+    }
+    switch (status) {
+    case CBM_VERSION_COHORT_OK:
+    case CBM_VERSION_COHORT_BUSY:
+        return CLI_ACTIVATION_SCOPE_ACTIVE;
+    case CBM_VERSION_COHORT_CONFLICT:
+        break;
+    default:
+        return CLI_ACTIVATION_SCOPE_ERROR;
+    }
+    if (!conflict.active_cache_fingerprint[0] ||
+        strcmp(conflict.active_cache_fingerprint, context->cache_fingerprint) == 0) {
+        /* Same cache namespace, another build or version: that IS the daemon
+         * this activation replaces. An unreadable active cache stays in scope
+         * rather than silently exempting a same-namespace daemon. */
+        return CLI_ACTIVATION_SCOPE_ACTIVE;
+    }
+    (void)snprintf(context->scope_detail, sizeof(context->scope_detail),
+                   "active cohort serves another cache namespace (%.12s), this %s targets "
+                   "%.12s; scope=%s; nothing stopped",
+                   conflict.active_cache_fingerprint, action, context->cache_fingerprint, scope);
+    cli_activation_log_guard_decision(context, "foreign_cohort", conflict.active_cache_fingerprint);
+    printf("Leaving active CBM sessions untouched: they serve another cache namespace than "
+           "this %s targets.\n",
+           action);
+    (void)fflush(stdout);
+    return CLI_ACTIVATION_SCOPE_FOREIGN_COHORT;
+}
+
 static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lock_t *lease_out) {
     cli_activation_production_context_t *context = opaque;
     if (lease_out) {
@@ -539,6 +630,26 @@ static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lo
     if (!context || !context->cohort_manager || !lease_out) {
         return CLI_ERR;
     }
+    cli_activation_scope_t scope = cli_activation_resolve_scope(context);
+    if (scope == CLI_ACTIVATION_SCOPE_ERROR) {
+        return CLI_ERR;
+    }
+    if (scope != CLI_ACTIVATION_SCOPE_ACTIVE) {
+        /* Nothing in the target namespace is being replaced, or the only
+         * active cohort serves another namespace: hold no maintenance,
+         * admission, lifetime or startup lock (each wakes or blocks the other
+         * namespace's sessions) and send no drain request. */
+        if (!cli_activation_log_event(context, "quiesce_skipped", context->scope_detail)) {
+            return CLI_ERR;
+        }
+        context->coordination_skipped = true;
+        context->mutation_authorized = true;
+        *lease_out = context;
+        return 1;
+    }
+    printf("Stopping active CBM sessions and operations for %s...\n",
+           cli_activation_action_text(context->action));
+    (void)fflush(stdout);
     cbm_version_cohort_quiesce_result_t quiesce = CBM_VERSION_COHORT_QUIESCE_NOT_NEEDED;
     cbm_version_cohort_lease_t *lease = NULL;
     context->control_deadline_ms = cli_activation_deadline_after(CLI_ACTIVATION_CONTROL_TIMEOUT_MS);
@@ -585,6 +696,8 @@ static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lo
     }
 
     context->cohort_lease = lease;
+    cli_activation_log_guard_decision(
+        context, context->shutdown_requested ? "cohort_drained" : "no_active_cohort", NULL);
     if (!cli_activation_log_event(context, "daemon_stopped",
                                   context->shutdown_requested ? "cohort drained"
                                                               : "no active cohort")) {
@@ -601,6 +714,13 @@ static int cli_activation_production_reserve(void *opaque, cbm_cli_activation_lo
 static void cli_activation_production_release(void *opaque, cbm_cli_activation_lock_t lease) {
     cli_activation_production_context_t *context = opaque;
     if (!context) {
+        return;
+    }
+    if (context->coordination_skipped) {
+        /* Nothing was held: the token is the context itself. */
+        if (lease != (cbm_cli_activation_lock_t)context) {
+            context->cleanup_ok = false;
+        }
         return;
     }
     /* Global release order is the inverse of acquisition: startup first,
@@ -629,9 +749,11 @@ static void cli_activation_production_diagnostic(void *opaque, const char *messa
 static bool cli_activation_production_context_init(cli_activation_production_context_t *context,
                                                    cbm_daemon_runtime_activation_action_t action,
                                                    const char *target_version,
-                                                   const char *target_build) {
+                                                   const char *target_build,
+                                                   bool quiesce_required) {
     memset(context, 0, sizeof(*context));
     context->action = action;
+    context->quiesce_required = quiesce_required;
     context->target_version = target_version;
     context->target_build = target_build;
     context->cleanup_ok = true;
@@ -738,16 +860,22 @@ static void cli_activation_production_context_close(cli_activation_production_co
     context->original_cache_environment = NULL;
 }
 
-static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
-                                const char *target_version, const char *target_build,
-                                cbm_cli_activation_mutation_fn mutation, void *mutation_context) {
+/* quiesce_required: false when the activation publishes no binary and resets
+ * no index (a config-only install) — nothing running is then replaced, and
+ * no session is stopped for it. */
+static int cli_activation_guard_scoped(cbm_daemon_runtime_activation_action_t action,
+                                       const char *target_version, const char *target_build,
+                                       bool quiesce_required,
+                                       cbm_cli_activation_mutation_fn mutation,
+                                       void *mutation_context) {
     if (g_cli_activation_test_ops_set) {
         return cbm_cli_activation_guard_with_ops(&g_cli_activation_test_ops, mutation,
                                                  mutation_context);
     }
 
     cli_activation_production_context_t context;
-    if (!cli_activation_production_context_init(&context, action, target_version, target_build)) {
+    if (!cli_activation_production_context_init(&context, action, target_version, target_build,
+                                                quiesce_required)) {
         cli_activation_production_context_close(&context);
         /* #1856: this refusal used to print the generic text BARE. Every other
          * emitter routes through cli_activation_diagnostic, which appends the
@@ -760,9 +888,6 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
         cli_activation_diagnostic(NULL, CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
-    printf("Stopping active CBM sessions and operations for %s...\n",
-           cli_activation_action_text(action));
-    (void)fflush(stdout);
     if (!cli_activation_log_event(&context, "requested", NULL)) {
         cli_activation_production_context_close(&context);
         (void)fprintf(stderr, "error: activation request could not be recorded safely; "
@@ -802,6 +927,13 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
         return CLI_TRUE;
     }
     return rc;
+}
+
+static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
+                                const char *target_version, const char *target_build,
+                                cbm_cli_activation_mutation_fn mutation, void *mutation_context) {
+    return cli_activation_guard_scoped(action, target_version, target_build, true, mutation,
+                                       mutation_context);
 }
 
 /* Tar header field offsets */
@@ -11203,11 +11335,16 @@ int cbm_cmd_install(int argc, char **argv) {
         .force = force,
         .dry_run = dry_run,
     };
-    int activation_rc =
-        dry_run ? cli_install_activate(&activation)
-                : cli_activation_guard(CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL, CBM_VERSION,
-                                       has_binary_validator ? binary_validator.fingerprint : NULL,
-                                       cli_install_activate, &activation);
+    /* What this install replaces decides whether any session must stop: with
+     * the published binary untouched (--skip-binary, or an externally managed
+     * binary) and no index reset, agent configs are refreshed while every
+     * session stays up. */
+    bool quiesce_required = has_binary_validator || delete_indexes;
+    int activation_rc = dry_run ? cli_install_activate(&activation)
+                                : cli_activation_guard_scoped(
+                                      CBM_DAEMON_RUNTIME_ACTIVATION_INSTALL, CBM_VERSION,
+                                      has_binary_validator ? binary_validator.fingerprint : NULL,
+                                      quiesce_required, cli_install_activate, &activation);
     if (activation.binary_transaction) {
         (void)cli_activation_transaction_abort(&activation.binary_transaction);
     }

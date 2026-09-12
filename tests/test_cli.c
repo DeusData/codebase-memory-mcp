@@ -23,7 +23,9 @@
 #include <foundation/constants.h>
 #include <foundation/log.h>
 #include <foundation/platform.h>
+#include <foundation/sha256.h>
 #include <mcp/mcp.h>
+#include <mcp/index_supervisor.h>
 #include <pipeline/pipeline.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
@@ -39,6 +41,8 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -47,6 +51,12 @@
 #include <limits.h>
 #include <wchar.h> /* wcscmp/wcslen/swprintf for the Windows user-PATH test (#2117) */
 #include <zlib.h>
+
+/* Same guarded fallback every product TU carries; CI injects the real value
+ * through CFLAGS_EXTRA for product objects and test objects alike. */
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
 
 /* Internal prompt seam used to restore process-global state after command
  * tests that exercise --yes. */
@@ -1272,6 +1282,23 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         test_rmdir_r(tmpdir);
         FAIL("runtime parent setup failed");
     }
+    /* The participant models the daemon of THIS namespace: its cohort
+     * identity carries the fingerprint of the cache the install below
+     * targets, derived as main.c derives it. A foreign cache would (rightly)
+     * be left alone by the scoped guard. */
+    char participant_cache[512];
+    char participant_cache_canonical[1024];
+    char participant_cache_fingerprint[CBM_SHA256_HEX_LEN + 1] = {0};
+    snprintf(participant_cache, sizeof(participant_cache), "%s/cache", tmpdir);
+    if (!cbm_mkdir_p(participant_cache, 0700) ||
+        !cbm_canonical_path(participant_cache, participant_cache_canonical,
+                            sizeof(participant_cache_canonical))) {
+        test_rmdir_r(tmpdir);
+        FAIL("participant cache setup failed");
+    }
+    cbm_normalize_path_sep(participant_cache_canonical);
+    cbm_sha256_hex(participant_cache_canonical, strlen(participant_cache_canonical),
+                   participant_cache_fingerprint);
     int ready_pipe[2] = {-1, -1};
     if (pipe(ready_pipe) != 0) {
         test_rmdir_r(tmpdir);
@@ -1287,7 +1314,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         cbm_daemon_build_identity_t identity = {
             .semantic_version = "cli-activation-test",
             .build_fingerprint = fingerprint,
-            .cache_fingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            .cache_fingerprint = participant_cache_fingerprint,
             .protocol_abi = CBM_DAEMON_RUNTIME_WIRE_ABI,
             .store_abi = 1,
             .feature_abi = 1,
@@ -1521,6 +1548,493 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
     ASSERT_TRUE(event_order);
     ASSERT_TRUE(socket_removed);
     ASSERT_TRUE(anchor_removed);
+    PASS();
+}
+/* ── Activation-guard namespace scope (2026-09-08) ──────────────────
+ * The rendezvous directory is per OS ACCOUNT, never per HOME (service.h):
+ * every daemon of one user meets at one endpoint, and the cohort identity's
+ * cache fingerprint is what separates one HOME / CBM_CACHE_DIR namespace
+ * from another. An `install` into a second HOME (a sandbox, a second
+ * profile) therefore reaches the LIVE host daemon at the shared endpoint —
+ * and used to drain it, disconnecting every MCP client, although nothing
+ * that install touched belonged to the host namespace.
+ *
+ * The fixture models the host the way host.c builds it: a forked process
+ * that admits itself to the cohort with the host cache fingerprint, runs a
+ * real runtime service at the shared endpoint, and exits (releasing the
+ * cohort lease LAST, the real teardown order) once that service has been
+ * drained. The parent keeps one committed client connected to it across the
+ * install under test and asks the daemon itself afterwards. */
+#define CLI_SCOPE_HOST_DRAINED 3
+#define CLI_SCOPE_TIMEOUT_MS 5000U
+/* Generous, BOUNDED waits so a wedged host child (a fork-time sanitizer
+ * allocator stall is the classic cause — see the posix_spawn fix history)
+ * fails the test cleanly instead of hanging the whole suite to the CI
+ * wall-clock kill. Each comfortably exceeds the child's own 45 s cohort
+ * admission deadline plus a multi-second service start/teardown, so none trips
+ * for a merely slow-but-healthy runner; they only convert an otherwise
+ * unbounded hang into a deterministic pass/fail. */
+#define CLI_SCOPE_READY_TIMEOUT_MS 90000U
+#define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
+#define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
+/* Teardown budget for a child the activation ALREADY drained: its service is
+ * gone, so each free/release succeeds immediately and this is only the
+ * give-up point if one unexpectedly does not. The undrained path keeps the
+ * full 2 x CLI_SCOPE_TIMEOUT_MS, which is where a wedged teardown is real. */
+#define CLI_SCOPE_CLEANUP_DRAINED_MS 1000U
+/* Budget for probing that an ALREADY-drained host has stopped serving.
+ *
+ * The generous CLI_SCOPE_HOST_SERVING_TIMEOUT_MS exists for the POSITIVE
+ * question -- "is this daemon still up?" -- where a slow reply on a loaded
+ * runner must not be misread as drained. Asked in the negative it inverts:
+ * there is no reply coming, so the whole budget is spent proving silence, and
+ * the assertion is decided by a timeout expiring rather than by the system's
+ * own behaviour. That was 15 s of the drain test's wall clock and the largest
+ * single idle block in the cli suite.
+ *
+ * The drain is proven POSITIVELY elsewhere in that test: install returns 0
+ * only after the activation completed, and the host child exits with
+ * CLI_SCOPE_HOST_DRAINED. By the time this probe runs the daemon is already
+ * gone, so a short budget confirms the same fact a long one would -- it just
+ * stops charging the suite for the wait. */
+#define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
+
+typedef struct {
+    char tmpdir[256];
+    char runtime_parent[512];
+    char host_home[512];
+    char host_cache[512];
+    char host_cache_fingerprint[CBM_SHA256_HEX_LEN + 1];
+    char self_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char previous_supervisor_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char conflict_log[640];
+    cbm_daemon_build_identity_t identity;
+    cbm_daemon_ipc_endpoint_t *endpoint;
+    cbm_daemon_runtime_client_t *client;
+    pid_t host;
+    int release_fd;
+    char *old_home;
+    char *old_cache;
+    char *old_shell;
+} cli_scope_fixture_t;
+
+static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, int ready_fd,
+                                           int release_fd) {
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
+    cbm_version_cohort_manager_t *manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_version_cohort_lease_t *lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    cbm_daemon_runtime_service_t *service = NULL;
+    bool admitted = endpoint && manager &&
+                    cbm_version_cohort_acquire(manager, &fixture->identity, cbm_now_ms() + 45000U,
+                                               &lease, &conflict) == CBM_VERSION_COHORT_OK;
+    if (admitted) {
+        cbm_daemon_runtime_service_config_t config = {
+            .endpoint = endpoint,
+            .identity = fixture->identity,
+            .conflict_log_path = fixture->conflict_log,
+            .conflict_log_cap_bytes = 64U * 1024U,
+            .max_clients = 8,
+            .lease_timeout_ms = CLI_SCOPE_TIMEOUT_MS,
+            .request_timeout_ms = CLI_SCOPE_TIMEOUT_MS,
+            .shutdown_timeout_ms = CLI_SCOPE_TIMEOUT_MS,
+            /* Born permanent: only a drain/stop ends it, never the parent's
+             * client leaving, so "still alive" is a statement about the
+             * drain alone. */
+            .permanent = true,
+        };
+        service = cbm_daemon_runtime_service_start(&config);
+    }
+    bool ready_ok =
+        service && cbm_daemon_runtime_service_state(service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    char ready = ready_ok ? 'R' : 'E';
+    (void)write(ready_fd, &ready, 1);
+    close(ready_fd);
+    bool drained = false;
+    uint64_t deadline = cbm_now_ms() + 120000U;
+    while (ready_ok && cbm_now_ms() < deadline) {
+        if (cbm_daemon_runtime_service_wait_exited(service, 50U)) {
+            drained = true;
+            break;
+        }
+        struct pollfd release_poll = {.fd = release_fd, .events = POLLIN, .revents = 0};
+        if (poll(&release_poll, 1, 0) > 0) {
+            break;
+        }
+    }
+    /* A DRAINED child has already had its service torn down by the activation,
+     * so every teardown below succeeds on the first attempt; the long deadline
+     * exists for the wedged case, where we keep retrying before giving up. On
+     * the drained path that budget was pure wall clock -- the parent sits in
+     * cli_scope_reap_host waiting for this exit, and it was the single largest
+     * idle block in the whole cli suite. Behaviour at the deadline is
+     * unchanged (give up and _exit); it is simply reached sooner when there is
+     * nothing wedged to wait for. */
+    uint64_t cleanup_deadline =
+        cbm_now_ms() + (drained ? CLI_SCOPE_CLEANUP_DRAINED_MS : 2U * CLI_SCOPE_TIMEOUT_MS);
+    if (service) {
+        if (!drained) {
+            (void)cbm_daemon_runtime_service_stop(service, CLI_SCOPE_TIMEOUT_MS);
+        }
+        while (!cbm_daemon_runtime_service_free(service) && cbm_now_ms() < cleanup_deadline) {
+            cbm_usleep(1000);
+        }
+    }
+    while (lease && cbm_version_cohort_lease_release(&lease) != CBM_PRIVATE_FILE_LOCK_OK &&
+           cbm_now_ms() < cleanup_deadline) {
+        cbm_usleep(1000);
+    }
+    while (manager && cbm_version_cohort_manager_free(&manager) != CBM_PRIVATE_FILE_LOCK_OK &&
+           cbm_now_ms() < cleanup_deadline) {
+        cbm_usleep(1000);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    close(release_fd);
+    _exit(!ready_ok ? 1 : drained ? CLI_SCOPE_HOST_DRAINED : 0);
+}
+
+/* Bounded read of the host child's one-byte readiness signal. A child that
+ * deadlocks before it can write (a fork-time allocator stall under a sanitizer
+ * is the classic cause) must never hang the whole suite on an unbounded read:
+ * poll to a generous deadline, then let the caller's ASSERT_TRUE(ready) fail
+ * cleanly. Returns the byte, or 0 when the child died, closed the pipe, or
+ * never answered in time. */
+static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    for (;;) {
+        int64_t remaining = (int64_t)deadline - (int64_t)cbm_now_ms();
+        if (remaining <= 0) {
+            return 0;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int r = poll(&pfd, 1, (int)remaining);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return 0;
+        }
+        if (r == 0) {
+            return 0; /* deadline reached with no signal */
+        }
+        char ready = 0;
+        ssize_t got = read(fd, &ready, 1);
+        if (got == 1) {
+            return ready;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        return 0; /* EOF (child gone) or error */
+    }
+}
+
+/* Reap the host child within a bound: the release signal makes a healthy child
+ * break within ~50 ms and finish teardown in a few seconds, so a child still
+ * alive past the deadline is wedged — SIGKILL it and reap so the suite always
+ * makes progress. Returns the child's exit code, or -1 when it had to be
+ * killed or did not exit cleanly; a -1 fails the caller's host_exit assertion
+ * cleanly rather than hanging. */
+static int cli_scope_reap_host(pid_t host, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    int status = 0;
+    for (;;) {
+        pid_t reaped = waitpid(host, &status, WNOHANG);
+        if (reaped == host) {
+            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (reaped < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (cbm_now_ms() >= deadline) {
+            (void)kill(host, SIGKILL);
+            (void)waitpid(host, &status, 0);
+            return -1;
+        }
+        cbm_usleep(2000);
+    }
+}
+
+static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *tag) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->host = -1;
+    fixture->release_fd = -1;
+    snprintf(fixture->tmpdir, sizeof(fixture->tmpdir), "/tmp/cli-guard-scope-%s-XXXXXX", tag);
+    if (!cbm_mkdtemp(fixture->tmpdir)) {
+        return false;
+    }
+    snprintf(fixture->runtime_parent, sizeof(fixture->runtime_parent), "%s/runtime",
+             fixture->tmpdir);
+    snprintf(fixture->host_home, sizeof(fixture->host_home), "%s/host", fixture->tmpdir);
+    snprintf(fixture->host_cache, sizeof(fixture->host_cache), "%s/cache", fixture->host_home);
+    snprintf(fixture->conflict_log, sizeof(fixture->conflict_log), "%s/conflicts.ndjson",
+             fixture->host_home);
+    /* The host identity's cache fingerprint is derived exactly as main.c does
+     * for a real daemon: resolved dir -> canonical path -> SHA-256. */
+    char canonical_cache[1024];
+    if (test_mkdirp(fixture->runtime_parent) != 0 || !cbm_mkdir_p(fixture->host_cache, 0700) ||
+        !cbm_canonical_path(fixture->host_cache, canonical_cache, sizeof(canonical_cache))) {
+        return false;
+    }
+    cbm_normalize_path_sep(canonical_cache);
+    cbm_sha256_hex(canonical_cache, strlen(canonical_cache), fixture->host_cache_fingerprint);
+    if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fixture->self_build)) {
+        return false;
+    }
+    /* The guard claims the supervisor's captured build; the runner stubs that
+     * capture while a runtime service must carry the real image hash. Align
+     * the two for this fixture exactly as one production process has them. */
+    const char *previous_supervisor_build = cbm_index_supervisor_build_fingerprint();
+    snprintf(fixture->previous_supervisor_build, sizeof(fixture->previous_supervisor_build), "%s",
+             previous_supervisor_build ? previous_supervisor_build : "");
+    cbm_index_supervisor_set_build_fingerprint_for_test(fixture->self_build);
+    fixture->identity = (cbm_daemon_build_identity_t){
+        .semantic_version = CBM_VERSION,
+        .build_fingerprint = fixture->self_build,
+        .cache_fingerprint = fixture->host_cache_fingerprint,
+        .protocol_abi = CBM_DAEMON_RUNTIME_WIRE_ABI,
+        .store_abi = 1,
+        .feature_abi = 1,
+    };
+    int ready_pipe[2] = {-1, -1};
+    int release_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0) {
+        return false;
+    }
+    if (pipe(release_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return false;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(release_pipe[1]);
+        cli_scope_host_child(fixture, ready_pipe[1], release_pipe[0]);
+    }
+    close(ready_pipe[1]);
+    close(release_pipe[0]);
+    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0], CLI_SCOPE_READY_TIMEOUT_MS) : 0;
+    bool host_ready = ready == 'R';
+    close(ready_pipe[0]);
+    fixture->host = child;
+    fixture->release_fd = release_pipe[1];
+    cli_activation_save_env(&fixture->old_home, &fixture->old_cache);
+    const char *shell = getenv("SHELL");
+    fixture->old_shell = shell ? strdup(shell) : NULL;
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    if (!host_ready) {
+        return false;
+    }
+    fixture->endpoint = cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    fixture->client = fixture->endpoint
+                          ? cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
+                                                              CLI_SCOPE_TIMEOUT_MS, &connect_result)
+                          : NULL;
+    return fixture->client != NULL;
+}
+
+static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture,
+                                          uint32_t timeout_ms) {
+    cbm_daemon_runtime_status_t status = {0};
+    return fixture->endpoint &&
+           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
+                                             &status) &&
+           !status.stopping && status.committed_clients == 1;
+}
+
+/* Ask the host daemon itself: still running, not stopping, and the parent's
+ * committed client still admitted. */
+static bool cli_scope_host_serving(const cli_scope_fixture_t *fixture) {
+    /* A generous, bounded status deadline: a foreign-namespace install leaves
+     * this daemon serving, so a slow response on a loaded runner must not be
+     * misread as "drained" (the flaky failure this fixture showed). The call
+     * still fails cleanly — a genuinely drained daemon is unreachable or
+     * reports stopping — it just no longer decides survival on a 5 s budget. */
+    return cli_scope_host_serving_within(fixture, CLI_SCOPE_HOST_SERVING_TIMEOUT_MS);
+}
+
+static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, const char *cache,
+                             const char *bin_dir, bool skip_binary) {
+    cbm_setenv("HOME", home, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_cli_set_activation_runtime_parent_for_test(fixture->runtime_parent);
+    char dir_arg[704];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
+    char *install_argv[] = {skip_binary ? "--skip-binary" : "--force", "--skip-config", "--yes",
+                            dir_arg};
+    int rc = cli_test_cmd_install(4, install_argv);
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
+    cbm_set_auto_answer_for_test(0);
+    return rc;
+}
+
+/* Returns the host child's exit status: 0 released intact,
+ * CLI_SCOPE_HOST_DRAINED when an activation drained it, -1 unknown. */
+static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
+    if (fixture->client) {
+        (void)cbm_daemon_runtime_client_close(fixture->client, CLI_SCOPE_TIMEOUT_MS);
+        fixture->client = NULL;
+    }
+    if (fixture->release_fd >= 0) {
+        /* Closing the write end is the signal (the child's poll sees POLLHUP);
+         * a write would raise SIGPIPE once a drained child is already gone. */
+        close(fixture->release_fd);
+        fixture->release_fd = -1;
+    }
+    int host_exit = -1;
+    if (fixture->host > 0) {
+        host_exit = cli_scope_reap_host(fixture->host, CLI_SCOPE_HOST_REAP_TIMEOUT_MS);
+        fixture->host = -1;
+    }
+    cbm_daemon_ipc_endpoint_free(fixture->endpoint);
+    fixture->endpoint = NULL;
+    if (fixture->previous_supervisor_build[0]) {
+        cbm_index_supervisor_set_build_fingerprint_for_test(fixture->previous_supervisor_build);
+    }
+    if (fixture->old_shell) {
+        cbm_setenv("SHELL", fixture->old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(fixture->old_shell);
+    fixture->old_shell = NULL;
+    cli_activation_restore_env(fixture->old_home, fixture->old_cache);
+    fixture->old_home = NULL;
+    fixture->old_cache = NULL;
+    test_rmdir_r(fixture->tmpdir);
+    return host_exit;
+}
+
+static void cli_scope_foreign_paths(const cli_scope_fixture_t *fixture, char home[512],
+                                    char cache[576], char bin_dir[640], char activation_log[704]) {
+    snprintf(home, 512, "%s/sandbox", fixture->tmpdir);
+    snprintf(cache, 576, "%s/cache", home);
+    snprintf(bin_dir, 640, "%s/custom/bin", home);
+    snprintf(activation_log, 704, "%s/logs/activation-events.ndjson", cache);
+}
+
+/* (a) `HOME=<sandbox> install --skip-binary` — the observed incident shape:
+ * the sandbox shares the account rendezvous, its cache namespace differs. */
+TEST(cli_install_skip_binary_into_foreign_home_never_drains_host_cohort) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "skipbin");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    bool prepared = ready && cbm_mkdir_p(foreign_home, 0700);
+    int install_rc =
+        prepared ? cli_scope_install(&fixture, foreign_home, foreign_cache, foreign_bin, true) : -1;
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* (b) A full install (binary published into the sandbox bin dir) is scoped
+ * the same way: the host namespace is not what is being replaced. */
+TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "binary");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    char target_path[704];
+    snprintf(target_path, sizeof(target_path), "%s/codebase-memory-mcp", foreign_bin);
+    bool prepared = ready && cbm_mkdir_p(foreign_home, 0700);
+    int install_rc =
+        prepared ? cli_scope_install(&fixture, foreign_home, foreign_cache, foreign_bin, false)
+                 : -1;
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    struct stat target_status;
+    bool target_exists = stat(target_path, &target_status) == 0;
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(target_exists);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* (c) Regression: an install that replaces the binary inside the host's own
+ * namespace still drains that cohort — and the audit names its client. */
+TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "host");
+    char host_bin[640];
+    char activation_log[704];
+    snprintf(host_bin, sizeof(host_bin), "%s/custom/bin", fixture.host_home);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson",
+             fixture.host_cache);
+    int install_rc =
+        ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, host_bin, false)
+              : -1;
+    /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
+     * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
+    bool host_serving = ready && cli_scope_host_serving_within(&fixture,
+                                                               CLI_SCOPE_HOST_DRAINED_PROBE_MS);
+    const char *events = read_test_file(activation_log);
+    bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
+                          strstr(events, "\"daemon_active_clients\":1") != NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_FALSE(host_serving);
+    ASSERT_EQ(host_exit, CLI_SCOPE_HOST_DRAINED);
+    ASSERT_TRUE(drained_in_log);
+    PASS();
+}
+
+/* (d) `--skip-binary` with nothing to publish (no binary at the target, no
+ * index reset) replaces nothing, so even the host's own namespace has
+ * nothing to quiesce: agent configs are refreshed, sessions stay up. */
+TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "unchanged");
+    char absent_bin[640];
+    char activation_log[704];
+    snprintf(absent_bin, sizeof(absent_bin), "%s/absent/bin", fixture.host_home);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson",
+             fixture.host_cache);
+    int install_rc =
+        ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, absent_bin, true)
+              : -1;
+    bool host_serving = ready && cli_scope_host_serving(&fixture);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
     PASS();
 }
 #endif
@@ -15459,6 +15973,10 @@ SUITE(cli) {
     RUN_TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release);
     RUN_TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup);
     RUN_TEST(cli_install_recovers_markerless_stale_rendezvous);
+    RUN_TEST(cli_install_skip_binary_into_foreign_home_never_drains_host_cohort);
+    RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
+    RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
+    RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);

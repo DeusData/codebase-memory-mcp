@@ -76,6 +76,16 @@ void cbm_index_worker_log_begin(const char *args_json, const char *repo_path);
 bool cbm_index_supervisor_capture_build_fingerprint(void);
 const char *cbm_index_supervisor_build_fingerprint(void);
 
+#if defined(CBM_CLI_ENABLE_TEST_API)
+/* Test-only: the runner captures a synthetic stub (see the capture seam) so
+ * spawned workers start instantly, but a daemon runtime service can only carry
+ * the REAL image hash. A fixture that runs a real daemon and drives the
+ * production activation guard against it aligns the captured value with that
+ * hash for its duration and restores the previous value afterwards. Invalid
+ * input is ignored. Never compiled into production. */
+void cbm_index_supervisor_set_build_fingerprint_for_test(const char *fingerprint);
+#endif
+
 typedef struct {
     const char *expected_build_fingerprint;
     const char *args_json;
