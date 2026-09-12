@@ -38,6 +38,7 @@ enum {
 #include "foundation/mem.h"
 #include <sqlite3.h>
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h> // int64_t
 #include <stdio.h>
@@ -1625,6 +1626,32 @@ static void log_dump_summary(int node_count, int edge_count) {
     cbm_log_info("gbuf.dump", "nodes", b1, "edges", b2);
 }
 
+/* A dump that published nothing gets exactly one signature in the log.
+ * Without it the writer's return code is the only evidence, and it reaches
+ * the user as a generic pipeline failure that blames their repository
+ * (#1620, #2001).
+ *
+ * failure_errno is read by the caller at the point of failure: the value is
+ * only meaningful before the next library call. Zero means the failure did
+ * not originate at the publish boundary — an append that failed many calls
+ * earlier — and the field is omitted rather than claim a reason this record
+ * does not have. */
+static void log_dump_failed(int rc, int failure_errno, int node_count, int edge_count) {
+    char b1[CBM_SZ_16];
+    char b3[CBM_SZ_16];
+    char b4[CBM_SZ_16];
+    snprintf(b1, sizeof(b1), "%d", rc);
+    snprintf(b3, sizeof(b3), "%d", node_count);
+    snprintf(b4, sizeof(b4), "%d", edge_count);
+    if (failure_errno == 0) {
+        cbm_log_error("gbuf.dump_failed", "rc", b1, "nodes", b3, "edges", b4);
+        return;
+    }
+    char b2[CBM_SZ_16];
+    snprintf(b2, sizeof(b2), "%d", failure_errno);
+    cbm_log_error("gbuf.dump_failed", "rc", b1, "errno", b2, "nodes", b3, "edges", b4);
+}
+
 static void free_dump_resources(char **url_paths, char **local_names, int edge_count,
                                 CBMDumpEdge *dump_edges, CBMDumpNode *dump_nodes,
                                 int64_t *temp_to_final) {
@@ -1680,6 +1707,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int64_t max_temp_id = gb->next_id;
     int64_t *temp_to_final = calloc((size_t)max_temp_id, sizeof(int64_t));
     if (!temp_to_final) {
+        log_dump_failed(CBM_NOT_FOUND, errno, 0, 0);
         return CBM_NOT_FOUND;
     }
 
@@ -1710,6 +1738,7 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
      * uninitialized budget from ever triggering the free). */
     cbm_db_writer_t *w = cbm_writer_open(path);
     if (!w) {
+        log_dump_failed(CBM_NOT_FOUND, errno, node_idx, 0);
         free(src_nodes);
         free(dump_nodes);
         free(temp_to_final);
@@ -1759,12 +1788,19 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
     int frc = cbm_writer_finalize(w, gb->project, gb->root_path, indexed_at, dump_nodes, node_idx,
                                   dump_edges, edge_idx, gb->dump_vectors, gb->dump_vector_count,
                                   gb->dump_token_vecs, gb->dump_token_vec_count);
+    /* Read errno before anything else can touch it: the profiling macro
+     * below is already one library call away from losing the reason. */
+    int finalize_errno = errno;
     CBM_PROF_END_N("dump", "6_write_db_finalize", t_finalize, node_idx + edge_idx);
     if (rc == 0) {
         rc = frc;
     }
 
-    log_dump_summary(node_idx, edge_idx);
+    if (rc != 0) {
+        log_dump_failed(rc, finalize_errno, node_idx, edge_idx);
+    } else {
+        log_dump_summary(node_idx, edge_idx);
+    }
     free_dump_resources(url_paths, local_names, edge_idx, dump_edges, dump_nodes, temp_to_final);
     free(src_nodes);
     return rc;
