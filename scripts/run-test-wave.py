@@ -26,7 +26,19 @@ SUITE_NAME = re.compile(r"^[a-z0-9_]+$")
 SUMMARY = re.compile(r"^  (?P<passed>[0-9]+) passed")
 FAILED = re.compile(r"(?:^|, )(?P<failed>[0-9]+) failed")
 SKIPPED = re.compile(r"(?:^|, )(?P<skipped>[0-9]+) skipped")
-SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime"))
+# Suites whose honest runtime does not fit the default per-suite budget, and so
+# get --slow-timeout instead. This is a statement about SIZE, never about
+# flakiness: every suite here is deterministic and simply long, and a racy suite
+# must be made deterministic rather than given more clock.
+#
+# `cli` joined the list because the classification had gone stale, not because
+# anything regressed. It spends 497s of the 900s default on macos-14 -- the
+# FASTEST macOS runner -- while the macos-15-intel runner in the same matrix is
+# 2.4-3.6x slower on comparable suites (daemon_runtime 842s vs 349s,
+# stack_overflow_b 277s vs 76s). 497s at that ratio cannot fit, so the suite was
+# killed at 900s and reported as hung. daemon_runtime, at 842s on that same
+# runner, survives only because it was already listed here.
+SLOW_SUITES = frozenset(("incremental", "store_arch", "daemon_runtime", "cli"))
 POLL_SECONDS = 0.05
 
 # WHY: the Windows descendant probe below is a cold `powershell.exe` + CIM

@@ -1522,6 +1522,27 @@ TEST(cli_install_recovers_markerless_stale_rendezvous) {
 #define CLI_SCOPE_READY_TIMEOUT_MS 90000U
 #define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
 #define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
+/* Teardown budget for a child the activation ALREADY drained: its service is
+ * gone, so each free/release succeeds immediately and this is only the
+ * give-up point if one unexpectedly does not. The undrained path keeps the
+ * full 2 x CLI_SCOPE_TIMEOUT_MS, which is where a wedged teardown is real. */
+#define CLI_SCOPE_CLEANUP_DRAINED_MS 1000U
+/* Budget for probing that an ALREADY-drained host has stopped serving.
+ *
+ * The generous CLI_SCOPE_HOST_SERVING_TIMEOUT_MS exists for the POSITIVE
+ * question -- "is this daemon still up?" -- where a slow reply on a loaded
+ * runner must not be misread as drained. Asked in the negative it inverts:
+ * there is no reply coming, so the whole budget is spent proving silence, and
+ * the assertion is decided by a timeout expiring rather than by the system's
+ * own behaviour. That was 15 s of the drain test's wall clock and the largest
+ * single idle block in the cli suite.
+ *
+ * The drain is proven POSITIVELY elsewhere in that test: install returns 0
+ * only after the activation completed, and the host child exits with
+ * CLI_SCOPE_HOST_DRAINED. By the time this probe runs the daemon is already
+ * gone, so a short budget confirms the same fact a long one would -- it just
+ * stops charging the suite for the wait. */
+#define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
 
 typedef struct {
     char tmpdir[256];
@@ -1588,7 +1609,16 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
             break;
         }
     }
-    uint64_t cleanup_deadline = cbm_now_ms() + 2U * CLI_SCOPE_TIMEOUT_MS;
+    /* A DRAINED child has already had its service torn down by the activation,
+     * so every teardown below succeeds on the first attempt; the long deadline
+     * exists for the wedged case, where we keep retrying before giving up. On
+     * the drained path that budget was pure wall clock -- the parent sits in
+     * cli_scope_reap_host waiting for this exit, and it was the single largest
+     * idle block in the whole cli suite. Behaviour at the deadline is
+     * unchanged (give up and _exit); it is simply reached sooner when there is
+     * nothing wedged to wait for. */
+    uint64_t cleanup_deadline =
+        cbm_now_ms() + (drained ? CLI_SCOPE_CLEANUP_DRAINED_MS : 2U * CLI_SCOPE_TIMEOUT_MS);
     if (service) {
         if (!drained) {
             (void)cbm_daemon_runtime_service_stop(service, CLI_SCOPE_TIMEOUT_MS);
@@ -1752,19 +1782,24 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     return fixture->client != NULL;
 }
 
+static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture,
+                                          uint32_t timeout_ms) {
+    cbm_daemon_runtime_status_t status = {0};
+    return fixture->endpoint &&
+           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
+                                             &status) &&
+           !status.stopping && status.committed_clients == 1;
+}
+
 /* Ask the host daemon itself: still running, not stopping, and the parent's
  * committed client still admitted. */
 static bool cli_scope_host_serving(const cli_scope_fixture_t *fixture) {
-    cbm_daemon_runtime_status_t status = {0};
     /* A generous, bounded status deadline: a foreign-namespace install leaves
      * this daemon serving, so a slow response on a loaded runner must not be
      * misread as "drained" (the flaky failure this fixture showed). The call
      * still fails cleanly — a genuinely drained daemon is unreachable or
      * reports stopping — it just no longer decides survival on a 5 s budget. */
-    return fixture->endpoint &&
-           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity,
-                                             CLI_SCOPE_HOST_SERVING_TIMEOUT_MS, &status) &&
-           !status.stopping && status.committed_clients == 1;
+    return cli_scope_host_serving_within(fixture, CLI_SCOPE_HOST_SERVING_TIMEOUT_MS);
 }
 
 static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, const char *cache,
@@ -1902,7 +1937,10 @@ TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
     int install_rc =
         ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, host_bin, false)
               : -1;
-    bool host_serving = ready && cli_scope_host_serving(&fixture);
+    /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
+     * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
+    bool host_serving = ready && cli_scope_host_serving_within(&fixture,
+                                                               CLI_SCOPE_HOST_DRAINED_PROBE_MS);
     const char *events = read_test_file(activation_log);
     bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
                           strstr(events, "\"daemon_active_clients\":1") != NULL;
