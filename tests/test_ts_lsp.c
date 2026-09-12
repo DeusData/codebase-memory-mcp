@@ -2817,6 +2817,64 @@ TEST(tslsp_stress_many_classes) {
     PASS();
 }
 
+TEST(tslsp_stress_declarations_past_stack_cap) {
+    /* 300 padding functions, then the generic pair that needs the AST walk.
+     * The walk used to hold 256 nodes at most, so every top-level declaration
+     * after the 256th was dropped without a word and kept whatever signature
+     * the first extraction pass had guessed. */
+    enum { BUF_CAP = 64 * 1024 };
+    char *buf = (char *)malloc(BUF_CAP);
+    if (!buf)
+        PASS();
+    char *p = buf;
+    char *end = buf + BUF_CAP;
+    for (int i = 0; i < 300; i++) {
+        p += snprintf(p, (size_t)(end - p), "function pad%d(): void {}\n", i);
+    }
+    p += snprintf(p, (size_t)(end - p), "function identity<T>(x: T): T { return x; }\n");
+    p += snprintf(p, (size_t)(end - p), "class Box { use(): void {} }\n");
+    p += snprintf(p, (size_t)(end - p),
+                  "function go() { const b = identity(new Box()); b.use(); }\n");
+    *p = '\0';
+
+    CBMFileResult *r = extract_ts(buf);
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    /* Same claim as tslsp_generic_identity_inference, 300 declarations deeper. */
+    ASSERT_GTE(require_resolved(r, ".go", "use"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tslsp_stress_return_past_stack_cap) {
+    /* infer_return_type_from_body reads the return type out of a body that
+     * carries no written one. The return here sits after 300 statements, more
+     * than the old fixed cap held, so the walk used to stop before reaching it
+     * and answer "unknown return type". */
+    enum { BUF_CAP = 64 * 1024 };
+    char *buf = (char *)malloc(BUF_CAP);
+    if (!buf)
+        PASS();
+    char *p = buf;
+    char *end = buf + BUF_CAP;
+    p += snprintf(p, (size_t)(end - p), "class Conn { ping(): void {} }\n");
+    p += snprintf(p, (size_t)(end - p), "function makeConn() {\n");
+    for (int i = 0; i < 300; i++) {
+        p += snprintf(p, (size_t)(end - p), "  let a%d = 0;\n", i);
+    }
+    p += snprintf(p, (size_t)(end - p), "  return new Conn();\n}\n");
+    p += snprintf(p, (size_t)(end - p), "function go() { const c = makeConn(); c.ping(); }\n");
+    *p = '\0';
+
+    CBMFileResult *r = extract_ts(buf);
+    free(buf);
+    ASSERT_NOT_NULL(r);
+    /* Same claim as tslsp_return_inferred_local, 300 statements deeper. */
+    ASSERT_GTE(require_resolved(r, ".go", "ping"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_stress_deep_inheritance) {
     /* Chain of 30 classes via extends, leaf method on root. */
     char buf[16 * 1024];
@@ -4565,6 +4623,8 @@ SUITE(ts_lsp) {
 
     /* Stress tests */
     RUN_TEST(tslsp_stress_many_classes);
+    RUN_TEST(tslsp_stress_declarations_past_stack_cap);
+    RUN_TEST(tslsp_stress_return_past_stack_cap);
     RUN_TEST(tslsp_stress_deep_inheritance);
     RUN_TEST(tslsp_stress_long_method_chain);
     RUN_TEST(tslsp_stress_megafile_mixed);
