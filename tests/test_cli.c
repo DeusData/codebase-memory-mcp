@@ -723,6 +723,61 @@ static void test_rmdir_r(const char *path) {
     th_rmtree(path);
 }
 
+#ifndef _WIN32
+/* Capture everything a command writes to one fd (stdout or stderr) so a test
+ * can assert on the transcript. Restores the fd on end and returns the text. */
+typedef struct {
+    FILE *file;
+    FILE *stream;
+    int target_fd;
+    int saved_fd;
+    bool redirected;
+} cli_fd_capture_t;
+
+static void cli_fd_capture_begin(cli_fd_capture_t *capture, FILE *stream, int target_fd) {
+    memset(capture, 0, sizeof(*capture));
+    capture->stream = stream;
+    capture->target_fd = target_fd;
+    capture->saved_fd = -1;
+    capture->file = tmpfile();
+    if (!capture->file) {
+        return;
+    }
+    capture->saved_fd = dup(target_fd);
+    if (capture->saved_fd < 0) {
+        return;
+    }
+    fflush(stream);
+    capture->redirected = dup2(fileno(capture->file), target_fd) >= 0;
+}
+
+/* Returns the captured text (heap, "" when nothing was written) or NULL when
+ * the capture never engaged. */
+static char *cli_fd_capture_end(cli_fd_capture_t *capture) {
+    fflush(capture->stream);
+    if (capture->saved_fd >= 0) {
+        (void)dup2(capture->saved_fd, capture->target_fd);
+        close(capture->saved_fd);
+        capture->saved_fd = -1;
+    }
+    char *text = NULL;
+    if (capture->file) {
+        if (capture->redirected) {
+            rewind(capture->file);
+            size_t capacity = 65536U;
+            text = calloc(1U, capacity);
+            if (text) {
+                size_t count = fread(text, 1U, capacity - 1U, capture->file);
+                text[count] = '\0';
+            }
+        }
+        fclose(capture->file);
+        capture->file = NULL;
+    }
+    return text;
+}
+#endif /* !_WIN32 -- POSIX-only fd-capture helpers (#2110) */
+
 /* Mandatory-daemon activation guard fixture. The production path uses the
  * stable per-account endpoint directly; these callbacks make every race
  * ordering deterministic without exposing a CLI flag or environment bypass. */
@@ -2324,6 +2379,181 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     ASSERT_TRUE(fake.diagnostic[0] != '\0');
     PASS();
 }
+
+#ifndef _WIN32
+/* #1954: an agent config that cannot be cleaned must not hold the executable
+ * and the indexes hostage. The fixture's ~/.cursor/mcp.json is a dangling
+ * symlink (a dotfiles checkout that moved) — a shape every config editor keeps
+ * refusing. Before the fix the cleanup failure aborted the activation BEFORE
+ * index and binary removal: `uninstall -y` exited 1 and left a 300 MB binary
+ * plus the whole cache behind, while the report still read "removed". */
+TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-hostage-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    /* PATH moves with HOME so no real agent on the developer's PATH is detected. */
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must go even when a config cannot be cleaned");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(bin_target, "binary must go even when a config cannot be cleaned");
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    char dangling_target[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    test_mkdirp(cursor_dir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    snprintf(dangling_target, sizeof(dangling_target), "%s/.dotfiles/cursor/mcp.json", tmpdir);
+    if (symlink(dangling_target, cursor_config) != 0) {
+        FAIL("symlink failed");
+    }
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cli_fd_capture_t out_capture;
+    cli_fd_capture_t err_capture;
+    cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
+    cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    char *err_text = cli_fd_capture_end(&err_capture);
+    char *out_text = cli_fd_capture_end(&out_capture);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat state;
+    bool binary_gone = lstat(bin_target, &state) != 0 && errno == ENOENT;
+    bool index_gone = lstat(index_path, &state) != 0 && errno == ENOENT;
+    bool link_untouched = lstat(cursor_config, &state) == 0 && S_ISLNK(state.st_mode);
+    bool failure_named = err_text && strstr(err_text, cursor_config) != NULL;
+
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+    free(err_text);
+    free(out_text);
+
+    ASSERT(rc != 0);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(index_gone);
+    ASSERT_TRUE(link_untouched);
+    ASSERT_TRUE(failure_named);
+    PASS();
+}
+
+/* #1954 end to end: ~/.cursor/mcp.json is a user-owned symlink into a
+ * dotfiles checkout. The uninstall command opts in to following it, removes
+ * our entry THROUGH the link, leaves the link pointing where it did, and
+ * exits 0 with the binary and the index gone. */
+TEST(cli_uninstall_cleans_user_owned_symlinked_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-symlinked-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index goes with the uninstall");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(bin_target, "binary goes with the uninstall");
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    char dotfiles_dir[512];
+    char dotfiles_config[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    snprintf(dotfiles_dir, sizeof(dotfiles_dir), "%s/.dotfiles/cursor", tmpdir);
+    snprintf(dotfiles_config, sizeof(dotfiles_config), "%s/mcp.json", dotfiles_dir);
+    test_mkdirp(cursor_dir);
+    test_mkdirp(dotfiles_dir);
+    write_test_file(dotfiles_config,
+                    "{\n  \"mcpServers\": {\n    \"keep\": {\"command\": \"x\"}\n  }\n}\n");
+    int installed = cbm_install_editor_mcp(bin_target, dotfiles_config);
+    if (symlink(dotfiles_config, cursor_config) != 0) {
+        FAIL("symlink failed");
+    }
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cli_fd_capture_t out_capture;
+    cli_fd_capture_t err_capture;
+    cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
+    cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    char *err_text = cli_fd_capture_end(&err_capture);
+    char *out_text = cli_fd_capture_end(&out_capture);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat state;
+    bool binary_gone = lstat(bin_target, &state) != 0 && errno == ENOENT;
+    bool index_gone = lstat(index_path, &state) != 0 && errno == ENOENT;
+    bool link_intact = lstat(cursor_config, &state) == 0 && S_ISLNK(state.st_mode);
+    char link_value[640] = {0};
+    ssize_t link_length = readlink(cursor_config, link_value, sizeof(link_value) - 1U);
+    bool link_same = link_length > 0 && strcmp(link_value, dotfiles_config) == 0;
+    char *after = read_test_file_alloc(dotfiles_config);
+    bool entry_removed =
+        after && !strstr(after, "codebase-memory-mcp") && strstr(after, "\"keep\"");
+    bool no_error = err_text && !strstr(err_text, "error:");
+
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+    free(after);
+    free(err_text);
+    free(out_text);
+
+    ASSERT_EQ(installed, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(index_gone);
+    ASSERT_TRUE(link_intact);
+    ASSERT_TRUE(link_same);
+    ASSERT_TRUE(entry_removed);
+    ASSERT_TRUE(no_error);
+    PASS();
+}
+#endif
 
 TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
     char tmpdir[256];
@@ -4928,7 +5158,7 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
 #else
     snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp", bin_dir);
 #endif
-    write_test_file(bin_path, "installed binary must remain live\n");
+    write_test_file(bin_path, "installed binary goes even when a config cannot be cleaned\n");
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -4952,9 +5182,12 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     test_rmdir_r(tmpdir);
-    if (rc == 0 || !preserved || !binary_preserved || fake.mutation_reserve_count != 1 ||
-        fake.mutation_lease_release_count != 1 || !strstr(fake.diagnostic, "executable was kept"))
-        FAIL("agent uninstall refusal must fail before removing the live binary");
+    /* #1954: a refused config is reported and fails the exit code, but it never
+     * keeps the executable installed — that left a 300 MB binary and every index
+     * behind for one unreadable mcp.json. */
+    if (rc == 0 || !preserved || binary_preserved || fake.mutation_reserve_count != 1 ||
+        fake.mutation_lease_release_count != 1 || fake.diagnostic[0] != '\0')
+        FAIL("agent uninstall refusal must fail the exit code without keeping the binary");
     PASS();
 }
 
@@ -10964,7 +11197,7 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
 #else
     snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
 #endif
-    write_test_file(binary_path, "installed binary must survive failed cleanup\n");
+    write_test_file(binary_path, "installed binary goes even when a config cannot be cleaned\n");
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -11019,7 +11252,9 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     struct stat state;
     hooks = read_test_file_alloc(hooks_path);
     char *agents_after_uninstall = read_test_file_alloc(agents_path);
-    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) == 0 &&
+    /* #1954: the ambiguous/foreign hook still fails the exit code, but the binary
+     * is removed anyway (uninstall is no longer held hostage by agent-config). */
+    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) != 0 &&
                                stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0 &&
                                hooks && !strstr(hooks, "hook-augment") && agents_after_uninstall &&
                                agents_after_uninstall[0] == '\0';
@@ -15244,6 +15479,10 @@ SUITE(cli) {
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
+#ifndef _WIN32
+    RUN_TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails);
+    RUN_TEST(cli_uninstall_cleans_user_owned_symlinked_config);
+#endif
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
     RUN_TEST(cli_windows_update_hands_off_to_install_script);

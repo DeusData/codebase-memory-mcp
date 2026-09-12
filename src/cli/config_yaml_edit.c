@@ -7,6 +7,7 @@
  */
 #include "cli/config_yaml_edit.h"
 
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
@@ -694,13 +695,26 @@ static int yaml_read_file(const char *path, char **out_data, size_t *out_len,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    int descriptor = open(path, flags);
+    /* A symlink the invoking user owns, inside an opted-in configuration
+     * root, is read through the descriptor the helper validated on the
+     * target's pinned parent directory (#1954); everything else is opened by
+     * name with O_NOFOLLOW exactly as before. */
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(path, &target) < 0) {
+        return YAML_ERROR;
+    }
+    int descriptor = target.fd;
+    target.fd = -1;
+    if (target.status != CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        descriptor = open(target.path, flags);
+    }
+    cbm_config_edit_target_close(&target);
     if (descriptor < 0) {
         if (errno != ENOENT) {
             return YAML_ERROR;
         }
         struct stat path_state;
-        if (lstat(path, &path_state) == 0 || errno != ENOENT) {
+        if (lstat(target.path, &path_state) == 0 || errno != ENOENT) {
             return YAML_ERROR;
         }
         char *empty = (char *)calloc(YAML_UNIT, YAML_UNIT);
@@ -869,9 +883,30 @@ static int yaml_replace_file(const char *temp_path, const char *path, bool desti
 #endif
 }
 
-static int yaml_write_atomic(const char *path, const char *data, size_t len,
-                             const char *expected_data, size_t expected_len,
-                             const yaml_file_snapshot_t *expected_snapshot) {
+static const char *yaml_temp_name(const char *temp_path) {
+    const char *slash = strrchr(temp_path, '/');
+    return slash ? slash + 1 : temp_path;
+}
+
+/* Drop a staged temp file: through the pinned parent for a followed link,
+ * by name otherwise. */
+static void yaml_discard_temp(const cbm_config_edit_target_t *target, const char *temp_path) {
+    if (target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        (void)cbm_config_edit_target_unlink(target, yaml_temp_name(temp_path));
+    } else {
+        (void)cbm_unlink(temp_path);
+    }
+}
+
+/* For a followed link (#1954) the temp file is created with openat() beside
+ * the target and published with renameat() on the pinned parent, so the link
+ * itself is never replaced; every pre-publish comparison runs against the
+ * resolved path. A direct path keeps the by-name sequence unchanged. */
+static int yaml_write_atomic_at(const cbm_config_edit_target_t *target, const char *data,
+                                size_t len, const char *expected_data, size_t expected_len,
+                                const yaml_file_snapshot_t *expected_snapshot) {
+    const char *path = target->path;
+    bool followed = target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED;
     size_t path_len = 0U;
     if (yaml_bounded_strlen(path, YAML_OUTPUT_MAX, &path_len) != 0 ||
         path_len > SIZE_MAX - YAML_TMP_SUFFIX_MAX - YAML_UNIT) {
@@ -901,12 +936,14 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
-        int descriptor = open(temp_path, flags, YAML_NEW_FILE_MODE);
+        int descriptor = followed ? cbm_config_edit_target_create_temp(
+                                        target, yaml_temp_name(temp_path), YAML_NEW_FILE_MODE)
+                                  : open(temp_path, flags, YAML_NEW_FILE_MODE);
         if (descriptor >= 0) {
             file = fdopen(descriptor, "wb");
             if (!file) {
                 (void)close(descriptor);
-                (void)cbm_unlink(temp_path);
+                yaml_discard_temp(target, temp_path);
                 free(temp_path);
                 return YAML_ERROR;
             }
@@ -947,7 +984,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
         failed = true;
     }
     if (failed) {
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -958,7 +995,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
         !temp_snapshot.exists || temp_len != len ||
         (len != 0U && memcmp(temp_data, data, len) != 0)) {
         free(temp_data);
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -970,7 +1007,7 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
     }
 #endif
     if (yaml_snapshot_matches_path(path, expected_data, expected_len, expected_snapshot) != 0) {
-        (void)cbm_unlink(temp_path);
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
@@ -981,13 +1018,27 @@ static int yaml_write_atomic(const char *path, const char *data, size_t len,
 #endif
     if (yaml_snapshot_matches_path(path, expected_data, expected_len, expected_snapshot) != 0 ||
         yaml_snapshot_matches_path(temp_path, data, len, &temp_snapshot) != 0 ||
-        yaml_replace_file(temp_path, path, expected_snapshot->exists) != 0) {
-        (void)cbm_unlink(temp_path);
+        (followed ? cbm_config_edit_target_commit(target, yaml_temp_name(temp_path))
+                  : yaml_replace_file(temp_path, path, expected_snapshot->exists)) != 0) {
+        yaml_discard_temp(target, temp_path);
         free(temp_path);
         return YAML_ERROR;
     }
     free(temp_path);
     return 0;
+}
+
+static int yaml_write_atomic(const char *requested_path, const char *data, size_t len,
+                             const char *expected_data, size_t expected_len,
+                             const yaml_file_snapshot_t *expected_snapshot) {
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(requested_path, &target) < 0) {
+        return YAML_ERROR;
+    }
+    int result =
+        yaml_write_atomic_at(&target, data, len, expected_data, expected_len, expected_snapshot);
+    cbm_config_edit_target_close(&target);
+    return result;
 }
 
 #ifdef CBM_YAML_ENABLE_TEST_API

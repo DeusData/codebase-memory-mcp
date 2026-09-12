@@ -8,6 +8,7 @@
  */
 #include "cli/config_json_like.h"
 
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
@@ -1440,11 +1441,24 @@ static int jl_read_file(const char *path, char **content_out, size_t *length_out
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    int descriptor = open(path, flags);
+    /* A symlink the invoking user owns, inside an opted-in configuration
+     * root, is read through the descriptor the helper validated on the
+     * target's pinned parent directory (#1954); everything else is opened by
+     * name with O_NOFOLLOW exactly as before. */
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(path, &target) < 0) {
+        return -1;
+    }
+    int descriptor = target.fd;
+    target.fd = -1;
+    if (target.status != CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        descriptor = open(target.path, flags);
+    }
+    cbm_config_edit_target_close(&target);
     if (descriptor < 0) {
         if (errno == ENOENT) {
             struct stat path_state;
-            if (lstat(path, &path_state) == 0 || errno != ENOENT) {
+            if (lstat(target.path, &path_state) == 0 || errno != ENOENT) {
                 return -1;
             }
             *missing_out = true;
@@ -1609,10 +1623,31 @@ static int jl_replace_atomic(const char *temp_path, const char *path, bool desti
 #endif
 }
 
-static int jl_write_atomic(const char *path, const char *content, size_t length,
-                           const char *expected_content, size_t expected_length,
-                           const jl_file_snapshot_t *expected_snapshot) {
-    if (jl_ensure_parent(path) != 0) {
+static const char *jl_temp_name(const char *temp_path) {
+    const char *slash = strrchr(temp_path, '/');
+    return slash ? slash + 1 : temp_path;
+}
+
+/* Drop a staged temp file: through the pinned parent for a followed link,
+ * by name otherwise. */
+static void jl_discard_temp(const cbm_config_edit_target_t *target, const char *temp_path) {
+    if (target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        (void)cbm_config_edit_target_unlink(target, jl_temp_name(temp_path));
+    } else {
+        (void)cbm_unlink(temp_path);
+    }
+}
+
+/* For a followed link (#1954) the temp file is created with openat() beside
+ * the target and published with renameat() on the pinned parent, so the link
+ * itself is never replaced; every pre-publish comparison runs against the
+ * resolved path. A direct path keeps the by-name sequence unchanged. */
+static int jl_write_atomic_at(const cbm_config_edit_target_t *target, const char *content,
+                              size_t length, const char *expected_content, size_t expected_length,
+                              const jl_file_snapshot_t *expected_snapshot) {
+    const char *path = target->path;
+    bool followed = target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED;
+    if (!followed && jl_ensure_parent(path) != 0) {
         return -1;
     }
     size_t path_length = strlen(path);
@@ -1647,13 +1682,15 @@ static int jl_write_atomic(const char *path, const char *content, size_t length,
 #ifdef O_CLOEXEC
         flags |= O_CLOEXEC;
 #endif
-        int descriptor = open(temp_path, flags, 0600);
+        int descriptor =
+            followed ? cbm_config_edit_target_create_temp(target, jl_temp_name(temp_path), 0600U)
+                     : open(temp_path, flags, 0600);
         if (descriptor >= 0) {
             file = fdopen(descriptor, "wb");
             if (!file) {
                 int saved_error = errno;
                 close(descriptor);
-                (void)cbm_unlink(temp_path);
+                jl_discard_temp(target, temp_path);
                 errno = saved_error;
             }
         }
@@ -1696,7 +1733,7 @@ static int jl_write_atomic(const char *path, const char *content, size_t length,
         failed = true;
     }
     if (failed) {
-        cbm_unlink(temp_path);
+        jl_discard_temp(target, temp_path);
         free(temp_path);
         return -1;
     }
@@ -1708,7 +1745,7 @@ static int jl_write_atomic(const char *path, const char *content, size_t length,
         temp_missing || temp_length != length ||
         (length != 0U && memcmp(temp_content, content, length) != 0)) {
         free(temp_content);
-        cbm_unlink(temp_path);
+        jl_discard_temp(target, temp_path);
         free(temp_path);
         return -1;
     }
@@ -1719,7 +1756,7 @@ static int jl_write_atomic(const char *path, const char *content, size_t length,
     }
 #endif
     if (jl_snapshot_matches_path(path, expected_content, expected_length, expected_snapshot) != 0) {
-        cbm_unlink(temp_path);
+        jl_discard_temp(target, temp_path);
         free(temp_path);
         return -1;
     }
@@ -1730,13 +1767,27 @@ static int jl_write_atomic(const char *path, const char *content, size_t length,
 #endif
     if (jl_snapshot_matches_path(path, expected_content, expected_length, expected_snapshot) != 0 ||
         jl_snapshot_matches_path(temp_path, content, length, &temp_snapshot) != 0 ||
-        jl_replace_atomic(temp_path, path, expected_snapshot->exists) != 0) {
-        cbm_unlink(temp_path);
+        (followed ? cbm_config_edit_target_commit(target, jl_temp_name(temp_path))
+                  : jl_replace_atomic(temp_path, path, expected_snapshot->exists)) != 0) {
+        jl_discard_temp(target, temp_path);
         free(temp_path);
         return -1;
     }
     free(temp_path);
     return 0;
+}
+
+static int jl_write_atomic(const char *requested_path, const char *content, size_t length,
+                           const char *expected_content, size_t expected_length,
+                           const jl_file_snapshot_t *expected_snapshot) {
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(requested_path, &target) < 0) {
+        return -1;
+    }
+    int result = jl_write_atomic_at(&target, content, length, expected_content, expected_length,
+                                    expected_snapshot);
+    cbm_config_edit_target_close(&target);
+    return result;
 }
 
 static int jl_decode_utf8(const unsigned char *text, size_t remaining, uint32_t *codepoint,
