@@ -1475,6 +1475,42 @@ static char *extract_puppet_callee(CBMArena *a, TSNode node, const char *source,
     return NULL;
 }
 
+// VB6/VBA: resolve the callee text of a call-shaped node.
+//   call_statement        `Foo 1` / `Call Foo(1)` / `obj.Bar x`  -> field `callee`
+//   call_expression       `y = Foo(1)` / `obj.Items(1)`          -> field `function`
+//   raise_event_statement `RaiseEvent Changed(x)`                -> field `event`
+// The callee node is an identifier, a qualified_member_expression (`obj.Method`,
+// emitted dotted so the resolver's last-segment match finds `Method`), an
+// implicit_member_expression (`.Method` inside a With block — bare member name),
+// or a nested call_expression (`a(1)(2)` / `obj.Items(1).Name`) that we unwrap.
+static char *extract_vb6_callee(CBMArena *a, TSNode node, const char *source, const char *nk) {
+    enum { VB6_CALLEE_UNWRAP_MAX = 4 };
+    TSNode callee = {0};
+    if (strcmp(nk, "call_statement") == 0) {
+        callee = ts_node_child_by_field_name(node, TS_FIELD("callee"));
+    } else if (strcmp(nk, "call_expression") == 0) {
+        callee = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    } else if (strcmp(nk, "raise_event_statement") == 0) {
+        callee = ts_node_child_by_field_name(node, TS_FIELD("event"));
+    }
+    for (int depth = 0; depth < VB6_CALLEE_UNWRAP_MAX && !ts_node_is_null(callee); depth++) {
+        const char *ck = ts_node_type(callee);
+        if (strcmp(ck, "identifier") == 0 || strcmp(ck, "qualified_member_expression") == 0) {
+            return cbm_node_text(a, callee, source);
+        }
+        if (strcmp(ck, "implicit_member_expression") == 0) {
+            TSNode m = ts_node_child_by_field_name(callee, TS_FIELD("member"));
+            return ts_node_is_null(m) ? NULL : cbm_node_text(a, m, source);
+        }
+        if (strcmp(ck, "call_expression") == 0) {
+            callee = ts_node_child_by_field_name(callee, TS_FIELD("function"));
+            continue;
+        }
+        break;
+    }
+    return NULL;
+}
+
 static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *source,
                                           CBMLanguage lang) {
     const char *nk = ts_node_type(node);
@@ -1707,6 +1743,12 @@ static char *extract_callee_lang_specific(CBMArena *a, TSNode node, const char *
             return cbm_arena_sprintf(a, "$$$%s", name_start);
         }
         return NULL;
+    }
+    if (lang == CBM_LANG_VB6) {
+        char *c = extract_vb6_callee(a, node, source, nk);
+        if (c) {
+            return c;
+        }
     }
 
     return extract_scripting_callee(a, node, source, lang, nk);

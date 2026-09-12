@@ -29,6 +29,7 @@
  *
  *   Added after the original snapshot:
  *     chialisp  (1 case, expected GREEN -- lisp-family scope attribution)
+ *     vb6       (1 case, expected GREEN -- procedure scope attribution)
  *
  * Note: the "suspicious" group (r, julia, ...) from QUALITY_ANALYSIS may be
  * GREEN because the calls-breadth table (test_lang_contract.c) already shows
@@ -549,6 +550,27 @@ static const IBCase IB_CASES[] = {
          * compute_lisp_func_qn pushes a scope for the inner `(defun run ...)`
          * rather than stopping at the module. That is exactly what would
          * regress if the Chialisp def-head set drifted from the defs walk.
+         */
+        1, NULL
+    },
+
+    {
+        "vb6", "a.bas",
+        "Attribute VB_Name = \"ModA\"\n"
+        "Option Explicit\n"
+        "\n"
+        "Private Function Helper(x As Long) As Long\n"
+        "    Helper = x * 2\n"
+        "End Function\n"
+        "\n"
+        "Public Sub Run()\n"
+        "    Helper 21\n"
+        "End Sub\n",
+        /*
+         * VB6: EXPECTED-GREEN. `Helper 21` is a call_statement whose `callee`
+         * field is an identifier; sub_declaration/function_declaration are the
+         * enclosing callables, so the edge must source at Function, never at
+         * the .bas Module.
          */
         1, NULL
     },
