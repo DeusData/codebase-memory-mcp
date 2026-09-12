@@ -122,11 +122,64 @@ static void update_cors(const cbm_http_req_t *req, int port) {
     snprintf(g_cors_json, sizeof(g_cors_json), "%sContent-Type: application/json\r\n", g_cors);
 }
 
+/* RFC 9110 §12.5.4: rank Accept-Language tags by q-value (default 1.0,
+ * q=0 excluded per §12.5.1) and return the top-ranked "zh"/"en" tag; ties
+ * keep whichever came first. */
 static const char *detect_ui_lang(const char *accept_language) {
-    if (accept_language && (strstr(accept_language, "zh-CN") || strstr(accept_language, "zh"))) {
-        return "zh";
+    if (!accept_language) {
+        return "en";
     }
-    return "en";
+
+    char buf[CBM_SZ_256];
+    snprintf(buf, sizeof(buf), "%s", accept_language);
+
+    const char *best_tag = NULL;
+    double best_q = 0.0; /* only a strictly positive q is acceptable */
+    char *cursor = buf;
+
+    while (cursor) {
+        char *comma = strchr(cursor, ',');
+        if (comma) {
+            *comma = '\0';
+        }
+
+        char *entry = cursor;
+        while (*entry == ' ' || *entry == '\t') {
+            entry++;
+        }
+
+        double q = 1.0;
+        char *semi = strchr(entry, ';');
+        if (semi) {
+            *semi = '\0';
+            char *qpos = strstr(semi + 1, "q=");
+            if (qpos) {
+                q = strtod(qpos + 2, NULL);
+            }
+        }
+
+        size_t len = strlen(entry);
+        while (len > 0 && (entry[len - 1] == ' ' || entry[len - 1] == '\t')) {
+            entry[--len] = '\0';
+        }
+
+        if (len >= 2 && q > best_q) {
+            char base0 = (char)tolower((unsigned char)entry[0]);
+            char base1 = (char)tolower((unsigned char)entry[1]);
+            bool base_ends = len == 2 || entry[2] == '-';
+            if (base_ends && base0 == 'z' && base1 == 'h') {
+                best_q = q;
+                best_tag = "zh";
+            } else if (base_ends && base0 == 'e' && base1 == 'n') {
+                best_q = q;
+                best_tag = "en";
+            }
+        }
+
+        cursor = comma ? comma + 1 : NULL;
+    }
+
+    return best_tag ? best_tag : "en";
 }
 
 static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {

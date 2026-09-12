@@ -1637,6 +1637,46 @@ TEST(ui_server_ui_config_prefers_config_lang) {
     PASS();
 }
 
+TEST(ui_server_ui_config_ranks_by_qvalue_not_substring_issue1829) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+
+    /* English is ranked first (q=0.9 vs zh's q=0.5); a substring scan over
+     * the raw header would still match "zh" and serve Chinese. */
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/ui-config HTTP/1.1\r\n"
+                    "Accept-Language: en-US,en;q=0.9,zh;q=0.5\r\n"
+                    "\r\n",
+                    resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"lang\":\"en\""));
+
+    th_server_stop(&ts);
+    PASS();
+}
+
+TEST(ui_server_ui_config_treats_qzero_as_unacceptable_issue1829) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+
+    /* q=0 means "not acceptable" (RFC 9110 12.5.1), so English must win even
+     * though zh appears first in the header. */
+    char resp[4096];
+    int n = th_http(cbm_http_server_port(ts.srv),
+                    "GET /api/ui-config HTTP/1.1\r\n"
+                    "Accept-Language: zh;q=0, en\r\n"
+                    "\r\n",
+                    resp, sizeof(resp));
+    ASSERT_TRUE(n > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"lang\":\"en\""));
+
+    th_server_stop(&ts);
+    PASS();
+}
+
 TEST(ui_server_slow_request_hits_deadline) {
     th_server_t ts;
     ASSERT_EQ(th_server_start(&ts), 0);
@@ -2426,6 +2466,8 @@ SUITE(httpd) {
     RUN_TEST(ui_server_ui_config_detects_zh_accept_language);
     RUN_TEST(ui_server_ui_config_includes_serving_version_issue1820);
     RUN_TEST(ui_server_ui_config_prefers_config_lang);
+    RUN_TEST(ui_server_ui_config_ranks_by_qvalue_not_substring_issue1829);
+    RUN_TEST(ui_server_ui_config_treats_qzero_as_unacceptable_issue1829);
     RUN_TEST(ui_server_slow_request_hits_deadline);
     RUN_TEST(ui_server_access_log_redacts_query);
     RUN_TEST(ui_server_stop_joins_cleanly);
