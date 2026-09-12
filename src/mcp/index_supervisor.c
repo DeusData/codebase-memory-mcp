@@ -609,6 +609,21 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
     (void)snprintf(exit_text, sizeof(exit_text), "%d", handle->result.exit_code);
     cbm_log_info("index.supervisor.reap", "outcome", cbm_proc_outcome_str(handle->result.outcome),
                  "exit_code", exit_text, "signal", signal_text);
+    if (!worker_result_succeeded(&handle->result) &&
+        handle->process_result.job_memory_limit_bytes > 0) {
+        char limit_text[CBM_SZ_32];
+        char peak_text[CBM_SZ_32];
+        (void)snprintf(limit_text, sizeof(limit_text), "%zu",
+                       handle->process_result.job_memory_limit_bytes);
+        (void)snprintf(peak_text, sizeof(peak_text), "%zu",
+                       handle->process_result.peak_job_memory_bytes);
+        /* Peak accounting may include a denied allocation and exceed the cap,
+         * or remain below it. Report evidence, not an inferred OOM classification
+         * or a file to quarantine. */
+        cbm_log_warn("index.supervisor.worker_memory", "job_limit_bytes", limit_text,
+                     "peak_job_memory_bytes",
+                     handle->process_result.job_memory_available ? peak_text : "unavailable");
+    }
     if (handle->result.response_rejected) {
         cbm_log_error("index.supervisor.response_rejected", "reason", "payload_too_large", "log",
                       handle->log_path);
@@ -627,6 +642,26 @@ static void worker_terminal_log(cbm_index_worker_handle_t *handle) {
                      cbm_proc_outcome_str(handle->result.outcome), "exit_code", exit_text, "log",
                      handle->log_path);
     }
+}
+
+size_t cbm_index_worker_job_memory_limit(size_t memory_budget_bytes) {
+    /* Tiny token budgets must still reach main (image/CRT/stack startup already
+     * needs memory). Keep their argv value but leave the OS cap disabled below
+     * 512 MiB. KILL_ON_JOB_CLOSE remains in force regardless of the cap.
+     *
+     * Windows charges job-wide COMMIT, not RSS. This 1.5x limit leaves room
+     * for the
+     * cooperative budget's recovery/abort gate, but an allocation can
+     * still be denied before
+     * the next cooperative check. It is a backstop for
+     * descendants too, not exact
+     * enforcement of the accounting budget. */
+    const size_t minimum_budget = (size_t)512U * 1024U * 1024U;
+    if (memory_budget_bytes < minimum_budget) {
+        return 0;
+    }
+    size_t headroom = memory_budget_bytes / 2;
+    return memory_budget_bytes > SIZE_MAX - headroom ? SIZE_MAX : memory_budget_bytes + headroom;
 }
 
 int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_bytes,
@@ -716,6 +751,7 @@ int cbm_index_worker_start_with_log(const char *args_json, size_t memory_budget_
     options.on_log_line = NULL;
     options.log_ud = NULL;
     options.quiet_timeout_ms = worker_quiet_timeout_ms();
+    options.memory_limit_bytes = cbm_index_worker_job_memory_limit(memory_budget_bytes);
     options.delete_log_on_exit = false;
     if (cbm_subprocess_spawn(&options, &handle->process) != 0) {
         (void)cbm_unlink(handle->response_path);
