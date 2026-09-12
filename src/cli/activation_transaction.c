@@ -712,9 +712,17 @@ static bool activation_windows_acl_check(HANDLE handle, DWORD tolerated_untruste
         if (!trusted) {
             char label[128];
             LPSTR sid_text = NULL;
-            (void)snprintf(label, sizeof(label), "acl-grants-cross-account-mutation to %s",
+            /* #1856: say whether the grant is INHERITED. The remedy differs and
+             * the wrong one silently does nothing: `icacls <dir> /remove:g <sid>`
+             * cannot remove an inherited ACE -- that needs `/inheritance:r` --
+             * and the stock `C:\` ACE for Authenticated Users reaches every new
+             * child directory exactly this way. A reporter following the
+             * generic advice sees the command succeed and the refusal persist. */
+            bool inherited = (header->AceFlags & INHERITED_ACE) != 0;
+            (void)snprintf(label, sizeof(label), "acl-grants-cross-account-mutation to %s%s",
                            ConvertSidToStringSidA(sid, &sid_text) && sid_text ? sid_text
-                                                                              : "unparsable-sid");
+                                                                              : "unparsable-sid",
+                           inherited ? " (inherited from a parent directory)" : "");
             if (sid_text) {
                 (void)LocalFree(sid_text);
             }

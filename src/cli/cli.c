@@ -240,7 +240,9 @@ static void cli_activation_diagnostic(const cbm_cli_activation_ops_t *ops, const
                        "error: activation was refused by a filesystem safety check before any "
                        "change was made: %s\n"
                        "error: this is not a session problem. If the flagged directory is one you "
-                       "trust, remove the flagged permission grant (icacls <dir> /remove:g <sid>) "
+                       "trust, remove the flagged permission grant (icacls <dir> /remove:g <sid>; "
+                       "an INHERITED grant needs icacls <dir> /inheritance:r /grant:r "
+                       "\"%%USERNAME%%\":(OI)(CI)F instead, because /remove:g cannot delete one) "
                        "or use an owner-private directory for --dir/CBM_CACHE_DIR, then retry.",
                        note);
         diagnostic = attributed;
@@ -747,7 +749,15 @@ static int cli_activation_guard(cbm_daemon_runtime_activation_action_t action,
     cli_activation_production_context_t context;
     if (!cli_activation_production_context_init(&context, action, target_version, target_build)) {
         cli_activation_production_context_close(&context);
-        cli_activation_production_diagnostic(NULL, CLI_ACTIVATION_REFUSED_MESSAGE);
+        /* #1856: this refusal used to print the generic text BARE. Every other
+         * emitter routes through cli_activation_diagnostic, which appends the
+         * transaction refusal note or cbm_daemon_ipc_validation_detail() and so
+         * names the check that actually refused. Here the reader got "Check the
+         * errors above" with nothing above -- exactly the dead end #1537/#1416
+         * fixed on the other paths and missed on this one. Context init is
+         * where the cache, rendezvous and log directories are validated, so it
+         * is the emitter MOST likely to hold a detail worth showing. */
+        cli_activation_diagnostic(NULL, CLI_ACTIVATION_REFUSED_MESSAGE);
         return CLI_TRUE;
     }
     printf("Stopping active CBM sessions and operations for %s...\n",
