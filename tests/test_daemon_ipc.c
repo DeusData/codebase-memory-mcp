@@ -13,6 +13,7 @@
 #include "daemon/ipc_internal.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/subprocess.h"
@@ -5187,6 +5188,83 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
 #endif /* CBM_ENABLE_TEST_SEAMS */
 #endif /* !_WIN32 */
 
+#ifndef _WIN32
+enum { IPC_TEST_LOG_CAPTURE_CAP = 16384 };
+static char ipc_test_log_capture[IPC_TEST_LOG_CAPTURE_CAP];
+static size_t ipc_test_log_capture_used;
+
+static void ipc_test_log_capture_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t length = strlen(line);
+    if (ipc_test_log_capture_used + length + 2 > sizeof(ipc_test_log_capture)) {
+        return;
+    }
+    memcpy(ipc_test_log_capture + ipc_test_log_capture_used, line, length);
+    ipc_test_log_capture_used += length;
+    ipc_test_log_capture[ipc_test_log_capture_used++] = '\n';
+    ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
+}
+
+/* #1828: a full /tmp made every daemon start die at pending publication, and
+ * the only durable trace was `daemon.ipc.listen_failed stage=pending_publication`
+ * -- no syscall, no errno, no path. The reporter needed hours (and a wrong
+ * `df` on the wrong mount) to find the cause. The failure line must name the
+ * errno and the exact artifact path that could not be written. */
+TEST(daemon_ipc_listen_failure_names_errno_and_path) {
+    static const char key[] = "1828000000000001";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char pending_path[TEST_PATH_CAP] = {0};
+    char expected_path[TEST_PATH_CAP + 16] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+
+    bool parent_ok = ipc_test_parent_new(parent, "enospc-diag");
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+    }
+    bool paths_ok = endpoint && ipc_test_socket_pending_path(pending_path, socket_path) &&
+                    snprintf(expected_path, sizeof(expected_path), "path=%s.tmp", pending_path) > 0;
+    if (paths_ok) {
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        listener = cbm_daemon_ipc_listen(endpoint);
+        cbm_log_set_sink(NULL);
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
+    }
+    const char *failed = strstr(ipc_test_log_capture, "msg=daemon.ipc.listen_failed");
+    bool stage_named = failed && strstr(failed, "stage=pending_publication") != NULL;
+    bool errno_named = failed && strstr(failed, "errno=ENOSPC") != NULL;
+    bool path_named = failed && strstr(failed, expected_path) != NULL;
+    struct stat leftover;
+    bool namespace_clean = paths_ok && lstat(socket_path, &leftover) != 0 && errno == ENOENT &&
+                           lstat(pending_path, &leftover) != 0 && errno == ENOENT;
+
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(listener == NULL);
+    ASSERT_TRUE(failed != NULL);
+    ASSERT_TRUE(stage_named);
+    ASSERT_TRUE(errno_named);
+    ASSERT_TRUE(path_named);
+    ASSERT_TRUE(namespace_clean);
+    PASS();
+}
+#endif
+
 SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_pending_timeout_race_returns_completed_io);
     RUN_TEST(daemon_ipc_pending_wait_failure_cancels_and_drains);
@@ -5260,5 +5338,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
+#ifndef _WIN32
+    RUN_TEST(daemon_ipc_listen_failure_names_errno_and_path);
+#endif
 #endif
 }

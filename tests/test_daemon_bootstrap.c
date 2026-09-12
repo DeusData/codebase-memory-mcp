@@ -1,18 +1,30 @@
 /* RED contract for early process-role classification. */
 #include "test_framework.h"
+#include "test_helpers.h"
 
 #include "daemon/bootstrap.h"
+#include "daemon/host.h"
 #include "daemon/ipc.h"
+#include "daemon/ipc_internal.h"
+#include "daemon/runtime.h"
 #include "daemon/service.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
 
+#include <errno.h>
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#ifndef _WIN32
+#include <signal.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 enum {
     BOOTSTRAP_TEST_PATH_CAP = 1024,
@@ -874,6 +886,253 @@ TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous) {
 }
 #endif
 
+#ifndef _WIN32
+enum { BOOTSTRAP_ENOSPC_MAX_CHILDREN = 16, BOOTSTRAP_ENOSPC_LOG_CAP = 65536 };
+
+typedef struct {
+    char parent[BOOTSTRAP_TEST_PATH_CAP];
+    cbm_daemon_build_identity_t identity;
+    pid_t children[BOOTSTRAP_ENOSPC_MAX_CHILDREN];
+    size_t child_count;
+    size_t spawn_calls;
+} bootstrap_enospc_host_t;
+
+/* The production spawn exec's the product binary; this one forks a REAL daemon
+ * host (cbm_daemon_host_run, the same entry `--cbm-daemon-internal` reaches)
+ * whose record publication fails with ENOSPC through the inherited seam. */
+static bool bootstrap_enospc_host_spawn(void *opaque,
+                                        const cbm_daemon_bootstrap_launch_spec_t *spec) {
+    bootstrap_enospc_host_t *state = opaque;
+    if (!spec || !spec->detached) {
+        return false;
+    }
+    state->spawn_calls++;
+    if (state->child_count >= BOOTSTRAP_ENOSPC_MAX_CHILDREN) {
+        /* RED-run guard only: a client that keeps respawning a doomed daemon
+         * for its whole deadline must not fork without bound. */
+        return true;
+    }
+    pid_t child = fork();
+    if (child < 0) {
+        return false;
+    }
+    if (child == 0) {
+        cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(state->parent);
+        atomic_int stop_requested = ATOMIC_VAR_INIT(0);
+        cbm_daemon_host_config_t config = {
+            .endpoint = endpoint,
+            .identity = state->identity,
+            .executable_path = "/enospc-host-test",
+            .stop_requested = &stop_requested,
+        };
+        int run_result = endpoint ? cbm_daemon_host_run(&config) : 0;
+        _exit(run_result == -1 ? 0 : 50);
+    }
+    state->children[state->child_count++] = child;
+    return true;
+}
+
+static void bootstrap_enospc_reap(bootstrap_enospc_host_t *state, int *nonzero_exits) {
+    *nonzero_exits = 0;
+    for (size_t i = 0; i < state->child_count; i++) {
+        int status = 0;
+        pid_t waited;
+        do {
+            waited = waitpid(state->children[i], &status, WNOHANG);
+        } while (waited < 0 && errno == EINTR);
+        if (waited == 0) {
+            (void)kill(state->children[i], SIGKILL);
+            do {
+                waited = waitpid(state->children[i], &status, 0);
+            } while (waited < 0 && errno == EINTR);
+        }
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            (*nonzero_exits)++;
+        }
+    }
+}
+
+static bool bootstrap_read_file(const char *path, char *out, size_t capacity) {
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        return false;
+    }
+    size_t used = fread(out, 1, capacity - 1, file);
+    out[used] = '\0';
+    (void)fclose(file);
+    return true;
+}
+
+/* The record contract behind the fail-fast: a real listener failure in this
+ * process is recorded and read back with stage, errno, and path; a record
+ * older than the reader's spawn or for another endpoint is not evidence. */
+TEST(daemon_bootstrap_start_failure_record_round_trip) {
+    bootstrap_endpoint_fixture_t fixture;
+    bootstrap_endpoint_fixture_t other;
+    ASSERT_TRUE(bootstrap_endpoint_fixture_start(&fixture, "failure-record"));
+    char other_parent[BOOTSTRAP_TEST_PATH_CAP];
+    int other_written =
+        snprintf(other_parent, sizeof(other_parent), "%s/other-XXXXXX", fixture.parent);
+    ASSERT(other_written > 0 && other_written < (int)sizeof(other_parent));
+    ASSERT_TRUE(cbm_mkdtemp(other_parent) != NULL);
+    memset(&other, 0, sizeof(other));
+    other.endpoint = cbm_daemon_ipc_endpoint_new("1828000000000002", other_parent);
+    ASSERT_TRUE(other.endpoint != NULL);
+    char logs[BOOTSTRAP_TEST_PATH_CAP];
+    int logs_written = snprintf(logs, sizeof(logs), "%s/logs", fixture.parent);
+    ASSERT(logs_written > 0 && logs_written < (int)sizeof(logs));
+    char expected_path[BOOTSTRAP_TEST_PATH_CAP];
+    int path_written = snprintf(expected_path, sizeof(expected_path), "%s.pending.tmp",
+                                cbm_daemon_ipc_endpoint_address(fixture.endpoint));
+    ASSERT(path_written > 0 && path_written < (int)sizeof(expected_path));
+
+    cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
+    cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(fixture.endpoint);
+    cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
+    ASSERT_TRUE(listener == NULL);
+
+    uint64_t now_s = (uint64_t)time(NULL);
+    bool recorded = cbm_daemon_bootstrap_start_failure_record(logs, fixture.endpoint, "runtime");
+    cbm_daemon_bootstrap_start_failure_t failure;
+    int found =
+        cbm_daemon_bootstrap_start_failure_read(logs, fixture.endpoint, now_s - 2, &failure);
+    cbm_daemon_bootstrap_start_failure_t stale;
+    int stale_found =
+        cbm_daemon_bootstrap_start_failure_read(logs, fixture.endpoint, now_s + 60, &stale);
+    cbm_daemon_bootstrap_start_failure_t foreign;
+    int foreign_found =
+        cbm_daemon_bootstrap_start_failure_read(logs, other.endpoint, now_s - 2, &foreign);
+    char message[CBM_DAEMON_CONFLICT_MESSAGE_SIZE];
+    cbm_daemon_bootstrap_start_failure_format(&failure, logs, message, sizeof(message));
+
+    cbm_daemon_ipc_endpoint_free(other.endpoint);
+    (void)th_rmtree(fixture.parent);
+    bootstrap_endpoint_fixture_finish(&fixture);
+
+    ASSERT_TRUE(recorded);
+    ASSERT_EQ(found, 1);
+    ASSERT_STR_EQ(failure.component, "runtime");
+    ASSERT_STR_EQ(failure.stage, "pending_publication");
+    ASSERT_EQ(failure.errno_value, ENOSPC);
+    ASSERT_STR_EQ(failure.path, expected_path);
+    ASSERT_TRUE(failure.pid == (uint64_t)getpid());
+    ASSERT_EQ(stale_found, 0);
+    ASSERT_EQ(foreign_found, 0);
+    ASSERT_TRUE(strstr(message, "CBM daemon failed to start: pending_publication failed with "
+                                "ENOSPC (") != NULL);
+    ASSERT_TRUE(strstr(message, expected_path) != NULL);
+    ASSERT_TRUE(strstr(message, "/cbm-daemon.log") != NULL);
+    PASS();
+}
+
+/* #1828: a daemon that dies at publication (full /tmp) left every client
+ * waiting the full 30 s and then reporting "active or starting" -- the
+ * opposite of the truth. A real host is spawned against a runtime directory
+ * whose record writes fail with ENOSPC; the client must report "failed to
+ * start" naming the errno and the path by ending the wait on the recorded
+ * cause, not by exhausting the deadline. The proof is the surfaced record and
+ * the single spawn (see the assertions), never a wall-clock measurement. */
+TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
+    const char *old_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
+    bool snapshot_ok = !old_cache || saved_cache;
+
+    bootstrap_endpoint_fixture_t fixture;
+    bool fixture_ok = snapshot_ok && bootstrap_endpoint_fixture_start(&fixture, "enospc-host");
+    char cache[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char daemon_log[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    char expected_path[BOOTSTRAP_TEST_PATH_CAP] = {0};
+    int cache_written =
+        fixture_ok ? snprintf(cache, sizeof(cache), "%s/cache", fixture.parent) : -1;
+    int log_written =
+        fixture_ok ? snprintf(daemon_log, sizeof(daemon_log), "%s/logs/cbm-daemon.log", cache) : -1;
+    int path_written = fixture_ok ? snprintf(expected_path, sizeof(expected_path), "%s.pending.tmp",
+                                             cbm_daemon_ipc_endpoint_address(fixture.endpoint))
+                                  : -1;
+    bool environment_ready = cache_written > 0 && cache_written < (int)sizeof(cache) &&
+                             log_written > 0 && log_written < (int)sizeof(daemon_log) &&
+                             path_written > 0 && path_written < (int)sizeof(expected_path) &&
+                             cbm_mkdir_p(cache, 0700) && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0;
+
+    char self_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+    bool identity_ready = environment_ready && cbm_daemon_runtime_process_build_fingerprint(
+                                                   (uint64_t)getpid(), self_build);
+    static bootstrap_enospc_host_t host;
+    memset(&host, 0, sizeof(host));
+    (void)snprintf(host.parent, sizeof(host.parent), "%s", fixture_ok ? fixture.parent : "");
+    host.identity = bootstrap_identity("2.4.0", self_build);
+
+    cbm_daemon_bootstrap_config_t config = {
+        .role = CBM_DAEMON_PROCESS_MCP_CLIENT,
+        .endpoint = fixture.endpoint,
+        .identity = &host.identity,
+        .executable_path = "/enospc-host-test",
+        .connect_timeout_ms = 200,
+        .startup_timeout_ms = 30000,
+    };
+    cbm_daemon_bootstrap_result_t result;
+    memset(&result, 0, sizeof(result));
+    cbm_daemon_bootstrap_status_t status = CBM_DAEMON_BOOTSTRAP_FAILED;
+    if (identity_ready) {
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
+        cbm_daemon_bootstrap_spawn_override_set_for_test(bootstrap_enospc_host_spawn, &host);
+        status = cbm_daemon_bootstrap_execute(&config, &result);
+        cbm_daemon_bootstrap_spawn_override_set_for_test(NULL, NULL);
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
+    }
+    int nonzero_exits = 0;
+    bootstrap_enospc_reap(&host, &nonzero_exits);
+
+    static char log[BOOTSTRAP_ENOSPC_LOG_CAP];
+    log[0] = '\0';
+    bool log_read = bootstrap_read_file(daemon_log, log, sizeof(log));
+    const char *listen_failed = strstr(log, "msg=daemon.ipc.listen_failed");
+    bool daemon_named_cause = listen_failed && strstr(listen_failed, "errno=ENOSPC") != NULL &&
+                              strstr(listen_failed, expected_path) != NULL;
+    bool message_names_failure = strstr(result.message, "failed to start") != NULL;
+    bool message_names_errno = strstr(result.message, "ENOSPC") != NULL;
+    bool message_names_path = strstr(result.message, expected_path) != NULL;
+    bool stale_wording = strstr(result.message, "active or starting") != NULL;
+
+    if (saved_cache) {
+        (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
+    } else {
+        (void)cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    free(saved_cache);
+    if (fixture_ok) {
+        (void)th_rmtree(fixture.parent);
+        bootstrap_endpoint_fixture_finish(&fixture);
+    }
+
+    ASSERT_TRUE(snapshot_ok);
+    ASSERT_TRUE(fixture_ok);
+    ASSERT_TRUE(environment_ready);
+    ASSERT_TRUE(identity_ready);
+    ASSERT_EQ(status, CBM_DAEMON_BOOTSTRAP_FAILED);
+    ASSERT_TRUE(result.daemon_spawned);
+    ASSERT_TRUE(host.child_count >= 1);
+    ASSERT_TRUE(log_read);
+    ASSERT_TRUE(daemon_named_cause);
+    /* Fast-fail is proven by the MECHANISM, never by wall-clock (O9: a gate
+     * never asserts a transient timing window). The recorded ENOSPC cause is
+     * surfaced verbatim ("failed to start" + errno + path) and the slow
+     * "active or starting" timeout wording is absent -- that message is emitted
+     * ONLY on the fast-fail break (cbm_daemon_bootstrap_start_failure_format),
+     * never on the 30 s deadline path -- and the client stopped after exactly
+     * one spawn instead of respawning a doomed daemon until the deadline. Any
+     * regression to the pre-#1828 30 s hang trips these deterministically. */
+    ASSERT_FALSE(stale_wording);
+    ASSERT_TRUE(message_names_failure);
+    ASSERT_TRUE(message_names_errno);
+    ASSERT_TRUE(message_names_path);
+    ASSERT_EQ(host.child_count, 1U);
+    ASSERT_EQ(nonzero_exits, 0);
+    bootstrap_endpoint_fixture_finish(&fixture);
+    PASS();
+}
+#endif
+
 SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_classifies_default_and_ui_as_mcp_clients);
     RUN_TEST(daemon_bootstrap_classifies_stateless_commands_without_client);
@@ -902,5 +1161,9 @@ SUITE(daemon_bootstrap) {
     RUN_TEST(daemon_bootstrap_concurrent_first_clients_spawn_one_daemon);
 #ifdef __APPLE__
     RUN_TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous);
+#endif
+#ifndef _WIN32
+    RUN_TEST(daemon_bootstrap_start_failure_record_round_trip);
+    RUN_TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication);
 #endif
 }
