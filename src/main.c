@@ -2672,6 +2672,47 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     return ui_result;
 }
 
+/* In-process sessions are read-only, and these two are what enforce it.
+ *
+ * Without a mutation guard the enforcement would be absent rather than lax:
+ * mcp_project_mutation_begin() is `!srv->mutation_begin || srv->mutation_begin(...)`,
+ * so an unset guard fails OPEN and every mutation proceeds. The daemon
+ * (daemon/application.c), the UI (ui/http_server.c) and the local CLI above all
+ * install one; an in-process session has no daemon to acquire a cross-session
+ * lease from, so it must refuse the mutation instead of taking it unguarded.
+ * Otherwise an in-process index_repository would write the shared cache under
+ * CBM_CACHE_DIR while a daemon session on the same machine mutates the same
+ * project — the exact race the lease exists to prevent.
+ *
+ * Leaving the try-guard unset is deliberate and load-bearing: with
+ * mutation_begin set and mutation_try_begin NULL, mcp_project_mutation_try_begin()
+ * also returns false, so opportunistic writes during a read are refused too. */
+static bool main_in_process_mutation_refused(void *context, const char *project) {
+    (void)context;
+    (void)project;
+    return false;
+}
+
+static void main_in_process_mutation_end(void *context, const char *project) {
+    (void)context;
+    (void)project;
+}
+
+/* Reject indexing with a message that says why, rather than letting the
+ * mutation guard report it as "blocked by an active index" — nothing is
+ * blocking, the mode simply cannot coordinate a write. Mirrors
+ * http_read_only_index_rejected in ui/http_server.c. */
+static char *main_in_process_index_rejected(void *context, const char *repo_path,
+                                            const char *args_json) {
+    (void)context;
+    (void)repo_path;
+    (void)args_json;
+    return cbm_mcp_text_result("indexing is unavailable in CBM_IN_PROCESS mode: it needs the "
+                               "coordination daemon's cross-session lease. Run "
+                               "`codebase-memory-mcp cli index_repository` outside the sandbox.",
+                               true);
+}
+
 int main(int argc, char **argv) {
     /* Must remain the first statement: see allocator binding contract above. */
     cbm_alloc_init();
@@ -3100,6 +3141,64 @@ int main(int argc, char **argv) {
             return EXIT_FAILURE;
         }
         return result;
+    }
+
+    /* In-process MCP: serve the stdio JSON-RPC loop directly, with no
+     * coordination daemon and therefore no AF_UNIX rendezvous at all.
+     *
+     * This exists for hosts whose sandbox denies socket syscalls outright —
+     * e.g. a macOS seatbelt profile that is `(allow default)` for the
+     * filesystem but `(deny network*)`, which covers network-bind and
+     * network-outbound and so makes both bind() and connect() EPERM. There the
+     * daemon handshake can never complete: presence is inferred from a file
+     * lock (permitted), so an EPERM connect is misread as "daemon still
+     * starting" and the whole MAIN_MCP_STARTUP_TIMEOUT_MS budget is spent
+     * retrying it before the client gives up.
+     *
+     * Opt-in via CBM_IN_PROCESS so default behaviour is unchanged. The store is
+     * resolved from CBM_CACHE_DIR exactly as a daemon session does
+     * (cbm_mcp_server_new(NULL), as in daemon/application.c and
+     * ui/http_server.c), so this reads the same index the daemon builds.
+     *
+     * The session is READ-ONLY, and deliberately so. Without a daemon there is
+     * no cross-session mutation lease, no index executor and no exact-build
+     * admission, so a write here could not be coordinated against a daemon
+     * session touching the same project. See the guards above main() for how
+     * that is enforced and why an unset guard would have been worse than a
+     * refusing one. Indexing stays with the daemon, outside the sandbox. */
+    if (role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
+        char inproc_buf[MAIN_PATH_CAP];
+        const char *inproc =
+            cbm_safe_getenv("CBM_IN_PROCESS", inproc_buf, sizeof(inproc_buf), NULL);
+        if (inproc && inproc[0] && strcmp(inproc, "0") != 0) {
+            cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
+            cbm_mcp_server_t *inproc_srv = cbm_mcp_server_new(NULL);
+            if (!inproc_srv) {
+                (void)fprintf(stderr, "codebase-memory-mcp: cannot create in-process MCP server\n");
+                return EXIT_FAILURE;
+            }
+            cbm_mcp_server_set_tool_profile(inproc_srv, tool_profile);
+            /* Read-only: no daemon means no cross-session lease, index executor
+             * or exact-build admission, so every write path must refuse rather
+             * than proceed unguarded. background_tasks off also stops
+             * maybe_auto_index() from indexing on the initialize path. */
+            cbm_mcp_server_set_background_tasks(inproc_srv, false);
+            cbm_mcp_server_set_index_executor(inproc_srv, main_in_process_index_rejected, NULL);
+            cbm_mcp_server_set_project_mutation_guard(inproc_srv, main_in_process_mutation_refused,
+                                                      main_in_process_mutation_end, NULL);
+            char inproc_root[MAIN_PATH_CAP];
+            char inproc_allowed[MAIN_PATH_CAP];
+            const char *inproc_allowed_ptr = NULL;
+            if (main_session_context(NULL, inproc_root, inproc_allowed, &inproc_allowed_ptr)) {
+                (void)cbm_mcp_server_set_session_context(inproc_srv, inproc_root,
+                                                         inproc_allowed_ptr);
+            }
+            setup_signal_handlers();
+            cbm_log_info("mcp.in_process", "reason", "CBM_IN_PROCESS", "daemon", "bypassed");
+            int inproc_rc = cbm_mcp_server_run(inproc_srv, stdin, stdout);
+            cbm_mcp_server_free(inproc_srv);
+            return inproc_rc < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        }
     }
 
     cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
