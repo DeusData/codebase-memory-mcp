@@ -297,6 +297,31 @@ static const RFile kTsImport[] = {
      "function caller(v: number): number { return helper(v); }\n"},
 };
 
+/* An imported class constructed through an inferred local variable must retain
+ * the imported class QN for subsequent member dispatch.  The explicit type
+ * annotation path already covers this shape; this fixture isolates inference.
+ */
+static const RFile kTsInferredImportedMethod[] = {
+    {"store.ts",
+     "export class WidgetStore {\n"
+     "    findById(id: string): string { return id; }\n"
+     "}\n"},
+    {"service.ts",
+     "import { WidgetStore } from \"./store\";\n"
+     "function load(id: string): string {\n"
+     "    const store = new WidgetStore();\n"
+     "    return store.findById(id);\n"
+     "}\n"},
+};
+
+/* A standard-library class constructed through an inferred local variable must
+ * retain the bare stdlib QN so subsequent member dispatch finds Map.get. */
+static const char kTsInferredStdlibMethod[] =
+    "function lookup(id: string): string {\n"
+    "    const m = new Map<string, string>();\n"
+    "    return m.get(id);\n"
+    "}\n";
+
 /* lsp_ts_jsx — <Comp/> JSX element whose tag is a module-local component
  * function (ts_lsp.c:2643-2647). TSX only (jsx_mode); the tag's first letter is
  * uppercase so it is NOT treated as an intrinsic HTML element; it resolves via
@@ -370,6 +395,19 @@ TEST(repro_lsp_ts_import) {
         "lsp_ts_import");
 }
 
+TEST(repro_lsp_ts_inferred_import_receiver) {
+    return assert_lsp_strategy_files(
+        kTsInferredImportedMethod,
+        (int)(sizeof(kTsInferredImportedMethod) /
+              sizeof(kTsInferredImportedMethod[0])),
+        "lsp_ts_method");
+}
+
+TEST(repro_lsp_ts_inferred_stdlib_receiver) {
+    return assert_lsp_strategy("main.ts", kTsInferredStdlibMethod,
+                               "lsp_ts_method");
+}
+
 TEST(repro_lsp_ts_jsx) {
     return assert_lsp_strategy("app.tsx", kTsxJsx, "lsp_ts_jsx");
 }
@@ -403,6 +441,8 @@ SUITE(repro_lsp_ts) {
     RUN_TEST(repro_lsp_ts_method);
     RUN_TEST(repro_lsp_ts_namespace);
     RUN_TEST(repro_lsp_ts_import);
+    RUN_TEST(repro_lsp_ts_inferred_import_receiver);
+    RUN_TEST(repro_lsp_ts_inferred_stdlib_receiver);
     RUN_TEST(repro_lsp_ts_jsx);
     RUN_TEST(repro_lsp_ts_jsx_import);
     RUN_TEST(repro_lsp_ts_default);

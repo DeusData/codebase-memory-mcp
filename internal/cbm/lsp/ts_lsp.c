@@ -2176,10 +2176,19 @@ const CBMType *ts_eval_expr_type(TSLSPContext *ctx, TSNode node) {
         if (!ts_node_is_null(ctor)) {
             char *cname = node_text(ctx, ctor);
             if (cname) {
-                // Bare class name → qualify against module.
-                if (strchr(cname, '.') == NULL && ctx->module_qn) {
-                    const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
-                    result = cbm_type_named(ctx->arena, qn);
+                // Resolve lexical/import bindings before falling back to the
+                // current module. This preserves the imported class QN for
+                // inferred locals such as `const x = new ImportedClass()`.
+                if (strchr(cname, '.') == NULL) {
+                    const CBMType *bound = type_of_identifier(ctx, cname);
+                    if (bound && bound->kind == CBM_TYPE_NAMED &&
+                        bound->data.named.qualified_name) {
+                        result = bound;
+                    } else if (ctx->module_qn) {
+                        const char *qn =
+                            cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, cname);
+                        result = cbm_type_named(ctx->arena, qn);
+                    }
                 } else {
                     result = cbm_type_named(ctx->arena, cname);
                 }
