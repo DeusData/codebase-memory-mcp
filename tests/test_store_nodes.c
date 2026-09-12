@@ -2030,6 +2030,37 @@ TEST(store_count_nodes_unknown_project) {
     PASS();
 }
 
+/* A COUNT(*) that cannot be read must not be reported as a count of zero:
+ * index_status renders that as the positive assertion status "empty", so a
+ * corrupt project looks like one that was never indexed. Dropping the table
+ * after the statement is cached makes the step fail deterministically. */
+TEST(store_count_failed_read_is_not_zero) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n = {.project = "test",
+                    .label = "File",
+                    .name = "main.c",
+                    .qualified_name = "test.main.c",
+                    .file_path = "main.c"};
+    cbm_store_upsert_node(s, &n);
+
+    /* Sanity: a readable table still counts normally. */
+    ASSERT_EQ(cbm_store_count_nodes(s, "test"), 1);
+    ASSERT_TRUE(cbm_store_count_edges(s, "test") >= 0);
+
+    /* Make the read fail. The statements are cached by the calls above, so the
+     * step (not the prepare) is what fails once the tables are gone. */
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE nodes;"), 0);
+    ASSERT_EQ(cbm_store_exec(s, "DROP TABLE edges;"), 0);
+
+    ASSERT_TRUE(cbm_store_count_nodes(s, "test") < 0);
+    ASSERT_TRUE(cbm_store_count_edges(s, "test") < 0);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Index coverage (#963) ──────────────────────────────────────── */
 
 /* Round-trip + deleted-file prune + shadow miss-graph materialization +
@@ -2432,4 +2463,5 @@ SUITE(store_nodes) {
     RUN_TEST(store_node_properties_special_chars);
     RUN_TEST(store_delete_nodes_nonexistent);
     RUN_TEST(store_count_nodes_unknown_project);
+    RUN_TEST(store_count_failed_read_is_not_zero);
 }
