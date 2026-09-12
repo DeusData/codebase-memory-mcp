@@ -2587,7 +2587,12 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     /* Base walk-state tuple (previously established by the first
      * recompute_state call): module scope, nothing else active. */
     state.enclosing_func_qn = ctx->module_qn;
-    state.enclosing_class_qn = NULL;
+    /* VB6 class modules (.cls/.frm/.ctl/.dsr/.pag) ARE a class but have no
+     * class node to open a SCOPE_CLASS, so the file's class QN is the baseline
+     * every frame saves on push and restores on pop (NULL for every other
+     * language and for .bas standard modules). compute_func_qn then qualifies
+     * each procedure as class.name -- the Method QN extract_func_def mints. */
+    state.enclosing_class_qn = cbm_vb6_file_class_qn(ctx);
     state.invocation_kind = CBM_INVOCATION_NONE;
     state.callee_expr = (TSNode){0};
     state.callee_leaf = (TSNode){0};
