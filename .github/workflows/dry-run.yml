@@ -58,6 +58,13 @@ jobs:
   # ── Security (independent island — does not block main pipeline) ──
   security:
     uses: ./.github/workflows/_security.yml
+    # The called job requests security-events:read to count code-scanning
+    # alerts; a reusable workflow cannot request more than its caller grants,
+    # so withholding this here fails the whole run at startup.
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
     secrets: inherit
 
   # ── Lint (cppcheck + clang-format) ────────────────────────────
