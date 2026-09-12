@@ -1037,6 +1037,11 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         } else {
             exit_code = cli_print_mcp_result(result);
         }
+        /* One place for both presentations: a gate reading the status must get
+         * the same verdict whether or not the caller asked for --json. */
+        if (tool_name && strcmp(tool_name, "index_repository") == 0) {
+            exit_code = cbm_cli_index_exit_status(result, exit_code);
+        }
         exit_code = cbm_cli_exit_status_after_maintenance(exit_code, maintenance_cancelled);
         if (cbm_index_worker_active()) {
             /* The supervisor protocol classifies the PROCESS, not the tool

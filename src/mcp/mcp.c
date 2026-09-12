@@ -10316,6 +10316,28 @@ static bool build_index_success_response(cbm_mcp_server_t *srv, yyjson_mut_doc *
         add_parse_partial_summary(doc, root, file_errors, file_error_count);
         add_parse_unusable_summary(doc, root, file_errors, file_error_count);
     }
+    /* Denominator for quality gates. parse_partial_count on its own cannot
+     * say whether sixty flagged files are a rounding error or half the
+     * repository; file_hashes holds exactly one row per indexed file. */
+    if (store) {
+        cbm_file_hash_t *hashes = NULL;
+        int hash_count = 0;
+        if (cbm_store_get_file_hashes(store, project_name, &hashes, &hash_count) == CBM_STORE_OK) {
+            yyjson_mut_obj_add_int(doc, root, "files_indexed", hash_count);
+            /* The share, stated outright. A gate that only passes or fails
+             * cannot tell anyone HOW partial the parse was, and "the graph is
+             * fresh, but 6.2% of files parsed partially" is a usable hint
+             * where a bare verdict is not. Tenths of a percent are derived by
+             * integer division so the number never depends on rounding. */
+            yyjson_mut_val *partial_val = yyjson_mut_obj_get(root, "parse_partial_count");
+            if (partial_val && hash_count > 0) {
+                int partial = yyjson_mut_get_int(partial_val);
+                long tenths = (long)partial * 1000 / hash_count;
+                yyjson_mut_obj_add_real(doc, root, "parse_partial_pct", (double)tenths / 10.0);
+            }
+            cbm_store_free_file_hashes(hashes, hash_count);
+        }
+    }
     int nodes = 0;
     int edges = 0;
     bool degraded = false;
@@ -11254,6 +11276,16 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
                                "previous index may have been rolled back.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
+        /* A repository that is not there at all is a different failure from a
+         * pipeline that fell over inside one that is — the hint below reads
+         * identically for both, so callers could not tell them apart. The
+         * split is deliberately about the ROOT: an unreadable subtree is a
+         * pipeline failure, not a missing target. */
+        cbm_path_info_t target = {0};
+        bool target_reachable =
+            cbm_path_info_utf8(repo_path, &target) == CBM_PATH_INFO_OK && target.is_directory;
+        yyjson_mut_obj_add_str(doc, root, "reason",
+                               target_reachable ? "pipeline_failed" : "target_unavailable");
         yyjson_mut_obj_add_str(doc, root, "hint",
                                "Pipeline failed. Check repo_path exists and contains source files. "
                                "Try mode='fast' for a quicker diagnostic run.");

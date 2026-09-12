@@ -15928,6 +15928,319 @@ TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
     PASS();
 }
 
+/* ── index_repository exit contract ──────────────────────────────
+ *
+ * cbm_cli_index_exit_status grades a result envelope into a process exit
+ * code, because a freshness gate reads process status rather than a tool's
+ * account of itself. The six outcomes were measured by hand against the
+ * built binary when the contract landed; measured once is not pinned, and
+ * a code that moves silently is exactly what the contract exists to stop. */
+
+/* Build the envelope the CLI actually receives: the payload travels as a
+ * JSON string inside content[0].text. Escaping it by hand in every test
+ * would put the test's own escaping on trial instead of the grader. */
+static char *cli_index_envelope(const char *payload) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    yyjson_mut_val *content = yyjson_mut_arr(doc);
+    yyjson_mut_val *item = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_str(doc, item, "text", payload);
+    yyjson_mut_arr_append(content, item);
+    yyjson_mut_obj_add_val(doc, root, "content", content);
+    char *json = yyjson_mut_write(doc, 0, NULL);
+    yyjson_mut_doc_free(doc);
+    return json;
+}
+
+/* Grade one payload. Returns -1 only if the envelope could not be built, a
+ * value no exit code uses, so a setup failure cannot pass for a verdict. */
+static int cli_index_grade(const char *payload, int base_status) {
+    char *envelope = cli_index_envelope(payload);
+    if (!envelope) {
+        return -1;
+    }
+    int status = cbm_cli_index_exit_status(envelope, base_status);
+    free(envelope);
+    return status;
+}
+
+typedef struct {
+    char *gate;
+    char *unusable;
+    char *partial_pct;
+} cli_gate_env_t;
+
+/* A test that means to exercise the documented defaults must not inherit
+ * whatever the developer happens to have exported. The contract is opt-in,
+ * so the gate is switched on here; the one test about it being off unsets
+ * CBM_GATE itself. */
+static cli_gate_env_t cli_gate_env_clear(void) {
+    cli_gate_env_t saved = {save_test_env("CBM_GATE"), save_test_env("CBM_GATE_MAX_UNUSABLE"),
+                            save_test_env("CBM_GATE_MAX_PARTIAL_PCT")};
+    cbm_setenv("CBM_GATE", "1", 1);
+    cbm_unsetenv("CBM_GATE_MAX_UNUSABLE");
+    cbm_unsetenv("CBM_GATE_MAX_PARTIAL_PCT");
+    return saved;
+}
+
+static void cli_gate_env_restore(cli_gate_env_t saved) {
+    restore_test_env("CBM_GATE", saved.gate);
+    restore_test_env("CBM_GATE_MAX_UNUSABLE", saved.unusable);
+    restore_test_env("CBM_GATE_MAX_PARTIAL_PCT", saved.partial_pct);
+}
+
+/* Without CBM_GATE the CLI exits exactly as it always did: a payload that
+ * would grade 2 or 3 with the gate on keeps the base status. "0" and the
+ * empty string count as off, so an exported CBM_GATE=0 is not a surprise. */
+TEST(cli_index_exit_gate_off_keeps_base_status) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    const char *below_quality = "{\"status\":\"ok\",\"files_indexed\":10,"
+                                "\"parse_partial_count\":5,\"parse_unusable_count\":1}";
+    const char *missing_target = "{\"status\":\"error\",\"reason\":\"target_unavailable\"}";
+
+    /* Positive control: with the gate on both payloads DO change the status,
+     * so the unchanged codes below are the switch working, not a dead check. */
+    int quality_on = cli_index_grade(below_quality, CBM_CLI_EXIT_OK);
+    int target_on = cli_index_grade(missing_target, CBM_CLI_EXIT_FAILURE);
+
+    cbm_unsetenv("CBM_GATE");
+    int quality_unset = cli_index_grade(below_quality, CBM_CLI_EXIT_OK);
+    int target_unset = cli_index_grade(missing_target, CBM_CLI_EXIT_FAILURE);
+
+    cbm_setenv("CBM_GATE", "0", 1);
+    int quality_zero = cli_index_grade(below_quality, CBM_CLI_EXIT_OK);
+
+    cbm_setenv("CBM_GATE", "", 1);
+    int quality_empty = cli_index_grade(below_quality, CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+
+    ASSERT_EQ(quality_on, CBM_CLI_EXIT_QUALITY);
+    ASSERT_EQ(target_on, CBM_CLI_EXIT_TARGET);
+    ASSERT_EQ(quality_unset, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(target_unset, CBM_CLI_EXIT_FAILURE);
+    ASSERT_EQ(quality_zero, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(quality_empty, CBM_CLI_EXIT_OK);
+    PASS();
+}
+
+/* A clean index keeps the code it always had: the contract adds verdicts,
+ * it does not make previously good runs start failing. */
+TEST(cli_index_exit_clean_run_stays_zero) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int status = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":4,"
+                                 "\"parse_partial_count\":0,\"parse_unusable_count\":0}",
+                                 CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(status, CBM_CLI_EXIT_OK);
+    PASS();
+}
+
+/* A file that did not parse at all gets no tolerance — the default is zero,
+ * so one such file is already a quality failure. */
+TEST(cli_index_exit_unusable_file_is_a_quality_failure) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int status = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":5,"
+                                 "\"parse_partial_count\":0,\"parse_unusable_count\":1}",
+                                 CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(status, CBM_CLI_EXIT_QUALITY);
+    PASS();
+}
+
+/* Partial parsing is graded as a share, not a count: 20 of 100 files is
+ * twice the default ceiling. */
+TEST(cli_index_exit_partial_above_threshold_is_a_quality_failure) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int status = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":100,"
+                                 "\"parse_partial_count\":20,\"parse_unusable_count\":0}",
+                                 CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(status, CBM_CLI_EXIT_QUALITY);
+    PASS();
+}
+
+/* The boundary itself passes. The comparison is strict and integral on
+ * purpose: at exactly the documented ceiling a double could round either
+ * way, and a threshold whose verdict depends on rounding is not a
+ * threshold. 10 of 100 is the ceiling, and the ceiling is allowed. */
+TEST(cli_index_exit_partial_exactly_at_threshold_passes) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int at_ceiling = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":100,"
+                                     "\"parse_partial_count\":10,\"parse_unusable_count\":0}",
+                                     CBM_CLI_EXIT_OK);
+    /* One file more is over it, which proves the case above is the boundary
+     * and not simply a check that never fires. */
+    int over_ceiling = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":100,"
+                                       "\"parse_partial_count\":11,\"parse_unusable_count\":0}",
+                                       CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(at_ceiling, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(over_ceiling, CBM_CLI_EXIT_QUALITY);
+    PASS();
+}
+
+/* "degraded" is the pipeline's own verdict that the graph came out far
+ * smaller than the run expected. It carries no parse counts, so it has to
+ * be graded on the status alone. */
+TEST(cli_index_exit_degraded_status_is_a_quality_failure) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int status = cli_index_grade("{\"status\":\"degraded\",\"files_indexed\":40,"
+                                 "\"parse_partial_count\":0,\"parse_unusable_count\":0}",
+                                 CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(status, CBM_CLI_EXIT_QUALITY);
+    PASS();
+}
+
+/* An absent target and a pipeline that fell over inside a reachable
+ * repository used to share code 1, which is the whole reason the contract
+ * was written: the caller could not tell "wrong path" from "broken run". */
+TEST(cli_index_exit_separates_missing_target_from_broken_run) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int target = cli_index_grade("{\"status\":\"error\",\"reason\":\"target_unavailable\"}",
+                                 CBM_CLI_EXIT_FAILURE);
+    int pipeline = cli_index_grade("{\"status\":\"error\",\"reason\":\"pipeline_failed\"}",
+                                   CBM_CLI_EXIT_FAILURE);
+    /* An error the mapping had not already flagged still has to land on a
+     * failure code rather than fall through as success. */
+    int unflagged = cli_index_grade("{\"status\":\"error\",\"reason\":\"pipeline_failed\"}",
+                                    CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(target, CBM_CLI_EXIT_TARGET);
+    ASSERT_EQ(pipeline, CBM_CLI_EXIT_FAILURE);
+    ASSERT_EQ(unflagged, CBM_CLI_EXIT_FAILURE);
+    PASS();
+}
+
+/* Silence is never upgraded into a verdict. A payload the grader cannot
+ * read says nothing about index quality, and inventing a 2 from it would
+ * fail runs for the crime of an unexpected response shape. */
+TEST(cli_index_exit_never_upgrades_silence) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    ASSERT_EQ(cbm_cli_index_exit_status(NULL, CBM_CLI_EXIT_OK), CBM_CLI_EXIT_OK);
+    ASSERT_EQ(cbm_cli_index_exit_status("", CBM_CLI_EXIT_OK), CBM_CLI_EXIT_OK);
+    ASSERT_EQ(cbm_cli_index_exit_status("not json at all", CBM_CLI_EXIT_OK), CBM_CLI_EXIT_OK);
+    /* A well-formed envelope carrying no content, and one whose text is not
+     * itself JSON — both are shapes a future response could take. */
+    ASSERT_EQ(cbm_cli_index_exit_status("{\"content\":[]}", CBM_CLI_EXIT_OK), CBM_CLI_EXIT_OK);
+    ASSERT_EQ(cli_index_grade("plain text, not a payload", CBM_CLI_EXIT_OK), CBM_CLI_EXIT_OK);
+    /* And the same shapes must not erase a failure already established. */
+    ASSERT_EQ(cbm_cli_index_exit_status(NULL, CBM_CLI_EXIT_FAILURE), CBM_CLI_EXIT_FAILURE);
+    cli_gate_env_restore(saved);
+    PASS();
+}
+
+/* Grading only ever makes a code more specific. A base failure survives a
+ * payload that looks perfectly healthy, because the transport already knew
+ * something the payload does not say. */
+TEST(cli_index_exit_does_not_downgrade_a_failing_base) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int status = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":9,"
+                                 "\"parse_partial_count\":0,\"parse_unusable_count\":0}",
+                                 CBM_CLI_EXIT_FAILURE);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(status, CBM_CLI_EXIT_FAILURE);
+    PASS();
+}
+
+/* Both thresholds are overridable, and both are read at grading time. */
+TEST(cli_index_exit_thresholds_read_the_environment) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    const char *twenty_percent = "{\"status\":\"ok\",\"files_indexed\":100,"
+                                 "\"parse_partial_count\":20,\"parse_unusable_count\":0}";
+    const char *three_unusable = "{\"status\":\"ok\",\"files_indexed\":50,"
+                                 "\"parse_partial_count\":0,\"parse_unusable_count\":3}";
+
+    /* Positive control: at the defaults both payloads fail, so a pass below
+     * is the override working and not the check being absent. */
+    int partial_default = cli_index_grade(twenty_percent, CBM_CLI_EXIT_OK);
+    int unusable_default = cli_index_grade(three_unusable, CBM_CLI_EXIT_OK);
+
+    cbm_setenv("CBM_GATE_MAX_PARTIAL_PCT", "50", 1);
+    cbm_setenv("CBM_GATE_MAX_UNUSABLE", "5", 1);
+    int partial_raised = cli_index_grade(twenty_percent, CBM_CLI_EXIT_OK);
+    int unusable_raised = cli_index_grade(three_unusable, CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+
+    ASSERT_EQ(partial_default, CBM_CLI_EXIT_QUALITY);
+    ASSERT_EQ(unusable_default, CBM_CLI_EXIT_QUALITY);
+    ASSERT_EQ(partial_raised, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(unusable_raised, CBM_CLI_EXIT_OK);
+    PASS();
+}
+
+/* A negative ceiling switches its own check off. This is the documented
+ * escape hatch for a repository whose grammars are known to be thin. */
+TEST(cli_index_exit_negative_threshold_disables_the_check) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    cbm_setenv("CBM_GATE_MAX_PARTIAL_PCT", "-1", 1);
+    cbm_setenv("CBM_GATE_MAX_UNUSABLE", "-1", 1);
+    int status = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":100,"
+                                 "\"parse_partial_count\":99,\"parse_unusable_count\":7}",
+                                 CBM_CLI_EXIT_OK);
+    /* Disabling the parse checks must not disable the pipeline's own
+     * verdict: "degraded" is not a threshold and has no off switch. */
+    int degraded = cli_index_grade("{\"status\":\"degraded\",\"files_indexed\":10,"
+                                   "\"parse_partial_count\":0,\"parse_unusable_count\":0}",
+                                   CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(status, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(degraded, CBM_CLI_EXIT_QUALITY);
+    PASS();
+}
+
+/* A typo must not silently disable a gate. Anything that is not a whole
+ * number falls back to the documented default, so "1O" (letter O) fails the
+ * run it would have failed anyway instead of quietly waving it through. */
+TEST(cli_index_exit_unreadable_threshold_falls_back_to_default) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    const char *twenty_percent = "{\"status\":\"ok\",\"files_indexed\":100,"
+                                 "\"parse_partial_count\":20,\"parse_unusable_count\":0}";
+    /* The last one overflows long: strtol clamps it to LONG_MAX with the
+     * whole string consumed, a ceiling no run could exceed. */
+    const char *unreadable[] = {
+        "abc", "1O", "10pct", " 10", "10 ", "", "1e1", "10.0", "99999999999999999999999"};
+    for (size_t i = 0; i < sizeof(unreadable) / sizeof(unreadable[0]); i++) {
+        cbm_setenv("CBM_GATE_MAX_PARTIAL_PCT", unreadable[i], 1);
+        int status = cli_index_grade(twenty_percent, CBM_CLI_EXIT_OK);
+        if (status != CBM_CLI_EXIT_QUALITY) {
+            printf("  unreadable threshold \"%s\" gave exit %d\n", unreadable[i], status);
+        }
+        ASSERT_EQ(status, CBM_CLI_EXIT_QUALITY);
+    }
+    /* A value that DOES read still takes effect, so the loop above is about
+     * unreadable text and not about the override being ignored outright. */
+    cbm_setenv("CBM_GATE_MAX_PARTIAL_PCT", "50", 1);
+    int readable = cli_index_grade(twenty_percent, CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(readable, CBM_CLI_EXIT_OK);
+    PASS();
+}
+
+/* A share needs a denominator. Without files_indexed the percentage cannot
+ * be computed at all, and a run must not be failed on a number nobody
+ * could work out. */
+TEST(cli_index_exit_partial_without_denominator_is_not_graded) {
+    cli_gate_env_t saved = cli_gate_env_clear();
+    int no_denominator = cli_index_grade("{\"status\":\"ok\",\"parse_partial_count\":20}",
+                                         CBM_CLI_EXIT_OK);
+    int zero_denominator = cli_index_grade("{\"status\":\"ok\",\"files_indexed\":0,"
+                                           "\"parse_partial_count\":20}",
+                                           CBM_CLI_EXIT_OK);
+    /* An unusable file is an absolute count and still grades without one. */
+    int unusable_still_graded = cli_index_grade("{\"status\":\"ok\",\"parse_unusable_count\":1}",
+                                                CBM_CLI_EXIT_OK);
+    cli_gate_env_restore(saved);
+    ASSERT_EQ(no_denominator, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(zero_denominator, CBM_CLI_EXIT_OK);
+    ASSERT_EQ(unusable_still_graded, CBM_CLI_EXIT_QUALITY);
+    PASS();
+}
+
 SUITE(cli) {
     if (!th_secure_runtime_parent_new(g_cli_suite_runtime_parent,
                                       sizeof(g_cli_suite_runtime_parent), "cli-suite")) {
@@ -16357,6 +16670,21 @@ SUITE(cli) {
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
     RUN_TEST(cli_stdin_args_gate_tracks_tool_schema_issue1359);
+
+    /* index_repository exit contract */
+    RUN_TEST(cli_index_exit_gate_off_keeps_base_status);
+    RUN_TEST(cli_index_exit_clean_run_stays_zero);
+    RUN_TEST(cli_index_exit_unusable_file_is_a_quality_failure);
+    RUN_TEST(cli_index_exit_partial_above_threshold_is_a_quality_failure);
+    RUN_TEST(cli_index_exit_partial_exactly_at_threshold_passes);
+    RUN_TEST(cli_index_exit_degraded_status_is_a_quality_failure);
+    RUN_TEST(cli_index_exit_separates_missing_target_from_broken_run);
+    RUN_TEST(cli_index_exit_never_upgrades_silence);
+    RUN_TEST(cli_index_exit_does_not_downgrade_a_failing_base);
+    RUN_TEST(cli_index_exit_thresholds_read_the_environment);
+    RUN_TEST(cli_index_exit_negative_threshold_disables_the_check);
+    RUN_TEST(cli_index_exit_unreadable_threshold_falls_back_to_default);
+    RUN_TEST(cli_index_exit_partial_without_denominator_is_not_graded);
     cbm_cli_set_activation_runtime_parent_for_test(NULL);
     test_rmdir_r(g_cli_suite_runtime_parent);
     g_cli_suite_runtime_parent[0] = '\0';
