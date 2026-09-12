@@ -51,6 +51,16 @@ static bool node_is_test(const cbm_gbuf_node_t *n) {
     return strstr(n->properties_json, "\"is_test\":true") != NULL;
 }
 
+/* JVM annotation evidence (@Test/@ParameterizedTest/...): emitted by
+ * extraction only for exact test-annotation matches, so it may bypass the
+ * test-NAME gate below without letting file-located helpers spray edges. */
+static bool node_is_test_annotated(const cbm_gbuf_node_t *n) {
+    if (!n || !n->properties_json) {
+        return false;
+    }
+    return strstr(n->properties_json, "\"is_test_annotated\":true") != NULL;
+}
+
 /* Helper to check suffix. */
 static bool str_ends_with(const char *s, size_t slen, const char *suffix) {
     size_t sflen = strlen(suffix);
@@ -108,6 +118,17 @@ bool cbm_is_test_path(const char *path) {
         return true;
     }
 
+    /* Perl CPAN layout: .t harness scripts, t/ and xt/ (author tests) dirs.
+     * Only Perl maps .t, and the dir rules are segment-anchored; keep in
+     * lockstep with cbm_is_test_file's CBM_LANG_PERL case (#1294). */
+    if (str_ends_with(path, len, ".t")) {
+        return true;
+    }
+    if (strncmp(path, "t/", SLEN("t/")) == 0 || strncmp(path, "xt/", SLEN("xt/")) == 0 ||
+        strstr(path, "/t/") || strstr(path, "/xt/")) {
+        return true;
+    }
+
     return false;
 }
 
@@ -119,6 +140,11 @@ bool cbm_is_test_func_name(const char *name) {
     /* Go: Test/Benchmark/Example + uppercase letter or end-of-string.
      * "TestFoo" = test, "Testable" = not test (lowercase after prefix). */
     if (strncmp(name, "Test", SLEN("Test")) == 0 &&
+        (name[PT_TEST_LEN] == '\0' || (name[PT_TEST_LEN] >= 'A' && name[PT_TEST_LEN] <= 'Z'))) {
+        return true;
+    }
+    /* Go native fuzzing (1.18+): FuzzXxx, same shape rule as Test. */
+    if (strncmp(name, "Fuzz", SLEN("Fuzz")) == 0 &&
         (name[PT_TEST_LEN] == '\0' || (name[PT_TEST_LEN] >= 'A' && name[PT_TEST_LEN] <= 'Z'))) {
         return true;
     }
@@ -238,8 +264,14 @@ static int create_tests_edges(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        if (!cbm_is_test_func_name(src->name)) {
-            continue;
+        if (!cbm_is_test_func_name(src->name) && !node_is_test_annotated(src)) {
+            /* Perl .t files assert at file scope, so the caller is the
+             * module-level def whose name never looks like a test function —
+             * for them the .t path suffix is the gate instead. */
+            size_t src_len = src->file_path ? strlen(src->file_path) : 0;
+            if (!(src_len && str_ends_with(src->file_path, src_len, ".t"))) {
+                continue;
+            }
         }
 
         cbm_gbuf_insert_edge(ctx->gbuf, src->id, tgt->id, "TESTS", "{}");

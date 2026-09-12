@@ -9,6 +9,7 @@
  */
 #include "test_framework.h"
 #include "pipeline/pipeline_internal.h"
+#include "service_patterns.h"
 
 #include <string.h>
 
@@ -93,6 +94,62 @@ TEST(route_canon_truncation_safe) {
     PASS();
 }
 
+/* ── Go 1.22 ServeMux "METHOD /path" pattern splitting ─────────── */
+
+TEST(go_mux_split_method_pattern) {
+    const char *method = NULL;
+    ASSERT_STR_EQ(cbm_go_split_mux_pattern("GET /users/{id}", &method), "/users/{id}");
+    ASSERT_STR_EQ(method, "GET");
+    PASS();
+}
+
+TEST(go_mux_split_host_pattern) {
+    /* Host prefix is skipped; "{$}" stays for canonicalization. */
+    const char *method = NULL;
+    ASSERT_STR_EQ(cbm_go_split_mux_pattern("GET example.com/{$}", &method), "/{$}");
+    ASSERT_STR_EQ(method, "GET");
+    PASS();
+}
+
+TEST(go_mux_split_wildcard_tail) {
+    const char *method = NULL;
+    ASSERT_STR_EQ(cbm_go_split_mux_pattern("POST /orders/{id...}", &method), "/orders/{id...}");
+    ASSERT_STR_EQ(method, "POST");
+    PASS();
+}
+
+TEST(go_mux_split_plain_path_is_null) {
+    /* No leading method → not a method-qualified pattern. */
+    const char *method = NULL;
+    ASSERT(cbm_go_split_mux_pattern("/legacy", &method) == NULL);
+    ASSERT(method == NULL);
+    PASS();
+}
+
+TEST(go_mux_split_prose_is_null) {
+    /* A space between method and '/' beyond the separator means prose, and an
+     * unknown method never splits. */
+    const char *method = NULL;
+    ASSERT(cbm_go_split_mux_pattern("GET the file /tmp/x", &method) == NULL);
+    ASSERT(cbm_go_split_mux_pattern("FETCH /x", &method) == NULL);
+    ASSERT(cbm_go_split_mux_pattern("GET ", &method) == NULL);
+    ASSERT(cbm_go_split_mux_pattern("GETTER /x", &method) == NULL);
+    PASS();
+}
+
+TEST(go_mux_split_canon_converges) {
+    /* End-to-end invariant: the split path canonicalizes to the same QN body a
+     * client ":id" call site produces. */
+    const char *method = NULL;
+    const char *p = cbm_go_split_mux_pattern("GET /users/{id}", &method);
+    char a[128];
+    char c[128];
+    cbm_route_canon_path(p, a, sizeof(a));
+    cbm_route_canon_path("/users/:id", c, sizeof(c));
+    ASSERT_STR_EQ(a, c);
+    PASS();
+}
+
 SUITE(route_canon) {
     RUN_TEST(route_canon_static_unchanged);
     RUN_TEST(route_canon_colon_param);
@@ -105,4 +162,10 @@ SUITE(route_canon) {
     RUN_TEST(route_canon_colon_mid_segment_is_literal);
     RUN_TEST(route_canon_null_and_empty);
     RUN_TEST(route_canon_truncation_safe);
+    RUN_TEST(go_mux_split_method_pattern);
+    RUN_TEST(go_mux_split_host_pattern);
+    RUN_TEST(go_mux_split_wildcard_tail);
+    RUN_TEST(go_mux_split_plain_path_is_null);
+    RUN_TEST(go_mux_split_prose_is_null);
+    RUN_TEST(go_mux_split_canon_converges);
 }

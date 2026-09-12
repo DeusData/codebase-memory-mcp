@@ -510,6 +510,114 @@ static void ensure_decorator_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* Phase 2a-bis: HANDLES edges for call-registered Route defs (Django urls.py).
+ * Extraction records the spelled handler ("views.detail", "AboutView") in the
+ * Route node's route_handler property; resolve it against Function/Method/
+ * Class nodes by boundary-suffix QN match, preferring nodes that share the
+ * route's directory, and fail closed on ambiguity. */
+static bool qn_has_dotted_suffix(const char *qn, const char *suffix) {
+    if (!qn || !suffix || !suffix[0]) {
+        return false;
+    }
+    size_t qlen = strlen(qn);
+    size_t slen = strlen(suffix);
+    if (qlen <= slen) {
+        return qlen == slen && strcmp(qn, suffix) == 0;
+    }
+    return qn[qlen - slen - SKIP_ONE] == '.' && strcmp(qn + qlen - slen, suffix) == 0;
+}
+
+/* Directory prefix length of a path ("app/urls.py" -> 4, "urls.py" -> 0). */
+static int path_dir_len(const char *path) {
+    const char *last_slash = path ? strrchr(path, '/') : NULL;
+    return last_slash ? (int)(last_slash - path) + SKIP_ONE : 0;
+}
+
+static const cbm_gbuf_node_t *resolve_route_handler_node(cbm_gbuf_t *gb, const char *handler,
+                                                         const char *route_file) {
+    static const char *labels[] = {"Function", "Method", "Class"};
+    const cbm_gbuf_node_t *unique = NULL;
+    const cbm_gbuf_node_t *same_dir = NULL;
+    int match_count = 0;
+    int same_dir_count = 0;
+    int dir_len = path_dir_len(route_file);
+    for (int li = 0; li < (int)(sizeof(labels) / sizeof(labels[0])); li++) {
+        const cbm_gbuf_node_t **nodes = NULL;
+        int count = 0;
+        if (cbm_gbuf_find_by_label(gb, labels[li], &nodes, &count) != 0) {
+            continue;
+        }
+        for (int i = 0; i < count; i++) {
+            if (!qn_has_dotted_suffix(nodes[i]->qualified_name, handler)) {
+                continue;
+            }
+            match_count++;
+            unique = nodes[i];
+            if (dir_len > 0 && nodes[i]->file_path &&
+                strncmp(nodes[i]->file_path, route_file, (size_t)dir_len) == 0) {
+                same_dir_count++;
+                same_dir = nodes[i];
+            }
+        }
+    }
+    if (match_count == 1) {
+        return unique;
+    }
+    if (match_count > 1 && same_dir_count == 1) {
+        return same_dir;
+    }
+    return NULL; /* unresolved or ambiguous: no edge (zero-edge guarantee) */
+}
+
+static void connect_route_handler_defs(cbm_gbuf_t *gb) {
+    const cbm_gbuf_node_t **routes = NULL;
+    int route_count = 0;
+    if (cbm_gbuf_find_by_label(gb, "Route", &routes, &route_count) != 0) {
+        return;
+    }
+    int connected = 0;
+    for (int ri = 0; ri < route_count; ri++) {
+        const cbm_gbuf_node_t *route = routes[ri];
+        char handler[CBM_SZ_256];
+        if (!route->properties_json ||
+            !extract_json_prop(route->properties_json, "route_handler", handler,
+                               sizeof(handler)) ||
+            !handler[0]) {
+            continue;
+        }
+        const cbm_gbuf_node_t *h = resolve_route_handler_node(
+            gb, handler, route->file_path ? route->file_path : "");
+        if (!h) {
+            continue;
+        }
+        const cbm_gbuf_edge_t **existing = NULL;
+        int eh_count = 0;
+        bool already = false;
+        cbm_gbuf_find_edges_by_target_type(gb, route->id, "HANDLES", &existing, &eh_count);
+        for (int eh = 0; eh < eh_count; eh++) {
+            if (existing[eh]->source_id == h->id) {
+                already = true;
+                break;
+            }
+        }
+        if (already) {
+            continue;
+        }
+        char hprops[CBM_SZ_512];
+        char esc_h[CBM_SZ_256];
+        cbm_json_escape(esc_h, sizeof(esc_h), h->qualified_name ? h->qualified_name : "");
+        snprintf(hprops, sizeof(hprops), "{\"handler\":\"%s\",\"source\":\"route_handler\"}",
+                 esc_h);
+        cbm_gbuf_insert_edge(gb, h->id, route->id, "HANDLES", hprops);
+        connected++;
+    }
+    if (connected > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", connected);
+        cbm_log_info("pass.route_handler_defs", "connected", buf);
+    }
+}
+
 /* Phase 2b: Connect prefix Routes to decorator handler Functions.
  * For each prefix Route (__route__ANY__/path), find the CALLS edge leading to it
  * (from the registering file), derive the service directory, then find decorator
@@ -566,26 +674,34 @@ static void connect_prefix_to_decorators(cbm_gbuf_t *gb) {
         const cbm_gbuf_edge_t **calls_in = NULL;
         int calls_count = 0;
         cbm_gbuf_find_edges_by_target_type(gb, prefix_route->id, "CALLS", &calls_in, &calls_count);
-        if (calls_count == 0) {
+        const char *registrar_path = NULL;
+        if (calls_count > 0) {
+            const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
+            if (registrar) {
+                registrar_path = registrar->file_path;
+            }
+        } else if (prefix_route->file_path && prefix_route->file_path[0]) {
+            /* Def-minted prefix Route (Django include() in urls.py): no CALLS
+             * edge exists — the route's OWN file is the registrar. Call-minted
+             * prefix Routes carry an empty file_path, so their behavior is
+             * unchanged. */
+            registrar_path = prefix_route->file_path;
+        }
+        if (!registrar_path) {
             continue;
         }
-
-        const cbm_gbuf_node_t *registrar = cbm_gbuf_find_by_id(gb, calls_in[0]->source_id);
-        if (!registrar || !registrar->file_path) {
-            continue;
-        }
-        const char *last_slash = strrchr(registrar->file_path, '/');
+        const char *last_slash = strrchr(registrar_path, '/');
         if (!last_slash) {
             continue;
         }
-        int dir_len = (int)(last_slash - registrar->file_path) + SKIP_ONE;
+        int dir_len = (int)(last_slash - registrar_path) + SKIP_ONE;
 
         const char *prefix_path = prefix_route->name;
         const char *prefix_segs =
             (prefix_path && prefix_path[0] == '/') ? prefix_path + SKIP_ONE : prefix_path;
 
         connected +=
-            bridge_funcs_to_prefix(gb, prefix_route, registrar->file_path, dir_len, prefix_segs);
+            bridge_funcs_to_prefix(gb, prefix_route, registrar_path, dir_len, prefix_segs);
     }
 
     if (connected > 0) {
@@ -1198,6 +1314,227 @@ static void create_sveltekit_routes(cbm_gbuf_t *gb) {
     }
 }
 
+/* ── Phase 4b: gRPC SERVER registrations → HANDLES (go-grpc-server-handles) ──
+ *
+ * `pb.RegisterCartServiceServer(g, &server{})` (protoc-gen-go-grpc) and the
+ * grpc-gateway `Register<S>HandlerServer(ctx, mux, server)` bind an impl type
+ * to a service; the client side already mints __grpc__<Service>/<Method>
+ * Route nodes (emit_grpc_edge / calls_emit_grpc_edge), so emitting HANDLES
+ * from each of the impl type's methods onto those same Route QNs completes
+ * the rendezvous — "who serves CartService/GetCart" stops dead-ending.
+ *
+ * Placement (对拍-adjudicated): a post-merge sweep here, NOT in the parallel
+ * resolve worker — the worker cannot see cross-file impl methods. The carrier
+ * is the CALLS edge the register call already produces: its props hold the
+ * callee text and the "args" array (both venues append them), and the edge
+ * SOURCE node's QN yields the registering module for impl resolution.
+ *
+ * Scope gates (binding corrections): only Register<S>Server and
+ * Register<S>HandlerServer callee leaves; the conn-taking gateway variants
+ * (Register<S>Handler / ...FromEndpoint / ...Client) are skipped entirely;
+ * HANDLES is emitted only when the impl argument resolves to a same-module
+ * project type node (natural fail-closed for conn/mux args and for
+ * registrations whose generated pb package is not in the indexed tree). */
+enum { RN_GRPC_REG_MAX = 64 };
+
+typedef struct {
+    char service[CBM_SZ_128];
+    char impl[CBM_SZ_128];
+    int64_t source_id;
+} rn_grpc_reg_t;
+
+typedef struct {
+    rn_grpc_reg_t regs[RN_GRPC_REG_MAX];
+    int count;
+} rn_grpc_ctx_t;
+
+/* Parse "Register<S>Server" / "Register<S>HandlerServer" out of a callee
+ * leaf. Returns false for every other shape (incl. the gateway variants). */
+static bool rn_grpc_service_from_callee(const char *callee, char *out, size_t outsz) {
+    if (!callee) {
+        return false;
+    }
+    const char *leaf = strrchr(callee, '.');
+    leaf = leaf ? leaf + 1 : callee;
+    size_t len = strlen(leaf);
+    if (len <= SLEN("Register") + SLEN("Server") ||
+        strncmp(leaf, "Register", SLEN("Register")) != 0 ||
+        strcmp(leaf + len - SLEN("Server"), "Server") != 0) {
+        return false;
+    }
+    size_t mid_len = len - SLEN("Register") - SLEN("Server");
+    const char *mid = leaf + SLEN("Register");
+    /* grpc-gateway in-process variant: Register<S>HandlerServer. */
+    if (mid_len > SLEN("Handler") &&
+        strncmp(mid + mid_len - SLEN("Handler"), "Handler", SLEN("Handler")) == 0) {
+        mid_len -= SLEN("Handler");
+    }
+    if (mid_len == 0 || mid_len >= outsz) {
+        return false;
+    }
+    memcpy(out, mid, mid_len);
+    out[mid_len] = '\0';
+    return true;
+}
+
+/* Extract the LAST argument expression from a CALLS edge's "args" array and
+ * normalize it to a bare impl type name: "&server{}" → "server",
+ * "srv" → "srv". Composite/pointer sugar is stripped; anything with calls,
+ * dots (cross-package impls — out of the conservative same-module scope) or
+ * remaining punctuation is rejected. */
+static bool rn_grpc_impl_from_props(const char *props, char *out, size_t outsz) {
+    const char *args = props ? strstr(props, "\"args\":[") : NULL;
+    if (!args) {
+        return false;
+    }
+    const char *end = strchr(args, ']');
+    if (!end) {
+        return false;
+    }
+    const char *last_e = NULL;
+    for (const char *p = args; (p = strstr(p, "\"e\":\"")) != NULL && p < end;
+         p += SLEN("\"e\":\"")) {
+        last_e = p;
+    }
+    if (!last_e) {
+        return false;
+    }
+    const char *v = last_e + SLEN("\"e\":\"");
+    char raw[CBM_SZ_128];
+    size_t n = 0;
+    while (*v && *v != '"' && v < end && n + 1 < sizeof(raw)) {
+        if (*v == '\\' && v[1]) {
+            v++; /* unescape one level — arg exprs carry no multi-byte escapes */
+        }
+        raw[n++] = *v++;
+    }
+    raw[n] = '\0';
+    const char *s = raw;
+    while (*s == '&' || *s == '*') {
+        s++;
+    }
+    size_t sl = strlen(s);
+    if (sl > 1 && s[sl - 1] == '}') {
+        const char *brace = strchr(s, '{');
+        if (!brace) {
+            return false;
+        }
+        sl = (size_t)(brace - s);
+    }
+    if (sl == 0 || sl >= outsz) {
+        return false;
+    }
+    for (size_t i = 0; i < sl; i++) {
+        char ch = s[i];
+        bool ident = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                     (ch >= '0' && ch <= '9') || ch == '_';
+        if (!ident) {
+            return false;
+        }
+    }
+    memcpy(out, s, sl);
+    out[sl] = '\0';
+    return true;
+}
+
+static void rn_grpc_reg_visitor(const cbm_gbuf_edge_t *edge, void *userdata) {
+    rn_grpc_ctx_t *ctx = (rn_grpc_ctx_t *)userdata;
+    if (ctx->count >= RN_GRPC_REG_MAX || strcmp(edge->type, "CALLS") != 0) {
+        return;
+    }
+    char callee[CBM_SZ_256];
+    if (!json_extract(edge->properties_json, "callee", callee, sizeof(callee))) {
+        return;
+    }
+    rn_grpc_reg_t *r = &ctx->regs[ctx->count];
+    if (!rn_grpc_service_from_callee(callee, r->service, sizeof(r->service))) {
+        return;
+    }
+    if (!rn_grpc_impl_from_props(edge->properties_json, r->impl, sizeof(r->impl))) {
+        return;
+    }
+    r->source_id = edge->source_id;
+    ctx->count++;
+}
+
+/* Emit HANDLES from every exported method of one registration's impl type. */
+static int rn_grpc_emit_one(cbm_gbuf_t *gb, const rn_grpc_reg_t *r) {
+    const cbm_gbuf_node_t *src = cbm_gbuf_find_by_id(gb, r->source_id);
+    if (!src || !src->qualified_name) {
+        return 0;
+    }
+    /* Registering module = the source function's QN minus its leaf segment. */
+    const char *dot = strrchr(src->qualified_name, '.');
+    if (!dot || dot == src->qualified_name) {
+        return 0;
+    }
+    char impl_qn[CBM_SZ_512];
+    int n = snprintf(impl_qn, sizeof(impl_qn), "%.*s.%s",
+                     (int)(dot - src->qualified_name), src->qualified_name, r->impl);
+    if (n <= 0 || (size_t)n >= sizeof(impl_qn)) {
+        return 0;
+    }
+    const cbm_gbuf_node_t *impl = cbm_gbuf_find_by_qn(gb, impl_qn);
+    if (!impl || !impl->label ||
+        (strcmp(impl->label, "Struct") != 0 && strcmp(impl->label, "Class") != 0 &&
+         strcmp(impl->label, "Type") != 0)) {
+        return 0; /* fail-closed: impl arg did not resolve to a project type */
+    }
+    const cbm_gbuf_edge_t **dm = NULL;
+    int dmc = 0;
+    cbm_gbuf_find_edges_by_source_type(gb, impl->id, "DEFINES_METHOD", &dm, &dmc);
+    int created = 0;
+    for (int i = 0; i < dmc; i++) {
+        const cbm_gbuf_node_t *m = cbm_gbuf_find_by_id(gb, dm[i]->target_id);
+        if (!m || !m->name || m->name[0] < 'A' || m->name[0] > 'Z') {
+            continue; /* gRPC methods are exported */
+        }
+        char route_qn[CBM_ROUTE_QN_SIZE];
+        char route_name[CBM_SZ_256];
+        snprintf(route_qn, sizeof(route_qn), "__grpc__%s/%s", r->service, m->name);
+        snprintf(route_name, sizeof(route_name), "%s/%s", r->service, m->name);
+        int64_t route_id =
+            cbm_gbuf_upsert_node(gb, "Route", route_name, route_qn, "", 0, 0,
+                                 "{\"source\":\"grpc\"}");
+        /* Idempotent across re-runs: skip when this method already HANDLES
+         * this route (mirrors ensure_one_decorator_route). */
+        const cbm_gbuf_edge_t **eh = NULL;
+        int ehc = 0;
+        cbm_gbuf_find_edges_by_target_type(gb, route_id, "HANDLES", &eh, &ehc);
+        bool exists = false;
+        for (int j = 0; j < ehc; j++) {
+            if (eh[j]->source_id == m->id) {
+                exists = true;
+                break;
+            }
+        }
+        if (exists) {
+            continue;
+        }
+        cbm_gbuf_insert_edge(gb, m->id, route_id, "HANDLES",
+                             "{\"via\":\"grpc_server_registration\"}");
+        created++;
+    }
+    return created;
+}
+
+static void create_grpc_server_handles(cbm_gbuf_t *gb) {
+    rn_grpc_ctx_t ctx;
+    ctx.count = 0;
+    /* Collect first, mutate after — inserting edges during edge iteration is
+     * unsafe (same discipline as route_edge_visitor above). */
+    cbm_gbuf_foreach_edge(gb, rn_grpc_reg_visitor, &ctx);
+    int created = 0;
+    for (int i = 0; i < ctx.count; i++) {
+        created += rn_grpc_emit_one(gb, &ctx.regs[i]);
+    }
+    if (created > 0) {
+        char buf[CBM_SZ_16];
+        snprintf(buf, sizeof(buf), "%d", created);
+        cbm_log_info("pass.route_nodes.grpc_server", "handles", buf);
+    }
+}
+
 void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
     if (!gb) {
         return;
@@ -1216,6 +1553,10 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
      * Handles incremental mode where unchanged files don't re-extract. */
     ensure_decorator_routes(gb);
 
+    /* Phase 2a-bis: HANDLES for call-registered Route defs (Django urls.py) —
+     * resolve each Route node's route_handler property to its handler node. */
+    connect_route_handler_defs(gb);
+
     /* Phase 2b: connect prefix Routes to decorator handler Functions.
      * Must run BEFORE match_infra_routes so infra matching can find
      * HANDLES edges on prefix Routes for the bridge. */
@@ -1231,6 +1572,11 @@ void cbm_pipeline_create_route_nodes(cbm_gbuf_t *gb) {
      * Scans Class nodes from .proto files, follows DEFINES_METHOD edges
      * to find rpc methods, creates __grpc__ServiceName/MethodName Route nodes. */
     create_grpc_routes(gb);
+
+    /* Phase 4b: gRPC SERVER side — Register<S>Server(...) impl methods get
+     * HANDLES edges onto the same __grpc__Service/Method Route QNs the
+     * client side mints (see create_grpc_server_handles). */
+    create_grpc_server_handles(gb);
 
     /* Phase 5: filesystem-based SvelteKit routes (+server / +page.server /
      * +layout.server) — no call-site equivalent for pass_calls.c to pick

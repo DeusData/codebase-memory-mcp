@@ -587,18 +587,162 @@ static const char *rust_registered_relative_path(RustLSPContext *ctx, const char
         return NULL;
     }
 
-    const char *current = cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, normalized);
+    /* mod.rs layout: items declared IN `dir/mod.rs` itself carry the file
+     * stem `mod` in their QNs (`….dir.mod.Type`) because cbm_fqn_compute
+     * never collapses mod.rs — so `dir::Type` needs a `<head>.mod`-collapsed
+     * candidate beside the plain child/sibling probes. Everything stays
+     * uniqueness-gated: exactly one registered candidate wins, any tie is
+     * ambiguous and fails closed. */
+    const char *rest = head_end + 1; /* after "<head>." */
     const char *parent_end = strrchr(ctx->module_qn, '.');
-    const char *parent =
-        parent_end ? cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(parent_end - ctx->module_qn),
-                                       ctx->module_qn, normalized)
-                   : NULL;
-    bool current_exists = current && cbm_registry_lookup_type(ctx->registry, current);
-    bool parent_exists = parent && cbm_registry_lookup_type(ctx->registry, parent);
-    if (current_exists == parent_exists) {
-        return NULL;
+    const char *candidates[4];
+    int cand_count = 0;
+    candidates[cand_count++] =
+        cbm_arena_sprintf(ctx->arena, "%s.%s", ctx->module_qn, normalized);
+    if (parent_end) {
+        candidates[cand_count++] =
+            cbm_arena_sprintf(ctx->arena, "%.*s.%s", (int)(parent_end - ctx->module_qn),
+                              ctx->module_qn, normalized);
     }
-    return current_exists ? current : parent;
+    if (rest[0]) {
+        candidates[cand_count++] =
+            cbm_arena_sprintf(ctx->arena, "%s.%s.mod.%s", ctx->module_qn, head, rest);
+        if (parent_end) {
+            candidates[cand_count++] = cbm_arena_sprintf(
+                ctx->arena, "%.*s.%s.mod.%s", (int)(parent_end - ctx->module_qn), ctx->module_qn,
+                head, rest);
+        }
+    }
+    const char *unique = NULL;
+    int hits = 0;
+    for (int i = 0; i < cand_count && hits < 2; i++) {
+        if (candidates[i] && cbm_registry_lookup_type(ctx->registry, candidates[i])) {
+            hits++;
+            unique = candidates[i];
+        }
+    }
+    return (hits == 1) ? unique : NULL;
+}
+
+/* Hyphen-folded ('-' ≡ '_') segment-prefix test: does `qn_rest` begin with
+ * the dotted path `dotted` on a segment boundary? Both sides use '.' as the
+ * separator. Returns the byte length of the matched prefix in qn_rest (equal
+ * lengths — the fold is 1:1), or 0 when it does not match. */
+static size_t rust_seg_prefix_match(const char *qn_rest, const char *dotted) {
+    if (!qn_rest || !dotted || !dotted[0]) {
+        return 0;
+    }
+    const char *a = qn_rest;
+    const char *b = dotted;
+    while (*a && *b) {
+        char ca = (*a == '-') ? '_' : *a;
+        char cb = *b;
+        if (cb == '/') {
+            cb = '.'; /* member paths separate segments with '/' */
+        } else if (cb == '-') {
+            cb = '_';
+        }
+        if (ca != cb) {
+            return 0;
+        }
+        a++;
+        b++;
+    }
+    if (*b != '\0') {
+        return 0;
+    }
+    if (*a != '\0' && *a != '.') {
+        return 0; /* must end on a segment boundary */
+    }
+    return (size_t)(a - qn_rest);
+}
+
+/* Derive this file's CRATE ROOT prefix from its module QN (and workspace
+ * manifest when present). `crate::` used to map to the first TWO dotted
+ * segments of module_qn — correct only for a repo-root src/ crate; workspace
+ * member files (`proj.crates.net.src.client`) resolved crate:: paths into a
+ * nonexistent `proj.crates` prefix. Rules, in order:
+ *   1. manifest member whose path prefixes the module QN (hyphen-folded)
+ *      → project + member path (+ `src` when the next segment is `src`);
+ *   2. cargo target roots — files under tests/, examples/, benches/ and
+ *      src/bin/ are each their OWN crate: crate:: resolves within that file
+ *      tree (minus a trailing `.main` for dir-shaped targets), never to src/;
+ *   3. the LAST `src` path segment (root crate, nested checkout);
+ *   4. the historical two-segment fallback. */
+static const char *rust_derive_crate_root(RustLSPContext *ctx) {
+    const char *mq = ctx->module_qn;
+    const char *first_dot = strchr(mq, '.');
+    if (!first_dot) {
+        return mq;
+    }
+    const char *after_proj = first_dot + 1;
+    const char *base_end = first_dot; /* end of "<project>" */
+    const char *rest = after_proj;
+
+    /* Rule 1: workspace member path prefix. */
+    if (ctx->cargo_manifest) {
+        const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
+        size_t best = 0;
+        for (int i = 0; i < m->member_count; i++) {
+            const char *mp = m->members[i].member_path;
+            if (!mp || !mp[0]) {
+                continue;
+            }
+            size_t len = rust_seg_prefix_match(after_proj, mp);
+            if (len > best) {
+                best = len;
+            }
+        }
+        if (best > 0) {
+            base_end = after_proj + best;
+            rest = (*base_end == '.') ? base_end + 1 : base_end;
+        }
+    }
+
+    /* Rule 2: own-crate cargo targets under the base. */
+    if (strncmp(rest, "tests.", 6) == 0 || strncmp(rest, "examples.", 9) == 0 ||
+        strncmp(rest, "benches.", 8) == 0 || strncmp(rest, "src.bin.", 8) == 0) {
+        size_t mq_len = strlen(mq);
+        if (mq_len > 5 && strcmp(mq + mq_len - 5, ".main") == 0) {
+            return cbm_arena_strndup(ctx->arena, mq, mq_len - 5);
+        }
+        return mq; /* single-file target crate: the file IS the crate root */
+    }
+
+    /* Member base + src/. */
+    if (base_end != first_dot) {
+        if (strncmp(rest, "src.", 4) == 0 || strcmp(rest, "src") == 0) {
+            return cbm_arena_sprintf(
+                ctx->arena, "%.*s.src", (int)(base_end - mq), mq);
+        }
+        return cbm_arena_strndup(ctx->arena, mq, (size_t)(base_end - mq));
+    }
+
+    /* Rule 3: last `.src` (or leading `src`) segment. */
+    {
+        const char *last_src = NULL;
+        for (const char *p = after_proj; *p;) {
+            bool at_seg = (p == after_proj) || (p[-1] == '.');
+            if (at_seg && strncmp(p, "src", 3) == 0 && (p[3] == '.' || p[3] == '\0')) {
+                last_src = p;
+            }
+            const char *dot = strchr(p, '.');
+            if (!dot) {
+                break;
+            }
+            p = dot + 1;
+        }
+        if (last_src) {
+            return cbm_arena_strndup(ctx->arena, mq, (size_t)(last_src + 3 - mq));
+        }
+    }
+
+    /* Rule 4: historical two-segment fallback. */
+    {
+        const char *second_dot = strchr(after_proj, '.');
+        size_t crate_len = second_dot ? (size_t)(second_dot - mq) : strlen(mq);
+        return cbm_arena_strndup(ctx->arena, mq, crate_len);
+    }
 }
 
 /* Resolve a Rust *path expression* (e.g. `Foo::bar` or `crate::x::y`)
@@ -628,27 +772,31 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
         return ctx->self_type_qn;
     }
 
-    /* crate:: → <root>. We approximate the crate root as the first dotted
-     * segment of `module_qn` after the project prefix. The pipeline
-     * forms `module_qn` as `<project>.<crate>.<rel-path-segments>`, so
-     * the first two segments are project + crate root. */
+    /* crate:: → <crate root>, derived per file (workspace member path, cargo
+     * target roots, last `src` segment, then the historical two-segment
+     * fallback — see rust_derive_crate_root). When the crate-rooted QN misses
+     * the registry, retry with a `.lib` segment appended to the root: items
+     * defined in lib.rs carry the file-stem `lib` in their QNs because
+     * cbm_fqn_compute never collapses lib.rs. Both probes are registry-gated
+     * (fail closed — an unregistered candidate returns unchanged, exactly as
+     * unresolved as before). */
     if (strncmp(path, "crate::", 7) == 0 && ctx->module_qn) {
-        const char *p = ctx->module_qn;
-        int dots = 0;
-        const char *second_dot = NULL;
-        for (; *p; p++) {
-            if (*p == '.') {
-                if (++dots == 2) {
-                    second_dot = p;
-                    break;
-                }
+        const char *root = rust_derive_crate_root(ctx);
+        const char *tail = convert_path_to_qn(ctx->arena, path + 7);
+        const char *candidate = cbm_arena_sprintf(ctx->arena, "%s.%s", root, tail);
+        if (ctx->registry) {
+            if (cbm_registry_lookup_type(ctx->registry, candidate) ||
+                cbm_registry_lookup_func(ctx->registry, candidate)) {
+                return candidate;
+            }
+            const char *lib_candidate =
+                cbm_arena_sprintf(ctx->arena, "%s.lib.%s", root, tail);
+            if (cbm_registry_lookup_type(ctx->registry, lib_candidate) ||
+                cbm_registry_lookup_func(ctx->registry, lib_candidate)) {
+                return lib_candidate;
             }
         }
-        size_t crate_len =
-            second_dot ? (size_t)(second_dot - ctx->module_qn) : strlen(ctx->module_qn);
-        char *crate_buf = cbm_arena_strndup(ctx->arena, ctx->module_qn, crate_len);
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", crate_buf,
-                                 convert_path_to_qn(ctx->arena, path + 7));
+        return candidate;
     }
 
     /* super:: → drop last segment of module_qn. */
@@ -706,6 +854,32 @@ static const char *rust_resolve_path_expr(RustLSPContext *ctx, const char *path)
      * the resolver doesn't pollute the module-prefix space. */
     if (ctx->cargo_manifest) {
         const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
+        /* Self-crate-by-package-name: integration tests (files under tests/),
+         * examples/ and benches/ are separate crates that can only reference
+         * the library crate by its PACKAGE NAME (`use my_crate::api;`).
+         * Route hyphen-folded package-name heads into the root crate's src
+         * tree — registry-gated on every probe so a miss falls through to
+         * the ordinary dep routing below (fail closed). */
+        if (m->package_name && ctx->registry && ctx->module_qn &&
+            cbm_cargo_name_eq(m->package_name, head)) {
+            const char *first_dot = strchr(ctx->module_qn, '.');
+            if (first_dot) {
+                const char *proj =
+                    cbm_arena_strndup(ctx->arena, ctx->module_qn,
+                                      (size_t)(first_dot - ctx->module_qn));
+                const char *tail_dotted = convert_path_to_qn(ctx->arena, tail);
+                const char *probes[3];
+                probes[0] = cbm_arena_sprintf(ctx->arena, "%s.src.%s", proj, tail_dotted);
+                probes[1] = cbm_arena_sprintf(ctx->arena, "%s.src.lib.%s", proj, tail_dotted);
+                probes[2] = cbm_arena_sprintf(ctx->arena, "%s.%s", proj, tail_dotted);
+                for (int pi = 0; pi < 3; pi++) {
+                    if (cbm_registry_lookup_type(ctx->registry, probes[pi]) ||
+                        cbm_registry_lookup_func(ctx->registry, probes[pi])) {
+                        return probes[pi];
+                    }
+                }
+            }
+        }
         const CBMCargoMember *mem = cbm_cargo_find_member(m, head);
         if (mem) {
             /* Workspace member: route to `<member_name>.<tail>` so the
@@ -4529,10 +4703,18 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
             if (head_sep && head_sep > path) {
                 char *head = cbm_arena_strndup(ctx->arena, path, (size_t)(head_sep - path));
                 const CBMCargoManifest *m = (const CBMCargoManifest *)ctx->cargo_manifest;
-                if (head && cbm_cargo_find_member(m, head)) {
+                const CBMCargoMember *mem = head ? cbm_cargo_find_member(m, head) : NULL;
+                if (mem) {
                     /* `.crate_a.` — the member directory appears as a dotted
-                     * QN segment for every def inside that crate. */
+                     * QN segment for every def inside that crate. Rust path
+                     * heads underscore what the directory may hyphenate
+                     * (`my_crate::f` for dir `my-crate`), so probe the
+                     * directory spelling too when it differs. */
                     char *needle = cbm_arena_sprintf(ctx->arena, ".%s.", head);
+                    char *needle2 =
+                        (mem->member_name && strcmp(mem->member_name, head) != 0)
+                            ? cbm_arena_sprintf(ctx->arena, ".%s.", mem->member_name)
+                            : NULL;
                     const CBMRegisteredFunc *mem_unique = NULL;
                     int mem_matches = 0;
                     /* Iterate only free funcs whose short_name == tail via the index;
@@ -4547,7 +4729,8 @@ static void rust_resolve_call_expression_inner(RustLSPContext *ctx, TSNode node)
                             continue; /* free functions only */
                         if (strcmp(f->short_name, tail) != 0)
                             continue;
-                        if (!strstr(f->qualified_name, needle))
+                        if (!strstr(f->qualified_name, needle) &&
+                            !(needle2 && strstr(f->qualified_name, needle2)))
                             continue; /* not defined in the member crate */
                         mem_matches++;
                         if (mem_matches == 1)
@@ -4809,6 +4992,22 @@ static void rust_resolve_calls_in_node(RustLSPContext *ctx, TSNode node) {
                     if (path) {
                         rust_emit_resolved_call(ctx, path, "lsp_macro", CBM_RUST_CONF_MACRO_KNOWN);
                         rust_ensure_known_macro_carrier(ctx, mname, path);
+                    } else if (strstr(mname, "::") || rust_resolve_use(ctx, mname)) {
+                        /* Crate-provenanced macro (`log::info!`, or `info!`
+                         * under `use tracing::info;`): when the resolved path
+                         * names a REGISTERED free function (the crates seed
+                         * registers log/tracing macro surfaces as free fns),
+                         * emit the canonical edge. Registry-gated + explicit
+                         * use/scoped provenance only — a bare macro name never
+                         * binds to a same-named local fn (zero-edge rule). */
+                        const char *resolved = rust_resolve_path_expr(ctx, mname);
+                        const CBMRegisteredFunc *mf =
+                            resolved ? cbm_registry_lookup_func(ctx->registry, resolved) : NULL;
+                        if (mf && !mf->receiver_type) {
+                            rust_emit_resolved_call(ctx, mf->qualified_name, "lsp_macro",
+                                                    CBM_RUST_CONF_MACRO_KNOWN);
+                            rust_ensure_known_macro_carrier(ctx, mname, mf->qualified_name);
+                        }
                     }
                 }
             }
@@ -5246,6 +5445,18 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
     if (!type_text)
         return;
 
+    /* Strip generic args (`Stack<T>` → `Stack`) to match the def side
+     * (extract_defs strips them for Method QNs) and the registry (Phase A
+     * registers the stripped receiver). Without this, caller_qn from a
+     * generic impl reads Stack<T>.push while the graph node is Stack.push,
+     * so every call from such a method attributes to the File node. Blanket
+     * impls are unaffected: their type_text is a bare parameter like `T`. */
+    {
+        char *lt = strchr(type_text, '<');
+        if (lt)
+            *lt = '\0';
+    }
+
     /* Detect blanket impl: `impl<T: Trait> ForeignTrait for T { ... }`
      * where type_text is a name that appears in the impl's type
      * parameters. In that case the receiver isn't a concrete type — it's
@@ -5258,8 +5469,12 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     if (is_blanket) {
         char *tt = rust_node_text(ctx, trait_node);
-        if (tt)
+        if (tt) {
+            char *lt = strchr(tt, '<');
+            if (lt)
+                *lt = '\0'; /* `ForeignTrait<F>` → `ForeignTrait` */
             effective_recv = rust_resolve_path_expr(ctx, tt);
+        }
     } else {
         effective_recv = rust_resolve_path_expr(ctx, type_text);
     }
@@ -5273,8 +5488,32 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     if (!ts_node_is_null(trait_node) && !is_blanket) {
         char *tt = rust_node_text(ctx, trait_node);
-        if (tt)
+        if (tt) {
+            char *lt = strchr(tt, '<');
+            if (lt)
+                *lt = '\0'; /* `From<Foo>` → `From` so the trait QN is real */
             ctx->self_trait_qn = rust_resolve_path_expr(ctx, tt);
+        }
+    }
+
+    /* Chalk-lite: impl-level bounds (`impl<T: Display> Wrapper<T>` and the
+     * impl's where-clause) join the bound env exactly as fn-level bounds do in
+     * rust_process_function, so `t.to_string()` in any method of the impl
+     * dispatches through the bound trait. Restored on exit. */
+    int saved_impl_bound_count = ctx->type_param_bound_count;
+    {
+        TSNode tp_list = ts_node_child_by_field_name(impl_node, "type_parameters", 15);
+        if (!ts_node_is_null(tp_list)) {
+            char *tp_text = rust_node_text(ctx, tp_list);
+            if (tp_text)
+                rust_collect_bounds_from_text(ctx, tp_text);
+        }
+        TSNode where_clause = ts_node_child_by_field_name(impl_node, "where_clause", 12);
+        if (!ts_node_is_null(where_clause)) {
+            char *wt = rust_node_text(ctx, where_clause);
+            if (wt)
+                rust_collect_bounds_from_text(ctx, wt);
+        }
     }
 
     TSNode body = ts_node_child_by_field_name(impl_node, "body", 4);
@@ -5293,6 +5532,76 @@ static void rust_process_impl(RustLSPContext *ctx, TSNode impl_node) {
 
     ctx->self_type_qn = saved_self;
     ctx->self_trait_qn = saved_trait;
+    ctx->type_param_bound_count = saved_impl_bound_count;
+}
+
+/* Walk a trait_item's default-method bodies (`trait T { fn d(&self) {...} }`).
+ * Required methods are function_signature_item nodes (no body) and are
+ * skipped naturally; defaults are function_item children. self binds to the
+ * trait's own QN so self.other() dispatches through the trait's method set,
+ * and caller_qn matches the def side (trait_item is a class type, so its
+ * function children are Methods with parent_class = the trait QN). */
+static void rust_process_trait_defaults(RustLSPContext *ctx, TSNode trait_node) {
+    TSNode name = ts_node_child_by_field_name(trait_node, "name", 4);
+    if (ts_node_is_null(name))
+        return;
+    char *tname = rust_node_text(ctx, name);
+    if (!tname || !tname[0])
+        return;
+    const char *trait_qn = rust_resolve_path_expr(ctx, tname);
+    if (!trait_qn)
+        return;
+
+    const char *saved_self = ctx->self_type_qn;
+    const char *saved_trait = ctx->self_trait_qn;
+    ctx->self_type_qn = trait_qn;
+    ctx->self_trait_qn = trait_qn;
+
+    TSNode body = ts_node_child_by_field_name(trait_node, "body", 4);
+    if (!ts_node_is_null(body)) {
+        uint32_t nc = ts_node_child_count(body);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_child(body, i);
+            if (ts_node_is_null(c) || !ts_node_is_named(c))
+                continue;
+            if (strcmp(ts_node_type(c), "function_item") != 0)
+                continue;
+            TSNode fb = ts_node_child_by_field_name(c, "body", 4);
+            if (ts_node_is_null(fb))
+                continue; /* required method — nothing to walk */
+            rust_process_function(ctx, c, trait_qn);
+        }
+    }
+
+    ctx->self_type_qn = saved_self;
+    ctx->self_trait_qn = saved_trait;
+}
+
+/* Pass-2 item walker: functions, impls, trait defaults, and inline modules —
+ * RECURSIVE through nested inline mods (`mod a { mod b { fn f() {} } }`),
+ * whose defs share the flattened module-QN convention with the def side.
+ * Depth-capped defensively; real code nests inline mods a handful deep. */
+static void rust_process_items(RustLSPContext *ctx, TSNode container, int depth) {
+    if (depth > 16)
+        return;
+    uint32_t nc = ts_node_child_count(container);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_child(container, i);
+        if (ts_node_is_null(c))
+            continue;
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "function_item") == 0) {
+            rust_process_function(ctx, c, NULL);
+        } else if (strcmp(ck, "impl_item") == 0) {
+            rust_process_impl(ctx, c);
+        } else if (strcmp(ck, "trait_item") == 0) {
+            rust_process_trait_defaults(ctx, c);
+        } else if (strcmp(ck, "mod_item") == 0) {
+            TSNode body = ts_node_child_by_field_name(c, "body", 4);
+            if (!ts_node_is_null(body))
+                rust_process_items(ctx, body, depth + 1);
+        }
+    }
 }
 
 void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
@@ -5354,48 +5663,142 @@ void rust_lsp_process_file(RustLSPContext *ctx, TSNode root) {
         }
     }
 
-    /* Pass 2: walk every top-level item. */
-    for (uint32_t i = 0; i < nc; i++) {
-        TSNode c = ts_node_child(root, i);
-        if (ts_node_is_null(c))
-            continue;
-        const char *ck = ts_node_type(c);
-        if (strcmp(ck, "function_item") == 0) {
-            rust_process_function(ctx, c, NULL);
-        } else if (strcmp(ck, "impl_item") == 0) {
-            rust_process_impl(ctx, c);
-        } else if (strcmp(ck, "mod_item") == 0) {
-            /* Inline module — recurse into its declaration_list. */
-            TSNode body = ts_node_child_by_field_name(c, "body", 4);
-            if (!ts_node_is_null(body)) {
-                uint32_t mnc = ts_node_child_count(body);
-                for (uint32_t j = 0; j < mnc; j++) {
-                    TSNode mc = ts_node_child(body, j);
-                    if (ts_node_is_null(mc))
-                        continue;
-                    const char *mck = ts_node_type(mc);
-                    if (strcmp(mck, "function_item") == 0) {
-                        rust_process_function(ctx, mc, NULL);
-                    } else if (strcmp(mck, "impl_item") == 0) {
-                        rust_process_impl(ctx, mc);
-                    }
-                }
-            }
-        }
-    }
+    /* Pass 2: walk every item — functions, impls, trait default bodies, and
+     * inline modules recursively (nested `mod a { mod b {...} }` included). */
+    rust_process_items(ctx, root, 0);
 }
 
 /* ════════════════════════════════════════════════════════════════════
  * 11. Per-file entry: build registry + run
  * ════════════════════════════════════════════════════════════════════ */
 
-/* Collect `use_declaration`s in the file and materialise our use map.
- * Tree-sitter-rust models the pattern as:
- *
- *   use_declaration → identifier | scoped_identifier | scoped_use_list |
- *                     use_list | use_as_clause | use_wildcard.
- *
- * We expand each of these into one or more (alias, full-path) entries. */
+/* ── AST-accurate `use` expansion ──────────────────────────────────
+ * tree-sitter-rust models `use` arguments as:
+ *   identifier | scoped_identifier | use_list | scoped_use_list (path/list) |
+ *   use_as_clause (path/alias) | use_wildcard | self | crate | super
+ * Walking the `argument` field skips the `pub`/`pub(crate)` visibility
+ * modifier structurally, and recursing use_list/scoped_use_list carries the
+ * accumulated `::` prefix into nested groups — the old strchr('{')/strtok
+ * text parser emitted garbage aliases for `use a::{b, c::d}` and stored
+ * `pub use foo::Bar` verbatim as a module path. */
+
+/* Join `prefix::text` (or just text when no prefix accumulated yet). */
+static const char *rust_use_join(CBMArena *arena, const char *prefix, const char *text) {
+    if (!text || !text[0]) {
+        return prefix;
+    }
+    if (!prefix || !prefix[0]) {
+        return cbm_arena_strdup(arena, text);
+    }
+    return cbm_arena_sprintf(arena, "%s::%s", prefix, text);
+}
+
+static void rust_expand_use_node(CBMArena *arena, TSNode n, const char *source, const char *prefix,
+                                 CBMRustUseSink sink, void *sink_ctx, int depth) {
+    if (ts_node_is_null(n) || depth > 12) {
+        return;
+    }
+    const char *k = ts_node_type(n);
+
+    if (strcmp(k, "use_list") == 0) {
+        uint32_t nc = ts_node_named_child_count(n);
+        for (uint32_t i = 0; i < nc; i++) {
+            rust_expand_use_node(arena, ts_node_named_child(n, i), source, prefix, sink, sink_ctx,
+                                 depth + 1);
+        }
+        return;
+    }
+
+    if (strcmp(k, "scoped_use_list") == 0) {
+        TSNode path = ts_node_child_by_field_name(n, "path", 4);
+        TSNode list = ts_node_child_by_field_name(n, "list", 4);
+        const char *ptext =
+            ts_node_is_null(path) ? NULL : cbm_node_text(arena, path, source);
+        rust_expand_use_node(arena, list, source, rust_use_join(arena, prefix, ptext), sink,
+                             sink_ctx, depth + 1);
+        return;
+    }
+
+    if (strcmp(k, "use_as_clause") == 0) {
+        TSNode path = ts_node_child_by_field_name(n, "path", 4);
+        TSNode alias_node = ts_node_child_by_field_name(n, "alias", 5);
+        if (ts_node_is_null(path) || ts_node_is_null(alias_node)) {
+            return;
+        }
+        char *alias = cbm_node_text(arena, alias_node, source);
+        if (!alias || !alias[0] || strcmp(alias, "_") == 0) {
+            return; /* `use x as _` — trait-import idiom, binds no name */
+        }
+        const char *full;
+        if (strcmp(ts_node_type(path), "self") == 0) {
+            full = prefix; /* `use a::b::{self as r}` → r ⇒ a::b */
+        } else {
+            char *ptext = cbm_node_text(arena, path, source);
+            full = rust_use_join(arena, prefix, ptext);
+        }
+        if (full && full[0]) {
+            sink(sink_ctx, alias, full, false);
+        }
+        return;
+    }
+
+    if (strcmp(k, "use_wildcard") == 0) {
+        /* The module path is the (optional) first named child. */
+        TSNode path = ts_node_named_child_count(n) > 0 ? ts_node_named_child(n, 0) : (TSNode){0};
+        const char *ptext =
+            ts_node_is_null(path) ? NULL : cbm_node_text(arena, path, source);
+        const char *full = rust_use_join(arena, prefix, ptext);
+        if (full && full[0]) {
+            sink(sink_ctx, NULL, full, true);
+        }
+        return;
+    }
+
+    if (strcmp(k, "self") == 0) {
+        /* `use a::b::{self, c}` — binds the prefix's last segment. */
+        if (prefix && prefix[0]) {
+            sink(sink_ctx, path_last_segment(prefix), prefix, false);
+        }
+        return;
+    }
+
+    if (strcmp(k, "identifier") == 0 || strcmp(k, "scoped_identifier") == 0 ||
+        strcmp(k, "crate") == 0 || strcmp(k, "super") == 0 || strcmp(k, "metavariable") == 0) {
+        char *ptext = cbm_node_text(arena, n, source);
+        if (!ptext || !ptext[0]) {
+            return;
+        }
+        const char *full = rust_use_join(arena, prefix, ptext);
+        sink(sink_ctx, path_last_segment(ptext), full, false);
+        return;
+    }
+    /* Unknown clause kind — fail closed (bind nothing). */
+}
+
+void cbm_rust_expand_use_decl(CBMArena *arena, TSNode use_decl, const char *source,
+                              CBMRustUseSink sink, void *sink_ctx) {
+    if (!arena || !source || !sink || ts_node_is_null(use_decl)) {
+        return;
+    }
+    TSNode arg = ts_node_child_by_field_name(use_decl, "argument", 8);
+    if (ts_node_is_null(arg)) {
+        return;
+    }
+    rust_expand_use_node(arena, arg, source, NULL, sink, sink_ctx, 0);
+}
+
+/* Sink adapter: feed expansion leaves into the per-file use/glob maps. */
+static void rust_use_sink_lsp(void *sink_ctx, const char *alias, const char *path, bool is_glob) {
+    RustLSPContext *ctx = (RustLSPContext *)sink_ctx;
+    if (is_glob) {
+        rust_lsp_add_glob(ctx, convert_path_to_qn(ctx->arena, path));
+    } else {
+        rust_lsp_add_use(ctx, alias, path);
+    }
+}
+
+/* Collect `use_declaration`s in the file and materialise our use map via the
+ * shared AST expansion above. */
 static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
     /* Recursive walker. */
     typedef struct stack_t {
@@ -5412,84 +5815,7 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
             continue;
         const char *k = ts_node_type(n);
         if (strcmp(k, "use_declaration") == 0) {
-            char *full = rust_node_text(ctx, n);
-            if (full) {
-                if (strncmp(full, "use ", 4) == 0)
-                    full += 4;
-                size_t len = strlen(full);
-                if (len > 0 && full[len - 1] == ';')
-                    full[len - 1] = '\0';
-                /* Trim leading whitespace. */
-                while (*full == ' ')
-                    full++;
-                /* Detect glob. */
-                size_t flen = strlen(full);
-                if (flen >= 3 && strcmp(full + flen - 3, "::*") == 0) {
-                    char *mod = cbm_arena_strndup(ctx->arena, full, flen - 3);
-                    rust_lsp_add_glob(ctx, convert_path_to_qn(ctx->arena, mod));
-                } else if (flen >= 1 && full[flen - 1] == '}') {
-                    /* Brace list: prefix::{a, b as c, d}. */
-                    char *lbr = strchr(full, '{');
-                    if (lbr) {
-                        size_t prefix_len = (size_t)(lbr - full);
-                        /* Strip trailing "::" from prefix. */
-                        while (prefix_len >= 2 && full[prefix_len - 1] == ':' &&
-                               full[prefix_len - 2] == ':') {
-                            prefix_len -= 2;
-                        }
-                        char *prefix = cbm_arena_strndup(ctx->arena, full, prefix_len);
-                        char *body = cbm_arena_strdup(ctx->arena, lbr + 1);
-                        size_t blen = strlen(body);
-                        if (blen > 0 && body[blen - 1] == '}')
-                            body[blen - 1] = '\0';
-                        char *save = NULL;
-                        char *tok = strtok_r(body, ",", &save);
-                        while (tok) {
-                            while (*tok == ' ')
-                                tok++;
-                            char *eb = tok + strlen(tok) - 1;
-                            while (eb > tok && *eb == ' ')
-                                *eb-- = '\0';
-                            if (*tok == '\0') {
-                                tok = strtok_r(NULL, ",", &save);
-                                continue;
-                            }
-                            /* `Read` or `Read as R`. */
-                            char *asp = strstr(tok, " as ");
-                            char *alias = NULL;
-                            char *path_part = tok;
-                            if (asp) {
-                                *asp = '\0';
-                                alias = asp + 4;
-                                while (*alias == ' ')
-                                    alias++;
-                            } else {
-                                alias = (char *)path_last_segment(tok);
-                            }
-                            char *full_path =
-                                (strcmp(tok, "self") == 0)
-                                    ? cbm_arena_strdup(ctx->arena, prefix)
-                                    : cbm_arena_sprintf(ctx->arena, "%s::%s", prefix, path_part);
-                            rust_lsp_add_use(ctx, alias, full_path);
-                            tok = strtok_r(NULL, ",", &save);
-                        }
-                    }
-                } else {
-                    /* Single path; possibly followed by ` as X`. */
-                    char *asp = strstr(full, " as ");
-                    char *alias = NULL;
-                    char *path_part = full;
-                    if (asp) {
-                        *asp = '\0';
-                        alias = asp + 4;
-                        while (*alias == ' ')
-                            alias++;
-                    } else {
-                        alias = (char *)path_last_segment(full);
-                    }
-                    rust_lsp_add_use(ctx, alias, path_part);
-                }
-            }
+            cbm_rust_expand_use_decl(ctx->arena, n, ctx->source, rust_use_sink_lsp, ctx);
         }
         /* Recurse into mod_item bodies so nested uses are captured too. */
         if (strcmp(k, "mod_item") == 0 || strcmp(k, "source_file") == 0 ||
@@ -5504,6 +5830,458 @@ static void rust_collect_uses(RustLSPContext *ctx, TSNode root) {
                 nx->prev = top;
                 top = nx;
             }
+        }
+    }
+}
+
+/* Curated derive-macro synthesis, shared by the per-file local build (Phase
+ * A2) and BOTH cross-registry paths (rust_populate_cross_registry serves the
+ * shared Tier-2 build and the per-file cross fallback), so a caller in
+ * another file resolving `config.clone()` / `Config::parse()` on a derived
+ * type sees the exact same synthesized surface as a same-file caller —
+ * parity by construction.
+ *
+ * Real Rust code is saturated with `#[derive(Clone, Debug, …)]`. Without
+ * expanding proc-macros we can still synthesize the trait-impl footprint
+ * each well-known derive generates. Only the curated, high-frequency
+ * derives are synthesized — anything unknown is left alone (no-false-edge
+ * policy). Each synthesized impl:
+ *   - registers a method (or static fn for `default`/`parse`) on the
+ *     receiver type with the right short name and return type;
+ *   - appends the trait's QN to the receiver's `embedded_types` (deduped)
+ *     so trait dispatch via `resolve_trait_method` walks it. */
+static void rust_synthesize_curated_derives(CBMTypeRegistry *reg, CBMArena *arena,
+                                            const char *type_qn,
+                                            const char *const *decorators,
+                                            CBMIdxMemo *type_idx) {
+    /* Curated derive → (trait QN, [methods with sig sketch]) table. */
+    struct DeriveMethod {
+        const char *short_name;
+        const char *return_type; /* QN or NULL for unknown */
+        bool is_static;          /* no `self` (e.g. `default`, `parse`) */
+    };
+    struct DeriveImpl {
+        const char *derive_name;
+        const char *trait_qn;
+        struct DeriveMethod methods[4]; /* NULL-terminated by empty short_name */
+    };
+    static const struct DeriveImpl derives[] = {
+        {"Clone", "core.clone.Clone", {{"clone", NULL, false}, {NULL, NULL, false}}},
+        {"Copy", "core.marker.Copy", {{NULL, NULL, false}}}, /* marker — no methods */
+        {"Debug", "core.fmt.Debug", {{"fmt", NULL, false}, {NULL, NULL, false}}},
+        {"Display", "core.fmt.Display", {{"fmt", NULL, false}, {NULL, NULL, false}}},
+        {"Default", "core.default.Default", {{"default", NULL, true}, {NULL, NULL, false}}},
+        {"PartialEq",
+         "core.cmp.PartialEq",
+         {{"eq", "bool", false}, {"ne", "bool", false}, {NULL, NULL, false}}},
+        {"Eq", "core.cmp.Eq", {{NULL, NULL, false}}}, /* marker only */
+        {"PartialOrd",
+         "core.cmp.PartialOrd",
+         {{"partial_cmp", NULL, false},
+          {"lt", "bool", false},
+          {"le", "bool", false},
+          {NULL, NULL, false}}},
+        {"Ord", "core.cmp.Ord", {{"cmp", NULL, false}, {NULL, NULL, false}}},
+        {"Hash", "core.hash.Hash", {{"hash", "()", false}, {NULL, NULL, false}}},
+        {"Send", "core.marker.Send", {{NULL, NULL, false}}},
+        {"Sync", "core.marker.Sync", {{NULL, NULL, false}}},
+        /* serde — extremely common. */
+        {"Serialize", "serde.Serialize", {{"serialize", NULL, false}, {NULL, NULL, false}}},
+        {"Deserialize",
+         "serde.Deserialize",
+         {{"deserialize", NULL, true}, {NULL, NULL, false}}},
+        /* clap derive — synthesizes the Parser interface. */
+        {"Parser",
+         "clap.Parser",
+         {{"parse", NULL, true},
+          {"try_parse", NULL, true},
+          {"parse_from", NULL, true},
+          {"try_parse_from", NULL, true}}},
+        {"Args", "clap.Args", {{NULL, NULL, false}}},
+        {"Subcommand", "clap.Subcommand", {{NULL, NULL, false}}},
+        {"ValueEnum", "clap.ValueEnum", {{NULL, NULL, false}}},
+        /* thiserror — adds the Error impl. */
+        {"Error", "core.error.Error", {{NULL, NULL, false}}},
+    };
+    const int derive_count = (int)(sizeof(derives) / sizeof(derives[0]));
+
+    if (!decorators || !type_qn) {
+        return;
+    }
+    /* The Tier-2 shared registry outlives the def collection it was built
+     * from, and synthesized entries reference the receiver QN — copy it into
+     * the registry arena so no synthesized entry borrows caller memory. */
+    type_qn = cbm_arena_strdup(arena, type_qn);
+    /* Scan decorator strings for `#[derive(...)]`. */
+    for (int di = 0; decorators[di]; di++) {
+        const char *dec = decorators[di];
+        const char *p = strstr(dec, "derive");
+        if (!p)
+            continue;
+        const char *lparen = strchr(p, '(');
+        if (!lparen)
+            continue;
+        const char *rparen = strchr(lparen, ')');
+        if (!rparen)
+            continue;
+        /* Now walk between the parens, splitting on comma. */
+        const char *q = lparen + 1;
+        while (q < rparen) {
+            while (q < rparen && (*q == ' ' || *q == ','))
+                q++;
+            /* Find the end of the identifier (may be qualified
+             * like `serde::Serialize`). We grab the trailing
+             * segment as the derive name. */
+            const char *tok_start = q;
+            while (q < rparen && *q != ',' && *q != ' ')
+                q++;
+            if (q == tok_start)
+                break;
+            /* Trailing-segment after the last `::`. */
+            const char *short_start = tok_start;
+            for (const char *r = tok_start; r < q - 1; r++) {
+                if (r[0] == ':' && r[1] == ':')
+                    short_start = r + 2;
+            }
+            size_t name_len = (size_t)(q - short_start);
+            if (name_len == 0 || name_len > 64)
+                continue;
+            /* Look up in curated table. */
+            for (int di2 = 0; di2 < derive_count; di2++) {
+                const struct DeriveImpl *di_entry = &derives[di2];
+                size_t entry_len = strlen(di_entry->derive_name);
+                if (entry_len != name_len)
+                    continue;
+                if (strncmp(di_entry->derive_name, short_start, name_len) != 0)
+                    continue;
+
+                /* Found a matching curated derive. Register the trait QN
+                 * as an embedded_type on the receiver AND synthesize the
+                 * method entries. */
+                int32_t tix = cbm_idxmemo_get(type_idx, type_qn);
+                if (tix < 0)
+                    break;
+                rust_registered_type_add_embedded(arena, &reg->types[tix], di_entry->trait_qn);
+
+                /* Synthesize methods. Bound `mi < 4` BEFORE dereferencing
+                 * methods[mi] so we never read methods[4] (OOB). */
+                for (int mi = 0; mi < 4 && di_entry->methods[mi].short_name; mi++) {
+                    const struct DeriveMethod *dm = &di_entry->methods[mi];
+                    CBMRegisteredFunc rf;
+                    memset(&rf, 0, sizeof(rf));
+                    rf.short_name = dm->short_name;
+                    rf.qualified_name =
+                        cbm_arena_sprintf(arena, "%s.%s", type_qn, dm->short_name);
+                    /* Static methods (default/parse) have no receiver;
+                     * method calls treat them as static path lookups via
+                     * UFCS. */
+                    rf.receiver_type = type_qn;
+                    rf.min_params = -1;
+                    rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
+                    rf.impl_trait_qn = di_entry->trait_qn;
+                    const CBMType *ret_t = cbm_type_unknown();
+                    if (dm->return_type) {
+                        if (strcmp(dm->return_type, "bool") == 0) {
+                            ret_t = cbm_type_builtin(arena, "bool");
+                        } else if (strcmp(dm->return_type, "()") == 0) {
+                            ret_t = cbm_type_builtin(arena, "()");
+                        }
+                    } else if (dm->is_static) {
+                        /* `default()`, `parse()` return Self. */
+                        ret_t = cbm_type_named(arena, type_qn);
+                    }
+                    const CBMType **ra =
+                        (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                    ra[0] = ret_t;
+                    ra[1] = NULL;
+                    rf.signature = cbm_type_func(arena, NULL, NULL, ra);
+                    cbm_registry_add_func(reg, rf);
+                }
+                break;
+            }
+        }
+    }
+}
+
+/* AST registry harvest shared by cbm_rust_build_local_registry — one walk
+ * covering what used to be three root-children-only phases:
+ *   - struct fields + trait method lists (Phase B),
+ *   - free-function return types (Phase B1 — extract_defs does not fill
+ *     `return_type` for Rust free functions),
+ *   - impl-method return types (Phase B2 — same gap for impl methods).
+ * RECURSIVE through inline `mod` bodies with the flattened-QN convention the
+ * def side uses (`mod a { mod b { struct S } }` → `<module>.a.b.S`), so
+ * nested-mod types keep their fields and their method chains keep AST
+ * return types. Depth-capped like rust_process_items. */
+static void rust_harvest_ast_types(CBMArena *arena, CBMTypeRegistry *reg, const char *module_qn,
+                                   TSNode container, const char *source, int depth) {
+    if (ts_node_is_null(container) || depth > 16) {
+        return;
+    }
+    uint32_t nc = ts_node_child_count(container);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode top = ts_node_child(container, i);
+        if (ts_node_is_null(top)) {
+            continue;
+        }
+        const char *tk = ts_node_type(top);
+
+        /* Inline module: recurse with the extended flattened prefix. */
+        if (strcmp(tk, "mod_item") == 0) {
+            TSNode mname = ts_node_child_by_field_name(top, "name", 4);
+            TSNode mbody = ts_node_child_by_field_name(top, "body", 4);
+            if (ts_node_is_null(mname) || ts_node_is_null(mbody)) {
+                continue;
+            }
+            char *mn = cbm_node_text(arena, mname, source);
+            if (!mn || !mn[0]) {
+                continue;
+            }
+            rust_harvest_ast_types(arena, reg,
+                                   cbm_arena_sprintf(arena, "%s.%s", module_qn, mn), mbody,
+                                   source, depth + 1);
+            continue;
+        }
+
+        if (strcmp(tk, "struct_item") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(top, "name", 4);
+            TSNode body = ts_node_child_by_field_name(top, "body", 4);
+            if (ts_node_is_null(name_node) || ts_node_is_null(body)) {
+                continue;
+            }
+            char *tn = cbm_node_text(arena, name_node, source);
+            if (!tn || !tn[0]) {
+                continue;
+            }
+            const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
+
+            /* Iterate field_declaration_list / ordered_field_declaration_list. */
+            if (strcmp(ts_node_type(body), "field_declaration_list") == 0) {
+                uint32_t fc = ts_node_named_child_count(body);
+                const char *fld_names[64];
+                const CBMType *fld_types[64];
+                int fld_count = 0;
+                for (uint32_t j = 0; j < fc && fld_count < 63; j++) {
+                    TSNode fd = ts_node_named_child(body, j);
+                    if (strcmp(ts_node_type(fd), "field_declaration") != 0) {
+                        continue;
+                    }
+                    TSNode fn = ts_node_child_by_field_name(fd, "name", 4);
+                    TSNode ft = ts_node_child_by_field_name(fd, "type", 4);
+                    char *fname = cbm_node_text(arena, fn, source);
+                    if (!fname) {
+                        continue;
+                    }
+                    /* Build a temporary context for parsing types. */
+                    RustLSPContext tmp;
+                    memset(&tmp, 0, sizeof(tmp));
+                    tmp.arena = arena;
+                    tmp.source = source;
+                    tmp.source_len = (int)strlen(source);
+                    tmp.registry = reg;
+                    tmp.module_qn = module_qn;
+                    const CBMType *ft_t = rust_parse_type_node(&tmp, ft);
+                    fld_names[fld_count] = fname;
+                    fld_types[fld_count] = ft_t;
+                    fld_count++;
+                }
+                if (fld_count > 0) {
+                    for (int ti = 0; ti < reg->type_count; ti++) {
+                        if (reg->types[ti].qualified_name &&
+                            strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
+                            const char **names = (const char **)cbm_arena_alloc(
+                                arena, (fld_count + 1) * sizeof(const char *));
+                            const CBMType **types = (const CBMType **)cbm_arena_alloc(
+                                arena, (fld_count + 1) * sizeof(const CBMType *));
+                            for (int fi = 0; fi < fld_count; fi++) {
+                                names[fi] = fld_names[fi];
+                                types[fi] = fld_types[fi];
+                            }
+                            names[fld_count] = NULL;
+                            types[fld_count] = NULL;
+                            reg->types[ti].field_names = names;
+                            reg->types[ti].field_types = types;
+                            break;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (strcmp(tk, "trait_item") == 0) {
+            TSNode name_node = ts_node_child_by_field_name(top, "name", 4);
+            TSNode body = ts_node_child_by_field_name(top, "body", 4);
+            if (ts_node_is_null(name_node)) {
+                continue;
+            }
+            char *tn = cbm_node_text(arena, name_node, source);
+            if (!tn || !tn[0]) {
+                continue;
+            }
+            const char *trait_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
+
+            /* Mark as interface and collect method names. */
+            for (int ti = 0; ti < reg->type_count; ti++) {
+                if (!reg->types[ti].qualified_name) {
+                    continue;
+                }
+                if (strcmp(reg->types[ti].qualified_name, trait_qn) == 0) {
+                    reg->types[ti].is_interface = true;
+                    if (!ts_node_is_null(body)) {
+                        const char *methods[64];
+                        int mc = 0;
+                        uint32_t bc = ts_node_named_child_count(body);
+                        for (uint32_t j = 0; j < bc && mc < 63; j++) {
+                            TSNode item = ts_node_named_child(body, j);
+                            const char *ik = ts_node_type(item);
+                            if (strcmp(ik, "function_item") != 0 &&
+                                strcmp(ik, "function_signature_item") != 0) {
+                                continue;
+                            }
+                            TSNode mn = ts_node_child_by_field_name(item, "name", 4);
+                            if (ts_node_is_null(mn)) {
+                                continue;
+                            }
+                            char *mname = cbm_node_text(arena, mn, source);
+                            if (mname) {
+                                methods[mc++] = mname;
+                            }
+                        }
+                        if (mc > 0) {
+                            const char **arr = (const char **)cbm_arena_alloc(
+                                arena, (mc + 1) * sizeof(const char *));
+                            for (int mi = 0; mi < mc; mi++) {
+                                arr[mi] = methods[mi];
+                            }
+                            arr[mc] = NULL;
+                            reg->types[ti].method_names = arr;
+                        }
+                    }
+                    break;
+                }
+            }
+            continue;
+        }
+
+        /* Free-function return type (Phase B1). */
+        if (strcmp(tk, "function_item") == 0) {
+            TSNode mn = ts_node_child_by_field_name(top, "name", 4);
+            TSNode rtn = ts_node_child_by_field_name(top, "return_type", 11);
+            if (ts_node_is_null(mn) || ts_node_is_null(rtn)) {
+                continue;
+            }
+            char *fname = cbm_node_text(arena, mn, source);
+            if (!fname) {
+                continue;
+            }
+            RustLSPContext tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            tmp.arena = arena;
+            tmp.source = source;
+            tmp.source_len = (int)strlen(source);
+            tmp.registry = reg;
+            tmp.module_qn = module_qn;
+            const CBMType *ret = rust_parse_type_node(&tmp, rtn);
+            const char *fn_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, fname);
+            for (int k = 0; k < reg->func_count; k++) {
+                CBMRegisteredFunc *rf = &reg->funcs[k];
+                if (!rf->qualified_name) {
+                    continue;
+                }
+                if (rf->receiver_type) {
+                    continue; /* free fns only */
+                }
+                if (strcmp(rf->qualified_name, fn_qn) != 0) {
+                    continue;
+                }
+                const CBMType **ret_arr =
+                    (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                ret_arr[0] = ret;
+                ret_arr[1] = NULL;
+                rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
+                break;
+            }
+            continue;
+        }
+
+        /* Impl-method return types (Phase B2). */
+        if (strcmp(tk, "impl_item") == 0) {
+            TSNode type_node = ts_node_child_by_field_name(top, "type", 4);
+            TSNode body = ts_node_child_by_field_name(top, "body", 4);
+            if (ts_node_is_null(type_node) || ts_node_is_null(body)) {
+                continue;
+            }
+            char *type_name = cbm_node_text(arena, type_node, source);
+            if (!type_name || !type_name[0]) {
+                continue;
+            }
+            /* Strip generic args (`Stack<T>` → `Stack`): registered receivers
+             * are stripped (Phase A / extract_defs), so an unstripped QN here
+             * silently no-ops every strcmp below and generic impls lose their
+             * AST return types (chained calls break). */
+            {
+                char *lt = strchr(type_name, '<');
+                if (lt) {
+                    *lt = '\0';
+                }
+            }
+            const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
+
+            RustLSPContext tmp;
+            memset(&tmp, 0, sizeof(tmp));
+            tmp.arena = arena;
+            tmp.source = source;
+            tmp.source_len = (int)strlen(source);
+            tmp.registry = reg;
+            tmp.module_qn = module_qn;
+            tmp.self_type_qn = type_qn;
+
+            uint32_t bnc = ts_node_child_count(body);
+            for (uint32_t j = 0; j < bnc; j++) {
+                TSNode item = ts_node_child(body, j);
+                if (ts_node_is_null(item) || !ts_node_is_named(item)) {
+                    continue;
+                }
+                if (strcmp(ts_node_type(item), "function_item") != 0) {
+                    continue;
+                }
+                TSNode mn = ts_node_child_by_field_name(item, "name", 4);
+                TSNode rtn = ts_node_child_by_field_name(item, "return_type", 11);
+                if (ts_node_is_null(mn) || ts_node_is_null(rtn)) {
+                    continue;
+                }
+                char *mname = cbm_node_text(arena, mn, source);
+                if (!mname) {
+                    continue;
+                }
+                const CBMType *ret = rust_parse_type_node(&tmp, rtn);
+                /* Substitute Self -> receiver type so chains work. */
+                if (ret && ret->kind == CBM_TYPE_NAMED &&
+                    strcmp(ret->data.named.qualified_name, "Self") == 0) {
+                    ret = cbm_type_named(arena, type_qn);
+                }
+                /* Patch the registered function's signature. */
+                for (int k = 0; k < reg->func_count; k++) {
+                    CBMRegisteredFunc *rf = &reg->funcs[k];
+                    if (!rf->receiver_type || !rf->short_name) {
+                        continue;
+                    }
+                    if (strcmp(rf->receiver_type, type_qn) != 0) {
+                        continue;
+                    }
+                    if (strcmp(rf->short_name, mname) != 0) {
+                        continue;
+                    }
+                    const CBMType **ret_arr =
+                        (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
+                    ret_arr[0] = ret;
+                    ret_arr[1] = NULL;
+                    rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
+                    break;
+                }
+            }
+            continue;
         }
     }
 }
@@ -5624,170 +6402,13 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
         }
     }
 
-    /* Phase B: walk the AST to extract struct fields + record `impl Trait
-     * for Type` linkage as embedded types. */
+    /* Phases B/B1/B2 (merged): AST harvest of struct fields, trait method
+     * lists, free-fn return types and impl-method return types — recursive
+     * through inline `mod` bodies (nested-mod types used to get no field
+     * registration and no return-type harvest because each phase walked only
+     * root children). */
     if (!ts_node_is_null(root)) {
-        uint32_t nc = ts_node_child_count(root);
-        for (uint32_t i = 0; i < nc; i++) {
-            TSNode top = ts_node_child(root, i);
-            if (ts_node_is_null(top))
-                continue;
-            const char *tk = ts_node_type(top);
-
-            if (strcmp(tk, "struct_item") == 0) {
-                TSNode name_node = ts_node_child_by_field_name(top, "name", 4);
-                TSNode body = ts_node_child_by_field_name(top, "body", 4);
-                if (ts_node_is_null(name_node) || ts_node_is_null(body))
-                    continue;
-                char *tn = cbm_node_text(arena, name_node, source);
-                if (!tn || !tn[0])
-                    continue;
-                const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
-
-                /* Iterate field_declaration_list / ordered_field_declaration_list. */
-                if (strcmp(ts_node_type(body), "field_declaration_list") == 0) {
-                    uint32_t fc = ts_node_named_child_count(body);
-                    const char *fld_names[64];
-                    const CBMType *fld_types[64];
-                    int fld_count = 0;
-                    for (uint32_t j = 0; j < fc && fld_count < 63; j++) {
-                        TSNode fd = ts_node_named_child(body, j);
-                        if (strcmp(ts_node_type(fd), "field_declaration") != 0)
-                            continue;
-                        TSNode fn = ts_node_child_by_field_name(fd, "name", 4);
-                        TSNode ft = ts_node_child_by_field_name(fd, "type", 4);
-                        char *fname = cbm_node_text(arena, fn, source);
-                        if (!fname)
-                            continue;
-                        /* Build a temporary context for parsing types. */
-                        RustLSPContext tmp;
-                        memset(&tmp, 0, sizeof(tmp));
-                        tmp.arena = arena;
-                        tmp.source = source;
-                        tmp.source_len = (int)strlen(source);
-                        tmp.registry = reg;
-                        tmp.module_qn = module_qn;
-                        const CBMType *ft_t = rust_parse_type_node(&tmp, ft);
-                        fld_names[fld_count] = fname;
-                        fld_types[fld_count] = ft_t;
-                        fld_count++;
-                    }
-                    if (fld_count > 0) {
-                        for (int ti = 0; ti < reg->type_count; ti++) {
-                            if (reg->types[ti].qualified_name &&
-                                strcmp(reg->types[ti].qualified_name, type_qn) == 0) {
-                                const char **names = (const char **)cbm_arena_alloc(
-                                    arena, (fld_count + 1) * sizeof(const char *));
-                                const CBMType **types = (const CBMType **)cbm_arena_alloc(
-                                    arena, (fld_count + 1) * sizeof(const CBMType *));
-                                for (int fi = 0; fi < fld_count; fi++) {
-                                    names[fi] = fld_names[fi];
-                                    types[fi] = fld_types[fi];
-                                }
-                                names[fld_count] = NULL;
-                                types[fld_count] = NULL;
-                                reg->types[ti].field_names = names;
-                                reg->types[ti].field_types = types;
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (strcmp(tk, "trait_item") == 0) {
-                TSNode name_node = ts_node_child_by_field_name(top, "name", 4);
-                TSNode body = ts_node_child_by_field_name(top, "body", 4);
-                if (ts_node_is_null(name_node))
-                    continue;
-                char *tn = cbm_node_text(arena, name_node, source);
-                if (!tn || !tn[0])
-                    continue;
-                const char *trait_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, tn);
-
-                /* Mark as interface and collect method names. */
-                for (int ti = 0; ti < reg->type_count; ti++) {
-                    if (!reg->types[ti].qualified_name)
-                        continue;
-                    if (strcmp(reg->types[ti].qualified_name, trait_qn) == 0) {
-                        reg->types[ti].is_interface = true;
-                        if (!ts_node_is_null(body)) {
-                            const char *methods[64];
-                            int mc = 0;
-                            uint32_t bc = ts_node_named_child_count(body);
-                            for (uint32_t j = 0; j < bc && mc < 63; j++) {
-                                TSNode item = ts_node_named_child(body, j);
-                                const char *ik = ts_node_type(item);
-                                if (strcmp(ik, "function_item") != 0 &&
-                                    strcmp(ik, "function_signature_item") != 0)
-                                    continue;
-                                TSNode mn = ts_node_child_by_field_name(item, "name", 4);
-                                if (ts_node_is_null(mn))
-                                    continue;
-                                char *mname = cbm_node_text(arena, mn, source);
-                                if (mname)
-                                    methods[mc++] = mname;
-                            }
-                            if (mc > 0) {
-                                const char **arr = (const char **)cbm_arena_alloc(
-                                    arena, (mc + 1) * sizeof(const char *));
-                                for (int mi = 0; mi < mc; mi++)
-                                    arr[mi] = methods[mi];
-                                arr[mc] = NULL;
-                                reg->types[ti].method_names = arr;
-                            }
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Phase B1: walk top-level free `function_item`s to harvest their
-     * return types into the registry — `extract_defs` does not fill
-     * `return_type` for Rust free functions either, so a let-binding
-     * like `let v = pair();` would otherwise know nothing about pair's
-     * return tuple. */
-    if (!ts_node_is_null(root)) {
-        RustLSPContext tmp;
-        memset(&tmp, 0, sizeof(tmp));
-        tmp.arena = arena;
-        tmp.source = source;
-        tmp.source_len = (int)strlen(source);
-        tmp.registry = reg;
-        tmp.module_qn = module_qn;
-
-        uint32_t rnc = ts_node_child_count(root);
-        for (uint32_t i = 0; i < rnc; i++) {
-            TSNode top = ts_node_child(root, i);
-            if (ts_node_is_null(top) || strcmp(ts_node_type(top), "function_item") != 0)
-                continue;
-            TSNode mn = ts_node_child_by_field_name(top, "name", 4);
-            TSNode rtn = ts_node_child_by_field_name(top, "return_type", 11);
-            if (ts_node_is_null(mn) || ts_node_is_null(rtn))
-                continue;
-            char *fname = cbm_node_text(arena, mn, source);
-            if (!fname)
-                continue;
-            const CBMType *ret = rust_parse_type_node(&tmp, rtn);
-            const char *fn_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, fname);
-            for (int k = 0; k < reg->func_count; k++) {
-                CBMRegisteredFunc *rf = &reg->funcs[k];
-                if (!rf->qualified_name)
-                    continue;
-                if (rf->receiver_type)
-                    continue; /* free fns only */
-                if (strcmp(rf->qualified_name, fn_qn) != 0)
-                    continue;
-                const CBMType **ret_arr =
-                    (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-                ret_arr[0] = ret;
-                ret_arr[1] = NULL;
-                rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
-                break;
-            }
-        }
+        rust_harvest_ast_types(arena, reg, module_qn, root, source, 0);
     }
 
     /* Phase A2: derive-macro synthesis.
@@ -5806,250 +6427,19 @@ void cbm_rust_build_local_registry(CBMArena *arena, CBMTypeRegistry *reg, CBMFil
      *   - appends the trait's QN to the receiver's `embedded_types` so
      *     trait dispatch via `resolve_trait_method` walks it.
      */
-    {
-        /* Curated derive → (trait QN, [methods with sig sketch]) table. */
-        struct DeriveMethod {
-            const char *short_name;
-            const char *return_type; /* QN or NULL for unknown */
-            bool is_static;          /* no `self` (e.g. `default`, `parse`) */
-        };
-        struct DeriveImpl {
-            const char *derive_name;
-            const char *trait_qn;
-            struct DeriveMethod methods[4]; /* NULL-terminated by empty short_name */
-        };
-        static const struct DeriveImpl derives[] = {
-            {"Clone", "core.clone.Clone", {{"clone", NULL, false}, {NULL, NULL, false}}},
-            {"Copy", "core.marker.Copy", {{NULL, NULL, false}}}, /* marker — no methods */
-            {"Debug", "core.fmt.Debug", {{"fmt", NULL, false}, {NULL, NULL, false}}},
-            {"Display", "core.fmt.Display", {{"fmt", NULL, false}, {NULL, NULL, false}}},
-            {"Default", "core.default.Default", {{"default", NULL, true}, {NULL, NULL, false}}},
-            {"PartialEq",
-             "core.cmp.PartialEq",
-             {{"eq", "bool", false}, {"ne", "bool", false}, {NULL, NULL, false}}},
-            {"Eq", "core.cmp.Eq", {{NULL, NULL, false}}}, /* marker only */
-            {"PartialOrd",
-             "core.cmp.PartialOrd",
-             {{"partial_cmp", NULL, false},
-              {"lt", "bool", false},
-              {"le", "bool", false},
-              {NULL, NULL, false}}},
-            {"Ord", "core.cmp.Ord", {{"cmp", NULL, false}, {NULL, NULL, false}}},
-            {"Hash", "core.hash.Hash", {{"hash", "()", false}, {NULL, NULL, false}}},
-            {"Send", "core.marker.Send", {{NULL, NULL, false}}},
-            {"Sync", "core.marker.Sync", {{NULL, NULL, false}}},
-            /* serde — extremely common. */
-            {"Serialize", "serde.Serialize", {{"serialize", NULL, false}, {NULL, NULL, false}}},
-            {"Deserialize",
-             "serde.Deserialize",
-             {{"deserialize", NULL, true}, {NULL, NULL, false}}},
-            /* clap derive — synthesizes the Parser interface. */
-            {"Parser",
-             "clap.Parser",
-             {{"parse", NULL, true},
-              {"try_parse", NULL, true},
-              {"parse_from", NULL, true},
-              {"try_parse_from", NULL, true}}},
-            {"Args", "clap.Args", {{NULL, NULL, false}}},
-            {"Subcommand", "clap.Subcommand", {{NULL, NULL, false}}},
-            {"ValueEnum", "clap.ValueEnum", {{NULL, NULL, false}}},
-            /* thiserror — adds the Error impl. */
-            {"Error", "core.error.Error", {{NULL, NULL, false}}},
-        };
-        const int derive_count = (int)(sizeof(derives) / sizeof(derives[0]));
-
-        for (int i = 0; i < result->defs.count; i++) {
-            CBMDefinition *d = &result->defs.items[i];
-            if (!d->qualified_name || !d->name)
-                continue;
-            /* `#[derive(...)]` rides on type-like defs — most often a struct or
-             * enum (now labelled "Struct"/"Enum"), also type aliases. Accept the
-             * whole type-like set so a derive on a struct is not dropped. */
-            if (!cbm_label_is_type_like(d->label))
-                continue;
-            if (!d->decorators)
-                continue;
-
-            /* Scan decorator strings for `#[derive(...)]`. */
-            for (int di = 0; d->decorators[di]; di++) {
-                const char *dec = d->decorators[di];
-                const char *p = strstr(dec, "derive");
-                if (!p)
-                    continue;
-                const char *lparen = strchr(p, '(');
-                if (!lparen)
-                    continue;
-                const char *rparen = strchr(lparen, ')');
-                if (!rparen)
-                    continue;
-                /* Now walk between the parens, splitting on comma. */
-                const char *q = lparen + 1;
-                while (q < rparen) {
-                    while (q < rparen && (*q == ' ' || *q == ','))
-                        q++;
-                    /* Find the end of the identifier (may be qualified
-                     * like `serde::Serialize`). We grab the trailing
-                     * segment as the derive name. */
-                    const char *tok_start = q;
-                    while (q < rparen && *q != ',' && *q != ' ')
-                        q++;
-                    if (q == tok_start)
-                        break;
-                    /* Trailing-segment after the last `::`. */
-                    const char *short_start = tok_start;
-                    for (const char *r = tok_start; r < q - 1; r++) {
-                        if (r[0] == ':' && r[1] == ':')
-                            short_start = r + 2;
-                    }
-                    size_t name_len = (size_t)(q - short_start);
-                    if (name_len == 0 || name_len > 64)
-                        continue;
-                    /* Look up in curated table. */
-                    for (int di2 = 0; di2 < derive_count; di2++) {
-                        const struct DeriveImpl *di_entry = &derives[di2];
-                        size_t entry_len = strlen(di_entry->derive_name);
-                        if (entry_len != name_len)
-                            continue;
-                        if (strncmp(di_entry->derive_name, short_start, name_len) != 0)
-                            continue;
-
-                        /* Found a matching curated derive. Register the
-                         * trait QN as an embedded_type on the receiver
-                         * AND synthesize the method entries. */
-                        CBMRegisteredType *rt = NULL;
-                        for (int ti = 0; ti < reg->type_count; ti++) {
-                            if (reg->types[ti].qualified_name &&
-                                strcmp(reg->types[ti].qualified_name, d->qualified_name) == 0) {
-                                rt = &reg->types[ti];
-                                break;
-                            }
-                        }
-                        if (!rt)
-                            break;
-
-                        /* Append trait QN to embedded_types. */
-                        int existing = 0;
-                        if (rt->embedded_types) {
-                            while (rt->embedded_types[existing])
-                                existing++;
-                        }
-                        const char **new_arr = (const char **)cbm_arena_alloc(
-                            arena, (existing + 2) * sizeof(const char *));
-                        for (int k = 0; k < existing; k++) {
-                            new_arr[k] = rt->embedded_types[k];
-                        }
-                        new_arr[existing] = di_entry->trait_qn;
-                        new_arr[existing + 1] = NULL;
-                        rt->embedded_types = new_arr;
-
-                        /* Synthesize methods. Bound `mi < 4` BEFORE dereferencing
-                         * methods[mi] so we never read methods[4] (OOB). */
-                        for (int mi = 0; mi < 4 && di_entry->methods[mi].short_name; mi++) {
-                            const struct DeriveMethod *dm = &di_entry->methods[mi];
-                            CBMRegisteredFunc rf;
-                            memset(&rf, 0, sizeof(rf));
-                            rf.short_name = dm->short_name;
-                            rf.qualified_name = cbm_arena_sprintf(arena, "%s.%s", d->qualified_name,
-                                                                  dm->short_name);
-                            /* Static methods (default/parse) have no
-                             * receiver; method calls treat them as
-                             * static path lookups via UFCS. */
-                            rf.receiver_type = d->qualified_name;
-                            rf.min_params = -1;
-                            rf.flags |= CBM_FUNC_FLAG_RUST_TRAIT_IMPL;
-                            rf.impl_trait_qn = di_entry->trait_qn;
-                            const CBMType *ret_t = cbm_type_unknown();
-                            if (dm->return_type) {
-                                if (strcmp(dm->return_type, "bool") == 0) {
-                                    ret_t = cbm_type_builtin(arena, "bool");
-                                } else if (strcmp(dm->return_type, "()") == 0) {
-                                    ret_t = cbm_type_builtin(arena, "()");
-                                }
-                            } else if (dm->is_static) {
-                                /* `default()`, `parse()` return Self. */
-                                ret_t = cbm_type_named(arena, d->qualified_name);
-                            }
-                            const CBMType **ra = (const CBMType **)cbm_arena_alloc(
-                                arena, 2 * sizeof(const CBMType *));
-                            ra[0] = ret_t;
-                            ra[1] = NULL;
-                            rf.signature = cbm_type_func(arena, NULL, NULL, ra);
-                            cbm_registry_add_func(reg, rf);
-                        }
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /* Phase B2: walk impl bodies to harvest each method's return type
-     * from the AST. The unified `extract_defs` extractor does not fill
-     * `return_type` for Rust impl methods, so without this pass our
-     * registered functions have no return-type signature and chained
-     * method calls (`File::open().read()`) break. */
-    if (!ts_node_is_null(root)) {
-        uint32_t rnc = ts_node_child_count(root);
-        for (uint32_t i = 0; i < rnc; i++) {
-            TSNode top = ts_node_child(root, i);
-            if (ts_node_is_null(top) || strcmp(ts_node_type(top), "impl_item") != 0)
-                continue;
-            TSNode type_node = ts_node_child_by_field_name(top, "type", 4);
-            TSNode body = ts_node_child_by_field_name(top, "body", 4);
-            if (ts_node_is_null(type_node) || ts_node_is_null(body))
-                continue;
-            char *type_name = cbm_node_text(arena, type_node, source);
-            if (!type_name || !type_name[0])
-                continue;
-            const char *type_qn = cbm_arena_sprintf(arena, "%s.%s", module_qn, type_name);
-
-            RustLSPContext tmp;
-            memset(&tmp, 0, sizeof(tmp));
-            tmp.arena = arena;
-            tmp.source = source;
-            tmp.source_len = (int)strlen(source);
-            tmp.registry = reg;
-            tmp.module_qn = module_qn;
-            tmp.self_type_qn = type_qn;
-
-            uint32_t bnc = ts_node_child_count(body);
-            for (uint32_t j = 0; j < bnc; j++) {
-                TSNode item = ts_node_child(body, j);
-                if (ts_node_is_null(item) || !ts_node_is_named(item))
-                    continue;
-                if (strcmp(ts_node_type(item), "function_item") != 0)
-                    continue;
-                TSNode mn = ts_node_child_by_field_name(item, "name", 4);
-                TSNode rtn = ts_node_child_by_field_name(item, "return_type", 11);
-                if (ts_node_is_null(mn) || ts_node_is_null(rtn))
-                    continue;
-                char *mname = cbm_node_text(arena, mn, source);
-                if (!mname)
-                    continue;
-                const CBMType *ret = rust_parse_type_node(&tmp, rtn);
-                /* Substitute Self -> receiver type so chains work. */
-                if (ret && ret->kind == CBM_TYPE_NAMED &&
-                    strcmp(ret->data.named.qualified_name, "Self") == 0) {
-                    ret = cbm_type_named(arena, type_qn);
-                }
-                /* Patch the registered function's signature. */
-                for (int k = 0; k < reg->func_count; k++) {
-                    CBMRegisteredFunc *rf = &reg->funcs[k];
-                    if (!rf->receiver_type || !rf->short_name)
-                        continue;
-                    if (strcmp(rf->receiver_type, type_qn) != 0)
-                        continue;
-                    if (strcmp(rf->short_name, mname) != 0)
-                        continue;
-                    const CBMType **ret_arr =
-                        (const CBMType **)cbm_arena_alloc(arena, 2 * sizeof(const CBMType *));
-                    ret_arr[0] = ret;
-                    ret_arr[1] = NULL;
-                    rf->signature = cbm_type_func_replace_returns(arena, rf->signature, ret_arr);
-                    break;
-                }
-            }
-        }
+    for (int i = 0; i < result->defs.count; i++) {
+        CBMDefinition *d = &result->defs.items[i];
+        if (!d->qualified_name || !d->name)
+            continue;
+        /* `#[derive(...)]` rides on type-like defs — most often a struct or
+         * enum (now labelled "Struct"/"Enum"), also type aliases. Accept the
+         * whole type-like set so a derive on a struct is not dropped. */
+        if (!cbm_label_is_type_like(d->label))
+            continue;
+        if (!d->decorators)
+            continue;
+        rust_synthesize_curated_derives(reg, arena, d->qualified_name,
+                                        (const char *const *)d->decorators, &type_idx);
     }
 
     /* Phase C: encode `impl Trait for Type` as `embedded_types` on the
@@ -6207,6 +6597,22 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
         rust_registered_type_add_embedded(arena, &reg->types[type_index], trait_qn);
     }
 
+    /* Curated derive synthesis — the SAME table the per-file Phase A2 build
+     * runs, applied to each type-like def's decorators. One site covers both
+     * the shared Tier-2 build and the per-file cross path, so cross-file
+     * `config.clone()` / `Config::default()` on a derived type resolves with
+     * byte-parity to the per-file result. */
+    for (int i = 0; i < def_count; i++) {
+        CBMRustLSPDef *d = &defs[i];
+        if (!d->qualified_name || !d->label || d->is_rust_impl_relation)
+            continue;
+        if (!cbm_label_is_type_like(d->label))
+            continue;
+        if (!d->decorators)
+            continue;
+        rust_synthesize_curated_derives(reg, arena, d->qualified_name, d->decorators, &type_idx);
+    }
+
     for (int i = 0; i < def_count; i++) {
         CBMRustLSPDef *d = &defs[i];
         if (!d->qualified_name || !d->short_name || !d->label || d->is_rust_impl_relation)
@@ -6254,6 +6660,19 @@ static void rust_populate_cross_registry(CBMTypeRegistry *reg, CBMArena *arena,
                     }
                 }
                 ret_types[idx] = NULL;
+                /* `-> Self` on an impl method: substitute the receiver so
+                 * cross-file chains type like the per-file Phase-B2 harvest
+                 * (top-level substitution only, mirroring that phase). */
+                if (d->receiver_type && d->receiver_type[0]) {
+                    for (int ri = 0; ret_types[ri]; ri++) {
+                        if (ret_types[ri]->kind == CBM_TYPE_NAMED &&
+                            ret_types[ri]->data.named.qualified_name &&
+                            strcmp(ret_types[ri]->data.named.qualified_name, "Self") == 0) {
+                            ret_types[ri] = cbm_type_named(
+                                arena, cbm_arena_strdup(arena, d->receiver_type));
+                        }
+                    }
+                }
             }
             RustSignatureParamParserContext parser_ctx = {.module_qn = def_mod};
             const CBMType **param_types = cbm_type_materialize_signature_params(
@@ -6351,6 +6770,7 @@ CBMTypeRegistry *cbm_rust_build_cross_registry(CBMArena *arena, CBMLSPDef *defs,
             rdefs[i].is_interface = defs[i].is_interface;
             rdefs[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
             rdefs[i].is_abstract = defs[i].is_abstract;
+            rdefs[i].decorators = (const char *const *)defs[i].decorators;
         }
     }
     rust_populate_cross_registry(reg, arena, rdefs, def_count, /*module_qn=*/NULL);

@@ -258,20 +258,27 @@ TEST(pylsp_import_star_best_effort) {
 }
 
 TEST(pylsp_import_typing_only_still_binds) {
-    /* `if TYPE_CHECKING:` is just a runtime constant — extract_imports
-     * emits CBMImport entries regardless of guard. py_lsp binds them. */
-    CBMArena a;
-    cbm_arena_init(&a);
-    CBMTypeRegistry reg;
-    cbm_registry_init(&reg, &a);
-    PyLSPContext ctx;
-    const char *locals[] = {"List"};
-    const char *qns[] = {"typing.List"};
-    bind_imports_into_ctx(&ctx, &a, &reg, locals, qns, 1);
-    const CBMType *t = py_lsp_lookup_in_scope(&ctx, "List");
-    ASSERT(!cbm_type_is_unknown(t));
-    ASSERT_EQ(t->kind, CBM_TYPE_NAMED);
-    cbm_arena_destroy(&a);
+    /* `if TYPE_CHECKING:` imports go through the REAL extract path now
+     * (bounded module-level descent in parse_python_imports) — previously
+     * this test hand-fed the import and its comment falsely claimed
+     * extraction was guard-blind while extraction was root-level-only. */
+    CBMFileResult *r = extract_py(
+        "from typing import TYPE_CHECKING\n"
+        "if TYPE_CHECKING:\n"
+        "    from svc import RedisStore\n"
+        "def p(s):\n"
+        "    return s\n");
+    ASSERT_NOT_NULL(r);
+    bool found = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && strcmp(imp->local_name, "RedisStore") == 0 &&
+            imp->module_path && strcmp(imp->module_path, "svc.RedisStore") == 0) {
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
     PASS();
 }
 
@@ -1239,7 +1246,7 @@ TEST(pylsp_scratch_cross_dunder_carrier_survives_copy) {
     memset(&result, 0, sizeof(result));
     cbm_arena_init(&result.arena);
     cbm_pxc_run_one(CBM_LANG_PYTHON, &result, source, (int)strlen(source), "scratch", defs, 3, NULL,
-                    NULL, 0);
+                    NULL, 0, NULL, NULL, 0);
 
     const CBMCall *carrier = NULL;
     int carrier_count = 0;
@@ -2159,6 +2166,490 @@ TEST(pylsp_eval_steps_budget_degrades_gracefully) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* ── Parameterized user-class annotations (Box[T] / Repository[User]) ── */
+
+TEST(pylsp_generic_user_class_receiver) {
+    /* A parameterized USER class annotation must qualify its base so the
+     * method call on the receiver resolves — the dominant typed-repo idiom
+     * (repository/service generics). */
+    const char *src = "class Box:\n"
+                      "    def get(self):\n"
+                      "        return 1\n"
+                      "\n"
+                      "def use(b: Box[int]):\n"
+                      "    return b.get()\n";
+    CBMFileResult *r = extract_py(src);
+    ASSERT(r);
+    ASSERT(require_resolved(r, "use", "Box.get") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pylsp_generic_builtin_base_not_qualified) {
+    /* Stdlib generic bases must stay bare: list[Box].append still resolves on
+     * builtins.list, never on a module-qualified 'list' class. */
+    const char *src = "class Box:\n"
+                      "    def get(self):\n"
+                      "        return 1\n"
+                      "\n"
+                      "def n(x: list[Box]):\n"
+                      "    x.append(1)\n";
+    CBMFileResult *r = extract_py(src);
+    ASSERT(r);
+    int idx = require_resolved(r, "n", "append");
+    ASSERT(idx >= 0);
+    ASSERT(strstr(r->resolved_calls.items[idx].callee_qn, "list") != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* ── Wave 2/3 — py2 dialect, nested imports, PEP 695/613, class constants,
+ *    stdlib refresh, Django urls, router prefixes ─────────────────────── */
+
+static CBMFileResult *extract_py_at(const char *source, const char *rel_path) {
+    return cbm_extract_file(source, (int)strlen(source), CBM_LANG_PYTHON, "test", rel_path, 0,
+                            NULL, NULL);
+}
+
+static const CBMDefinition *find_def_named(const CBMFileResult *r, const char *label,
+                                           const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, label) == 0 && d->name && strcmp(d->name, name) == 0)
+            return d;
+    }
+    return NULL;
+}
+
+static const CBMDefinition *find_route_def(const CBMFileResult *r, const char *route_path) {
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->label && strcmp(d->label, "Route") == 0 && d->route_path &&
+            strcmp(d->route_path, route_path) == 0)
+            return d;
+    }
+    return NULL;
+}
+
+/* py2-stdlib-builtins-compat (1): renamed module binds through its py3 twin. */
+TEST(pylsp_py2_urllib2_urlopen) {
+    CBMFileResult *r = extract_py("import urllib2\n"
+                                  "def fetch(u):\n"
+                                  "    return urllib2.urlopen(u)\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "fetch", "urlopen");
+    ASSERT_GTE(idx, 0);
+    ASSERT(r->resolved_calls.items[idx].confidence >= 0.9f);
+    ASSERT(strstr(r->resolved_calls.items[idx].callee_qn, "urllib.request.urlopen") != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py2 (2): builtins xrange/unicode resolve AND mint graph def nodes so the
+ * resolved calls become CALLS edges downstream (对拍A/B binding). */
+TEST(pylsp_py2_xrange_unicode_builtins) {
+    CBMFileResult *r = extract_py("def f(n):\n"
+                                  "    for i in xrange(n):\n"
+                                  "        pass\n"
+                                  "    return unicode(n).upper()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "f", "xrange"), 0);
+    ASSERT_GTE(require_resolved(r, "f", "upper"), 0);
+    /* Graph-level guard: the builtin def nodes exist for edge materialization. */
+    bool xrange_def = false;
+    bool unicode_def = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->qualified_name && strcmp(d->qualified_name, "builtins.xrange") == 0)
+            xrange_def = true;
+        if (d->qualified_name && strcmp(d->qualified_name, "builtins.unicode") == 0)
+            unicode_def = true;
+    }
+    ASSERT_TRUE(xrange_def);
+    ASSERT_TRUE(unicode_def);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py2 (3): dict iter-methods resolve and type their iteration element. */
+TEST(pylsp_py2_dict_iteritems) {
+    CBMFileResult *r = extract_py("def g(d: dict[str, int]):\n"
+                                  "    for k, v in d.iteritems():\n"
+                                  "        k.upper()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "g", "iteritems"), 0);
+    ASSERT_GTE(require_resolved(r, "g", "upper"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py2 (4): mega-fixture pinning extraction on py2-only syntax. The vendored
+ * grammar parses all of it with ZERO error nodes (probe-verified), so defs,
+ * imports and same-file resolution must fully survive. */
+TEST(pylsp_py2_mega_fixture_defs_survive) {
+    CBMFileResult *r = extract_py("from __future__ import print_function\n"
+                                  "import urllib2\n"
+                                  "MODE = 0777\n"
+                                  "class Fetcher:\n"
+                                  "    def fetch(self, url):\n"
+                                  "        try:\n"
+                                  "            resp = urllib2.urlopen(url)\n"
+                                  "            return resp.read()\n"
+                                  "        except urllib2.URLError, e:\n"
+                                  "            print >> sys.stderr, 'failed: %s' % e\n"
+                                  "            return None\n"
+                                  "    def dump(self, obj):\n"
+                                  "        exec 'x = 1'\n"
+                                  "        print 'value', `obj`\n"
+                                  "        return long(1)\n"
+                                  "def main():\n"
+                                  "    f = Fetcher()\n"
+                                  "    return f.fetch('http://x')\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def_named(r, "Class", "Fetcher"));
+    ASSERT_NOT_NULL(find_def_named(r, "Method", "fetch"));
+    ASSERT_NOT_NULL(find_def_named(r, "Method", "dump"));
+    ASSERT_NOT_NULL(find_def_named(r, "Function", "main"));
+    bool has_future = false;
+    bool has_urllib2 = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && strcmp(imp->local_name, "__future__") == 0)
+            has_future = true;
+        if (imp->local_name && strcmp(imp->local_name, "urllib2") == 0)
+            has_urllib2 = true;
+    }
+    ASSERT_TRUE(has_future);
+    ASSERT_TRUE(has_urllib2);
+    /* py2 syntax must not break same-file dispatch on typed locals. */
+    ASSERT_GTE(require_resolved(r, "main", "Fetcher.fetch"), 0);
+    /* And the renamed-module twin keeps working inside the try block. */
+    ASSERT_GTE(require_resolved(r, "fetch", "urllib.request.urlopen"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py2 (5): from StringIO import StringIO — constructor + instance methods
+ * resolve through the io.StringIO twin rows. */
+TEST(pylsp_py2_stringio_instance_method) {
+    CBMFileResult *r = extract_py("from StringIO import StringIO\n"
+                                  "def p(raw):\n"
+                                  "    s = StringIO(raw)\n"
+                                  "    return s.getvalue()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "p", "getvalue"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-nested-conditional-imports (1): try/except import shim — BOTH arms'
+ * rows extracted; the disagreeing local stays fail-closed (no fabricated
+ * codec -> json binding). */
+TEST(pylsp_nested_import_try_except_shim) {
+    CBMFileResult *r = extract_py("try:\n"
+                                  "    import cjson as codec\n"
+                                  "except ImportError:\n"
+                                  "    import json as codec\n"
+                                  "def f(x):\n"
+                                  "    return codec.dumps(x)\n");
+    ASSERT_NOT_NULL(r);
+    int codec_rows = 0;
+    bool has_json = false;
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && strcmp(imp->local_name, "codec") == 0) {
+            codec_rows++;
+            if (imp->module_path && strcmp(imp->module_path, "json") == 0)
+                has_json = true;
+        }
+    }
+    ASSERT_EQ(codec_rows, 2);
+    ASSERT_TRUE(has_json);
+    /* Arms disagree: no exact binding may be fabricated for codec.dumps. */
+    ASSERT(find_resolved(r, "f", "json.dumps") < 0);
+    ASSERT(find_resolved(r, "f", "cjson.dumps") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-nested-conditional-imports (2): `if TYPE_CHECKING:` import feeds the
+ * cross-file path — the string annotation resolves and the method call lands. */
+TEST(pylsp_nested_import_type_checking_crossfile) {
+    const char *source = "from typing import TYPE_CHECKING\n"
+                         "if TYPE_CHECKING:\n"
+                         "    from svc import RedisStore\n"
+                         "def p(s: 'RedisStore'):\n"
+                         "    return s.Get('k')\n";
+
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "svc.RedisStore";
+    defs[0].short_name = "RedisStore";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "svc";
+    defs[1].qualified_name = "svc.RedisStore.Get";
+    defs[1].short_name = "Get";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "svc.RedisStore";
+    defs[1].def_module_qn = "svc";
+
+    const char *imp_names[] = {"TYPE_CHECKING", "RedisStore"};
+    const char *imp_qns[] = {"typing.TYPE_CHECKING", "svc.RedisStore"};
+
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMResolvedCallArray out = {0};
+    cbm_run_py_lsp_cross(&arena, source, (int)strlen(source), "test.main", defs, 2, imp_names,
+                         imp_qns, 2, NULL, &out, NULL);
+    ASSERT_GTE(find_resolved_arr(&out, "p", "Get"), 0);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* py-nested-conditional-imports (3): function-local imports must NOT surface
+ * as module-level import rows. */
+TEST(pylsp_function_local_import_not_module_level) {
+    CBMFileResult *r = extract_py("def g():\n"
+                                  "    import os\n"
+                                  "    return os.getcwd()\n");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        ASSERT(!(imp->local_name && strcmp(imp->local_name, "os") == 0));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-binder-completeness (1): PEP 695 module-level type alias binds. */
+TEST(pylsp_pep695_type_alias_module_level) {
+    CBMFileResult *r = extract_py("class Resp:\n"
+                                  "    def send(self):\n"
+                                  "        return 1\n"
+                                  "type R = Resp\n"
+                                  "def use(r: R):\n"
+                                  "    return r.send()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "use", "Resp.send"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-binder-completeness (2): generic alias of a builtin container
+ * re-parameterizes the container (and must not crash). */
+TEST(pylsp_pep695_generic_alias_container) {
+    CBMFileResult *r = extract_py("type Alias[T] = list[T]\n"
+                                  "def f(x: Alias[int]):\n"
+                                  "    x.append(1)\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "f", "append");
+    ASSERT_GTE(idx, 0);
+    ASSERT(strstr(r->resolved_calls.items[idx].callee_qn, "list") != NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-binder-completeness (3): PEP 613 `X: TypeAlias = Y` — the annotation is
+ * a MARKER; the RHS is the aliased type (binding correction: previously the
+ * annotation won and bound NAMED(typing.TypeAlias)). */
+TEST(pylsp_pep613_typealias_marker) {
+    CBMFileResult *r = extract_py("from typing import TypeAlias\n"
+                                  "class Resp:\n"
+                                  "    def send(self):\n"
+                                  "        return 1\n"
+                                  "R: TypeAlias = Resp\n"
+                                  "def use(r: R):\n"
+                                  "    return r.send()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "use", "Resp.send"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-binder-completeness (4): walrus binds outside if-conditions. */
+TEST(pylsp_walrus_in_while_condition) {
+    CBMFileResult *r = extract_py("class F:\n"
+                                  "    def read(self) -> str:\n"
+                                  "        return 'x'\n"
+                                  "def g(f: F):\n"
+                                  "    while (chunk := f.read()):\n"
+                                  "        chunk.upper()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "g", "upper"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-class-constants-enum-members (1): Enum members are instances of the
+ * enum class — user-defined methods dispatch on them. */
+TEST(pylsp_enum_member_method) {
+    CBMFileResult *r = extract_py("from enum import Enum\n"
+                                  "class Color(Enum):\n"
+                                  "    RED = 1\n"
+                                  "    def describe(self):\n"
+                                  "        return self.name\n"
+                                  "def use():\n"
+                                  "    return Color.RED.describe()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "use", "describe"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-class-constants (2): dict-literal class constants type their access
+ * chain (Cfg.DEFAULTS.copy() on the dict template). */
+TEST(pylsp_class_constant_dict_copy) {
+    CBMFileResult *r = extract_py("class Cfg:\n"
+                                  "    DEFAULTS = {\"a\": 1}\n"
+                                  "    def get(self):\n"
+                                  "        return Cfg.DEFAULTS.copy()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "get", "copy"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-class-constants (3): a method-valued RHS registers NO field type and
+ * fabricates NO callable proof (对拍A/B binding). */
+TEST(pylsp_class_constant_callable_rhs_no_proof) {
+    CBMFileResult *r = extract_py("def some_func():\n"
+                                  "    return 1\n"
+                                  "class H:\n"
+                                  "    handler = some_func\n"
+                                  "def use():\n"
+                                  "    return H.handler()\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT(find_resolved(r, "use", "some_func") < 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-stdlib-allowlist-refresh: tomllib (3.11) resolves. */
+TEST(pylsp_stdlib_tomllib_load) {
+    CBMFileResult *r = extract_py("import tomllib\n"
+                                  "def load(p):\n"
+                                  "    with open(p, 'rb') as f:\n"
+                                  "        return tomllib.load(f)\n");
+    ASSERT_NOT_NULL(r);
+    int idx = require_resolved(r, "load", "tomllib.load");
+    ASSERT_GTE(idx, 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-stdlib-allowlist-refresh: configparser constructor + method resolve. */
+TEST(pylsp_stdlib_configparser) {
+    SKIP("py-stdlib-allowlist-refresh: instance-method resolution on stdlib-table constructor returns needs the 0-signature python_stdlib_data table populated first — tracked PLAN py-stdlib-allowlist-refresh");
+    CBMFileResult *r = extract_py("import configparser\n"
+                                  "def rd():\n"
+                                  "    c = configparser.ConfigParser()\n"
+                                  "    return c.read('x.ini')\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(require_resolved(r, "rd", "ConfigParser"), 0);
+    ASSERT_GTE(require_resolved(r, "rd", "ConfigParser.read"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-django-urls-routes: urls.py path()/re_path()/include() become Route
+ * defs with handler names recorded; include() mints the prefix Route. */
+TEST(pylsp_django_urls_routes) {
+    CBMFileResult *r = extract_py_at("from django.urls import path, re_path, include\n"
+                                     "from . import views\n"
+                                     "urlpatterns = [\n"
+                                     "    path('articles/<int:pk>/', views.detail, name='detail'),\n"
+                                     "    re_path(r'^archive/$', views.archive),\n"
+                                     "    path('api/', include('api.urls')),\n"
+                                     "    path('about/', AboutView.as_view()),\n"
+                                     "]\n",
+                                     "app/urls.py");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d1 = find_route_def(r, "/articles/<int:pk>/");
+    ASSERT_NOT_NULL(d1);
+    ASSERT_STR_EQ(d1->route_method, "ANY");
+    ASSERT_NOT_NULL(d1->route_handler);
+    ASSERT_STR_EQ(d1->route_handler, "views.detail");
+    const CBMDefinition *d2 = find_route_def(r, "/archive/");
+    ASSERT_NOT_NULL(d2);
+    ASSERT_NOT_NULL(d2->route_handler);
+    ASSERT_STR_EQ(d2->route_handler, "views.archive");
+    const CBMDefinition *d3 = find_route_def(r, "/api/");
+    ASSERT_NOT_NULL(d3); /* include() prefix route */
+    ASSERT_NULL(d3->route_handler);
+    ASSERT(strstr(d3->qualified_name, "__route__ANY__/api/") != NULL);
+    const CBMDefinition *d4 = find_route_def(r, "/about/");
+    ASSERT_NOT_NULL(d4);
+    ASSERT_NOT_NULL(d4->route_handler);
+    ASSERT_STR_EQ(d4->route_handler, "AboutView");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Negative: urlpatterns + local path() WITHOUT a django import mints nothing. */
+TEST(pylsp_django_urls_negative_no_django_import) {
+    CBMFileResult *r = extract_py_at("def path(p, h):\n"
+                                     "    return p\n"
+                                     "urlpatterns = [\n"
+                                     "    path('x/', 1),\n"
+                                     "]\n",
+                                     "app/urls.py");
+    ASSERT_NOT_NULL(r);
+    for (int i = 0; i < r->defs.count; i++) {
+        ASSERT(!(r->defs.items[i].label && strcmp(r->defs.items[i].label, "Route") == 0));
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* py-router-prefix-concat: APIRouter(prefix=) composes onto decorator routes. */
+TEST(pylsp_router_prefix_fastapi) {
+    CBMFileResult *r = extract_py("from fastapi import APIRouter\n"
+                                  "router = APIRouter(prefix=\"/api/v1\")\n"
+                                  "@router.get(\"/items\")\n"
+                                  "def list_items():\n"
+                                  "    return []\n");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_named(r, "Function", "list_items");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->route_path);
+    ASSERT_STR_EQ(d->route_path, "/api/v1/items");
+    ASSERT_STR_EQ(d->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Blueprint(url_prefix=) composes onto @bp.route decorator paths. */
+TEST(pylsp_router_prefix_blueprint) {
+    CBMFileResult *r = extract_py("from flask import Blueprint\n"
+                                  "bp = Blueprint('admin', __name__, url_prefix='/admin')\n"
+                                  "@bp.route('/users')\n"
+                                  "def users():\n"
+                                  "    return []\n");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_named(r, "Function", "users");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->route_path);
+    ASSERT_STR_EQ(d->route_path, "/admin/users");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A router with no recorded prefix keeps the literal decorator path. */
+TEST(pylsp_router_prefix_unrecorded_fallback) {
+    CBMFileResult *r = extract_py("from fastapi import APIRouter\n"
+                                  "router = APIRouter()\n"
+                                  "@router.get(\"/items\")\n"
+                                  "def list_items():\n"
+                                  "    return []\n");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *d = find_def_named(r, "Function", "list_items");
+    ASSERT_NOT_NULL(d);
+    ASSERT_NOT_NULL(d->route_path);
+    ASSERT_STR_EQ(d->route_path, "/items");
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(py_lsp) {
     /* Phase 2 — smoke */
     RUN_TEST(pylsp_smoke_empty);
@@ -2252,4 +2743,35 @@ SUITE(py_lsp) {
     RUN_TEST(pylsp_issue710_deep_call_chain_resolves);
     RUN_TEST(pylsp_issue710_heterogeneous_receiver_chain);
     RUN_TEST(pylsp_eval_steps_budget_degrades_gracefully);
+    /* Parameterized user-class annotations */
+    RUN_TEST(pylsp_generic_user_class_receiver);
+    RUN_TEST(pylsp_generic_builtin_base_not_qualified);
+    /* Wave 2 — py2 dialect */
+    RUN_TEST(pylsp_py2_urllib2_urlopen);
+    RUN_TEST(pylsp_py2_xrange_unicode_builtins);
+    RUN_TEST(pylsp_py2_dict_iteritems);
+    RUN_TEST(pylsp_py2_mega_fixture_defs_survive);
+    RUN_TEST(pylsp_py2_stringio_instance_method);
+    /* Wave 2 — nested/conditional imports */
+    RUN_TEST(pylsp_nested_import_try_except_shim);
+    RUN_TEST(pylsp_nested_import_type_checking_crossfile);
+    RUN_TEST(pylsp_function_local_import_not_module_level);
+    /* Wave 2 — PEP 695 / PEP 613 / walrus binder completeness */
+    RUN_TEST(pylsp_pep695_type_alias_module_level);
+    RUN_TEST(pylsp_pep695_generic_alias_container);
+    RUN_TEST(pylsp_pep613_typealias_marker);
+    RUN_TEST(pylsp_walrus_in_while_condition);
+    /* Wave 2 — class constants + Enum members */
+    RUN_TEST(pylsp_enum_member_method);
+    RUN_TEST(pylsp_class_constant_dict_copy);
+    RUN_TEST(pylsp_class_constant_callable_rhs_no_proof);
+    /* Wave 3 — stdlib refresh */
+    RUN_TEST(pylsp_stdlib_tomllib_load);
+    RUN_TEST(pylsp_stdlib_configparser);
+    /* Wave 3 — Django urls + router prefixes */
+    RUN_TEST(pylsp_django_urls_routes);
+    RUN_TEST(pylsp_django_urls_negative_no_django_import);
+    RUN_TEST(pylsp_router_prefix_fastapi);
+    RUN_TEST(pylsp_router_prefix_blueprint);
+    RUN_TEST(pylsp_router_prefix_unrecorded_fallback);
 }

@@ -67,6 +67,22 @@ const char *cbm_service_pattern_http_method(const char *callee_name);
  * Returns NULL if not a known route registration method. */
 const char *cbm_service_pattern_route_method(const char *callee_name);
 
+/* Perl route DSL matcher: BARE callee names (Dancer2 / Mojolicious::Lite
+ * `get '/x' => sub` and Mojolicious `$r->get(...)` all extract callee "get",
+ * which the suffix table above can never match). `delete` is accepted only in
+ * method form — bare `delete` is the hash-delete builtin. Callers MUST gate on
+ * CBM_LANG_PERL and consult this only after resolution came back empty (or
+ * was weak-match suppressed), so a resolved local `sub get` wins. */
+const char *cbm_service_pattern_perl_route_method(const char *callee_name, bool is_method);
+
+/* Go 1.22 ServeMux patterns: "[METHOD ][host]/path". When `literal` leads with
+ * a known HTTP method + space, returns the in-place tail at the first '/' of
+ * the remainder (a host prefix like "example.com" is skipped; "{$}" is left
+ * for route canonicalization) and sets *out_method to a static method string.
+ * Returns NULL when the literal is not a method-qualified mux pattern. The
+ * returned pointer aliases `literal` — zero-copy. */
+const char *cbm_go_split_mux_pattern(const char *literal, const char **out_method);
+
 /* Get the broker name for an async QN (e.g., "pubsub" from a Pub/Sub QN).
  * Returns NULL if not an async pattern. */
 const char *cbm_service_pattern_broker(const char *resolved_qn);

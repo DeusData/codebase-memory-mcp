@@ -191,6 +191,17 @@ TEST(lang_ext_pm) {
     ASSERT_EQ(cbm_language_for_extension(".pm"), CBM_LANG_PERL);
     PASS();
 }
+TEST(lang_ext_perl_t) {
+    /* CPAN test layout: .t harness scripts under t/ are Perl (GitHub-linguist
+     * maps .t the same way). */
+    ASSERT_EQ(cbm_language_for_extension(".t"), CBM_LANG_PERL);
+    PASS();
+}
+TEST(lang_ext_perl_psgi) {
+    /* PSGI app entry points (app.psgi) are Perl and carry no shebang. */
+    ASSERT_EQ(cbm_language_for_extension(".psgi"), CBM_LANG_PERL);
+    PASS();
+}
 TEST(lang_ext_groovy) {
     ASSERT_EQ(cbm_language_for_extension(".groovy"), CBM_LANG_GROOVY);
     PASS();
@@ -1301,6 +1312,8 @@ SUITE(language) {
     RUN_TEST(lang_ext_dart);
     RUN_TEST(lang_ext_perl);
     RUN_TEST(lang_ext_pm);
+    RUN_TEST(lang_ext_perl_t);
+    RUN_TEST(lang_ext_perl_psgi);
     RUN_TEST(lang_ext_groovy);
     RUN_TEST(lang_ext_gradle);
     RUN_TEST(lang_ext_erlang);

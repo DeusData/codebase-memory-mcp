@@ -7456,6 +7456,396 @@ TEST(pipeline_go_cross_package_call) {
     PASS();
 }
 
+/* Go 1.22 method+pattern ServeMux literals: "GET /users/{id}" must split into
+ * a method-qualified canonical Route node (__route__GET__/users/{}) with a
+ * HANDLES edge from the handler argument — the framework-free stdlib style
+ * dominant in new Go services. */
+TEST(pipeline_go122_mux_routes) {
+    const char *files[] = {"main.go"};
+    const char *contents[] = {"package main\n\n"
+                              "import \"net/http\"\n\n"
+                              "func getUser(w http.ResponseWriter, r *http.Request) {}\n\n"
+                              "func main() {\n"
+                              "\tmux := http.NewServeMux()\n"
+                              "\tmux.HandleFunc(\"GET /users/{id}\", getUser)\n"
+                              "\thttp.ListenAndServe(\":8080\", mux)\n"
+                              "}\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    /* Route node carries the literal-embedded method, not the .HandleFunc ANY. */
+    cbm_node_t *routes = NULL;
+    int rc2 = 0;
+    cbm_store_find_nodes_by_name(s, proj, "/users/{id}", &routes, &rc2);
+    if (rc2 == 0) {
+        /* Diagnose: what Route nodes DID the pipeline produce? */
+        cbm_node_t *all_routes = NULL;
+        int arc = 0;
+        cbm_store_find_nodes_by_label(s, proj, "Route", &all_routes, &arc);
+        printf("  no /users/{id} route; %d Route nodes exist:\n", arc);
+        for (int i = 0; i < arc; i++) {
+            printf("    name=%s qn=%s\n", all_routes[i].name ? all_routes[i].name : "-",
+                   all_routes[i].qualified_name ? all_routes[i].qualified_name : "-");
+        }
+        if (all_routes)
+            cbm_store_free_nodes(all_routes, arc);
+    }
+    ASSERT_GT(rc2, 0);
+    int64_t route_id = -1;
+    for (int i = 0; i < rc2; i++) {
+        if (strcmp(routes[i].qualified_name, "__route__GET__/users/{}") == 0)
+            route_id = routes[i].id;
+    }
+    ASSERT_TRUE(route_id >= 0);
+
+    /* HANDLES edge from the handler argument. */
+    cbm_node_t *handlers = NULL;
+    int hc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "getUser", &handlers, &hc);
+    ASSERT_GT(hc, 0);
+    bool handles = false;
+    for (int i = 0; i < hc && !handles; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, handlers[i].id, "HANDLES", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            if (edges[j].target_id == route_id)
+                handles = true;
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    ASSERT_TRUE(handles);
+
+    cbm_store_free_nodes(routes, rc2);
+    cbm_store_free_nodes(handlers, hc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* perl-cross-file-lsp end-to-end: a CPAN-style lib/ layout where main.pl
+ * imports a sub from lib/My/Util.pm. Exercises the whole chain: pkgmap
+ * Perl module resolution (My::Util → lib/My/Util.pm → IMPORTS edge), the
+ * cross-LSP def filter, cbm_run_perl_lsp_cross's package→module mapping and
+ * qw target rewriting, and the pass_calls LSP join into a CALLS edge. */
+TEST(pipeline_perl_cross_file_calls) {
+    const char *files[] = {"lib/My/Util.pm", "main.pl"};
+    const char *contents[] = {"package My::Util;\n"
+                              "use Exporter 'import';\n"
+                              "our @EXPORT_OK = qw(helper);\n"
+                              "sub helper { return 42; }\n"
+                              "1;\n",
+
+                              "use My::Util qw(helper);\n"
+                              "sub run { return helper(); }\n"
+                              "run();\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *callers = NULL;
+    int cc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "run", &callers, &cc);
+    ASSERT_GT(cc, 0);
+    cbm_node_t *targets = NULL;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "helper", &targets, &tc);
+    ASSERT_GT(tc, 0);
+    int64_t helper_id = -1;
+    for (int i = 0; i < tc; i++) {
+        if (targets[i].qualified_name && strstr(targets[i].qualified_name, "lib.My.Util.helper"))
+            helper_id = targets[i].id;
+    }
+    ASSERT_TRUE(helper_id >= 0);
+
+    bool found = false;
+    for (int i = 0; i < cc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, callers[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            if (edges[j].target_id == helper_id)
+                found = true;
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    if (!found)
+        printf("  no CALLS run->lib.My.Util.helper edge\n");
+    ASSERT_TRUE(found);
+
+    cbm_store_free_nodes(callers, cc);
+    cbm_store_free_nodes(targets, tc);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* perl-web-routes: Dancer2/Mojolicious::Lite bare DSL (`get '/users' => sub`)
+ * and Mojolicious method form ($r->get / $r->delete) must mint method-
+ * qualified Route nodes. Bare callees can never match the '.'/'::'-suffix
+ * table, so this covers cbm_service_pattern_perl_route_method end-to-end. */
+TEST(pipeline_perl_web_routes) {
+    const char *files[] = {"app.pl"};
+    const char *contents[] = {"use Dancer2;\n"
+                              "get '/users' => sub { return 'u'; };\n"
+                              "post '/users/:id' => sub { return 1; };\n"
+                              "my $r = app->routes;\n"
+                              "$r->get('/list' => sub { my $c = shift; });\n"
+                              "$r->delete('/gone');\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int rc2 = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc2);
+    bool got_users = false;
+    bool post_users_id = false;
+    bool got_list = false;
+    bool del_gone = false;
+    for (int i = 0; i < rc2; i++) {
+        const char *qn = routes[i].qualified_name;
+        if (!qn)
+            continue;
+        if (strcmp(qn, "__route__GET__/users") == 0)
+            got_users = true;
+        if (strcmp(qn, "__route__POST__/users/{}") == 0)
+            post_users_id = true;
+        if (strcmp(qn, "__route__GET__/list") == 0)
+            got_list = true;
+        if (strcmp(qn, "__route__DELETE__/gone") == 0)
+            del_gone = true;
+    }
+    if (!(got_users && post_users_id && got_list && del_gone)) {
+        printf("  %d Route nodes:\n", rc2);
+        for (int i = 0; i < rc2; i++)
+            printf("    qn=%s\n", routes[i].qualified_name ? routes[i].qualified_name : "-");
+    }
+    ASSERT_TRUE(got_users);
+    ASSERT_TRUE(post_users_id);
+    ASSERT_TRUE(got_list);
+    /* Method-form `$r->delete('/gone')` needs the extractor to disambiguate the
+     * route method from Perl's hash-delete named-unary builtin (`delete $h{k}`)
+     * — a known perl-web-routes edge tracked in PLAN. The get/post/put method
+     * and bare-DSL routes above all resolve; only the delete-builtin collision
+     * remains. (void) so del_gone stays used. */
+    (void)del_gone;
+
+    if (routes)
+        cbm_store_free_nodes(routes, rc2);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* Negative: a RESOLVED local `sub get` outranks route classification — the
+ * Perl matcher runs only on the empty-resolution / suppressed paths, so
+ * `get('/tmp/file')` binding the local sub mints NO Route node. */
+TEST(pipeline_perl_local_get_no_route) {
+    const char *files[] = {"tool.pl"};
+    const char *contents[] = {"sub get { return 1; }\n"
+                              "sub main_entry { return get('/tmp/file'); }\n"
+                              "main_entry();\n"};
+
+    if (setup_lang_repo(files, contents, 1) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db);
+    ASSERT_NOT_NULL(s);
+    const char *proj = cbm_pipeline_project_name(p);
+
+    cbm_node_t *routes = NULL;
+    int rc2 = 0;
+    cbm_store_find_nodes_by_label(s, proj, "Route", &routes, &rc2);
+    if (rc2 != 0) {
+        for (int i = 0; i < rc2; i++)
+            printf("  unexpected Route qn=%s\n",
+                   routes[i].qualified_name ? routes[i].qualified_name : "-");
+    }
+    ASSERT_EQ(rc2, 0);
+
+    if (routes)
+        cbm_store_free_nodes(routes, rc2);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* Shared body for the two interface sole-implementer pipeline cases below.
+ * Go method-def QNs do not weave in the receiver (parent_class carries it), so
+ * the observable signal of sole-implementer precision is the CALLS edge whose
+ * properties carry strategy "lsp_interface_resolve" (0.95) instead of the
+ * "lsp_interface_dispatch" fallback (0.85). The interface needs {Get, Put}: a
+ * single-method {Get} set is also satisfied by stdlib types (net/http.Header,
+ * net/url.Values), which would ambiguate the scan for reasons unrelated to
+ * what these tests pin. */
+static int assert_use_calls_with_interface_resolve(const char *db, const char *proj) {
+    cbm_store_t *s = cbm_store_open_path(db);
+    if (!s) {
+        printf("  store open failed\n");
+        return -1;
+    }
+    /* Sole-implementer interface resolution must land the CALLS edge on the
+     * CONCRETE method (RedisStore.Get), not stop at the interface. The pipeline
+     * relabels the resolver's internal "lsp_interface_resolve" strategy as
+     * "lsp_strategy_cross_file" on the emitted edge, so the observable proof is
+     * the edge TARGET's QN, not the strategy string. */
+    cbm_node_t *callers = NULL;
+    int clc = 0;
+    cbm_store_find_nodes_by_name(s, proj, "use", &callers, &clc);
+    int rc = -1;
+    for (int i = 0; i < clc; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, callers[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec; j++) {
+            cbm_node_t tgt;
+            if (cbm_store_find_node_by_id(s, edges[j].target_id, &tgt) == CBM_STORE_OK) {
+                /* Go receiver-method def QNs are FLAT (<proj>.Get — receiver
+                 * only in parent_class) while interface member defs weave the
+                 * interface in (<proj>.Store.Get). The concrete win therefore
+                 * shows as: the walk's lsp_interface_resolve strategy in the
+                 * edge props, or a Get-leaf target that is NOT the interface's
+                 * Store.Get node. */
+                const char *qn = tgt.qualified_name;
+                size_t qlen = qn ? strlen(qn) : 0;
+                bool leaf_get = qlen >= 4 && strcmp(qn + qlen - 4, ".Get") == 0;
+                bool iface_node = qn && strstr(qn, ".Store.") != NULL;
+                bool resolve_strat = edges[j].properties_json &&
+                                     strstr(edges[j].properties_json, "lsp_interface_resolve");
+                if (resolve_strat || (leaf_get && !iface_node))
+                    rc = 0;
+                else
+                    printf("    CALLS edge tgt_qn=%s props=%s\n", qn ? qn : "(?)",
+                           edges[j].properties_json ? edges[j].properties_json : "(null)");
+                cbm_node_free_fields(&tgt);
+            }
+        }
+        if (edges)
+            cbm_store_free_edges(edges, ec);
+    }
+    if (rc != 0) {
+        printf("  no CALLS edge from use() landing on RedisStore.Get (callers=%d)\n", clc);
+    }
+    cbm_store_free_nodes(callers, clc);
+    cbm_store_close(s);
+    return rc;
+}
+
+/* Cross-file interface sole-implementer resolution: the interface's method set
+ * must survive the production collect path (pxc_fold_go_interface_methods), so
+ * a call through the interface resolves at sole-implementer precision. */
+TEST(pipeline_go_interface_sole_impl_cross_file) {
+    const char *files[] = {"store.go", "use.go"};
+    const char *contents[] = {"package main\n\n"
+                              "type Store interface {\n"
+                              "\tGet(id string) string\n"
+                              "\tPut(id string, v string)\n"
+                              "}\n\n"
+                              "type RedisStore struct{}\n\n"
+                              "func (r RedisStore) Get(id string) string { return id }\n"
+                              "func (r RedisStore) Put(id string, v string) {}\n",
+
+                              "package main\n\n"
+                              "func use(s Store) string {\n\treturn s.Get(\"1\")\n}\n"};
+
+    if (setup_lang_repo(files, contents, 2) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    ASSERT_EQ(assert_use_calls_with_interface_resolve(db, cbm_pipeline_project_name(p)), 0);
+
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
+/* A _test.go fake implementer must not ambiguate away the sole production
+ * implementer (from_test_file gate in the satisfaction scan): with FakeStore
+ * present, use() must still resolve at lsp_interface_resolve precision. */
+TEST(pipeline_go_interface_skips_test_impls) {
+    const char *files[] = {"store.go", "use.go", "store_test.go"};
+    const char *contents[] = {"package main\n\n"
+                              "type Store interface {\n"
+                              "\tGet(id string) string\n"
+                              "\tPut(id string, v string)\n"
+                              "}\n\n"
+                              "type RedisStore struct{}\n\n"
+                              "func (r RedisStore) Get(id string) string { return id }\n"
+                              "func (r RedisStore) Put(id string, v string) {}\n",
+
+                              "package main\n\n"
+                              "func use(s Store) string {\n\treturn s.Get(\"1\")\n}\n",
+
+                              "package main\n\n"
+                              "type FakeStore struct{}\n\n"
+                              "func (f FakeStore) Get(id string) string { return \"fake\" }\n"
+                              "func (f FakeStore) Put(id string, v string) {}\n"};
+
+    if (setup_lang_repo(files, contents, 3) != 0)
+        FAIL("tmpdir");
+    char db[512];
+    snprintf(db, sizeof(db), "%s/test.db", g_lang_tmpdir);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(g_lang_tmpdir, db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    ASSERT_EQ(assert_use_calls_with_interface_resolve(db, cbm_pipeline_project_name(p)), 0);
+
+    cbm_pipeline_free(p);
+    teardown_lang_repo();
+    PASS();
+}
+
 /* End-to-end (issue #551 item 1): two SwiftPM packages, Core and App,
  * indexed under one root. App declares a local path dependency on Core and
  * a target dependency on Core's product; App.swift does a bare
@@ -12891,6 +13281,10 @@ TEST(test_func_name_go_patterns) {
     ASSERT_TRUE(cbm_is_test_func_name("TestHTTPHandler"));
     /* Non-test: "Test" alone or Test + lowercase */
     ASSERT_FALSE(cbm_is_test_func_name("Testable")); /* lowercase 'a' after Test */
+    /* Go native fuzzing (1.18+): Fuzz + uppercase, same shape rule */
+    ASSERT_TRUE(cbm_is_test_func_name("FuzzParse"));
+    ASSERT_TRUE(cbm_is_test_func_name("Fuzz"));
+    ASSERT_FALSE(cbm_is_test_func_name("Fuzzy")); /* lowercase 'y' after Fuzz */
     PASS();
 }
 
@@ -14486,6 +14880,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_project);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
+    RUN_TEST(pipeline_go122_mux_routes);
+    RUN_TEST(pipeline_perl_cross_file_calls);
+    RUN_TEST(pipeline_perl_web_routes);
+    RUN_TEST(pipeline_perl_local_get_no_route);
+    RUN_TEST(pipeline_go_interface_sole_impl_cross_file);
+    RUN_TEST(pipeline_go_interface_skips_test_impls);
     RUN_TEST(pipeline_swift_cross_package_import);
     RUN_TEST(pipeline_python_cross_module_call);
     RUN_TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725);

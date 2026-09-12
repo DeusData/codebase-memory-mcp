@@ -185,6 +185,17 @@ static int parse_dep_entry(CBMArena* a, const char* s, int len, int from,
     return from;
 }
 
+/* `[target.'cfg(unix)'.dependencies]` / `[target.x86_64-….dev-dependencies]`
+ * — platform-conditional dep tables. Any section starting `target.` and
+ * ending in a `dependencies` table name carries deps we should know. */
+static bool section_is_target_deps(const char* section) {
+    if (!section || strncmp(section, "target.", 7) != 0) return false;
+    size_t len = strlen(section);
+    static const char suffix[] = ".dependencies";
+    size_t sfx = sizeof(suffix) - 1;
+    return len > sfx && strcmp(section + len - sfx, suffix) == 0;
+}
+
 /* ── Section dispatcher ──────────────────────────────────────── */
 
 static int parse_package_kv(CBMArena* a, const char* s, int len, int from,
@@ -279,7 +290,8 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
         } else if (strcmp(section, "dependencies") == 0 ||
                    strcmp(section, "dev-dependencies") == 0 ||
                    strcmp(section, "build-dependencies") == 0 ||
-                   strcmp(section, "workspace.dependencies") == 0) {
+                   strcmp(section, "workspace.dependencies") == 0 ||
+                   section_is_target_deps(section)) {
             from = parse_dep_entry(arena, src, src_len, from, out);
         } else {
             /* Section we don't care about — skip the line. */
@@ -290,16 +302,28 @@ void cbm_cargo_parse(CBMArena* arena, const char* src, int src_len,
     }
 }
 
+bool cbm_cargo_name_eq(const char* a, const char* b) {
+    if (!a || !b) return false;
+    while (*a && *b) {
+        char ca = (*a == '-') ? '_' : *a;
+        char cb = (*b == '-') ? '_' : *b;
+        if (ca != cb) return false;
+        a++;
+        b++;
+    }
+    return *a == '\0' && *b == '\0';
+}
+
 bool cbm_cargo_is_known_dep(const CBMCargoManifest* m, const char* head) {
     if (!m || !head) return false;
     for (int i = 0; i < m->dep_count; i++) {
-        if (m->deps[i].name && strcmp(m->deps[i].name, head) == 0) {
+        if (cbm_cargo_name_eq(m->deps[i].name, head)) {
             return true;
         }
     }
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, head) == 0) {
+        if (cbm_cargo_name_eq(m->members[i].member_name, head) ||
+            cbm_cargo_name_eq(m->members[i].package_name, head)) {
             return true;
         }
     }
@@ -310,10 +334,33 @@ const CBMCargoMember* cbm_cargo_find_member(const CBMCargoManifest* m,
     const char* name) {
     if (!m || !name) return NULL;
     for (int i = 0; i < m->member_count; i++) {
-        if (m->members[i].member_name &&
-            strcmp(m->members[i].member_name, name) == 0) {
+        if (cbm_cargo_name_eq(m->members[i].member_name, name) ||
+            cbm_cargo_name_eq(m->members[i].package_name, name)) {
             return &m->members[i];
         }
     }
     return NULL;
+}
+
+const char* cbm_cargo_merge_member_deps(CBMArena* arena, CBMCargoManifest* dst,
+    const char* toml, int toml_len) {
+    if (!arena || !dst || !toml) return NULL;
+    CBMCargoManifest tmp;
+    cbm_cargo_parse(arena, toml, toml_len, &tmp);
+    for (int i = 0; i < tmp.dep_count && dst->dep_count < CBM_CARGO_MAX_DEPS; i++) {
+        const char* name = tmp.deps[i].name;
+        if (!name) continue;
+        bool dup = false;
+        for (int j = 0; j < dst->dep_count; j++) {
+            if (cbm_cargo_name_eq(dst->deps[j].name, name)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        dst->deps[dst->dep_count].name = name;
+        dst->deps[dst->dep_count].path = tmp.deps[i].path;
+        dst->dep_count++;
+    }
+    return tmp.package_name;
 }

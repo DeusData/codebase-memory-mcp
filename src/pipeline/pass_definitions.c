@@ -263,14 +263,17 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
                      "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
                      "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
                      "\"unguarded_recursion\":%s,"
-                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%s",
                      def->complexity, def->cognitive, def->loop_count, def->loop_depth,
                      def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
                      def->linear_scan_in_loop, def->alloc_in_loop,
                      def->recursion_in_loop ? "true" : "false",
                      def->unguarded_recursion ? "true" : "false", def->lines,
                      def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
-                     def->is_entry_point ? "true" : "false");
+                     def->is_entry_point ? "true" : "false",
+                     /* Emitted only when set: keeps every non-annotated
+                      * function's properties blob byte-identical. */
+                     def->is_test_annotated ? ",\"is_test_annotated\":true" : "");
     } else {
         n = snprintf(buf, bufsize,
                      "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
@@ -292,8 +295,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "base_classes", def->base_classes);
     append_json_str_array(buf, bufsize, &pos, "param_names", def->param_names);
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
+    append_json_str_array(buf, bufsize, &pos, "subtests", def->subtests);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "route_handler", def->route_handler);
 
     /* MinHash fingerprint — append if present and buffer has room. */
     if (def->fingerprint && def->fingerprint_k > 0 &&

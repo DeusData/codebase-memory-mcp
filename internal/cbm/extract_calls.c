@@ -1833,6 +1833,281 @@ static const char *php_group_prefix_for_call(CBMArena *a, TSNode node, const cha
     return pos ? cbm_arena_strndup(a, buf, pos) : NULL;
 }
 
+/* ── Go router-group prefix composition (route-group-prefix-composition) ──
+ *
+ * gin/echo/fiber:  g := r.Group("/api"); g.GET("/users", h)      → /api/users
+ * nested:          v1 := g.Group("/v1"); v1.POST("/orders", h)   → /api/v1/orders
+ * gorilla:         s := r.PathPrefix("/api").Subrouter(); s.HandleFunc("/u", h)
+ * chi closures:    r.Route("/admin", func(r chi.Router){ r.Get("/users", h) })
+ *
+ * Like the PHP #952 branch below, composition happens at EXTRACTION: the
+ * resolve passes only see the flat CBMCall, and the group-variable binding /
+ * enclosing closure exist only in the AST. Both route venues (parallel
+ * emit_route_registration and sequential handle_route_registration) then see
+ * the composed path in first_string_arg with zero pipeline changes.
+ *
+ * CONSERVATIVE LIMITS (documented): the group variable must be bound by
+ * `v := X.Group("/p")` / `v = X.Group("/p")` (or the gorilla
+ * PathPrefix().Subrouter() chain) in a lexically enclosing block of the SAME
+ * function/file, before the registration site. Groups passed across function
+ * boundaries, chi Mount()ed subrouters built elsewhere, and rebinding through
+ * anything but a direct group call keep today's leaf path (fail-closed: a
+ * non-group binding of the receiver var stops the search). */
+enum { GO_GROUP_WALK_MAX = 64, GO_GROUP_CHAIN_DEPTH = 4, GO_GROUP_PARTS_MAX = 8 };
+
+/* First named argument when it is a '/'-leading string literal (unquoted). */
+static const char *go_call_slash_arg0(CBMExtractCtx *ctx, TSNode call_expr) {
+    TSNode args = ts_node_child_by_field_name(call_expr, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return NULL;
+    }
+    TSNode a0 = ts_node_named_child(args, 0);
+    const char *k0 = ts_node_type(a0);
+    if (strcmp(k0, "interpreted_string_literal") != 0 && strcmp(k0, "raw_string_literal") != 0) {
+        return NULL;
+    }
+    char *text = cbm_node_text(ctx->arena, a0, ctx->source);
+    if (!text || !text[0]) {
+        return NULL;
+    }
+    size_t len = strlen(text);
+    if (len >= 2 && (text[0] == '"' || text[0] == '`')) {
+        text[len - 1] = '\0';
+        text++;
+    }
+    return text[0] == '/' ? text : NULL;
+}
+
+/* If call_expr is a group-creating call, return its prefix and set
+ * *out_recv_var to the receiver variable name (NULL when the receiver is not
+ * a bare identifier). Recognized shapes:
+ *   X.Group("/p")                      (gin / echo / fiber)
+ *   X.PathPrefix("/p").Subrouter()     (gorilla) */
+static const char *go_group_call_prefix(CBMExtractCtx *ctx, TSNode call_expr,
+                                        const char **out_recv_var) {
+    *out_recv_var = NULL;
+    if (ts_node_is_null(call_expr) || strcmp(ts_node_type(call_expr), "call_expression") != 0) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(call_expr, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
+        return NULL;
+    }
+    TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+    TSNode operand = ts_node_child_by_field_name(fn, TS_FIELD("operand"));
+    if (ts_node_is_null(field) || ts_node_is_null(operand)) {
+        return NULL;
+    }
+    char *fname = cbm_node_text(ctx->arena, field, ctx->source);
+    if (!fname) {
+        return NULL;
+    }
+    if (strcmp(fname, "Group") == 0) {
+        const char *prefix = go_call_slash_arg0(ctx, call_expr);
+        if (!prefix) {
+            return NULL;
+        }
+        if (strcmp(ts_node_type(operand), "identifier") == 0) {
+            *out_recv_var = cbm_node_text(ctx->arena, operand, ctx->source);
+        }
+        return prefix;
+    }
+    if (strcmp(fname, "Subrouter") == 0 &&
+        strcmp(ts_node_type(operand), "call_expression") == 0) {
+        TSNode ifn = ts_node_child_by_field_name(operand, TS_FIELD("function"));
+        if (ts_node_is_null(ifn) || strcmp(ts_node_type(ifn), "selector_expression") != 0) {
+            return NULL;
+        }
+        TSNode ifield = ts_node_child_by_field_name(ifn, TS_FIELD("field"));
+        char *ifname = ts_node_is_null(ifield) ? NULL : cbm_node_text(ctx->arena, ifield, ctx->source);
+        if (!ifname || strcmp(ifname, "PathPrefix") != 0) {
+            return NULL;
+        }
+        const char *prefix = go_call_slash_arg0(ctx, operand);
+        if (!prefix) {
+            return NULL;
+        }
+        TSNode ioperand = ts_node_child_by_field_name(ifn, TS_FIELD("operand"));
+        if (!ts_node_is_null(ioperand) && strcmp(ts_node_type(ioperand), "identifier") == 0) {
+            *out_recv_var = cbm_node_text(ctx->arena, ioperand, ctx->source);
+        }
+        return prefix;
+    }
+    return NULL;
+}
+
+/* Join parent chain + one segment with exactly one '/' between them. */
+static const char *go_group_join(CBMExtractCtx *ctx, const char *parent, const char *seg) {
+    const char *s = seg;
+    while (*s == '/') {
+        s++;
+    }
+    size_t sl = strlen(s);
+    while (sl > 0 && s[sl - 1] == '/') {
+        sl--;
+    }
+    if (sl == 0) {
+        return parent;
+    }
+    char *trimmed = cbm_arena_strndup(ctx->arena, s, sl);
+    if (!parent || !parent[0]) {
+        return cbm_arena_sprintf(ctx->arena, "/%s", trimmed);
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s/%s", parent, trimmed);
+}
+
+/* Resolve the accumulated group prefix bound to `var_name` at `site`:
+ * find the last `var_name := <group call>` / `= <group call>` in a lexically
+ * enclosing statement list BEFORE the site and compose recursively through
+ * the receiver chain. NULL when the variable is not a recognizable group. */
+static const char *go_var_group_prefix(CBMExtractCtx *ctx, TSNode site, const char *var_name,
+                                       int depth) {
+    if (!var_name || !var_name[0] || depth > GO_GROUP_CHAIN_DEPTH) {
+        return NULL;
+    }
+    uint32_t site_start = ts_node_start_byte(site);
+    TSNode cur = ts_node_parent(site);
+    for (int hops = 0; hops < GO_GROUP_WALK_MAX && !ts_node_is_null(cur);
+         hops++, cur = ts_node_parent(cur)) {
+        const char *ck = ts_node_type(cur);
+        if (strcmp(ck, "statement_list") != 0 && strcmp(ck, "block") != 0 &&
+            strcmp(ck, "source_file") != 0) {
+            continue;
+        }
+        TSNode binding_rhs = {0};
+        uint32_t nc = ts_node_named_child_count(cur);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode st = ts_node_named_child(cur, i);
+            if (ts_node_start_byte(st) >= site_start) {
+                break;
+            }
+            const char *sk = ts_node_type(st);
+            if (strcmp(sk, "short_var_declaration") != 0 &&
+                strcmp(sk, "assignment_statement") != 0) {
+                continue;
+            }
+            TSNode left = ts_node_child_by_field_name(st, TS_FIELD("left"));
+            TSNode right = ts_node_child_by_field_name(st, TS_FIELD("right"));
+            if (ts_node_is_null(left) || ts_node_is_null(right) ||
+                ts_node_named_child_count(left) != 1) {
+                continue;
+            }
+            TSNode lv = ts_node_named_child(left, 0);
+            if (strcmp(ts_node_type(lv), "identifier") != 0) {
+                continue;
+            }
+            char *lname = cbm_node_text(ctx->arena, lv, ctx->source);
+            if (!lname || strcmp(lname, var_name) != 0) {
+                continue;
+            }
+            /* Last matching binding before the site wins (rebinding). */
+            binding_rhs = ts_node_named_child_count(right) == 1 ? ts_node_named_child(right, 0)
+                                                                : (TSNode){0};
+        }
+        if (!ts_node_is_null(binding_rhs)) {
+            const char *recv_var = NULL;
+            const char *prefix = go_group_call_prefix(ctx, binding_rhs, &recv_var);
+            if (!prefix) {
+                return NULL; /* bound to something that is not a group — stop */
+            }
+            const char *parent_chain =
+                recv_var ? go_var_group_prefix(ctx, binding_rhs, recv_var, depth + 1) : NULL;
+            return go_group_join(ctx, parent_chain, prefix);
+        }
+    }
+    return NULL;
+}
+
+/* chi-style closures: collect the prefixes of every enclosing
+ * `X.Route("/p", func(r){...})` / `X.Group("/p", func(r){...})` whose closure
+ * argument contains `node`, outer-first, then extend through the outermost
+ * receiver's own group-variable chain. */
+static const char *go_closure_group_prefix(CBMExtractCtx *ctx, TSNode node) {
+    const char *parts[GO_GROUP_PARTS_MAX];
+    int part_count = 0;
+    TSNode outermost_call = {0};
+    TSNode cur = ts_node_parent(node);
+    for (int hops = 0; hops < GO_GROUP_WALK_MAX && !ts_node_is_null(cur);
+         hops++, cur = ts_node_parent(cur)) {
+        if (strcmp(ts_node_type(cur), "func_literal") != 0) {
+            continue;
+        }
+        TSNode args = ts_node_parent(cur);
+        if (ts_node_is_null(args) || strcmp(ts_node_type(args), "argument_list") != 0) {
+            continue;
+        }
+        TSNode call = ts_node_parent(args);
+        if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+            continue;
+        }
+        TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+        if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
+            continue;
+        }
+        TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+        char *fname = ts_node_is_null(field) ? NULL : cbm_node_text(ctx->arena, field, ctx->source);
+        if (!fname || (strcmp(fname, "Route") != 0 && strcmp(fname, "Group") != 0)) {
+            continue;
+        }
+        const char *prefix = go_call_slash_arg0(ctx, call);
+        if (!prefix) {
+            continue;
+        }
+        if (part_count < GO_GROUP_PARTS_MAX) {
+            parts[part_count++] = prefix; /* inner-first */
+            outermost_call = call;
+        }
+    }
+    if (part_count == 0) {
+        return NULL;
+    }
+    /* The outermost group call's receiver may itself be a bound group var. */
+    const char *chain = NULL;
+    TSNode ofn = ts_node_child_by_field_name(outermost_call, TS_FIELD("function"));
+    TSNode ooperand = ts_node_child_by_field_name(ofn, TS_FIELD("operand"));
+    if (!ts_node_is_null(ooperand) && strcmp(ts_node_type(ooperand), "identifier") == 0) {
+        char *ovar = cbm_node_text(ctx->arena, ooperand, ctx->source);
+        chain = go_var_group_prefix(ctx, outermost_call, ovar, 0);
+    }
+    const char *composed = chain;
+    for (int i = part_count - 1; i >= 0; i--) {
+        composed = go_group_join(ctx, composed, parts[i]);
+    }
+    return composed;
+}
+
+/* Full composed prefix for a Go route-registration call, or NULL. */
+static const char *go_group_prefix_for_call(CBMExtractCtx *ctx, TSNode call_node) {
+    TSNode fn = ts_node_child_by_field_name(call_node, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "selector_expression") != 0) {
+        return NULL;
+    }
+    TSNode operand = ts_node_child_by_field_name(fn, TS_FIELD("operand"));
+    const char *var_chain = NULL;
+    if (!ts_node_is_null(operand)) {
+        if (strcmp(ts_node_type(operand), "identifier") == 0) {
+            char *var = cbm_node_text(ctx->arena, operand, ctx->source);
+            var_chain = go_var_group_prefix(ctx, call_node, var, 0);
+        } else if (strcmp(ts_node_type(operand), "call_expression") == 0) {
+            /* Inline chain: r.Group("/api").GET("/u", h). */
+            const char *recv_var = NULL;
+            const char *prefix = go_group_call_prefix(ctx, operand, &recv_var);
+            if (prefix) {
+                const char *parent =
+                    recv_var ? go_var_group_prefix(ctx, call_node, recv_var, 0) : NULL;
+                var_chain = go_group_join(ctx, parent, prefix);
+            }
+        }
+    }
+    const char *closure_chain = go_closure_group_prefix(ctx, call_node);
+    if (closure_chain && var_chain) {
+        /* Var-bound group used inside a routed closure: closure prefixes are
+         * outer, the variable's own chain already includes ITS outer scopes. */
+        return go_group_join(ctx, closure_chain, var_chain);
+    }
+    return var_chain ? var_chain : closure_chain;
+}
+
 static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
     if (lang != CBM_LANG_VERILOG || strcmp(ts_node_type(node), "subroutine_call") != 0) {
         return false;
@@ -1841,6 +2116,57 @@ static bool is_nested_verilog_call_wrapper(CBMLanguage lang, TSNode node) {
     TSNode parent = ts_node_parent(node);
     return !ts_node_is_null(parent) &&
            strcmp(ts_node_type(parent), "function_subroutine_call") == 0;
+}
+
+/* Java `this(...)` / `super(...)` constructor delegation: resolve the textual
+ * callee from the enclosing type declaration. `this` -> the enclosing class's
+ * own short name (the ctor short name equals it); `super` -> the leaf of the
+ * `extends` clause (generics and qualifiers stripped), "Object" when the class
+ * has no extends clause. Returns NULL when no enclosing class is found (an
+ * explicit ctor invocation cannot legally appear outside one). */
+static char *java_explicit_ctor_callee(CBMArena *a, TSNode node, const char *source) {
+    TSNode ctor = ts_node_child_by_field_name(node, TS_FIELD("constructor"));
+    if (ts_node_is_null(ctor)) {
+        return NULL;
+    }
+    const char *ck = ts_node_type(ctor);
+    bool is_super = strcmp(ck, "super") == 0;
+    if (!is_super && strcmp(ck, "this") != 0) {
+        return NULL;
+    }
+    /* Walk up to the nearest type declaration that can own a constructor. */
+    TSNode cls = ts_node_parent(node);
+    int hops = 0;
+    while (!ts_node_is_null(cls) && hops++ < 64) {
+        const char *k = ts_node_type(cls);
+        if (strcmp(k, "class_declaration") == 0 || strcmp(k, "enum_declaration") == 0 ||
+            strcmp(k, "record_declaration") == 0) {
+            break;
+        }
+        cls = ts_node_parent(cls);
+    }
+    if (ts_node_is_null(cls)) {
+        return NULL;
+    }
+    if (!is_super) {
+        TSNode name = ts_node_child_by_field_name(cls, TS_FIELD("name"));
+        return ts_node_is_null(name) ? NULL : cbm_node_text(a, name, source);
+    }
+    TSNode sup = ts_node_child_by_field_name(cls, TS_FIELD("superclass"));
+    char *raw = NULL;
+    if (!ts_node_is_null(sup) && ts_node_named_child_count(sup) > 0) {
+        raw = cbm_node_text(a, ts_node_named_child(sup, 0), source);
+    }
+    if (!raw || !raw[0]) {
+        return cbm_arena_strdup(a, "Object");
+    }
+    /* Strip generic args, keep the last dotted segment. */
+    char *lt = strchr(raw, '<');
+    if (lt) {
+        *lt = '\0';
+    }
+    char *dot = strrchr(raw, '.');
+    return dot ? dot + 1 : raw;
 }
 
 static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, CBMLanguage lang) {
@@ -1874,6 +2200,16 @@ static char *extract_callee_name(CBMArena *a, TSNode node, const char *source, C
         if (g) {
             return g;
         }
+    }
+
+    // Java ctor delegation `this(...)` / `super(...)` (explicit_constructor_invocation):
+    // the syntactic callee is a keyword, so derive the textual callee from the
+    // enclosing class — its own short name for `this`, the superclass leaf for
+    // `super` — matching what the Java LSP resolves the site to, so the
+    // pipeline join has a raw CALL row with an agreeing short name.
+    if (lang == CBM_LANG_JAVA &&
+        strcmp(ts_node_type(node), "explicit_constructor_invocation") == 0) {
+        return java_explicit_ctor_callee(a, node, source);
     }
 
     // Constructor / instantiation nodes (new T(), object_creation, instance_expression):
@@ -2370,6 +2706,84 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
     return unq;
 }
 
+/* Rust/axum: `.route("/", get(root))` wraps the handler in a method-router
+ * call. Peel `get(root)` / chained `get(a).post(b)` down to the innermost
+ * routing-verb call's first path-shaped argument. For a chain, the OUTERMOST
+ * call's handler wins (the last registered verb) — one HANDLES edge minimum.
+ * Only axum::routing verb names qualify, so `wrap(mw)` never yields a handler. */
+static bool rust_is_axum_routing_verb(const char *name) {
+    static const char *const verbs[] = {"get",  "post",    "put", "delete", "patch",
+                                        "head", "options", "any", "trace",  NULL};
+    if (!name) {
+        return false;
+    }
+    /* Accept a scoped tail too (`routing::get`). */
+    const char *tail = name;
+    for (const char *p = name; p[0]; p++) {
+        if (p[0] == ':' && p[1] == ':' && p[2]) {
+            tail = p + 2;
+        }
+    }
+    for (int i = 0; verbs[i]; i++) {
+        if (strcmp(tail, verbs[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static const char *rust_axum_handler_from_call(CBMExtractCtx *ctx, TSNode call) {
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    const char *fk = ts_node_type(fn);
+    char *verb = NULL;
+    if (strcmp(fk, "identifier") == 0 || strcmp(fk, "scoped_identifier") == 0) {
+        verb = cbm_node_text(ctx->arena, fn, ctx->source);
+    } else if (strcmp(fk, "field_expression") == 0) {
+        /* Chained method router `get(a).post(b)`: the field is the verb. */
+        TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+        if (!ts_node_is_null(field)) {
+            verb = cbm_node_text(ctx->arena, field, ctx->source);
+        }
+    }
+    if (!rust_is_axum_routing_verb(verb)) {
+        return NULL;
+    }
+    TSNode vargs = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    if (ts_node_is_null(vargs)) {
+        return NULL;
+    }
+    uint32_t vn = ts_node_named_child_count(vargs);
+    for (uint32_t vi = 0; vi < vn; vi++) {
+        TSNode h = ts_node_named_child(vargs, vi);
+        const char *hk = ts_node_type(h);
+        if (strcmp(hk, "identifier") == 0 || strcmp(hk, "field_expression") == 0) {
+            return cbm_node_text(ctx->arena, h, ctx->source);
+        }
+        if (strcmp(hk, "scoped_identifier") == 0) {
+            /* `handlers::create` → dotted form so registry suffix/short-name
+             * resolution sees the same shape other member handlers use. */
+            char *t = cbm_node_text(ctx->arena, h, ctx->source);
+            if (t) {
+                char *w = t;
+                for (char *p = t; *p; p++) {
+                    if (p[0] == ':' && p[1] == ':') {
+                        *w++ = '.';
+                        p++;
+                    } else {
+                        *w++ = *p;
+                    }
+                }
+                *w = '\0';
+            }
+            return t;
+        }
+    }
+    return NULL;
+}
+
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
     /* The LAST eligible argument wins, and every argument is examined.
      * Express, Fastify, gin and Laravel all put middleware between the route
@@ -2394,6 +2808,31 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
             handler = cbm_node_text(ctx->arena, arg2, ctx->source);
+            continue;
+        }
+        /* Go middleware wrappers (对拍B rider on route-group composition):
+         * `g.POST("/x", mw(createOrder))` — unwrap an exactly-one-argument
+         * wrapper call whose argument is a bare identifier/selector, so the
+         * wrapped handler still gets its HANDLES edge. Multi-arg and
+         * non-identifier forms (mw(role), asyncHandler(func(){}…)) are
+         * syntactically indistinguishable from config wrappers — left alone. */
+        if (ctx->language == CBM_LANG_GO && strcmp(ak2, "call_expression") == 0) {
+            TSNode wargs = ts_node_child_by_field_name(arg2, TS_FIELD("arguments"));
+            if (!ts_node_is_null(wargs) && ts_node_named_child_count(wargs) == 1) {
+                TSNode inner = ts_node_named_child(wargs, 0);
+                const char *iak = ts_node_type(inner);
+                if (strcmp(iak, "identifier") == 0 || strcmp(iak, "selector_expression") == 0) {
+                    handler = cbm_node_text(ctx->arena, inner, ctx->source);
+                }
+            }
+            continue;
+        }
+        /* Rust/axum wraps the handler in a routing-verb call (`get(root)`). */
+        if (ctx->language == CBM_LANG_RUST && strcmp(ak2, "call_expression") == 0) {
+            const char *h = rust_axum_handler_from_call(ctx, arg2);
+            if (h && h[0]) {
+                handler = h;
+            }
             continue;
         }
         if (is_string_like(ak2)) {
@@ -3651,6 +4090,14 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             call.enclosing_func_qn = state->enclosing_func_qn;
             call.loop_depth = state->loop_depth;     // enclosing loop nesting at this call
             call.branch_depth = state->branch_depth; // enclosing branch nesting at this call
+            // Java this(...)/super(...): the callee text is DERIVED from the
+            // enclosing class, not spelled at the site. Only the Java LSP may
+            // resolve it — a textual short-name fallback could bind the class
+            // name to an unrelated same-named def.
+            if (ctx->language == CBM_LANG_JAVA &&
+                strcmp(ts_node_type(node), "explicit_constructor_invocation") == 0) {
+                call.requires_lsp_resolution = true;
+            }
             call.start_line = (int)ts_node_start_point(node).row + TS_LINE_OFFSET;
             call.site_start_byte = ts_node_start_byte(node);
             call.site_end_byte = ts_node_end_byte(node);
@@ -3752,7 +4199,30 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                                    : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
                     }
                 }
-                if (call.first_string_arg && call.first_string_arg[0] == '/') {
+                /* Go router groups: g := r.Group("/api"); g.GET("/users", h)
+                 * must register /api/users — same extraction-time composition
+                 * as the Laravel branch above (see go_group_prefix_for_call
+                 * for the recognized shapes and conservative limits). */
+                if (ctx->language == CBM_LANG_GO && call.first_string_arg &&
+                    call.first_string_arg[0] == '/' && call.callee_name &&
+                    cbm_service_pattern_route_method(call.callee_name) != NULL) {
+                    const char *gp = go_group_prefix_for_call(ctx, node);
+                    if (gp && gp[0]) {
+                        const char *rel = call.first_string_arg;
+                        while (*rel == '/') {
+                            rel++;
+                        }
+                        call.first_string_arg =
+                            rel[0] ? cbm_arena_sprintf(ctx->arena, "%s/%s", gp, rel)
+                                   : cbm_arena_strndup(ctx->arena, gp, strlen(gp));
+                    }
+                }
+                if (call.first_string_arg &&
+                    (call.first_string_arg[0] == '/' ||
+                     cbm_go_split_mux_pattern(call.first_string_arg, NULL) != NULL)) {
+                    /* Go 1.22 mux literals carry the handler in arg 2 exactly
+                     * like '/'-prefixed routes; without this the HANDLES edge
+                     * loses its handler name. */
                     call.second_arg_name = extract_handler_arg(ctx, args);
                 }
                 if (ctx->language == CBM_LANG_OBJECTSCRIPT_UDL ||
@@ -3802,6 +4272,38 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                             cbm_calls_push(&ctx->result->calls, ctx->arena, xcall);
                         }
                         break;
+                    }
+                }
+            }
+
+            /* Perl: `func->method` where `func` is a LOWERCASE bareword is an
+             * Exporter-imported nullary function used as a receiver — the
+             * Mojo::File idiom `curfile->sibling(...)`. The primary call above
+             * recorded the METHOD (`sibling`); emit a SECOND call row for the
+             * FUNCTION invocant (`curfile`) at the invocant's own span so the
+             * Perl LSP (perl_imported_function) can bind an edge to it. Perl
+             * spells classes CamelCase and functions lowercase, so the lowercase
+             * initial distinguishes `curfile->` (function) from `Foo->` (class).
+             * requires_lsp_resolution: LSP-only — a textual short-name fallback
+             * could bind the bareword to an unrelated same-named sub, so a
+             * non-imported bareword stays zero-edge. */
+            if (ctx->language == CBM_LANG_PERL &&
+                strcmp(ts_node_type(node), "method_call_expression") == 0) {
+                TSNode inv = ts_node_child_by_field_name(node, TS_FIELD("invocant"));
+                if (!ts_node_is_null(inv) && strcmp(ts_node_type(inv), "bareword") == 0) {
+                    char *inv_txt = cbm_node_text(ctx->arena, inv, ctx->source);
+                    if (inv_txt && inv_txt[0] >= 'a' && inv_txt[0] <= 'z' &&
+                        perl_is_identifier_callee(inv_txt)) {
+                        CBMCall icall = {0};
+                        icall.callee_name = inv_txt;
+                        icall.enclosing_func_qn = state->enclosing_func_qn;
+                        icall.loop_depth = state->loop_depth;
+                        icall.branch_depth = state->branch_depth;
+                        icall.start_line = (int)ts_node_start_point(inv).row + TS_LINE_OFFSET;
+                        icall.site_start_byte = ts_node_start_byte(inv);
+                        icall.site_end_byte = ts_node_end_byte(inv);
+                        icall.requires_lsp_resolution = true;
+                        cbm_calls_push(&ctx->result->calls, ctx->arena, icall);
                     }
                 }
             }

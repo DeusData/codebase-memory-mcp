@@ -128,6 +128,24 @@ CBMLSPDef *cbm_pxc_filter_defs_for_file(const CBMModuleDefIndex *idx, CBMLSPDef 
  * matching cbm_run_X_lsp_cross_with_registry variant which skips the
  * per-file registry build entirely. NULL → fall back to the per-file
  * cbm_pxc_run_one path. */
+/* Perl cross-file @ISA inheritance index: for a class's module_qn, the TAGGED
+ * parent spellings declared in that file (use parent/base/Mojo::Base 'X'). Lets
+ * cbm_run_perl_lsp_cross walk the MULTI-LEVEL chain (child -> parent ->
+ * grandparent ...) — a per-file cross pass only sees its own @ISA, so the
+ * ancestor-of-ancestor links must be supplied project-wide. Parallel arrays;
+ * entry i: module_qns[i] has parent spellings parent_lists[i] (NULL-terminated).
+ * Pointers borrow the pass's def_modules[] and cache[fi]->perl_isa_parents,
+ * which outlive the pass; the two arrays themselves are heap-owned and freed by
+ * cbm_perl_free_inherit_index. */
+typedef struct CBMPerlInheritIndex {
+    const char **module_qns;
+    const char *const **parent_lists;
+    int count;
+} CBMPerlInheritIndex;
+
+/* Look up a module's tagged parent spellings; NULL if the module declares none. */
+const char *const *cbm_perl_inherit_lookup(const CBMPerlInheritIndex *idx, const char *module_qn);
+
 typedef struct {
     CBMTypeRegistry *go;     /* CBM_LANG_GO */
     CBMTypeRegistry *c;      /* CBM_LANG_C, CBM_LANG_CPP, CBM_LANG_CUDA */
@@ -136,9 +154,18 @@ typedef struct {
     CBMTypeRegistry *php;    /* CBM_LANG_PHP */
     CBMTypeRegistry *cs;     /* CBM_LANG_CSHARP */
     CBMTypeRegistry *java;   /* CBM_LANG_JAVA (JVM def universe incl. Kotlin defs) */
+    const CBMPerlInheritIndex *perl_inherit; /* CBM_LANG_PERL multi-level @ISA index (borrowed) */
     /* CBM_LANG_RUST: intentionally absent — the shared rust registry is built
      * LAZILY inside cbm_parallel_resolve (first NULL-filter rust file), not eagerly. */
 } CBMCrossLspRegistries;
+
+/* Build the Perl inheritance index from the per-file cache (borrowing
+ * def_modules[] and cache[fi]->perl_isa_parents). Fills *out; no-op fill when no
+ * Perl file declares a parent. Free with cbm_perl_free_inherit_index. */
+void cbm_perl_build_inherit_index(CBMFileResult **cache, const cbm_file_info_t *files,
+                                  int file_count, char *const *def_modules,
+                                  CBMPerlInheritIndex *out);
+void cbm_perl_free_inherit_index(CBMPerlInheritIndex *idx);
 
 /* Return the appropriate pre-built registry for a language, or NULL
  * if none was built (or language has no cross-LSP entrypoint). */
@@ -196,7 +223,8 @@ const struct CBMCargoManifest *cbm_pxc_get_rust_manifest(void);
  * the existing cbm_run_X_lsp_cross callee signatures. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
-                     const char **imp_qns, int imp_count);
+                     const char **imp_qns, int imp_count, const CBMPerlInheritIndex *perl_inherit,
+                     CBMLSPDef *all_defs, int all_def_count);
 
 /* TS / JS / JSX / TSX variant with explicit dialect flags. */
 void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, const char *module_qn,
@@ -217,5 +245,16 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx);
+
+/* Perl cross-file duck-typing pre-pass DRIVER: gathers each Perl file's source
+ * (via the pipeline file reader) + module QN + cached tree, then calls
+ * cbm_perl_duck_prepass to infer typeless-accessor return types into all_defs
+ * BEFORE resolution. Shared by the parallel (pipeline.c) and sequential
+ * (pass_lsp_cross.c) drivers. `arena` owns the inferred type strings and must
+ * outlive the resolve loop. No-op unless the project has Perl files. */
+void cbm_pxc_perl_duck_prepass_driver(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult **cache, char **def_modules,
+                                      CBMLSPDef *all_defs, int def_count,
+                                      CBMPerlInheritIndex *perl_inherit, CBMArena *arena);
 
 #endif /* CBM_PIPELINE_PASS_LSP_CROSS_H */

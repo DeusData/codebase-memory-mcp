@@ -39,6 +39,45 @@ typedef struct {
     int use_count;
     int use_cap;
 
+    /* Seeded-imports floor (cross-file mode): perl_lsp_process_file's PASS-1
+     * reset truncates the use map back to this count instead of zero, so
+     * caller-supplied mappings (cbm_run_perl_lsp_cross) survive the reset.
+     * Zero in per-file mode. */
+    int use_floor;
+
+    /* Cross-file package→module map (cbm_run_perl_lsp_cross only): package
+     * spelling as written in source ("My::Util") → resolved dotted module QN
+     * ("test.lib.My.Util"). Consulted when composing qw-import targets and
+     * left empty in per-file mode (naive Module.sym targets then only ever
+     * match stdlib entries — zero-edge safe). */
+    const char **xmod_pkgs;
+    const char **xmod_qns;
+    int xmod_count;
+    int xmod_cap;
+
+    /* Cross-file default-export table: module QN → "|"-joined @EXPORT names
+     * (collected at extraction from `our @EXPORT = qw(...)`, carried on the
+     * EXPORT Variable def's return_type). `use Mod;` with NO import list
+     * imports these names. */
+    const char **xexp_module_qns;
+    const char **xexp_names;
+    int xexp_count;
+    int xexp_cap;
+
+    /* Moose/Moo attribute + mode tables (PASS 1). moose_pkgs lists packages
+     * that `use Moose|Moo|Mouse|Class::Accessor` — the has/extends/with DSL
+     * is honored ONLY inside those packages (per-package gate, not per-file).
+     * attr_* records `has 'name' => (isa => 'Type')` attributes; attr_isa[i]
+     * is the isa class name or NULL when unknown/parameterized. */
+    const char **moose_pkgs;
+    int moose_pkg_count;
+    int moose_pkg_cap;
+    const char **attr_pkgs;
+    const char **attr_names;
+    const char **attr_isa;
+    int attr_count;
+    int attr_cap;
+
     /* @ISA inheritance table: isa_pkg_qns[i] inherits from isa_parent_qns[i].
      * Populated from @ISA assignments and `use parent`/`use base`. */
     const char **isa_pkg_qns;
@@ -111,10 +150,33 @@ void cbm_perl_stdlib_register(CBMTypeRegistry *reg, CBMArena *arena);
  * a later plan (Phase 23, cross-file) can implement it without touching the
  * wiring. Caller supplies the combined CBMLSPDef[] (file-local + cross-file)
  * and a resolved import map (use → target QN). */
+/* Multi-level cross-file @ISA index (defined in pass_lsp_cross.h); NULL disables
+ * grandparent+ resolution and falls back to one-level. Forward-declared to keep
+ * this low-level header free of the pipeline header. */
+struct CBMPerlInheritIndex;
+
 void cbm_run_perl_lsp_cross(CBMArena *arena, const char *source, int source_len,
                             const char *module_qn, CBMLSPDef *defs, int def_count,
                             const char **import_names, const char **import_qns, int import_count,
                             TSTree *cached_tree, /* NULL = parse internally */
-                            CBMResolvedCallArray *out);
+                            CBMResolvedCallArray *out,
+                            const struct CBMPerlInheritIndex *inherit_idx,
+                            /* Full project def universe for ancestor (grandparent+)
+                             * resolution; NULL/0 falls back to `defs`. */
+                            CBMLSPDef *all_defs, int all_def_count);
+
+/* Cross-file duck-typing PRE-PASS (run ONCE over all Perl files BEFORE the
+ * per-file resolve loop). Aggregates project-wide `$self`/`$class` accessor-
+ * chain usage per accessor def and writes an inferred UNIQUE return class into
+ * all_defs[idx].return_types (DOTTED spelling), so a typeless accessor whose
+ * type only shows in cross-file usage (e.g. Mojolicious::Controller::req →
+ * Mojo::Message::Request) drives chain dispatch everywhere. `arena` must
+ * outlive the resolve loop (it owns the inferred type strings). Parallel arrays
+ * are per Perl file; cached_trees entries may be NULL (parsed internally, not
+ * freed by the caller). Sound: ambiguous/polymorphic accessors stay untyped. */
+void cbm_perl_duck_prepass(CBMArena *arena, const char **sources, const int *source_lens,
+                           const char **module_qns, TSTree **cached_trees, int file_count,
+                           CBMLSPDef *all_defs, int all_def_count,
+                           const struct CBMPerlInheritIndex *inherit_idx);
 
 #endif /* CBM_LSP_PERL_LSP_H */

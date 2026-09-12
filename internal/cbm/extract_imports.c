@@ -2,6 +2,7 @@
 #include "arena.h" // CBMArena, cbm_arena_strdup/strndup/sprintf
 #include "helpers.h"
 #include "lang_specs.h"      // CBMLangSpec, CBMEmbeddedLangSpec, cbm_lang_spec, cbm_ts_language
+#include "lsp/rust_lsp.h"    // cbm_rust_expand_use_decl (shared use-decl AST expansion)
 #include "tree_sitter/api.h" // TSNode, ts_node_*
 #include "foundation/constants.h"
 #include "extract_node_stack.h"
@@ -121,6 +122,32 @@ static const char *python_import_root(CBMArena *a, const char *path) {
 // --- Go imports ---
 // import_declaration -> import_spec_list -> import_spec -> (name, path)
 
+/* Go module-major-version suffix: an unaliased `import "math/rand/v2"` (or
+ * "github.com/x/foo/v3") binds the package name of the segment BEFORE the
+ * /vN suffix — the Go modules convention keeps the package name stable across
+ * major versions. Without this the local name would be "v2" and every
+ * `rand.IntN(...)` reference in the file would dangle. */
+static const char *go_import_local_name(CBMArena *a, const char *path) {
+    const char *last_slash = strrchr(path, '/');
+    if (last_slash && last_slash != path && last_slash[1] == 'v' && last_slash[2] >= '0' &&
+        last_slash[2] <= '9') {
+        bool all_digits = true;
+        for (const char *p = last_slash + 2; *p; p++) {
+            if (*p < '0' || *p > '9') {
+                all_digits = false;
+                break;
+            }
+        }
+        if (all_digits) {
+            char *trimmed = cbm_arena_strndup(a, path, (size_t)(last_slash - path));
+            if (trimmed && trimmed[0]) {
+                return path_last(a, trimmed);
+            }
+        }
+    }
+    return path_last(a, path);
+}
+
 // Parse a single Go import_spec node.
 static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
     CBMArena *a = ctx->arena;
@@ -134,8 +161,8 @@ static void parse_go_import_spec(CBMExtractCtx *ctx, TSNode spec) {
     }
 
     TSNode name_node = ts_node_child_by_field_name(spec, TS_FIELD("name"));
-    const char *local_name =
-        !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source) : path_last(a, path);
+    const char *local_name = !ts_node_is_null(name_node) ? cbm_node_text(a, name_node, ctx->source)
+                                                         : go_import_local_name(a, path);
 
     CBMImport imp = {.local_name = local_name, .module_path = path};
     cbm_imports_push(&ctx->result->imports, a, imp);
@@ -303,6 +330,43 @@ static void process_py_import_from(CBMExtractCtx *ctx, TSNode node) {
     }
 }
 
+/* Module-level imports also live inside compound statements: try/except
+ * shims (`try: import cjson as json / except ImportError: import json`),
+ * `if TYPE_CHECKING:` blocks, platform conditionals, even `with` bodies.
+ * Descend a bounded depth into those wrappers — but NEVER into function /
+ * class / decorated bodies, whose imports are function-local and would
+ * pollute module scope (CBMImport carries no scope). Depth 3 covers
+ * try -> except_clause -> block -> import. */
+#define PY_IMPORT_SCAN_MAX_DEPTH 3
+
+static void parse_python_imports_in(CBMExtractCtx *ctx, TSNode node, int depth) {
+    if (ts_node_is_null(node) || depth > PY_IMPORT_SCAN_MAX_DEPTH) {
+        return;
+    }
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "import_statement") == 0) {
+        process_py_import_stmt(ctx, node);
+        return;
+    }
+    if (strcmp(kind, "import_from_statement") == 0 ||
+        strcmp(kind, "future_import_statement") == 0) {
+        // `from __future__ import annotations` is a distinct node type in
+        // tree-sitter-python but has the same shape (module + name list).
+        process_py_import_from(ctx, node);
+        return;
+    }
+    if (strcmp(kind, "try_statement") != 0 && strcmp(kind, "if_statement") != 0 &&
+        strcmp(kind, "elif_clause") != 0 && strcmp(kind, "else_clause") != 0 &&
+        strcmp(kind, "except_clause") != 0 && strcmp(kind, "finally_clause") != 0 &&
+        strcmp(kind, "with_statement") != 0 && strcmp(kind, "block") != 0) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        parse_python_imports_in(ctx, ts_node_named_child(node, i), depth + 1);
+    }
+}
+
 static void parse_python_imports(CBMExtractCtx *ctx) {
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
@@ -310,17 +374,7 @@ static void parse_python_imports(CBMExtractCtx *ctx) {
         return;
     }
     do {
-        TSNode node = ts_tree_cursor_current_node(&cursor);
-        const char *kind = ts_node_type(node);
-
-        if (strcmp(kind, "import_statement") == 0) {
-            process_py_import_stmt(ctx, node);
-        } else if (strcmp(kind, "import_from_statement") == 0 ||
-                   strcmp(kind, "future_import_statement") == 0) {
-            // `from __future__ import annotations` is a distinct node type in
-            // tree-sitter-python but has the same shape (module + name list).
-            process_py_import_from(ctx, node);
-        }
+        parse_python_imports_in(ctx, ts_tree_cursor_current_node(&cursor), 0);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -585,11 +639,32 @@ static void parse_java_imports(CBMExtractCtx *ctx) {
 }
 
 // --- Rust imports ---
-// use_declaration -> use_list or scoped_use_list
+// use_declaration -> argument (identifier | scoped_identifier | use_list |
+// scoped_use_list | use_as_clause | use_wildcard). Expanded through the same
+// AST walker the Rust LSP's use-map builder uses (cbm_rust_expand_use_decl,
+// lsp/rust_lsp.c) so nested groups `use a::{b, c::d}`, renames and `pub use`
+// re-exports each yield one accurate (local_name, module_path) IMPORTS row —
+// the old whole-text hack stored `pub use foo::Bar` verbatim as a module path
+// and one garbage row for a whole brace group.
+
+static void rust_import_use_sink(void *sink_ctx, const char *alias, const char *path,
+                                 bool is_glob) {
+    CBMExtractCtx *ctx = (CBMExtractCtx *)sink_ctx;
+    CBMImport imp = {0};
+    if (is_glob) {
+        /* Preserve the historical glob shape (`a::b::*` with local `*`). */
+        imp.local_name = "*";
+        imp.module_path = cbm_arena_sprintf(ctx->arena, "%s::*", path);
+    } else {
+        imp.local_name = alias;
+        imp.module_path = path;
+    }
+    if (imp.local_name && imp.module_path) {
+        cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+    }
+}
 
 static void parse_rust_imports(CBMExtractCtx *ctx) {
-    CBMArena *a = ctx->arena;
-
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
     if (!ts_tree_cursor_goto_first_child(&cursor)) {
         ts_tree_cursor_delete(&cursor);
@@ -600,22 +675,7 @@ static void parse_rust_imports(CBMExtractCtx *ctx) {
         if (strcmp(ts_node_type(node), "use_declaration") != 0) {
             continue;
         }
-
-        char *full = cbm_node_text(a, node, ctx->source);
-        if (!full) {
-            continue;
-        }
-        // Strip "use " prefix and trailing ";"
-        if (strncmp(full, "use ", USE_PREFIX_LEN) == 0) {
-            full += USE_PREFIX_LEN;
-        }
-        size_t len = strlen(full);
-        if (len > 0 && full[len - SKIP_ONE] == ';') {
-            full[len - SKIP_ONE] = '\0';
-        }
-
-        CBMImport imp = {.local_name = path_last(a, full), .module_path = full};
-        cbm_imports_push(&ctx->result->imports, a, imp);
+        cbm_rust_expand_use_decl(ctx->arena, node, ctx->source, rust_import_use_sink, ctx);
     } while (ts_tree_cursor_goto_next_sibling(&cursor));
     ts_tree_cursor_delete(&cursor);
 }
@@ -949,6 +1009,234 @@ static void generic_import_from_text(CBMExtractCtx *ctx, TSNode node) {
         CBMImport imp = {.local_name = path_last(a, text), .module_path = text};
         cbm_imports_push(&ctx->result->imports, a, imp);
     }
+}
+
+// --- Perl require imports ---
+// `require Foo::Bar;` parses as expression_statement > require_expression with
+// a bareword (or 'Foo/Bar.pm' string) operand — never a use_statement, so the
+// generic top-level use scan cannot see it. The common patterns are
+// CONDITIONAL (`if (...) { require Foo; }`, `eval { require JSON::XS; 1 }`),
+// so walk the WHOLE tree for require_expression (a named node — cheap) and
+// emit rows only for literal barewords and 'Foo/Bar.pm' string operands;
+// variables are skipped. Depth-capped for pathological nesting.
+static void perl_require_import_row(CBMExtractCtx *ctx, const char *module) {
+    if (!module || !module[0]) {
+        return;
+    }
+    CBMImport imp = {.local_name = path_last(ctx->arena, module), .module_path = module};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+static void perl_collect_require_imports(CBMExtractCtx *ctx, TSNode node, int depth) {
+    enum { PERL_REQUIRE_MAX_DEPTH = 200 };
+    if (ts_node_is_null(node) || depth > PERL_REQUIRE_MAX_DEPTH) {
+        return;
+    }
+    if (strcmp(ts_node_type(node), "require_expression") == 0) {
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            TSNode c = ts_node_named_child(node, i);
+            const char *ck = ts_node_type(c);
+            if (strcmp(ck, "bareword") == 0 || strcmp(ck, "package") == 0) {
+                perl_require_import_row(ctx, cbm_node_text(ctx->arena, c, ctx->source));
+            } else if (strcmp(ck, "string_literal") == 0) {
+                /* require 'Legacy/Helper.pm' → Legacy::Helper */
+                char *raw = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, c, ctx->source));
+                size_t n = raw ? strlen(raw) : 0;
+                if (n > 3 && strcmp(raw + n - 3, ".pm") == 0) {
+                    raw[n - 3] = '\0';
+                    size_t segs = 0;
+                    for (const char *p = raw; *p; p++) {
+                        if (*p == '/') {
+                            segs++;
+                        }
+                    }
+                    char *pkg = (char *)cbm_arena_alloc(ctx->arena, n + segs + 1);
+                    if (pkg) {
+                        size_t w = 0;
+                        for (const char *p = raw; *p; p++) {
+                            if (*p == '/') {
+                                pkg[w++] = ':';
+                                pkg[w++] = ':';
+                            } else {
+                                pkg[w++] = *p;
+                            }
+                        }
+                        pkg[w] = '\0';
+                        perl_require_import_row(ctx, pkg);
+                    }
+                }
+            }
+            /* `require v5.36` / scalar operands: no import row. */
+        }
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        perl_collect_require_imports(ctx, ts_node_named_child(node, i), depth + 1);
+    }
+}
+
+static void parse_perl_require_imports(CBMExtractCtx *ctx) {
+    perl_collect_require_imports(ctx, ctx->root, 0);
+}
+
+// --- Perl inheritance imports ---
+// `use parent 'Base'` / `use base 'Base'` / `use Mojo::Base 'Base'` establish an
+// @ISA parent that is ALSO a compile-time require of the parent module
+// (parent.pm / base.pm / Mojo::Base each `require` the named class). Emit an
+// import row per parent so (a) the graph carries a correct IMPORTS edge to the
+// parent and (b) the cross-file LSP def filter keeps the parent module's defs,
+// letting `$self->inherited` dispatch up the ISA chain across files (the class
+// hierarchy of the entire Mojolicious ecosystem lives one class per file).
+// Parent names are the use_statement's string / qw / bareword arguments; -flags
+// (-norequire, -signatures, -role, -strict, ...) are skipped — except
+// `Mojo::Base -base`, which requires Mojo::Base itself. Mirrors
+// perl_require_import_row. Bounded recursion.
+//
+// `isa` is an optional TAGGED-parent collector: every parent spelling routed
+// here (which is ONLY reached from inheritance `use` statements) is appended,
+// so the cross-file LSP can later walk the multi-level @ISA chain. It is kept
+// separate from the import rows because an ordinary `use Foo` must never be
+// treated as a parent (zero-edge guarantee).
+enum { PERL_ISA_PARENTS_CAP = 256 };
+typedef struct {
+    const char *items[PERL_ISA_PARENTS_CAP];
+    int count;
+} PerlIsaParents;
+
+static void perl_isa_parents_add(PerlIsaParents *isa, CBMArena *arena, const char *sp) {
+    if (!isa || !sp || !sp[0] || isa->count >= PERL_ISA_PARENTS_CAP) {
+        return;
+    }
+    /* De-dup within the file (many classes share a base). */
+    for (int i = 0; i < isa->count; i++) {
+        if (strcmp(isa->items[i], sp) == 0) {
+            return;
+        }
+    }
+    isa->items[isa->count++] = cbm_arena_strdup(arena, sp);
+}
+
+static void perl_inherit_emit_parents(CBMExtractCtx *ctx, TSNode node, bool mojo, int depth,
+                                      PerlIsaParents *isa) {
+    if (ts_node_is_null(node) || depth > 6) {
+        return;
+    }
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "string_literal") == 0 || strcmp(k, "interpolated_string_literal") == 0) {
+        char *inner = strip_quotes(ctx->arena, cbm_node_text(ctx->arena, node, ctx->source));
+        if (inner && inner[0] && inner[0] != '-' && strcmp(inner, "-norequire") != 0) {
+            perl_require_import_row(ctx, inner);
+            perl_isa_parents_add(isa, ctx->arena, inner);
+        }
+        return;
+    }
+    if (strcmp(k, "autoquoted_bareword") == 0) {
+        char *bw = cbm_node_text(ctx->arena, node, ctx->source);
+        if (mojo && bw && strcmp(bw, "-base") == 0) {
+            perl_require_import_row(ctx, "Mojo::Base");
+            perl_isa_parents_add(isa, ctx->arena, "Mojo::Base");
+        }
+        return; /* other -flags contribute no parent */
+    }
+    if (strcmp(k, "bareword") == 0 || strcmp(k, "package") == 0) {
+        char *bw = cbm_node_text(ctx->arena, node, ctx->source);
+        if (bw && bw[0] && bw[0] != '-') {
+            perl_require_import_row(ctx, bw);
+            perl_isa_parents_add(isa, ctx->arena, bw);
+        }
+        return;
+    }
+    if (strcmp(k, "quoted_word_list") == 0) {
+        /* qw(A B C): named children carry the space-separated word blob. */
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            char *blob = cbm_node_text(ctx->arena, ts_node_named_child(node, i), ctx->source);
+            if (!blob) {
+                continue;
+            }
+            char *p = blob;
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') {
+                    p++;
+                }
+                char *s = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+                    p++;
+                }
+                if (p > s) {
+                    char save = *p;
+                    *p = '\0';
+                    if (s[0] && s[0] != '-') {
+                        char *w = cbm_arena_strdup(ctx->arena, s);
+                        perl_require_import_row(ctx, w);
+                        perl_isa_parents_add(isa, ctx->arena, w);
+                    }
+                    *p = save;
+                }
+            }
+        }
+        return;
+    }
+    /* list_expression / parenthesized wrapper: descend. */
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        perl_inherit_emit_parents(ctx, ts_node_named_child(node, i), mojo, depth + 1, isa);
+    }
+}
+
+static void perl_collect_inheritance_imports(CBMExtractCtx *ctx, TSNode node, int depth,
+                                             PerlIsaParents *isa) {
+    enum { PERL_INHERIT_MAX_DEPTH = 200 };
+    if (ts_node_is_null(node) || depth > PERL_INHERIT_MAX_DEPTH) {
+        return;
+    }
+    if (strcmp(ts_node_type(node), "use_statement") == 0) {
+        TSNode mod = ts_node_child_by_field_name(node, "module", 6);
+        if (!ts_node_is_null(mod)) {
+            char *mn = cbm_node_text(ctx->arena, mod, ctx->source);
+            bool is_parent = mn && (strcmp(mn, "parent") == 0 || strcmp(mn, "base") == 0);
+            bool is_mojo = mn && strcmp(mn, "Mojo::Base") == 0;
+            if (is_parent || is_mojo) {
+                uint32_t nc = ts_node_named_child_count(node);
+                for (uint32_t i = 0; i < nc; i++) {
+                    TSNode c = ts_node_named_child(node, i);
+                    if (ts_node_eq(c, mod)) {
+                        continue;
+                    }
+                    perl_inherit_emit_parents(ctx, c, is_mojo, 0, isa);
+                }
+            }
+        }
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        perl_collect_inheritance_imports(ctx, ts_node_named_child(node, i), depth + 1, isa);
+    }
+}
+
+/* Entry point: scan tagged inheritance `use` statements, emitting import rows
+ * AND recording the file's @ISA parent spellings on the result (result-owned,
+ * NULL-terminated) for cross-file multi-level chain resolution. */
+static void parse_perl_inheritance_imports(CBMExtractCtx *ctx) {
+    PerlIsaParents isa;
+    isa.count = 0;
+    perl_collect_inheritance_imports(ctx, ctx->root, 0, &isa);
+    if (isa.count <= 0) {
+        return;
+    }
+    const char **arr =
+        (const char **)cbm_arena_alloc(ctx->arena, (size_t)(isa.count + 1) * sizeof(char *));
+    if (!arr) {
+        return;
+    }
+    for (int i = 0; i < isa.count; i++) {
+        arr[i] = isa.items[i];
+    }
+    arr[isa.count] = NULL;
+    ctx->result->perl_isa_parents = arr;
 }
 
 static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
@@ -3012,6 +3300,8 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         break;
     case CBM_LANG_PERL:
         parse_generic_imports(ctx, "use_statement");
+        parse_perl_require_imports(ctx);
+        parse_perl_inheritance_imports(ctx);
         break;
     case CBM_LANG_GROOVY:
         parse_generic_imports(ctx, "groovy_import");

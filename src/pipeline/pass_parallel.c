@@ -489,14 +489,16 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
                      "\"self_recursive\":%s,\"param_count\":%d,\"max_access_depth\":%d,"
                      "\"linear_scan_in_loop\":%d,\"alloc_in_loop\":%d,\"recursion_in_loop\":%s,"
                      "\"unguarded_recursion\":%s,"
-                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s",
+                     "\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,\"is_entry_point\":%s%s",
                      def->complexity, def->cognitive, def->loop_count, def->loop_depth,
                      def->is_recursive ? "true" : "false", def->param_count, def->max_access_depth,
                      def->linear_scan_in_loop, def->alloc_in_loop,
                      def->recursion_in_loop ? "true" : "false",
                      def->unguarded_recursion ? "true" : "false", def->lines,
                      def->is_exported ? "true" : "false", def->is_test ? "true" : "false",
-                     def->is_entry_point ? "true" : "false");
+                     def->is_entry_point ? "true" : "false",
+                     /* Emitted only when set — see pass_definitions.c. */
+                     def->is_test_annotated ? ",\"is_test_annotated\":true" : "");
     } else {
         n = snprintf(buf, bufsize,
                      "{\"complexity\":%d,\"lines\":%d,\"is_exported\":%s,\"is_test\":%s,"
@@ -517,8 +519,10 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "base_classes", def->base_classes);
     append_json_str_array(buf, bufsize, &pos, "param_names", def->param_names);
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
+    append_json_str_array(buf, bufsize, &pos, "subtests", def->subtests);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "route_handler", def->route_handler);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -696,7 +700,11 @@ static void insert_def_into_gbuf(extract_worker_state_t *ws, const cbm_file_info
                              def->qualified_name, def->file_path ? def->file_path : fi->rel_path,
                              (int)def->start_line, (int)def->end_line, props);
     ws->nodes_created++;
-    if (def->route_path && def->route_path[0] != '\0') {
+    /* A def whose label IS "Route" (Django urls.py synthetic rows) already
+     * became the Route node above — minting a second Route + self-HANDLES
+     * from its route_path would be noise. */
+    if (def->route_path && def->route_path[0] != '\0' &&
+        !(def->label && strcmp(def->label, "Route") == 0)) {
         const char *rm = def->route_method ? def->route_method : "ANY";
         char route_qn[CBM_ROUTE_QN_SIZE];
         char cpath[CBM_SZ_256];
@@ -1599,12 +1607,23 @@ static bool is_path_keyword(const char *keyword) {
     return false;
 }
 
-static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler) {
+static const char *find_route_path_in_args(const CBMCall *call, const char **out_handler,
+                                           const char **out_method) {
     *out_handler = NULL;
+    *out_method = NULL;
     /* 1. First string arg starting with / */
-    if (call->first_string_arg && call->first_string_arg[0] == '/') {
-        *out_handler = call->second_arg_name;
-        return call->first_string_arg;
+    if (call->first_string_arg) {
+        if (call->first_string_arg[0] == '/') {
+            *out_handler = call->second_arg_name;
+            return call->first_string_arg;
+        }
+        /* Go 1.22 ServeMux "METHOD /path" literals: the literal-embedded
+         * method outranks the callee-suffix ANY of .Handle/.HandleFunc. */
+        const char *mux_path = cbm_go_split_mux_pattern(call->first_string_arg, out_method);
+        if (mux_path) {
+            *out_handler = call->second_arg_name;
+            return mux_path;
+        }
     }
     /* 2. Keyword args (prefix=, path=, route=, etc.) */
     const char *found = NULL;
@@ -1752,10 +1771,12 @@ static void emit_normal_calls_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *sour
 /* Create Route node + CALLS + HANDLES edges for a route registration call. */
 static void emit_route_registration(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
                                     const CBMCall *call, const char *route_path,
-                                    const char *handler_ref, const char *module_qn,
-                                    const cbm_registry_t *registry, const cbm_gbuf_t *main_gbuf,
-                                    const char **ik, const char **iv, int ic) {
-    const char *method = cbm_service_pattern_route_method(call->callee_name);
+                                    const char *handler_ref, const char *method_lit,
+                                    const char *module_qn, const cbm_registry_t *registry,
+                                    const cbm_gbuf_t *main_gbuf, const char **ik, const char **iv,
+                                    int ic) {
+    const char *method =
+        method_lit ? method_lit : cbm_service_pattern_route_method(call->callee_name);
     char rqn[CBM_ROUTE_QN_SIZE];
     char cpath[CBM_SZ_256];
     snprintf(rqn, sizeof(rqn), "__route__%s__%s", method ? method : "ANY",
@@ -2076,6 +2097,19 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
         svc = CBM_SVC_ROUTE_REG;
     }
 
+    /* Go 1.22 ServeMux "METHOD /path" literals: the resolved QN classifies
+     * net/http surfaces as an HTTP *client* library, but a method-qualified
+     * mux pattern is unambiguously a server-side registration — no HTTP
+     * client passes "GET /x" as its URL. Reclassify before the client branch
+     * would swallow (and then drop) it. */
+    if (svc == CBM_SVC_HTTP && cbm_service_pattern_route_method(call->callee_name) != NULL &&
+        call->first_string_arg) {
+        const char *mux_method_probe = NULL;
+        if (cbm_go_split_mux_pattern(call->first_string_arg, &mux_method_probe)) {
+            svc = CBM_SVC_ROUTE_REG;
+        }
+    }
+
     /* Detect gRPC stub method calls by resolved QN.
      * Go pattern: pb.NewCartServiceClient(conn).GetCart(ctx, req)
      * Tree-sitter extracts GetCart as the callee, which resolves to the
@@ -2090,10 +2124,11 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 
     if (svc == CBM_SVC_ROUTE_REG) {
         const char *handler_ref = NULL;
-        const char *route_path = find_route_path_in_args(call, &handler_ref);
+        const char *route_method = NULL;
+        const char *route_path = find_route_path_in_args(call, &handler_ref, &route_method);
         if (route_path) {
-            emit_route_registration(gbuf, source, call, route_path, handler_ref, module_qn,
-                                    registry, main_gbuf, imp_keys, imp_vals, imp_count);
+            emit_route_registration(gbuf, source, call, route_path, handler_ref, route_method,
+                                    module_qn, registry, main_gbuf, imp_keys, imp_vals, imp_count);
             return;
         }
         /* No path found — fall through to normal CALLS edge */
@@ -2514,8 +2549,9 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                   memory_order_relaxed);
 
         /* Perl call-graph noise guard (#476), mirroring the sequential pass
-         * (pass_calls.c). Perl has no LSP resolver; for builtins (push/shift/
-         * keys/...) and method calls ($obj->m, unresolved receiver), suppress
+         * (pass_calls.c). The Perl LSP resolves typed/exact calls first
+         * (per-file + cross-file); for the residue — builtins (push/shift/
+         * keys/...) and method calls ($obj->m, unresolved receiver) — suppress
          * only WEAK cross-file short-name matches and keep the high-confidence
          * same_module / import_map strategies so a genuine same-file or
          * imported call to a builtin-named sub still resolves. Placed after the
@@ -2523,6 +2559,25 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * Gated to Perl — other languages are unaffected. */
         if (cbm_perl_suppress_generic_match(lang == CBM_LANG_PERL, call->is_method,
                                             call->callee_name, res.strategy)) {
+            /* A weakly-matched `$r->get('/x' => sub)` is still a genuine route
+             * registration — drop the CALLS noise, keep the Route node.
+             * Lockstep twin of the sequential branch in pass_calls.c. */
+            if (lang == CBM_LANG_PERL && call->first_string_arg &&
+                call->first_string_arg[0] == '/') {
+                const char *perl_method =
+                    cbm_service_pattern_perl_route_method(call->callee_name, call->is_method);
+                if (perl_method != NULL) {
+                    const char *handler_ref = NULL;
+                    const char *route_method = NULL;
+                    const char *route_path =
+                        find_route_path_in_args(call, &handler_ref, &route_method);
+                    if (route_path) {
+                        emit_route_registration(ws->local_edge_buf, source_node, call, route_path,
+                                                handler_ref, perl_method, module_qn, rc->registry,
+                                                rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                    }
+                }
+            }
             continue;
         }
 
@@ -2577,6 +2632,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
 
         if (!res.qualified_name || res.qualified_name[0] == '\0') {
+            /* Perl route DSL (bare "get"/"post"/... callees the suffix table
+             * cannot match) — only on this empty-resolution path, so a
+             * resolved local `sub get` wins. Lockstep twin of pass_calls.c. */
+            if (lang == CBM_LANG_PERL && call->first_string_arg &&
+                call->first_string_arg[0] == '/') {
+                const char *perl_method =
+                    cbm_service_pattern_perl_route_method(call->callee_name, call->is_method);
+                if (perl_method != NULL) {
+                    const char *handler_ref = NULL;
+                    const char *route_method = NULL;
+                    const char *route_path =
+                        find_route_path_in_args(call, &handler_ref, &route_method);
+                    if (route_path) {
+                        emit_route_registration(ws->local_edge_buf, source_node, call, route_path,
+                                                handler_ref, perl_method, module_qn, rc->registry,
+                                                rc->main_gbuf, imp_keys, imp_vals, imp_count);
+                        continue;
+                    }
+                }
+            }
             if (cbm_service_pattern_route_method(call->callee_name) != NULL) {
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,

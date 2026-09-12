@@ -207,7 +207,8 @@ static const char *py_import_from_types[] = {"import_from_statement", "future_im
                                              NULL};
 static const char *py_branch_types[] = {
     "if_statement",  "for_statement",  "while_statement", "try_statement",
-    "except_clause", "with_statement", "elif_clause",     NULL};
+    "except_clause", "with_statement", "elif_clause",     "match_statement",
+    "case_clause",   NULL};
 static const char *py_var_types[] = {"assignment", "augmented_assignment", NULL};
 static const char *py_throw_types[] = {"raise_statement", NULL};
 static const char *py_decorator_types[] = {"decorator", NULL};
@@ -332,14 +333,16 @@ static const char *rust_decorator_types[] = {"attribute_item", NULL};
 
 // ==================== JAVA ====================
 static const char *java_func_types[] = {"method_declaration", "constructor_declaration",
-                                        "lambda_expression", NULL};
+                                        "compact_constructor_declaration", "lambda_expression",
+                                        NULL};
 static const char *java_class_types[] = {"class_declaration",   "interface_declaration",
                                          "enum_declaration",    "annotation_type_declaration",
                                          "record_declaration",  "module_declaration",
                                          "package_declaration", NULL};
 static const char *java_field_types[] = {"field_declaration", NULL};
 static const char *java_module_types[] = {"program", NULL};
-static const char *java_call_types[] = {"method_invocation", "object_creation_expression", NULL};
+static const char *java_call_types[] = {"method_invocation", "object_creation_expression",
+                                        "explicit_constructor_invocation", NULL};
 static const char *java_import_types[] = {"import_declaration", "extends", "import", NULL};
 static const char *java_branch_types[] = {
     "if_statement",    "for_statement",     "enhanced_for_statement",
@@ -608,12 +611,16 @@ static const char *dart_throw_types[] = {"throw_expression", NULL};
 static const char *dart_decorator_types[] = {"annotation", NULL};
 
 // ==================== PERL ====================
-static const char *perl_func_types[] = {"subroutine_declaration_statement", NULL};
+static const char *perl_func_types[] = {"subroutine_declaration_statement",
+                                        "method_declaration_statement", NULL};
 static const char *perl_module_types[] = {"source_file", NULL};
 static const char *perl_call_types[] = {"ambiguous_function_call_expression",
                                         "function_call_expression", "func1op_call_expression",
                                         "method_call_expression", NULL};
-static const char *perl_import_types[] = {"use_statement", "require_statement", "require", NULL};
+/* require parses as expression_statement > require_expression (the previously
+ * listed require_statement/require node kinds do not exist in the vendored
+ * grammar — phantom names that never matched). */
+static const char *perl_import_types[] = {"use_statement", "require_expression", NULL};
 static const char *perl_branch_types[] = {"if_statement",      "unless_statement", "for_statement",
                                           "foreach_statement", "while_statement",  NULL};
 static const char *perl_var_types[] = {"variable_declaration", "expression_statement", NULL};
@@ -1657,6 +1664,7 @@ static const char *mojo_import_types[] = {"import_statement", "import_from_state
                                           "future_import_statement", NULL};
 static const char *mojo_branch_types[] = {"if_statement",
                                           "match_statement",
+                                          "case_clause",
                                           "for_statement",
                                           "while_statement",
                                           "try_statement",

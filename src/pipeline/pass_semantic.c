@@ -242,6 +242,134 @@ typedef struct {
     int64_t id;
 } go_imethod_t;
 
+/* Bounds for the Go embedding walks below (interface method-set closure and
+ * struct promoted-method search). Both traverse the INHERITS/IMPLEMENTS edges
+ * that Go embedding's base_classes produced earlier in this same pass (both
+ * venues emit them before implements_go runs). */
+enum { GO_SEM_EMBED_MAX_VISITED = 8 };
+
+/* Append the DEFINES_METHOD sets of `node`'s embedded interfaces (its
+ * outgoing IMPLEMENTS/INHERITS edges to Interface-labeled .go nodes),
+ * transitively, into imethods. Names already present are skipped so an
+ * interface overriding an embedded signature stays single-counted. */
+static void go_union_embedded_iface_methods(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *iface,
+                                            go_imethod_t *imethods, int *im_count, int max) {
+    const cbm_gbuf_node_t *work[GO_SEM_EMBED_MAX_VISITED];
+    const cbm_gbuf_node_t *visited[GO_SEM_EMBED_MAX_VISITED];
+    int sp = 0, vcount = 0;
+    work[sp++] = iface;
+    while (sp > 0) {
+        const cbm_gbuf_node_t *cur = work[--sp];
+        bool seen = false;
+        for (int i = 0; i < vcount; i++) {
+            if (visited[i] == cur) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        if (vcount >= GO_SEM_EMBED_MAX_VISITED) {
+            break;
+        }
+        visited[vcount++] = cur;
+        if (cur != iface) {
+            const cbm_gbuf_edge_t **dm = NULL;
+            int dmc = 0;
+            cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cur->id, "DEFINES_METHOD", &dm, &dmc);
+            for (int j = 0; j < dmc && *im_count < max; j++) {
+                const cbm_gbuf_node_t *m = cbm_gbuf_find_by_id(ctx->gbuf, dm[j]->target_id);
+                if (!m || !m->name) {
+                    continue;
+                }
+                bool dup = false;
+                for (int k = 0; k < *im_count; k++) {
+                    if (strcmp(imethods[k].name, m->name) == 0) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (!dup) {
+                    imethods[(*im_count)++] = (go_imethod_t){m->name, m->id};
+                }
+            }
+        }
+        static const char *const kinds[] = {"IMPLEMENTS", "INHERITS", NULL};
+        for (int k = 0; kinds[k]; k++) {
+            const cbm_gbuf_edge_t **emb = NULL;
+            int ec = 0;
+            cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cur->id, kinds[k], &emb, &ec);
+            for (int j = 0; j < ec && sp < GO_SEM_EMBED_MAX_VISITED; j++) {
+                const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(ctx->gbuf, emb[j]->target_id);
+                if (t && t->label && strcmp(t->label, "Interface") == 0 && t->file_path &&
+                    fp_ends_with(t->file_path, ".go")) {
+                    work[sp++] = t;
+                }
+            }
+        }
+    }
+}
+
+/* Find a method named `name` promoted from one of cls's embedded types: walk
+ * cls's outgoing INHERITS/IMPLEMENTS edges (Go embedding) and match each
+ * embedded type's DEFINES_METHOD set by name. Real Go method sets include
+ * promoted methods, so a struct satisfying an interface partly through an
+ * embedded base (mock embeds, composition-heavy DI) must still count. */
+static const cbm_gbuf_node_t *go_find_promoted_method(cbm_pipeline_ctx_t *ctx,
+                                                      const cbm_gbuf_node_t *cls,
+                                                      const char *name) {
+    const cbm_gbuf_node_t *work[GO_SEM_EMBED_MAX_VISITED];
+    const cbm_gbuf_node_t *visited[GO_SEM_EMBED_MAX_VISITED];
+    int sp = 0, vcount = 0;
+    work[sp++] = cls;
+    while (sp > 0) {
+        const cbm_gbuf_node_t *cur = work[--sp];
+        bool seen = false;
+        for (int i = 0; i < vcount; i++) {
+            if (visited[i] == cur) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) {
+            continue;
+        }
+        if (vcount >= GO_SEM_EMBED_MAX_VISITED) {
+            break;
+        }
+        visited[vcount++] = cur;
+        if (cur != cls) {
+            const cbm_gbuf_edge_t **dm = NULL;
+            int dmc = 0;
+            cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cur->id, "DEFINES_METHOD", &dm, &dmc);
+            for (int j = 0; j < dmc; j++) {
+                const cbm_gbuf_node_t *m = cbm_gbuf_find_by_id(ctx->gbuf, dm[j]->target_id);
+                if (m && m->name && strcmp(m->name, name) == 0) {
+                    return m;
+                }
+            }
+        }
+        static const char *const kinds[] = {"IMPLEMENTS", "INHERITS", NULL};
+        for (int k = 0; kinds[k]; k++) {
+            const cbm_gbuf_edge_t **emb = NULL;
+            int ec = 0;
+            cbm_gbuf_find_edges_by_source_type(ctx->gbuf, cur->id, kinds[k], &emb, &ec);
+            for (int j = 0; j < ec && sp < GO_SEM_EMBED_MAX_VISITED; j++) {
+                const cbm_gbuf_node_t *t = cbm_gbuf_find_by_id(ctx->gbuf, emb[j]->target_id);
+                /* Interface targets declare, not implement — chasing them
+                 * would count a mere embedded DECLARATION as a concrete
+                 * method. Only concrete embedded types contribute. */
+                if (t && t->label && strcmp(t->label, "Interface") != 0 && t->file_path &&
+                    fp_ends_with(t->file_path, ".go")) {
+                    work[sp++] = t;
+                }
+            }
+        }
+    }
+    return NULL;
+}
+
 /* Check if class has all interface methods and create IMPLEMENTS + OVERRIDE edges. */
 static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *cls,
                                      const cbm_gbuf_node_t *iface, const go_imethod_t *imethods,
@@ -285,6 +413,11 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
             char method_qn[CBM_SZ_512];
             snprintf(method_qn, sizeof(method_qn), "%s%s", prefix, imethods[m].name);
             found = cbm_gbuf_find_by_qn(ctx->gbuf, method_qn);
+        }
+        /* (c) promoted from an embedded type — Go method sets include
+         * methods promoted through struct embedding. */
+        if (!found) {
+            found = go_find_promoted_method(ctx, cls, imethods[m].name);
         }
         if (!found) {
             return 0; /* struct does not satisfy the interface */
@@ -332,11 +465,8 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
         /* Get interface methods via DEFINES_METHOD edges */
         const cbm_gbuf_edge_t **dm_edges = NULL;
         int dm_count = 0;
-        if (cbm_gbuf_find_edges_by_source_type(ctx->gbuf, iface->id, "DEFINES_METHOD", &dm_edges,
-                                               &dm_count) != 0 ||
-            dm_count == 0) {
-            continue;
-        }
+        cbm_gbuf_find_edges_by_source_type(ctx->gbuf, iface->id, "DEFINES_METHOD", &dm_edges,
+                                           &dm_count);
 
         /* Collect interface method info */
         go_imethod_t imethods[CBM_SZ_128];
@@ -347,6 +477,11 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
                 imethods[im_count++] = (go_imethod_t){m->name, m->id};
             }
         }
+        /* Union in embedded interfaces' methods (interface embedding:
+         * `type RC interface { Reader; Close() error }` requires the full
+         * set). An interface made ONLY of embeds has no own DEFINES_METHOD
+         * edges but a real method set — hence no early-out above. */
+        go_union_embedded_iface_methods(ctx, iface, imethods, &im_count, CBM_SZ_128);
         if (im_count == 0) {
             continue;
         }

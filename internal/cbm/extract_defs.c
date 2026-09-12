@@ -46,6 +46,13 @@ enum {
     FP_SPACE_SEP = 1,    /* one byte for space separator between tokens */
 };
 
+/* Python route surfaces (Django urls.py + router-prefix concat) — defined
+ * near cbm_extract_definitions at the bottom of this file. */
+static void py_prescan_router_prefixes(CBMExtractCtx *ctx);
+static void py_extract_django_urlpatterns(CBMExtractCtx *ctx);
+static void py_apply_router_prefix(CBMExtractCtx *ctx, TSNode func_node, const CBMLangSpec *spec,
+                                   const char **route_path);
+
 /* Hash a span of source text. */
 static uint32_t hash_source_span(const char *source, uint32_t start, int len) {
     uint32_t h = 0;
@@ -1350,6 +1357,12 @@ static const char *decorator_method_name(const char *attr_text) {
     if (strcmp(method, "patch") == 0 || strcmp(method, "Patch") == 0) {
         return "PATCH";
     }
+    if (strcmp(method, "head") == 0 || strcmp(method, "Head") == 0) {
+        return "HEAD";
+    }
+    if (strcmp(method, "options") == 0 || strcmp(method, "Options") == 0) {
+        return "OPTIONS";
+    }
     if (strcmp(method, "route") == 0 || strcmp(method, "api_route") == 0) {
         return "ANY";
     }
@@ -1775,6 +1788,97 @@ static bool extract_route_from_annotations(CBMArena *a, TSNode func_node, const 
     return true;
 }
 
+/* Rust attribute-macro routes: actix-web `#[get("/p")]` / `#[route("/p",
+ * method = "GET")]` and rocket `#[get("/item/<id>")]`. The attribute_item's
+ * `attribute` child carries the macro path (identifier or scoped_identifier)
+ * and an `arguments` token_tree whose first '/'-leading string_literal is the
+ * route path. The mandatory '/'-gate keeps arbitrary user attribute macros
+ * that happen to be named `get` from minting routes. */
+static const char *rust_attr_token_tree_method_kwarg(CBMArena *a, TSNode token_tree,
+                                                     const char *source) {
+    /* Scan for `method = "GET"`: an identifier named `method` followed by a
+     * string_literal among the token_tree's named children. */
+    uint32_t nc = ts_node_named_child_count(token_tree);
+    bool method_key_seen = false;
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(token_tree, i);
+        const char *ck = ts_node_type(c);
+        if (strcmp(ck, "identifier") == 0) {
+            char *t = cbm_node_text(a, c, source);
+            method_key_seen = (t && strcmp(t, "method") == 0);
+            continue;
+        }
+        if (method_key_seen && strcmp(ck, "string_literal") == 0) {
+            char *v = cbm_node_text(a, c, source);
+            if (!v) {
+                return NULL;
+            }
+            size_t vlen = strlen(v);
+            if (vlen >= CBM_QUOTE_PAIR && (v[0] == '"' || v[0] == '\'')) {
+                v = cbm_arena_strndup(a, v + SKIP_CHAR, vlen - PAIR_CHARS);
+            }
+            for (char *p = v; *p; p++) {
+                if (*p >= 'a' && *p <= 'z') {
+                    *p = (char)(*p - 'a' + 'A');
+                }
+            }
+            return v[0] ? v : NULL;
+        }
+        method_key_seen = false;
+    }
+    return NULL;
+}
+
+static bool try_route_from_rust_attribute(CBMArena *a, TSNode attr_item, const char *source,
+                                          const char **out_path, const char **out_method) {
+    TSNode attr = cbm_find_child_by_kind(attr_item, "attribute");
+    if (ts_node_is_null(attr)) {
+        return false;
+    }
+    TSNode path_node = ts_node_named_child(attr, 0);
+    if (ts_node_is_null(path_node)) {
+        return false;
+    }
+    const char *pk = ts_node_type(path_node);
+    if (strcmp(pk, "identifier") != 0 && strcmp(pk, "scoped_identifier") != 0) {
+        return false;
+    }
+    char *macro_path = cbm_node_text(a, path_node, source);
+    if (!macro_path || !macro_path[0]) {
+        return false;
+    }
+    /* Take the last `::` segment (`actix_web::get` → `get`); the
+     * dot-splitting in decorator_method_name then sees the bare verb. */
+    const char *verb = macro_path;
+    for (const char *p = macro_path; p[0]; p++) {
+        if (p[0] == ':' && p[1] == ':' && p[2]) {
+            verb = p + PAIR_CHARS;
+        }
+    }
+    const char *method = decorator_method_name(verb);
+    if (!method) {
+        return false;
+    }
+    TSNode args = ts_node_child_by_field_name(attr, TS_FIELD("arguments"));
+    if (ts_node_is_null(args)) {
+        return false; /* bare `#[get]` — not a route */
+    }
+    const char *path = find_route_path_literal(a, args, source, CBM_DESCENDANT_MAX_DEPTH);
+    if (!path) {
+        return false; /* mandatory '/'-leading string-literal gate */
+    }
+    /* actix `#[route("/p", method = "GET")]` carries the verb as a kwarg. */
+    if (strcmp(method, "ANY") == 0) {
+        const char *kw = rust_attr_token_tree_method_kwarg(a, args, source);
+        if (kw) {
+            method = kw;
+        }
+    }
+    *out_path = path;
+    *out_method = method;
+    return true;
+}
+
 static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const char *source,
                                           const CBMLangSpec *spec, const char **out_path,
                                           const char **out_method) {
@@ -1782,6 +1886,19 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
     *out_method = NULL;
 
     if (!spec->decorator_node_types || !spec->decorator_node_types[0]) {
+        return;
+    }
+
+    /* Rust routes ride on prev-sibling attribute_item macros, whose AST shape
+     * (attribute → macro path + token_tree) matches no other language here. */
+    if (spec->language == CBM_LANG_RUST) {
+        TSNode rprev = ts_node_prev_sibling(func_node);
+        while (!ts_node_is_null(rprev) && cbm_kind_in_set(rprev, spec->decorator_node_types)) {
+            if (try_route_from_rust_attribute(a, rprev, source, out_path, out_method)) {
+                return;
+            }
+            rprev = ts_node_prev_sibling(rprev);
+        }
         return;
     }
 
@@ -2049,13 +2166,23 @@ static bool rust_def_is_test(const char *const *decorators) {
         /* Path-qualified async/param test macros (substring match, robust to the
          * optional argument list and the surrounding #[ ]). */
         if (strstr(d, "tokio::test") || strstr(d, "async_std::test") ||
-            strstr(d, "actix_rt::test") || strstr(d, "test_case::case")) {
+            strstr(d, "actix_rt::test") || strstr(d, "test_case::case") ||
+            strstr(d, "test_log::test") || strstr(d, "sqlx::test")) {
             return true;
         }
         /* Bare #[test] / #[test(...)]: match the bracketed path exactly so we do
          * NOT match the unrelated #[test_case::case] (handled above) or a
          * hypothetical #[test_crate]. */
         if (strstr(d, "#[test]") || strstr(d, "#[test(")) {
+            return true;
+        }
+        /* Parameterised / property test frameworks whose attribute IS the test
+         * marker: rstest, test-strategy's #[proptest], quickcheck, and bare
+         * #[test_case(...)] (the path-qualified form matches above). Bracketed
+         * forms only, so e.g. #[rstest_reuse] stays unmatched. */
+        if (strstr(d, "#[rstest]") || strstr(d, "#[rstest(") || strstr(d, "#[proptest]") ||
+            strstr(d, "#[proptest(") || strstr(d, "#[quickcheck]") || strstr(d, "#[quickcheck(") ||
+            strstr(d, "#[test_case(")) {
             return true;
         }
     }
@@ -2540,8 +2667,104 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
     return result;
 }
 
+/* Go: embedded types are the Go analog of a base-class list — `type S struct
+ * { Inner; *Outer; io.Reader }` embeds are the UNNAMED field_declarations;
+ * `type I interface { io.Reader; A; M() }` embeds are the single-child
+ * type_elem entries (union elements like `~int | string` have several
+ * children and are skipped). Emitting their SOURCE SPELLING into
+ * base_classes (a) lets the cross-file Go registrars qualify and register
+ * embedded_types for files whose ASTs they never see (the shared Tier-2
+ * registry skips the per-file Phase 1b scan, so promoted-method dispatch on
+ * cross-file structs was dead there), and (b) turns on INHERITS/IMPLEMENTS
+ * edges plus pass_semantic's method-set unions for Go embedding. */
+static const char **extract_go_embedded_bases(CBMArena *a, TSNode type_spec, const char *source) {
+    TSNode inner = ts_node_child_by_field_name(type_spec, TS_FIELD("type"));
+    if (ts_node_is_null(inner)) {
+        return NULL;
+    }
+    const char *ik = ts_node_type(inner);
+    const char *bases[MAX_BASES];
+    int base_count = 0;
+
+    if (strcmp(ik, "struct_type") == 0) {
+        TSNode list = cbm_find_child_by_kind(inner, "field_declaration_list");
+        if (ts_node_is_null(list)) {
+            return NULL;
+        }
+        uint32_t nc = ts_node_child_count(list);
+        for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
+            TSNode field = ts_node_child(list, i);
+            if (ts_node_is_null(field) || !ts_node_is_named(field) ||
+                strcmp(ts_node_type(field), "field_declaration") != 0) {
+                continue;
+            }
+            TSNode fname = ts_node_child_by_field_name(field, TS_FIELD("name"));
+            TSNode ftype = ts_node_child_by_field_name(field, TS_FIELD("type"));
+            if (!ts_node_is_null(fname) || ts_node_is_null(ftype)) {
+                continue; /* named field — not an embed */
+            }
+            char *text = cbm_node_text(a, ftype, source);
+            if (!text || !text[0]) {
+                continue;
+            }
+            /* Keep the source spelling minus pointerness and generic args:
+             * "*Outer" → "Outer", "Base[T]" → "Base", "io.Reader" as-is. */
+            while (*text == '*') {
+                text++;
+            }
+            char *br = strchr(text, '[');
+            if (br) {
+                *br = '\0';
+            }
+            if (text[0]) {
+                bases[base_count++] = text;
+            }
+        }
+    } else if (strcmp(ik, "interface_type") == 0) {
+        uint32_t nc = ts_node_named_child_count(inner);
+        for (uint32_t i = 0; i < nc && base_count < MAX_BASES_MINUS_1; i++) {
+            TSNode elem = ts_node_named_child(inner, i);
+            if (ts_node_is_null(elem) || strcmp(ts_node_type(elem), "type_elem") != 0 ||
+                ts_node_named_child_count(elem) != 1) {
+                continue;
+            }
+            TSNode et = ts_node_named_child(elem, 0);
+            const char *ek = ts_node_type(et);
+            if (strcmp(ek, "type_identifier") != 0 && strcmp(ek, "qualified_type") != 0) {
+                continue;
+            }
+            char *text = cbm_node_text(a, et, source);
+            if (text && text[0]) {
+                bases[base_count++] = text;
+            }
+        }
+    } else {
+        return NULL;
+    }
+
+    if (base_count == 0) {
+        return NULL;
+    }
+    const char **result = (const char **)cbm_arena_alloc(a, (base_count + 1) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < base_count; i++) {
+        result[i] = bases[i];
+    }
+    result[base_count] = NULL;
+    return result;
+}
+
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
+    // Go: type_spec embeds (struct + interface) — see extract_go_embedded_bases.
+    if (lang == CBM_LANG_GO) {
+        if (strcmp(ts_node_type(node), "type_spec") == 0) {
+            return extract_go_embedded_bases(a, node, source);
+        }
+        return NULL;
+    }
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
     // the class_extends node.
     if (lang == CBM_LANG_OBJECTSCRIPT_UDL) {
@@ -3521,6 +3744,78 @@ static void set_def_complexity(CBMDefinition *def, TSNode body, const CBMLangSpe
  * Walks to the parameter_declaration's `type` field, unwrapping pointer_type
  * and generic_type, and returns the type_identifier text (e.g. "OrderService").
  * Returns NULL if no type_identifier is found. */
+/* Go subtests: collect `X.Run("name", func(...){...})` names inside a Test*
+ * function body (any receiver named .Run — in practice t / tt). Names land on
+ * CBMDefinition.subtests and are emitted as a "subtests" JSON array in node
+ * properties, so `go test -run TestFoo/case_name` failures map to graph
+ * nodes. Nested t.Run calls are collected flat. Requires a string first arg
+ * AND a func_literal second arg (the PLAN-adjudicated shape) so unrelated
+ * `runner.Run("cmd", args)` calls never masquerade as subtests. */
+enum { GO_SUBTEST_MAX = 32, GO_SUBTEST_WALK_DEPTH = 40 };
+
+static void go_collect_subtests_walk(CBMArena *a, TSNode node, const char *source,
+                                     const char **out, int *count, int depth) {
+    if (ts_node_is_null(node) || depth > GO_SUBTEST_WALK_DEPTH || *count >= GO_SUBTEST_MAX) {
+        return;
+    }
+    if (strcmp(ts_node_type(node), "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "selector_expression") == 0) {
+            TSNode field = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+            char *fname = ts_node_is_null(field) ? NULL : cbm_node_text(a, field, source);
+            if (fname && strcmp(fname, "Run") == 0) {
+                TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+                if (!ts_node_is_null(args) && ts_node_named_child_count(args) >= 2) {
+                    TSNode a0 = ts_node_named_child(args, 0);
+                    TSNode a1 = ts_node_named_child(args, 1);
+                    const char *k0 = ts_node_type(a0);
+                    if ((strcmp(k0, "interpreted_string_literal") == 0 ||
+                         strcmp(k0, "raw_string_literal") == 0) &&
+                        strcmp(ts_node_type(a1), "func_literal") == 0) {
+                        char *text = cbm_node_text(a, a0, source);
+                        if (text && text[0]) {
+                            size_t len = strlen(text);
+                            if (len >= 2 && (text[0] == '"' || text[0] == '`')) {
+                                text[len - 1] = '\0';
+                                text++;
+                            }
+                            if (text[0] && *count < GO_SUBTEST_MAX) {
+                                out[(*count)++] = text;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && *count < GO_SUBTEST_MAX; i++) {
+        go_collect_subtests_walk(a, ts_node_named_child(node, i), source, out, count, depth + 1);
+    }
+}
+
+static const char **go_collect_subtests(CBMArena *a, TSNode func_node, const char *source) {
+    TSNode body = ts_node_child_by_field_name(func_node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return NULL;
+    }
+    const char *names[GO_SUBTEST_MAX];
+    int count = 0;
+    go_collect_subtests_walk(a, body, source, names, &count, 0);
+    if (count == 0) {
+        return NULL;
+    }
+    const char **result = (const char **)cbm_arena_alloc(a, (count + 1) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        result[i] = names[i];
+    }
+    result[count] = NULL;
+    return result;
+}
+
 static char *go_receiver_type_name(CBMArena *a, TSNode recv, const char *source) {
     uint32_t nc = ts_node_child_count(recv);
     for (uint32_t i = 0; i < nc; i++) {
@@ -3600,6 +3895,100 @@ static char *resolve_cpp_test_macro_name(CBMArena *a, const char *macro, TSNode 
         return cbm_arena_sprintf(a, "%s_%s", macro, args[0]);
     }
     return NULL;
+}
+
+/* Perl subs carry no syntactic return type, so `my $x = $obj->accessor`
+ * chains lose their receiver class and stop resolving. Infer a return type
+ * when the sub's return VALUE is a `Class->new(...)` constructor — the dominant
+ * factory / accessor-default idiom (`sub build_tx { ...; return
+ * Mojo::Transaction->new }`, `sub ua { Mojo::UserAgent->new }`). Only the `new`
+ * constructor is inferred: it reliably returns the invoked class; a general
+ * method could return anything, so it stays unknown (zero-edge, unchanged).
+ * The returned value is the LAST statement (trailing implicit return) or the
+ * value of an explicit `return EXPR`. The class spelling is dotted (Foo::Bar ->
+ * Foo.Bar) to match the resolver's package-QN convention. NULL when not
+ * inferable. */
+static const char **perl_infer_return_types(CBMArena *a, TSNode func_node, const char *source) {
+    TSNode block = cbm_find_child_by_kind(func_node, "block");
+    if (ts_node_is_null(block)) {
+        return NULL;
+    }
+    TSNode ret_expr;
+    memset(&ret_expr, 0, sizeof(ret_expr));
+    uint32_t nc = ts_node_named_child_count(block);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode st = ts_node_named_child(block, i);
+        if (strcmp(ts_node_type(st), "expression_statement") != 0) {
+            continue;
+        }
+        TSNode inner = ts_node_named_child(st, 0);
+        if (ts_node_is_null(inner)) {
+            continue;
+        }
+        if (strcmp(ts_node_type(inner), "return_expression") == 0) {
+            uint32_t rc = ts_node_named_child_count(inner);
+            if (rc > 0) {
+                ret_expr = ts_node_named_child(inner, rc - 1);
+            }
+        } else {
+            /* Trailing expression = implicit return; last one wins. */
+            ret_expr = inner;
+        }
+    }
+    if (ts_node_is_null(ret_expr) ||
+        strcmp(ts_node_type(ret_expr), "method_call_expression") != 0) {
+        return NULL;
+    }
+    TSNode method = ts_node_child_by_field_name(ret_expr, "method", 6);
+    TSNode inv = ts_node_child_by_field_name(ret_expr, "invocant", 8);
+    /* Invocant is normally a `bareword` (Foo::Bar->new). tree-sitter-perl parses
+     * the `__PACKAGE__` compile-time macro as a `func0op_call_expression` (a
+     * zero-arg builtin op), not a bareword — the `sub curfile { __PACKAGE__->new }`
+     * factory idiom (Mojo::File) would otherwise infer no return type. Accept it:
+     * its text is the literal "__PACKAGE__", which the resolver maps to the
+     * function's own package. */
+    if (ts_node_is_null(method) || ts_node_is_null(inv)) {
+        return NULL;
+    }
+    const char *invk = ts_node_type(inv);
+    bool inv_is_package_macro = strcmp(invk, "func0op_call_expression") == 0;
+    if (strcmp(invk, "bareword") != 0 && !inv_is_package_macro) {
+        return NULL;
+    }
+    char *mname = cbm_node_text(a, method, source);
+    if (!mname || strcmp(mname, "new") != 0) {
+        return NULL;
+    }
+    char *cls = cbm_node_text(a, inv, source);
+    if (inv_is_package_macro && (!cls || strcmp(cls, "__PACKAGE__") != 0)) {
+        return NULL; /* only __PACKAGE__ among the zero-arg builtin ops */
+    }
+    if (!cls || !cls[0] ||
+        !((cls[0] >= 'A' && cls[0] <= 'Z') || (cls[0] >= 'a' && cls[0] <= 'z') || cls[0] == '_')) {
+        return NULL;
+    }
+    size_t n = strlen(cls);
+    char *dotted = (char *)cbm_arena_alloc(a, n + 1);
+    if (!dotted) {
+        return NULL;
+    }
+    size_t w = 0;
+    for (size_t r = 0; r < n; r++) {
+        if (cls[r] == ':' && r + 1 < n && cls[r + 1] == ':') {
+            dotted[w++] = '.';
+            r++;
+        } else {
+            dotted[w++] = cls[r];
+        }
+    }
+    dotted[w] = '\0';
+    const char **rt = (const char **)cbm_arena_alloc(a, 2 * sizeof(char *));
+    if (!rt) {
+        return NULL;
+    }
+    rt[0] = dotted;
+    rt[1] = NULL;
+    return rt;
 }
 
 static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
@@ -3724,6 +4113,18 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
         resolve_cpp_trailing_return(a, func_node, ctx->source, &def);
     }
 
+    // Perl: no syntactic return type — infer one from a `Class->new` return so
+    // accessor/factory chains ($obj->build_tx->res->headers) keep a typed
+    // receiver (see perl_infer_return_types). Set BOTH the array and the
+    // singular `return_type` — the cross-file surface (pass_lsp_cross.c) carries
+    // the singular field into CBMLSPDef.return_types, which the resolver reads.
+    if (ctx->language == CBM_LANG_PERL && !def.return_types) {
+        def.return_types = perl_infer_return_types(a, func_node, ctx->source);
+        if (def.return_types && def.return_types[0] && !def.return_type) {
+            def.return_type = def.return_types[0];
+        }
+    }
+
     // Receiver (Go methods)
     TSNode recv = ts_node_child_by_field_name(node, TS_FIELD("receiver"));
     if (!ts_node_is_null(recv)) {
@@ -3783,6 +4184,12 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // Decorators + route extraction from decorator AST
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, node, ctx->source, spec, &def.route_path, &def.route_method);
+    // Python: exact APIRouter(prefix=)/Blueprint(url_prefix=) composition —
+    // the decorator recorded the local path; the module-level pre-scan knows
+    // the router object's mount prefix.
+    if (ctx->language == CBM_LANG_PYTHON && def.route_path) {
+        py_apply_router_prefix(ctx, node, spec, &def.route_path);
+    }
 
     // Rust: disambiguate cfg-gated twin functions by folding the #[cfg(...)]
     // predicate into the QN so both branches survive the graph upsert (#495).
@@ -3826,6 +4233,16 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     // main is always an entry point
     if (strcmp(name, "main") == 0) {
         def.is_entry_point = true;
+    }
+
+    // Go: collect t.Run subtest names onto the enclosing Test* function def
+    // (Fuzz*/Benchmark* take no subtests worth mapping; the Test-prefix shape
+    // rule matches cbm_is_test_func_name in pass_tests.c).
+    if (ctx->language == CBM_LANG_GO &&
+        strcmp(ts_node_type(node), "function_declaration") == 0 &&
+        strncmp(name, "Test", 4) == 0 &&
+        (name[4] == '\0' || (name[4] >= 'A' && name[4] <= 'Z'))) {
+        def.subtests = go_collect_subtests(a, node, ctx->source);
     }
 
     cbm_defs_push(&ctx->result->defs, a, def);
@@ -4635,6 +5052,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
+    /* A type declared in a test file is itself test code, mirroring free
+     * functions, class methods, and modules (#1294 lockstep). Go's
+     * sole-implementer interface scan reads from_test_file off the TYPE def;
+     * without this bit a _test.go fake implementer ambiguates the sole
+     * production implementer. */
+    def.is_test = ctx->result->is_test_file;
 
     cbm_defs_push(&ctx->result->defs, a, def);
 
@@ -4696,6 +5119,87 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
                 pdef.end_line = ts_node_end_point(p).row + TS_LINE_OFFSET;
                 pdef.is_exported = false;
                 cbm_defs_push(&ctx->result->defs, a, pdef);
+            }
+        }
+    }
+
+    // Java records (JLS §8.10.3): each component on the record line
+    // (`record Point(int x, int y)`) is an implicit private final field PLUS a
+    // public zero-arg accessor method. extract_class_fields only walks body
+    // field_declarations and never sees components, so without this a record
+    // is field- and accessor-blind cross-file. Emit (a) one "Field" def per
+    // component — name, parent_class, full generic type text — mirroring the
+    // C# primary-constructor block above, and (b) one synthetic zero-arg
+    // accessor "Method" def per component (return_type = component type),
+    // skipped when the body declares a same-name method explicitly, so
+    // `point.x()` has a real graph Method node and Kotlin→Java record interop
+    // flows through the ordinary Method registrar. The label stays "Class"
+    // (对拍A/B binding corrections: no new label plumbing).
+    if (ctx->language == CBM_LANG_JAVA && strcmp(kind, "record_declaration") == 0) {
+        TSNode rec_params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+        // extract_class_methods above already pushed the body's explicit
+        // Method defs; scan only that def range for accessor overrides.
+        if (!ts_node_is_null(rec_params)) {
+            uint32_t pcount = ts_node_named_child_count(rec_params);
+            for (uint32_t k = 0; k < pcount; k++) {
+                TSNode p = ts_node_named_child(rec_params, k);
+                const char *pkind = ts_node_type(p);
+                if (strcmp(pkind, "formal_parameter") != 0 &&
+                    strcmp(pkind, "spread_parameter") != 0) {
+                    continue;
+                }
+                TSNode pname_node = ts_node_child_by_field_name(p, TS_FIELD("name"));
+                TSNode ptype_node = ts_node_child_by_field_name(p, TS_FIELD("type"));
+                if (ts_node_is_null(pname_node) || ts_node_is_null(ptype_node)) {
+                    continue;
+                }
+                char *pname = cbm_node_text(a, pname_node, ctx->source);
+                char *ptype = cbm_node_text(a, ptype_node, ctx->source);
+                if (!pname || !pname[0] || !ptype || !ptype[0]) {
+                    continue;
+                }
+                CBMDefinition fdef;
+                memset(&fdef, 0, sizeof(fdef));
+                fdef.name = pname;
+                fdef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, pname);
+                fdef.label = "Field";
+                fdef.file_path = ctx->rel_path;
+                fdef.parent_class = class_qn;
+                fdef.return_type = ptype;
+                fdef.start_line = ts_node_start_point(p).row + TS_LINE_OFFSET;
+                fdef.end_line = ts_node_end_point(p).row + TS_LINE_OFFSET;
+                fdef.is_exported = false;
+                cbm_defs_push(&ctx->result->defs, a, fdef);
+
+                // (b) synthetic accessor — the body's explicit same-name
+                // method wins (records may override accessors).
+                bool explicit_method = false;
+                for (int di = 0; di < ctx->result->defs.count && !explicit_method; di++) {
+                    const CBMDefinition *md = &ctx->result->defs.items[di];
+                    if (md->label && strcmp(md->label, "Method") == 0 && md->parent_class &&
+                        strcmp(md->parent_class, class_qn) == 0 && md->name &&
+                        strcmp(md->name, pname) == 0) {
+                        explicit_method = true;
+                    }
+                }
+                if (explicit_method) {
+                    continue;
+                }
+                CBMDefinition mdef;
+                memset(&mdef, 0, sizeof(mdef));
+                mdef.name = pname;
+                mdef.qualified_name = fdef.qualified_name;
+                mdef.label = "Method";
+                mdef.file_path = ctx->rel_path;
+                mdef.parent_class = class_qn;
+                mdef.return_type = ptype;
+                mdef.signature = "()";
+                mdef.start_line = fdef.start_line;
+                mdef.end_line = fdef.end_line;
+                mdef.lines = 1;
+                mdef.is_exported = true;
+                mdef.is_test = ctx->result->is_test_file;
+                cbm_defs_push(&ctx->result->defs, a, mdef);
             }
         }
     }
@@ -4923,6 +5427,103 @@ static TSNode resolve_method_name(TSNode child, CBMLanguage lang) {
 }
 
 // Push a single method definition
+// JVM test-annotation detection (JUnit4/5, TestNG). The annotation's SIMPLE
+// name (leading '@' and qualifiers dropped, arguments stripped) must match
+// EXACTLY — Spring's @SpringBootTest/@WebMvcTest/@DataJpaTest end in "Test"
+// and must never mark methods (对拍B binding correction).
+static bool jvm_annotation_simple_name_in(const char *deco, const char *const *names) {
+    if (!deco) {
+        return false;
+    }
+    const char *p = deco;
+    while (*p == '@' || *p == ' ' || *p == '\t') {
+        p++;
+    }
+    size_t len = strcspn(p, "(");
+    const char *seg = p;
+    for (const char *q = p; q < p + len; q++) {
+        if (*q == '.') {
+            seg = q + 1;
+        }
+    }
+    size_t seg_len = (size_t)((p + len) - seg);
+    while (seg_len > 0 && (seg[seg_len - 1] == ' ' || seg[seg_len - 1] == '\t' ||
+                           seg[seg_len - 1] == '\n' || seg[seg_len - 1] == '\r')) {
+        seg_len--;
+    }
+    if (seg_len == 0) {
+        return false;
+    }
+    for (int i = 0; names[i]; i++) {
+        if (strlen(names[i]) == seg_len && strncmp(seg, names[i], seg_len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool jvm_decorators_mark_test(const char *const *decorators) {
+    static const char *const test_annotations[] = {"Test",        "ParameterizedTest",
+                                                   "RepeatedTest", "TestFactory",
+                                                   "TestTemplate", NULL};
+    if (!decorators) {
+        return false;
+    }
+    for (int i = 0; decorators[i]; i++) {
+        if (jvm_annotation_simple_name_in(decorators[i], test_annotations)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// TestNG class-level @Test marks every public method of the class. Gate it on
+// an org.testng import being present (对拍B): a bare project-defined @Test on
+// a class must not propagate. Definitions are extracted before imports, so
+// scan the root's import_declaration nodes directly.
+static bool jvm_class_testng_test(CBMExtractCtx *ctx, TSNode class_node) {
+    /* find_jvm_modifiers fills an array of modifier-wrapper nodes and returns
+     * the count (upstream #1692 signature change). A Java class has one
+     * "modifiers" wrapper, but iterate all returned wrappers to stay correct. */
+    TSNode wrappers[MAX_ATTR_WRAPPERS];
+    int wn = find_jvm_modifiers(class_node, ctx->language, wrappers, MAX_ATTR_WRAPPERS);
+    if (wn <= 0) {
+        return false;
+    }
+    static const char *const just_test[] = {"Test", NULL};
+    bool has_test = false;
+    for (int w = 0; w < wn && !has_test; w++) {
+        TSNode mods = wrappers[w];
+        uint32_t n = ts_node_child_count(mods);
+        for (uint32_t i = 0; i < n && !has_test; i++) {
+            TSNode c = ts_node_child(mods, i);
+            const char *k = ts_node_type(c);
+            if (strcmp(k, "marker_annotation") != 0 && strcmp(k, "annotation") != 0) {
+                continue;
+            }
+            char *txt = cbm_node_text(ctx->arena, c, ctx->source);
+            if (jvm_annotation_simple_name_in(txt, just_test)) {
+                has_test = true;
+            }
+        }
+    }
+    if (!has_test) {
+        return false;
+    }
+    uint32_t rn = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < rn; i++) {
+        TSNode c = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(c), "import_declaration") != 0) {
+            continue;
+        }
+        char *txt = cbm_node_text(ctx->arena, c, ctx->source);
+        if (txt && strstr(txt, "org.testng")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
                             const char *class_qn, const CBMLangSpec *spec, TSNode name_node) {
     CBMArena *a = ctx->arena;
@@ -4997,6 +5598,17 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
+    }
+    // JUnit4/5 + TestNG annotation-driven test detection: path/suffix
+    // conventions miss `@Test void returnsUser()` in unconventionally named
+    // files, and pass_tests.c's name gate then refuses the TESTS edge. The
+    // is_test_annotated bit lets that gate accept the method by evidence.
+    if (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN) {
+        if (jvm_decorators_mark_test(def.decorators) ||
+            (!ts_node_is_null(class_node) && jvm_class_testng_test(ctx, class_node))) {
+            def.is_test = true;
+            def.is_test_annotated = true;
+        }
     }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
@@ -5231,6 +5843,26 @@ static void extract_rust_impl(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
             def.param_types = extract_param_types(a, params, ctx->source, ctx->language);
             def.signature_param_types = extract_signature_param_types(
                 a, params, ctx->source, ctx->language, true, &def.signature_param_count);
+        }
+
+        /* Return type. The free-function path records this via the generic
+         * rt_fields loop; impl methods never did, so the def-driven cross-file
+         * registries typed every project method chain as unknown (the per-file
+         * Phase B2 AST harvest masked it locally). Strip the generic argument
+         * list only when the head names the impl's own (already-stripped) type
+         * — `-> Stack<T>` in `impl<T> Stack<T>` becomes `Stack`, matching the
+         * registered receiver, while `-> Vec<String>` keeps its template args. */
+        TSNode ret_node = ts_node_child_by_field_name(child, TS_FIELD("return_type"));
+        if (!ts_node_is_null(ret_node)) {
+            char *ret_text = cbm_node_text(a, ret_node, ctx->source);
+            if (ret_text && ret_text[0]) {
+                char *lt = strchr(ret_text, '<');
+                if (lt && (size_t)(lt - ret_text) == strlen(type_name) &&
+                    strncmp(ret_text, type_name, (size_t)(lt - ret_text)) == 0) {
+                    ret_text = cbm_arena_strndup(a, ret_text, (size_t)(lt - ret_text));
+                }
+                def.return_type = ret_text;
+            }
         }
 
         if (spec->branching_node_types && spec->branching_node_types[0]) {
@@ -5752,6 +6384,70 @@ static bool is_perl_var_type(const char *ck) {
            strcmp(ck, "scalar") == 0 || strcmp(ck, "array") == 0 || strcmp(ck, "hash") == 0;
 }
 
+// Append the words found in a Perl export-list RHS (quoted_word_list blobs —
+// ONE string_content carries the whole space-separated list — plus discrete
+// string literals) into buf as a '|'-joined list. Depth-capped; skips the
+// LHS variable_declaration subtree (it contains no strings anyway).
+static void perl_export_words_walk(CBMExtractCtx *ctx, TSNode node, char *buf, size_t cap,
+                                   size_t *len, int depth) {
+    if (ts_node_is_null(node) || depth > 4) {
+        return;
+    }
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "variable_declaration") == 0) {
+        return;
+    }
+    if (strcmp(k, "quoted_word_list") == 0 || strcmp(k, "string_literal") == 0) {
+        TSNode content = ts_node_child_by_field_name(node, TS_FIELD("content"));
+        if (ts_node_is_null(content)) {
+            uint32_t nc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                if (strcmp(ts_node_type(c), "string_content") == 0) {
+                    content = c;
+                    break;
+                }
+            }
+        }
+        if (ts_node_is_null(content)) {
+            return;
+        }
+        char *blob = cbm_node_text(ctx->arena, content, ctx->source);
+        if (!blob) {
+            return;
+        }
+        const char *p = blob;
+        while (*p) {
+            while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
+                p++;
+            }
+            const char *start = p;
+            while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r') {
+                p++;
+            }
+            size_t wl = (size_t)(p - start);
+            if (wl == 0 || start[0] == ':' || start[0] == '$' || start[0] == '@' ||
+                start[0] == '%') {
+                continue; /* tags and variable exports are not callable names */
+            }
+            if (*len + wl + 2 >= cap) {
+                return; /* full — keep what fits (whole words only) */
+            }
+            if (*len > 0) {
+                buf[(*len)++] = '|';
+            }
+            memcpy(buf + *len, start, wl);
+            *len += wl;
+            buf[*len] = '\0';
+        }
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc && i < 64; i++) {
+        perl_export_words_walk(ctx, ts_node_named_child(node, i), buf, cap, len, depth + 1);
+    }
+}
+
 // Perl variable extraction: handle direct variable nodes and assignment_expression.
 static void extract_perl_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
     uint32_t n = ts_node_named_child_count(node);
@@ -5782,7 +6478,27 @@ static void extract_perl_vars(CBMExtractCtx *ctx, TSNode node, CBMArena *a) {
                 }
             }
         }
-        push_var_def(ctx, strip_perl_sigil(cbm_node_text(a, left, ctx->source)), node);
+        char *pv_name = strip_perl_sigil(cbm_node_text(a, left, ctx->source));
+        push_var_def(ctx, pv_name, node);
+        /* perl-exports-model: `our @EXPORT = qw(...)` (and @EXPORT_OK) carry
+         * the module's Exporter surface. Store the '|'-joined word list on the
+         * just-pushed Variable def's return_type so the cross-file LSP can
+         * resolve `use Mod;` (no import list) to Mod's @EXPORT defaults.
+         * Pointer-compare the def's name to confirm push_var_def did not skip
+         * the row (empty/"_" names are dropped there). */
+        if (pv_name &&
+            (strcmp(pv_name, "EXPORT") == 0 || strcmp(pv_name, "EXPORT_OK") == 0) &&
+            ctx->result->defs.count > 0 &&
+            ctx->result->defs.items[ctx->result->defs.count - 1].name == pv_name) {
+            char words[1024];
+            size_t wlen = 0;
+            words[0] = '\0';
+            perl_export_words_walk(ctx, child, words, sizeof(words), &wlen, 0);
+            if (wlen > 0) {
+                ctx->result->defs.items[ctx->result->defs.count - 1].return_type =
+                    cbm_arena_strdup(a, words);
+            }
+        }
         return;
     }
 }
@@ -8008,6 +8724,525 @@ static const char *cbm_razor_page_route(CBMArena *a, const char *source, int sou
     return NULL;
 }
 
+/* ── Python route surfaces: Django urls.py + router-prefix concat ─────────
+ *
+ * Django routes are CALL-shaped (`urlpatterns = [path('x/', views.x), ...]`),
+ * so the decorator walk never sees them; FastAPI/Flask decorator routes are
+ * seen but record only the LOCAL path while the mounted path lives on the
+ * module-level router object (`router = APIRouter(prefix="/api/v1")`).
+ * Both walkers below are Python-only, top-level-only, literal-only. */
+
+/* Inner text of a Python string literal node, prefix (r/b/u/f) and quotes
+ * stripped via the string_content child. Returns "" for an empty literal and
+ * NULL for non-string nodes. */
+static const char *py_string_node_content(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "string") != 0) {
+        return NULL;
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(node, i);
+        if (strcmp(ts_node_type(c), "string_content") == 0) {
+            return cbm_node_text(a, c, source);
+        }
+    }
+    return "";
+}
+
+/* Short callee name of a call: `path(...)` -> "path", `views.x(...)` -> "x".
+ * Optionally hands back the function node. */
+static const char *py_call_callee_short(CBMArena *a, TSNode call, const char *source,
+                                        TSNode *out_fn) {
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn)) {
+        return NULL;
+    }
+    if (out_fn) {
+        *out_fn = fn;
+    }
+    const char *fk = ts_node_type(fn);
+    if (strcmp(fk, "identifier") == 0) {
+        return cbm_node_text(a, fn, source);
+    }
+    if (strcmp(fk, "attribute") == 0) {
+        TSNode attr = ts_node_child_by_field_name(fn, TS_FIELD("attribute"));
+        if (!ts_node_is_null(attr)) {
+            return cbm_node_text(a, attr, source);
+        }
+    }
+    return NULL;
+}
+
+/* Normalize a Django route string: strip re_path/url regex anchors (^ $),
+ * guarantee the leading slash Django omits. */
+static const char *py_django_route_path(CBMArena *a, const char *raw) {
+    if (!raw) {
+        return NULL;
+    }
+    size_t len = strlen(raw);
+    if (len > 0 && raw[0] == '^') {
+        raw++;
+        len--;
+    }
+    if (len > 0 && raw[len - SKIP_CHAR] == '$') {
+        len--;
+    }
+    char *clean = cbm_arena_strndup(a, raw, len);
+    if (!clean) {
+        return NULL;
+    }
+    return clean[0] == '/' ? clean : cbm_arena_sprintf(a, "/%s", clean);
+}
+
+/* Gate: the file names django.urls / django.conf.urls in a top-level import.
+ * Runs on the AST (imports are extracted after defs), statement text match. */
+static bool py_file_imports_django_urls(CBMExtractCtx *ctx) {
+    uint32_t nc = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode c = ts_node_named_child(ctx->root, i);
+        const char *k = ts_node_type(c);
+        if (strcmp(k, "import_statement") != 0 && strcmp(k, "import_from_statement") != 0) {
+            continue;
+        }
+        char *text = cbm_node_text(ctx->arena, c, ctx->source);
+        if (text && (strstr(text, "django.urls") || strstr(text, "django.conf.urls"))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Emit one synthetic Route definition row for a Django urlpattern. The def
+ * node IS the Route (label "Route", QN in __route__ form so the
+ * pass_route_nodes prefix bridge recognizes include() prefixes); the spelled
+ * handler is recorded on route_handler for connect_route_handler_defs. */
+static void py_django_emit_route(CBMExtractCtx *ctx, TSNode call, const char *path,
+                                 const char *method, const char *handler) {
+    CBMArena *a = ctx->arena;
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = path;
+    def.qualified_name = cbm_arena_sprintf(a, "__route__%s__%s", method, path);
+    def.label = "Route";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(call).row + TS_LINE_OFFSET;
+    def.end_line = ts_node_end_point(call).row + TS_LINE_OFFSET;
+    def.route_path = path;
+    def.route_method = method;
+    def.route_handler = handler;
+    def.is_exported = true;
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* Walk one urlpatterns list: `path()/re_path()/url()` elements become Route
+ * defs; a nested `include('pkg.urls')` becomes a prefix Route (method ANY)
+ * that the pass_route_nodes bridge connects to the included app's routes. */
+static void py_django_walk_urlpatterns_list(CBMExtractCtx *ctx, TSNode list) {
+    CBMArena *a = ctx->arena;
+    uint32_t nc = ts_node_named_child_count(list);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode call = ts_node_named_child(list, i);
+        if (strcmp(ts_node_type(call), "call") != 0) {
+            continue;
+        }
+        const char *callee = py_call_callee_short(a, call, ctx->source, NULL);
+        if (!callee || (strcmp(callee, "path") != 0 && strcmp(callee, "re_path") != 0 &&
+                        strcmp(callee, "url") != 0)) {
+            continue;
+        }
+        TSNode args = find_decorator_args(call);
+        if (ts_node_is_null(args)) {
+            continue;
+        }
+        const char *raw_path = NULL;
+        const char *handler = NULL;
+        bool is_include = false;
+        uint32_t an = ts_node_named_child_count(args);
+        for (uint32_t j = 0; j < an; j++) {
+            TSNode arg = ts_node_named_child(args, j);
+            const char *ak = ts_node_type(arg);
+            if (strcmp(ak, "keyword_argument") == 0) {
+                continue; /* name= / kwargs= — not route surface */
+            }
+            if (!raw_path) {
+                raw_path = py_string_node_content(a, arg, ctx->source);
+                if (raw_path) {
+                    continue;
+                }
+                break; /* first positional arg is not a literal: skip pattern */
+            }
+            if (handler || is_include) {
+                break;
+            }
+            if (strcmp(ak, "identifier") == 0 || strcmp(ak, "attribute") == 0) {
+                handler = cbm_node_text(a, arg, ctx->source); /* detail / views.detail */
+            } else if (strcmp(ak, "call") == 0) {
+                TSNode inner_fn = {0};
+                const char *inner = py_call_callee_short(a, arg, ctx->source, &inner_fn);
+                if (inner && strcmp(inner, "include") == 0) {
+                    is_include = true;
+                } else if (inner && strcmp(inner, "as_view") == 0 &&
+                           strcmp(ts_node_type(inner_fn), "attribute") == 0) {
+                    /* AboutView.as_view() — the class is the handler. */
+                    TSNode obj = ts_node_child_by_field_name(inner_fn, TS_FIELD("object"));
+                    if (!ts_node_is_null(obj)) {
+                        handler = cbm_node_text(a, obj, ctx->source);
+                    }
+                }
+            }
+        }
+        if (!raw_path) {
+            continue;
+        }
+        const char *route_path = py_django_route_path(a, raw_path);
+        if (!route_path) {
+            continue;
+        }
+        /* include() mounts another urlconf: a prefix Route with no handler. */
+        py_django_emit_route(ctx, call, route_path, "ANY", is_include ? NULL : handler);
+    }
+}
+
+/* Django urls.py entry: gated on a top-level `urlpatterns = [...]` assignment
+ * (or `urlpatterns += [...]`) AND a django.urls / django.conf.urls import.
+ * A non-urls file with a local function named path() therefore never mints
+ * a Route (对拍A binding). Top-level lists only — computed urlpatterns stay
+ * with the directory bridge. */
+static void py_extract_django_urlpatterns(CBMExtractCtx *ctx) {
+    if (ctx->language != CBM_LANG_PYTHON) {
+        return;
+    }
+    TSNode lists[4];
+    int list_count = 0;
+    uint32_t nc = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < nc && list_count < (int)(sizeof(lists) / sizeof(lists[0])); i++) {
+        TSNode c = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(c), "expression_statement") != 0 ||
+            ts_node_named_child_count(c) == 0) {
+            continue;
+        }
+        TSNode asg = ts_node_named_child(c, 0);
+        const char *ak = ts_node_type(asg);
+        if (strcmp(ak, "assignment") != 0 && strcmp(ak, "augmented_assignment") != 0) {
+            continue;
+        }
+        TSNode left = ts_node_child_by_field_name(asg, TS_FIELD("left"));
+        TSNode right = ts_node_child_by_field_name(asg, TS_FIELD("right"));
+        if (ts_node_is_null(left) || ts_node_is_null(right) ||
+            strcmp(ts_node_type(left), "identifier") != 0 ||
+            strcmp(ts_node_type(right), "list") != 0) {
+            continue;
+        }
+        char *lname = cbm_node_text(ctx->arena, left, ctx->source);
+        if (lname && strcmp(lname, "urlpatterns") == 0) {
+            lists[list_count++] = right;
+        }
+    }
+    if (list_count == 0 || !py_file_imports_django_urls(ctx)) {
+        return;
+    }
+    for (int i = 0; i < list_count; i++) {
+        py_django_walk_urlpatterns_list(ctx, lists[i]);
+    }
+}
+
+/* ── py-router-prefix-concat ── */
+
+/* Pre-scan module-level `NAME = APIRouter(prefix="/x")` and
+ * `NAME = Blueprint(..., url_prefix="/x")` into ctx->router_prefixes.
+ * Literal keyword strings only; FastAPI(root_path=...) deliberately not
+ * scanned (对拍B binding — root_path is proxy metadata, not a route prefix).
+ * Cross-file router variables and nested blueprints remain with the
+ * pass_route_nodes directory bridge. */
+static void py_prescan_router_prefixes(CBMExtractCtx *ctx) {
+    if (ctx->language != CBM_LANG_PYTHON) {
+        return;
+    }
+    CBMArena *a = ctx->arena;
+    uint32_t nc = ts_node_named_child_count(ctx->root);
+    for (uint32_t i = 0; i < nc; i++) {
+        if (ctx->router_prefixes.count >= CBM_MAX_ROUTER_PREFIXES) {
+            return;
+        }
+        TSNode c = ts_node_named_child(ctx->root, i);
+        if (strcmp(ts_node_type(c), "expression_statement") != 0 ||
+            ts_node_named_child_count(c) == 0) {
+            continue;
+        }
+        TSNode asg = ts_node_named_child(c, 0);
+        if (strcmp(ts_node_type(asg), "assignment") != 0) {
+            continue;
+        }
+        TSNode left = ts_node_child_by_field_name(asg, TS_FIELD("left"));
+        TSNode right = ts_node_child_by_field_name(asg, TS_FIELD("right"));
+        if (ts_node_is_null(left) || ts_node_is_null(right) ||
+            strcmp(ts_node_type(left), "identifier") != 0 ||
+            strcmp(ts_node_type(right), "call") != 0) {
+            continue;
+        }
+        const char *ctor = py_call_callee_short(a, right, ctx->source, NULL);
+        const char *kwarg = NULL;
+        if (ctor && strcmp(ctor, "APIRouter") == 0) {
+            kwarg = "prefix";
+        } else if (ctor && strcmp(ctor, "Blueprint") == 0) {
+            kwarg = "url_prefix";
+        } else {
+            continue;
+        }
+        TSNode args = find_decorator_args(right);
+        if (ts_node_is_null(args)) {
+            continue;
+        }
+        TSNode val = find_drf_kwarg_in_args(a, args, kwarg, ctx->source);
+        const char *prefix = py_string_node_content(a, val, ctx->source);
+        if (!prefix || !prefix[0]) {
+            continue;
+        }
+        char *name = cbm_node_text(a, left, ctx->source);
+        if (!name || !name[0]) {
+            continue;
+        }
+        ctx->router_prefixes.names[ctx->router_prefixes.count] = name;
+        ctx->router_prefixes.prefixes[ctx->router_prefixes.count] = prefix;
+        ctx->router_prefixes.count++;
+    }
+}
+
+/* After extract_route_from_decorators recorded a path, find the SAME winning
+ * decorator (first prev-sibling decorator call whose callee maps to a route
+ * method — mirroring try_route_from_decorator_call's pick) and, when its
+ * receiver object carries a recorded prefix, join prefix + path. A router
+ * with no recorded prefix keeps the literal path (unprefixed fallback). */
+static void py_apply_router_prefix(CBMExtractCtx *ctx, TSNode func_node, const CBMLangSpec *spec,
+                                   const char **route_path) {
+    if (!route_path || !*route_path || ctx->router_prefixes.count == 0 ||
+        !spec->decorator_node_types || !spec->decorator_node_types[0]) {
+        return;
+    }
+    CBMArena *a = ctx->arena;
+    TSNode prev = ts_node_prev_sibling(func_node);
+    while (!ts_node_is_null(prev)) {
+        if (!cbm_kind_in_set(prev, spec->decorator_node_types)) {
+            return;
+        }
+        uint32_t dc = ts_node_named_child_count(prev);
+        for (uint32_t di = 0; di < dc; di++) {
+            TSNode dchild = ts_node_named_child(prev, di);
+            if (strcmp(ts_node_type(dchild), "call") != 0) {
+                continue;
+            }
+            TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
+            if (ts_node_is_null(fn)) {
+                fn = ts_node_named_child(dchild, 0);
+            }
+            if (ts_node_is_null(fn)) {
+                continue;
+            }
+            char *fn_text = cbm_node_text(a, fn, ctx->source);
+            if (!decorator_method_name(fn_text)) {
+                continue; /* not the route decorator — keep scanning */
+            }
+            /* This is the decorator the route came from. */
+            if (strcmp(ts_node_type(fn), "attribute") == 0) {
+                TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+                if (!ts_node_is_null(obj) && strcmp(ts_node_type(obj), "identifier") == 0) {
+                    char *obj_name = cbm_node_text(a, obj, ctx->source);
+                    for (int r = 0; obj_name && r < ctx->router_prefixes.count; r++) {
+                        if (strcmp(ctx->router_prefixes.names[r], obj_name) == 0) {
+                            *route_path = join_route_paths(
+                                a, ctx->router_prefixes.prefixes[r], *route_path);
+                            return;
+                        }
+                    }
+                }
+            }
+            return; /* first route decorator decides; no prefix recorded */
+        }
+        prev = ts_node_prev_sibling(prev);
+    }
+}
+
+/* Emit one synthetic Function def for a Mojo::Base / Moose `has X` accessor so
+ * `$obj->X` resolves to a real node (the generated read/write accessor is not a
+ * `sub`, so it has no def otherwise — the #1 reason typed receivers still fail:
+ * `$c->stash`, `$c->app`, `$c->tx` are all has-accessors). QN follows the Perl
+ * sub convention (module_qn.name, package not woven in); def_module_qn = the
+ * file module so the cross-file registrars attach it to the package's type. */
+/* `Class->new` → "Class" (bareword invocant + `new` method), else NULL. */
+static const char *perl_new_invocant_class(CBMExtractCtx *ctx, TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "method_call_expression") != 0)
+        return NULL;
+    TSNode m = ts_node_child_by_field_name(node, TS_FIELD("method"));
+    char *mn = ts_node_is_null(m) ? NULL : cbm_node_text(ctx->arena, m, ctx->source);
+    if (!mn || strcmp(mn, "new") != 0)
+        return NULL;
+    TSNode inv = ts_node_child_by_field_name(node, TS_FIELD("invocant"));
+    if (ts_node_is_null(inv))
+        return NULL;
+    const char *ik = ts_node_type(inv);
+    if (strcmp(ik, "bareword") != 0 && strcmp(ik, "package") != 0)
+        return NULL;
+    char *cls = cbm_node_text(ctx->arena, inv, ctx->source);
+    return (cls && cls[0] && cls[0] != '$' && cls[0] != '-') ? cls : NULL;
+}
+
+/* Infer an accessor's return type from its `has` default: the very common
+ * Mojo::Base idiom `has x => sub { Some::Class->new }` (and the direct
+ * `has x => Some::Class->new`) means `$obj->x` returns Some::Class — which
+ * unlocks chained calls `$obj->x->method`. Only the tail expression (the sub's
+ * return value) is examined; anything else yields no type (zero-edge). */
+static const char *perl_has_default_class(CBMExtractCtx *ctx, TSNode def_node) {
+    if (ts_node_is_null(def_node))
+        return NULL;
+    if (strcmp(ts_node_type(def_node), "anonymous_subroutine_expression") == 0) {
+        TSNode body = ts_node_child_by_field_name(def_node, TS_FIELD("body"));
+        if (ts_node_is_null(body))
+            return NULL;
+        uint32_t bn = ts_node_named_child_count(body);
+        for (int i = (int)bn - 1; i >= 0; i--) {
+            TSNode st = ts_node_named_child(body, (uint32_t)i);
+            if (strcmp(ts_node_type(st), "expression_statement") != 0)
+                continue;
+            return perl_new_invocant_class(ctx, ts_node_named_child(st, 0));
+        }
+        return NULL;
+    }
+    return perl_new_invocant_class(ctx, def_node);
+}
+
+static void perl_emit_has_accessor(CBMExtractCtx *ctx, const char *name, const char *ret_type,
+                                   TSNode at) {
+    if (!name || !name[0])
+        return;
+    CBMArena *a = ctx->arena;
+    CBMDefinition def;
+    memset(&def, 0, sizeof(def));
+    def.name = name;
+    def.qualified_name =
+        ctx->module_qn ? cbm_arena_sprintf(a, "%s.%s", ctx->module_qn, name) : name;
+    /* short_name and def_module_qn are derived on the CBMLSPDef surface (from
+     * name and the file module); only name/qualified_name/label are set here. */
+    def.label = "Method";
+    def.file_path = ctx->rel_path;
+    def.start_line = ts_node_start_point(at).row + TS_LINE_OFFSET;
+    def.end_line = def.start_line;
+    def.lines = 1;
+    def.is_test = ctx->result->is_test_file;
+    /* `has x => sub { Class->new }` types $obj->x as Class (flows to the
+     * CBMLSPDef surface via return_type -> return_types), enabling $obj->x->m. */
+    def.return_type = ret_type;
+    cbm_defs_push(&ctx->result->defs, a, def);
+}
+
+/* Collect accessor NAME(s) from the FIRST argument of a `has` call: 'name',
+ * bareword name, or ['a','b'] arrayref. Strings only (Object::Pad `has $x` is a
+ * variable and is skipped). Mirrors the LSP's perl_collect_has_names. */
+static void perl_emit_has_names(CBMExtractCtx *ctx, TSNode node, const char *ret_type, int depth) {
+    if (ts_node_is_null(node) || depth > 3)
+        return;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "string_literal") == 0 || strcmp(k, "interpolated_string_literal") == 0) {
+        /* The unquoted value is the `string_content` child. */
+        TSNode content = cbm_find_child_by_kind(node, "string_content");
+        char *inner = ts_node_is_null(content) ? NULL : cbm_node_text(ctx->arena, content, ctx->source);
+        if (inner && inner[0] && inner[0] != '$')
+            perl_emit_has_accessor(ctx, inner, ret_type, node);
+        return;
+    }
+    if (strcmp(k, "bareword") == 0 || strcmp(k, "autoquoted_bareword") == 0) {
+        char *bw = cbm_node_text(ctx->arena, node, ctx->source);
+        if (bw && bw[0] && bw[0] != '-')
+            perl_emit_has_accessor(ctx, bw, ret_type, node);
+        return;
+    }
+    if (strcmp(k, "quoted_word_list") == 0) {
+        /* `has [qw(app tx headers)] => ...`: the qw() word list carries the
+         * space-separated accessor names. Without this the extremely common
+         * multi-accessor `has [qw(...)]` form (97 accessors across Mojolicious)
+         * emitted NO nodes at all — every `$obj->name` to them was unresolved. */
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc; i++) {
+            char *blob = cbm_node_text(ctx->arena, ts_node_named_child(node, i), ctx->source);
+            if (!blob)
+                continue;
+            char *p = blob;
+            while (*p) {
+                while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')
+                    p++;
+                char *s = p;
+                while (*p && *p != ' ' && *p != '\t' && *p != '\n' && *p != '\r')
+                    p++;
+                if (p > s) {
+                    char save = *p;
+                    *p = '\0';
+                    if (s[0] && s[0] != '$' && s[0] != '-')
+                        perl_emit_has_accessor(ctx, cbm_arena_strdup(ctx->arena, s), ret_type, node);
+                    *p = save;
+                }
+            }
+        }
+        return;
+    }
+    if (strcmp(k, "anonymous_array_expression") == 0 || strcmp(k, "list_expression") == 0) {
+        /* `has [qw(a b)] => sub {...}`: the arrayref is the NAME list; the shared
+         * default (2nd element of an enclosing list) already gave ret_type. But a
+         * list_expression here is ALSO the `has` argument wrapper carrying
+         * [name, default] — the default (a sub / Class->new) is not a name, so
+         * perl_emit_has_names skips it; only the name element(s) emit. */
+        uint32_t nc = ts_node_named_child_count(node);
+        for (uint32_t i = 0; i < nc && i < 16; i++)
+            perl_emit_has_names(ctx, ts_node_named_child(node, i), ret_type, depth + 1);
+    }
+}
+
+/* Walk the file emitting has-accessor defs. A `has` call is an accessor only in
+ * a package that imports Mojo::Base / Moose / Moo / Mouse (tracked forward: the
+ * `use` precedes the `has` in that package), so a foreign `has(...)` is never
+ * treated as an accessor (zero-edge). */
+static void perl_scan_has_accessors(CBMExtractCtx *ctx, TSNode node, bool *gated, int depth) {
+    if (ts_node_is_null(node) || depth > 200)
+        return;
+    const char *k = ts_node_type(node);
+    if (strcmp(k, "package_statement") == 0 || strcmp(k, "class_statement") == 0) {
+        *gated = false; /* new package: re-gate on its own use-statements */
+    } else if (strcmp(k, "use_statement") == 0) {
+        TSNode mod = ts_node_child_by_field_name(node, "module", 6);
+        if (!ts_node_is_null(mod)) {
+            char *mn = cbm_node_text(ctx->arena, mod, ctx->source);
+            if (mn && (strcmp(mn, "Mojo::Base") == 0 || strcmp(mn, "Moose") == 0 ||
+                       strcmp(mn, "Moo") == 0 || strcmp(mn, "Mouse") == 0 ||
+                       strcmp(mn, "Moose::Role") == 0 || strcmp(mn, "Moo::Role") == 0))
+                *gated = true;
+        }
+    } else if (*gated && (strcmp(k, "function_call_expression") == 0 ||
+                          strcmp(k, "ambiguous_function_call_expression") == 0)) {
+        TSNode fn = ts_node_child_by_field_name(node, "function", 8);
+        if (ts_node_is_null(fn))
+            fn = ts_node_named_child(node, 0);
+        char *fname = ts_node_is_null(fn) ? NULL : cbm_node_text(ctx->arena, fn, ctx->source);
+        if (fname && strcmp(fname, "has") == 0) {
+            uint32_t nc = ts_node_named_child_count(node);
+            for (uint32_t i = 0; i < nc; i++) {
+                TSNode c = ts_node_named_child(node, i);
+                if (ts_node_eq(c, fn))
+                    continue;
+                /* c is the argument wrapper: [name(s), default, ...]. Infer the
+                 * accessor's return type from the default (2nd element) so
+                 * `$obj->accessor->method` chains resolve; the name element(s)
+                 * then emit carrying that type. */
+                const char *ret = NULL;
+                if (strcmp(ts_node_type(c), "list_expression") == 0)
+                    ret = perl_has_default_class(ctx, ts_node_named_child(c, 1));
+                perl_emit_has_names(ctx, c, ret, 0);
+                break;
+            }
+        }
+    }
+    uint32_t nc = ts_node_named_child_count(node);
+    for (uint32_t i = 0; i < nc; i++)
+        perl_scan_has_accessors(ctx, ts_node_named_child(node, i), gated, depth + 1);
+}
+
 void cbm_extract_definitions(CBMExtractCtx *ctx) {
     const CBMLangSpec *spec = cbm_lang_spec(ctx->language);
     if (!spec) {
@@ -8042,5 +9277,20 @@ void cbm_extract_definitions(CBMExtractCtx *ctx) {
     }
     cbm_defs_push(&ctx->result->defs, a, mod);
 
+    /* Python route surfaces: router-prefix pre-scan must precede the def walk
+     * (decorator routes consult it); the Django urls.py walker emits its own
+     * synthetic Route defs. */
+    if (ctx->language == CBM_LANG_PYTHON) {
+        py_prescan_router_prefixes(ctx);
+        py_extract_django_urlpatterns(ctx);
+    }
+
     cbm_extract_definitions_without_module(ctx);
+
+    /* Perl: emit synthetic defs for Mojo::Base/Moose `has X` accessors so
+     * `$obj->X` resolves (see perl_scan_has_accessors). */
+    if (ctx->language == CBM_LANG_PERL) {
+        bool has_gated = false;
+        perl_scan_has_accessors(ctx, ctx->root, &has_gated, 0);
+    }
 }

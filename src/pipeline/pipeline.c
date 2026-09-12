@@ -1364,12 +1364,26 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
          * first NULL-filter rust file (the amplifier files) inside cbm_parallel_resolve
          * — repos whose rust files all filter to subsets never pay the build/RSS. */
     }
+    /* Perl multi-level @ISA index (borrows def_modules[] + cache perl_isa_parents;
+     * both outlive cbm_parallel_resolve). Freed right after it returns. */
+    CBMPerlInheritIndex perl_inherit;
+    cbm_perl_build_inherit_index(cache, files, file_count, def_modules, &perl_inherit);
+    cross_registries.perl_inherit = &perl_inherit;
+    /* Perl cross-file duck-typing pre-pass: infer typeless-accessor return types
+     * from project-wide $self/$class usage into all_defs BEFORE the parallel
+     * resolve workers run, so the inferred type (e.g. Controller::req ->
+     * Mojo::Message::Request) drives chain dispatch in every file. Inferred
+     * strings live in cross_lsp_arena (freed after cbm_parallel_resolve). */
+    if (all_defs)
+        cbm_pxc_perl_duck_prepass_driver(ctx, files, file_count, cache, def_modules, all_defs,
+                                         def_count, &perl_inherit, &cross_lsp_arena);
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("lsp_cross_prepare");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
+    cbm_perl_free_inherit_index(&perl_inherit);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     log_phase_mem("parallel_resolve");

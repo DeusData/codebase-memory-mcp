@@ -1845,8 +1845,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             src_base = pb + SKIP_ONE;
         }
     }
-    const bool symbol_fallback_allowed =
-        cbm_import_symbol_fallback_allowed(cbm_language_for_filename(src_base));
+    const CBMLanguage src_lang = cbm_language_for_filename(src_base);
+    const bool symbol_fallback_allowed = cbm_import_symbol_fallback_allowed(src_lang);
 
     /* Strategy 1b: sibling-file resolution for build/markup grammars whose
      * import string is a sibling filename or directory (SCSS partials, Just/
@@ -2075,6 +2075,31 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
             }
         }
         if (body[0]) {
+            /* Perl module→file convention (perl-cross-file-lsp prerequisite):
+             * `use My::Util` names lib/My/Util.pm in a CPAN-style layout (or
+             * t/lib for test-only helpers), so try those roots FIRST — exact
+             * path only, no truncation (a Perl module maps to exactly one
+             * .pm). The plain `My/Util` spelling then falls through to the
+             * generic loop below for root-relative layouts. */
+            if (src_lang == CBM_LANG_PERL) {
+                static const char *const perl_roots[] = {"lib/", "t/lib/", NULL};
+                for (int ri = 0; perl_roots[ri]; ri++) {
+                    char rooted[1024];
+                    int wn = snprintf(rooted, sizeof(rooted), "%s%s", perl_roots[ri], body);
+                    if (wn <= 0 || (size_t)wn >= sizeof(rooted)) {
+                        continue;
+                    }
+                    char *rqn = cbm_pipeline_resolve_module(ctx, source_rel, rooted);
+                    const cbm_gbuf_node_t *n =
+                        rqn ? cbm_gbuf_find_by_qn(ctx->gbuf, rqn) : NULL;
+                    free(rqn);
+                    if (n && import_targetable_label(n->label) &&
+                        (!source_file_qn || !n->qualified_name ||
+                         strcmp(n->qualified_name, source_file_qn) != 0)) {
+                        return n;
+                    }
+                }
+            }
             char work[1024];
             snprintf(work, sizeof(work), "%s", body);
             for (;;) {

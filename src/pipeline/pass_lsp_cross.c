@@ -27,6 +27,7 @@
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "lsp/rust_cargo.h"
+#include "lsp/perl_lsp.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
@@ -377,6 +378,11 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     if (!label || !src->qualified_name || !src->name)
         return -1;
     memset(dst, 0, sizeof(*dst));
+    /* Def-level is_test flows from cbm_is_test_file at extraction, so every
+     * def in a _test.go (or other test file) carries it. Go's interface
+     * satisfaction scan consumes the bit to keep test doubles from shadowing
+     * production implementers. */
+    dst->from_test_file = src->is_test;
     if (pxc_is_jvm_lang(lang) && namespace_name && namespace_name[0]) {
         dst->qualified_name = pxc_jvm_def_qn(arena, src, namespace_name, label);
         dst->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src->parent_class);
@@ -413,25 +419,63 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     return 0;
 }
 
-/* Go: fold per-field "Field" definitions into their owning struct's
- * field_defs. extract_defs.c emits one flat CBMDefinition per struct field
- * (label "Field", parent_class = owning struct QN, name = field name,
- * return_type = raw type text). Those rows are dropped by pxc_build_lsp_def
- * (pxc_map_label excludes "Field"), so without this fold every Go struct
- * registers with zero fields and field-chain calls (h.svc.Handle) can
- * never resolve. Fields are always declared in the same file as their struct,
- * so scanning the file's own defs covers every case. Runs inside
+/* Fold per-field "Field" definitions into their owning type's field_defs.
+ * extract_defs.c emits one flat CBMDefinition per class/struct field
+ * (label "Field", parent_class = owning type QN, name = field name,
+ * return_type = raw type text — full generic text for Java). Those rows are
+ * dropped by pxc_build_lsp_def (pxc_map_label excludes "Field"), so without
+ * this fold every Go struct / Java class registers with zero fields and
+ * field-chain calls (h.svc.Handle, handler.service.process()) can never
+ * resolve. Fields are always declared in the same file as their type, so
+ * scanning the file's own defs covers every case. Runs inside
  * cbm_pxc_collect_all_defs — one site covers both the prebuilt-registry path
- * and the per-file fallback, since both consume all_defs. */
-static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
-                                      int start, int end) {
+ * and the per-file fallback, since both consume all_defs.
+ *
+ * Owner labels per language: Go folds into "Struct"; Java folds into
+ * Class/Interface/Enum/Type (records keep label Class; interface constants
+ * and enum fields ride the same shape — 对拍B). For a JVM file with an
+ * inferred namespace the owning def's QN was rebuilt by pxc_jvm_def_qn, so
+ * match the Field row through the same mapping (ns + "." + leaf(parent)),
+ * falling back to the raw QN comparison otherwise (对拍A). */
+static bool pxc_fold_owner_label(CBMLanguage lang, const char *label) {
+    if (lang == CBM_LANG_JAVA) {
+        return strcmp(label, "Class") == 0 || strcmp(label, "Interface") == 0 ||
+               strcmp(label, "Enum") == 0 || strcmp(label, "Type") == 0;
+    }
+    return strcmp(label, "Struct") == 0;
+}
+
+static bool pxc_field_parent_matches(const CBMLSPDef *dst, const CBMDefinition *fd,
+                                     CBMLanguage lang) {
+    if (strcmp(fd->parent_class, dst->qualified_name) == 0) {
+        return true;
+    }
+    if (!pxc_is_jvm_lang(lang) || !dst->namespace_name || !dst->namespace_name[0]) {
+        return false;
+    }
+    /* Alloc-free equivalent of
+     *   pxc_jvm_type_qn(arena, ns, fd->parent_class) == dst->qualified_name:
+     * dst QN is ns-built (pxc_jvm_def_qn), so equality holds exactly when the
+     * dst QN is ns + "." + last-component(parent_class). */
+    const char *leaf = pxc_last_component(fd->parent_class);
+    const char *ns = dst->namespace_name;
+    size_t nsl = strlen(ns);
+    const char *dq = dst->qualified_name;
+    return strncmp(dq, ns, nsl) == 0 && dq[nsl] == '.' && strcmp(dq + nsl + 1, leaf) == 0;
+}
+
+static void pxc_fold_class_fields(CBMArena *arena, const CBMFileResult *result, CBMLSPDef *defs,
+                                  int start, int end, CBMLanguage lang) {
     if (!arena || !result || !defs || start >= end) {
         return;
     }
     for (int si = start; si < end; si++) {
         CBMLSPDef *dst = &defs[si];
-        if (!dst->label || strcmp(dst->label, "Struct") != 0 || !dst->qualified_name) {
+        if (!dst->label || !dst->qualified_name || !pxc_fold_owner_label(lang, dst->label)) {
             continue;
+        }
+        if (dst->field_defs && dst->field_defs[0]) {
+            continue; /* already carried (e.g. surface round-trip) */
         }
         int count = 0;
         size_t total = 0; /* "name:type" bytes; separators and NUL added below */
@@ -439,7 +483,7 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
             const CBMDefinition *fd = &result->defs.items[di];
             if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
                 !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
-                strcmp(fd->parent_class, dst->qualified_name) != 0) {
+                !pxc_field_parent_matches(dst, fd, lang)) {
                 continue;
             }
             total += strlen(fd->name) + 1 + strlen(fd->return_type);
@@ -460,7 +504,7 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
             const CBMDefinition *fd = &result->defs.items[di];
             if (!fd->label || !fd->parent_class || !fd->name || !fd->name[0] || !fd->return_type ||
                 !fd->return_type[0] || strcmp(fd->label, "Field") != 0 ||
-                strcmp(fd->parent_class, dst->qualified_name) != 0) {
+                !pxc_field_parent_matches(dst, fd, lang)) {
                 continue;
             }
             size_t n = strlen(fd->name);
@@ -477,6 +521,137 @@ static void pxc_fold_go_struct_fields(CBMArena *arena, const CBMFileResult *resu
         }
         *p = '\0';
         dst->field_defs = buf;
+    }
+}
+
+/* Go: fold interface Method defs into their owning interface's
+ * method_names_str ("Get|Put"). Interface methods exist as flat Method defs
+ * (method_elem is in go_func_types) with parent_class = the interface QN and
+ * always live in the interface's own file, so the file-local scan mirrors
+ * pxc_fold_class_fields above. Without this fold, cross-file registries
+ * see interfaces with an empty method set and the sole-implementer branch
+ * (go_lsp.c lsp_interface_resolve, 0.95) never fires on the production
+ * Tier-2/per-file cross paths — only the 0.85 lsp_interface_dispatch
+ * fallback.
+ *
+ * The fold is TRANSITIVE over same-file interface embedding: for
+ * `type A interface { B; Extra() }` with B in the same file, A's folded set
+ * is B's methods plus Extra. Embeds of interfaces from OTHER files (or the
+ * stdlib) are left to the resolver's registry-side closure
+ * (go_iface_sole_impl_method walks embedded_types), which sees the whole
+ * project; the fold only ever closes over what this file declares. */
+enum { PXC_GO_IFACE_METHODS_MAX = 64, PXC_GO_IFACE_EMBED_DEPTH = 8 };
+
+/* Append the method names of the interface def at qualified_name `iface_qn`
+ * (its same-file Method defs plus, recursively, same-file embedded
+ * interfaces') into names[]. Embedded spellings come from the CBMDefinition
+ * base_classes source text: bare names match same-file interfaces by short
+ * name under the same module. */
+static void pxc_go_iface_collect(const CBMFileResult *result, const CBMLSPDef *defs, int start,
+                                 int end, const CBMLSPDef *iface, const char **names, int *count,
+                                 const CBMLSPDef **visited, int *vcount, int depth) {
+    if (!iface || depth > PXC_GO_IFACE_EMBED_DEPTH) {
+        return;
+    }
+    for (int i = 0; i < *vcount; i++) {
+        if (visited[i] == iface) {
+            return;
+        }
+    }
+    if (*vcount >= PXC_GO_IFACE_EMBED_DEPTH * 2) {
+        return;
+    }
+    visited[(*vcount)++] = iface;
+
+    for (int di = 0; di < result->defs.count && *count < PXC_GO_IFACE_METHODS_MAX; di++) {
+        const CBMDefinition *md = &result->defs.items[di];
+        if (!md->label || !md->parent_class || !md->name || !md->name[0] ||
+            strcmp(md->label, "Method") != 0 ||
+            strcmp(md->parent_class, iface->qualified_name) != 0) {
+            continue;
+        }
+        bool dup = false;
+        for (int k = 0; k < *count; k++) {
+            if (strcmp(names[k], md->name) == 0) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            names[(*count)++] = md->name;
+        }
+    }
+
+    /* Same-file embedded interfaces, matched by short name (bare source
+     * spelling — dotted spellings are cross-package and out of fold scope). */
+    if (iface->embedded_types) {
+        const char *p = iface->embedded_types;
+        while (*p) {
+            const char *sep = strchr(p, '|');
+            size_t len = sep ? (size_t)(sep - p) : strlen(p);
+            if (len > 0 && memchr(p, '.', len) == NULL) {
+                for (int si = start; si < end; si++) {
+                    const CBMLSPDef *cand = &defs[si];
+                    if (cand == iface || !cand->label || !cand->short_name ||
+                        strcmp(cand->label, "Interface") != 0 ||
+                        strlen(cand->short_name) != len ||
+                        strncmp(cand->short_name, p, len) != 0) {
+                        continue;
+                    }
+                    pxc_go_iface_collect(result, defs, start, end, cand, names, count, visited,
+                                         vcount, depth + 1);
+                    break;
+                }
+            }
+            if (!sep) {
+                break;
+            }
+            p = sep + 1;
+        }
+    }
+}
+
+static void pxc_fold_go_interface_methods(CBMArena *arena, const CBMFileResult *result,
+                                          CBMLSPDef *defs, int start, int end) {
+    if (!arena || !result || !defs || start >= end) {
+        return;
+    }
+    for (int si = start; si < end; si++) {
+        CBMLSPDef *dst = &defs[si];
+        if (!dst->label || strcmp(dst->label, "Interface") != 0 || !dst->qualified_name) {
+            continue;
+        }
+        if (dst->method_names_str && dst->method_names_str[0]) {
+            continue; /* already carried (e.g. surface round-trip) */
+        }
+        const char *names[PXC_GO_IFACE_METHODS_MAX];
+        int count = 0;
+        const CBMLSPDef *visited[PXC_GO_IFACE_EMBED_DEPTH * 2];
+        int vcount = 0;
+        pxc_go_iface_collect(result, defs, start, end, dst, names, &count, visited, &vcount, 0);
+        if (count == 0) {
+            continue;
+        }
+        size_t total = 0;
+        for (int i = 0; i < count; i++) {
+            total += strlen(names[i]);
+        }
+        size_t bufsz = total + (size_t)(count - 1) + 1;
+        char *buf = (char *)cbm_arena_alloc(arena, bufsz);
+        if (!buf) {
+            continue;
+        }
+        char *p = buf;
+        for (int i = 0; i < count; i++) {
+            size_t n = strlen(names[i]);
+            memcpy(p, names[i], n);
+            p += n;
+            if (i + 1 < count) {
+                *p++ = '|';
+            }
+        }
+        *p = '\0';
+        dst->method_names_str = buf;
     }
 }
 
@@ -579,7 +754,15 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult
         }
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
-            pxc_fold_go_struct_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx);
+            pxc_fold_class_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx, CBM_LANG_GO);
+            pxc_fold_go_interface_methods(&cache[fi]->arena, cache[fi], defs, file_start, idx);
+        }
+        if (files[fi].language == CBM_LANG_JAVA) {
+            /* Java Field defs (class fields + record components) fold into
+             * field_defs so cross-file field-chain calls resolve — the
+             * dominant Spring shape (@Autowired-field call chains). */
+            pxc_fold_class_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx,
+                                  CBM_LANG_JAVA);
         }
         if (files[fi].language == CBM_LANG_RUST) {
             for (int ii = 0; ii < cache[fi]->impl_traits.count; ii++) {
@@ -891,6 +1074,7 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     case CBM_LANG_JAVA:   /* fallback cbm_pxc_run_one path */
     case CBM_LANG_KOTLIN: /* fallback cbm_pxc_run_one path */
     case CBM_LANG_RUST:   /* fallback cbm_pxc_run_one path (manifest-aware) */
+    case CBM_LANG_PERL:   /* fallback cbm_pxc_run_one path */
         return true;
     default:
         return false;
@@ -1130,6 +1314,7 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
         out[i].is_interface = defs[i].is_interface;
         out[i].is_rust_impl_relation = defs[i].is_rust_impl_relation;
         out[i].is_abstract = defs[i].is_abstract;
+        out[i].decorators = defs[i].decorators;
     }
     return out;
 }
@@ -1143,7 +1328,8 @@ static CBMRustLSPDef *pxc_lspdefs_to_rust(CBMArena *arena, const CBMLSPDef *defs
  * arena and merged into result->resolved_calls. */
 void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int source_len,
                      const char *module_qn, CBMLSPDef *defs, int def_count, const char **imp_names,
-                     const char **imp_qns, int imp_count) {
+                     const char **imp_qns, int imp_count, const CBMPerlInheritIndex *perl_inherit,
+                     CBMLSPDef *all_defs, int all_def_count) {
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
@@ -1177,6 +1363,12 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     case CBM_LANG_PHP:
         cbm_run_php_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
                               imp_qns, imp_count, tree, &out);
+        break;
+    case CBM_LANG_PERL:
+        cbm_run_perl_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
+                               imp_qns, imp_count, tree, &out,
+                               (const struct CBMPerlInheritIndex *)perl_inherit, all_defs,
+                               all_def_count);
         break;
     case CBM_LANG_JAVA:
         cbm_run_java_lsp_cross(&scratch, source, source_len, module_qn, defs, def_count, imp_names,
@@ -1385,7 +1577,16 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
      * crate — a module that is in neither own_module nor the import map, so
      * the filter starves cross-crate resolution (#56 repro red). Rust
      * therefore always resolves against the FULL def universe: the lazily
-     * built shared registry when available, else a full per-file build. */
+     * built shared registry when available, else a full per-file build.
+     *
+     * PERL keeps the tight filter: a class's @ISA parent (use parent / use base
+     * / use Mojo::Base 'Base') would be starved by an import-only filter, but
+     * the Perl import extraction emits an import row for each such parent (see
+     * perl_collect_inheritance_imports), so the parent module lands in the
+     * import map and the filter keeps its defs. Exempting Perl entirely
+     * (resolving vs the full universe) was measured to REGRESS a real 274-file
+     * Mojolicious index by widening same-name ambiguity — the targeted
+     * parent-as-import path avoids that. */
     CBMLSPDef *filtered = NULL;
     CBMLSPDef *file_defs = all_defs;
     int file_def_count = all_def_count;
@@ -1425,7 +1626,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             cbm_arena_destroy(&scratch);
         } else {
             cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                            imp_keys, imp_vals, imp_count);
+                            imp_keys, imp_vals, imp_count,
+                            cross_registries ? cross_registries->perl_inherit : NULL, all_defs,
+                            all_def_count);
         }
     } else if (lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX) {
         bool js;
@@ -1436,9 +1639,143 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            imp_keys, imp_vals, imp_count, js, jsx, dts);
     } else {
         cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
-                        imp_keys, imp_vals, imp_count);
+                        imp_keys, imp_vals, imp_count,
+                        cross_registries ? cross_registries->perl_inherit : NULL, all_defs,
+                        all_def_count);
     }
     free(filtered);
+}
+
+/* ── Perl multi-level @ISA inheritance index ─────────────────────── */
+
+const char *const *cbm_perl_inherit_lookup(const CBMPerlInheritIndex *idx, const char *module_qn) {
+    if (!idx || !idx->module_qns || !idx->parent_lists || !module_qn) {
+        return NULL;
+    }
+    for (int i = 0; i < idx->count; i++) {
+        if (idx->module_qns[i] && strcmp(idx->module_qns[i], module_qn) == 0) {
+            return idx->parent_lists[i];
+        }
+    }
+    return NULL;
+}
+
+void cbm_perl_build_inherit_index(CBMFileResult **cache, const cbm_file_info_t *files,
+                                  int file_count, char *const *def_modules,
+                                  CBMPerlInheritIndex *out) {
+    if (!out) {
+        return;
+    }
+    memset(out, 0, sizeof(*out));
+    if (!cache || !files || !def_modules || file_count <= 0) {
+        return;
+    }
+    int pc = 0;
+    for (int i = 0; i < file_count; i++) {
+        if (cache[i] && files[i].language == CBM_LANG_PERL && cache[i]->perl_isa_parents &&
+            cache[i]->perl_isa_parents[0] && def_modules[i]) {
+            pc++;
+        }
+    }
+    if (pc == 0) {
+        return;
+    }
+    out->module_qns = (const char **)calloc((size_t)pc, sizeof(char *));
+    out->parent_lists = (const char *const **)calloc((size_t)pc, sizeof(char **));
+    if (!out->module_qns || !out->parent_lists) {
+        cbm_perl_free_inherit_index(out);
+        return;
+    }
+    int w = 0;
+    for (int i = 0; i < file_count && w < pc; i++) {
+        if (cache[i] && files[i].language == CBM_LANG_PERL && cache[i]->perl_isa_parents &&
+            cache[i]->perl_isa_parents[0] && def_modules[i]) {
+            out->module_qns[w] = def_modules[i];
+            out->parent_lists[w] = cache[i]->perl_isa_parents;
+            w++;
+        }
+    }
+    out->count = w;
+}
+
+void cbm_perl_free_inherit_index(CBMPerlInheritIndex *idx) {
+    if (!idx) {
+        return;
+    }
+    free((void *)idx->module_qns);
+    free((void *)idx->parent_lists);
+    idx->module_qns = NULL;
+    idx->parent_lists = NULL;
+    idx->count = 0;
+}
+
+/* Expand a trailing slash-star workspace-member glob (members = ["crates" +
+ * glob]) by listing the directory and admitting each subdirectory that
+ * contains a Cargo.toml. Uses the cross-platform cbm_opendir wrappers (POSIX
+ * opendir, Windows FindFirstFileW behind one API) — file I/O, no processes. */
+static void pxc_expand_member_globs(const char *repo_path, CBMArena *marena,
+                                    CBMCargoManifest *m) {
+    int original_count = m->member_count;
+    for (int i = 0; i < original_count; i++) {
+        const char *mp = m->members[i].member_path;
+        size_t plen = mp ? strlen(mp) : 0;
+        if (plen < 2 || mp[plen - 1] != '*' || mp[plen - 2] != '/')
+            continue;
+        /* Blank out the glob entry itself (`member_name` was "*"). */
+        m->members[i].member_name = NULL;
+        m->members[i].package_name = NULL;
+        char *prefix = (char *)cbm_arena_strndup(marena, mp, plen - 2); /* "crates" */
+        m->members[i].member_path = NULL;
+        char dirpath[1024];
+        int n = snprintf(dirpath, sizeof(dirpath), "%s/%s", repo_path, prefix);
+        if (n <= 0 || (size_t)n >= sizeof(dirpath))
+            continue;
+        cbm_dir_t *d = cbm_opendir(dirpath);
+        if (!d)
+            continue;
+        cbm_dirent_t *ent;
+        while ((ent = cbm_readdir(d)) != NULL && m->member_count < CBM_CARGO_MAX_MEMBERS) {
+            if (!ent->is_dir || ent->name[0] == '.')
+                continue;
+            char member_toml[1024];
+            n = snprintf(member_toml, sizeof(member_toml), "%s/%s/Cargo.toml", dirpath, ent->name);
+            if (n <= 0 || (size_t)n >= sizeof(member_toml))
+                continue;
+            cbm_path_info_t info;
+            if (cbm_path_info_utf8(member_toml, &info) != 0 || !info.is_regular)
+                continue;
+            CBMCargoMember *mem = &m->members[m->member_count++];
+            mem->member_name = cbm_arena_strdup(marena, ent->name);
+            mem->member_path = cbm_arena_sprintf(marena, "%s/%s", prefix, ent->name);
+            mem->package_name = NULL;
+        }
+        cbm_closedir(d);
+    }
+}
+
+/* Merge each member crate's own Cargo.toml into the root manifest: its
+ * [dependencies] keys become known path heads (the root-only read left every
+ * member-crate dep invisible to routing) and its [package].name is recorded
+ * so integration tests referencing the crate by package name connect. */
+static void pxc_merge_member_manifests(const char *repo_path, CBMArena *marena,
+                                       CBMCargoManifest *m) {
+    for (int i = 0; i < m->member_count && i < CBM_CARGO_MAX_MEMBERS; i++) {
+        if (!m->members[i].member_path)
+            continue;
+        char path[1024];
+        int n = snprintf(path, sizeof(path), "%s/%s/Cargo.toml", repo_path,
+                         m->members[i].member_path);
+        if (n <= 0 || (size_t)n >= sizeof(path))
+            continue;
+        int len = 0;
+        char *toml = pxc_read_file(path, &len);
+        if (!toml || len <= 0) {
+            free(toml);
+            continue;
+        }
+        m->members[i].package_name = cbm_cargo_merge_member_deps(marena, m, toml, len);
+        free(toml);
+    }
 }
 
 bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena,
@@ -1458,7 +1795,61 @@ bool cbm_pxc_build_rust_manifest(const cbm_pipeline_ctx_t *ctx, CBMArena *marena
     memset(out_m, 0, sizeof(*out_m));
     cbm_cargo_parse(marena, toml, toml_len, out_m);
     free(toml); /* cargo parser copies into marena */
+    pxc_expand_member_globs(ctx->repo_path, marena, out_m);
+    pxc_merge_member_manifests(ctx->repo_path, marena, out_m);
     return true;
+}
+
+void cbm_pxc_perl_duck_prepass_driver(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
+                                      int file_count, CBMFileResult **cache, char **def_modules,
+                                      CBMLSPDef *all_defs, int def_count,
+                                      CBMPerlInheritIndex *perl_inherit, CBMArena *arena) {
+    if (!ctx || !files || file_count <= 0 || !cache || !def_modules || !all_defs || def_count <= 0 ||
+        !arena)
+        return;
+    int perl_n = 0;
+    for (int i = 0; i < file_count; i++)
+        if (cache[i] && files[i].language == CBM_LANG_PERL)
+            perl_n++;
+    if (perl_n == 0)
+        return;
+
+    const char **p_src = (const char **)calloc((size_t)perl_n, sizeof(char *));
+    int *p_len = (int *)calloc((size_t)perl_n, sizeof(int));
+    const char **p_mod = (const char **)calloc((size_t)perl_n, sizeof(char *));
+    TSTree **p_tree = (TSTree **)calloc((size_t)perl_n, sizeof(TSTree *));
+    char **p_own = (char **)calloc((size_t)perl_n, sizeof(char *));
+    if (p_src && p_len && p_mod && p_tree && p_own) {
+        int k = 0;
+        for (int i = 0; i < file_count && k < perl_n; i++) {
+            if (!cache[i] || files[i].language != CBM_LANG_PERL)
+                continue;
+            int slen = 0;
+            char *src = pxc_read_file(files[i].path, &slen);
+            if (!src || slen <= 0) {
+                free(src);
+                continue;
+            }
+            if (!def_modules[i])
+                def_modules[i] = cbm_pipeline_fqn_module_dir(ctx->project_name, files[i].rel_path,
+                                                             pxc_module_is_dir(files[i].language));
+            p_own[k] = src;
+            p_src[k] = src;
+            p_len[k] = slen;
+            p_mod[k] = def_modules[i];
+            p_tree[k] = cache[i]->cached_tree;
+            k++;
+        }
+        cbm_perl_duck_prepass(arena, p_src, p_len, p_mod, p_tree, k, all_defs, def_count,
+                              perl_inherit);
+        for (int j = 0; j < k; j++)
+            free(p_own[j]);
+    }
+    free(p_src);
+    free(p_len);
+    free(p_mod);
+    free(p_tree);
+    free(p_own);
 }
 
 int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files,
@@ -1538,6 +1929,24 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         cross_registries.cs = cbm_cs_build_cross_registry(xa, all_defs, def_count);
         cross_registries.ts = cbm_ts_build_cross_registry(xa, all_defs, def_count);
     }
+    /* Perl multi-level @ISA index (borrows def_modules[] + cache perl_isa_parents;
+     * both outlive this pass). Freed after the per-file loop. */
+    CBMPerlInheritIndex perl_inherit;
+    cbm_perl_build_inherit_index(cache, files, file_count, def_modules, &perl_inherit);
+    cross_registries.perl_inherit = &perl_inherit;
+
+    /* Perl cross-file duck-typing pre-pass (shared driver): infer typeless-
+     * accessor return types from project-wide $self/$class usage BEFORE
+     * resolution. Strings live in seq_cross_arena, which outlives this pass. */
+    if (all_defs) {
+        CBMArena *xa = &ctx->seq_cross_arena;
+        if (!ctx->seq_cross_arena_live) {
+            cbm_arena_init(xa);
+            ctx->seq_cross_arena_live = true;
+        }
+        cbm_pxc_perl_duck_prepass_driver(ctx, files, file_count, cache, def_modules, all_defs,
+                                         def_count, &perl_inherit, xa);
+    }
 
     int processed = 0;
     int skipped_no_lsp = 0;
@@ -1587,6 +1996,7 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
         free(source);
     }
 
+    cbm_perl_free_inherit_index(&perl_inherit);
     cbm_pxc_free_module_def_index(module_def_index);
     free(all_defs);
     /* The module-QN strings are borrowed by the shared cross registries in
