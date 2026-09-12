@@ -1355,6 +1355,93 @@ TEST(discover_worktree_committed_gitignore) {
     PASS();
 }
 
+/* ── Enclosing-repo .gitignore tests (issue #510, second half) ──── */
+
+/* repo_path itself has no .git (indexing a git-less subfolder of a larger
+ * repo). The enclosing repo's root .gitignore must still be honored, exactly
+ * as `git status`/`git check-ignore` run from that subfolder would. Before
+ * this fix, resolve_git_common_dir() only ever stat'd repo_path/.git
+ * directly and gave up, so the enclosing repo's rules were silently never
+ * consulted. */
+TEST(discover_enclosing_repo_gitignore_issue510) {
+    char *base = th_mktempdir("cbm_disc_enc_gi");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "secret.py\n");
+    th_write_file(TH_PATH(base, "pkg/secret.py"), "TOKEN = 1\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "keep.py") != NULL);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "secret.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* The enclosing repo's <common>/info/exclude (per-clone, uncommitted) must
+ * be honored the same way once the enclosing root is found, exactly as it
+ * already is for a repo_path that carries its own .git (issue #489). */
+TEST(discover_enclosing_repo_info_exclude) {
+    char *base = th_mktempdir("cbm_disc_enc_exc");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git/info"));
+    th_write_file(TH_PATH(base, ".git/info/exclude"), "scratch/\n");
+    th_write_file(TH_PATH(base, "pkg/main.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/scratch/tmp.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "main.py") != NULL);
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
+/* Precedence: the indexed directory's own .gitignore is more specific than
+ * the enclosing repo's root .gitignore and must still win on conflict,
+ * matching git's shallow-to-deep rule (a later, deeper pattern overrides an
+ * earlier, shallower one). Without this, folding the enclosing root in
+ * ahead of repo_path's own .gitignore in the wrong order would let a root
+ * pattern silently re-ignore a file the subfolder's own .gitignore
+ * un-ignores. */
+TEST(discover_enclosing_repo_gitignore_local_overrides) {
+    char *base = th_mktempdir("cbm_disc_enc_gi_ovr");
+    ASSERT(base != NULL);
+
+    th_mkdir_p(TH_PATH(base, ".git"));
+    th_write_file(TH_PATH(base, ".gitignore"), "*.py\n");
+    th_write_file(TH_PATH(base, "pkg/.gitignore"), "!keep.py\n");
+    th_write_file(TH_PATH(base, "pkg/keep.py"), "pass\n");
+    th_write_file(TH_PATH(base, "pkg/drop.py"), "pass\n");
+
+    cbm_discover_opts_t opts = {0};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    int rc = cbm_discover(TH_PATH(base, "pkg"), &opts, &files, &count);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(count, 1);
+    ASSERT_TRUE(strstr(files[0].rel_path, "keep.py") != NULL);
+    ASSERT_FALSE(discover_has_rel_path(files, count, "drop.py"));
+
+    cbm_discover_free(files, count);
+    th_cleanup(base);
+    PASS();
+}
+
 /* ── Nested .gitignore tests (issue #178) ──────────────────────── */
 
 TEST(discover_nested_gitignore) {
@@ -1970,6 +2057,11 @@ SUITE(discover) {
     /* Linked-worktree ignore resolution (gitlink + commondir) */
     RUN_TEST(discover_worktree_info_exclude);
     RUN_TEST(discover_worktree_committed_gitignore);
+
+    /* Enclosing-repo .gitignore resolution (issue #510, second half) */
+    RUN_TEST(discover_enclosing_repo_gitignore_issue510);
+    RUN_TEST(discover_enclosing_repo_info_exclude);
+    RUN_TEST(discover_enclosing_repo_gitignore_local_overrides);
 
     /* Nested .gitignore tests (issue #178) */
     RUN_TEST(discover_nested_gitignore);

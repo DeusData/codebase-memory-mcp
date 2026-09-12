@@ -1168,6 +1168,37 @@ static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size
     return true;
 }
 
+/* When repo_path itself carries no .git (resolve_git_common_dir already
+ * returned false for it), walk upward looking for an enclosing repository,
+ * exactly as `git` itself would when run from a subfolder. Bounded by the
+ * filesystem/drive root: dir is truncated at each iteration, so the loop
+ * cannot run more times than repo_path is characters long. Returns true and
+ * fills ancestor_root (for the enclosing repo's own .gitignore) plus
+ * common_dir (for its info/exclude + config, via the same resolution
+ * resolve_git_common_dir already applies to an ordinary repo root). Fixes
+ * the remaining half of issue #510: only the indexed directory's own
+ * .gitignore was ever consulted, never an enclosing repo's. */
+static bool resolve_enclosing_git_root(const char *repo_path, char *ancestor_root, size_t ar_sz,
+                                       char *common_dir, size_t cd_sz) {
+    char dir[CBM_SZ_4K];
+    snprintf(dir, sizeof(dir), "%s", repo_path);
+    cbm_normalize_path_sep(dir);
+
+    for (;;) {
+        char *slash = strrchr(dir, '/');
+        /* No separator left, or only the root separator (POSIX "/") or a
+         * bare drive prefix (Windows "C:/"): nothing above this to check. */
+        if (!slash || slash == dir || (slash > dir && *(slash - 1) == ':')) {
+            return false;
+        }
+        *slash = '\0';
+        if (resolve_git_common_dir(dir, common_dir, cd_sz)) {
+            snprintf(ancestor_root, ar_sz, "%s", dir);
+            return true;
+        }
+    }
+}
+
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
     return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL);
@@ -1215,11 +1246,13 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
 
     /* Load gitignore sources for ordinary repos AND linked worktrees.
      * Sources merged in order (later patterns win on conflict):
-     *   1. <repo>/.gitignore     — committed exclusions
-     *   2. <common>/info/exclude — per-clone exclusions, not committed
+     *   1. <enclosing>/.gitignore: enclosing repo's root exclusions, only when
+     *      repo_path itself has no .git of its own (see below)
+     *   2. <repo>/.gitignore: committed exclusions
+     *   3. <common>/info/exclude: per-clone exclusions, not committed
      * <common> is the git common dir, resolved via resolve_git_common_dir() so a
      * worktree (where .git is a gitlink file) reads the shared info/exclude/config
-     * just like a normal checkout. Both are folded into a single matcher so all
+     * just like a normal checkout. All are folded into a single matcher so all
      * downstream call paths remain unchanged. Fixes issue #489: OOM on repos whose
      * worktrees are excluded only via .git/info/exclude (e.g. Sandcastle). */
     cbm_gitignore_t *gitignore = NULL;
@@ -1231,11 +1264,34 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     char git_common_dir[CBM_SZ_4K];
     bool is_git_repo = resolve_git_common_dir(repo_path, git_common_dir, sizeof(git_common_dir));
     bool has_git_config = false;
+    /* repo_path itself is not a git repo root: walk upward for an enclosing one,
+     * exactly as `git` does when run from a subfolder. Its root .gitignore is
+     * loaded FIRST below (least specific), so the indexed directory's own
+     * .gitignore and info/exclude (both more specific) still override it on
+     * conflict. Fixes the remaining half of issue #510: only the indexed
+     * directory's own .gitignore was ever consulted, never an enclosing repo's. */
+    char enclosing_root[CBM_SZ_4K];
+    if (!is_git_repo &&
+        resolve_enclosing_git_root(repo_path, enclosing_root, sizeof(enclosing_root),
+                                   git_common_dir, sizeof(git_common_dir))) {
+        is_git_repo = true;
+        char enclosing_gi_path[CBM_SZ_4K];
+        path_join(enclosing_gi_path, sizeof(enclosing_gi_path), enclosing_root, ".gitignore");
+        gitignore = cbm_gitignore_load(enclosing_gi_path);
+    }
     /* Always honour the .gitignore at the indexed-directory root, even when the
      * directory is not a git repo root (e.g. indexing a sub-package directly).
      * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
     snprintf(gi_path, sizeof(gi_path), "%s/.gitignore", repo_path);
-    gitignore = cbm_gitignore_load(gi_path);
+    cbm_gitignore_t *local_gitignore = cbm_gitignore_load(gi_path);
+    if (local_gitignore) {
+        if (!gitignore) {
+            gitignore = local_gitignore;
+        } else {
+            (void)cbm_gitignore_merge(gitignore, local_gitignore);
+            cbm_gitignore_free(local_gitignore);
+        }
+    }
     if (is_git_repo) {
         path_join(gi_path, sizeof(gi_path), git_common_dir, "config");
         has_git_config = wide_stat(gi_path, &gi_stat) == 0 && S_ISREG(gi_stat.st_mode);
