@@ -792,6 +792,17 @@ int cbm_pipeline_publish_staged(char *stage_path, const cbm_pipeline_generation_
  * executor; the dump path uses it internally). malloc'd, caller frees. */
 char *cbm_pipeline_create_staging_path(const char *final_path);
 
+/* Stage ownership (#1839). Every stage minted by cbm_pipeline_create_staging_path
+ * is owned through an exclusive kernel lock on the sidecar "<stage>.lock" for
+ * as long as the stage exists; the lock -- and the sidecar -- go away when the
+ * stage is discarded or renamed into place, and the kernel drops the lock
+ * when the writer dies. Hold/drop are the same primitive, exposed so a test
+ * can stand in for a live writer. hold returns a descriptor >= 0, or -1 when
+ * another holder is live or the sidecar cannot be created. drop releases the
+ * lock and unlinks the sidecar. */
+int cbm_pipeline_stage_lock_hold(const char *stage_path);
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd);
+
 /* ── Delta-repair staging primitives (pipeline_delta.c) ──────────
  * Closure-route-only subsystem: clone the live generation, patch exactly
  * the repaired node/edge set, publish through the shared finalize leg. */
@@ -897,6 +908,15 @@ void cbm_pipeline_incremental_test_fail_adr_capture_once(void);
 typedef void (*cbm_pipeline_test_hook_fn)(void *userdata);
 void cbm_pipeline_incremental_test_before_final_manifest_once(cbm_pipeline_test_hook_fn hook,
                                                               void *userdata);
+/* Fires from create_staging_path(), right after the stage's main file is
+ * created with O_EXCL. In the current lock-before-visible ordering its sidecar
+ * lock is already held at this point, so a test hook installed here can run a
+ * concurrent sweep (via another cbm_pipeline_run() against the same
+ * final_path) and confirm the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked window, so the hook also
+ * binds RED if that ordering regresses. */
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata);
 cbm_incremental_route_t cbm_pipeline_incremental_test_last_route(void);
 void cbm_pipeline_incremental_test_reset_faults(void);
 
@@ -906,6 +926,7 @@ bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_predump(void);
 bool cbm_pipeline_persist_test_take_cancel_after_destination_prepare(void);
 void cbm_pipeline_persist_test_run_before_final_manifest(void);
+void cbm_pipeline_persist_test_run_after_stage_created(void);
 void cbm_pipeline_persist_test_reset_faults(void);
 #endif
 
