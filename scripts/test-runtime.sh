@@ -105,6 +105,17 @@ _cbm_test_runtime_daemon() {
         CBM_CACHE_DIR="$_CBM_TEST_RUNTIME_PRODUCT_CACHE" "$1" daemon "$2"
 }
 
+# The supervisor resolves one resource policy per index and hands it to the
+# worker in argv; a worker that finds no complete policy refuses to start rather
+# than index unbounded. A shell test that spawns `cli --index-worker` itself
+# stands in for the supervisor and owes the worker the same object. Mirrors
+# cbm_mcp_index_policy_add_to_args: every key in cbm_index_policy_key_at, and
+# nothing else.
+cbm_test_index_worker_policy_json() {
+    printf '%s' '"_cbm_index_policy":{"index_max_files":"off","index_max_source_mb":"off"'
+    printf '%s' ',"index_max_rss_mb":"off","index_max_duration_seconds":"off"}'
+}
+
 cbm_test_runtime_cleanup() {
     local binary="${1:-}" root="$_CBM_TEST_RUNTIME_CREATED_ROOT"
     local name="${_CBM_TEST_RUNTIME_CREATED_ROOT##*/}" runtime_entry="" active=0
