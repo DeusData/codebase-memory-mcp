@@ -7,8 +7,22 @@
 
 $ErrorActionPreference = "Stop"
 
-# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects)
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# Enforce TLS 1.2+ (older PowerShell defaults to TLS 1.0 which GitHub rejects).
+#
+# TLS 1.3 is added ONLY where schannel can actually negotiate it: Windows 11 and
+# Server 2022 (build 20348+). On Windows 10 the enum value still exists from
+# .NET Framework 4.8 onward, so the assignment succeeds and nothing warns -- but
+# the handshake then fails outright with "The request was aborted: Could not
+# create SSL/TLS secure channel". An unsupported protocol flag in this bitmask
+# is a hard failure, not a graceful downgrade, so every Windows 10 user was
+# blocked at the first download (#1856). The enum-name probe additionally keeps
+# the script parsing on .NET Framework 4.7, where Tls13 is not defined at all.
+$CbmProtocols = [Net.SecurityProtocolType]::Tls12
+if ([Environment]::OSVersion.Version.Build -ge 20348 -and
+    ([enum]::GetNames([Net.SecurityProtocolType]) -contains 'Tls13')) {
+    $CbmProtocols = $CbmProtocols -bor [Net.SecurityProtocolType]::Tls13
+}
+[Net.ServicePointManager]::SecurityProtocol = $CbmProtocols
 Add-Type -AssemblyName System.Net.Http
 
 $Repo = "DeusData/codebase-memory-mcp"

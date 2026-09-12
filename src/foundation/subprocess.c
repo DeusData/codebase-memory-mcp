@@ -411,6 +411,7 @@ struct cbm_subprocess {
     void *log_ud;
     int quiet_timeout_ms;
     int cancel_grace_ms;
+    size_t memory_limit_bytes;
     bool delete_log_on_exit;
 
     long tail_pos;
@@ -444,6 +445,9 @@ static void cbm_subprocess_result_init(cbm_proc_result_t *result) {
     result->forced = false;
     result->tree_quiesced = false;
     result->supervision_failed = false;
+    result->job_memory_limit_bytes = 0;
+    result->peak_job_memory_bytes = 0;
+    result->job_memory_available = false;
 }
 
 static void cbm_subprocess_free_config(cbm_subprocess_t *process) {
@@ -525,6 +529,7 @@ static cbm_subprocess_t *cbm_subprocess_copy_opts(const cbm_proc_opts_t *opts) {
     if (process->cancel_grace_ms > CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS) {
         process->cancel_grace_ms = CBM_SUBPROCESS_MAX_CANCEL_GRACE_MS;
     }
+    process->memory_limit_bytes = opts->memory_limit_bytes;
     process->delete_log_on_exit = opts->delete_log_on_exit;
     atomic_init(&process->lifecycle, CBM_SUBPROCESS_ACTIVE);
     cbm_subprocess_result_init(&process->result);
@@ -658,6 +663,10 @@ static int cbm_subprocess_spawn_win(cbm_subprocess_t *process) {
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
     ZeroMemory(&limits, sizeof(limits));
     limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (process->memory_limit_bytes > 0) {
+        limits.BasicLimitInformation.LimitFlags |= JOB_OBJECT_LIMIT_JOB_MEMORY;
+        limits.JobMemoryLimit = (SIZE_T)process->memory_limit_bytes;
+    }
     HANDLE job = CreateJobObjectW(NULL, NULL);
     if (!job ||
         !SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits))) {
@@ -785,6 +794,17 @@ static bool cbm_win_job_active(cbm_subprocess_t *process, bool *known) {
     return accounting.ActiveProcesses != 0;
 }
 
+static void cbm_win_capture_job_memory(cbm_subprocess_t *process) {
+    process->result.job_memory_limit_bytes = process->memory_limit_bytes;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+    ZeroMemory(&limits, sizeof(limits));
+    if (QueryInformationJobObject(process->job, JobObjectExtendedLimitInformation, &limits,
+                                  sizeof(limits), NULL)) {
+        process->result.peak_job_memory_bytes = (size_t)limits.PeakJobMemoryUsed;
+        process->result.job_memory_available = true;
+    }
+}
+
 static void cbm_win_begin_termination(cbm_subprocess_t *process, uint64_t now) {
     if (process->termination_started) {
         return;
@@ -873,9 +893,11 @@ static cbm_proc_poll_t cbm_subprocess_poll_win(cbm_subprocess_t *process, cbm_pr
     if (process->force_started_ms != 0 &&
         now - process->force_started_ms >= CBM_SUBPROCESS_FORCE_SETTLE_MS &&
         (!job_known || job_active || !process->root_reaped)) {
+        cbm_win_capture_job_memory(process);
         return cbm_subprocess_finish_failed(process, out);
     }
     if (process->root_reaped && !job_active) {
+        cbm_win_capture_job_memory(process);
         return cbm_subprocess_finish(process, out);
     }
     return CBM_PROC_POLL_RUNNING;

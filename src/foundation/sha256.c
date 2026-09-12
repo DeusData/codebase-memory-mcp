@@ -25,7 +25,11 @@ static const uint32_t K[64] = {
 #define SIG1(x) (ROTR(x, 17) ^ ROTR(x, 19) ^ ((x) >> 10))
 
 static void sha256_transform(cbm_sha256_ctx *c, const uint8_t *data) {
-    uint32_t m[64];
+    /* Scratch comes from the context, not this frame: a 256-byte local here
+     * is fake-stacked by ASan's use-after-return mode on every 64-byte block
+     * (see the note on cbm_sha256_ctx::sched). Identical values, allocated
+     * once per hash instead of once per block. */
+    uint32_t *m = c->sched;
     for (int i = 0, j = 0; i < 16; i++, j += 4) {
         m[i] = ((uint32_t)data[j] << 24) | ((uint32_t)data[j + 1] << 16) |
                ((uint32_t)data[j + 2] << 8) | (uint32_t)data[j + 3];

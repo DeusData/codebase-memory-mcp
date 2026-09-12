@@ -23,7 +23,9 @@
 #include <foundation/constants.h>
 #include <foundation/log.h>
 #include <foundation/platform.h>
+#include <foundation/sha256.h>
 #include <mcp/mcp.h>
+#include <mcp/index_supervisor.h>
 #include <pipeline/pipeline.h>
 #include <foundation/yaml.h>
 #include <store/store.h>
@@ -36,14 +38,25 @@
 #include <sys/stat.h>
 #include <unistd.h>
 #ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
+#include <poll.h>
+#include <signal.h>
 #endif
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
 #include <errno.h>
 #include <limits.h>
+#include <wchar.h> /* wcscmp/wcslen/swprintf for the Windows user-PATH test (#2117) */
 #include <zlib.h>
+
+/* Same guarded fallback every product TU carries; CI injects the real value
+ * through CFLAGS_EXTRA for product objects and test objects alike. */
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
 
 /* Internal prompt seam used to restore process-global state after command
  * tests that exercise --yes. */
@@ -499,6 +512,14 @@ static bool test_plan_has_hook_for_agent(yyjson_val *root, const char *agent) {
     return false;
 }
 
+static const char test_codex_activation_pointer[] =
+    "For structural codebase exploration, use the installed `codebase-memory` skill.\n";
+
+static const char test_codex_activation_block[] =
+    "<!-- codebase-memory-mcp:start -->\n"
+    "For structural codebase exploration, use the installed `codebase-memory` skill.\n"
+    "<!-- codebase-memory-mcp:end -->\n";
+
 static size_t test_count_substring(const char *text, const char *needle) {
     size_t count = 0U;
     size_t needle_len = strlen(needle);
@@ -711,6 +732,61 @@ static int test_mkdirp(const char *path) {
 static void test_rmdir_r(const char *path) {
     th_rmtree(path);
 }
+
+#ifndef _WIN32
+/* Capture everything a command writes to one fd (stdout or stderr) so a test
+ * can assert on the transcript. Restores the fd on end and returns the text. */
+typedef struct {
+    FILE *file;
+    FILE *stream;
+    int target_fd;
+    int saved_fd;
+    bool redirected;
+} cli_fd_capture_t;
+
+static void cli_fd_capture_begin(cli_fd_capture_t *capture, FILE *stream, int target_fd) {
+    memset(capture, 0, sizeof(*capture));
+    capture->stream = stream;
+    capture->target_fd = target_fd;
+    capture->saved_fd = -1;
+    capture->file = tmpfile();
+    if (!capture->file) {
+        return;
+    }
+    capture->saved_fd = dup(target_fd);
+    if (capture->saved_fd < 0) {
+        return;
+    }
+    fflush(stream);
+    capture->redirected = dup2(fileno(capture->file), target_fd) >= 0;
+}
+
+/* Returns the captured text (heap, "" when nothing was written) or NULL when
+ * the capture never engaged. */
+static char *cli_fd_capture_end(cli_fd_capture_t *capture) {
+    fflush(capture->stream);
+    if (capture->saved_fd >= 0) {
+        (void)dup2(capture->saved_fd, capture->target_fd);
+        close(capture->saved_fd);
+        capture->saved_fd = -1;
+    }
+    char *text = NULL;
+    if (capture->file) {
+        if (capture->redirected) {
+            rewind(capture->file);
+            size_t capacity = 65536U;
+            text = calloc(1U, capacity);
+            if (text) {
+                size_t count = fread(text, 1U, capacity - 1U, capture->file);
+                text[count] = '\0';
+            }
+        }
+        fclose(capture->file);
+        capture->file = NULL;
+    }
+    return text;
+}
+#endif /* !_WIN32 -- POSIX-only fd-capture helpers (#2110) */
 
 /* Mandatory-daemon activation guard fixture. The production path uses the
  * stable per-account endpoint directly; these callbacks make every race
@@ -1206,6 +1282,23 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         test_rmdir_r(tmpdir);
         FAIL("runtime parent setup failed");
     }
+    /* The participant models the daemon of THIS namespace: its cohort
+     * identity carries the fingerprint of the cache the install below
+     * targets, derived as main.c derives it. A foreign cache would (rightly)
+     * be left alone by the scoped guard. */
+    char participant_cache[512];
+    char participant_cache_canonical[1024];
+    char participant_cache_fingerprint[CBM_SHA256_HEX_LEN + 1] = {0};
+    snprintf(participant_cache, sizeof(participant_cache), "%s/cache", tmpdir);
+    if (!cbm_mkdir_p(participant_cache, 0700) ||
+        !cbm_canonical_path(participant_cache, participant_cache_canonical,
+                            sizeof(participant_cache_canonical))) {
+        test_rmdir_r(tmpdir);
+        FAIL("participant cache setup failed");
+    }
+    cbm_normalize_path_sep(participant_cache_canonical);
+    cbm_sha256_hex(participant_cache_canonical, strlen(participant_cache_canonical),
+                   participant_cache_fingerprint);
     int ready_pipe[2] = {-1, -1};
     if (pipe(ready_pipe) != 0) {
         test_rmdir_r(tmpdir);
@@ -1221,7 +1314,7 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
         cbm_daemon_build_identity_t identity = {
             .semantic_version = "cli-activation-test",
             .build_fingerprint = fingerprint,
-            .cache_fingerprint = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            .cache_fingerprint = participant_cache_fingerprint,
             .protocol_abi = CBM_DAEMON_RUNTIME_WIRE_ABI,
             .store_abi = 1,
             .feature_abi = 1,
@@ -1339,6 +1432,609 @@ TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup) {
     ASSERT_TRUE(target_exists);
     ASSERT_TRUE(log_private);
     ASSERT_TRUE(event_order);
+    PASS();
+}
+
+TEST(cli_install_recovers_markerless_stale_rendezvous) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-markerless-rendezvous-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char runtime_parent[512];
+    char cache_dir[512];
+    char install_dir[512];
+    char target_path[640];
+    char activation_log[640];
+    snprintf(runtime_parent, sizeof(runtime_parent), "%s/runtime", tmpdir);
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    snprintf(install_dir, sizeof(install_dir), "%s/custom/bin", tmpdir);
+    snprintf(target_path, sizeof(target_path), "%s/codebase-memory-mcp", install_dir);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson", cache_dir);
+    if (test_mkdirp(runtime_parent) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("runtime parent setup failed");
+    }
+
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    const char *shell = getenv("SHELL");
+    char *old_shell = shell ? strdup(shell) : NULL;
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+
+    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(runtime_parent);
+    const char *socket_path = endpoint ? cbm_daemon_ipc_endpoint_address(endpoint) : NULL;
+    char anchor_path[1024] = {0};
+    size_t socket_length = socket_path ? strlen(socket_path) : 0;
+    bool anchor_path_ok =
+        socket_length > 5 && strcmp(socket_path + socket_length - 5, ".sock") == 0;
+    if (anchor_path_ok) {
+        int written = snprintf(anchor_path, sizeof(anchor_path), "%.*s.anc",
+                               (int)(socket_length - 5), socket_path);
+        anchor_path_ok = written > 0 && written < (int)sizeof(anchor_path);
+    }
+    struct sockaddr_un address;
+    memset(&address, 0, sizeof(address));
+    address.sun_family = AF_UNIX;
+    size_t address_length = socket_path ? strlen(socket_path) : 0;
+    bool address_ok = address_length > 0 && address_length < sizeof(address.sun_path);
+    if (address_ok) {
+        memcpy(address.sun_path, socket_path, address_length + 1);
+    }
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    address.sun_len = (uint8_t)(offsetof(struct sockaddr_un, sun_path) + address_length + 1);
+#endif
+    socklen_t sockaddr_length =
+        (socklen_t)(offsetof(struct sockaddr_un, sun_path) + address_length + 1);
+    int raw_listener = address_ok && anchor_path_ok ? socket(AF_UNIX, SOCK_STREAM, 0) : -1;
+    struct stat socket_status = {0};
+    struct stat anchor_status = {0};
+    bool orphan_created =
+        raw_listener >= 0 &&
+        bind(raw_listener, (const struct sockaddr *)&address, sockaddr_length) == 0 &&
+        chmod(socket_path, 0600) == 0 && listen(raw_listener, 1) == 0 &&
+        link(socket_path, anchor_path) == 0 && lstat(socket_path, &socket_status) == 0 &&
+        lstat(anchor_path, &anchor_status) == 0 && S_ISSOCK(socket_status.st_mode) &&
+        S_ISSOCK(anchor_status.st_mode) && socket_status.st_nlink == 2 &&
+        anchor_status.st_nlink == 2 && socket_status.st_dev == anchor_status.st_dev &&
+        socket_status.st_ino == anchor_status.st_ino;
+    if (raw_listener >= 0) {
+        (void)close(raw_listener);
+    }
+
+    cbm_cli_set_activation_runtime_parent_for_test(runtime_parent);
+    char dir_arg[640];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", install_dir);
+    char *install_argv[] = {"--force", "--skip-config", "--yes", dir_arg};
+    int install_rc = orphan_created ? cli_test_cmd_install(4, install_argv) : -1;
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat target_status = {0};
+    struct stat log_status = {0};
+    struct stat absent_status = {0};
+    bool target_exists = stat(target_path, &target_status) == 0;
+    bool log_private = stat(activation_log, &log_status) == 0 && (log_status.st_mode & 0077) == 0;
+    const char *events = read_test_file(activation_log);
+    const char *requested = events ? strstr(events, "\"phase\":\"requested\"") : NULL;
+    const char *stopped = events ? strstr(events, "\"phase\":\"daemon_stopped\"") : NULL;
+    const char *completed = events ? strstr(events, "\"phase\":\"completed\"") : NULL;
+    bool event_order =
+        requested && stopped && completed && requested < stopped && stopped < completed;
+    errno = 0;
+    bool socket_removed = socket_path && lstat(socket_path, &absent_status) != 0 && errno == ENOENT;
+    errno = 0;
+    bool anchor_removed = lstat(anchor_path, &absent_status) != 0 && errno == ENOENT;
+
+    if (old_shell) {
+        cbm_setenv("SHELL", old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(old_shell);
+    cli_activation_restore_env(old_home, old_cache);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_TRUE(anchor_path_ok);
+    ASSERT_TRUE(address_ok);
+    ASSERT_TRUE(orphan_created);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(target_exists);
+    ASSERT_TRUE(log_private);
+    ASSERT_TRUE(event_order);
+    ASSERT_TRUE(socket_removed);
+    ASSERT_TRUE(anchor_removed);
+    PASS();
+}
+/* ── Activation-guard namespace scope (2026-09-08) ──────────────────
+ * The rendezvous directory is per OS ACCOUNT, never per HOME (service.h):
+ * every daemon of one user meets at one endpoint, and the cohort identity's
+ * cache fingerprint is what separates one HOME / CBM_CACHE_DIR namespace
+ * from another. An `install` into a second HOME (a sandbox, a second
+ * profile) therefore reaches the LIVE host daemon at the shared endpoint —
+ * and used to drain it, disconnecting every MCP client, although nothing
+ * that install touched belonged to the host namespace.
+ *
+ * The fixture models the host the way host.c builds it: a forked process
+ * that admits itself to the cohort with the host cache fingerprint, runs a
+ * real runtime service at the shared endpoint, and exits (releasing the
+ * cohort lease LAST, the real teardown order) once that service has been
+ * drained. The parent keeps one committed client connected to it across the
+ * install under test and asks the daemon itself afterwards. */
+#define CLI_SCOPE_HOST_DRAINED 3
+#define CLI_SCOPE_TIMEOUT_MS 5000U
+/* Generous, BOUNDED waits so a wedged host child (a fork-time sanitizer
+ * allocator stall is the classic cause — see the posix_spawn fix history)
+ * fails the test cleanly instead of hanging the whole suite to the CI
+ * wall-clock kill. Each comfortably exceeds the child's own 45 s cohort
+ * admission deadline plus a multi-second service start/teardown, so none trips
+ * for a merely slow-but-healthy runner; they only convert an otherwise
+ * unbounded hang into a deterministic pass/fail. */
+#define CLI_SCOPE_READY_TIMEOUT_MS 90000U
+#define CLI_SCOPE_HOST_REAP_TIMEOUT_MS 60000U
+#define CLI_SCOPE_HOST_SERVING_TIMEOUT_MS 15000U
+/* Teardown budget for a child the activation ALREADY drained: its service is
+ * gone, so each free/release succeeds immediately and this is only the
+ * give-up point if one unexpectedly does not. The undrained path keeps the
+ * full 2 x CLI_SCOPE_TIMEOUT_MS, which is where a wedged teardown is real. */
+#define CLI_SCOPE_CLEANUP_DRAINED_MS 1000U
+/* Budget for probing that an ALREADY-drained host has stopped serving.
+ *
+ * The generous CLI_SCOPE_HOST_SERVING_TIMEOUT_MS exists for the POSITIVE
+ * question -- "is this daemon still up?" -- where a slow reply on a loaded
+ * runner must not be misread as drained. Asked in the negative it inverts:
+ * there is no reply coming, so the whole budget is spent proving silence, and
+ * the assertion is decided by a timeout expiring rather than by the system's
+ * own behaviour. That was 15 s of the drain test's wall clock and the largest
+ * single idle block in the cli suite.
+ *
+ * The drain is proven POSITIVELY elsewhere in that test: install returns 0
+ * only after the activation completed, and the host child exits with
+ * CLI_SCOPE_HOST_DRAINED. By the time this probe runs the daemon is already
+ * gone, so a short budget confirms the same fact a long one would -- it just
+ * stops charging the suite for the wait. */
+#define CLI_SCOPE_HOST_DRAINED_PROBE_MS 2000U
+
+typedef struct {
+    char tmpdir[256];
+    char runtime_parent[512];
+    char host_home[512];
+    char host_cache[512];
+    char host_cache_fingerprint[CBM_SHA256_HEX_LEN + 1];
+    char self_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char previous_supervisor_build[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    char conflict_log[640];
+    cbm_daemon_build_identity_t identity;
+    cbm_daemon_ipc_endpoint_t *endpoint;
+    cbm_daemon_runtime_client_t *client;
+    pid_t host;
+    int release_fd;
+    char *old_home;
+    char *old_cache;
+    char *old_shell;
+} cli_scope_fixture_t;
+
+static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, int ready_fd,
+                                           int release_fd) {
+    cbm_daemon_ipc_endpoint_t *endpoint =
+        cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
+    cbm_version_cohort_manager_t *manager =
+        endpoint ? cbm_version_cohort_manager_new(endpoint) : NULL;
+    cbm_version_cohort_lease_t *lease = NULL;
+    cbm_daemon_conflict_t conflict;
+    cbm_daemon_runtime_service_t *service = NULL;
+    bool admitted = endpoint && manager &&
+                    cbm_version_cohort_acquire(manager, &fixture->identity, cbm_now_ms() + 45000U,
+                                               &lease, &conflict) == CBM_VERSION_COHORT_OK;
+    if (admitted) {
+        cbm_daemon_runtime_service_config_t config = {
+            .endpoint = endpoint,
+            .identity = fixture->identity,
+            .conflict_log_path = fixture->conflict_log,
+            .conflict_log_cap_bytes = 64U * 1024U,
+            .max_clients = 8,
+            .lease_timeout_ms = CLI_SCOPE_TIMEOUT_MS,
+            .request_timeout_ms = CLI_SCOPE_TIMEOUT_MS,
+            .shutdown_timeout_ms = CLI_SCOPE_TIMEOUT_MS,
+            /* Born permanent: only a drain/stop ends it, never the parent's
+             * client leaving, so "still alive" is a statement about the
+             * drain alone. */
+            .permanent = true,
+        };
+        service = cbm_daemon_runtime_service_start(&config);
+    }
+    bool ready_ok =
+        service && cbm_daemon_runtime_service_state(service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    char ready = ready_ok ? 'R' : 'E';
+    (void)write(ready_fd, &ready, 1);
+    close(ready_fd);
+    bool drained = false;
+    uint64_t deadline = cbm_now_ms() + 120000U;
+    while (ready_ok && cbm_now_ms() < deadline) {
+        if (cbm_daemon_runtime_service_wait_exited(service, 50U)) {
+            drained = true;
+            break;
+        }
+        struct pollfd release_poll = {.fd = release_fd, .events = POLLIN, .revents = 0};
+        if (poll(&release_poll, 1, 0) > 0) {
+            break;
+        }
+    }
+    /* A DRAINED child has already had its service torn down by the activation,
+     * so every teardown below succeeds on the first attempt; the long deadline
+     * exists for the wedged case, where we keep retrying before giving up. On
+     * the drained path that budget was pure wall clock -- the parent sits in
+     * cli_scope_reap_host waiting for this exit, and it was the single largest
+     * idle block in the whole cli suite. Behaviour at the deadline is
+     * unchanged (give up and _exit); it is simply reached sooner when there is
+     * nothing wedged to wait for. */
+    uint64_t cleanup_deadline =
+        cbm_now_ms() + (drained ? CLI_SCOPE_CLEANUP_DRAINED_MS : 2U * CLI_SCOPE_TIMEOUT_MS);
+    if (service) {
+        if (!drained) {
+            (void)cbm_daemon_runtime_service_stop(service, CLI_SCOPE_TIMEOUT_MS);
+        }
+        while (!cbm_daemon_runtime_service_free(service) && cbm_now_ms() < cleanup_deadline) {
+            cbm_usleep(1000);
+        }
+    }
+    while (lease && cbm_version_cohort_lease_release(&lease) != CBM_PRIVATE_FILE_LOCK_OK &&
+           cbm_now_ms() < cleanup_deadline) {
+        cbm_usleep(1000);
+    }
+    while (manager && cbm_version_cohort_manager_free(&manager) != CBM_PRIVATE_FILE_LOCK_OK &&
+           cbm_now_ms() < cleanup_deadline) {
+        cbm_usleep(1000);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    close(release_fd);
+    _exit(!ready_ok ? 1 : drained ? CLI_SCOPE_HOST_DRAINED : 0);
+}
+
+/* Bounded read of the host child's one-byte readiness signal. A child that
+ * deadlocks before it can write (a fork-time allocator stall under a sanitizer
+ * is the classic cause) must never hang the whole suite on an unbounded read:
+ * poll to a generous deadline, then let the caller's ASSERT_TRUE(ready) fail
+ * cleanly. Returns the byte, or 0 when the child died, closed the pipe, or
+ * never answered in time. */
+static char cli_scope_wait_ready(int fd, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    for (;;) {
+        int64_t remaining = (int64_t)deadline - (int64_t)cbm_now_ms();
+        if (remaining <= 0) {
+            return 0;
+        }
+        struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
+        int r = poll(&pfd, 1, (int)remaining);
+        if (r < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            return 0;
+        }
+        if (r == 0) {
+            return 0; /* deadline reached with no signal */
+        }
+        char ready = 0;
+        ssize_t got = read(fd, &ready, 1);
+        if (got == 1) {
+            return ready;
+        }
+        if (got < 0 && errno == EINTR) {
+            continue;
+        }
+        return 0; /* EOF (child gone) or error */
+    }
+}
+
+/* Reap the host child within a bound: the release signal makes a healthy child
+ * break within ~50 ms and finish teardown in a few seconds, so a child still
+ * alive past the deadline is wedged — SIGKILL it and reap so the suite always
+ * makes progress. Returns the child's exit code, or -1 when it had to be
+ * killed or did not exit cleanly; a -1 fails the caller's host_exit assertion
+ * cleanly rather than hanging. */
+static int cli_scope_reap_host(pid_t host, uint32_t timeout_ms) {
+    uint64_t deadline = cbm_now_ms() + timeout_ms;
+    int status = 0;
+    for (;;) {
+        pid_t reaped = waitpid(host, &status, WNOHANG);
+        if (reaped == host) {
+            return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+        }
+        if (reaped < 0 && errno != EINTR) {
+            return -1;
+        }
+        if (cbm_now_ms() >= deadline) {
+            (void)kill(host, SIGKILL);
+            (void)waitpid(host, &status, 0);
+            return -1;
+        }
+        cbm_usleep(2000);
+    }
+}
+
+static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *tag) {
+    memset(fixture, 0, sizeof(*fixture));
+    fixture->host = -1;
+    fixture->release_fd = -1;
+    snprintf(fixture->tmpdir, sizeof(fixture->tmpdir), "/tmp/cli-guard-scope-%s-XXXXXX", tag);
+    if (!cbm_mkdtemp(fixture->tmpdir)) {
+        return false;
+    }
+    snprintf(fixture->runtime_parent, sizeof(fixture->runtime_parent), "%s/runtime",
+             fixture->tmpdir);
+    snprintf(fixture->host_home, sizeof(fixture->host_home), "%s/host", fixture->tmpdir);
+    snprintf(fixture->host_cache, sizeof(fixture->host_cache), "%s/cache", fixture->host_home);
+    snprintf(fixture->conflict_log, sizeof(fixture->conflict_log), "%s/conflicts.ndjson",
+             fixture->host_home);
+    /* The host identity's cache fingerprint is derived exactly as main.c does
+     * for a real daemon: resolved dir -> canonical path -> SHA-256. */
+    char canonical_cache[1024];
+    if (test_mkdirp(fixture->runtime_parent) != 0 || !cbm_mkdir_p(fixture->host_cache, 0700) ||
+        !cbm_canonical_path(fixture->host_cache, canonical_cache, sizeof(canonical_cache))) {
+        return false;
+    }
+    cbm_normalize_path_sep(canonical_cache);
+    cbm_sha256_hex(canonical_cache, strlen(canonical_cache), fixture->host_cache_fingerprint);
+    if (!cbm_daemon_runtime_process_build_fingerprint((uint64_t)getpid(), fixture->self_build)) {
+        return false;
+    }
+    /* The guard claims the supervisor's captured build; the runner stubs that
+     * capture while a runtime service must carry the real image hash. Align
+     * the two for this fixture exactly as one production process has them. */
+    const char *previous_supervisor_build = cbm_index_supervisor_build_fingerprint();
+    snprintf(fixture->previous_supervisor_build, sizeof(fixture->previous_supervisor_build), "%s",
+             previous_supervisor_build ? previous_supervisor_build : "");
+    cbm_index_supervisor_set_build_fingerprint_for_test(fixture->self_build);
+    fixture->identity = (cbm_daemon_build_identity_t){
+        .semantic_version = CBM_VERSION,
+        .build_fingerprint = fixture->self_build,
+        .cache_fingerprint = fixture->host_cache_fingerprint,
+        .protocol_abi = CBM_DAEMON_RUNTIME_WIRE_ABI,
+        .store_abi = 1,
+        .feature_abi = 1,
+    };
+    int ready_pipe[2] = {-1, -1};
+    int release_pipe[2] = {-1, -1};
+    if (pipe(ready_pipe) != 0) {
+        return false;
+    }
+    if (pipe(release_pipe) != 0) {
+        close(ready_pipe[0]);
+        close(ready_pipe[1]);
+        return false;
+    }
+    pid_t child = fork();
+    if (child == 0) {
+        close(ready_pipe[0]);
+        close(release_pipe[1]);
+        cli_scope_host_child(fixture, ready_pipe[1], release_pipe[0]);
+    }
+    close(ready_pipe[1]);
+    close(release_pipe[0]);
+    char ready = child > 0 ? cli_scope_wait_ready(ready_pipe[0], CLI_SCOPE_READY_TIMEOUT_MS) : 0;
+    bool host_ready = ready == 'R';
+    close(ready_pipe[0]);
+    fixture->host = child;
+    fixture->release_fd = release_pipe[1];
+    cli_activation_save_env(&fixture->old_home, &fixture->old_cache);
+    const char *shell = getenv("SHELL");
+    fixture->old_shell = shell ? strdup(shell) : NULL;
+    cbm_setenv("SHELL", "/bin/zsh", 1);
+    if (!host_ready) {
+        return false;
+    }
+    fixture->endpoint = cbm_daemon_bootstrap_endpoint_new(fixture->runtime_parent);
+    cbm_daemon_runtime_connect_result_t connect_result = {0};
+    fixture->client = fixture->endpoint
+                          ? cbm_daemon_runtime_client_connect(fixture->endpoint, &fixture->identity,
+                                                              CLI_SCOPE_TIMEOUT_MS, &connect_result)
+                          : NULL;
+    return fixture->client != NULL;
+}
+
+static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture,
+                                          uint32_t timeout_ms) {
+    cbm_daemon_runtime_status_t status = {0};
+    return fixture->endpoint &&
+           cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
+                                             &status) &&
+           !status.stopping && status.committed_clients == 1;
+}
+
+/* Ask the host daemon itself: still running, not stopping, and the parent's
+ * committed client still admitted. */
+static bool cli_scope_host_serving(const cli_scope_fixture_t *fixture) {
+    /* A generous, bounded status deadline: a foreign-namespace install leaves
+     * this daemon serving, so a slow response on a loaded runner must not be
+     * misread as "drained" (the flaky failure this fixture showed). The call
+     * still fails cleanly — a genuinely drained daemon is unreachable or
+     * reports stopping — it just no longer decides survival on a 5 s budget. */
+    return cli_scope_host_serving_within(fixture, CLI_SCOPE_HOST_SERVING_TIMEOUT_MS);
+}
+
+static int cli_scope_install(cli_scope_fixture_t *fixture, const char *home, const char *cache,
+                             const char *bin_dir, bool skip_binary) {
+    cbm_setenv("HOME", home, 1);
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_cli_set_activation_runtime_parent_for_test(fixture->runtime_parent);
+    char dir_arg[704];
+    snprintf(dir_arg, sizeof(dir_arg), "--dir=%s", bin_dir);
+    char *install_argv[] = {skip_binary ? "--skip-binary" : "--force", "--skip-config", "--yes",
+                            dir_arg};
+    int rc = cli_test_cmd_install(4, install_argv);
+    cbm_cli_set_activation_runtime_parent_for_test(g_cli_suite_runtime_parent);
+    cbm_set_auto_answer_for_test(0);
+    return rc;
+}
+
+/* Returns the host child's exit status: 0 released intact,
+ * CLI_SCOPE_HOST_DRAINED when an activation drained it, -1 unknown. */
+static int cli_scope_fixture_finish(cli_scope_fixture_t *fixture) {
+    if (fixture->client) {
+        (void)cbm_daemon_runtime_client_close(fixture->client, CLI_SCOPE_TIMEOUT_MS);
+        fixture->client = NULL;
+    }
+    if (fixture->release_fd >= 0) {
+        /* Closing the write end is the signal (the child's poll sees POLLHUP);
+         * a write would raise SIGPIPE once a drained child is already gone. */
+        close(fixture->release_fd);
+        fixture->release_fd = -1;
+    }
+    int host_exit = -1;
+    if (fixture->host > 0) {
+        host_exit = cli_scope_reap_host(fixture->host, CLI_SCOPE_HOST_REAP_TIMEOUT_MS);
+        fixture->host = -1;
+    }
+    cbm_daemon_ipc_endpoint_free(fixture->endpoint);
+    fixture->endpoint = NULL;
+    if (fixture->previous_supervisor_build[0]) {
+        cbm_index_supervisor_set_build_fingerprint_for_test(fixture->previous_supervisor_build);
+    }
+    if (fixture->old_shell) {
+        cbm_setenv("SHELL", fixture->old_shell, 1);
+    } else {
+        cbm_unsetenv("SHELL");
+    }
+    free(fixture->old_shell);
+    fixture->old_shell = NULL;
+    cli_activation_restore_env(fixture->old_home, fixture->old_cache);
+    fixture->old_home = NULL;
+    fixture->old_cache = NULL;
+    test_rmdir_r(fixture->tmpdir);
+    return host_exit;
+}
+
+static void cli_scope_foreign_paths(const cli_scope_fixture_t *fixture, char home[512],
+                                    char cache[576], char bin_dir[640], char activation_log[704]) {
+    snprintf(home, 512, "%s/sandbox", fixture->tmpdir);
+    snprintf(cache, 576, "%s/cache", home);
+    snprintf(bin_dir, 640, "%s/custom/bin", home);
+    snprintf(activation_log, 704, "%s/logs/activation-events.ndjson", cache);
+}
+
+/* (a) `HOME=<sandbox> install --skip-binary` — the observed incident shape:
+ * the sandbox shares the account rendezvous, its cache namespace differs. */
+TEST(cli_install_skip_binary_into_foreign_home_never_drains_host_cohort) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "skipbin");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    bool prepared = ready && cbm_mkdir_p(foreign_home, 0700);
+    int install_rc =
+        prepared ? cli_scope_install(&fixture, foreign_home, foreign_cache, foreign_bin, true) : -1;
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* (b) A full install (binary published into the sandbox bin dir) is scoped
+ * the same way: the host namespace is not what is being replaced. */
+TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "binary");
+    char foreign_home[512];
+    char foreign_cache[576];
+    char foreign_bin[640];
+    char activation_log[704];
+    cli_scope_foreign_paths(&fixture, foreign_home, foreign_cache, foreign_bin, activation_log);
+    char target_path[704];
+    snprintf(target_path, sizeof(target_path), "%s/codebase-memory-mcp", foreign_bin);
+    bool prepared = ready && cbm_mkdir_p(foreign_home, 0700);
+    int install_rc =
+        prepared ? cli_scope_install(&fixture, foreign_home, foreign_cache, foreign_bin, false)
+                 : -1;
+    bool host_serving = prepared && cli_scope_host_serving(&fixture);
+    struct stat target_status;
+    bool target_exists = stat(target_path, &target_status) == 0;
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(target_exists);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
+    PASS();
+}
+
+/* (c) Regression: an install that replaces the binary inside the host's own
+ * namespace still drains that cohort — and the audit names its client. */
+TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "host");
+    char host_bin[640];
+    char activation_log[704];
+    snprintf(host_bin, sizeof(host_bin), "%s/custom/bin", fixture.host_home);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson",
+             fixture.host_cache);
+    int install_rc =
+        ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, host_bin, false)
+              : -1;
+    /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
+     * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
+    bool host_serving = ready && cli_scope_host_serving_within(&fixture,
+                                                               CLI_SCOPE_HOST_DRAINED_PROBE_MS);
+    const char *events = read_test_file(activation_log);
+    bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
+                          strstr(events, "\"daemon_active_clients\":1") != NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_FALSE(host_serving);
+    ASSERT_EQ(host_exit, CLI_SCOPE_HOST_DRAINED);
+    ASSERT_TRUE(drained_in_log);
+    PASS();
+}
+
+/* (d) `--skip-binary` with nothing to publish (no binary at the target, no
+ * index reset) replaces nothing, so even the host's own namespace has
+ * nothing to quiesce: agent configs are refreshed, sessions stay up. */
+TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing) {
+    cli_scope_fixture_t fixture;
+    bool ready = cli_scope_fixture_start(&fixture, "unchanged");
+    char absent_bin[640];
+    char activation_log[704];
+    snprintf(absent_bin, sizeof(absent_bin), "%s/absent/bin", fixture.host_home);
+    snprintf(activation_log, sizeof(activation_log), "%s/logs/activation-events.ndjson",
+             fixture.host_cache);
+    int install_rc =
+        ready ? cli_scope_install(&fixture, fixture.host_home, fixture.host_cache, absent_bin, true)
+              : -1;
+    bool host_serving = ready && cli_scope_host_serving(&fixture);
+    const char *events = read_test_file(activation_log);
+    bool completed = events && strstr(events, "\"phase\":\"completed\"") != NULL;
+    bool nothing_drained = events && strstr(events, "cohort drained") == NULL;
+    int host_exit = cli_scope_fixture_finish(&fixture);
+
+    ASSERT_TRUE(ready);
+    ASSERT_EQ(install_rc, 0);
+    ASSERT_TRUE(host_serving);
+    ASSERT_EQ(host_exit, 0);
+    ASSERT_TRUE(completed);
+    ASSERT_TRUE(nothing_drained);
     PASS();
 }
 #endif
@@ -1540,6 +2236,53 @@ TEST(cli_install_reset_deletion_waits_for_final_activation_guard) {
     ASSERT_EQ(fake.mutation_reserve_count, 1);
     ASSERT_EQ(fake.mutation_lease_release_count, 0);
     ASSERT_TRUE(fake.diagnostic[0] != '\0');
+    PASS();
+}
+
+/* Removing an index must also delete its SQLite sidecars (-wal/-shm/-journal),
+ * not just the .db. cbm_remove_indexes is the single deletion chokepoint for
+ * both explicit deleters (install --reset-indexes, uninstall), so an orphan
+ * -wal/-shm left behind here outlives the index everywhere. Reporter ask (c)
+ * on issue #2054. */
+TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-remove-indexes-sidecars-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    char db_path[640];
+    char wal_path[640];
+    char shm_path[640];
+    snprintf(db_path, sizeof(db_path), "%s/proj.db", cache_dir);
+    snprintf(wal_path, sizeof(wal_path), "%s/proj.db-wal", cache_dir);
+    snprintf(shm_path, sizeof(shm_path), "%s/proj.db-shm", cache_dir);
+    write_test_file(db_path, "db");
+    write_test_file(wal_path, "wal");
+    write_test_file(shm_path, "shm");
+
+    int rc = cbm_remove_indexes(tmpdir);
+
+    struct stat st;
+    bool db_absent = stat(db_path, &st) != 0;
+    bool wal_absent = stat(wal_path, &st) != 0;
+    bool shm_absent = stat(shm_path, &st) != 0;
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    /* One .db removed; sidecars are not indexes, so the count is unchanged. */
+    ASSERT_EQ(rc, 1);
+    ASSERT_TRUE(db_absent);
+    ASSERT_TRUE(wal_absent);
+    ASSERT_TRUE(shm_absent);
     PASS();
 }
 
@@ -2151,6 +2894,181 @@ TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain) {
     PASS();
 }
 
+#ifndef _WIN32
+/* #1954: an agent config that cannot be cleaned must not hold the executable
+ * and the indexes hostage. The fixture's ~/.cursor/mcp.json is a dangling
+ * symlink (a dotfiles checkout that moved) — a shape every config editor keeps
+ * refusing. Before the fix the cleanup failure aborted the activation BEFORE
+ * index and binary removal: `uninstall -y` exited 1 and left a 300 MB binary
+ * plus the whole cache behind, while the report still read "removed". */
+TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-hostage-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    /* PATH moves with HOME so no real agent on the developer's PATH is detected. */
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index must go even when a config cannot be cleaned");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(bin_target, "binary must go even when a config cannot be cleaned");
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    char dangling_target[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    test_mkdirp(cursor_dir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    snprintf(dangling_target, sizeof(dangling_target), "%s/.dotfiles/cursor/mcp.json", tmpdir);
+    if (symlink(dangling_target, cursor_config) != 0) {
+        FAIL("symlink failed");
+    }
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cli_fd_capture_t out_capture;
+    cli_fd_capture_t err_capture;
+    cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
+    cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    char *err_text = cli_fd_capture_end(&err_capture);
+    char *out_text = cli_fd_capture_end(&out_capture);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat state;
+    bool binary_gone = lstat(bin_target, &state) != 0 && errno == ENOENT;
+    bool index_gone = lstat(index_path, &state) != 0 && errno == ENOENT;
+    bool link_untouched = lstat(cursor_config, &state) == 0 && S_ISLNK(state.st_mode);
+    bool failure_named = err_text && strstr(err_text, cursor_config) != NULL;
+
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+    free(err_text);
+    free(out_text);
+
+    ASSERT(rc != 0);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(index_gone);
+    ASSERT_TRUE(link_untouched);
+    ASSERT_TRUE(failure_named);
+    PASS();
+}
+
+/* #1954 end to end: ~/.cursor/mcp.json is a user-owned symlink into a
+ * dotfiles checkout. The uninstall command opts in to following it, removes
+ * our entry THROUGH the link, leaves the link pointing where it did, and
+ * exits 0 with the binary and the index gone. */
+TEST(cli_uninstall_cleans_user_owned_symlinked_config) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-uninstall-symlinked-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char *old_path = save_test_env("PATH");
+    cbm_setenv("PATH", tmpdir, 1);
+
+    char cache_dir[512];
+    char index_path[640];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+    snprintf(index_path, sizeof(index_path), "%s/project.db", cache_dir);
+    write_test_file(index_path, "index goes with the uninstall");
+
+    char bin_dir[512];
+    char bin_target[640];
+    snprintf(bin_dir, sizeof(bin_dir), "%s/.local/bin", tmpdir);
+    test_mkdirp(bin_dir);
+    snprintf(bin_target, sizeof(bin_target), "%s/codebase-memory-mcp", bin_dir);
+    write_test_file(bin_target, "binary goes with the uninstall");
+
+    char cursor_dir[512];
+    char cursor_config[640];
+    char dotfiles_dir[512];
+    char dotfiles_config[640];
+    snprintf(cursor_dir, sizeof(cursor_dir), "%s/.cursor", tmpdir);
+    snprintf(cursor_config, sizeof(cursor_config), "%s/mcp.json", cursor_dir);
+    snprintf(dotfiles_dir, sizeof(dotfiles_dir), "%s/.dotfiles/cursor", tmpdir);
+    snprintf(dotfiles_config, sizeof(dotfiles_config), "%s/mcp.json", dotfiles_dir);
+    test_mkdirp(cursor_dir);
+    test_mkdirp(dotfiles_dir);
+    write_test_file(dotfiles_config,
+                    "{\n  \"mcpServers\": {\n    \"keep\": {\"command\": \"x\"}\n  }\n}\n");
+    int installed = cbm_install_editor_mcp(bin_target, dotfiles_config);
+    if (symlink(dotfiles_config, cursor_config) != 0) {
+        FAIL("symlink failed");
+    }
+
+    cli_activation_fake_t fake = {.mutation_reserve_result = 1};
+    cbm_cli_activation_ops_t ops = cli_activation_fake_ops(&fake);
+    cbm_cli_set_activation_ops_for_test(&ops);
+    cli_fd_capture_t out_capture;
+    cli_fd_capture_t err_capture;
+    cli_fd_capture_begin(&out_capture, stdout, STDOUT_FILENO);
+    cli_fd_capture_begin(&err_capture, stderr, STDERR_FILENO);
+    char *argv[] = {"--yes"};
+    int rc = cli_test_cmd_uninstall(1, argv);
+    char *err_text = cli_fd_capture_end(&err_capture);
+    char *out_text = cli_fd_capture_end(&out_capture);
+    cbm_cli_set_activation_ops_for_test(NULL);
+    cbm_set_auto_answer_for_test(0);
+
+    struct stat state;
+    bool binary_gone = lstat(bin_target, &state) != 0 && errno == ENOENT;
+    bool index_gone = lstat(index_path, &state) != 0 && errno == ENOENT;
+    bool link_intact = lstat(cursor_config, &state) == 0 && S_ISLNK(state.st_mode);
+    char link_value[640] = {0};
+    ssize_t link_length = readlink(cursor_config, link_value, sizeof(link_value) - 1U);
+    bool link_same = link_length > 0 && strcmp(link_value, dotfiles_config) == 0;
+    char *after = read_test_file_alloc(dotfiles_config);
+    bool entry_removed =
+        after && !strstr(after, "codebase-memory-mcp") && strstr(after, "\"keep\"");
+    bool no_error = err_text && !strstr(err_text, "error:");
+
+    cli_activation_restore_env(old_home, old_cache);
+    restore_test_env("PATH", old_path);
+    test_rmdir_r(tmpdir);
+    free(after);
+    free(err_text);
+    free(out_text);
+
+    ASSERT_EQ(installed, 0);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(binary_gone);
+    ASSERT_TRUE(index_gone);
+    ASSERT_TRUE(link_intact);
+    ASSERT_TRUE(link_same);
+    ASSERT_TRUE(entry_removed);
+    ASSERT_TRUE(no_error);
+    PASS();
+}
+#endif
+
 TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan) {
     char tmpdir[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-daemon-stateless-XXXXXX");
@@ -2738,11 +3656,11 @@ TEST(cli_skill_files_content) {
 }
 
 TEST(cli_codex_instructions) {
-    /* Port of TestCodexInstructionsCreation */
     const char *instr = cbm_get_codex_instructions();
     ASSERT_NOT_NULL(instr);
-    ASSERT(strstr(instr, "Codebase Knowledge Graph") != NULL);
-    ASSERT(strstr(instr, "trace_path") != NULL);
+    ASSERT_STR_EQ(instr, test_codex_activation_pointer);
+    ASSERT_NULL(strstr(instr, "search_graph"));
+    ASSERT_NULL(strstr(instr, "trace_path"));
     PASS();
 }
 
@@ -3689,6 +4607,251 @@ TEST(cli_openclaw_uninstall_removes_compaction_when_workspace_is_ambiguous) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════
+ *  OpenHands settings.json + agent-profiles registration (#1826)
+ *
+ *  A bare ~/.openhands/mcp.json is not enough: OpenHands registers global MCP
+ *  servers under settings.json → mcp_config, and every agent profile under
+ *  agent-profiles/ must list the server in mcp_server_refs before that agent
+ *  may use it. Foreign content survives byte-for-byte; uninstall removes
+ *  exactly what install added.
+ * ═══════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    char home[256];
+    char binary[512]; /* the path `uninstall` expects: <home>/.local/bin/... */
+    char settings[640];
+    char mcp[640];
+    char profiles_dir[640];
+    char default_profile[768];
+    char custom_profile[768];
+    char note[768];
+    char *saved_home;
+    char *saved_path;
+    char *saved_cache;
+} openhands_fixture_t;
+
+static bool openhands_fixture_open(openhands_fixture_t *fx, bool with_profiles) {
+    snprintf(fx->home, sizeof(fx->home), "/tmp/cli-openhands-XXXXXX");
+    if (!cbm_mkdtemp(fx->home)) {
+        return false;
+    }
+    snprintf(fx->settings, sizeof(fx->settings), "%s/.openhands/settings.json", fx->home);
+#ifdef _WIN32
+    snprintf(fx->binary, sizeof(fx->binary), "%s/.local/bin/codebase-memory-mcp.exe", fx->home);
+#else
+    snprintf(fx->binary, sizeof(fx->binary), "%s/.local/bin/codebase-memory-mcp", fx->home);
+#endif
+    snprintf(fx->mcp, sizeof(fx->mcp), "%s/.openhands/mcp.json", fx->home);
+    snprintf(fx->profiles_dir, sizeof(fx->profiles_dir), "%s/.openhands/agent-profiles", fx->home);
+    snprintf(fx->default_profile, sizeof(fx->default_profile), "%s/default.json", fx->profiles_dir);
+    snprintf(fx->custom_profile, sizeof(fx->custom_profile), "%s/custom.json", fx->profiles_dir);
+    snprintf(fx->note, sizeof(fx->note), "%s/README.txt", fx->profiles_dir);
+    char openhands_dir[512];
+    snprintf(openhands_dir, sizeof(openhands_dir), "%s/.openhands", fx->home);
+    test_mkdirp(with_profiles ? fx->profiles_dir : openhands_dir);
+    fx->saved_home = save_test_env("HOME");
+    fx->saved_path = save_test_env("PATH");
+    fx->saved_cache = save_test_env("CBM_CACHE_DIR");
+    cbm_setenv("HOME", fx->home, 1);
+    cbm_setenv("PATH", fx->home, 1);
+    cbm_unsetenv("CBM_CACHE_DIR");
+    return true;
+}
+
+static void openhands_fixture_close(openhands_fixture_t *fx) {
+    restore_test_env("HOME", fx->saved_home);
+    restore_test_env("PATH", fx->saved_path);
+    restore_test_env("CBM_CACHE_DIR", fx->saved_cache);
+    test_rmdir_r(fx->home);
+}
+
+static yyjson_doc *openhands_read_doc(const char *path) {
+    char *data = read_test_file_alloc(path);
+    if (!data) {
+        return NULL;
+    }
+    yyjson_doc *doc = yyjson_read(data, strlen(data), 0);
+    free(data);
+    return doc;
+}
+
+/* settings.json → mcp_config.<name> must be {transport:"stdio", command:<binary>,
+ * enabled:true}; returns false for any deviation. */
+static bool openhands_settings_entry_ok(const char *settings_path, const char *name,
+                                        const char *binary) {
+    yyjson_doc *doc = openhands_read_doc(settings_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *mcp_config = root ? yyjson_obj_get(root, "mcp_config") : NULL;
+    yyjson_val *entry = mcp_config ? yyjson_obj_get(mcp_config, name) : NULL;
+    bool ok = entry && yyjson_is_obj(entry) && yyjson_obj_size(entry) == 3U;
+    yyjson_val *transport = ok ? yyjson_obj_get(entry, "transport") : NULL;
+    yyjson_val *command = ok ? yyjson_obj_get(entry, "command") : NULL;
+    yyjson_val *enabled = ok ? yyjson_obj_get(entry, "enabled") : NULL;
+    ok = ok && transport && yyjson_is_str(transport) &&
+         strcmp(yyjson_get_str(transport), "stdio") == 0;
+    ok = ok && command && yyjson_is_str(command) && strcmp(yyjson_get_str(command), binary) == 0;
+    ok = ok && enabled && yyjson_is_true(enabled);
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+static bool openhands_settings_entry_absent(const char *settings_path, const char *name) {
+    yyjson_doc *doc = openhands_read_doc(settings_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *mcp_config = root ? yyjson_obj_get(root, "mcp_config") : NULL;
+    bool absent = root && (!mcp_config || !yyjson_obj_get(mcp_config, name));
+    yyjson_doc_free(doc);
+    return absent;
+}
+
+/* profile → mcp_server_refs must be exactly the given strings in order. */
+static bool openhands_profile_refs_equal(const char *profile_path, const char *const *expected,
+                                         size_t expected_count) {
+    yyjson_doc *doc = openhands_read_doc(profile_path);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *refs = root ? yyjson_obj_get(root, "mcp_server_refs") : NULL;
+    bool ok = refs && yyjson_is_arr(refs) && yyjson_arr_size(refs) == expected_count;
+    for (size_t i = 0; ok && i < expected_count; i++) {
+        yyjson_val *item = yyjson_arr_get(refs, i);
+        ok = item && yyjson_is_str(item) && strcmp(yyjson_get_str(item), expected[i]) == 0;
+    }
+    yyjson_doc_free(doc);
+    return ok;
+}
+
+static bool openhands_file_equals(const char *path, const char *expected) {
+    char *data = read_test_file_alloc(path);
+    bool equal = data && expected && strcmp(data, expected) == 0;
+    free(data);
+    return equal;
+}
+
+static const char openhands_settings_before[] = "{\n"
+                                                "  \"language\": \"en\",\n"
+                                                "  \"mcp_config\": {\n"
+                                                "    \"other-mcp\": {\"transport\": \"stdio\", "
+                                                "\"command\": \"/opt/other\", \"enabled\": false}\n"
+                                                "  },\n"
+                                                "  \"llm_model\": \"gpt-x\"\n"
+                                                "}\n";
+static const char openhands_default_profile_before[] = "{\n"
+                                                       "  \"name\": \"default\",\n"
+                                                       "  \"mcp_server_refs\": null,\n"
+                                                       "  \"tools\": [\"bash\"]\n"
+                                                       "}\n";
+static const char openhands_custom_profile_before[] =
+    "{\"name\": \"custom\", \"mcp_server_refs\": [\"other-mcp\"]}\n";
+static const char openhands_note_before[] = "not a profile\n";
+
+/* Foreign settings keys and a foreign mcp_config sibling survive verbatim;
+ * a null profile ref list becomes ours, an existing list is appended once;
+ * a second install is byte-idempotent; uninstall restores the foreign files
+ * byte-for-byte and removes only our ref. */
+TEST(cli_openhands_registers_settings_mcp_config_and_profile_refs_issue1826) {
+    openhands_fixture_t fx;
+    if (!openhands_fixture_open(&fx, true))
+        FAIL("cbm_mkdtemp failed");
+    write_test_file(fx.settings, openhands_settings_before);
+    write_test_file(fx.default_profile, openhands_default_profile_before);
+    write_test_file(fx.custom_profile, openhands_custom_profile_before);
+    write_test_file(fx.note, openhands_note_before);
+
+    cbm_install_agent_configs(fx.home, fx.binary, false, false);
+
+    const char *const only_ours[] = {"codebase-memory-mcp"};
+    const char *const appended[] = {"other-mcp", "codebase-memory-mcp"};
+    bool ours_ok = openhands_settings_entry_ok(fx.settings, "codebase-memory-mcp", fx.binary);
+    char *settings_after = read_test_file_alloc(fx.settings);
+    bool foreign_ok =
+        settings_after && strstr(settings_after, "\"language\": \"en\"") &&
+        strstr(settings_after, "\"llm_model\": \"gpt-x\"") &&
+        strstr(settings_after, "\"other-mcp\": {\"transport\": \"stdio\", \"command\": "
+                               "\"/opt/other\", \"enabled\": false}");
+    bool default_ok = openhands_profile_refs_equal(fx.default_profile, only_ours, 1U);
+    bool custom_ok = openhands_profile_refs_equal(fx.custom_profile, appended, 2U);
+    char *default_after = read_test_file_alloc(fx.default_profile);
+    bool default_foreign_ok = default_after && strstr(default_after, "\"name\": \"default\"") &&
+                              strstr(default_after, "\"tools\": [\"bash\"]");
+    bool note_ok = openhands_file_equals(fx.note, openhands_note_before);
+    const char *const standard_json[] = {"mcpServers", "codebase-memory-mcp", fx.binary};
+    bool mcp_json_ok = test_file_contains_all(fx.mcp, standard_json, 3);
+    char *custom_after = read_test_file_alloc(fx.custom_profile);
+
+    /* Second install: byte-idempotent on every touched file. */
+    cbm_install_agent_configs(fx.home, fx.binary, false, false);
+    bool idempotent = openhands_file_equals(fx.settings, settings_after) &&
+                      openhands_file_equals(fx.default_profile, default_after) &&
+                      openhands_file_equals(fx.custom_profile, custom_after);
+    free(settings_after);
+    free(default_after);
+    free(custom_after);
+
+    char *argv[] = {"uninstall", "--yes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
+    bool settings_restored = openhands_file_equals(fx.settings, openhands_settings_before);
+    bool custom_restored =
+        openhands_file_equals(fx.custom_profile, openhands_custom_profile_before);
+    /* null → ["codebase-memory-mcp"] → [] : the ref is gone; an empty list is
+     * the minimal edit (the editor cannot know the list was null before). */
+    bool default_cleared = openhands_profile_refs_equal(fx.default_profile, only_ours, 0U);
+    bool note_restored = openhands_file_equals(fx.note, openhands_note_before);
+    openhands_fixture_close(&fx);
+
+    if (!ours_ok)
+        FAIL("settings.json must register mcp_config.codebase-memory-mcp {stdio, binary, enabled}");
+    if (!foreign_ok)
+        FAIL("settings.json foreign keys and the foreign mcp_config sibling must survive verbatim");
+    if (!default_ok)
+        FAIL("a null mcp_server_refs must become [\"codebase-memory-mcp\"]");
+    if (!custom_ok)
+        FAIL("an existing mcp_server_refs list must gain codebase-memory-mcp exactly once");
+    if (!default_foreign_ok)
+        FAIL("profile keys around mcp_server_refs must survive verbatim");
+    if (!note_ok)
+        FAIL("non-JSON files under agent-profiles must not be touched");
+    if (!mcp_json_ok)
+        FAIL("the existing ~/.openhands/mcp.json registration must be kept");
+    if (!idempotent)
+        FAIL("a second install must be byte-idempotent");
+    if (rc != 0 || !settings_restored)
+        FAIL("uninstall must restore settings.json byte-for-byte");
+    if (!custom_restored)
+        FAIL("uninstall must restore a profile with foreign refs byte-for-byte");
+    if (!default_cleared)
+        FAIL("uninstall must remove our ref from the null-origin profile");
+    if (!note_restored)
+        FAIL("uninstall must not touch non-JSON files under agent-profiles");
+    PASS();
+}
+
+/* Fresh ~/.openhands without settings.json or agent-profiles: settings.json is
+ * created with only our entry, no profile directory is invented, and uninstall
+ * removes the entry again. */
+TEST(cli_openhands_creates_settings_and_skips_missing_profiles_issue1826) {
+    openhands_fixture_t fx;
+    if (!openhands_fixture_open(&fx, false))
+        FAIL("cbm_mkdtemp failed");
+
+    cbm_install_agent_configs(fx.home, fx.binary, false, false);
+    bool ours_ok = openhands_settings_entry_ok(fx.settings, "codebase-memory-mcp", fx.binary);
+    struct stat st;
+    bool no_profiles_invented = stat(fx.profiles_dir, &st) != 0;
+
+    char *argv[] = {"uninstall", "--yes"};
+    int rc = cli_test_cmd_uninstall(2, argv);
+    bool removed = openhands_settings_entry_absent(fx.settings, "codebase-memory-mcp");
+    openhands_fixture_close(&fx);
+
+    if (!ours_ok)
+        FAIL("a missing settings.json must be created with mcp_config.codebase-memory-mcp");
+    if (!no_profiles_invented)
+        FAIL("install must never create ~/.openhands/agent-profiles");
+    if (rc != 0 || !removed)
+        FAIL("uninstall must remove mcp_config.codebase-memory-mcp from settings.json");
+    PASS();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
  *  VS Code MCP config tests
  * ═══════════════════════════════════════════════════════════════════ */
 
@@ -4509,7 +5672,7 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
 #else
     snprintf(bin_path, sizeof(bin_path), "%s/codebase-memory-mcp", bin_dir);
 #endif
-    write_test_file(bin_path, "installed binary must remain live\n");
+    write_test_file(bin_path, "installed binary goes even when a config cannot be cleaned\n");
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -4533,9 +5696,12 @@ TEST(cli_agent_uninstall_reports_safe_editor_refusal) {
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     test_rmdir_r(tmpdir);
-    if (rc == 0 || !preserved || !binary_preserved || fake.mutation_reserve_count != 1 ||
-        fake.mutation_lease_release_count != 1 || !strstr(fake.diagnostic, "executable was kept"))
-        FAIL("agent uninstall refusal must fail before removing the live binary");
+    /* #1954: a refused config is reported and fails the exit code, but it never
+     * keeps the executable installed — that left a 300 MB binary and every index
+     * behind for one unreadable mcp.json. */
+    if (rc == 0 || !preserved || binary_preserved || fake.mutation_reserve_count != 1 ||
+        fake.mutation_lease_release_count != 1 || fake.diagnostic[0] != '\0')
+        FAIL("agent uninstall refusal must fail the exit code without keeping the binary");
     PASS();
 }
 
@@ -4832,6 +5998,7 @@ TEST(cli_install_plan_receipt_no_mutation_issue388) {
             }
         }
     }
+
     free(json);
 
     /* Critical: building the plan must NOT have created any config file. */
@@ -5041,6 +6208,7 @@ TEST(cli_new_agent_install_plans_use_documented_paths) {
         "/.hermes/skills/codebase-memory/SKILL.md",
         "\"openhands\"",
         "/.openhands/mcp.json",
+        "/.openhands/settings.json",
         "/.agents/skills/codebase-memory/SKILL.md",
         "\"cline\"",
         "/.cline/mcp.json",
@@ -8205,23 +9373,169 @@ TEST(cli_codex_respects_codex_home) {
     char *saved = save_test_env("CODEX_HOME");
     cbm_setenv("CODEX_HOME", codex_home, 1);
 
+    char expected_instructions[640];
+    snprintf(expected_instructions, sizeof(expected_instructions), "%s/AGENTS.md", codex_home);
+    const char *user_instructions = "# Personal Codex guidance\n";
+    ASSERT_EQ(write_test_file(expected_instructions, user_instructions), 0);
+
     cbm_detected_agents_t agents = cbm_detect_agents(tmpdir);
     char *json = cbm_build_install_plan_json(tmpdir, "/usr/local/bin/codebase-memory-mcp");
     char expected_config[640];
-    char expected_instructions[640];
     snprintf(expected_config, sizeof(expected_config), "%s/config.toml", codex_home);
-    snprintf(expected_instructions, sizeof(expected_instructions), "%s/AGENTS.md", codex_home);
-    bool plans_config = json && strstr(json, expected_config) != NULL;
-    bool plans_instructions = json && strstr(json, expected_instructions) != NULL;
+    yyjson_doc *plan_doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
+    yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    bool plans_config = test_json_string_array_contains(plan_root, "config_files_planned",
+                                                        expected_config);
+    bool plans_instructions = test_json_string_array_contains(
+        plan_root, "instruction_files_planned", expected_instructions);
+    bool plans_cleanup = json && strstr(json, "remove_managed_block_if_present") != NULL;
+    char *instructions_after = read_test_file_alloc(expected_instructions);
+    bool plan_preserved_user_file =
+        instructions_after && strcmp(instructions_after, user_instructions) == 0;
 
+    free(instructions_after);
+    yyjson_doc_free(plan_doc);
     free(json);
     restore_test_env("CODEX_HOME", saved);
     test_rmdir_r(tmpdir);
 
     if (!agents.codex)
         FAIL("Codex detection must honor CODEX_HOME");
-    if (!plans_config || !plans_instructions)
-        FAIL("Codex install plan must place config and AGENTS.md under CODEX_HOME");
+    if (!plans_config || !plans_instructions || plans_cleanup || !plan_preserved_user_file)
+        FAIL("Codex plan must include the managed activation pointer under CODEX_HOME without "
+             "mutating existing user content");
+    PASS();
+}
+
+TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-agents-pointer-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_home[512];
+    char agents_path[640];
+    char config_path[640];
+    char skill_path[768];
+    char profile_path[768];
+    char binary_path[768];
+    snprintf(codex_home, sizeof(codex_home), "%s/.codex", tmpdir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_home);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_home);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_home);
+    snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_home);
+#ifdef _WIN32
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp.exe", tmpdir);
+#else
+    snprintf(binary_path, sizeof(binary_path), "%s/.local/bin/codebase-memory-mcp", tmpdir);
+#endif
+    ASSERT_EQ(test_mkdirp(codex_home), 0);
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_setenv("CODEX_HOME", codex_home, 1);
+
+    struct stat state;
+    int fresh_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *fresh_agents = read_test_file_alloc(agents_path);
+    bool fresh_pointer_installed = fresh_rc == 0 && fresh_agents &&
+                                   strcmp(fresh_agents, test_codex_activation_block) == 0;
+    char *config = read_test_file_alloc(config_path);
+    bool other_surfaces_installed =
+        fresh_rc == 0 && config && strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+        strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
+        stat(profile_path, &state) == 0;
+    free(fresh_agents);
+    free(config);
+
+    const char *user_only = "# Personal Codex guidance\nKeep this byte-for-byte.\n";
+    ASSERT_EQ(write_test_file(agents_path, user_only), 0);
+    int dry_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_dry = read_test_file_alloc(agents_path);
+    int unowned_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_unowned = read_test_file_alloc(agents_path);
+    char expected_user_pointer[1024];
+    int user_pointer_written = snprintf(expected_user_pointer, sizeof(expected_user_pointer),
+                                        "%s%s", user_only, test_codex_activation_block);
+    bool unowned_preserved =
+        user_pointer_written > 0 && (size_t)user_pointer_written < sizeof(expected_user_pointer) &&
+        dry_rc == 0 && unowned_rc == 0 && after_dry && after_unowned &&
+        strcmp(after_dry, user_only) == 0 &&
+        strcmp(after_unowned, expected_user_pointer) == 0;
+    free(after_dry);
+    free(after_unowned);
+
+    const char *legacy = "# Before\n<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                         "<!-- codebase-memory-mcp:end -->\n# After\n";
+    char expected_migration[1024];
+    int migration_written = snprintf(expected_migration, sizeof(expected_migration),
+                                     "# Before\n%s# After\n", test_codex_activation_block);
+    ASSERT_EQ(write_test_file(agents_path, legacy), 0);
+    int managed_dry_rc = cbm_install_agent_configs(tmpdir, binary_path, false, true);
+    char *after_managed_dry = read_test_file_alloc(agents_path);
+    int managed_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_managed = read_test_file_alloc(agents_path);
+    int repeat_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_repeat = read_test_file_alloc(agents_path);
+    bool managed_migrated_once =
+        migration_written > 0 && (size_t)migration_written < sizeof(expected_migration) &&
+        managed_dry_rc == 0 && after_managed_dry && strcmp(after_managed_dry, legacy) == 0 &&
+        managed_rc == 0 && repeat_rc == 0 && after_managed && after_repeat &&
+        strcmp(after_managed, expected_migration) == 0 &&
+        strcmp(after_repeat, expected_migration) == 0 &&
+        test_count_substring(after_repeat, "<!-- codebase-memory-mcp:start -->") == 1U;
+    free(after_managed_dry);
+    free(after_managed);
+    free(after_repeat);
+
+    const char *managed_only = "<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                               "<!-- codebase-memory-mcp:end -->\n";
+    ASSERT_EQ(write_test_file(agents_path, managed_only), 0);
+    int managed_only_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_managed_only = read_test_file_alloc(agents_path);
+    bool marker_only_migrated = managed_only_rc == 0 && after_managed_only &&
+                                strcmp(after_managed_only, test_codex_activation_block) == 0 &&
+                                stat(agents_path, &state) == 0;
+    free(after_managed_only);
+
+    const char *malformed = "# Keep\n<!-- codebase-memory-mcp:start -->\nunterminated\n";
+    ASSERT_EQ(write_test_file(agents_path, malformed), 0);
+    ASSERT_EQ(remove(config_path), 0);
+    ASSERT_EQ(remove(skill_path), 0);
+    ASSERT_EQ(remove(profile_path), 0);
+    int malformed_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
+    char *after_malformed = read_test_file_alloc(agents_path);
+    config = read_test_file_alloc(config_path);
+    bool malformed_preserved = malformed_rc != 0 && after_malformed &&
+                               strcmp(after_malformed, malformed) == 0 && config &&
+                               strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
+                               strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
+                               stat(profile_path, &state) == 0;
+    free(config);
+    free(after_malformed);
+
+    ASSERT_EQ(write_test_file(agents_path, expected_user_pointer), 0);
+    char *uninstall_argv[] = {"uninstall", "--yes"};
+    int uninstall_rc = cli_test_cmd_uninstall(2, uninstall_argv);
+    char *after_uninstall = read_test_file_alloc(agents_path);
+    bool uninstall_preserved_foreign = uninstall_rc == 0 && after_uninstall &&
+                                       strcmp(after_uninstall, user_only) == 0;
+    free(after_uninstall);
+
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+
+    if (!fresh_pointer_installed || !other_surfaces_installed || !unowned_preserved ||
+        !managed_migrated_once || !marker_only_migrated || !malformed_preserved ||
+        !uninstall_preserved_foreign)
+        FAIL("Codex install must keep only a tiny managed activation pointer, preserve foreign "
+             "bytes, migrate legacy blocks, fail closed on malformed markers, and remove the "
+             "pointer on uninstall");
     PASS();
 }
 
@@ -10140,32 +11454,37 @@ TEST(cli_mcp_installers_preserve_foreign_same_name_entries) {
     PASS();
 }
 
-TEST(cli_installer_rejects_symlinked_agent_roots) {
+/* Agent roots reached through a symlink. A link the invoking account owns is
+ * that account's own arrangement -- a dotfile manager, or a config tree kept
+ * on another volume (~/.config/opencode -> /mnt/...) -- and the installer
+ * follows it; refusing it failed every write under such a root with an opaque
+ * agent_config error. Root-owned links are trusted as infrastructure (distro
+ * /home indirection, macOS /tmp): only root can create them, so they are
+ * outside the attacker model. A link owned by ANY OTHER account is the
+ * planted-link case the O_NOFOLLOW parent-chain walk exists for, and stays
+ * refused, and so is a user-owned link when the installer itself runs as
+ * root. Only root can create a link owned by someone else, so both refusal
+ * legs are exercised when the suite runs as root (containers); the follow leg
+ * runs everywhere. */
+TEST(cli_installer_follows_symlinked_agent_roots_only_for_trusted_owners) {
 #ifdef _WIN32
     SKIP_PLATFORM("POSIX symlink parent-chain contract");
 #else
     char tmpdir[256];
-    char qoder_target[256];
-    char junie_target[256];
+    char own_target[256];
+    char foreign_target[256];
+    char user_target[256];
     snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-linked-roots-XXXXXX");
-    snprintf(qoder_target, sizeof(qoder_target), "/tmp/cli-linked-qoder-XXXXXX");
-    snprintf(junie_target, sizeof(junie_target), "/tmp/cli-linked-junie-XXXXXX");
-    if (!cbm_mkdtemp(tmpdir) || !cbm_mkdtemp(qoder_target) || !cbm_mkdtemp(junie_target))
+    snprintf(own_target, sizeof(own_target), "/tmp/cli-linked-own-XXXXXX");
+    snprintf(foreign_target, sizeof(foreign_target), "/tmp/cli-linked-foreign-XXXXXX");
+    snprintf(user_target, sizeof(user_target), "/tmp/cli-linked-user-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir) || !cbm_mkdtemp(own_target) || !cbm_mkdtemp(foreign_target) ||
+        !cbm_mkdtemp(user_target))
         FAIL("cbm_mkdtemp failed");
     char qoder_link[512];
-    char junie_link[512];
     snprintf(qoder_link, sizeof(qoder_link), "%s/.qoder", tmpdir);
-    snprintf(junie_link, sizeof(junie_link), "%s/.junie", tmpdir);
-    if (symlink(qoder_target, qoder_link) != 0 || symlink(junie_target, junie_link) != 0)
+    if (symlink(own_target, qoder_link) != 0)
         FAIL("symlink failed");
-    /* Root-owned symlinks are deliberately trusted as infrastructure (distro
-     * /home indirection, macOS /tmp) — only root can create them, so they are
-     * outside the attacker model. The contract under test is refusal of
-     * USER-planted links; a root test run (containers) must demote its links
-     * to an unprivileged owner or it would assert against the wrong model. */
-    if (geteuid() == 0 &&
-        (lchown(qoder_link, 65534, 65534) != 0 || lchown(junie_link, 65534, 65534) != 0))
-        FAIL("lchown to unprivileged owner failed");
 
     char qoder_executable[512];
     snprintf(qoder_executable, sizeof(qoder_executable), "%s/qodercli", tmpdir);
@@ -10177,33 +11496,80 @@ TEST(cli_installer_rejects_symlinked_agent_roots) {
     char *saved_path = save_test_env("PATH");
     cbm_setenv("HOME", tmpdir, 1);
     cbm_setenv("PATH", tmpdir, 1);
-    (void)cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int own_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
 
-    char outside_qoder_settings[512];
-    char outside_qoder_skill[512];
-    char outside_junie_mcp[512];
-    char outside_junie_agent[512];
-    snprintf(outside_qoder_settings, sizeof(outside_qoder_settings), "%s/settings.json",
-             qoder_target);
-    snprintf(outside_qoder_skill, sizeof(outside_qoder_skill), "%s/skills/codebase-memory/SKILL.md",
-             qoder_target);
-    snprintf(outside_junie_mcp, sizeof(outside_junie_mcp), "%s/mcp/mcp.json", junie_target);
-    snprintf(outside_junie_agent, sizeof(outside_junie_agent), "%s/agents/codebase-memory.md",
-             junie_target);
+    char own_settings[512];
+    char own_skill[512];
+    snprintf(own_settings, sizeof(own_settings), "%s/settings.json", own_target);
+    snprintf(own_skill, sizeof(own_skill), "%s/skills/codebase-memory/SKILL.md", own_target);
     struct stat state;
-    bool refused = stat(outside_qoder_settings, &state) != 0 &&
-                   stat(outside_qoder_skill, &state) != 0 && stat(outside_junie_mcp, &state) != 0 &&
-                   stat(outside_junie_agent, &state) != 0;
+    bool followed = stat(own_settings, &state) == 0 && S_ISREG(state.st_mode) &&
+                    stat(own_skill, &state) == 0 && S_ISREG(state.st_mode);
+
+    /* Refusal leg: the same root, now a link some other account planted. */
+    bool foreign_refused = true;
+    bool foreign_setup_ok = true;
+    if (geteuid() == 0) {
+        foreign_setup_ok = cbm_unlink(qoder_link) == 0 &&
+                           symlink(foreign_target, qoder_link) == 0 &&
+                           lchown(qoder_link, 65534, 65534) == 0;
+        if (foreign_setup_ok) {
+            int foreign_rc =
+                cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+            char foreign_settings[512];
+            char foreign_skill[512];
+            snprintf(foreign_settings, sizeof(foreign_settings), "%s/settings.json",
+                     foreign_target);
+            snprintf(foreign_skill, sizeof(foreign_skill), "%s/skills/codebase-memory/SKILL.md",
+                     foreign_target);
+            foreign_refused = foreign_rc != 0 && stat(foreign_settings, &state) != 0 &&
+                              stat(foreign_skill, &state) != 0;
+        }
+    }
+
+    /* Refusal leg (root only): a privileged install into another account's
+     * home. Home, link and target are all owned by that account and the walk
+     * runs as euid 0, which trusts only root-owned links, so the user's link
+     * is refused and nothing lands in the target. This pins the claim that
+     * following user-owned links never extends to a root-run install. */
+    bool user_refused = true;
+    bool user_setup_ok = true;
+    if (geteuid() == 0) {
+        enum { LINKED_HOME_UID = 65533 };
+        user_setup_ok = cbm_unlink(qoder_link) == 0 && symlink(user_target, qoder_link) == 0 &&
+                        lchown(qoder_link, LINKED_HOME_UID, LINKED_HOME_UID) == 0 &&
+                        chown(user_target, LINKED_HOME_UID, LINKED_HOME_UID) == 0 &&
+                        chown(tmpdir, LINKED_HOME_UID, LINKED_HOME_UID) == 0;
+        if (user_setup_ok) {
+            int user_rc =
+                cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+            char user_settings[512];
+            char user_skill[512];
+            snprintf(user_settings, sizeof(user_settings), "%s/settings.json", user_target);
+            snprintf(user_skill, sizeof(user_skill), "%s/skills/codebase-memory/SKILL.md",
+                     user_target);
+            user_refused =
+                user_rc != 0 && stat(user_settings, &state) != 0 && stat(user_skill, &state) != 0;
+        }
+    }
 
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     cbm_unlink(qoder_link);
-    cbm_unlink(junie_link);
     test_rmdir_r(tmpdir);
-    test_rmdir_r(qoder_target);
-    test_rmdir_r(junie_target);
-    if (!refused)
-        FAIL("installer must not follow symlinked agent roots outside the selected home");
+    test_rmdir_r(own_target);
+    test_rmdir_r(foreign_target);
+    test_rmdir_r(user_target);
+    if (!foreign_setup_ok)
+        FAIL("could not plant a foreign-owned link while running as root");
+    if (!user_setup_ok)
+        FAIL("could not plant a user-owned link and home while running as root");
+    if (own_rc != 0 || !followed)
+        FAIL("installer must follow an agent root symlinked by the invoking account");
+    if (!foreign_refused)
+        FAIL("installer must not follow an agent root symlinked by another account");
+    if (!user_refused)
+        FAIL("a root-run installer must not follow an agent root symlinked by the home's owner");
     PASS();
 #endif
 }
@@ -10345,7 +11711,7 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
 #else
     snprintf(binary_path, sizeof(binary_path), "%s/codebase-memory-mcp", binary_dir);
 #endif
-    write_test_file(binary_path, "installed binary must survive failed cleanup\n");
+    write_test_file(binary_path, "installed binary goes even when a config cannot be cleaned\n");
 
     char *saved_home = save_test_env("HOME");
     char *saved_path = save_test_env("PATH");
@@ -10356,8 +11722,10 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
 
     char hooks_path[640];
     char config_path[640];
+    char agents_path[640];
     snprintf(hooks_path, sizeof(hooks_path), "%s/hooks.json", codex_dir);
     snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_dir);
     int first_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
     char *first = read_test_file_alloc(config_path);
     int repeat_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
@@ -10397,14 +11765,19 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     snprintf(agent_path, sizeof(agent_path), "%s/agents/codebase-memory.toml", codex_dir);
     struct stat state;
     hooks = read_test_file_alloc(hooks_path);
-    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) == 0 &&
+    char *agents_after_uninstall = read_test_file_alloc(agents_path);
+    /* #1954: the ambiguous/foreign hook still fails the exit code, but the binary
+     * is removed anyway (uninstall is no longer held hostage by agent-config). */
+    bool independent_cleanup = uninstall_rc != 0 && stat(binary_path, &state) != 0 &&
                                stat(skill_path, &state) != 0 && stat(agent_path, &state) != 0 &&
-                               hooks && !strstr(hooks, "hook-augment");
+                               hooks && !strstr(hooks, "hook-augment") && agents_after_uninstall &&
+                               agents_after_uninstall[0] == '\0';
     free(hooks);
+    free(agents_after_uninstall);
 
     char bad_home[256];
     snprintf(bad_home, sizeof(bad_home), "/tmp/cli-codex-preflight-XXXXXX");
-    bool no_partial = false;
+    bool pointer_only_on_preflight_failure = false;
     if (cbm_mkdtemp(bad_home)) {
         char bad_codex[512];
         char bad_config[640];
@@ -10418,18 +11791,110 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
         cbm_setenv("PATH", bad_home, 1);
         int bad_rc = cbm_install_agent_configs(bad_home, binary_path, false, false);
         char *bad_after = read_test_file_alloc(bad_config);
-        no_partial = bad_rc != 0 && bad_after && strcmp(bad_after, ambiguous) == 0 &&
-                     stat(bad_agents, &state) != 0;
+        char *bad_agents_after = read_test_file_alloc(bad_agents);
+        pointer_only_on_preflight_failure =
+            bad_rc != 0 && bad_after && strcmp(bad_after, ambiguous) == 0 && bad_agents_after &&
+            strcmp(bad_agents_after, test_codex_activation_block) == 0;
         free(bad_after);
+        free(bad_agents_after);
         test_rmdir_r(bad_home);
     }
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!lifecycle_ok || !migrated || !independent_cleanup || !no_partial)
-        FAIL("Codex lifecycle preflight must be idempotent, transactional, and independently "
-             "clean owned side files");
+    if (!lifecycle_ok || !migrated || !independent_cleanup ||
+        !pointer_only_on_preflight_failure)
+        FAIL("Codex lifecycle preflight must be idempotent, preserve the activation pointer "
+             "contract, and independently clean owned side files");
+    PASS();
+}
+
+TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-cleanup-preflight-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    char codex_dir[512];
+    char config_path[640];
+    char agents_path[640];
+    char skill_path[768];
+    char profile_path[768];
+    snprintf(codex_dir, sizeof(codex_dir), "%s/.codex", tmpdir);
+    snprintf(config_path, sizeof(config_path), "%s/config.toml", codex_dir);
+    snprintf(agents_path, sizeof(agents_path), "%s/AGENTS.md", codex_dir);
+    snprintf(skill_path, sizeof(skill_path), "%s/skills/codebase-memory/SKILL.md", codex_dir);
+    snprintf(profile_path, sizeof(profile_path), "%s/agents/codebase-memory.toml", codex_dir);
+    if (test_mkdirp(codex_dir) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to create Codex cleanup preflight fixture directory");
+    }
+
+    const char *ambiguous =
+        "[hooks]\nSessionStart = [{ matcher = 'startup|resume|clear|compact', hooks = ["
+        "{ type = 'command', command = 'codebase-memory-mcp hook-augment' }, "
+        "{ type = 'command', command = 'foreign' }] }]\n";
+    const char *legacy = "# Before\n<!-- codebase-memory-mcp:start -->\nlegacy\n"
+                         "<!-- codebase-memory-mcp:end -->\n# After\n";
+    char legacy_migrated[1024];
+    int migrated_written = snprintf(legacy_migrated, sizeof(legacy_migrated),
+                                    "# Before\n%s# After\n", test_codex_activation_block);
+    if (migrated_written <= 0 || (size_t)migrated_written >= sizeof(legacy_migrated)) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to build expected Codex pointer migration");
+    }
+    if (write_test_file(config_path, ambiguous) != 0 ||
+        write_test_file(agents_path, legacy) != 0) {
+        test_rmdir_r(tmpdir);
+        FAIL("failed to write Codex cleanup preflight fixture");
+    }
+
+    char *saved_home = save_test_env("HOME");
+    char *saved_path = save_test_env("PATH");
+    char *saved_codex = save_test_env("CODEX_HOME");
+    cbm_setenv("HOME", tmpdir, 1);
+    cbm_setenv("PATH", tmpdir, 1);
+    cbm_unsetenv("CODEX_HOME");
+
+    char *plan = cbm_build_install_plan_json(tmpdir, "/opt/codebase-memory-mcp");
+    yyjson_doc *plan_doc = plan ? yyjson_read(plan, strlen(plan), 0) : NULL;
+    yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
+    bool plans_pointer =
+        test_json_string_array_contains(plan_root, "instruction_files_planned", agents_path);
+    char *config_after_plan = read_test_file_alloc(config_path);
+    char *agents_after_plan = read_test_file_alloc(agents_path);
+    bool plan_preserved_files = config_after_plan && agents_after_plan &&
+                                strcmp(config_after_plan, ambiguous) == 0 &&
+                                strcmp(agents_after_plan, legacy) == 0;
+
+    int install_rc =
+        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    char *config_after_install = read_test_file_alloc(config_path);
+    char *agents_after_install = read_test_file_alloc(agents_path);
+    struct stat state;
+    bool preflight_failed_closed =
+        install_rc != 0 && config_after_install && strcmp(config_after_install, ambiguous) == 0 &&
+        stat(skill_path, &state) != 0 && stat(profile_path, &state) != 0;
+    bool pointer_migrated =
+        agents_after_install && strcmp(agents_after_install, legacy_migrated) == 0;
+
+    free(config_after_plan);
+    free(agents_after_plan);
+    free(config_after_install);
+    free(agents_after_install);
+    if (plan_doc) {
+        yyjson_doc_free(plan_doc);
+    }
+    free(plan);
+    restore_test_env("HOME", saved_home);
+    restore_test_env("PATH", saved_path);
+    restore_test_env("CODEX_HOME", saved_codex);
+    test_rmdir_r(tmpdir);
+
+    if (!plans_pointer || !plan_preserved_files || !preflight_failed_closed || !pointer_migrated)
+        FAIL("Codex legacy instructions must migrate to the activation pointer independently of "
+             "hook preflight while other config surfaces fail closed");
     PASS();
 }
 
@@ -10498,13 +11963,15 @@ TEST(cli_codex_preflight_reports_heading_and_reason) {
         fclose(capture);
     }
     char *after = read_test_file_alloc(config_path);
-    struct stat state;
-    bool unchanged = after && strcmp(after, ambiguous) == 0 && stat(agents_path, &state) != 0;
+    char *agents_after = read_test_file_alloc(agents_path);
+    bool unchanged = after && strcmp(after, ambiguous) == 0 && agents_after &&
+                     strcmp(agents_after, test_codex_activation_block) == 0;
     bool diagnostic =
         strstr(output, "Codex CLI:\nerror: agent_config agent=Codex CLI op=hook_preflight path=") !=
             NULL &&
         strstr(output, "reason=ambiguous_hook_ownership") != NULL;
     free(after);
+    free(agents_after);
 
     restore_test_env("HOME", saved_home);
     restore_test_env("PATH", saved_path);
@@ -14298,6 +15765,110 @@ TEST(cli_windows_update_hands_off_to_install_script) {
     ASSERT_TRUE(preserved);
     PASS();
 }
+
+/* #2117: install registers the install dir in the persistent current-user PATH
+ * via the wide registry API and de-duplicates on reinstall; uninstall must take
+ * exactly that entry back out and leave every other entry byte-for-byte intact,
+ * or the PATH grows without bound (a real Windows host reached ~8000 chars).
+ * This drives the actual query/append/remove logic through the hermetic
+ * CBM_TEST_WINDOWS_USER_PATH_RUN_ID seam, against a GUID-scoped scratch key
+ * under HKCU\Software\CodebaseMemoryMCP\Smoke — the developer's live
+ * HKCU\Environment\Path is never opened. The non-ASCII install dir doubles as
+ * the mojibake guard: a broken UTF-8->UTF-16 round-trip would fail the segment
+ * match and leak a duplicate instead of de-duplicating.
+ *
+ * Return codes mirror the internal enum: 0 = added/removed, 1 = already
+ * present / nothing to remove. */
+int cbm_cli_ensure_windows_user_path_for_test(const char *bin_dir, bool dry_run);
+int cbm_cli_remove_windows_user_path_for_test(const char *bin_dir, bool dry_run);
+
+static const wchar_t k_cli_user_path_run_id[] = L"0123456789abcdef0123456789abcdef";
+
+static int cli_test_read_smoke_path(HKEY key, wchar_t *out, DWORD out_bytes) {
+    DWORD type = 0;
+    DWORD bytes = out_bytes;
+    return RegQueryValueExW(key, L"Path", NULL, &type, (BYTE *)out, &bytes) == ERROR_SUCCESS ? 0
+                                                                                             : -1;
+}
+
+static int cli_test_set_smoke_path(HKEY key, const wchar_t *value) {
+    DWORD bytes = (DWORD)((wcslen(value) + 1U) * sizeof(wchar_t));
+    LONG rc = RegSetValueExW(key, L"Path", 0, REG_EXPAND_SZ, (const BYTE *)value, bytes);
+    return rc == ERROR_SUCCESS ? 0 : -1;
+}
+
+TEST(cli_uninstall_removes_only_its_own_windows_user_path_entry_issue2117) {
+    if (!SetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", k_cli_user_path_run_id) ||
+        !SetEnvironmentVariableW(L"SMOKE_TEMP_ROOT", L"C:\\Temp\\cbm-smoke") ||
+        !SetEnvironmentVariableW(L"SMOKE_DOWNLOAD_URL", L"http://127.0.0.1:8765")) {
+        FAIL("could not arm the Windows user-PATH test seam");
+    }
+
+    wchar_t key_path[128];
+    swprintf(key_path, sizeof(key_path) / sizeof(key_path[0]),
+             L"Software\\CodebaseMemoryMCP\\Smoke\\%ls", k_cli_user_path_run_id);
+    /* Start from a clean leaf so a prior aborted run cannot skew the result. */
+    RegDeleteKeyW(HKEY_CURRENT_USER, key_path);
+    HKEY key = NULL;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, key_path, 0, NULL, REG_OPTION_NON_VOLATILE,
+                        KEY_QUERY_VALUE | KEY_SET_VALUE | KEY_WOW64_64KEY, NULL, &key,
+                        NULL) != ERROR_SUCCESS) {
+        FAIL("could not create the scratch smoke registry key");
+    }
+    DWORD sentinel_bytes = (DWORD)((wcslen(k_cli_user_path_run_id) + 1U) * sizeof(wchar_t));
+    RegSetValueExW(key, L"CbmSmokeRunId", 0, REG_SZ, (const BYTE *)k_cli_user_path_run_id,
+                   sentinel_bytes);
+
+    /* Non-ASCII install dir (Omega mu epsilon-tonos gamma alpha). */
+    wchar_t bin_dir_w[] = L"C:\\Users\\dev\\install_\u03A9\u03BC\u03AD\u03B3\u03B1\\bin";
+    char bin_dir[512];
+    WideCharToMultiByte(CP_UTF8, 0, bin_dir_w, -1, bin_dir, (int)sizeof(bin_dir), NULL, NULL);
+
+    wchar_t readback[1024];
+    wchar_t expected_appended[1024];
+    swprintf(expected_appended, sizeof(expected_appended) / sizeof(expected_appended[0]),
+             L"C:\\Tools\\alpha;C:\\Tools\\omega;%ls", bin_dir_w);
+    wchar_t seeded_middle[1024];
+    swprintf(seeded_middle, sizeof(seeded_middle) / sizeof(seeded_middle[0]),
+             L"C:\\Tools\\alpha;%ls;C:\\Tools\\omega", bin_dir_w);
+
+    int ok = 1;
+    /* Scenario A — append to a PATH lacking our dir, de-dup, then remove. */
+    ok &= cli_test_set_smoke_path(key, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+    ok &= cbm_cli_ensure_windows_user_path_for_test(bin_dir, false) == 0; /* added */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, expected_appended) == 0;
+    /* Reinstall must not duplicate: the non-ASCII entry must round-trip-match. */
+    ok &= cbm_cli_ensure_windows_user_path_for_test(bin_dir, false) == 1; /* already present */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, expected_appended) == 0;
+    /* Remove our entry — the two unrelated entries survive byte-for-byte. */
+    ok &= cbm_cli_remove_windows_user_path_for_test(bin_dir, false) == 0; /* removed */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+    /* Idempotent removal: nothing of ours left to take out. */
+    ok &= cbm_cli_remove_windows_user_path_for_test(bin_dir, false) == 1; /* nothing to remove */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+
+    /* Scenario B — our entry in the MIDDLE: neighbours on both sides survive. */
+    ok &= cli_test_set_smoke_path(key, seeded_middle) == 0;
+    ok &= cbm_cli_remove_windows_user_path_for_test(bin_dir, false) == 0; /* removed */
+    ok &= cli_test_read_smoke_path(key, readback, sizeof(readback)) == 0;
+    ok &= wcscmp(readback, L"C:\\Tools\\alpha;C:\\Tools\\omega") == 0;
+
+    /* Teardown: delete only our scratch leaf; clear the seam env. */
+    RegCloseKey(key);
+    RegDeleteKeyW(HKEY_CURRENT_USER, key_path);
+    SetEnvironmentVariableW(L"CBM_TEST_WINDOWS_USER_PATH_RUN_ID", NULL);
+    SetEnvironmentVariableW(L"SMOKE_TEMP_ROOT", NULL);
+    SetEnvironmentVariableW(L"SMOKE_DOWNLOAD_URL", NULL);
+
+    if (!ok) {
+        FAIL("uninstall must remove exactly its own user-PATH entry and leave others intact");
+    }
+    PASS();
+}
 #endif /* _WIN32 */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -14401,11 +15972,17 @@ SUITE(cli) {
 #ifndef _WIN32
     RUN_TEST(cli_activation_cleanup_failure_fail_stops_before_lease_release);
     RUN_TEST(cli_activation_quiesce_does_not_wait_on_bootstrap_startup);
+    RUN_TEST(cli_install_recovers_markerless_stale_rendezvous);
+    RUN_TEST(cli_install_skip_binary_into_foreign_home_never_drains_host_cohort);
+    RUN_TEST(cli_install_binary_into_foreign_home_never_drains_host_cohort);
+    RUN_TEST(cli_install_into_host_namespace_still_drains_host_cohort);
+    RUN_TEST(cli_install_skip_binary_unchanged_in_host_namespace_quiesces_nothing);
 #endif
     RUN_TEST(cli_install_force_quiesces_active_cohort_before_replacing_binary);
     RUN_TEST(cli_install_dir_and_skip_config_stage_first_install_safely);
     RUN_TEST(cli_activation_commands_reject_malformed_and_unknown_flags);
     RUN_TEST(cli_install_reset_deletion_waits_for_final_activation_guard);
+    RUN_TEST(cli_remove_indexes_deletes_orphan_sqlite_sidecars_issue2054);
     RUN_TEST(cli_install_config_only_waits_for_cohort_drain);
     RUN_TEST(cli_install_config_and_path_finish_before_guard_release);
     RUN_TEST(cli_install_config_failure_keeps_published_binary);
@@ -14420,9 +15997,14 @@ SUITE(cli) {
     RUN_TEST(cli_update_agent_configs_finish_before_guard_release);
     RUN_TEST(cli_uninstall_quiesces_active_cohort_before_removing_binary_and_index);
     RUN_TEST(cli_uninstall_preserves_binary_and_index_when_cohort_does_not_drain);
+#ifndef _WIN32
+    RUN_TEST(cli_uninstall_removes_binary_and_index_when_agent_config_cleanup_fails);
+    RUN_TEST(cli_uninstall_cleans_user_owned_symlinked_config);
+#endif
     RUN_TEST(cli_activation_guard_is_bypassed_for_dry_run_and_plan);
 #ifdef _WIN32
     RUN_TEST(cli_windows_update_hands_off_to_install_script);
+    RUN_TEST(cli_uninstall_removes_only_its_own_windows_user_path_entry_issue2117);
 #endif
 
     /* Version (2 tests — selfupdate_test.go) */
@@ -14485,6 +16067,8 @@ SUITE(cli) {
     RUN_TEST(cli_openclaw_mcp_preserves_valid_json5);
     RUN_TEST(cli_openclaw_mcp_uninstall_uses_nested_servers);
     RUN_TEST(cli_openclaw_compaction_preserves_user_owned_section);
+    RUN_TEST(cli_openhands_registers_settings_mcp_config_and_profile_refs_issue1826);
+    RUN_TEST(cli_openhands_creates_settings_and_skips_missing_profiles_issue1826);
     RUN_TEST(cli_openclaw_profile_uses_profile_state_and_default_workspace);
     RUN_TEST(cli_openclaw_uninstall_removes_compaction_when_workspace_is_ambiguous);
 
@@ -14590,6 +16174,7 @@ SUITE(cli) {
     RUN_TEST(cli_claude_user_scope_avoids_nested_mcp_json);
     RUN_TEST(cli_codex_respects_codex_home);
     RUN_TEST(cli_grok_respects_grok_home);
+    RUN_TEST(cli_codex_install_uses_global_activation_pointer_issue1689);
     RUN_TEST(cli_gemini_session_hook_uses_json_for_all_sources);
     RUN_TEST(cli_gemini_installs_dedicated_graph_subagent);
     RUN_TEST(cli_antigravity_does_not_imply_gemini);
@@ -14631,10 +16216,11 @@ SUITE(cli) {
     RUN_TEST(cli_read_only_agents_do_not_receive_mutating_mcp_server);
     RUN_TEST(cli_junie_foreign_analysis_alias_falls_back_to_parent_handoff);
     RUN_TEST(cli_mcp_installers_preserve_foreign_same_name_entries);
-    RUN_TEST(cli_installer_rejects_symlinked_agent_roots);
+    RUN_TEST(cli_installer_follows_symlinked_agent_roots_only_for_trusted_owners);
     RUN_TEST(cli_claude_hook_scripts_shell_quote_binary_path);
     RUN_TEST(cli_claude_hook_commands_use_exec_form_with_custom_config_dir);
     RUN_TEST(cli_codex_migrates_to_single_hook_representation);
+    RUN_TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689);
 #ifndef _WIN32
     RUN_TEST(cli_codex_preflight_reports_heading_and_reason);
 #endif

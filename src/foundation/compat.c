@@ -316,6 +316,30 @@ int cbm_clock_gettime(int clk_id, struct timespec *tp) {
 }
 #endif
 
+/* ── Per-thread CPU time ──────────────────────────────────────── */
+
+uint64_t cbm_thread_cpu_time_ns(void) {
+#ifdef _WIN32
+    FILETIME creation, exit_time, kernel, user;
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exit_time, &kernel, &user)) {
+        return 0;
+    }
+    /* kernel/user each carry a 64-bit count of 100-ns ticks split across a
+     * FILETIME's two DWORDs; recombine, sum, and scale to nanoseconds. The
+     * shift-combine avoids casting to ULARGE_INTEGER (alignment-unsafe per
+     * MSDN, and its union members trip cppcheck's unreadVariable). */
+    uint64_t kernel_ticks = ((uint64_t)kernel.dwHighDateTime << 32) | kernel.dwLowDateTime;
+    uint64_t user_ticks = ((uint64_t)user.dwHighDateTime << 32) | user.dwLowDateTime;
+    return (kernel_ticks + user_ticks) * 100ULL;
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+#endif
+}
+
 /* ── getline (Windows lacks it) ───────────────────────────────── */
 
 #ifdef _WIN32

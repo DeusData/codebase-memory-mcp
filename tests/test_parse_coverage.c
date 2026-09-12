@@ -834,6 +834,51 @@ TEST(c_thread_local_grammar_limit_is_pinned_issue963) {
     PASS();
 }
 
+/* Two error nodes can sit on ONE line. Line 113 of scripts/setup-windows.ps1
+ * does exactly that, and the report used to read "113-113,113-113" — the same
+ * line named twice. A line range says nothing new the second time, so repeated
+ * or overlapping regions must collapse into one. */
+static const char *PS_TWO_ERRORS_ONE_LINE = "Write-Host \"start\"\n"             /* 1 */
+                                            "wsl.exe -- bash -c $Command 2>&1\n" /* 2 */
+                                            "Write-Host \"end\"\n";              /* 3 */
+
+/* An error region that runs to the end of the file stops just after the last
+ * newline. Tree-sitter calls that position row N, column 0 — a row that holds
+ * no text. Reading it as a line number named a line past the end of the file:
+ * scripts/setup-windows.ps1 has 326 lines and the report said "245-327". */
+static const char *PS_ERROR_TO_EOF = "} else {\n"             /* 1 */
+                                     "    if ($a) {\n"        /* 2 */
+                                     "        Write-Host x\n" /* 3 */
+                                     "}\n";                   /* 4 */
+
+TEST(coverage_repeated_error_line_reports_one_range_issue963) {
+    CBMFileResult *r =
+        cbm_extract_file(PS_TWO_ERRORS_ONE_LINE, (int)strlen(PS_TWO_ERRORS_ONE_LINE),
+                         CBM_LANG_POWERSHELL, "covproj", "two_errors.ps1", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    /* Line 2 carries two separate error nodes. It must be named once. */
+    ASSERT_STR_EQ(r->error_ranges, "2-2");
+    ASSERT_EQ(r->error_region_count, 1);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(coverage_range_never_ends_past_the_last_line_issue963) {
+    int len = (int)strlen(PS_ERROR_TO_EOF);
+    CBMFileResult *r = cbm_extract_file(PS_ERROR_TO_EOF, len, CBM_LANG_POWERSHELL, "covproj",
+                                        "error_to_eof.ps1", 0, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    /* The file has four lines and ends with a newline. Line 5 does not exist. */
+    ASSERT_STR_EQ(r->error_ranges, "1-4");
+    ASSERT_NULL(strstr(r->error_ranges, "5"));
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -870,4 +915,6 @@ SUITE(parse_coverage) {
     RUN_TEST(real_error_before_eof_still_flagged_with_trailing_blank_issue1746);
     RUN_TEST(width_bearing_error_at_eof_still_flagged_with_trailing_blank_issue1746);
     RUN_TEST(c_thread_local_grammar_limit_is_pinned_issue963);
+    RUN_TEST(coverage_repeated_error_line_reports_one_range_issue963);
+    RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
 }

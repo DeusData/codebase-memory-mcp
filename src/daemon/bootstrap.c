@@ -6,13 +6,17 @@
 #include "daemon/ipc.h"
 #include "daemon/service.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 
+#include <errno.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -38,6 +42,14 @@ extern char **environ;
 
 enum {
     BOOTSTRAP_RETRY_NS = 1000000,
+    /* #1828: how often a waiting client re-reads the start-failure log
+     * (the wait loop itself ticks every millisecond). */
+    BOOTSTRAP_START_FAILURE_CHECK_MS = 50,
+    /* A record this many seconds OLDER than the client's own spawn instant is
+     * still accepted: a sibling client's attempt that just failed is the same
+     * evidence, and second-granularity clocks need the slack anyway. */
+    BOOTSTRAP_START_FAILURE_SKEW_S = 2,
+    BOOTSTRAP_START_FAILURE_LOG_CAP = 65536,
     BOOTSTRAP_COORDINATION_CLEANUP_MS = 500,
     BOOTSTRAP_PATH_CAP = 4096,
 };
@@ -292,6 +304,270 @@ static _Noreturn void bootstrap_cleanup_fail_stop(const char *component) {
 #endif
 }
 
+static const char BOOTSTRAP_START_FAILURE_LOG_NAME[] = "cbm-daemon.start-failures.log";
+
+bool cbm_daemon_bootstrap_log_directory(char *out, size_t capacity) {
+    if (!out || capacity == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    const char *cache = cbm_resolve_cache_dir();
+    if (!cache || !cache[0]) {
+        return false;
+    }
+    int written = snprintf(out, capacity, "%s/logs", cache);
+    if (written <= 0 || (size_t)written >= capacity) {
+        out[0] = '\0';
+        return false;
+    }
+    return true;
+}
+
+/* One record field: the line format is tab-separated, so a tab or newline in
+ * a value (a path, in theory) becomes '?' rather than a parser ambiguity. */
+static void bootstrap_record_field(char *out, size_t capacity, const char *value) {
+    size_t used = 0;
+    for (const char *cursor = value ? value : ""; *cursor && used + 1 < capacity; cursor++) {
+        unsigned char ch = (unsigned char)*cursor;
+        out[used++] = ch == '\t' || ch == '\n' || ch == '\r' ? '?' : (char)ch;
+    }
+    out[used] = '\0';
+}
+
+static uint64_t bootstrap_current_pid(void) {
+#ifdef _WIN32
+    return (uint64_t)GetCurrentProcessId();
+#else
+    return (uint64_t)getpid();
+#endif
+}
+
+bool cbm_daemon_bootstrap_start_failure_record(const char *log_directory,
+                                               const cbm_daemon_ipc_endpoint_t *endpoint,
+                                               const char *component) {
+    if (!log_directory || !log_directory[0] || !endpoint || !component || !component[0]) {
+        return false;
+    }
+    const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(endpoint);
+    if (!runtime_dir || !runtime_dir[0]) {
+        return false;
+    }
+    cbm_daemon_ipc_listen_failure_t detail;
+    if (!cbm_daemon_ipc_listen_failure_detail(&detail)) {
+        memset(&detail, 0, sizeof(detail));
+    }
+    char safe_runtime_dir[BOOTSTRAP_PATH_CAP];
+    char safe_component[CBM_DAEMON_BOOTSTRAP_COMPONENT_CAP];
+    char safe_stage[CBM_DAEMON_IPC_LISTEN_FAILURE_STAGE_CAP];
+    char safe_path[CBM_DAEMON_IPC_LISTEN_FAILURE_PATH_CAP];
+    bootstrap_record_field(safe_runtime_dir, sizeof(safe_runtime_dir), runtime_dir);
+    bootstrap_record_field(safe_component, sizeof(safe_component), component);
+    bootstrap_record_field(safe_stage, sizeof(safe_stage), detail.stage);
+    bootstrap_record_field(safe_path, sizeof(safe_path), detail.path);
+    FILE *stream = cbm_daemon_ipc_private_log_open(log_directory, BOOTSTRAP_START_FAILURE_LOG_NAME,
+                                                   BOOTSTRAP_START_FAILURE_LOG_CAP);
+    if (!stream) {
+        return false;
+    }
+    int written =
+        fprintf(stream, "v1\t%llu\t%llu\t%s\t%s\t%s\t%d\t%s\n", (unsigned long long)time(NULL),
+                (unsigned long long)bootstrap_current_pid(), safe_runtime_dir, safe_component,
+                safe_stage, detail.errno_value, safe_path);
+    bool ok = written > 0 && fflush(stream) == 0;
+    if (fclose(stream) != 0) {
+        ok = false;
+    }
+    return ok;
+}
+
+/* Parse one "v1\tts\tpid\truntime_dir\tcomponent\tstage\terrno\tpath" line
+ * (line is NUL-terminated, newline already stripped, and is modified). */
+static bool bootstrap_start_failure_parse(char *line, char **runtime_dir_out,
+                                          cbm_daemon_bootstrap_start_failure_t *out) {
+    char *fields[8];
+    size_t count = 0;
+    char *cursor = line;
+    while (count < 8) {
+        fields[count++] = cursor;
+        char *tab = strchr(cursor, '\t');
+        if (!tab) {
+            break;
+        }
+        *tab = '\0';
+        cursor = tab + 1;
+    }
+    if (count != 8 || strcmp(fields[0], "v1") != 0) {
+        return false;
+    }
+    memset(out, 0, sizeof(*out));
+    out->recorded_at_s = strtoull(fields[1], NULL, 10);
+    out->pid = strtoull(fields[2], NULL, 10);
+    *runtime_dir_out = fields[3];
+    (void)snprintf(out->component, sizeof(out->component), "%s", fields[4]);
+    (void)snprintf(out->stage, sizeof(out->stage), "%s", fields[5]);
+    out->errno_value = (int)strtol(fields[6], NULL, 10);
+    (void)snprintf(out->path, sizeof(out->path), "%s", fields[7]);
+    return true;
+}
+
+static FILE *bootstrap_start_failure_open(const char *log_directory, int *status_out) {
+    char path[BOOTSTRAP_PATH_CAP];
+    int written =
+        snprintf(path, sizeof(path), "%s/%s", log_directory, BOOTSTRAP_START_FAILURE_LOG_NAME);
+    if (written <= 0 || written >= (int)sizeof(path)) {
+        *status_out = -1;
+        return NULL;
+    }
+#ifndef _WIN32
+    struct stat status;
+    if (lstat(path, &status) != 0) {
+        *status_out = errno == ENOENT ? 0 : -1;
+        return NULL;
+    }
+    if (!S_ISREG(status.st_mode) || status.st_uid != geteuid() || status.st_nlink != 1) {
+        *status_out = -1;
+        return NULL;
+    }
+#endif
+    /* The directory is the trust boundary (owner-only, no symlinked
+     * ancestry); the same validation guards cbm-daemon.log itself. */
+    if (!cbm_daemon_ipc_private_directory_secure(log_directory)) {
+        *status_out = -1;
+        return NULL;
+    }
+    FILE *file = cbm_fopen(path, "rb");
+    if (!file) {
+        *status_out = errno == ENOENT ? 0 : -1;
+        return NULL;
+    }
+    *status_out = 1;
+    return file;
+}
+
+int cbm_daemon_bootstrap_start_failure_read(const char *log_directory,
+                                            const cbm_daemon_ipc_endpoint_t *endpoint,
+                                            uint64_t not_before_s,
+                                            cbm_daemon_bootstrap_start_failure_t *out_failure) {
+    if (!out_failure) {
+        return -1;
+    }
+    memset(out_failure, 0, sizeof(*out_failure));
+    if (!log_directory || !log_directory[0] || !endpoint) {
+        return -1;
+    }
+    const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(endpoint);
+    if (!runtime_dir || !runtime_dir[0]) {
+        return -1;
+    }
+    int status = 0;
+    FILE *file = bootstrap_start_failure_open(log_directory, &status);
+    if (!file) {
+        return status;
+    }
+    char *buffer = malloc(BOOTSTRAP_START_FAILURE_LOG_CAP + 1U);
+    if (!buffer) {
+        (void)fclose(file);
+        return -1;
+    }
+    size_t used = fread(buffer, 1, BOOTSTRAP_START_FAILURE_LOG_CAP, file);
+    bool read_ok = !ferror(file);
+    (void)fclose(file);
+    buffer[used] = '\0';
+    int found = 0;
+    if (read_ok) {
+        char *line = buffer;
+        while (line && *line) {
+            char *end = strchr(line, '\n');
+            if (!end) {
+                break; /* a partial trailing line is a record still being written */
+            }
+            *end = '\0';
+            char *record_runtime_dir = NULL;
+            cbm_daemon_bootstrap_start_failure_t candidate;
+            if (bootstrap_start_failure_parse(line, &record_runtime_dir, &candidate) &&
+                strcmp(record_runtime_dir, runtime_dir) == 0 &&
+                candidate.recorded_at_s >= not_before_s) {
+                *out_failure = candidate; /* later lines are newer */
+                found = 1;
+            }
+            line = end + 1;
+        }
+    } else {
+        found = -1;
+    }
+    free(buffer);
+    return found;
+}
+
+void cbm_daemon_bootstrap_start_failure_format(const cbm_daemon_bootstrap_start_failure_t *failure,
+                                               const char *log_directory, char *out,
+                                               size_t capacity) {
+    if (!out || capacity == 0) {
+        return;
+    }
+    if (!failure) {
+        out[0] = '\0';
+        return;
+    }
+    const char *what = failure->stage[0]       ? failure->stage
+                       : failure->component[0] ? failure->component
+                                               : "startup";
+    char where[BOOTSTRAP_PATH_CAP];
+    if (log_directory && log_directory[0]) {
+        (void)snprintf(where, sizeof(where), "see %s/cbm-daemon.log", log_directory);
+    } else {
+        (void)snprintf(where, sizeof(where), "see the daemon log");
+    }
+    if (failure->errno_value != 0 && failure->path[0]) {
+        (void)snprintf(out, capacity,
+                       "CBM daemon failed to start: %s failed with %s (%s) at %s; %s", what,
+                       cbm_errno_name(failure->errno_value), strerror(failure->errno_value),
+                       failure->path, where);
+    } else if (failure->errno_value != 0) {
+        (void)snprintf(out, capacity, "CBM daemon failed to start: %s failed with %s (%s); %s",
+                       what, cbm_errno_name(failure->errno_value), strerror(failure->errno_value),
+                       where);
+    } else if (failure->path[0]) {
+        (void)snprintf(out, capacity, "CBM daemon failed to start: %s failed at %s; %s", what,
+                       failure->path, where);
+    } else {
+        (void)snprintf(out, capacity, "CBM daemon failed to start: %s failed; %s", what, where);
+    }
+}
+
+/* After this attempt spawned a daemon: did that daemon (or a sibling attempt
+ * moments earlier) record a start failure? A found record ends the wait with
+ * its cause -- respawning a deterministically failing daemon until the
+ * deadline only produced "active or starting" (#1828). */
+static bool bootstrap_start_failure_detected(const cbm_daemon_bootstrap_config_t *config,
+                                             const cbm_daemon_bootstrap_ops_t *ops,
+                                             uint64_t spawn_wall_s, bool force,
+                                             uint64_t *next_check_ms,
+                                             cbm_daemon_bootstrap_result_t *result_out) {
+    if (spawn_wall_s == 0 || !ops->start_failure_probe) {
+        return false;
+    }
+    uint64_t now_ms = cbm_now_ms();
+    if (!force && now_ms < *next_check_ms) {
+        return false;
+    }
+    *next_check_ms = now_ms + BOOTSTRAP_START_FAILURE_CHECK_MS;
+    uint64_t not_before_s = spawn_wall_s > BOOTSTRAP_START_FAILURE_SKEW_S
+                                ? spawn_wall_s - BOOTSTRAP_START_FAILURE_SKEW_S
+                                : 0;
+    cbm_daemon_bootstrap_start_failure_t failure;
+    if (ops->start_failure_probe(ops->context, config->endpoint, not_before_s, &failure) != 1) {
+        return false;
+    }
+    char logs[BOOTSTRAP_PATH_CAP];
+    if (!cbm_daemon_bootstrap_log_directory(logs, sizeof(logs))) {
+        logs[0] = '\0';
+    }
+    cbm_daemon_bootstrap_start_failure_format(&failure, logs, result_out->message,
+                                              sizeof(result_out->message));
+    return true;
+}
+
 static void bootstrap_pause(uint64_t deadline) {
     uint64_t now = cbm_now_ms();
     if (now >= deadline) {
@@ -458,7 +734,15 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     bool lock_acquired = false;
     bool generation_observed = probe == CBM_DAEMON_BOOTSTRAP_PROBE_RESERVED ||
                                probe == CBM_DAEMON_BOOTSTRAP_PROBE_TERMINAL;
+    uint64_t spawn_wall_s = 0;
+    uint64_t next_failure_check_ms = 0;
+    bool start_failed = false;
     while (cbm_now_ms() < deadline) {
+        if (bootstrap_start_failure_detected(config, ops, spawn_wall_s, false,
+                                             &next_failure_check_ms, result_out)) {
+            start_failed = true;
+            break;
+        }
         if (!bootstrap_probe_is_waitable(probe)) {
             break;
         }
@@ -508,11 +792,20 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
             break;
         }
 
+        /* Never relaunch a daemon whose predecessor already recorded why it
+         * could not start; the record is written before that daemon lets go
+         * of its lifetime reservation, so this unconditional read sees it. */
+        if (bootstrap_start_failure_detected(config, ops, spawn_wall_s, true,
+                                             &next_failure_check_ms, result_out)) {
+            start_failed = true;
+            break;
+        }
         cbm_daemon_bootstrap_launch_spec_t spec;
         bool spec_ready =
             config->spawn_permanent
                 ? cbm_daemon_bootstrap_launch_spec_init_permanent(config->executable_path, &spec)
                 : cbm_daemon_bootstrap_launch_spec_init(config->executable_path, &spec);
+        spawn_wall_s = (uint64_t)time(NULL);
         if (!spec_ready || !ops->startup_lock_prepare_handoff(ops->context, startup_lock) ||
             !ops->spawn_daemon(ops->context, &spec)) {
             probe = CBM_DAEMON_BOOTSTRAP_PROBE_ERROR;
@@ -537,7 +830,15 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
             if (!bootstrap_probe_is_waitable(probe)) {
                 break;
             }
+            if (bootstrap_start_failure_detected(config, ops, spawn_wall_s, false,
+                                                 &next_failure_check_ms, result_out)) {
+                start_failed = true;
+                break;
+            }
         } while (cbm_now_ms() < deadline);
+        if (start_failed) {
+            break;
+        }
         if (!lock_acquired) {
             continue;
         }
@@ -555,7 +856,9 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     }
 
     result_out->status = CBM_DAEMON_BOOTSTRAP_FAILED;
-    if (muted_holder_pid != 0) {
+    if (start_failed) {
+        /* result_out->message already names the recorded cause. */
+    } else if (muted_holder_pid != 0) {
         /* The one diagnostic the 2026-08-29 zombie recovery had to assemble by
          * hand from process, pipe, and log correlation: name the pid that
          * holds the endpoint without answering, and say what to do with it. */
@@ -771,6 +1074,17 @@ static bool bootstrap_production_unlock(void *context, cbm_daemon_bootstrap_lock
     bool released = cbm_daemon_ipc_startup_lock_release(&lock);
     *lock_io = lock;
     return released;
+}
+
+static int bootstrap_production_start_failure_probe(
+    void *context, const cbm_daemon_ipc_endpoint_t *endpoint, uint64_t not_before_s,
+    cbm_daemon_bootstrap_start_failure_t *out_failure) {
+    (void)context;
+    char logs[BOOTSTRAP_PATH_CAP];
+    if (!cbm_daemon_bootstrap_log_directory(logs, sizeof(logs))) {
+        return -1;
+    }
+    return cbm_daemon_bootstrap_start_failure_read(logs, endpoint, not_before_s, out_failure);
 }
 
 static bool bootstrap_production_handoff(void *context, cbm_daemon_bootstrap_lock_t lock) {
@@ -1041,10 +1355,26 @@ static void bootstrap_production_diagnostic(void *context, const char *message) 
     (void)fflush(stderr);
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+static cbm_daemon_bootstrap_spawn_fn g_bootstrap_spawn_override_for_test;
+static void *g_bootstrap_spawn_override_context_for_test;
+
+void cbm_daemon_bootstrap_spawn_override_set_for_test(cbm_daemon_bootstrap_spawn_fn spawn,
+                                                      void *context) {
+    g_bootstrap_spawn_override_context_for_test = context;
+    g_bootstrap_spawn_override_for_test = spawn;
+}
+
+static bool bootstrap_seam_spawn(void *context, const cbm_daemon_bootstrap_launch_spec_t *spec) {
+    (void)context;
+    return g_bootstrap_spawn_override_for_test(g_bootstrap_spawn_override_context_for_test, spec);
+}
+#endif
+
 cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute(
     const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result_out) {
     bootstrap_production_context_t context = {0};
-    const cbm_daemon_bootstrap_ops_t ops = {
+    cbm_daemon_bootstrap_ops_t ops = {
         .context = &context,
         .cohort_acquire = bootstrap_production_cohort_acquire,
         .cohort_release = bootstrap_production_cohort_release,
@@ -1054,6 +1384,12 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute(
         .startup_lock_release = bootstrap_production_unlock,
         .spawn_daemon = bootstrap_production_spawn,
         .visible_diagnostic = bootstrap_production_diagnostic,
+        .start_failure_probe = bootstrap_production_start_failure_probe,
     };
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_bootstrap_spawn_override_for_test) {
+        ops.spawn_daemon = bootstrap_seam_spawn;
+    }
+#endif
     return cbm_daemon_bootstrap_execute_with_ops(config, &ops, result_out);
 }

@@ -119,6 +119,47 @@ cbm_daemon_bootstrap_probe_status_t cbm_daemon_bootstrap_classify_failed_connect
 typedef void *cbm_daemon_bootstrap_lock_t;
 typedef void *cbm_daemon_bootstrap_cohort_t;
 
+/* Durable daemon start-failure record (#1828). A detached daemon has no
+ * stderr and no channel back to the client that launched it; when its
+ * listener publication fails (a full /tmp, for instance) the client used to
+ * respawn it for the whole startup deadline and then report "active or
+ * starting". The host now appends one record per failed start to
+ * <cache>/logs/cbm-daemon.start-failures.log -- the same owner-only log
+ * directory as cbm-daemon.log, deliberately NOT the runtime directory: that
+ * one is exactly what a full /tmp cannot write, and a new artifact there
+ * would entangle stale-generation cleanup. A waiting client reads the newest
+ * record for its endpoint that is not older than its own spawn and fails
+ * immediately with the cause. Diagnostic only: policy never reads it. */
+enum { CBM_DAEMON_BOOTSTRAP_COMPONENT_CAP = 32 };
+typedef struct {
+    uint64_t recorded_at_s; /* wall clock, seconds */
+    uint64_t pid;
+    char component[CBM_DAEMON_BOOTSTRAP_COMPONENT_CAP];  /* host component that refused */
+    char stage[CBM_DAEMON_IPC_LISTEN_FAILURE_STAGE_CAP]; /* IPC stage, "" when none */
+    int errno_value;                                     /* 0 when unknown */
+    char path[CBM_DAEMON_IPC_LISTEN_FAILURE_PATH_CAP];   /* "" when none */
+} cbm_daemon_bootstrap_start_failure_t;
+
+/* <cache>/logs, the owner-only directory that holds every daemon log. */
+bool cbm_daemon_bootstrap_log_directory(char *out, size_t capacity);
+/* Append one record for this process's most recent listener failure detail
+ * (cbm_daemon_ipc_listen_failure_detail) under `component`. */
+bool cbm_daemon_bootstrap_start_failure_record(const char *log_directory,
+                                               const cbm_daemon_ipc_endpoint_t *endpoint,
+                                               const char *component);
+/* Newest record for `endpoint` recorded at or after not_before_s. Returns 1
+ * and fills out_failure, 0 when none matches, -1 when the log directory or
+ * file cannot be validated. */
+int cbm_daemon_bootstrap_start_failure_read(const char *log_directory,
+                                            const cbm_daemon_ipc_endpoint_t *endpoint,
+                                            uint64_t not_before_s,
+                                            cbm_daemon_bootstrap_start_failure_t *out_failure);
+/* The client-facing sentence: "CBM daemon failed to start: <stage> failed
+ * with ENOSPC (No space left on device) at <path>; see <log>". */
+void cbm_daemon_bootstrap_start_failure_format(const cbm_daemon_bootstrap_start_failure_t *failure,
+                                               const char *log_directory, char *out,
+                                               size_t capacity);
+
 /* Injectable OS/runtime boundary used by the deterministic unit contract.
  * Production callers use cbm_daemon_bootstrap_execute(), whose built-in
  * operations delegate to daemon IPC/runtime and write visible diagnostics to
@@ -149,6 +190,12 @@ typedef struct {
     bool (*startup_lock_release)(void *context, cbm_daemon_bootstrap_lock_t *lock_io);
     bool (*spawn_daemon)(void *context, const cbm_daemon_bootstrap_launch_spec_t *spec);
     void (*visible_diagnostic)(void *context, const char *message);
+    /* Optional. After this attempt spawned a daemon, report a start-failure
+     * record for the endpoint not older than not_before_s (1 found, 0 none,
+     * -1 unreadable). A found record ends the wait immediately (#1828). */
+    int (*start_failure_probe)(void *context, const cbm_daemon_ipc_endpoint_t *endpoint,
+                               uint64_t not_before_s,
+                               cbm_daemon_bootstrap_start_failure_t *out_failure);
 } cbm_daemon_bootstrap_ops_t;
 
 cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute(
@@ -156,6 +203,17 @@ cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute(
 
 /* Test seam for the same state machine. All callbacks are synchronous and
  * borrowed for the duration of the call. */
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Replace ONLY the production spawn while every other production operation
+ * (cohort, probe, startup lock, handoff) stays real. A test forks a real
+ * daemon host in place of exec'ing the product binary, so the complete
+ * client/daemon rendezvous runs in one deterministic process tree (#1828). */
+typedef bool (*cbm_daemon_bootstrap_spawn_fn)(void *context,
+                                              const cbm_daemon_bootstrap_launch_spec_t *spec);
+void cbm_daemon_bootstrap_spawn_override_set_for_test(cbm_daemon_bootstrap_spawn_fn spawn,
+                                                      void *context);
+#endif
+
 cbm_daemon_bootstrap_status_t cbm_daemon_bootstrap_execute_with_ops(
     const cbm_daemon_bootstrap_config_t *config, const cbm_daemon_bootstrap_ops_t *ops,
     cbm_daemon_bootstrap_result_t *result_out);
