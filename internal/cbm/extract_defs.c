@@ -1416,7 +1416,8 @@ static bool is_route_string_kind(const char *kind) {
            strcmp(kind, "interpreted_string_literal") == 0;
 }
 
-static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source) {
+static const char *route_path_from_string_node(CBMArena *a, TSNode node, const char *source,
+                                               bool allow_relative) {
     if (!is_route_string_kind(ts_node_type(node))) {
         return NULL;
     }
@@ -1428,21 +1429,28 @@ static const char *route_path_from_string_node(CBMArena *a, TSNode node, const c
     if (plen >= PAIR_CHARS && (path[0] == '"' || path[0] == '\'')) {
         path = cbm_arena_strndup(a, path + SKIP_CHAR, (size_t)(plen - PAIR_CHARS));
     }
-    return (path && path[0] == '/') ? path : NULL;
+    if (!path || path[0] == '/' || !allow_relative) {
+        return (path && path[0] == '/') ? path : NULL;
+    }
+    /* JAX-RS @Path values are relative URI templates; a leading slash is
+     * optional and ignored by the framework. Route nodes use absolute-looking
+     * paths consistently, so normalize a non-empty relative value here. */
+    return path[0] ? cbm_arena_sprintf(a, "/%s", path) : path;
 }
 
 static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
-                                           int max_depth) {
+                                           int max_depth, bool allow_relative) {
     if (ts_node_is_null(node) || max_depth < 0) {
         return NULL;
     }
-    const char *path = route_path_from_string_node(a, node, source);
+    const char *path = route_path_from_string_node(a, node, source, allow_relative);
     if (path || max_depth == 0) {
         return path;
     }
     uint32_t nc = ts_node_named_child_count(node);
     for (uint32_t i = 0; i < nc && i < DECORATOR_SCAN_LIMIT; i++) {
-        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1);
+        path = find_route_path_literal(a, ts_node_named_child(node, i), source, max_depth - 1,
+                                       allow_relative);
         if (path) {
             return path;
         }
@@ -1450,8 +1458,10 @@ static const char *find_route_path_literal(CBMArena *a, TSNode node, const char 
     return NULL;
 }
 
-// Extract route path from decorator arguments (first string that starts with /).
-static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source) {
+// Extract route path from decorator arguments. Generic mappings keep only
+// slash-prefixed strings; JAX-RS @Path additionally accepts relative templates.
+static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const char *source,
+                                                bool allow_relative) {
     /* Every argument is checked. Java and Kotlin put no order on annotation
      * attributes, so `path` can sit anywhere in the list. Stopping early left
      * a real route unread and formed no Route node. Each argument's own
@@ -1464,7 +1474,8 @@ static const char *extract_route_path_from_args(CBMArena *a, TSNode args, const 
          *   @GetMapping(path = {"/orders"})
          * Walk a bounded subtree and keep the first string literal that is
          * path-shaped, while ignoring non-route literals such as media types. */
-        const char *path = find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH);
+        const char *path =
+            find_route_path_literal(a, arg, source, CBM_DESCENDANT_MAX_DEPTH, allow_relative);
         if (path) {
             return path;
         }
@@ -1610,7 +1621,7 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
 
     TSNode args = find_decorator_args(dchild);
     if (!ts_node_is_null(args)) {
-        const char *path = extract_route_path_from_args(a, args, source);
+        const char *path = extract_route_path_from_args(a, args, source, false);
         if (path) {
             *out_path = path;
             *out_method = method;
@@ -1690,7 +1701,7 @@ static bool try_route_from_annotation(CBMArena *a, TSNode annotation, const char
     TSNode args = annotation_args_node(annotation);
     const char *path = NULL;
     if (!ts_node_is_null(args)) {
-        path = extract_route_path_from_args(a, args, source);
+        path = extract_route_path_from_args(a, args, source, false);
     }
     *out_path = path ? path : "/";
     *out_method = method;
@@ -1740,7 +1751,7 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
             if (!*out_jax_path && strcmp(name, "Path") == 0) {
                 TSNode args = annotation_args_node(child);
                 if (!ts_node_is_null(args)) {
-                    *out_jax_path = extract_route_path_from_args(a, args, source);
+                    *out_jax_path = extract_route_path_from_args(a, args, source, true);
                 }
                 continue;
             }
@@ -1750,7 +1761,7 @@ static void scan_route_annotations(CBMArena *a, TSNode owner, const char *source
                     *out_method = method;
                     TSNode args = annotation_args_node(child);
                     if (!ts_node_is_null(args)) {
-                        *out_map_path = extract_route_path_from_args(a, args, source);
+                        *out_map_path = extract_route_path_from_args(a, args, source, false);
                     }
                 }
             }
@@ -4994,7 +5005,8 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
 
     def.decorators = extract_decorators(a, child, ctx->source, ctx->language, spec);
     extract_route_from_decorators(a, child, ctx->source, spec, &def.route_path, &def.route_method);
-    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
+    if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN ||
+                           ctx->language == CBM_LANG_SCALA)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
     }
