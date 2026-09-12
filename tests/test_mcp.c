@@ -20108,6 +20108,45 @@ TEST(bm25_results_and_total_stay_consistent_issue518) {
     PASS();
 }
 
+TEST(bm25_honors_label_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "bm25-label";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/bm25-label");
+
+    cbm_node_t route = {.project = proj,
+                        .label = "Route",
+                        .name = "createInvoice",
+                        .qualified_name = "bm25-label.route.createInvoice",
+                        .file_path = "InvoiceController.scala"};
+    cbm_node_t function = {.project = proj,
+                           .label = "Function",
+                           .name = "createInvoice",
+                           .qualified_name = "bm25-label.function.createInvoice",
+                           .file_path = "InvoiceHandler.scala"};
+    ASSERT_TRUE(cbm_store_upsert_node(st, &route) > 0);
+    ASSERT_TRUE(cbm_store_upsert_node(st, &function) > 0);
+    ASSERT_EQ(cbm_store_fts_rebuild(st, NULL, 0), CBM_STORE_OK);
+
+    char *resp = cbm_mcp_handle_tool(
+        srv, "search_graph",
+        "{\"project\":\"bm25-label\",\"query\":\"create invoice\",\"label\":\"Route\","
+        "\"format\":\"json\",\"limit\":10}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    free(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1"));
+    ASSERT_NOT_NULL(strstr(inner, "bm25-label.route.createInvoice"));
+    ASSERT_NULL(strstr(inner, "bm25-label.function.createInvoice"));
+    free(inner);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 TEST(bm25_identifier_match_outranks_prose_only_match_issue518) {
     /* The 0.3 body weight is what keeps prose from drowning identifiers. Both
      * candidates carry the same label boost, so the ordering here is decided by
@@ -20222,6 +20261,7 @@ SUITE(mcp) {
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
     RUN_TEST(bm25_finds_module_by_promoted_description_issue519);
     RUN_TEST(bm25_results_and_total_stay_consistent_issue518);
+    RUN_TEST(bm25_honors_label_filter);
     RUN_TEST(bm25_identifier_match_outranks_prose_only_match_issue518);
     RUN_TEST(bm25_searches_legacy_four_column_fts_without_error_issue518);
     RUN_TEST(mcp_path_within_root_rejects_escape);
