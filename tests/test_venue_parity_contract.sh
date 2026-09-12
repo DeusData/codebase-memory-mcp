@@ -245,6 +245,8 @@ REQUIRED = [
     ("_soak.yml", r"scripts/ci/new-protected-temp-root\.ps1", "Windows soak uses the shared temp root"),
     ("_test.yml", r"scripts/ci/new-protected-temp-root\.ps1", "Windows tests use the shared temp root"),
     ("_test.yml", r"scripts/test\.sh", "the test legs run the canonical entry"),
+    ("_test.yml", r"run: bash scripts/ci/test-frontend\.sh", "frontend tests use the shared entry"),
+    ("_lint.yml", r"run: bash scripts/ci/lint-workflows\.sh", "workflow lint uses the shared entry"),
     ("pr.yml", r"vm-smoke\.sh", "PR CI smokes through the shared wrapper"),
     ("_build.yml", r"scripts/package-release\.sh",
      "release archives are produced by the canonical packaging entry"),
@@ -388,6 +390,8 @@ scripts/smoke-invariants.sh
 scripts/ci/preflight-docker.sh
 scripts/ci/require-all-green.sh
 scripts/ci/verify-shard-union.sh
+scripts/ci/test-frontend.sh
+scripts/ci/lint-workflows.sh
 scripts/ci/generate-sbom.py
 scripts/package-release.sh
 scripts/ci/smoke-artifact.sh
@@ -426,6 +430,8 @@ scripts/lint.sh
 scripts/smoke-local.sh
 scripts/soak-legs.sh
 scripts/ci/preflight-docker.sh
+scripts/ci/test-frontend.sh
+scripts/ci/lint-workflows.sh
 test-infrastructure/vm/vm-smoke.sh
 scripts/smoke-invariants.sh
 "
