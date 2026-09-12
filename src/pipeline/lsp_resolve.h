@@ -337,8 +337,18 @@ static inline bool cbm_pipeline_invocation_leaf_matches(const CBMResolvedCall *r
     }
     const char *resolved_leaf = cbm_lsp_bare_segment(resolved->callee_qn);
     const char *call_leaf = cbm_lsp_bare_segment(call->callee_name);
-    if (resolved_leaf && call_leaf && strcmp(resolved_leaf, call_leaf) == 0) {
-        return true;
+    if (resolved_leaf && call_leaf) {
+        if (strcmp(resolved_leaf, call_leaf) == 0) {
+            return true;
+        }
+        /* #495/#1911: a build-constrained twin QN carries a `#τ` suffix
+         * (`FlushDisk#linux`); its callable leaf is the part before the '#'
+         * (identifiers cannot contain one). */
+        size_t call_leaf_len = strlen(call_leaf);
+        if (strncmp(resolved_leaf, call_leaf, call_leaf_len) == 0 &&
+            resolved_leaf[call_leaf_len] == '#') {
+            return true;
+        }
     }
 
     /* Destructors intentionally join by their exact delete-expression
