@@ -218,6 +218,9 @@ bash "$ROOT/tests/test_windows_bundle_contract.sh"
 echo "=== Step 0e2: activation refusal diagnostic contract ==="
 bash "$ROOT/tests/test_activation_diagnostic_contract.sh"
 
+echo "=== Step 0e3: security gate fail-closed contract ==="
+bash "$ROOT/tests/test_security_gate_fail_closed.sh"
+
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
