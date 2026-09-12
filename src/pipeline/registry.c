@@ -925,6 +925,22 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     return match;
 }
 
+/* C#'s built-in type aliases (int, string, bool, ...) are lower-case
+ * KEYWORDS naming a type, not an ordinary lower-case value root; closed list,
+ * no caller-language read, matching the guard below's own design. */
+static bool receiver_root_is_type_keyword(const char *root, size_t len) {
+    static const char *const keywords[] = {
+        "bool",   "byte",  "char",  "decimal", "double", "dynamic", "float",  "int",  "long",
+        "object", "sbyte", "short", "string",  "uint",   "ulong",   "ushort", "void",
+    };
+    for (size_t i = 0; i < sizeof(keywords) / sizeof(keywords[0]); i++) {
+        if (strlen(keywords[i]) == len && strncmp(root, keywords[i], len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /* A dotted callee whose FIRST segment starts upper-case names a type — URLSession,
  * Calendar, JSONEncoder. That receiver chain is evidence the bare-name scorers
  * throw away, and throwing it away binds Foundation's URLSession.shared.data to
@@ -933,7 +949,8 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  * appears somewhere in the chain. Calendar.utcGregorian.startOfDayUTC resolving
  * to AuthDTOs.Calendar.startOfDayUTC passes, because Calendar is in the chain.
  *
- * Only an upper-case first segment is guarded. A lower-case root names a value
+ * Only an upper-case first segment is guarded, plus the closed set of
+ * lower-case type keywords above. Any other lower-case root names a value
  * (vm.load, http.Get, os.path.join) whose declared type the chain does not
  * show, so the chain proves nothing there and the call passes through
  * unchanged. A callee with no separator passes through as well.
@@ -960,7 +977,14 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
         return true; /* bare name — no receiver chain to judge */
     }
     if (dotted[0] < 'A' || dotted[0] > 'Z') {
-        return true; /* lower-case root names a value, not a type */
+        const char *first_dot = strchr(dotted, '.');
+        size_t root_len = (size_t)((first_dot ? first_dot : last_dot) - dotted);
+        if (!receiver_root_is_type_keyword(dotted, root_len)) {
+            return true; /* lower-case root names a value, not a type */
+        }
+        /* A reserved type keyword IS a type in receiver position
+         * (int.TryParse), so it falls through to the same chain-consistency
+         * check an upper-case root gets. */
     }
     /* A name written in capitals with underscores is a constant holding a
      * value, not a type: ISO_4217_URL.lower is a string's own method. JSON and

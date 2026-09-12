@@ -10288,6 +10288,34 @@ TEST(registry_receiver_chain_ignores_lowercase_root_issue1893) {
     PASS();
 }
 
+/* Issue #2121: unlike vm.load's lower-case value root above, C#'s built-in
+ * type keywords (int, string, bool, ...) DO name a type and must get the
+ * same chain-consistency check an upper-case root gets. */
+TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.Decoys.TsidNode.TryParse", "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "int.TryParse", "tmp.Demo", NULL, NULL, 0);
+    ASSERT_NULL(r.qualified_name);
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The true positive the new keyword check must not eat: the project really
+ * does define a type literally named "int" (or similar) and the chain shows
+ * it, so the match must still go through. */
+TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "TryParse", "tmp.int.TryParse", "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve(reg, "int.TryParse", "tmp.Demo", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "tmp.int.TryParse");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
 /* An unqualified callee has no chain at all and must pass through unchanged. */
 TEST(registry_receiver_chain_ignores_bare_name_issue1893) {
     cbm_registry_t *reg = cbm_registry_new();
@@ -14628,6 +14656,8 @@ SUITE(pipeline) {
     RUN_TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893);
     RUN_TEST(registry_receiver_chain_keeps_project_extension_issue1893);
     RUN_TEST(registry_receiver_chain_ignores_lowercase_root_issue1893);
+    RUN_TEST(registry_receiver_chain_refuses_lowercase_type_keyword_issue2121);
+    RUN_TEST(registry_receiver_chain_keeps_type_keyword_when_chain_matches_issue2121);
     RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
     RUN_TEST(registry_fuzzy_confidence_single);
     RUN_TEST(registry_fuzzy_confidence_distance);
