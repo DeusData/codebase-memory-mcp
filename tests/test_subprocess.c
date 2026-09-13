@@ -25,6 +25,7 @@
 #include <unistd.h>
 #else
 #include <windows.h>
+#include "../src/foundation/win_utf8.h"
 #endif
 
 /* ── Layer 1: pure classifier (all platforms) ─────────────────────────────── */
@@ -279,10 +280,20 @@ TEST(subprocess_run_spawn_failure) {
 TEST(subprocess_run_null_bin_rejected) {
     cbm_proc_opts_t opts = {0};
     opts.bin = NULL;
-    cbm_proc_result_t r;
+    /* Reusing a previous result must not expose stale Job Object diagnostics
+     * when validation rejects the next spawn before a process exists. */
+    cbm_proc_result_t r = {
+        .job_memory_limit_bytes = 123,
+        .peak_job_memory_bytes = 456,
+        .job_memory_available = true,
+    };
     int rc = cbm_subprocess_run(&opts, &r);
     ASSERT_EQ(rc, -1);
     ASSERT_EQ(r.outcome, CBM_PROC_SPAWN_FAILED);
+    ASSERT_EQ(r.exit_code, -1);
+    ASSERT_TRUE(r.job_memory_limit_bytes == 0);
+    ASSERT_TRUE(r.peak_job_memory_bytes == 0);
+    ASSERT_FALSE(r.job_memory_available);
     PASS();
 }
 
@@ -740,6 +751,46 @@ TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree) {
     ASSERT_FALSE(result.supervision_failed);
     ASSERT_TRUE(root_gone);
     ASSERT_TRUE(grandchild_gone);
+    PASS();
+#endif
+}
+
+TEST(subprocess_windows_job_object_enforces_memory_limit) {
+#ifndef _WIN32
+    SKIP_PLATFORM("native Windows Job Object memory-limit probe");
+#else
+    char *self_path = cbm_module_path_utf8();
+    ASSERT_TRUE(self_path != NULL);
+    const char *argv[] = {self_path, "__cbm_windows_memory_limit_probe", NULL};
+    cbm_proc_opts_t opts = {0};
+    opts.bin = self_path;
+    opts.argv = argv;
+    opts.quiet_timeout_ms = 5000;
+
+    /* Without the cap the SAME allocation must succeed. A machine-wide commit
+     * shortage must fail this test, not masquerade as Job Object enforcement. */
+    cbm_proc_result_t uncapped = {0};
+    int uncapped_rc = cbm_subprocess_run(&opts, &uncapped);
+    opts.memory_limit_bytes = (size_t)1024U * 1024U * 1024U;
+    cbm_proc_result_t result = {0};
+    int run_rc = cbm_subprocess_run(&opts, &result);
+    free(self_path);
+    ASSERT_EQ(uncapped_rc, 0);
+    ASSERT_EQ(uncapped.outcome, CBM_PROC_CLEAN);
+    ASSERT_EQ(uncapped.exit_code, 0);
+    ASSERT_TRUE(uncapped.tree_quiesced);
+    ASSERT_FALSE(uncapped.supervision_failed);
+    ASSERT_TRUE(uncapped.job_memory_limit_bytes == 0);
+    ASSERT_EQ(run_rc, 0);
+    ASSERT_EQ(result.outcome, CBM_PROC_EXIT_NONZERO);
+    ASSERT_EQ(result.exit_code, 73);
+    ASSERT_TRUE(result.tree_quiesced);
+    ASSERT_FALSE(result.supervision_failed);
+    ASSERT_TRUE(result.job_memory_available);
+    ASSERT_TRUE(result.job_memory_limit_bytes == opts.memory_limit_bytes);
+    ASSERT_TRUE(result.peak_job_memory_bytes > 0);
+    /* Windows may include the denied reservation in its peak counter, so peak
+     * can exceed the cap. The uncapped/capped exit codes prove enforcement. */
     PASS();
 #endif
 }
@@ -1228,6 +1279,7 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_cancel_is_idempotent_and_kills_ignoring_tree);
     RUN_TEST(subprocess_quiet_timeout_kills_ignoring_tree);
     RUN_TEST(subprocess_windows_job_object_cancellation_quiesces_descendant_tree);
+    RUN_TEST(subprocess_windows_job_object_enforces_memory_limit);
     RUN_TEST(subprocess_cancel_grace_is_hard_capped);
     RUN_TEST(subprocess_poll_log_delivery_is_bounded_and_terminal_is_lossless);
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);

@@ -842,6 +842,37 @@ TEST(async_calls_celery_python) {
     PASS();
 }
 
+/* RED-repro: a wall-clock / scheduling artifact must NOT drop a parseable
+ * file's defs. The CBM_TEST_WALL_STALL_ON seam forces the parse-timeout callback
+ * to read the WALL clock as (budget + 1 s) ahead while CPU time is untouched —
+ * emulating a worker descheduled under CI contention. celery/app.py DEFINES
+ * Celery.send_task; under the old wall-only 5 s budget that file is abandoned
+ * with zero defs, the "celery" QN the caller resolves against vanishes, and the
+ * ASYNC_CALLS edge count drops to 0 (the intermittent async_calls_celery_python
+ * failure). With the CPU-time budget the parse still completes (CPU under budget,
+ * wall under the generous ceiling) and the edge survives. Deterministic: the
+ * seam is a fixed offset, never real timing. Binds only under CBM_ENABLE_TEST_SEAMS
+ * (always set for the test-runner); a no-seam build exercises the plain edge. */
+TEST(async_calls_celery_wall_stall_seam) {
+    static const EtFile f[] = {
+        {"celery/app.py",
+         "class Celery:\n"
+         "    def task(self):\n        def decorator(fn): return fn\n        return decorator\n\n"
+         "    def send_task(self, name, args=None): return (name, args)\n\n"
+         "app = Celery()\n"},
+        {"tasks/order_tasks.py",
+         "from celery.app import app\n\n\n"
+         "def dispatch_order_created(order_id):\n"
+         "    return app.send_task('order_created', args=[order_id])\n\n\n"
+         "def dispatch_order_shipped(order_id):\n"
+         "    return app.send_task('order_shipped', args=[order_id])\n"}};
+    cbm_setenv("CBM_TEST_WALL_STALL_ON", "celery/app.py", 1);
+    int ok = et_edge_present(f, 2, "ASYNC_CALLS", 1);
+    cbm_unsetenv("CBM_TEST_WALL_STALL_ON");
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* Sidekiq (Ruby) — "Sidekiq" substring in resolved QN */
 TEST(async_calls_sidekiq_ruby) {
     static const EtFile f[] = {
@@ -1625,6 +1656,7 @@ SUITE(edge_types_probe) {
 
     /* ASYNC_CALLS — message queue dispatch (5 brokers × languages) */
     RUN_TEST(async_calls_celery_python);
+    RUN_TEST(async_calls_celery_wall_stall_seam);
     RUN_TEST(async_calls_sidekiq_ruby);
     RUN_TEST(async_calls_kafkajs_ts);
     RUN_TEST(async_calls_sqs_go);

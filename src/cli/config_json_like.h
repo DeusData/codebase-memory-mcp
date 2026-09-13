@@ -47,6 +47,11 @@ typedef enum {
     CBM_JSON_LIKE_VALUE_STRING,
     CBM_JSON_LIKE_VALUE_EMPTY_ARRAY,
     CBM_JSON_LIKE_VALUE_SINGLE_STRING_ARRAY,
+    /* An exact bare token (true/false/null/a number) matched byte-for-byte
+     * against expected_string. Requires expected_string and may not be
+     * combined with CBM_JSON_LIKE_FIELD_CAPTURE_STRING — a fixed token has
+     * nothing meaningful to capture for the caller. */
+    CBM_JSON_LIKE_VALUE_LITERAL,
 } cbm_json_like_value_shape_t;
 
 enum {

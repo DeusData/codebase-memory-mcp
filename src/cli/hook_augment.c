@@ -115,7 +115,7 @@ static void ha_open_crumb_log(int deadline_ms) {
         }
         char dir[CBM_SZ_1K];
         snprintf(dir, sizeof(dir), "%s/.cache/codebase-memory-mcp/logs", home);
-        cbm_mkdir_p(dir, 0755);
+        cbm_mkdir_p_ex(dir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(path, sizeof(path), "%s/hook-augment-timeouts.log", dir);
     }
     g_ha_crumb_fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);

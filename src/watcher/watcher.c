@@ -31,6 +31,7 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
+#include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #define WIN32_LEAN_AND_MEAN
@@ -631,12 +632,31 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
      * watched at a sub-package of a monorepo reindexes whenever any SIBLING
      * package changes, because git reports the whole repository's dirty state
      * regardless of -C. Paths stay repository-relative either way, which is
-     * what repo_cdup is for. */
-    const char *status_argv[] = {"git",    "--no-optional-locks",
-                                 "-C",     state->root_path,
-                                 "status", "--porcelain",
-                                 "-uall",  "-z",
-                                 "--",     ".",
+     * what repo_cdup is for.
+     *
+     * `:(exclude).codebase-memory` drops the indexer's OWN output. After every
+     * publish the pipeline re-exports <root>/.codebase-memory/ whenever an
+     * artifact already lives there (once persisted, or committed by the team
+     * and checked out into every worktree). Folding that write into the
+     * signature made each successful reindex look like a NEW dirty state on
+     * the next poll, and the daemon re-triggered itself forever (#1953: reap
+     * clean -> watcher.changed, 100+ times in 15 minutes, index workers
+     * pinned). Nothing under that directory is ever an index input (discovery
+     * skips it), so a change there can never require a reindex. The pathspec
+     * is CWD-relative, so a project watched at a monorepo sub-package excludes
+     * its own artifact directory; it is the same pathspec the exporter's
+     * clean-tree probe uses, for the same reason. */
+    const char *status_argv[] = {"git",
+                                 "--no-optional-locks",
+                                 "-C",
+                                 state->root_path,
+                                 "status",
+                                 "--porcelain",
+                                 "-uall",
+                                 "-z",
+                                 "--",
+                                 ".",
+                                 ":(exclude)" CBM_ARTIFACT_DIR,
                                  NULL};
     watcher_git_output_t output;
     watcher_git_status_t status =

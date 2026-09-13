@@ -213,9 +213,42 @@ static const char *cbm_string_read(void *payload, uint32_t byte, TSPoint point,
 
 // --- Parse timeout callback ---
 
+/* Budget for the tree-sitter progress callback. The PRIMARY gate is per-thread
+ * CPU time: a worker descheduled under CI contention burns WALL time but not
+ * CPU, so a starved-but-parseable file must NOT be abandoned merely because the
+ * 5 s budget elapsed in wall-clock against near-zero CPU. That false "parse
+ * timeout" silently dropped a file's defs and, with them, every cross-file edge
+ * those defs anchored (e.g. a Celery.send_task definition backing an ASYNC_CALLS
+ * edge). A generous WALL ceiling stays as a backstop so a genuinely
+ * stuck/spinning parse still terminates in bounded time. */
+#define CBM_PARSE_WALL_CEILING_FACTOR 12ULL /* ~60 s ceiling for the 5 s CPU budget */
+
+typedef struct {
+    uint64_t cpu_deadline_ns; // trip once this thread's CPU time passes it
+    uint64_t wall_ceiling_ns; // hard wall backstop for a spinning/stuck parse
+} CBMParseBudget;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic RED-repro seam (armed by CBM_TEST_WALL_STALL_ON in
+ * cbm_extract_file_ex): when set, the timeout callback reads the WALL clock this
+ * many ns ahead of reality while CPU time is untouched — emulating a worker
+ * descheduled long enough for the old wall-only budget to elapse against
+ * near-zero CPU. With the CPU-time budget the parse still completes; a wall-only
+ * / tight-ceiling budget drops the file. Thread-local so it cannot leak across
+ * worker threads. Compiled only into seam-enabled test artifacts. */
+static CBM_TLS uint64_t tl_parse_wall_seam_offset_ns = 0;
+#endif
+
+/* tree-sitter's TSProgressCallback mandates a non-const TSParseState*; a const
+ * parameter here would not match the opts.progress_callback assignment below. */
+// cppcheck-suppress constParameterCallback
 static bool cbm_timeout_cb(TSParseState *state) {
-    uint64_t deadline = *(uint64_t *)state->payload;
-    return now_ns() > deadline;
+    const CBMParseBudget *budget = (const CBMParseBudget *)state->payload;
+    uint64_t wall = now_ns();
+#ifdef CBM_ENABLE_TEST_SEAMS
+    wall += tl_parse_wall_seam_offset_ns;
+#endif
+    return cbm_thread_cpu_time_ns() > budget->cpu_deadline_ns || wall > budget->wall_ceiling_ns;
 }
 
 // --- Thread-local parser pool ---
@@ -794,12 +827,47 @@ typedef struct {
 } cbm_error_regions_t;
 
 static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
+    TSPoint start = ts_node_start_point(n);
+    TSPoint end = ts_node_end_point(n);
+    uint32_t start_line = start.row + 1;
+    uint32_t end_line = end.row + 1;
+
+    /* A node that ends at column 0 stopped right after the previous line's
+     * newline, so it holds no text on the row it points at. Counting that row
+     * named a line past the end of the file whenever the region ran to EOF:
+     * scripts/setup-windows.ps1 has 326 lines and reported "245-327". */
+    if (end.column == 0 && end.row > start.row) {
+        end_line = end.row;
+    }
+
+    /* One line can carry several error nodes, and repeating the same line range
+     * says nothing new. Line 113 of scripts/setup-windows.ps1 has two error
+     * nodes, at columns 25-29 and 31-32, and the report read "113-113,113-113".
+     * Drop the repeat.
+     *
+     * Only an EXACT repeat of the range already open is dropped. Do not merge
+     * ranges that merely overlap. Each range is judged separately later by
+     * cbm_region_is_recovered, which asks whether definitions starting inside
+     * that range cover it. Two ranges with the same numbers always get the same
+     * verdict, so collapsing them changes nothing. Two DIFFERENT ranges do not:
+     * merging 3-3 into 2-3 hands the wider range's covering definition to an
+     * error the definition does not explain, and a real parse failure then
+     * disappears from the report. tests/test_parse_coverage.c pins that case in
+     * perl_malformed_source_remains_partial_issue1838.
+     *
+     * This runs BEFORE the cap check, so a dropped repeat never counts as a
+     * range the cap threw away. */
+    if (acc->count > 0 && start_line == acc->starts[acc->count - 1] &&
+        end_line == acc->ends[acc->count - 1]) {
+        return;
+    }
+
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         acc->dropped++;
         return;
     }
-    acc->starts[acc->count] = ts_node_start_point(n).row + 1;
-    acc->ends[acc->count] = ts_node_end_point(n).row + 1;
+    acc->starts[acc->count] = start_line;
+    acc->ends[acc->count] = end_line;
     acc->count++;
 }
 
@@ -1585,11 +1653,26 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     };
 
     TSParseOptions opts = {0};
-    uint64_t deadline_ns = 0; // cppcheck-suppress unreadVariable
+    CBMParseBudget budget = {0}; // cppcheck-suppress unreadVariable
     if (timeout_micros > 0) {
-        deadline_ns = t0 + ((uint64_t)timeout_micros * USEC_TO_NSEC);
-        opts.payload = &deadline_ns;
+        uint64_t budget_ns = (uint64_t)timeout_micros * USEC_TO_NSEC;
+        // Descheduling burns wall time but not CPU: gate on this thread's CPU
+        // time so a starved-but-parseable file is not abandoned, with a generous
+        // wall ceiling as a backstop against a genuinely spinning/stuck parse.
+        budget.cpu_deadline_ns = cbm_thread_cpu_time_ns() + budget_ns;
+        budget.wall_ceiling_ns = t0 + budget_ns * CBM_PARSE_WALL_CEILING_FACTOR;
+        opts.payload = &budget;
         opts.progress_callback = cbm_timeout_cb;
+#ifdef CBM_ENABLE_TEST_SEAMS
+        tl_parse_wall_seam_offset_ns = 0;
+        const char *stall_on = getenv("CBM_TEST_WALL_STALL_ON");
+        if (stall_on && stall_on[0] && rel_path && strstr(rel_path, stall_on)) {
+            // Push the wall reading past the 1x budget (the old wall-only budget
+            // trips) but well under the generous ceiling (the CPU-time budget
+            // survives): budget + 1 s, deterministic, no real timing involved.
+            tl_parse_wall_seam_offset_ns = budget_ns + NSEC_PER_SEC;
+        }
+#endif
     }
 
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
