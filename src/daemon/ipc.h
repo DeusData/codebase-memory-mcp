@@ -131,6 +131,12 @@ bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, un
 bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
                                                     unsigned long euid, bool overflow_active,
                                                     unsigned long overflow_uid);
+#if defined(__linux__)
+/* Number of REAL overflow-uid derivations so far. The value is meaningless on
+ * its own; the point is that it must rise on every ancestor check, proving no
+ * cache has crept back in. */
+unsigned cbm_daemon_ipc_posix_overflow_compute_count_for_test(void);
+#endif
 #endif
 #endif
 

@@ -5124,6 +5124,49 @@ TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue183
     PASS();
 }
 
+/* #1830 regression guard, and the test that would have caught the original bug
+ * with no namespace at all. The overflow uid used to be memoised per process
+ * via pthread_once. That made a SECURITY decision sticky: pthread_once state
+ * survives fork(), unshare(CLONE_NEWUSER) rewrites /proc/self/uid_map, so a
+ * process that forked and then entered a namespace kept the parent verdict.
+ * Nothing in the suite could see it, because every deterministic #1830 test
+ * drives the override seam rather than the real derivation -- they bind the
+ * decision TABLE, not the WIRING.
+ *
+ * So assert the wiring directly: two ancestor checks must perform two real
+ * derivations. Re-introduce any cache and the second call derives zero times
+ * and this fails by name, on every platform, with no namespace required. */
+TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830) {
+#if defined(__linux__)
+    char parent[TEST_PATH_CAP];
+    if (!ipc_test_parent_new(parent, "overflow-nocache")) {
+        FAIL("could not create the probe parent directory");
+    }
+    char probe[TEST_PATH_CAP];
+    (void)snprintf(probe, sizeof(probe), "%s/x", parent);
+
+    /* The override seam short-circuits derivation, so it must be OFF here or
+     * the test would measure nothing. */
+    cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(false, 0);
+
+    unsigned before = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+    (void)cbm_daemon_ipc_private_directory_secure(probe);
+    unsigned after_first = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+    (void)cbm_daemon_ipc_private_directory_secure(probe);
+    unsigned after_second = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+
+    (void)rmdir(probe);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(after_first > before);
+    /* The decisive half: the SECOND call must derive again. */
+    ASSERT_TRUE(after_second > after_first);
+    PASS();
+#else
+    SKIP_PLATFORM("the overflow-uid derivation is Linux-only");
+#endif
+}
+
 /* #1830 real end-to-end smoke: inside a single-uid user namespace the
  * root-owned ancestors (/, /tmp) are overflow-owned, and the daemon must still
  * create its private directory there. An overflow-owned ancestor cannot be
@@ -5131,9 +5174,23 @@ TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue183
  * namespace is actually available. O10 whitelisted-skip everywhere it is not:
  * macOS has no user namespaces (compile-gated out); Docker's default seccomp
  * blocks unshare(CLONE_NEWUSER) on the Colima container leg; some kernels ship
- * user namespaces disabled. WHAT WAS TRIED when it skips: fork + unshare
+ * user namespaces disabled. NOT on that list any more: Ubuntu 23.10+ restricts
+ * unprivileged userns via AppArmor, which used to confine this test to the two
+ * ubuntu-22.04 legs -- broad-matrix only, so it ran in no PR and sat on
+ * GitHub's 2027-04-17 retirement clock. _test.yml now lifts that with
+ * kernel.apparmor_restrict_unprivileged_userns=0 on every ubuntu leg, so this
+ * runs on the CORE matrix. WHAT WAS TRIED when it skips: fork + unshare
  * CLONE_NEWUSER + a 1:1 uid_map write, which the sandbox denied (EPERM). The
- * deterministic decision coverage above is what binds the fix. */
+ * deterministic decision coverage above is what binds the fix.
+ *
+ * TO REPRODUCE IT LOCALLY two things are needed, and the second is easy to
+ * miss: run the container with --security-opt seccomp=unconfined so unshare is
+ * permitted, AND run the suite as a NON-ROOT uid. As root the mapped range
+ * covers uid 0, so root-owned /tmp stays 1:1 inside the namespace, never turns
+ * overflow, and this test passes without ever reaching the branch it exists to
+ * cover -- it passes just as happily with the fix reverted. Under `su tester`
+ * (uid 1001, the shape CI's runner user has) the ancestors do go overflow and
+ * the assertion becomes real. */
 TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
 #if defined(__linux__)
     uid_t host_uid = geteuid();
@@ -5164,9 +5221,20 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
             _exit(2);
         }
         /* Inside the ns / and /tmp now show the overflow uid. With #1830 the
-         * daemon can still build its private tree there; without it, refused. */
-        bool secured = cbm_daemon_ipc_private_directory_secure(probe);
-        _exit(secured ? 0 : 1);
+         * daemon can still build its private tree there; without it, refused.
+         *
+         * EXEC, do not just call. The overflow uid is derived once per process
+         * (pthread_once) from /proc/self/uid_map, and that state survives
+         * fork(): seven earlier call sites in this suite prime it with the HOST
+         * answer, so a forked child keeps "no overflow uid" and refuses no
+         * matter what its namespace says. That made this test fail on the only
+         * platform where it actually runs (ubuntu-22.04; macOS compile-gates it
+         * out, Colima's seccomp blocks unshare, and 23.10+ restricts
+         * unprivileged userns) -- while looking like a product regression.
+         * Re-exec so the decision is made by a process that STARTED here, which
+         * is also the only shape production ever takes. */
+        (void)execl("/proc/self/exe", "test-runner", "--userns-secure-probe", probe, (char *)NULL);
+        _exit(3); /* exec failed -- distinct from secure(0)/refused(1)/skip(2) */
     }
     if (child < 0) {
         FAIL("fork failed for userns smoke");
@@ -5178,7 +5246,24 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
     if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
         SKIP_PLATFORM("user namespaces unavailable (no CLONE_NEWUSER / seccomp-blocked)");
     }
-    ASSERT_TRUE(WIFEXITED(status));
+    /* A failed re-exec must never read as a product refusal: 3 is its own code
+     * so a broken probe is a loud harness failure, not a quiet "refused". */
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 3) {
+        FAIL("userns smoke could not re-exec /proc/self/exe for the probe");
+    }
+    /* {0,1,2,3} is the whole protocol. Any other code -- a sanitizer exit (LSan
+     * defaults to 23), an abort, a signal -- is a broken harness, not a refusal,
+     * and must say so with the code it actually saw. */
+    if (!WIFEXITED(status)) {
+        FAIL("userns probe did not exit normally (signalled) -- not a security verdict");
+    }
+    if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
+        char unexpected[128];
+        (void)snprintf(unexpected, sizeof(unexpected),
+                       "userns probe exited %d -- not a security verdict",
+                       WEXITSTATUS(status));
+        FAIL(unexpected);
+    }
     ASSERT_EQ(0, WEXITSTATUS(status));
     PASS();
 #else
@@ -5309,6 +5394,7 @@ SUITE(daemon_ipc) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
+    RUN_TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830);
     RUN_TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830);
 #endif
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);

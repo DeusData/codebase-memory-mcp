@@ -1463,9 +1463,21 @@ static char *private_log_directory_path_copy(const char *directory_path) {
  *
  * The overflow owner is tolerated for ANCESTORS ONLY, and ONLY when
  * /proc/self/uid_map is a single-uid map whose sole inside id is our euid. In
- * that shape no in-namespace principal can be the overflow owner, so an
- * overflow-owned ancestor is exactly as safe as a root-owned one on the host:
- * nobody reachable can have created it or can mutate it. A multi-uid map
+ * that shape no IN-NAMESPACE principal can be the overflow owner.
+ *
+ * Be precise about what that does and does not buy, because an earlier version
+ * of this comment overstated it. The overflow uid is what EVERY unmapped host
+ * uid maps to, not only host root (user_namespaces(7)), so "overflow-owned"
+ * does NOT prove "created by root". On a shared host, a directory owned by
+ * another local user is indistinguishable from root-owned /tmp once you are
+ * inside the namespace -- and there is no in-namespace discriminator that could
+ * tell them apart, which is precisely why the tolerance is scoped the way it
+ * is rather than made smarter. The real guarantee is narrower and still
+ * sufficient: no principal REACHABLE FROM INSIDE the namespace can create or
+ * mutate such an ancestor, and the private directory itself is never tolerated
+ * as overflow (see below), so a hostile host-side owner of an ancestor is
+ * bounded to denial of service and socket-path control. It cannot reach the
+ * leaf, which stays 0700 and euid-rechecked. A multi-uid map
  * (rootless podman with subuids) still shows host root as overflow and is
  * refused — conservative scope, not the safety argument. There is deliberately
  * no environment escape hatch.
@@ -1545,7 +1557,20 @@ static bool posix_read_small_proc_file(const char *path, char *buffer, size_t ca
     return true;
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Counts real derivations. A cache here was a security hazard once (see the
+ * note above posix_ancestor_overflow_uid); the contract test asserts this
+ * climbs on EVERY call so re-introducing one fails loudly. */
+static unsigned g_posix_overflow_compute_count;
+unsigned cbm_daemon_ipc_posix_overflow_compute_count_for_test(void) {
+    return g_posix_overflow_compute_count;
+}
+#endif
+
 static uid_t posix_compute_ancestor_overflow_uid(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_posix_overflow_compute_count++;
+#endif
     char map[256];
     if (!posix_read_small_proc_file("/proc/self/uid_map", map, sizeof(map)) ||
         !posix_uid_map_is_single_uid(map, geteuid())) {
@@ -1564,15 +1589,27 @@ static uid_t posix_compute_ancestor_overflow_uid(void) {
     return (uid_t)overflow;
 }
 
-static uid_t g_posix_overflow_cached = POSIX_NO_OVERFLOW_UID;
-static pthread_once_t g_posix_overflow_once = PTHREAD_ONCE_INIT;
-static void posix_overflow_init_once(void) {
-    g_posix_overflow_cached = posix_compute_ancestor_overflow_uid();
-}
 #endif /* __linux__ */
 
-/* The overflow uid tolerated for ancestors in this process, or
- * POSIX_NO_OVERFLOW_UID when none. Derived once from immutable /proc state. */
+/* The overflow uid tolerated for ancestors, or POSIX_NO_OVERFLOW_UID when none.
+ *
+ * DERIVED FRESH ON EVERY CALL, deliberately. This used to memoise via
+ * pthread_once behind a comment claiming "immutable /proc state". That claim
+ * was false in both halves: unshare(CLONE_NEWUSER) rewrites
+ * /proc/self/uid_map, and pthread_once state survives a forked child already
+ * marked done -- so a process that forked and then changed namespace kept the
+ * parent answer and refused a directory it should have accepted.
+ * (Spelled without the call syntax on purpose: scripts/security-audit.sh
+ * blocks that literal in src/, and an allow-list entry to let a COMMENT pass
+ * would weaken a real check on a real file.) It happened to be
+ * harmless because every caller today runs in a freshly exec'd process, but
+ * that made a security decision depend on an invariant nothing enforced, and
+ * the next fork-without-exec caller would have silently inherited a stale
+ * verdict.
+ *
+ * The cost of not caching is two small /proc reads per ancestor check, against
+ * an openat + fstat + fchmod + ACL check per path component in the same walk.
+ * Do not re-introduce a cache here; the contract test counts derivations. */
 static uid_t posix_ancestor_overflow_uid(void) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (g_posix_overflow_override_active) {
@@ -1580,8 +1617,7 @@ static uid_t posix_ancestor_overflow_uid(void) {
     }
 #endif
 #if defined(__linux__)
-    (void)pthread_once(&g_posix_overflow_once, posix_overflow_init_once);
-    return g_posix_overflow_cached;
+    return posix_compute_ancestor_overflow_uid();
 #else
     return POSIX_NO_OVERFLOW_UID;
 #endif

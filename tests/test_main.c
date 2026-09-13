@@ -965,6 +965,26 @@ int main(int argc, char **argv) {
         (void)cbm_setenv("CBM_TEST_BUILD_FINGERPRINT",
                          "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef", 1);
     }
+    /* #1830 userns smoke probe -- see the test that spawns it.
+     *
+     * The ancestor overflow uid is derived ONCE per process (pthread_once in
+     * src/daemon/ipc.c) from /proc/self/uid_map. That file is not immutable:
+     * unshare(CLONE_NEWUSER) is exactly what changes it, and pthread_once state
+     * survives fork(). A forked child therefore keeps the HOST answer and never
+     * re-derives inside its new namespace, so a fork-only smoke test refuses and
+     * cannot pass once anything earlier in the suite has primed the cache --
+     * seven call sites do. Re-exec into this probe so the decision is made by a
+     * process that STARTED inside the namespace, which is the production shape
+     * the test means to cover. */
+#if defined(__linux__) && defined(CBM_ENABLE_TEST_SEAMS)
+    if (argc == 3 && strcmp(argv[1], "--userns-secure-probe") == 0) {
+        /* _exit, not return: this process exists to answer ONE boolean. A
+         * return runs the atexit chain, and the runner is built with
+         * -fsanitize=address, so a future leak anywhere in the prologue would
+         * exit 23 and read as a security verdict on a test that has none. */
+        _exit(cbm_daemon_ipc_private_directory_secure(argv[2]) ? 0 : 1);
+    }
+#endif
     int mcp_idxfailclosed_rc = tf_maybe_run_mcp_idxfailclosed_probe(argc, argv);
     if (mcp_idxfailclosed_rc >= 0) {
         return mcp_idxfailclosed_rc;
