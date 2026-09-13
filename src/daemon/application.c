@@ -299,41 +299,85 @@ static void application_project_lock_release_fully(cbm_project_lock_lease_t **le
     }
 }
 
+typedef struct {
+    cbm_index_worker_handle_t *handle;
+    char *project;
+} application_default_worker_t;
+
+static char *application_index_project_key(const char *root_path, const char *args_json);
+
+/* Reuse the supervisor's bounded completed-line relay. Only actionable worker
+ * diagnostics enter the daemon journal; ordinary progress stays in worker logs. */
+static void application_worker_diagnostic(const char *line, void *context) {
+    const application_default_worker_t *worker = context;
+    if (!line || !worker) {
+        return;
+    }
+    if (!strncmp(line, "level=error ", strlen("level=error ")) ||
+        strstr(line, "\"level\":\"error\"")) {
+        cbm_log_error("index.worker", "project", worker->project ? worker->project : "", "record",
+                      line);
+    } else if (!strncmp(line, "level=warn ", strlen("level=warn ")) ||
+               strstr(line, "\"level\":\"warn\"")) {
+        cbm_log_warn("index.worker", "project", worker->project ? worker->project : "", "record",
+                     line);
+    }
+}
+
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
-    cbm_index_worker_handle_t *worker = NULL;
-    int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
-                                        quarantine_file, &worker);
+    application_default_worker_t *worker = calloc(1, sizeof(*worker));
+    if (!worker) {
+        return -1;
+    }
+    char *root = cbm_mcp_get_string_arg(args_json, "repo_path");
+    worker->project = application_index_project_key(root, args_json);
+    free(root);
+    int result = cbm_index_worker_start_with_log(args_json, memory_budget_bytes, false, marker_file,
+                                                 quarantine_file, application_worker_diagnostic,
+                                                 worker, &worker->handle);
+    if (result != 0) {
+        free(worker->project);
+        free(worker);
+        *worker_out = NULL;
+        return result;
+    }
     *worker_out = worker;
-    return result;
+    return 0;
 }
 
 static cbm_index_worker_poll_t application_worker_poll_default(
-    void *context, cbm_daemon_application_worker_t worker,
+    void *context, cbm_daemon_application_worker_t opaque,
     const cbm_index_worker_result_t **result_out) {
     (void)context;
-    return cbm_index_worker_poll((cbm_index_worker_handle_t *)worker, result_out);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_poll(worker->handle, result_out);
 }
 
 static bool application_worker_cancel_default(void *context,
-                                              cbm_daemon_application_worker_t worker) {
+                                              cbm_daemon_application_worker_t opaque) {
     (void)context;
-    return cbm_index_worker_request_cancel((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_request_cancel(worker->handle);
 }
 
 static const char *application_worker_log_path_default(void *context,
-                                                       cbm_daemon_application_worker_t worker) {
+                                                       cbm_daemon_application_worker_t opaque) {
     (void)context;
-    return cbm_index_worker_log_path((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    return cbm_index_worker_log_path(worker->handle);
 }
 
 static void application_worker_destroy_default(void *context,
-                                               cbm_daemon_application_worker_t worker) {
+                                               cbm_daemon_application_worker_t opaque) {
     (void)context;
-    cbm_index_worker_destroy((cbm_index_worker_handle_t *)worker);
+    application_default_worker_t *worker = opaque;
+    cbm_index_worker_destroy(worker->handle);
+    free(worker->project);
+    free(worker);
 }
 
 static uint32_t application_get_u32(const uint8_t *bytes) {
@@ -1244,6 +1288,21 @@ static void application_job_execution_cancel(application_job_execution_t *execut
     execution->unsafe_terminal = true;
 }
 
+/* A clean process exit means the response was delivered, not that indexing
+ * succeeded. The pipeline reports preserved-index aborts and publication errors
+ * as ordinary MCP tool results with isError=true. Keep that response for MCP
+ * callers, but do not publish a successful UI/background job or retry it as a
+ * crashed worker. Older successful responses may omit isError. */
+static bool application_index_response_succeeded(const char *response) {
+    yyjson_doc *document = response ? yyjson_read(response, strlen(response), 0) : NULL;
+    yyjson_val *root = document ? yyjson_doc_get_root(document) : NULL;
+    yyjson_val *error = yyjson_obj_get(root, "isError");
+    bool succeeded = yyjson_is_obj(root) && yyjson_is_arr(yyjson_obj_get(root, "content")) &&
+                     (!error || yyjson_is_false(error));
+    yyjson_doc_free(document);
+    return succeeded;
+}
+
 static application_attempt_decision_t application_consume_attempt(
     cbm_daemon_application_job_t *job, application_attempt_t *attempt,
     application_job_execution_t *execution, cbm_proc_outcome_t *failure_outcome) {
@@ -1254,7 +1313,7 @@ static application_attempt_decision_t application_consume_attempt(
     if (disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
         execution->response = attempt->result.response;
         attempt->result.response = NULL;
-        execution->successful = execution->response != NULL;
+        execution->successful = application_index_response_succeeded(execution->response);
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
     }
@@ -1459,6 +1518,15 @@ static void application_job_publish(cbm_daemon_application_job_t *job,
             execution->have_last_result ? &execution->last_result : NULL,
             execution->last_log[0] ? execution->last_log : NULL);
     }
+    bool cancelled = execution->have_last_result && execution->last_result.cancellation_requested;
+    cbm_log(execution->successful ? CBM_LOG_INFO
+            : cancelled           ? CBM_LOG_WARN
+                                  : CBM_LOG_ERROR,
+            "daemon.index.result", "project", job->project_key, "path", job->root_path, "status",
+            execution->successful ? "indexed"
+            : cancelled           ? "cancelled"
+                                  : "failed",
+            NULL);
     cbm_daemon_application_t *application = job->application;
     cbm_mutex_lock(&application->mutex);
     job->response = execution->response;

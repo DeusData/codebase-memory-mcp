@@ -1,0 +1,217 @@
+{
+  "root": {
+    "nodeId": "codeatlas-atlas-sample.src.services.userService.create",
+    "name": "create",
+    "qualifiedName": "codeatlas-atlas-sample.src.services.userService.create",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+    "range": {
+      "start": {
+        "line": 39,
+        "character": 0
+      },
+      "end": {
+        "line": 41,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "symbols": [
+    {
+      "nodeId": "codeatlas-atlas-sample.src.services.userService.create",
+      "name": "create",
+      "qualifiedName": "codeatlas-atlas-sample.src.services.userService.create",
+      "kind": "function",
+      "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+      "range": {
+        "start": {
+          "line": 39,
+          "character": 0
+        },
+        "end": {
+          "line": 41,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "name": "createUser",
+      "qualifiedName": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "kind": "function",
+      "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+      "range": {
+        "start": {
+          "line": 22,
+          "character": 0
+        },
+        "end": {
+          "line": 35,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.repo.db.insert",
+      "name": "insert",
+      "qualifiedName": "codeatlas-atlas-sample.src.repo.db.insert",
+      "kind": "function",
+      "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+      "range": {
+        "start": {
+          "line": 30,
+          "character": 0
+        },
+        "end": {
+          "line": 34,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.services.userService.listUsers",
+      "name": "listUsers",
+      "qualifiedName": "codeatlas-atlas-sample.src.services.userService.listUsers",
+      "kind": "function",
+      "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+      "range": {
+        "start": {
+          "line": 17,
+          "character": 0
+        },
+        "end": {
+          "line": 20,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.services.userService.toUser",
+      "name": "toUser",
+      "qualifiedName": "codeatlas-atlas-sample.src.services.userService.toUser",
+      "kind": "function",
+      "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+      "range": {
+        "start": {
+          "line": 8,
+          "character": 0
+        },
+        "end": {
+          "line": 15,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.types.UserEntity",
+      "name": "UserEntity",
+      "qualifiedName": "codeatlas-atlas-sample.src.types.UserEntity",
+      "kind": "class",
+      "uri": "file:///workspace/atlas-sample/src/types.ts",
+      "range": {
+        "start": {
+          "line": 36,
+          "character": 0
+        },
+        "end": {
+          "line": 52,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.util.validate.ValidationError",
+      "name": "ValidationError",
+      "qualifiedName": "codeatlas-atlas-sample.src.util.validate.ValidationError",
+      "kind": "class",
+      "uri": "file:///workspace/atlas-sample/src/util/validate.ts",
+      "range": {
+        "start": {
+          "line": 3,
+          "character": 0
+        },
+        "end": {
+          "line": 11,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    },
+    {
+      "nodeId": "codeatlas-atlas-sample.src.util.validate.validateUser",
+      "name": "validateUser",
+      "qualifiedName": "codeatlas-atlas-sample.src.util.validate.validateUser",
+      "kind": "function",
+      "uri": "file:///workspace/atlas-sample/src/util/validate.ts",
+      "range": {
+        "start": {
+          "line": 18,
+          "character": 0
+        },
+        "end": {
+          "line": 30,
+          "character": 0
+        }
+      },
+      "projectName": "codeatlas-atlas-sample"
+    }
+  ],
+  "edges": [
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.create",
+      "to": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "line": 41
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "to": "codeatlas-atlas-sample.src.repo.db.insert",
+      "line": 30
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "to": "codeatlas-atlas-sample.src.services.userService.listUsers",
+      "line": 29
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "to": "codeatlas-atlas-sample.src.services.userService.toUser",
+      "line": 35
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "to": "codeatlas-atlas-sample.src.types.UserEntity",
+      "line": 29
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "to": "codeatlas-atlas-sample.src.util.validate.ValidationError",
+      "line": 27
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.createUser",
+      "to": "codeatlas-atlas-sample.src.util.validate.validateUser",
+      "line": 24
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.services.userService.listUsers",
+      "to": "codeatlas-atlas-sample.src.services.userService.toUser",
+      "line": 20
+    },
+    {
+      "from": "codeatlas-atlas-sample.src.util.validate.validateUser",
+      "to": "codeatlas-atlas-sample.src.util.validate.ValidationError",
+      "line": 22
+    }
+  ],
+  "truncated": true,
+  "visited": 9,
+  "depth": 3,
+  "cap": 8
+}

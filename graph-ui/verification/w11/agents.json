@@ -1,0 +1,3101 @@
+{
+  "offMakesNoRequests": true,
+  "noBridgeExplained": true,
+  "bridgeConnects": true,
+  "agentsRendered": 4,
+  "agentColorsDistinct": true,
+  "agentColorStableAcrossReload": true,
+  "nodeColorsUnchanged": true,
+  "workKindsRendered": 4,
+  "letterOnBody": true,
+  "rangeMappingExact": true,
+  "innermostWins": true,
+  "fileOnlyHitsModule": true,
+  "uncertainMarked": true,
+  "unmappableListed": true,
+  "hudCompact": true,
+  "hudSize": {
+    "width": 320,
+    "height": 173
+  },
+  "hudCountsReal": true,
+  "activityStripFromEvents": true,
+  "seqGapReported": true,
+  "hudExpandShowsCards": true,
+  "hudCollapsedKeepsLine": true,
+  "hudSizePersists": true,
+  "youActorShown": true,
+  "filterYouAgentBoth": true,
+  "youEventsStayLocal": true,
+  "layerToggleInSettings": true,
+  "layerToggleNamesEffect": true,
+  "intentOnlyWhenReported": true,
+  "intentMarkedAsSelfReport": true,
+  "noProgressNoScore": true,
+  "replayFromFixture": true,
+  "orbitFrames": 8,
+  "orbitContactSheetWritten": true,
+  "orbitAnglesDiffer": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "port": 4621,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w11a",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "events": "fixtures/agent-events/w11a-replay.jsonl (nur gelesen)",
+  "method": "Die Bruecke laeuft im Wiedergabemodus: sie liest die Ereignisdatei einmal und gibt sie nur weiter, wenn dieser Lauf den Takt setzt (POST /replay/advance). Damit durchlaeuft jede Wiederholung dieselben Zustaende. Die erwartete Zuordnung rechnet dieser Lauf selbst aus der Layout-Antwort und haelt sie gegen die Ansicht; die Winkel des Orbits kommen aus derselben Tabelle, die den Koerper bewegt.",
+  "timings": {
+    "buildMs": 10804,
+    "totalMs": 78205
+  },
+  "generatedAt": "2026-08-30T18:36:13.258Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "bridgeRequests": [
+      {
+        "url": "http://127.0.0.1:4623/events",
+        "at": 1788114929873
+      },
+      {
+        "url": "http://127.0.0.1:4622/events",
+        "at": 1788114931913
+      },
+      {
+        "url": "http://127.0.0.1:4622/events",
+        "at": 1788114955534
+      }
+    ],
+    "consoleErrors": [
+      "Failed to load resource: net::ERR_CONNECTION_REFUSED"
+    ],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "live-off",
+        "candidates": 148,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "live-no-bridge",
+        "candidates": 164,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "hud-compact",
+        "candidates": 203,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "hud-expanded",
+        "candidates": 202,
+        "overlaps": [],
+        "clipped": []
+      },
+      {
+        "name": "hud-collapsed",
+        "candidates": 174,
+        "overlaps": [],
+        "clipped": []
+      }
+    ],
+    "shots": [
+      {
+        "name": "live-agents-nobridge",
+        "atRest": true,
+        "bytes": 263043,
+        "regions": [],
+        "why": ""
+      },
+      {
+        "name": "live-agents",
+        "atRest": true,
+        "bytes": 344992,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 985
+          }
+        ],
+        "why": ""
+      },
+      {
+        "name": "live-agents-collapsed",
+        "atRest": true,
+        "bytes": 329147,
+        "regions": [
+          {
+            "name": "atlas-twin-body",
+            "top": 0,
+            "left": 0,
+            "hidden": 985
+          }
+        ],
+        "why": ""
+      },
+      {
+        "name": "live-agents-cinema",
+        "atRest": true,
+        "bytes": 195894,
+        "regions": [],
+        "why": ""
+      }
+    ],
+    "steps": [
+      {
+        "step": 1,
+        "emitted": 3,
+        "remaining": 42,
+        "events": 3,
+        "missed": 0,
+        "bodies": 0,
+        "kinds": [],
+        "actors": []
+      },
+      {
+        "step": 2,
+        "emitted": 6,
+        "remaining": 39,
+        "events": 6,
+        "missed": 0,
+        "bodies": 0,
+        "kinds": [],
+        "actors": []
+      },
+      {
+        "step": 3,
+        "emitted": 9,
+        "remaining": 36,
+        "events": 9,
+        "missed": 0,
+        "bodies": 0,
+        "kinds": [],
+        "actors": []
+      },
+      {
+        "step": 4,
+        "emitted": 12,
+        "remaining": 33,
+        "events": 12,
+        "missed": 0,
+        "bodies": 0,
+        "kinds": [],
+        "actors": []
+      },
+      {
+        "step": 5,
+        "emitted": 15,
+        "remaining": 30,
+        "events": 15,
+        "missed": 0,
+        "bodies": 0,
+        "kinds": [],
+        "actors": []
+      },
+      {
+        "step": 6,
+        "emitted": 18,
+        "remaining": 27,
+        "events": 18,
+        "missed": 0,
+        "bodies": 0,
+        "kinds": [],
+        "actors": []
+      },
+      {
+        "step": 7,
+        "emitted": 21,
+        "remaining": 24,
+        "events": 21,
+        "missed": 0,
+        "bodies": 1,
+        "kinds": [
+          "read"
+        ],
+        "actors": [
+          {
+            "id": "explorer",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "loadConfig",
+            "uncertain": false,
+            "lastPath": "src/config.ts",
+            "lastLines": [
+              11,
+              18
+            ],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 8,
+        "emitted": 24,
+        "remaining": 21,
+        "events": 24,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "search",
+          "test",
+          "write"
+        ],
+        "actors": [
+          {
+            "id": "explorer",
+            "kind": "search",
+            "placement": "file",
+            "placeName": "src",
+            "uncertain": true,
+            "lastPath": "src",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "test",
+            "placement": "file",
+            "placeName": "test/userService.test.ts",
+            "uncertain": false,
+            "lastPath": "",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "implementer",
+            "kind": "write",
+            "placement": "range",
+            "placeName": "insert",
+            "uncertain": false,
+            "lastPath": "src/repo/db.ts",
+            "lastLines": [
+              31,
+              35
+            ],
+            "intent": "making insert keep the payload instead of dropping it"
+          }
+        ]
+      },
+      {
+        "step": 9,
+        "emitted": 27,
+        "remaining": 18,
+        "events": 27,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "read",
+          "search",
+          "write"
+        ],
+        "actors": [
+          {
+            "id": "implementer",
+            "kind": "write",
+            "placement": "range",
+            "placeName": "hotspotScan",
+            "uncertain": false,
+            "lastPath": "src/repo/db.ts",
+            "lastLines": [
+              39,
+              54
+            ],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "createApp",
+            "uncertain": false,
+            "lastPath": "src/server.ts",
+            "lastLines": [
+              32,
+              37
+            ],
+            "intent": ""
+          },
+          {
+            "id": "explorer",
+            "kind": "search",
+            "placement": "file",
+            "placeName": "src",
+            "uncertain": true,
+            "lastPath": "src",
+            "lastLines": [],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 10,
+        "emitted": 30,
+        "remaining": 15,
+        "events": 30,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "read",
+          "test",
+          "write"
+        ],
+        "actors": [
+          {
+            "id": "implementer",
+            "kind": "write",
+            "placement": "range",
+            "placeName": "validateId",
+            "uncertain": false,
+            "lastPath": "src/util/validate.ts",
+            "lastLines": [
+              33,
+              38
+            ],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "test",
+            "placement": "file",
+            "placeName": "test/userService.test.ts",
+            "uncertain": false,
+            "lastPath": "",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "explorer",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "label",
+            "uncertain": false,
+            "lastPath": "src/types.ts",
+            "lastLines": [
+              37,
+              53
+            ],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 11,
+        "emitted": 33,
+        "remaining": 12,
+        "events": 33,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "read",
+          "search"
+        ],
+        "actors": [
+          {
+            "id": "implementer",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "listUsers",
+            "uncertain": false,
+            "lastPath": "src/services/userService.ts",
+            "lastLines": [
+              18,
+              21
+            ],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "read",
+            "placement": "file",
+            "placeName": "src/routes/orders.ts",
+            "uncertain": false,
+            "lastPath": "src/routes/orders.ts",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "explorer",
+            "kind": "search",
+            "placement": "file",
+            "placeName": "src",
+            "uncertain": true,
+            "lastPath": "src",
+            "lastLines": [],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 12,
+        "emitted": 36,
+        "remaining": 9,
+        "events": 36,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "read",
+          "test",
+          "write"
+        ],
+        "actors": [
+          {
+            "id": "implementer",
+            "kind": "write",
+            "placement": "range",
+            "placeName": "listUsers",
+            "uncertain": false,
+            "lastPath": "src/services/userService.ts",
+            "lastLines": [
+              18,
+              21
+            ],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "test",
+            "placement": "file",
+            "placeName": "test/userService.test.ts",
+            "uncertain": false,
+            "lastPath": "",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "explorer",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "constructor",
+            "uncertain": false,
+            "lastPath": "src/util/validate.ts",
+            "lastLines": [
+              4,
+              12
+            ],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 13,
+        "emitted": 39,
+        "remaining": 6,
+        "events": 39,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "read",
+          "search"
+        ],
+        "actors": [
+          {
+            "id": "implementer",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "registerUserRoutes",
+            "uncertain": false,
+            "lastPath": "src/routes/users.ts",
+            "lastLines": [
+              7,
+              18
+            ],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "isProduction",
+            "uncertain": false,
+            "lastPath": "src/config.ts",
+            "lastLines": [
+              20,
+              22
+            ],
+            "intent": ""
+          },
+          {
+            "id": "explorer",
+            "kind": "search",
+            "placement": "file",
+            "placeName": "src",
+            "uncertain": true,
+            "lastPath": "src",
+            "lastLines": [],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 14,
+        "emitted": 42,
+        "remaining": 3,
+        "events": 42,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "read",
+          "write"
+        ],
+        "actors": [
+          {
+            "id": "implementer",
+            "kind": "write",
+            "placement": "range",
+            "placeName": "registerUserRoutes",
+            "uncertain": false,
+            "lastPath": "src/routes/users.ts",
+            "lastLines": [
+              7,
+              18
+            ],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "read",
+            "placement": "range",
+            "placeName": "main",
+            "uncertain": false,
+            "lastPath": "src/server.ts",
+            "lastLines": [
+              39,
+              46
+            ],
+            "intent": ""
+          },
+          {
+            "id": "explorer",
+            "kind": "read",
+            "placement": "file",
+            "placeName": "src/services/orderService.ts",
+            "uncertain": false,
+            "lastPath": "src/services/orderService.ts",
+            "lastLines": [],
+            "intent": ""
+          }
+        ]
+      },
+      {
+        "step": 15,
+        "emitted": 45,
+        "remaining": 0,
+        "events": 45,
+        "missed": 2,
+        "bodies": 3,
+        "kinds": [
+          "search",
+          "test",
+          "write"
+        ],
+        "actors": [
+          {
+            "id": "explorer",
+            "kind": "search",
+            "placement": "file",
+            "placeName": "src",
+            "uncertain": true,
+            "lastPath": "src",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "checker",
+            "kind": "test",
+            "placement": "file",
+            "placeName": "test/userService.test.ts",
+            "uncertain": false,
+            "lastPath": "",
+            "lastLines": [],
+            "intent": ""
+          },
+          {
+            "id": "implementer",
+            "kind": "write",
+            "placement": "range",
+            "placeName": "createUser",
+            "uncertain": false,
+            "lastPath": "src/services/userService.ts",
+            "lastLines": [
+              24,
+              30
+            ],
+            "intent": "tightening the input check in createUser"
+          }
+        ]
+      }
+    ],
+    "bridgeLog": [
+      "[stdout] [agent-bridge] replay on http://127.0.0.1:4622",
+      "[stdout] [agent-bridge] file: /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11a-replay.jsonl",
+      "[stdout] [agent-bridge] events read: 45, unreadable lines: 0"
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "ports": {
+      "serverPort": 4620,
+      "uiPort": 4621,
+      "bridgePort": 4622,
+      "deadPort": 4623
+    },
+    "bridgeHealth": {
+      "mode": "replay",
+      "file": "/Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11a-replay.jsonl",
+      "events": 45,
+      "unreadable": 0,
+      "emitted": 0,
+      "fileExists": true
+    },
+    "expected": {
+      "exact": {
+        "path": "src/services/userService.ts",
+        "lines": [
+          24,
+          30
+        ],
+        "candidates": [
+          {
+            "name": "createUser",
+            "label": "Function",
+            "span": [
+              23,
+              36
+            ]
+          },
+          {
+            "name": "src/services/userService.ts",
+            "label": "Module",
+            "span": [
+              1,
+              43
+            ]
+          }
+        ],
+        "winner": "createUser"
+      },
+      "module": {
+        "name": "src/services/orderService.ts",
+        "id": 45
+      },
+      "uncertain": {
+        "name": "src",
+        "label": "Folder",
+        "endLine": null
+      },
+      "unmappable": {
+        "path": "package.json",
+        "nodes": 0
+      }
+    },
+    "off": {
+      "windowMs": 6006,
+      "seam": {
+        "on": false,
+        "layerOn": true,
+        "sourceState": "off",
+        "origin": "",
+        "requests": 0,
+        "drops": 0,
+        "mode": "",
+        "file": "",
+        "error": "",
+        "port": 4623,
+        "events": 0,
+        "missed": 0,
+        "perMinute": 0,
+        "unreadable": 0,
+        "size": "compact",
+        "filter": "both",
+        "follow": false,
+        "trails": false,
+        "fullscreen": false,
+        "trailWindowMs": 60000,
+        "shown": 0,
+        "cap": 8,
+        "capped": 0,
+        "drawn": 0,
+        "transitionMs": 450,
+        "effects": {
+          "tails": true,
+          "trails": true,
+          "waves": true,
+          "timeline": true
+        },
+        "timeline": {
+          "mode": "live",
+          "from": 1788114869067,
+          "to": 1788114929067,
+          "windowMs": 60000,
+          "tracks": 0,
+          "ticks": 0,
+          "shown": false,
+          "width": 439
+        },
+        "radii": {},
+        "positions": {},
+        "pulses": {},
+        "tails": {},
+        "motion": {},
+        "camera": {
+          "position": {
+            "x": 0,
+            "y": 0,
+            "z": 0
+          },
+          "at": 0
+        },
+        "renderOrders": {
+          "trail": -2,
+          "others": 0,
+          "objects": 0,
+          "trails": 0,
+          "dash": [
+            0,
+            0
+          ]
+        },
+        "waves": [],
+        "ticker": [],
+        "actors": [],
+        "unmapped": [],
+        "angles": {}
+      },
+      "requestsSeen": 0
+    },
+    "noBridge": {
+      "hud": {
+        "present": true,
+        "size": "compact",
+        "source": "no-source",
+        "filter": "both",
+        "layer": "true",
+        "rect": {
+          "x": 1352,
+          "y": 799,
+          "width": 320,
+          "height": 153
+        },
+        "title": "LIVE AGENTS",
+        "count": {
+          "present": true,
+          "text": "0 actors",
+          "value": 0
+        },
+        "rate": {
+          "present": true,
+          "text": "0 events in the last minute",
+          "perMinute": 0
+        },
+        "order": {
+          "present": true,
+          "text": "order intact",
+          "missed": 0
+        },
+        "line": {
+          "present": false,
+          "text": ""
+        },
+        "reading": {
+          "present": true,
+          "text": "live mode is on and no bridge is answering"
+        },
+        "sourceBox": {
+          "present": true,
+          "state": "no-source",
+          "mode": "",
+          "text": "this window has no backend and cannot start one. The bridge reads the event file and hands it on; without it there is no source, and an empty graph here would be the claim that nobody is working:node tools/agent-bridge.mjs --port 4623"
+        },
+        "command": {
+          "present": true,
+          "command": "node tools/agent-bridge.mjs --port 4623"
+        },
+        "rows": [],
+        "unmapped": [],
+        "filters": [
+          {
+            "option": "you",
+            "active": false
+          },
+          {
+            "option": "agent",
+            "active": false
+          },
+          {
+            "option": "both",
+            "active": true
+          }
+        ],
+        "switches": [
+          {
+            "name": "follow",
+            "active": false,
+            "label": "follow"
+          },
+          {
+            "name": "trails",
+            "active": false,
+            "label": "trails"
+          },
+          {
+            "name": "fullscreen",
+            "active": false,
+            "label": "fullscreen"
+          }
+        ],
+        "progressElements": [],
+        "text": "LIVE AGENTSlive mode is on and no bridge is answeringexpandfold0 actors0 events in the last minuteorder intactthis window has no backend and cannot start one. The bridge reads the event file and hands it on; without it there is no source, and an empty graph here would be the claim that nobody is working:node tools/agent-bridge.mjs --port 4623showyouagentsbothfollowtrailsfullscreen"
+      },
+      "seam": {
+        "on": true,
+        "layerOn": true,
+        "sourceState": "no-source",
+        "origin": "http://127.0.0.1:4623",
+        "requests": 1,
+        "drops": 0,
+        "mode": "",
+        "file": "",
+        "error": "Failed to fetch",
+        "port": 4623,
+        "events": 0,
+        "missed": 0,
+        "perMinute": 0,
+        "unreadable": 0,
+        "size": "compact",
+        "filter": "both",
+        "follow": false,
+        "trails": false,
+        "fullscreen": false,
+        "trailWindowMs": 60000,
+        "shown": 0,
+        "cap": 8,
+        "capped": 0,
+        "drawn": 0,
+        "transitionMs": 450,
+        "effects": {
+          "tails": true,
+          "trails": true,
+          "waves": true,
+          "timeline": true
+        },
+        "timeline": {
+          "mode": "live",
+          "from": 1788114870069,
+          "to": 1788114930069,
+          "windowMs": 60000,
+          "tracks": 0,
+          "ticks": 0,
+          "shown": false,
+          "width": 439
+        },
+        "radii": {},
+        "positions": {},
+        "pulses": {},
+        "tails": {},
+        "motion": {},
+        "camera": {
+          "position": {
+            "x": -73.49507868421463,
+            "y": -80.79793505360557,
+            "z": -1149.5529388928387
+          },
+          "at": 1788114930063
+        },
+        "renderOrders": {
+          "trail": -2,
+          "others": 0,
+          "objects": 3,
+          "trails": 0,
+          "dash": [
+            0,
+            0
+          ]
+        },
+        "waves": [],
+        "ticker": [],
+        "actors": [],
+        "unmapped": [],
+        "angles": {}
+      }
+    },
+    "hello": {
+      "on": true,
+      "layerOn": true,
+      "sourceState": "connected",
+      "origin": "http://127.0.0.1:4622",
+      "requests": 1,
+      "drops": 0,
+      "mode": "replay",
+      "file": "/Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11a-replay.jsonl",
+      "error": "",
+      "port": 4622,
+      "events": 0,
+      "missed": 0,
+      "perMinute": 0,
+      "unreadable": 0,
+      "size": "compact",
+      "filter": "both",
+      "follow": false,
+      "trails": false,
+      "fullscreen": false,
+      "trailWindowMs": 60000,
+      "shown": 0,
+      "cap": 8,
+      "capped": 0,
+      "drawn": 0,
+      "transitionMs": 450,
+      "effects": {
+        "tails": true,
+        "trails": true,
+        "waves": true,
+        "timeline": true
+      },
+      "timeline": {
+        "mode": "live",
+        "from": 1788114871907,
+        "to": 1788114931907,
+        "windowMs": 60000,
+        "tracks": 0,
+        "ticks": 0,
+        "shown": false,
+        "width": 439
+      },
+      "radii": {},
+      "positions": {},
+      "pulses": {},
+      "tails": {},
+      "motion": {},
+      "camera": {
+        "position": {
+          "x": 0,
+          "y": 0,
+          "z": 0
+        },
+        "at": 0
+      },
+      "renderOrders": {
+        "trail": -2,
+        "others": 0,
+        "objects": 0,
+        "trails": 0,
+        "dash": [
+          0,
+          0
+        ]
+      },
+      "waves": [],
+      "ticker": [],
+      "actors": [],
+      "unmapped": [],
+      "angles": {}
+    },
+    "kindsSeen": [
+      "read",
+      "search",
+      "test",
+      "write"
+    ],
+    "colorClip": {
+      "clip": {
+        "x": 1241,
+        "y": 684,
+        "width": 439,
+        "height": 275
+      },
+      "ignore": {
+        "x": 149,
+        "y": 241,
+        "width": 286,
+        "height": 31
+      }
+    },
+    "layerToggle": {
+      "choice": {
+        "present": true,
+        "section": "display",
+        "label": "live agent layer",
+        "detail": "the glowing bodies that orbit the symbol an agent is working on, and their search pings and test lines. Each actor is one element that is placed again in every frame. Off draws none of it; the instrument in the corner stays and says so.",
+        "value": "true"
+      },
+      "measured": {
+        "verdict": "no-difference",
+        "before": "62",
+        "after": "64",
+        "band": "4.7",
+        "text": "before 62 frames/s, after 64 frames/s. That is inside the spread this machine shows without any change at all (4.7 frames/s), so there is no measurable difference here.measured on 76 nodes and 178 edges at 2026-08-30T18:35:43.855Z"
+      }
+    },
+    "layerOff": {
+      "bodies": 0,
+      "hudPresent": true,
+      "layerAttribute": "false",
+      "note": "the agent layer is off in the settings, so nothing is drawn on the graph"
+    },
+    "colors": {
+      "legendWithLayer": [
+        "CALLS=#1DA27E",
+        "CALL_REFERENCE=#7dd3fc",
+        "CONFIGURES=#fde047",
+        "CONTAINS_FILE=#22c55e",
+        "CONTAINS_FOLDER=#22c55e",
+        "DEFINES=#a855f7",
+        "DEFINES_METHOD=#a855f7",
+        "HAS_BRANCH=#94a3b8",
+        "IMPLEMENTS=#f97316",
+        "IMPORTS=#3b82f6",
+        "RAISES=#ff4d4d",
+        "USAGE=#a3e635"
+      ],
+      "legendWithoutLayer": [
+        "CALLS=#1DA27E",
+        "CALL_REFERENCE=#7dd3fc",
+        "CONFIGURES=#fde047",
+        "CONTAINS_FILE=#22c55e",
+        "CONTAINS_FOLDER=#22c55e",
+        "DEFINES=#a855f7",
+        "DEFINES_METHOD=#a855f7",
+        "HAS_BRANCH=#94a3b8",
+        "IMPLEMENTS=#f97316",
+        "IMPORTS=#3b82f6",
+        "RAISES=#ff4d4d",
+        "USAGE=#a3e635"
+      ],
+      "legendSame": true,
+      "baseline": {
+        "width": 439,
+        "height": 275,
+        "total": 111859,
+        "skipped": 8866,
+        "changed": 0,
+        "changedFraction": 0,
+        "warmBase": 1776,
+        "warmVariant": 1776,
+        "warmChanged": 0,
+        "warmAdded": 0,
+        "warmCovered": 0,
+        "warmAddedFraction": 0,
+        "warmDrift": 0
+      },
+      "difference": {
+        "width": 439,
+        "height": 275,
+        "total": 111859,
+        "skipped": 8866,
+        "changed": 3153,
+        "changedFraction": 0.02819,
+        "warmBase": 1776,
+        "warmVariant": 1625,
+        "warmChanged": 258,
+        "warmAdded": 16,
+        "warmCovered": 167,
+        "warmAddedFraction": 0.000143,
+        "warmDrift": 0.08502
+      },
+      "method": "Die Legende traegt die zwoelf Kantenfarben als Zeichenketten; sie werden mit und ohne Ebene verglichen. Das Bild wird dreimal aufgenommen: einmal MIT Ebene und zweimal OHNE. Die zwei ohne sind die Grundlinie und beantworten die Frage, ob die Szene ueberhaupt stillstand. `changedFraction` ist der Anteil der Flaeche, den die Ebene beruehrt, `warmDrift` die relative Aenderung an der Menge des warmen Lichts, aus dem die Knotenfarben dieser Fixture bestehen (r >= g >= b, r > 80, r - b > 25). Die Ecke, in der das eingeklappte Instrument steht, wird uebergangen; wie viele Pixel das waren, steht als `skipped`."
+    },
+    "full": {
+      "seam": {
+        "on": true,
+        "layerOn": true,
+        "sourceState": "connected",
+        "origin": "http://127.0.0.1:4622",
+        "requests": 1,
+        "drops": 0,
+        "mode": "replay",
+        "file": "/Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11a-replay.jsonl",
+        "error": "",
+        "port": 4622,
+        "events": 46,
+        "missed": 2,
+        "perMinute": 3,
+        "unreadable": 0,
+        "size": "compact",
+        "filter": "both",
+        "follow": false,
+        "trails": false,
+        "fullscreen": false,
+        "trailWindowMs": 60000,
+        "shown": 4,
+        "cap": 8,
+        "capped": 0,
+        "drawn": 4,
+        "transitionMs": 450,
+        "effects": {
+          "tails": true,
+          "trails": true,
+          "waves": true,
+          "timeline": true
+        },
+        "timeline": {
+          "mode": "live",
+          "from": 1788114890885,
+          "to": 1788114950885,
+          "windowMs": 60000,
+          "tracks": 4,
+          "ticks": 3,
+          "shown": false,
+          "width": 439
+        },
+        "radii": {
+          "implementer": 15,
+          "you": 49,
+          "explorer": 34,
+          "checker": 18
+        },
+        "positions": {
+          "explorer": {
+            "x": 131.45851263205012,
+            "y": -220.49277931327376,
+            "z": -4.25668478012085
+          },
+          "implementer": {
+            "x": -265.5845788312489,
+            "y": -450.55872622887875,
+            "z": -43.19480514526367
+          },
+          "checker": {
+            "x": -455.88874216057206,
+            "y": -83.92153652772532,
+            "z": -17.1922664642334
+          },
+          "you": {
+            "x": -298.83787793632246,
+            "y": -481.0396616608528,
+            "z": -43.19480514526367
+          }
+        },
+        "pulses": {
+          "explorer": 1.125538166290021,
+          "implementer": 1.125538166290021,
+          "checker": 1.125538166290021,
+          "you": 1
+        },
+        "tails": {
+          "explorer": 0,
+          "implementer": 0,
+          "checker": 0,
+          "you": 0
+        },
+        "motion": {
+          "explorer": {
+            "actor": "explorer",
+            "fromNode": 45,
+            "toNode": 5,
+            "from": {
+              "x": 132.53090856393374,
+              "y": 31.05553520207809,
+              "z": -2.8606830148117295
+            },
+            "to": {
+              "x": 82.10986732660689,
+              "y": -265.78950243444297,
+              "z": -4.25668478012085
+            },
+            "durationMs": 462.7999999523172,
+            "done": true,
+            "samples": [
+              {
+                "t": 0,
+                "x": 132.53090856393374,
+                "y": 31.05553520207809,
+                "z": -2.8606830148117295
+              },
+              {
+                "t": 13.49999999999909,
+                "x": 132.5409533740663,
+                "y": 31.021710761811175,
+                "z": -2.8608337830023824
+              },
+              {
+                "t": 29.49999999999909,
+                "x": 132.63626866923917,
+                "y": 30.70188224486999,
+                "z": -2.8622561804992874
+              },
+              {
+                "t": 51.60000002384186,
+                "x": 133.095655270299,
+                "y": 29.158512845486584,
+                "z": -2.869101956916061
+              },
+              {
+                "t": 78.89999997615814,
+                "x": 134.52242152436318,
+                "y": 24.262011317127925,
+                "z": -2.8907811387850697
+              },
+              {
+                "t": 95.20000004768463,
+                "x": 135.9586827217078,
+                "y": 19.119598916548085,
+                "z": -2.9135542264655725
+              },
+              {
+                "t": 111,
+                "x": 137.79556177141473,
+                "y": 12.146114466231078,
+                "z": -2.9444894473073773
+              },
+              {
+                "t": 127,
+                "x": 140.05350716383853,
+                "y": 2.7729867989526586,
+                "z": -2.9862049367444237
+              },
+              {
+                "t": 142.39999997615905,
+                "x": 142.4791176137031,
+                "y": -8.725025219281056,
+                "z": -3.037628051493344
+              },
+              {
+                "t": 158.7999999523172,
+                "x": 145.0799613287428,
+                "y": -23.923811545509395,
+                "z": -3.1060747385805563
+              },
+              {
+                "t": 174.60000002384277,
+                "x": 147.21027499864502,
+                "y": -41.69654788407004,
+                "z": -3.1868508534477433
+              },
+              {
+                "t": 190.39999997615905,
+                "x": 148.40477700761753,
+                "y": -62.75370298933137,
+                "z": -3.2836527072480055
+              },
+              {
+                "t": 207.2999999523172,
+                "x": 147.76176498145395,
+                "y": -89.10522048282479,
+                "z": -3.4065745040480486
+              },
+              {
+                "t": 222.0000000000009,
+                "x": 144.62110875458382,
+                "y": -115.36084526209265,
+                "z": -3.5311344747769207
+              },
+              {
+                "t": 237.39999997615905,
+                "x": 138.29377892798897,
+                "y": -143.6827292937049,
+                "z": -3.667843567776627
+              },
+              {
+                "t": 254.10000002384277,
+                "x": 129.67762830299066,
+                "y": -169.83533228432412,
+                "z": -3.7959916614343836
+              },
+              {
+                "t": 269.1000000238437,
+                "x": 121.36360022459165,
+                "y": -189.60542844690897,
+                "z": -3.8939208336604203
+              },
+              {
+                "t": 284.70000004768553,
+                "x": 112.85508073627662,
+                "y": -206.85507675298078,
+                "z": -3.979909704681285
+              },
+              {
+                "t": 300.89999997615996,
+                "x": 104.70441490844976,
+                "y": -221.59944391484757,
+                "z": -4.053570083699297
+              },
+              {
+                "t": 316.39999997615996,
+                "x": 97.89567462450646,
+                "y": -233.0382049133303,
+                "z": -4.110558680563039
+              },
+              {
+                "t": 332.6000000238437,
+                "x": 92.00938957433098,
+                "y": -242.54801076230004,
+                "z": -4.157530216408702
+              },
+              {
+                "t": 349.50000000000273,
+                "x": 87.27963801358996,
+                "y": -250.15799751169013,
+                "z": -4.194482457314979
+              },
+              {
+                "t": 371.7999999523181,
+                "x": 83.15505123234495,
+                "y": -257.1815301727085,
+                "z": -4.227380660568992
+              },
+              {
+                "t": 388.20000004768553,
+                "x": 81.47878682196381,
+                "y": -260.5705673423694,
+                "z": -4.242221265407062
+              },
+              {
+                "t": 410.6000000238437,
+                "x": 80.65333136962015,
+                "y": -263.377348793446,
+                "z": -4.252936801696463
+              },
+              {
+                "t": 427.7999999523172,
+                "x": 80.83173635173354,
+                "y": -264.5401571423513,
+                "z": -4.256014328656565
+              },
+              {
+                "t": 444.6000000238437,
+                "x": 81.38513375901502,
+                "y": -265.2136370661297,
+                "z": -4.256675130956776
+              },
+              {
+                "t": 450,
+                "x": 82.10986732660689,
+                "y": -265.78950243444297,
+                "z": -4.25668478012085
+              }
+            ],
+            "curvature": 0.12102
+          },
+          "checker": {
+            "actor": "checker",
+            "fromNode": 44,
+            "toNode": 71,
+            "from": {
+              "x": -289.9814441607309,
+              "y": -412.6466140039329,
+              "z": -41.21111195116684
+            },
+            "to": {
+              "x": -433.60544238347813,
+              "y": -112.09157192067394,
+              "z": -17.1922664642334
+            },
+            "durationMs": 462.7999999523172,
+            "done": true,
+            "samples": [
+              {
+                "t": 0,
+                "x": -289.9814441607309,
+                "y": -412.6466140039329,
+                "z": -41.21111195116684
+              },
+              {
+                "t": 13.600000023841858,
+                "x": -290.0174081173335,
+                "y": -412.62351654820276,
+                "z": -41.2084598425551
+              },
+              {
+                "t": 29.49999999999909,
+                "x": -290.3475919477992,
+                "y": -412.41060668069355,
+                "z": -41.18404491979642
+              },
+              {
+                "t": 51.60000002384186,
+                "x": -291.9308036557171,
+                "y": -411.379485607005,
+                "z": -41.06626022204126
+              },
+              {
+                "t": 79,
+                "x": -296.898025815733,
+                "y": -408.0619528612859,
+                "z": -40.6912885191764
+              },
+              {
+                "t": 95.20000004768463,
+                "x": -301.9597111468256,
+                "y": -404.56109132295296,
+                "z": -40.3014387007613
+              },
+              {
+                "t": 111.10000002384277,
+                "x": -308.76024340192487,
+                "y": -399.6639995031452,
+                "z": -39.765283537067795
+              },
+              {
+                "t": 127,
+                "x": -317.534278078309,
+                "y": -392.9996829127973,
+                "z": -39.051450177775955
+              },
+              {
+                "t": 142.39999997615905,
+                "x": -327.97395321953,
+                "y": -384.51518901163206,
+                "z": -38.16669209343523
+              },
+              {
+                "t": 158.89999997615905,
+                "x": -341.21891729545985,
+                "y": -372.7620685768823,
+                "z": -36.9810544617515
+              },
+              {
+                "t": 174.60000002384277,
+                "x": -355.58931794226277,
+                "y": -358.5178252270736,
+                "z": -35.599245896491254
+              },
+              {
+                "t": 190.5000000000009,
+                "x": -371.4992528537835,
+                "y": -340.4499717591715,
+                "z": -33.92225346597249
+              },
+              {
+                "t": 207.2999999523172,
+                "x": -389.0952809266386,
+                "y": -316.59025443715416,
+                "z": -31.818800524042118
+              },
+              {
+                "t": 222.10000002384277,
+                "x": -404.4333598378942,
+                "y": -290.7320273741238,
+                "z": -29.660094123536975
+              },
+              {
+                "t": 237.5000000000009,
+                "x": -417.9862092646442,
+                "y": -260.99550289840846,
+                "z": -27.309257880325866
+              },
+              {
+                "t": 254.10000002384277,
+                "x": -427.5978471236903,
+                "y": -231.7936791719631,
+                "z": -25.118701164818102
+              },
+              {
+                "t": 269.1000000238437,
+                "x": -432.9778207856069,
+                "y": -208.34916266103292,
+                "z": -23.433785203526583
+              },
+              {
+                "t": 284.70000004768553,
+                "x": -436.2235565831396,
+                "y": -187.0511956959357,
+                "z": -21.954307556742485
+              },
+              {
+                "t": 300.89999997615996,
+                "x": -437.86371704407105,
+                "y": -168.26565224662448,
+                "z": -20.68694722374833
+              },
+              {
+                "t": 316.39999997615996,
+                "x": -438.3666462586237,
+                "y": -153.37367417808179,
+                "z": -19.70643248759092
+              },
+              {
+                "t": 332.6000000238437,
+                "x": -438.2257844454496,
+                "y": -140.84254529987027,
+                "z": -18.898265843538628
+              },
+              {
+                "t": 349.50000000000273,
+                "x": -437.6943311019976,
+                "y": -130.7900906062881,
+                "z": -18.262485727223915
+              },
+              {
+                "t": 371.7999999523181,
+                "x": -436.7720836368624,
+                "y": -121.62732812404668,
+                "z": -17.696457173111792
+              },
+              {
+                "t": 388.20000004768553,
+                "x": -436.08682296762476,
+                "y": -117.35768990086592,
+                "z": -17.441117815099368
+              },
+              {
+                "t": 410.6000000238437,
+                "x": -435.2365378132426,
+                "y": -114.07822334516113,
+                "z": -17.256752138177923
+              },
+              {
+                "t": 427.89999997615905,
+                "x": -434.65638812850165,
+                "y": -112.93485547823182,
+                "z": -17.203646703702503
+              },
+              {
+                "t": 444.6000000238437,
+                "x": -434.14227088120515,
+                "y": -112.44875807712059,
+                "z": -17.192432482491206
+              },
+              {
+                "t": 450,
+                "x": -433.60544238347813,
+                "y": -112.09157192067394,
+                "z": -17.1922664642334
+              }
+            ],
+            "curvature": 0.15221
+          },
+          "implementer": {
+            "actor": "implementer",
+            "fromNode": 64,
+            "toNode": 51,
+            "from": {
+              "x": -202.12992323795288,
+              "y": -419.15241997166595,
+              "z": -43.039737701416016
+            },
+            "to": {
+              "x": -247.9825818603131,
+              "y": -474.0798999570912,
+              "z": -43.19480514526367
+            },
+            "durationMs": 462.7999999523172,
+            "done": true,
+            "samples": [
+              {
+                "t": 0,
+                "x": -202.12992323795288,
+                "y": -419.15241997166595,
+                "z": -43.039737701416016
+              },
+              {
+                "t": 13.600000023841858,
+                "x": -202.13998412847573,
+                "y": -419.1545190666037,
+                "z": -43.039754823625465
+              },
+              {
+                "t": 29.49999999999909,
+                "x": -202.2322568011043,
+                "y": -419.1745578347944,
+                "z": -43.0399124481735
+              },
+              {
+                "t": 51.700000047683716,
+                "x": -202.6772759730407,
+                "y": -419.2775548386316,
+                "z": -43.04067832249837
+              },
+              {
+                "t": 79,
+                "x": -204.05988539872746,
+                "y": -419.63108266410023,
+                "z": -43.04309371995966
+              },
+              {
+                "t": 95.20000004768463,
+                "x": -205.4740865907574,
+                "y": -420.0312125496614,
+                "z": -43.04561061923605
+              },
+              {
+                "t": 111.10000002384277,
+                "x": -207.37993477749237,
+                "y": -420.62444389037205,
+                "z": -43.0490720766481
+              },
+              {
+                "t": 127.10000002384277,
+                "x": -209.86914728569005,
+                "y": -421.48894921676776,
+                "z": -43.053713599657456
+              },
+              {
+                "t": 142.5000000000009,
+                "x": -212.83729121173803,
+                "y": -422.65379083295994,
+                "z": -43.059434138404
+              },
+              {
+                "t": 158.89999997615905,
+                "x": -216.62264061856993,
+                "y": -424.36234567261715,
+                "z": -43.06704726559008
+              },
+              {
+                "t": 174.60000002384277,
+                "x": -220.8253719933892,
+                "y": -426.58149628921757,
+                "z": -43.07596832394063
+              },
+              {
+                "t": 190.5000000000009,
+                "x": -225.59565881210585,
+                "y": -429.57419485656106,
+                "z": -43.086795111168755
+              },
+              {
+                "t": 207.39999997615905,
+                "x": -231.11013741179636,
+                "y": -433.8013205838352,
+                "z": -43.10046295457051
+              },
+              {
+                "t": 222.10000002384277,
+                "x": -236.128848068423,
+                "y": -438.57689962165404,
+                "z": -43.114311927281435
+              },
+              {
+                "t": 237.5000000000009,
+                "x": -240.95449264039354,
+                "y": -444.3704267970622,
+                "z": -43.12948910002846
+              },
+              {
+                "t": 254.10000002384277,
+                "x": -244.75174011182347,
+                "y": -450.294143159279,
+                "z": -43.143631496284016
+              },
+              {
+                "t": 269.1000000238437,
+                "x": -247.1778228223073,
+                "y": -455.1795240808474,
+                "z": -43.15450943841315
+              },
+              {
+                "t": 284.70000004768553,
+                "x": -248.9159645969151,
+                "y": -459.6894781749696,
+                "z": -43.164061055581485
+              },
+              {
+                "t": 300.89999997615996,
+                "x": -250.06972501339908,
+                "y": -463.69984712795525,
+                "z": -43.17224322767541
+              },
+              {
+                "t": 316.5000000000018,
+                "x": -250.70603094577214,
+                "y": -466.8970993931299,
+                "z": -43.17860992440118
+              },
+              {
+                "t": 332.6000000238437,
+                "x": -250.99845886665793,
+                "y": -469.52894331909306,
+                "z": -43.18379108702768
+              },
+              {
+                "t": 349.50000000000273,
+                "x": -251.01322636099854,
+                "y": -471.60803469612694,
+                "z": -43.18789573050605
+              },
+              {
+                "t": 371.89999997615996,
+                "x": -250.71303160290492,
+                "y": -473.4090918997693,
+                "z": -43.191562524345514
+              },
+              {
+                "t": 388.2999999523181,
+                "x": -250.33764882344704,
+                "y": -474.14844429026977,
+                "z": -43.193206328949586
+              },
+              {
+                "t": 410.6000000238437,
+                "x": -249.69741654936962,
+                "y": -474.55249720970045,
+                "z": -43.19438882098078
+              },
+              {
+                "t": 427.89999997615905,
+                "x": -249.14169402925293,
+                "y": -474.5293781623134,
+                "z": -43.19473167359553
+              },
+              {
+                "t": 444.6000000238437,
+                "x": -248.5857627245101,
+                "y": -474.3462142364577,
+                "z": -43.19480407343751
+              },
+              {
+                "t": 450,
+                "x": -247.9825818603131,
+                "y": -474.0798999570912,
+                "z": -43.19480514526367
+              }
+            ],
+            "curvature": 0.1908
+          }
+        },
+        "camera": {
+          "position": {
+            "x": -73.49507868421463,
+            "y": -80.79793505360557,
+            "z": -1149.5529388928387
+          },
+          "at": 1788114950846
+        },
+        "renderOrders": {
+          "trail": -2,
+          "others": 0,
+          "objects": 8,
+          "trails": 0,
+          "dash": [
+            0,
+            0
+          ]
+        },
+        "waves": [],
+        "ticker": [
+          {
+            "ts": 1788114950686,
+            "actor": "you",
+            "kind": "read",
+            "place": "createUser",
+            "lines": [
+              23,
+              36
+            ],
+            "text": "you reading createUser, lines 23 to 36"
+          },
+          {
+            "ts": 1788114921298,
+            "actor": "explorer",
+            "kind": "search",
+            "place": "src",
+            "lines": [],
+            "text": "explorer searching src"
+          },
+          {
+            "ts": 1788114907837,
+            "actor": "checker",
+            "kind": "test",
+            "place": "test/userService.test.ts",
+            "lines": [],
+            "text": "checker testing test/userService.test.ts"
+          },
+          {
+            "ts": 1788114890070,
+            "actor": "implementer",
+            "kind": "write",
+            "place": "createUser",
+            "lines": [
+              24,
+              30
+            ],
+            "text": "implementer writing createUser, lines 24 to 30"
+          },
+          {
+            "ts": 1788114880069,
+            "actor": "implementer",
+            "kind": "write",
+            "place": "registerUserRoutes",
+            "lines": [
+              7,
+              18
+            ],
+            "text": "implementer writing registerUserRoutes, lines 7 to 18"
+          },
+          {
+            "ts": 1788114874345,
+            "actor": "checker",
+            "kind": "read",
+            "place": "main",
+            "lines": [
+              39,
+              46
+            ],
+            "text": "checker reading main, lines 39 to 46"
+          }
+        ],
+        "actors": [
+          {
+            "id": "you",
+            "name": "you",
+            "you": true,
+            "color": "#F2F5FF",
+            "letter": "Y",
+            "kind": "read",
+            "kindLetter": "R",
+            "placement": "range",
+            "uncertain": false,
+            "nodeId": 51,
+            "qualifiedName": "codeatlasweb-w11a.src.services.userService.createUser",
+            "placeName": "createUser",
+            "why": "",
+            "ghosts": [],
+            "testedNodeId": -1,
+            "intent": "",
+            "count": 1,
+            "missed": 0,
+            "strip": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              1
+            ],
+            "paths": [
+              "src/services/userService.ts"
+            ],
+            "lastTool": "Open",
+            "lastPath": "src/services/userService.ts",
+            "lastLines": [
+              23,
+              36
+            ],
+            "angle": 204.78400000368129,
+            "idle": false,
+            "sinceMs": 199,
+            "recentEvents": 1,
+            "pulseMs": 2600,
+            "pulseAmplitude": 0.14,
+            "trail": [
+              51
+            ],
+            "drawn": true
+          },
+          {
+            "id": "explorer",
+            "name": "explorer",
+            "you": false,
+            "color": "hsl(198 92% 72%)",
+            "letter": "E",
+            "kind": "search",
+            "kindLetter": "S",
+            "placement": "file",
+            "uncertain": true,
+            "nodeId": 5,
+            "qualifiedName": "codeatlasweb-w11a.src",
+            "placeName": "src",
+            "why": "",
+            "ghosts": [
+              70,
+              16,
+              69,
+              65
+            ],
+            "testedNodeId": -1,
+            "intent": "",
+            "count": 14,
+            "missed": 0,
+            "strip": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "paths": [
+              "src"
+            ],
+            "lastTool": "Grep",
+            "lastPath": "src",
+            "lastLines": [],
+            "angle": 32.6400000061351,
+            "idle": false,
+            "sinceMs": 29587,
+            "recentEvents": 1,
+            "pulseMs": 2600,
+            "pulseAmplitude": 0.14,
+            "trail": [
+              5
+            ],
+            "drawn": true
+          },
+          {
+            "id": "checker",
+            "name": "checker",
+            "you": false,
+            "color": "hsl(288 92% 72%)",
+            "letter": "C",
+            "kind": "test",
+            "kindLetter": "T",
+            "placement": "file",
+            "uncertain": false,
+            "nodeId": 71,
+            "qualifiedName": "codeatlasweb-w11a.test.userService.test",
+            "placeName": "test/userService.test.ts",
+            "why": "",
+            "ghosts": [],
+            "testedNodeId": 71,
+            "intent": "",
+            "count": 14,
+            "missed": 2,
+            "strip": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "paths": [],
+            "lastTool": "Bash",
+            "lastPath": "",
+            "lastLines": [],
+            "angle": 132.21500000805236,
+            "idle": false,
+            "sinceMs": 43048,
+            "recentEvents": 1,
+            "pulseMs": 2600,
+            "pulseAmplitude": 0.14,
+            "trail": [
+              71
+            ],
+            "drawn": true
+          },
+          {
+            "id": "implementer",
+            "name": "implementer",
+            "you": false,
+            "color": "hsl(181 92% 72%)",
+            "letter": "I",
+            "kind": "write",
+            "kindLetter": "W",
+            "placement": "range",
+            "uncertain": false,
+            "nodeId": 51,
+            "qualifiedName": "codeatlasweb-w11a.src.services.userService.createUser",
+            "placeName": "createUser",
+            "why": "",
+            "ghosts": [],
+            "testedNodeId": -1,
+            "intent": "tightening the input check in createUser",
+            "count": 17,
+            "missed": 0,
+            "strip": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "paths": [],
+            "lastTool": "Edit",
+            "lastPath": "src/services/userService.ts",
+            "lastLines": [
+              24,
+              30
+            ],
+            "angle": 138.49538462529517,
+            "idle": true,
+            "sinceMs": 60815,
+            "recentEvents": 0,
+            "pulseMs": 0,
+            "pulseAmplitude": 0,
+            "trail": [],
+            "drawn": true
+          }
+        ],
+        "unmapped": [
+          {
+            "ts": 1788114751053,
+            "agent": "checker",
+            "tool": "Bash",
+            "path": "",
+            "detail": "node --test tests/scaffold/",
+            "why": "the command names no file this index knows"
+          },
+          {
+            "ts": 1788114455653,
+            "agent": "checker",
+            "tool": "Read",
+            "path": "package.json",
+            "detail": "read the scripts of the fixture repository",
+            "why": "the index has no node for this path"
+          }
+        ],
+        "angles": {
+          "explorer": 65.86285715103577,
+          "implementer": 191.49846154176976,
+          "checker": 175.82000001073447,
+          "you": 224.71771429062142
+        }
+      },
+      "hud": {
+        "present": true,
+        "size": "compact",
+        "source": "connected",
+        "filter": "both",
+        "layer": "true",
+        "rect": {
+          "x": 1352,
+          "y": 807,
+          "width": 320,
+          "height": 173
+        },
+        "title": "LIVE AGENTS",
+        "count": {
+          "present": true,
+          "text": "4 actors",
+          "value": 4
+        },
+        "rate": {
+          "present": true,
+          "text": "3 events in the last minute",
+          "perMinute": 3
+        },
+        "order": {
+          "present": true,
+          "text": "2 events missed",
+          "missed": 2
+        },
+        "line": {
+          "present": false,
+          "text": ""
+        },
+        "reading": {
+          "present": true,
+          "text": "replaying /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11a-replay.jsonl"
+        },
+        "sourceBox": {
+          "present": false,
+          "state": "",
+          "text": ""
+        },
+        "command": {
+          "present": false,
+          "command": ""
+        },
+        "rows": [
+          {
+            "actor": "you",
+            "kind": "read",
+            "letter": "Y",
+            "you": true,
+            "placement": "range",
+            "uncertain": false,
+            "name": "you",
+            "kindLetter": "R",
+            "place": "createUser, lines 23 to 36",
+            "since": "0s",
+            "dotColor": "#F2F5FF",
+            "strip": "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1",
+            "stripTotal": 1,
+            "bars": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              1
+            ],
+            "intent": {
+              "present": false,
+              "text": "",
+              "selfReported": ""
+            },
+            "tested": "",
+            "path": "",
+            "card": "",
+            "hasCard": false
+          },
+          {
+            "actor": "explorer",
+            "kind": "search",
+            "letter": "E",
+            "you": false,
+            "placement": "file",
+            "uncertain": true,
+            "name": "explorer",
+            "kindLetter": "S",
+            "place": "src (no line range in the index)",
+            "since": "30s",
+            "dotColor": "hsl(198 92% 72%)",
+            "strip": "1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+            "stripTotal": 1,
+            "bars": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "intent": {
+              "present": false,
+              "text": "",
+              "selfReported": ""
+            },
+            "tested": "",
+            "path": "",
+            "card": "",
+            "hasCard": false
+          },
+          {
+            "actor": "checker",
+            "kind": "test",
+            "letter": "C",
+            "you": false,
+            "placement": "file",
+            "uncertain": false,
+            "name": "checker",
+            "kindLetter": "T",
+            "place": "test/userService.test.ts",
+            "since": "43s",
+            "dotColor": "hsl(288 92% 72%)",
+            "strip": "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+            "stripTotal": 0,
+            "bars": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "intent": {
+              "present": false,
+              "text": "",
+              "selfReported": ""
+            },
+            "tested": "",
+            "path": "",
+            "card": "",
+            "hasCard": false
+          },
+          {
+            "actor": "implementer",
+            "kind": "write",
+            "letter": "I",
+            "you": false,
+            "placement": "range",
+            "uncertain": false,
+            "name": "implementer",
+            "kindLetter": "W",
+            "place": "createUser, lines 24 to 30",
+            "since": "1m 1s",
+            "dotColor": "hsl(181 92% 72%)",
+            "strip": "0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0",
+            "stripTotal": 0,
+            "bars": [
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "intent": {
+              "present": true,
+              "text": "agent says: tightening the input check in createUser",
+              "selfReported": "true",
+              "color": "rgb(216, 180, 254)"
+            },
+            "tested": "",
+            "path": "",
+            "card": "",
+            "hasCard": false
+          }
+        ],
+        "unmapped": [],
+        "filters": [
+          {
+            "option": "you",
+            "active": false
+          },
+          {
+            "option": "agent",
+            "active": false
+          },
+          {
+            "option": "both",
+            "active": true
+          }
+        ],
+        "switches": [
+          {
+            "name": "follow",
+            "active": false,
+            "label": "follow"
+          },
+          {
+            "name": "trails",
+            "active": false,
+            "label": "trails"
+          },
+          {
+            "name": "fullscreen",
+            "active": false,
+            "label": "fullscreen"
+          }
+        ],
+        "progressElements": [],
+        "text": "LIVE AGENTSreplaying /Users/bernhard/Desktop/CodeAtlasWeb/fixtures/agent-events/w11a-replay.jsonlexpandfold4 actors3 events in the last minute2 events missedshowyouagentsbothyouRcreateUser, lines 23 to 360sexplorerSsrc (no line range in the index)30scheckerTtest/userService.test.ts43simplementerWcreateUser, lines 24 to 301m 1sagent says: tightening the input check in createUser2 events are not placeable on the graphfollowtrailsfullscreen"
+      },
+      "bodies": [
+        {
+          "actor": "explorer",
+          "kind": "search",
+          "letter": "E",
+          "you": false,
+          "color": "hsl(198 92% 72%)",
+          "coreWidth": 11,
+          "coreHeight": 11,
+          "x": 1418,
+          "y": 791
+        },
+        {
+          "actor": "checker",
+          "kind": "test",
+          "letter": "C",
+          "you": false,
+          "color": "hsl(288 92% 72%)",
+          "coreWidth": 11,
+          "coreHeight": 11,
+          "x": 1493,
+          "y": 942
+        },
+        {
+          "actor": "implementer",
+          "kind": "write",
+          "letter": "I",
+          "you": false,
+          "color": "hsl(181 92% 72%)",
+          "coreWidth": 8,
+          "coreHeight": 8,
+          "x": 1375,
+          "y": 918
+        },
+        {
+          "actor": "you",
+          "kind": "read",
+          "letter": "Y",
+          "you": true,
+          "color": "#F2F5FF",
+          "coreWidth": 10,
+          "coreHeight": 10,
+          "x": 1367,
+          "y": 926
+        }
+      ],
+      "ghosts": [
+        {
+          "actor": "explorer",
+          "node": 70
+        },
+        {
+          "actor": "explorer",
+          "node": 16
+        },
+        {
+          "actor": "explorer",
+          "node": 69
+        },
+        {
+          "actor": "explorer",
+          "node": 65
+        }
+      ]
+    },
+    "bodySizes": [
+      {
+        "actor": "explorer",
+        "width": 11,
+        "height": 11
+      },
+      {
+        "actor": "checker",
+        "width": 11,
+        "height": 11
+      },
+      {
+        "actor": "implementer",
+        "width": 8,
+        "height": 8
+      },
+      {
+        "actor": "you",
+        "width": 10,
+        "height": 10
+      }
+    ],
+    "bodySizesInRange": true,
+    "mapping": {
+      "implementer": {
+        "id": "implementer",
+        "name": "implementer",
+        "you": false,
+        "color": "hsl(181 92% 72%)",
+        "letter": "I",
+        "kind": "write",
+        "kindLetter": "W",
+        "placement": "range",
+        "uncertain": false,
+        "nodeId": 51,
+        "qualifiedName": "codeatlasweb-w11a.src.services.userService.createUser",
+        "placeName": "createUser",
+        "why": "",
+        "ghosts": [],
+        "testedNodeId": -1,
+        "intent": "tightening the input check in createUser",
+        "count": 17,
+        "missed": 0,
+        "strip": [
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "paths": [],
+        "lastTool": "Edit",
+        "lastPath": "src/services/userService.ts",
+        "lastLines": [
+          24,
+          30
+        ],
+        "angle": 138.49538462529517,
+        "idle": true,
+        "sinceMs": 60815,
+        "recentEvents": 0,
+        "pulseMs": 0,
+        "pulseAmplitude": 0,
+        "trail": [],
+        "drawn": true
+      },
+      "uncertainActor": {
+        "id": "explorer",
+        "name": "explorer",
+        "you": false,
+        "color": "hsl(198 92% 72%)",
+        "letter": "E",
+        "kind": "search",
+        "kindLetter": "S",
+        "placement": "file",
+        "uncertain": true,
+        "nodeId": 5,
+        "qualifiedName": "codeatlasweb-w11a.src",
+        "placeName": "src",
+        "why": "",
+        "ghosts": [
+          70,
+          16,
+          69,
+          65
+        ],
+        "testedNodeId": -1,
+        "intent": "",
+        "count": 14,
+        "missed": 0,
+        "strip": [
+          1,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "paths": [
+          "src"
+        ],
+        "lastTool": "Grep",
+        "lastPath": "src",
+        "lastLines": [],
+        "angle": 32.6400000061351,
+        "idle": false,
+        "sinceMs": 29587,
+        "recentEvents": 1,
+        "pulseMs": 2600,
+        "pulseAmplitude": 0.14,
+        "trail": [
+          5
+        ],
+        "drawn": true
+      },
+      "unmapped": []
+    },
+    "hudGuideline": {
+      "guideline": {
+        "width": 320,
+        "height": 150
+      },
+      "measuredAgainst": {
+        "width": 340,
+        "height": 180
+      },
+      "measured": {
+        "width": 320,
+        "height": 173
+      },
+      "actors": 4
+    },
+    "hudCounts": {
+      "count": {
+        "present": true,
+        "text": "4 actors",
+        "value": 4
+      },
+      "rate": {
+        "present": true,
+        "text": "3 events in the last minute",
+        "perMinute": 3
+      },
+      "order": {
+        "present": true,
+        "text": "2 events missed",
+        "missed": 2
+      },
+      "strips": [
+        {
+          "actor": "you",
+          "bars": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          "total": 1
+        },
+        {
+          "actor": "explorer",
+          "bars": [
+            1,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "total": 1
+        },
+        {
+          "actor": "checker",
+          "bars": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "total": 0
+        },
+        {
+          "actor": "implementer",
+          "bars": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          "total": 0
+        }
+      ]
+    },
+    "intent": {
+      "rows": [
+        {
+          "actor": "implementer",
+          "present": true,
+          "text": "agent says: tightening the input check in createUser",
+          "selfReported": "true",
+          "color": "rgb(216, 180, 254)"
+        }
+      ],
+      "withoutIntent": [
+        "you",
+        "explorer",
+        "checker"
+      ],
+      "progressElements": []
+    },
+    "filters": {
+      "you": {
+        "rows": 1,
+        "you": 1,
+        "bodies": 1
+      },
+      "agent": {
+        "rows": 3,
+        "you": 0,
+        "bodies": 3
+      },
+      "both": {
+        "rows": 4,
+        "you": 1,
+        "bodies": 4
+      }
+    },
+    "eventsFile": {
+      "path": "fixtures/agent-events/w11a-replay.jsonl",
+      "sha256Before": "68b6c75f861f206edfeb82305e456fc85cc57d283397d9956c63116fc389d82d",
+      "sha256After": "68b6c75f861f206edfeb82305e456fc85cc57d283397d9956c63116fc389d82d",
+      "writesFromPage": 0
+    },
+    "unmappedExpanded": [
+      {
+        "tool": "Bash",
+        "path": "",
+        "why": "the command names no file this index knows",
+        "text": "Bash (no path): the command names no file this index knows"
+      },
+      {
+        "tool": "Read",
+        "path": "package.json",
+        "why": "the index has no node for this path",
+        "text": "Read package.json: the index has no node for this path"
+      }
+    ],
+    "reload": {
+      "colorsBefore": {
+        "you": "#F2F5FF",
+        "explorer": "hsl(198 92% 72%)",
+        "checker": "hsl(288 92% 72%)",
+        "implementer": "hsl(181 92% 72%)"
+      },
+      "colorsAfter": {
+        "explorer": "hsl(198 92% 72%)",
+        "checker": "hsl(288 92% 72%)",
+        "implementer": "hsl(181 92% 72%)"
+      },
+      "shared": [
+        "explorer",
+        "checker",
+        "implementer"
+      ],
+      "size": "collapsed"
+    },
+    "hudSizes": {
+      "compact": {
+        "x": 1352,
+        "y": 807,
+        "width": 320,
+        "height": 173
+      },
+      "expanded": {
+        "x": 1352,
+        "y": 692,
+        "width": 320,
+        "height": 287
+      },
+      "collapsed": {
+        "x": 1394,
+        "y": 957,
+        "width": 278,
+        "height": 23
+      }
+    },
+    "orbitClip": {
+      "x": 463,
+      "y": 174,
+      "width": 754,
+      "height": 754
+    },
+    "orbit": {
+      "periodMs": 4200,
+      "frames": [
+        {
+          "index": 1,
+          "file": "frames/orbit-01.png",
+          "angles": {
+            "explorer": 83.23714285918732,
+            "checker": 221.12375000268355,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 2,
+          "file": "frames/orbit-02.png",
+          "angles": {
+            "explorer": 177.05142857347346,
+            "checker": 344.255000002684,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 3,
+          "file": "frames/orbit-03.png",
+          "angles": {
+            "explorer": 282.11142856734284,
+            "checker": 122.1462499946374,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 4,
+          "file": "frames/orbit-04.png",
+          "angles": {
+            "explorer": 5.742857142858838,
+            "checker": 231.9125000000024,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 5,
+          "file": "frames/orbit-05.png",
+          "angles": {
+            "explorer": 99.10285714694601,
+            "checker": 354.44750000536646,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 6,
+          "file": "frames/orbit-06.png",
+          "angles": {
+            "explorer": 186.5485714265294,
+            "checker": 109.21999999731997,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 7,
+          "file": "frames/orbit-07.png",
+          "angles": {
+            "explorer": 279.6685714244861,
+            "checker": 187.59875000268448,
+            "implementer": 4.2846153846153925
+          }
+        },
+        {
+          "index": 8,
+          "file": "frames/orbit-08.png",
+          "angles": {
+            "explorer": 8.33142857551752,
+            "checker": 187.59875000268448,
+            "implementer": 4.2846153846153925
+          }
+        }
+      ],
+      "angleSeries": {
+        "explorer": [
+          83.2,
+          177.1,
+          282.1,
+          5.7,
+          99.1,
+          186.5,
+          279.7,
+          8.3
+        ],
+        "checker": [
+          221.1,
+          344.3,
+          122.1,
+          231.9,
+          354.4,
+          109.2,
+          187.6,
+          187.6
+        ],
+        "implementer": [
+          4.3,
+          4.3,
+          4.3,
+          4.3,
+          4.3,
+          4.3,
+          4.3,
+          4.3
+        ]
+      },
+      "moving": [
+        "explorer",
+        "checker"
+      ],
+      "method": "Der Winkel kommt aus derselben Tabelle, die den Koerper bewegt (src/galaxy/AgentLayer.tsx, agentAngles), gelesen unmittelbar vor jeder Aufnahme. Eine Reihe, in der sich der Winkel nicht aendert, ist ein stehender Koerper und damit ein Befund."
+    },
+    "contactSheet": {
+      "code": 0,
+      "out": ""
+    },
+    "leftovers": [
+      {
+        "port": 4620,
+        "listeners": 0
+      },
+      {
+        "port": 4621,
+        "listeners": 0
+      },
+      {
+        "port": 4622,
+        "listeners": 0
+      },
+      {
+        "port": 4623,
+        "listeners": 0
+      }
+    ],
+    "leftoverLooks": [
+      {
+        "attempt": 1,
+        "atMs": 77402,
+        "total": 1
+      },
+      {
+        "attempt": 2,
+        "atMs": 78204,
+        "total": 0
+      }
+    ]
+  }
+}

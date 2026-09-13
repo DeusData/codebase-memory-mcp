@@ -1,0 +1,10 @@
+.graph-edge-controls { position: relative; font-size: 11px; color: var(--atlas-dim, #98aaa3); }
+.graph-edge-controls > summary { list-style: none; cursor: pointer; padding: 7px 10px; border: 1px solid var(--atlas-line, #294139); border-radius: 6px; white-space: nowrap; }
+.graph-edge-controls > summary::-webkit-details-marker { display: none; }
+.graph-edge-settings { position: absolute; z-index: 100; top: calc(100% + 6px); right: 0; width: 260px; padding: 14px; white-space: normal; border: 1px solid var(--atlas-line, #294139); border-radius: 10px; background: var(--atlas-panel, #101917); box-shadow: 0 10px 30px #0005; }
+.graph-edge-settings label { display: flex; align-items: center; gap: 8px; color: var(--atlas-fg, #d1dcd6); font-size: 12px; }
+.graph-edge-settings input { accent-color: #91aaa7; }
+.graph-edge-settings p { margin: 8px 0 12px; font-size: 11px; line-height: 1.5; }
+.graph-edge-key { display: grid; grid-template-columns: 1fr 1fr; gap: 9px; margin: 0; padding: 0; list-style: none; }
+.graph-edge-key li { display: flex; align-items: center; gap: 6px; }
+.graph-edge-key i { width: 15px; height: 2px; display: inline-block; }

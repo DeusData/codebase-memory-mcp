@@ -1,0 +1,255 @@
+{
+  "schemaVersion": 1,
+  "symbol": {
+    "nodeId": "codeatlas-atlas-sample.src.services.userService.create",
+    "name": "create",
+    "qualifiedName": "codeatlas-atlas-sample.src.services.userService.create",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+    "range": {
+      "start": {
+        "line": 39,
+        "character": 0
+      },
+      "end": {
+        "line": 41,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "generation": 2,
+  "snippetHash": "5f460d85f2dd425b3a3b062c09dc7c3b49f8a94bbb43ba3080d505d2ca89b248",
+  "purpose": {
+    "value": "Function create in userService.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.",
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "graph-node",
+        "strategy": "derived-summary",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "steps": {
+    "value": [
+      {
+        "targetName": "createUser",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.services.userService.createUser",
+        "targetFile": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "line": 41,
+        "targetLine": 23,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "startLine": 41,
+          "endLine": 41
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calls": {
+    "value": [
+      {
+        "targetName": "createUser",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.services.userService.createUser",
+        "targetFile": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "line": 41,
+        "targetLine": 23,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "startLine": 41,
+          "endLine": 41
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calledBy": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "reads": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "writes": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "typeRefs": {
+    "value": [
+      {
+        "name": "User",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.User",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "line": 27
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "startLine": 27,
+          "endLine": 27
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "throws": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "externalEffects": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "tests": {
+    "value": [],
+    "state": "inferred",
+    "evidence": []
+  },
+  "missingTests": {
+    "value": true,
+    "state": "inferred",
+    "evidence": []
+  },
+  "complexity": {
+    "value": {
+      "cyclomatic": 0,
+      "cognitive": 0,
+      "loopDepth": 0,
+      "transitiveLoopDepth": 0,
+      "linearScanInLoop": false,
+      "allocInLoop": false,
+      "unguardedRecursion": false,
+      "recursive": false,
+      "isEntryPoint": false,
+      "isExported": false
+    },
+    "state": "unsupported",
+    "evidence": []
+  },
+  "risks": [],
+  "checklist": [
+    {
+      "id": "a4a1dce2ee8183366118d8cc85b8c60311698588",
+      "category": "core-logic",
+      "label": "Understand the call to createUser",
+      "target": {
+        "name": "createUser",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.userService.createUser",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "start": {
+            "line": 22,
+            "character": 0
+          },
+          "end": {
+            "line": 23,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 22,
+            "character": 0
+          },
+          "end": {
+            "line": 22,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "376f13c6ba7b77fdbf95156c3303b42a3fd365cd",
+      "category": "inputs",
+      "label": "Know the shape of User",
+      "target": {
+        "name": "User",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.User",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "start": {
+            "line": 26,
+            "character": 0
+          },
+          "end": {
+            "line": 27,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 26,
+            "character": 0
+          },
+          "end": {
+            "line": 26,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "7512d458235451601fb03f7e087b9beeb3854f6a",
+      "category": "tests",
+      "label": "No test callers found (inferred): decide if this needs a test",
+      "target": {
+        "nodeId": "codeatlas-atlas-sample.src.services.userService.create",
+        "name": "create",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.userService.create",
+        "kind": "function",
+        "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "start": {
+            "line": 39,
+            "character": 0
+          },
+          "end": {
+            "line": 41,
+            "character": 0
+          }
+        },
+        "projectName": "codeatlas-atlas-sample"
+      },
+      "done": false
+    }
+  ]
+}

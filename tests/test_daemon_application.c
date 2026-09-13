@@ -5280,6 +5280,50 @@ TEST(daemon_application_free_reports_retained_live_ownership) {
     PASS();
 }
 
+TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit) {
+    const char *responses[] = {
+        "{\"content\":[{\"type\":\"text\",\"text\":\"indexed\"}],\"isError\":false}",
+        ("{\"content\":[{\"type\":\"text\",\"text\":\"aborted_previous_preserved\"}],\"isError\":"
+         "true}"),
+        "{\"content\":[{\"type\":\"text\",\"text\":\"persist_failed\"}],\"isError\":true}",
+        "{\"error\":\"malformed worker response\"}",
+    };
+    for (size_t i = 0; i < sizeof(responses) / sizeof(responses[0]); i++) {
+        app_fake_worker_context_t fake;
+        app_fake_worker_context_init(&fake);
+        atomic_store(&fake.scripted, true);
+        fake.outcomes[0] = CBM_PROC_CLEAN;
+        fake.responses[0] = responses[i];
+        cbm_daemon_application_worker_ops_t worker_ops = {
+            .context = &fake,
+            .start = app_fake_worker_start,
+            .poll = app_fake_worker_poll,
+            .cancel = app_fake_worker_cancel,
+            .log_path = app_fake_worker_log_path,
+            .destroy = app_fake_worker_destroy,
+        };
+        cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+        cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+        int result = application ? cbm_daemon_application_index(application, "tool-error-fixture",
+                                                                cbm_tmpdir())
+                                 : -1;
+        bool stopped =
+            application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+        cbm_daemon_application_free(application);
+        ASSERT_NOT_NULL(application);
+        ASSERT_TRUE(stopped);
+        if (i == 0) {
+            ASSERT_EQ(result, 0);
+        } else {
+            ASSERT_LT(result, 0);
+        }
+        /* An honestly reported tool error must not cause crash recovery loops. */
+        ASSERT_EQ(atomic_load(&fake.starts), 1);
+        ASSERT_EQ(atomic_load(&fake.destroys), 1);
+    }
+    PASS();
+}
+
 TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained) {
     app_fake_worker_context_t fake;
     app_fake_worker_context_init(&fake);
@@ -5434,5 +5478,6 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
+    RUN_TEST(daemon_application_tool_error_is_failed_job_even_after_clean_worker_exit);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
 }

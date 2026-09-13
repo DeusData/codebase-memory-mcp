@@ -25,6 +25,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "ui/httpd.h"
+#include "ui/activity.h"
+#include <yyjson/yyjson.h>
 #include "ui/http_server.h"
 #include <store/store.h>
 #include <watcher/watcher.h>
@@ -971,6 +973,29 @@ TEST(ui_server_process_kill_route_is_unavailable) {
     PASS();
 }
 
+TEST(ui_server_process_measurements_declare_platform_semantics) {
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    char resp[16384];
+    int n = th_http(cbm_http_server_port(ts.srv), "GET /api/processes HTTP/1.1\r\n\r\n", resp,
+                    sizeof(resp));
+    ASSERT_GT(n, 0);
+    ASSERT_EQ(th_status(resp), 200);
+#ifdef _WIN32
+    ASSERT_NOT_NULL(strstr(resp, "\"cpu_unit\":\"seconds\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"memory_kind\":\"working_set\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_memory_kind\":\"working_set\""));
+#else
+    ASSERT_NOT_NULL(strstr(resp, "\"cpu_unit\":\"percent\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"memory_kind\":\"resident\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_memory_kind\":\"peak_resident\""));
+#endif
+    ASSERT_NOT_NULL(strstr(resp, "\"self_memory_available\":"));
+    ASSERT_NOT_NULL(strstr(resp, "\"self_pid\":"));
+    th_server_stop(&ts);
+    PASS();
+}
+
 TEST(ui_server_routes_indexing_through_joinable_daemon_executor) {
     char *root = th_mktempdir("cbm_httpd_daemon_index");
     ASSERT_NOT_NULL(root);
@@ -1045,6 +1070,762 @@ TEST(ui_server_free_never_joins_active_index_worker) {
     }
     ASSERT_TRUE(freed);
     th_cleanup(root);
+    PASS();
+}
+
+/* ── Frontend log file (POST/GET /api/ui-log) ─────────────────── */
+
+static int ui_log_read_file(const char *path, char *out, size_t outsz) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f)
+        return -1;
+    size_t n = fread(out, 1, outsz - 1, f);
+    fclose(f);
+    out[n] = '\0';
+    return (int)n;
+}
+
+static int ui_log_count_char(const char *s, char ch) {
+    int n = 0;
+    for (; *s; s++) {
+        if (*s == ch)
+            n++;
+    }
+    return n;
+}
+
+static int ui_log_post(int port, const char *body, char *resp, size_t respsz) {
+    size_t cap = strlen(body) + 512;
+    char *req = malloc(cap);
+    if (!req)
+        return 0;
+    snprintf(req, cap,
+             "POST /api/ui-log HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Type: application/json\r\nContent-Length: %zu\r\n\r\n%s",
+             port, strlen(body), body);
+    int n = th_http(port, req, resp, respsz);
+    free(req);
+    return n;
+}
+
+static int activity_interrupt_rows(unsigned kind, void *database, void *statement, void *unused) {
+    (void)kind;
+    (void)unused;
+    const char *sql = sqlite3_sql(statement);
+    if (sql && (strstr(sql, "SELECT id,ts,level,source,message") ||
+                strstr(sql, "SELECT id,payload FROM agent_events")))
+        sqlite3_interrupt(database);
+    return 0;
+}
+
+TEST(activity_preserves_severity_and_reports_interrupted_reads) {
+    sqlite3 *db = cbm_activity_open(":memory:");
+    ASSERT_NOT_NULL(db);
+    ASSERT_TRUE(cbm_activity_log(
+        db, "{\"level\":\"info\",\"msg\":\"read.file\",\"path\":\"notes/level=error.md\"}"));
+    ASSERT_TRUE(cbm_activity_log(db, "level=info msg=read.file path=notes/level=error.md"));
+    char *json = cbm_activity_logs(db, -1, 10, 2);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"total\":0"));
+    free(json);
+    ASSERT_EQ(sqlite3_trace_v2(db, SQLITE_TRACE_STMT, activity_interrupt_rows, db), SQLITE_OK);
+    ASSERT_NULL(cbm_activity_logs(db, -1, 10, 0));
+    ASSERT_NULL(cbm_activity_agents(db, "test", 0, 10));
+    sqlite3_trace_v2(db, 0, NULL, NULL);
+    sqlite3_close(db);
+    PASS();
+}
+
+TEST(activity_pruned_start_events_do_not_resurrect_on_retry) {
+    sqlite3 *db = cbm_activity_open(":memory:");
+    ASSERT_NOT_NULL(db);
+    const char *batch =
+        "{\"project\":\"fixture-a\",\"events\":[{\"run\":\"r1\",\"agent\":\"fixture\",\"tool\":"
+        "\"Read\",\"seq\":1,\"ts\":1000,\"phase\":\"start\"}]}";
+    char *reply = NULL;
+    ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
+    free(reply);
+    ASSERT_EQ(
+        sqlite3_exec(
+            db,
+            "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<10001) INSERT "
+            "INTO agent_events(project,run,seq,payload) SELECT 'fixture-b','filler',v,'{}' FROM n",
+            NULL, NULL, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(cbm_activity_ingest(db, "{\"project\":\"fixture-b\",\"events\":[]}", &reply), 200);
+    free(reply);
+    ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
+    ASSERT_NOT_NULL(strstr(reply, "\"accepted\":0"));
+    ASSERT_NOT_NULL(strstr(reply, "\"duplicates\":1"));
+    free(reply);
+    reply = cbm_activity_agents(db, "fixture-a", 0, 10);
+    ASSERT_NOT_NULL(strstr(reply, "\"events\":[]"));
+    ASSERT_NOT_NULL(strstr(reply, "\"truncated\":true"));
+    free(reply);
+    sqlite3_close(db);
+    PASS();
+}
+
+TEST(activity_migration_preserves_v1_logs_and_rejects_future_schema) {
+    char *dir = th_mktempdir("cbm_activity_migration");
+    ASSERT_NOT_NULL(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/activity.db", dir);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    ASSERT_EQ(
+        sqlite3_exec(db,
+                     "CREATE TABLE daemon_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT "
+                     "NULL,level INTEGER NOT NULL,source TEXT NOT NULL,message TEXT NOT NULL);"
+                     "INSERT INTO daemon_logs(ts,level,source,message) "
+                     "VALUES('2026-09-09T00:00:00Z',3,'migration fixture','preserved "
+                     "failure');PRAGMA user_version=1",
+                     NULL, NULL, NULL),
+        SQLITE_OK);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    char *json = cbm_activity_logs(db, -1, 10, 2);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "preserved failure"));
+    ASSERT_NOT_NULL(strstr(json, "\"total\":1"));
+    free(json);
+    const char *ui = "{\"session\":\"migration-fixture\",\"seq\":1,\"level\":\"error\",\"source\":"
+                     "\"frontend\",\"message\":\"retry-safe\"}";
+    ASSERT_TRUE(cbm_activity_log(db, ui));
+    ASSERT_TRUE(cbm_activity_log(db, ui));
+    json = cbm_activity_logs(db, -1, 10, 2);
+    ASSERT_NOT_NULL(strstr(json, "\"total\":2"));
+    free(json);
+    ASSERT_EQ(sqlite3_exec(db, "PRAGMA user_version=99", NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(db);
+    ASSERT_NULL(cbm_activity_open(path));
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(activity_log_project_scope_preserves_unknown_v2_history_and_filters_before_limit) {
+    char *dir = th_mktempdir("cbm_activity_project_scope");
+    ASSERT_NOT_NULL(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/activity.db", dir);
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(path, &db), SQLITE_OK);
+    ASSERT_EQ(
+        sqlite3_exec(
+            db,
+            "CREATE TABLE daemon_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,ts TEXT NOT NULL,"
+            "level INTEGER NOT NULL,source TEXT NOT NULL,message TEXT NOT NULL,event_key TEXT);"
+            "INSERT INTO daemon_logs VALUES(1,'2026-09-09',3,'old-worker',"
+            "'legacy project=fixture-a path=repo-a/broken.c',NULL);PRAGMA user_version=2",
+            NULL, NULL, NULL),
+        SQLITE_OK);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    ASSERT_TRUE(cbm_activity_log(db, "{\"level\":\"error\",\"source\":\"fixture\","
+                                     "\"project\":\"fixture-a\",\"message\":\"first-a\"}"));
+    ASSERT_TRUE(
+        cbm_activity_log(db, "level=error msg=index.worker project=fixture-a record=last-a"));
+    ASSERT_TRUE(cbm_activity_log(
+        db, "{\"level\":\"error\",\"source\":\"unknown\","
+            "\"message\":\" project=fixture-a \",\"page\":\"/?project=fixture-a\"}"));
+    ASSERT_TRUE(cbm_activity_log(db, "level=error msg=unknown record=project=fixture-a"));
+    ASSERT_EQ(
+        sqlite3_exec(db,
+                     "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<600) "
+                     "INSERT INTO daemon_logs(ts,level,source,message,project) "
+                     "SELECT '2026-09-09',3,'fixture-b','unrelated flood','fixture-b' FROM n",
+                     NULL, NULL, NULL),
+        SQLITE_OK);
+    char *page = cbm_activity_logs_scoped(db, -1, 1, 2, "fixture-a", false);
+    ASSERT_NOT_NULL(page);
+    ASSERT_NOT_NULL(strstr(page, "last-a"));
+    ASSERT_NOT_NULL(strstr(page, "\"total\":2"));
+    ASSERT_NOT_NULL(strstr(page, "\"scope\":\"project\""));
+    ASSERT_NULL(strstr(page, "unrelated flood"));
+    ASSERT_NULL(strstr(page, "legacy"));
+    free(page);
+    page = cbm_activity_logs_scoped(db, 0, 1, 2, "fixture-a", false);
+    ASSERT_NOT_NULL(strstr(page, "first-a"));
+    ASSERT_NOT_NULL(strstr(page, "\"cursor\":2"));
+    ASSERT_NOT_NULL(strstr(page, "\"has_more\":true"));
+    free(page);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    page = cbm_activity_logs_scoped(db, 2, 1, 2, "fixture-a", false);
+    ASSERT_NOT_NULL(strstr(page, "last-a"));
+    ASSERT_NOT_NULL(strstr(page, "\"cursor\":3"));
+    ASSERT_NOT_NULL(strstr(page, "\"has_more\":false"));
+    free(page);
+    page = cbm_activity_logs_scoped(db, -1, 10, 2, NULL, true);
+    ASSERT_NOT_NULL(strstr(page, "legacy project=fixture-a"));
+    ASSERT_NOT_NULL(strstr(page, "\"total\":3"));
+    ASSERT_NOT_NULL(strstr(page, "\"project\":null"));
+    ASSERT_NOT_NULL(strstr(page, "\"scope\":\"unattributed\""));
+    free(page);
+    page = cbm_activity_logs(db, -1, 1, 2);
+    ASSERT_NOT_NULL(strstr(page, "\"total\":605"));
+    ASSERT_NOT_NULL(strstr(page, "\"scope\":\"daemon\""));
+    free(page);
+    sqlite3_close(db);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(ui_log_scopes_use_explicit_entry_ownership_and_survive_server_restart) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    const char *body =
+        "{\"project\":\"fixture-a\",\"page\":\"/?project=wrong\","
+        "\"session\":\"project-scope-fixture\",\"entries\":["
+        "{\"seq\":1,\"level\":\"error\",\"message\":\"owned-a\"},"
+        "{\"seq\":2,\"level\":\"error\",\"project\":\"fixture-b\",\"message\":\"owned-b\"},"
+        "{\"seq\":3,\"level\":\"error\",\"project\":null,\"message\":\"unknown-owner\"}]}";
+    char response[8192];
+    ASSERT_GT(ui_log_post(port, body, response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 200);
+    th_server_stop(&ts);
+    ASSERT_EQ(th_server_start(&ts), 0);
+    port = cbm_http_server_port(ts.srv);
+    ASSERT_GT(th_http(port,
+                      "GET /api/logs?project=fixture-a&lines=1&min_level=error HTTP/1.1\r\n\r\n",
+                      response, sizeof(response)),
+              0);
+    ASSERT_EQ(th_status(response), 200);
+    ASSERT_NOT_NULL(strstr(response, "owned-a"));
+    ASSERT_NULL(strstr(response, "owned-b"));
+    ASSERT_NULL(strstr(response, "unknown-owner"));
+    ASSERT_NOT_NULL(strstr(response, "\"total\":1"));
+    ASSERT_GT(th_http(port, "GET /api/logs?project=fixture-b&lines=1 HTTP/1.1\r\n\r\n", response,
+                      sizeof(response)),
+              0);
+    ASSERT_NOT_NULL(strstr(response, "owned-b"));
+    ASSERT_GT(th_http(port, "GET /api/logs?scope=unattributed&lines=10 HTTP/1.1\r\n\r\n", response,
+                      sizeof(response)),
+              0);
+    ASSERT_NOT_NULL(strstr(response, "unknown-owner"));
+    ASSERT_NULL(strstr(response, "owned-a"));
+    ASSERT_NULL(strstr(response, "owned-b"));
+    ASSERT_GT(th_http(port, "GET /api/logs?project= HTTP/1.1\r\n\r\n", response, sizeof(response)),
+              0);
+    ASSERT_EQ(th_status(response), 400);
+    ASSERT_GT(th_http(port, "GET /api/logs?project=fixture-a&scope=unattributed HTTP/1.1\r\n\r\n",
+                      response, sizeof(response)),
+              0);
+    ASSERT_EQ(th_status(response), 400);
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(activity_log_search_and_severity_apply_before_limit_and_survive_reopen) {
+    char *dir = th_mktempdir("cbm_log_filter_fixture");
+    ASSERT_NOT_NULL(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/activity.db", dir);
+    sqlite3 *db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(
+        sqlite3_exec(db,
+                     "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<49) "
+                     "INSERT INTO daemon_logs(ts,level,source,message,project) "
+                     "SELECT '2026-09-09',3,'parser','src/10%_broken.c','fixture-a' FROM n;"
+                     "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<600) "
+                     "INSERT INTO daemon_logs(ts,level,source,message,project) "
+                     "SELECT '2026-09-09',1,'http','routine','fixture-a' FROM n",
+                     NULL, NULL, NULL),
+        SQLITE_OK);
+    char *json = cbm_activity_logs(db, -1, 200, 0);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(strstr(json, "10%_broken"));
+    free(json);
+    json = cbm_activity_logs_filtered(db, -1, 200, 3, "fixture-a", false, "10%_");
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"total\":49"));
+    ASSERT_NOT_NULL(strstr(json, "\"query\":\"10%_\""));
+    ASSERT_NOT_NULL(strstr(json, "10%_broken.c"));
+    ASSERT_NULL(strstr(json, "routine"));
+    free(json);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    json = cbm_activity_logs_filtered(db, 0, 1, 3, "fixture-a", false, "BROKEN");
+    ASSERT_NOT_NULL(json);
+    ASSERT_NOT_NULL(strstr(json, "\"cursor\":1"));
+    ASSERT_NOT_NULL(strstr(json, "\"has_more\":true"));
+    ASSERT_NOT_NULL(strstr(json, "\"total\":49"));
+    free(json);
+    json = cbm_activity_logs_filtered(db, 1, 1, 3, "fixture-a", false, "BROKEN");
+    ASSERT_NOT_NULL(strstr(json, "\"cursor\":2"));
+    free(json);
+    json = cbm_activity_logs_filtered(db, -1, 200, 3, "fixture-b", false, "10%_");
+    ASSERT_NOT_NULL(strstr(json, "\"total\":0"));
+    free(json);
+    sqlite3_close(db);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(ui_log_retention_prevents_expired_retry_and_preserves_full_json) {
+    char *dir = th_mktempdir("cbm_ui_retention_fixture");
+    ASSERT_NOT_NULL(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/activity.db", dir);
+    sqlite3 *db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    char message[12000];
+    memset(message, 'x', sizeof(message));
+    const char *prefix =
+        "{\"received\":\"2026-01-01T00:00:00Z\",\"page\":\"/\","
+        "\"session\":\"retention-fixture\",\"seq\":1,\"level\":\"info\",\"message\":\"";
+    memcpy(message, prefix, strlen(prefix));
+    memcpy(message + sizeof(message) - 3, "\"}", 3);
+    ASSERT_EQ(cbm_activity_ui_log(db, message, false), 1);
+    char *json = cbm_activity_ui_logs(db, 200, path, "", NULL);
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    const char *line =
+        yyjson_get_str(yyjson_arr_get(yyjson_obj_get(yyjson_doc_get_root(doc), "lines"), 0));
+    ASSERT_NOT_NULL(line);
+    ASSERT_EQ(strlen(line), strlen(message));
+    yyjson_doc *full = yyjson_read(line, strlen(line), 0);
+    ASSERT_NOT_NULL(full);
+    yyjson_doc_free(full);
+    yyjson_doc_free(doc);
+    free(json);
+    ASSERT_EQ(
+        sqlite3_exec(db,
+                     "WITH RECURSIVE n(v) AS (SELECT 1 UNION ALL SELECT v+1 FROM n WHERE v<3000) "
+                     "INSERT INTO daemon_logs(ts,level,source,message) SELECT "
+                     "'2026-09-09',1,'fixture','flood' FROM n",
+                     NULL, NULL, NULL),
+        SQLITE_OK);
+    ASSERT_TRUE(cbm_activity_log(db, "level=info msg=retention.trigger"));
+    ASSERT_EQ(cbm_activity_ui_log(db, message, false), 0);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    ASSERT_EQ(cbm_activity_ui_log(db, message, false), 0);
+    json = cbm_activity_ui_logs(db, 200, path, "", NULL);
+    ASSERT_NOT_NULL(strstr(json, "\"total\":0"));
+    free(json);
+    sqlite3_close(db);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(ui_log_journal_is_canonical_for_info_retry_and_restart) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char response[16384];
+    const char *body =
+        "{\"page\":\"/\",\"session\":\"canonical-fixture\",\"entries\":["
+        "{\"seq\":1,\"level\":\"info\",\"source\":\"console\",\"project\":\"fixture-a\","
+        "\"message\":\"ordinary retained 10%_detail\"}]}";
+    ASSERT_GT(ui_log_post(port, body, response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 200);
+    ASSERT_NOT_NULL(strstr(response, "\"accepted\":1"));
+    ASSERT_GT(ui_log_post(port, body, response, sizeof(response)), 0);
+    ASSERT_NOT_NULL(strstr(response, "\"accepted\":0"));
+    ASSERT_NOT_NULL(strstr(response, "\"duplicates\":1"));
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    char content[4096];
+    ASSERT_GT(ui_log_read_file(path, content, sizeof(content)), 0);
+    ASSERT_EQ(ui_log_count_char(content, '\n'), 1);
+    FILE *file = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(file);
+    fputs("unrelated export mutation\n", file);
+    fclose(file);
+    th_server_stop(&ts);
+    ASSERT_EQ(th_server_start(&ts), 0);
+    port = cbm_http_server_port(ts.srv);
+    ASSERT_GT(th_http(port, "GET /api/ui-log HTTP/1.1\r\n\r\n", response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 200);
+    ASSERT_NOT_NULL(strstr(response, "ordinary retained 10%_detail"));
+    ASSERT_NOT_NULL(strstr(response, "\"source\":\"sqlite\""));
+    ASSERT_NOT_NULL(strstr(response, "activity.db"));
+    ASSERT_NOT_NULL(strstr(response, "\"total\":1"));
+    ASSERT_NULL(strstr(response, "unrelated export mutation"));
+    ASSERT_GT(th_http(port,
+                      "GET /api/logs?project=fixture-a&min_level=info&q=10%25_ HTTP/1.1\r\n\r\n",
+                      response, sizeof(response)),
+              0);
+    ASSERT_EQ(th_status(response), 200);
+    ASSERT_NOT_NULL(strstr(response, "ordinary retained 10%_detail"));
+    ASSERT_NOT_NULL(strstr(response, "\"total\":1"));
+    ASSERT_GT(th_http(port, "GET /api/logs?q= HTTP/1.1\r\n\r\n", response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 400);
+    ASSERT_GT(ui_log_post(port, body, response, sizeof(response)), 0);
+    ASSERT_NOT_NULL(strstr(response, "\"duplicates\":1"));
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(ui_log_legacy_import_is_once_and_preserves_unknown_provenance_and_time) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/logs", fx.cache_dir);
+    ASSERT_TRUE(cbm_mkdir_p(path, 0700));
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    FILE *file = cbm_fopen(path, "wb");
+    ASSERT_NOT_NULL(file);
+    fputs("{\"received\":\"2026-01-01T00:00:00Z\",\"page\":\"/?project=wrong\","
+          "\"session\":\"\",\"level\":\"info\",\"source\":\"old-ui\","
+          "\"project\":\"not-current\",\"message\":\"legacy info fixture\"}\n",
+          file);
+    fclose(file);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char response[16384];
+    ASSERT_GT(th_http(port, "GET /api/ui-log HTTP/1.1\r\n\r\n", response, sizeof(response)), 0);
+    ASSERT_EQ(th_status(response), 200);
+    ASSERT_NOT_NULL(strstr(response, "legacy info fixture"));
+    ASSERT_NOT_NULL(strstr(response, "\"total\":1"));
+    th_server_stop(&ts);
+    ASSERT_EQ(th_server_start(&ts), 0);
+    port = cbm_http_server_port(ts.srv);
+    ASSERT_GT(th_http(port, "GET /api/ui-log HTTP/1.1\r\n\r\n", response, sizeof(response)), 0);
+    ASSERT_NOT_NULL(strstr(response, "\"total\":1"));
+    ASSERT_GT(th_http(port, "GET /api/logs?scope=unattributed&q=legacy HTTP/1.1\r\n\r\n", response,
+                      sizeof(response)),
+              0);
+    ASSERT_NOT_NULL(strstr(response, "\"project\":null"));
+    ASSERT_NOT_NULL(strstr(response, "\"ts\":\"2026-01-01T00:00:00Z\""));
+    ASSERT_GT(th_http(port, "GET /api/logs?project=not-current&q=legacy HTTP/1.1\r\n\r\n", response,
+                      sizeof(response)),
+              0);
+    ASSERT_NOT_NULL(strstr(response, "\"total\":0"));
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+TEST(activity_journal_reopen_cursor_dedup_and_project_isolation) {
+    char *dir = th_mktempdir("cbm_activity");
+    ASSERT_NOT_NULL(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/activity.db", dir);
+    sqlite3 *db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    const char *batch = "{\"project\":\"demo\",\"events\":["
+                        "{\"ts\":1000,\"agent\":\"test\",\"run\":\"run\",\"seq\":2,\"phase\":"
+                        "\"end\",\"tool\":\"Read\",\"response\":\"never-store-this\"},"
+                        "{\"ts\":999,\"agent\":\"test\",\"run\":\"run\",\"seq\":1,\"phase\":"
+                        "\"end\",\"tool\":\"Read\"}]}";
+    char *reply = NULL;
+    ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
+    ASSERT_NOT_NULL(strstr(reply, "\"accepted\":2"));
+    free(reply);
+    ASSERT_EQ(cbm_activity_ingest(db, batch, &reply), 200);
+    ASSERT_NOT_NULL(strstr(reply, "\"duplicates\":2"));
+    free(reply);
+    char *page = cbm_activity_agents(db, "demo", 0, 1);
+    ASSERT_NOT_NULL(page);
+    ASSERT_NULL(strstr(page, "never-store-this"));
+    ASSERT_NOT_NULL(strstr(page, "\"has_more\":true"));
+    yyjson_doc *parsed = yyjson_read(page, strlen(page), 0);
+    int64_t cursor = yyjson_get_sint(yyjson_obj_get(yyjson_doc_get_root(parsed), "cursor"));
+    yyjson_doc_free(parsed);
+    free(page);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    page = cbm_activity_agents(db, "demo", cursor, 10);
+    ASSERT_NOT_NULL(strstr(page, "\"seq\":1"));
+    ASSERT_NULL(strstr(page, "\"seq\":2"));
+    free(page);
+    page = cbm_activity_agents(db, "other", 0, 10);
+    ASSERT_NOT_NULL(strstr(page, "\"events\":[]"));
+    free(page);
+    ASSERT_EQ(cbm_activity_ingest(db, "{\"events\":[{\"run\":\"bad\"}]}", &reply), 400);
+    sqlite3_close(db);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(activity_errors_survive_routine_log_retention_and_reopen) {
+    char *dir = th_mktempdir("cbm_activity_logs");
+    ASSERT_NOT_NULL(dir);
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/activity.db", dir);
+    sqlite3 *db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    ASSERT_TRUE(cbm_activity_log(db, "level=error msg=index.parse.failed path=src/broken.c"));
+    for (int i = 0; i < 3010; i++)
+        ASSERT_TRUE(cbm_activity_log(db, "level=info msg=http.request"));
+    sqlite3 *reader = cbm_activity_open(path);
+    ASSERT_NOT_NULL(reader);
+    char *page = cbm_activity_logs(reader, -1, 10, 2);
+    ASSERT_NOT_NULL(strstr(page, "index.parse.failed"));
+    ASSERT_NOT_NULL(strstr(page, "\"level\":\"error\""));
+    ASSERT_NOT_NULL(strstr(page, "\"total\":1"));
+    ASSERT_NULL(strstr(page, "http.request"));
+    free(page);
+    sqlite3_close(reader);
+    sqlite3_close(db);
+    db = cbm_activity_open(path);
+    ASSERT_NOT_NULL(db);
+    page = cbm_activity_logs(db, -1, 10, 0);
+    ASSERT_NOT_NULL(strstr(page, "\"total\":3001"));
+    free(page);
+    sqlite3_close(db);
+    th_cleanup(dir);
+    PASS();
+}
+
+TEST(ui_agent_events_and_errors_use_daemon_port_and_survive_restart) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    const char *body =
+        "{\"project\":\"demo\",\"events\":[{\"ts\":1000,\"agent\":\"test "
+        "fixture\",\"run\":\"restart-fixture\",\"seq\":1,\"phase\":\"end\",\"tool\":\"Read\"}]}";
+    char request[2048], resp[16384];
+    snprintf(request, sizeof(request),
+             "POST /api/agent-events HTTP/1.1\r\nContent-Type: application/json\r\nContent-Length: "
+             "%zu\r\n\r\n%s",
+             strlen(body), body);
+    ASSERT_GT(th_http(cbm_http_server_port(ts.srv), request, resp, sizeof(resp)), 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"accepted\":1"));
+    cbm_ui_log_append("level=error msg=index.failure.fixture path=test-fixture/broken.c");
+    th_server_stop(&ts);
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    ASSERT_GT(
+        th_http(port, "GET /api/agent-events?project=demo HTTP/1.1\r\n\r\n", resp, sizeof(resp)),
+        0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "restart-fixture"));
+    ASSERT_GT(th_http(port, request, resp, sizeof(resp)), 0);
+    ASSERT_NOT_NULL(strstr(resp, "\"duplicates\":1"));
+    ASSERT_GT(th_http(port, "GET /api/logs?min_level=warn HTTP/1.1\r\n\r\n", resp, sizeof(resp)),
+              0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "index.failure.fixture"));
+    ASSERT_NOT_NULL(strstr(resp, "\"persistent\":true"));
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* One post, two entries: both are durable in SQLite and mirrored as JSONL
+ * for compatibility. Both readers use the journal, including ordinary logs. */
+TEST(ui_log_post_writes_jsonl_and_tail_reads_it) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+
+    const char *body =
+        "{\"page\":\"/?project=demo\",\"session\":\"s1\",\"entries\":["
+        "{\"ts\":\"2026-09-08T10:00:00.000Z\",\"seq\":1,\"level\":\"error\",\"source\":\"rpc\","
+        "\"message\":\"get_code_snippet returned no source\",\"detail\":\"HTTP 200\","
+        "\"stack\":\"Error: x\\n    at y\"},"
+        "{\"ts\":\"2026-09-08T10:00:01.000Z\",\"seq\":2,\"level\":\"log\",\"source\":\"console\","
+        "\"message\":\"galaxy \\\"ready\\\"\"}]}";
+    char resp[16384];
+    ASSERT_TRUE(ui_log_post(port, body, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"accepted\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "\"dropped\":0"));
+    ASSERT_NOT_NULL(strstr(resp, "\"file_error\":false"));
+    ASSERT_NOT_NULL(strstr(resp, "/logs/ui.log\""));
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    char content[8192];
+    ASSERT_TRUE(ui_log_read_file(path, content, sizeof(content)) > 0);
+    ASSERT_EQ(ui_log_count_char(content, '\n'), 2);
+    ASSERT_TRUE(strncmp(content, "{\"received\":\"", 13) == 0);
+    ASSERT_NOT_NULL(strstr(content, "\"page\":\"/?project=demo\",\"session\":\"s1\",\"seq\":1"));
+    ASSERT_NOT_NULL(strstr(content, "\"level\":\"error\",\"source\":\"rpc\","
+                                    "\"message\":\"get_code_snippet returned no source\","
+                                    "\"detail\":\"HTTP 200\",\"stack\":\"Error: x\\n    at y\"}"));
+    ASSERT_NOT_NULL(strstr(content,
+                           "\"seq\":2,\"ts\":\"2026-09-08T10:00:01.000Z\",\"level\":\"log\","
+                           "\"source\":\"console\",\"message\":\"galaxy \\\"ready\\\"\"}"));
+
+    /* The tail, asked for one line: the newest, and it says it is partial. */
+    char req[256];
+    snprintf(req, sizeof(req), "GET /api/ui-log?lines=1 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"partial\":true"));
+    ASSERT_NOT_NULL(strstr(resp, "\"total\":2"));
+    ASSERT_NOT_NULL(strstr(resp, "galaxy"));
+    ASSERT_TRUE(strstr(resp, "get_code_snippet") == NULL);
+    ASSERT_NOT_NULL(strstr(resp, "\"size_bytes\":"));
+    ASSERT_TRUE(strstr(resp, "previous_path") == NULL);
+
+    /* Asked for more than there is: both, complete. */
+    snprintf(req, sizeof(req), "GET /api/ui-log?lines=10 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"partial\":false"));
+    ASSERT_NOT_NULL(strstr(resp, "get_code_snippet"));
+    ASSERT_NOT_NULL(strstr(resp, "galaxy"));
+
+    /* The same journal carries both the error and the ordinary info line. */
+    snprintf(req, sizeof(req), "GET /api/logs?lines=50 HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "ui.error rpc: get_code_snippet returned no source"));
+    ASSERT_NOT_NULL(strstr(resp, "ui.info console: galaxy"));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* Refused bodies never create the file: empty, not JSON, no entries[], and a
+ * post above the 64 KiB cap. Entries that are not objects are counted as
+ * dropped rather than refused, so one bad entry does not cost the rest. */
+TEST(ui_log_post_refuses_bad_bodies) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[4096];
+    char req[512];
+
+    snprintf(req, sizeof(req),
+             "POST /api/ui-log HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n"
+             "Content-Type: application/json\r\nContent-Length: 0\r\n\r\n",
+             port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    ASSERT_TRUE(ui_log_post(port, "not json", resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    ASSERT_TRUE(ui_log_post(port, "{\"page\":\"/\"}", resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 400);
+
+    size_t big_len = 70000;
+    char *big = malloc(big_len + 64);
+    ASSERT_NOT_NULL(big);
+    strcpy(big, "{\"entries\":[{\"message\":\"");
+    size_t at = strlen(big);
+    memset(big + at, 'a', big_len);
+    strcpy(big + at + big_len, "\"}]}");
+    ASSERT_TRUE(ui_log_post(port, big, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 413);
+    free(big);
+
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    ASSERT_TRUE(!cbm_file_exists(path));
+
+    ASSERT_TRUE(ui_log_post(port, "{\"entries\":[42,{\"message\":\"kept\"}]}", resp, sizeof(resp)) >
+                0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"accepted\":1,\"dropped\":1"));
+    ASSERT_TRUE(cbm_file_exists(path));
+
+    th_server_stop(&ts);
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* The file rotates once to ui.log.1 when it has reached the configured size
+ * at the time of a post; the tail names the previous file. */
+TEST(ui_log_rotates_at_configured_size) {
+    ui_delete_fixture_t fx;
+    ASSERT_EQ(ui_delete_fixture_init(&fx), 0);
+    cbm_setenv("CBM_UI_LOG_ROTATE_BYTES", "300", 1);
+    th_server_t ts;
+    ASSERT_EQ(th_server_start(&ts), 0);
+    int port = cbm_http_server_port(ts.srv);
+    char resp[8192];
+
+    const char *names[] = {"first", "second", "third"};
+    for (int i = 0; i < 3; i++) {
+        char body[1024];
+        char pad[320];
+        memset(pad, 'p', sizeof(pad) - 1);
+        pad[sizeof(pad) - 1] = '\0';
+        snprintf(body, sizeof(body), "{\"entries\":[{\"level\":\"info\",\"message\":\"%s %s\"}]}",
+                 names[i], pad);
+        ASSERT_TRUE(ui_log_post(port, body, resp, sizeof(resp)) > 0);
+        ASSERT_EQ(th_status(resp), 200);
+    }
+
+    char path[1024], previous[1040];
+    snprintf(path, sizeof(path), "%s/logs/ui.log", fx.cache_dir);
+    snprintf(previous, sizeof(previous), "%s.1", path);
+    char content[4096];
+    ASSERT_TRUE(ui_log_read_file(path, content, sizeof(content)) > 0);
+    ASSERT_NOT_NULL(strstr(content, "\"message\":\"third "));
+    ASSERT_TRUE(strstr(content, "second") == NULL);
+    ASSERT_TRUE(ui_log_read_file(previous, content, sizeof(content)) > 0);
+    ASSERT_NOT_NULL(strstr(content, "\"message\":\"second "));
+    ASSERT_TRUE(strstr(content, "first") == NULL);
+
+    char req[256];
+    snprintf(req, sizeof(req), "GET /api/ui-log HTTP/1.1\r\nHost: 127.0.0.1:%d\r\n\r\n", port);
+    ASSERT_TRUE(th_http(port, req, resp, sizeof(resp)) > 0);
+    ASSERT_EQ(th_status(resp), 200);
+    ASSERT_NOT_NULL(strstr(resp, "\"previous_path\":\""));
+    ASSERT_NOT_NULL(strstr(resp, "ui.log.1\""));
+    ASSERT_NOT_NULL(strstr(resp, "third "));
+
+    th_server_stop(&ts);
+    cbm_unsetenv("CBM_UI_LOG_ROTATE_BYTES");
+    ui_delete_fixture_cleanup(&fx);
+    PASS();
+}
+
+/* The UI connections have a fixed allowlist: one optional local inference service and the
+ * model host plus its verified download CDN. Browser consent controls model
+ * downloads; script sources remain local, with no unrestricted CDN or eval
+ * allowance. */
+TEST(ui_csp_connect_src_has_explicit_download_hosts) {
+    const char *csp = CBM_UI_CSP_VALUE;
+    ASSERT_NOT_NULL(strstr(csp, "connect-src 'self' http://127.0.0.1:4141 "
+                                "https://huggingface.co https://us.aws.cdn.hf.co;"));
+    ASSERT_NOT_NULL(strstr(csp, "script-src 'self' 'wasm-unsafe-eval';"));
+    ASSERT_NOT_NULL(strstr(csp, "worker-src 'self' blob:;"));
+    ASSERT_TRUE(strstr(csp, "*") == NULL);
+    ASSERT_TRUE(strstr(csp, "'unsafe-eval'") == NULL);
+    ASSERT_TRUE(strstr(csp, "ws://") == NULL);
+    ASSERT_TRUE(strstr(csp, "wss://") == NULL);
+    int hosts = 0;
+    const char *p = csp;
+    while ((p = strstr(p, "http://")) != NULL) {
+        ASSERT_TRUE(strncmp(p, "http://127.0.0.1:4141", 21) == 0);
+        hosts++;
+        p += 7;
+    }
+    ASSERT_EQ(hosts, 1);
+    int secure_hosts = 0;
+    p = csp;
+    while ((p = strstr(p, "https://")) != NULL) {
+        secure_hosts++;
+        p += 8;
+    }
+    ASSERT_EQ(secure_hosts, 2);
+    ASSERT_NOT_NULL(strstr(csp, "frame-ancestors 'none'"));
+    ASSERT_NOT_NULL(strstr(csp, "object-src 'none'"));
     PASS();
 }
 
@@ -1818,6 +2599,7 @@ typedef struct {
     cbm_httpd_t *listener;
     atomic_int accepted;
     atomic_int finished;
+    int send_deadline_ms;
 } th_httpd_large_reply_t;
 
 static void *th_httpd_large_reply(void *opaque) {
@@ -1828,6 +2610,8 @@ static void *th_httpd_large_reply(void *opaque) {
         return NULL;
     }
     atomic_store(&reply->accepted, 1);
+    if (reply->send_deadline_ms)
+        cbm_http_conn_set_send_deadline_ms(connection, reply->send_deadline_ms);
     size_t response_size = 8U * 1024U * 1024U;
     char *response = malloc(response_size);
     if (response) {
@@ -1883,6 +2667,38 @@ TEST(httpd_interrupt_unblocks_nonreading_large_response_within_one_second) {
     /* The 60 s deadline cannot have fired, so the join above is the proof
      * of interrupt delivery; the watchdog is purely a hang detector. */
     ASSERT_EQ(atomic_load(&watchdog.watchdog_fired), 0);
+    PASS();
+}
+
+TEST(httpd_large_response_opt_in_survives_a_busy_reader_without_changing_default) {
+    cbm_httpd_t *listener = cbm_httpd_listen(0);
+    ASSERT_NOT_NULL(listener);
+    cbm_httpd_set_send_buffer_for_test(listener, 64 * 1024);
+    cbm_httpd_set_send_deadline_for_test(listener, 100);
+    th_httpd_large_reply_t reply = {.listener = listener, .send_deadline_ms = 5000};
+    atomic_init(&reply.accepted, 0);
+    atomic_init(&reply.finished, 0);
+    th_sock_t socket = th_connect_with_recv_buffer(cbm_httpd_port(listener), 64 * 1024);
+    ASSERT_TRUE(socket != TH_SOCK_BAD);
+    cbm_thread_t reply_thread;
+    ASSERT_EQ(cbm_thread_create(&reply_thread, 0, th_httpd_large_reply, &reply), 0);
+    ASSERT_TRUE(th_wait_httpd_activity(listener, CBM_HTTPD_ACTIVITY_RESPONDING, 1000));
+    /* Deterministic backpressure spans the ordinary test deadline. The new
+     * per-response opt-in must preserve the complete promised Content-Length. */
+    cbm_usleep(300 * 1000);
+    size_t size = 8U * 1024U * 1024U;
+    char *response = malloc(size + 1024);
+    ASSERT_NOT_NULL(response);
+    int got = th_recv_until_close(socket, response, size + 1024);
+    ASSERT_EQ(cbm_thread_join(&reply_thread), 0);
+    th_sock_close(socket);
+    ASSERT_TRUE(cbm_httpd_close(listener));
+    ASSERT_GT(got, (int)size);
+    char *body = strstr(response, "\r\n\r\n");
+    ASSERT_NOT_NULL(body);
+    ASSERT_EQ((size_t)got - (size_t)(body + 4 - response), size);
+    ASSERT_EQ(response[got - 1], 'R');
+    free(response);
     PASS();
 }
 
@@ -2459,8 +3275,25 @@ SUITE(httpd) {
     RUN_TEST(ui_server_rejects_non_loopback_host);
     RUN_TEST(ui_server_unknown_path_404);
     RUN_TEST(ui_server_process_kill_route_is_unavailable);
+    RUN_TEST(ui_server_process_measurements_declare_platform_semantics);
     RUN_TEST(ui_server_routes_indexing_through_joinable_daemon_executor);
     RUN_TEST(ui_server_free_never_joins_active_index_worker);
+    RUN_TEST(ui_csp_connect_src_has_explicit_download_hosts);
+    RUN_TEST(activity_preserves_severity_and_reports_interrupted_reads);
+    RUN_TEST(activity_pruned_start_events_do_not_resurrect_on_retry);
+    RUN_TEST(activity_migration_preserves_v1_logs_and_rejects_future_schema);
+    RUN_TEST(activity_log_project_scope_preserves_unknown_v2_history_and_filters_before_limit);
+    RUN_TEST(ui_log_scopes_use_explicit_entry_ownership_and_survive_server_restart);
+    RUN_TEST(activity_log_search_and_severity_apply_before_limit_and_survive_reopen);
+    RUN_TEST(ui_log_retention_prevents_expired_retry_and_preserves_full_json);
+    RUN_TEST(ui_log_journal_is_canonical_for_info_retry_and_restart);
+    RUN_TEST(ui_log_legacy_import_is_once_and_preserves_unknown_provenance_and_time);
+    RUN_TEST(activity_journal_reopen_cursor_dedup_and_project_isolation);
+    RUN_TEST(activity_errors_survive_routine_log_retention_and_reopen);
+    RUN_TEST(ui_agent_events_and_errors_use_daemon_port_and_survive_restart);
+    RUN_TEST(ui_log_post_writes_jsonl_and_tail_reads_it);
+    RUN_TEST(ui_log_post_refuses_bad_bodies);
+    RUN_TEST(ui_log_rotates_at_configured_size);
     RUN_TEST(ui_server_root_without_embedded_assets_is_not_found);
     RUN_TEST(ui_server_same_origin_request_is_allowed);
     RUN_TEST(ui_server_rejects_foreign_and_null_origins);
@@ -2491,6 +3324,7 @@ SUITE(httpd) {
     RUN_TEST(ui_server_free_refuses_scheduled_run_before_child_starts);
     RUN_TEST(daemon_host_http_thread_create_failure_cancels_scheduled_run);
     RUN_TEST(httpd_interrupt_unblocks_nonreading_large_response_within_one_second);
+    RUN_TEST(httpd_large_response_opt_in_survives_a_busy_reader_without_changing_default);
     RUN_TEST(httpd_nonreading_large_response_hits_send_deadline_without_interrupt);
     RUN_TEST(ui_server_stop_interrupts_partial_request_within_one_second);
     /* #798 follow-up: full UI-mode hang repro under live sockets */

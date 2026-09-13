@@ -1,0 +1,16 @@
+{
+  "command": "node tools/smoke-w12a.mjs",
+  "exitCode": 0,
+  "exitSignal": null,
+  "samples": 45,
+  "intervalMs": 400,
+  "warmupIntervalMs": 100,
+  "minSamples": 4,
+  "durationMs": 25795,
+  "maxProcessTreeSize": 7,
+  "lsofErrors": 0,
+  "outboundViolations": 0,
+  "violations": [],
+  "loopbackConnections": [],
+  "generatedAt": "2026-08-31T00:41:51.064Z"
+}

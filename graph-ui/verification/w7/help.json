@@ -1,0 +1,539 @@
+{
+  "menuItems": [
+    "[a]tlas",
+    "[w]hy am I here",
+    "[b]ug hunt",
+    "[c]hange scope",
+    "[r]eset layout",
+    "[l]ocal llm off",
+    "[?]help"
+  ],
+  "noNotWiredTooltip": true,
+  "everyMenuItemWired": true,
+  "helpOpensByClick": true,
+  "helpOpensByKey": true,
+  "helpEscCloses": true,
+  "helpSectionsShown": 7,
+  "helpListsEveryShortcut": true,
+  "helpNamesLimits": true,
+  "helpHasNoWebLinks": true,
+  "darkStyled": true,
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "twinRuntimeSentenceHonest": true,
+  "twinChangesSentenceHonest": true,
+  "typingWithoutClickReachesLine": true,
+  "typingNeverOpensPanelAccidentally": true,
+  "focusVisible": true,
+  "focusKeyWorks": true,
+  "oneCharHintInResultRow": true,
+  "noNativeTooltipOnCommandLine": true,
+  "menuShortcutByAltWorks": true,
+  "port": 4371,
+  "leftoverProcesses": 0,
+  "project": "codeatlasweb-w7a",
+  "fixture": "fixtures/atlas-sample (nur gelesen)",
+  "typedWord": "create",
+  "limitPhrases": [
+    "read-only",
+    "cannot edit",
+    "cannot run",
+    "no terminal",
+    "no cloud"
+  ],
+  "panelsWatched": [
+    "atlas-impact",
+    "atlas-bugwizard",
+    "atlas-entry",
+    "atlas-flow-overlay",
+    "atlas-help"
+  ],
+  "readabilityExclusions": [
+    {
+      "selector": ".monaco-editor",
+      "reason": "Der Editor setzt Zeilen, Zeilennummern und Dekorationen selbst, absolut positioniert und in eigenen Ebenen. Gemessen wird seine Flaeche gegen die Nachbarn, nicht sein Innenleben: das waere eine Pruefung einer fremden Bibliothek gegen die Layoutregeln dieses Produkts."
+    }
+  ],
+  "deliberateOverlays": [
+    {
+      "selector": "[data-testid=\"atlas-search-results\"]",
+      "reason": "Das Suchfenster liegt ueber der Kommandozeile."
+    },
+    {
+      "selector": "[data-testid=\"atlas-entry\"]",
+      "reason": "Der Einstiegsdialog liegt ueber der Editorflaeche."
+    },
+    {
+      "selector": "[data-testid=\"atlas-why\"]",
+      "reason": "Die Frage nach dem Warum fuellt die leere Editorflaeche."
+    },
+    {
+      "selector": "[data-testid=\"codeatlas-evidence-popover\"]",
+      "reason": "Ein Beleg klappt ueber die Zeile auf, zu der er gehoert."
+    },
+    {
+      "selector": "[data-testid=\"atlas-help\"]",
+      "reason": "Die Hilfeseite liegt ueber der Editorflaeche."
+    }
+  ],
+  "timings": {
+    "buildMs": 10509,
+    "serverStartMs": 7084,
+    "totalMs": 41698
+  },
+  "generatedAt": "2026-08-29T15:40:32.006Z",
+  "error": null,
+  "extras": {
+    "blockedRequests": [],
+    "consoleErrors": [],
+    "pageErrors": [],
+    "readability": [
+      {
+        "name": "help-open",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 184,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-help]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 180,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "command-line",
+        "scrolledRegions": 0,
+        "top": {
+          "candidates": 143,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-reader-placeholder]",
+            "[atlas-body] > [atlas-main] > [atlas-reader] > [atlas-why]",
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 143,
+          "overlaps": [],
+          "clipped": []
+        }
+      },
+      {
+        "name": "twin-lenses",
+        "scrolledRegions": 1,
+        "top": {
+          "candidates": 164,
+          "overlaps": [],
+          "clipped": [],
+          "layers": [
+            "document"
+          ]
+        },
+        "bottom": {
+          "candidates": 136,
+          "overlaps": [],
+          "clipped": []
+        }
+      }
+    ],
+    "indexed": {
+      "nodes": 76,
+      "edges": 178
+    },
+    "serverPort": 4370,
+    "menu": {
+      "items": [
+        {
+          "menu": "a",
+          "label": "[a]tlas",
+          "state": "on",
+          "disabled": false,
+          "title": "atlas: hide the galaxy panel (alt+a)",
+          "tag": "BUTTON"
+        },
+        {
+          "menu": "a-why",
+          "label": "[w]hy am I here",
+          "state": "off",
+          "disabled": false,
+          "title": "atlas: put the question again and pick a way in (alt+w)",
+          "tag": "BUTTON"
+        },
+        {
+          "menu": "a-bug",
+          "label": "[b]ug hunt",
+          "state": "off",
+          "disabled": false,
+          "title": "atlas: compare the expected path into a symbol with the observed one (alt+b)",
+          "tag": "BUTTON"
+        },
+        {
+          "menu": "a-impact",
+          "label": "[c]hange scope",
+          "state": "off",
+          "disabled": false,
+          "title": "atlas: what a change would reach, and what covers it (alt+c)",
+          "tag": "BUTTON"
+        },
+        {
+          "menu": "a-layout",
+          "label": "[r]eset layout",
+          "state": "off",
+          "disabled": false,
+          "title": "atlas: put every zone back to the width and height it starts with (alt+r)",
+          "tag": "BUTTON"
+        },
+        {
+          "menu": "a-llm",
+          "label": "[l]ocal llm off",
+          "state": "off",
+          "disabled": false,
+          "title": "atlas: turn the local model on (nothing is probed while it is off)",
+          "tag": "BUTTON"
+        },
+        {
+          "menu": "?",
+          "label": "[?]help",
+          "state": "off",
+          "disabled": false,
+          "title": "help: what this reads, what it cannot do, and every key it listens to (?)",
+          "tag": "BUTTON"
+        }
+      ],
+      "legend": "alt + letter",
+      "titles": [
+        "atlas: hide the galaxy panel (alt+a)",
+        "atlas: put the question again and pick a way in (alt+w)",
+        "atlas: compare the expected path into a symbol with the observed one (alt+b)",
+        "atlas: what a change would reach, and what covers it (alt+c)",
+        "atlas: put every zone back to the width and height it starts with (alt+r)",
+        "atlas: turn the local model on (nothing is probed while it is off)",
+        "help: what this reads, what it cannot do, and every key it listens to (?)",
+        "every file below it is in the graph without a recorded issue",
+        "every file below it is in the graph without a recorded issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "every file below it is in the graph without a recorded issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "every file below it is in the graph without a recorded issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "every file below it is in the graph without a recorded issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "every file below it is in the graph without a recorded issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "indexed: the graph carries this file and no source recorded an issue",
+        "drag this border. With the keyboard: focus it and use the arrow keys, with shift for a bigger step. A double click puts it back to the default.",
+        "drag this border. With the keyboard: focus it and use the arrow keys, with shift for a bigger step. A double click puts it back to the default.",
+        "the recorded calls of the symbol in the twin, as a sequence and as steps",
+        "the walk in front of you: one step, what it is, and where it sits",
+        "what was asked in this session, with the cards each answer was given",
+        "the expected path into a symbol against the observed one",
+        "what a change would reach, and what covers it",
+        "unfold this area again, on the tab that was open last",
+        "drag this border. With the keyboard: focus it and use the arrow keys, with shift for a bigger step. A double click puts it back to the default.",
+        "turn the local model on",
+        "Draw the code this symbol reaches as a sequence, beside the steps it is made of, and walk them one at a time.",
+        "How much CodeAtlas explains: a narrative, a guided summary, the recorded facts, or every detail behind them.",
+        "Hide Logic",
+        "Hide Calls",
+        "Hide Data",
+        "Hide Errors",
+        "Hide Tests",
+        "Show Runtime",
+        "Show Changes",
+        "Back to the panel.",
+        "Show the facts the index recorded for this symbol as a numbered block, with what its file pulls in.",
+        "drag this border. With the keyboard: focus it and use the arrow keys, with shift for a bigger step. A double click puts it back to the default.",
+        "galaxy: the whole project, laid out by the server",
+        "hierarchy: pick a way in and choose a symbol first, then this shows what it reaches",
+        "show the legend: what the colours, sizes and positions mean",
+        "hide the graph panel: the header stays, so it can be brought back",
+        "76 nodes, 178 edges from /api/layout",
+        "12 edge kinds"
+      ]
+    },
+    "wiredKeys": {
+      "menu": [
+        "/",
+        "?",
+        "a",
+        "b",
+        "c",
+        "l",
+        "r",
+        "w"
+      ],
+      "walk": [
+        "ArrowLeft",
+        "Enter",
+        "d",
+        "q"
+      ],
+      "search": [
+        "ArrowDown",
+        "ArrowUp",
+        "Enter",
+        "Escape"
+      ]
+    },
+    "help": {
+      "sections": [
+        "what",
+        "limits",
+        "panels",
+        "shortcuts",
+        "operations",
+        "honesty",
+        "references"
+      ],
+      "shortcuts": [
+        {
+          "scope": "mnemonic",
+          "key": "a",
+          "label": "alt+a",
+          "does": "show or hide the galaxy"
+        },
+        {
+          "scope": "mnemonic",
+          "key": "w",
+          "label": "alt+w",
+          "does": "ask again where to start, and walk from there"
+        },
+        {
+          "scope": "mnemonic",
+          "key": "b",
+          "label": "alt+b",
+          "does": "open the BUG hunt on the symbol in the twin"
+        },
+        {
+          "scope": "mnemonic",
+          "key": "c",
+          "label": "alt+c",
+          "does": "open the change scope"
+        },
+        {
+          "scope": "mnemonic",
+          "key": "l",
+          "label": "alt+l",
+          "does": "turn the local model on or off"
+        },
+        {
+          "scope": "mnemonic",
+          "key": "r",
+          "label": "alt+r",
+          "does": "put every zone back to the width and height it starts with"
+        },
+        {
+          "scope": "bare",
+          "key": "?",
+          "label": "?",
+          "does": "open or close this page"
+        },
+        {
+          "scope": "line",
+          "key": "/",
+          "label": "/",
+          "does": "put the cursor in the command line, without typing the slash itself"
+        },
+        {
+          "scope": "walk",
+          "key": "d",
+          "label": "d",
+          "does": "draw the flow of this step, when the step has a symbol"
+        },
+        {
+          "scope": "walk",
+          "key": "q",
+          "label": "q",
+          "does": "leave the walk"
+        },
+        {
+          "scope": "walk",
+          "key": "Enter",
+          "label": "enter",
+          "does": "go to the next step of the walk, and finish it on the last one"
+        },
+        {
+          "scope": "walk",
+          "key": "ArrowLeft",
+          "label": "left",
+          "does": "go back one step"
+        },
+        {
+          "scope": "search",
+          "key": "Enter",
+          "label": "enter",
+          "does": "open the selected hit, or ask the atlas when nothing matched"
+        },
+        {
+          "scope": "search",
+          "key": "Escape",
+          "label": "esc",
+          "does": "close the search window"
+        },
+        {
+          "scope": "search",
+          "key": "ArrowUp",
+          "label": "up",
+          "does": "move the selection up"
+        },
+        {
+          "scope": "search",
+          "key": "ArrowDown",
+          "label": "down",
+          "does": "move the selection down"
+        }
+      ],
+      "paths": [
+        "PLAN.md",
+        "INVENTAR.md",
+        "UPSTREAM-ASKS.md",
+        "docs/adr/0001-modellwahl.md",
+        "verification/"
+      ],
+      "anchors": 0,
+      "backgroundColor": "rgb(10, 14, 13)",
+      "color": "rgb(195, 212, 205)",
+      "fontFamily": "ui-monospace, SFMono-Regular, \"SF Mono\", \"JetBrains Mono\", Menlo, Consolas, \"Liberation Mono\", monospace",
+      "luminance": 0.04976470588235294,
+      "textLength": 5202
+    },
+    "shownKeys": {
+      "menu": [
+        "/",
+        "?",
+        "a",
+        "b",
+        "c",
+        "l",
+        "r",
+        "w"
+      ],
+      "walk": [
+        "ArrowLeft",
+        "Enter",
+        "d",
+        "q"
+      ],
+      "search": [
+        "ArrowDown",
+        "ArrowUp",
+        "Enter",
+        "Escape"
+      ]
+    },
+    "helpCloseButtonWorks": true,
+    "commandBeforeTyping": {
+      "value": "",
+      "focused": false,
+      "activeElement": "BODY",
+      "dataFocused": "false",
+      "promptColor": "rgb(31, 127, 76)",
+      "lineBorder": "rgb(29, 41, 38)",
+      "lineBackground": "rgb(15, 21, 19)",
+      "hasTitle": false,
+      "hint": "type 2 letters to search by meaning",
+      "resultsShown": false,
+      "resultsHeadline": "",
+      "openPanels": [],
+      "galaxyVisible": "true"
+    },
+    "commandAfterTyping": {
+      "value": "create",
+      "focused": true,
+      "activeElement": "INPUT",
+      "dataFocused": "true",
+      "promptColor": "rgb(51, 255, 153)",
+      "lineBorder": "rgb(31, 127, 76)",
+      "lineBackground": "rgb(19, 27, 24)",
+      "hasTitle": false,
+      "hint": "up/down picks, enter opens, esc closes",
+      "resultsShown": true,
+      "resultsHeadline": "4 hits for \"create\"",
+      "openPanels": [],
+      "galaxyVisible": "true"
+    },
+    "commandOneChar": {
+      "value": "c",
+      "focused": true,
+      "activeElement": "INPUT",
+      "dataFocused": "true",
+      "promptColor": "rgb(51, 255, 153)",
+      "lineBorder": "rgb(31, 127, 76)",
+      "lineBackground": "rgb(19, 27, 24)",
+      "hasTitle": false,
+      "hint": "type 2 letters to search by meaning",
+      "resultsShown": true,
+      "resultsHeadline": "one more letter, then the atlas searches by meaning",
+      "openPanels": [],
+      "galaxyVisible": "true"
+    },
+    "commandAfterFocusKey": {
+      "key": "/",
+      "value": "",
+      "focused": true,
+      "activeElement": "INPUT",
+      "dataFocused": "true",
+      "promptColor": "rgb(51, 255, 153)",
+      "lineBorder": "rgb(31, 127, 76)",
+      "lineBackground": "rgb(19, 27, 24)",
+      "hasTitle": false,
+      "hint": "type 2 letters to search by meaning",
+      "resultsShown": false,
+      "resultsHeadline": "",
+      "openPanels": [],
+      "galaxyVisible": "true"
+    },
+    "altShortcuts": {
+      "galaxyBefore": "true",
+      "galaxyAfterAltA": "false",
+      "lineAfterAltA": "",
+      "panelsAfterAltC": [
+        "atlas-impact"
+      ],
+      "lineAfterAltC": ""
+    },
+    "twinLenses": {
+      "runtime": "Runtime behaviournot recordedThis server hands observed calls to trace and flow answers, not to the twin, so this section stays empty. Recorded runs show up on the hops of the BUG hunt and in the flow; they get into the index through ingest_traces on the command line.",
+      "changes": "Recent changesnot recordedThe twin carries no version history, so this section stays empty. What a change here would reach is answered by the change scope panel ([c]hange scope), which reads it from detect_changes for the worktree or against a reference you name.",
+      "effects": "EFFECTSEffectsnot recordedThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md."
+    },
+    "apiRoutes": {
+      "/api/layout": 6,
+      "/api/tree": 42
+    },
+    "rpcTools": {
+      "index_status": 12,
+      "query_graph": 39,
+      "check_index_coverage": 7,
+      "search_graph": 3,
+      "detect_changes": 1,
+      "get_architecture": 1,
+      "get_code_snippet": 12
+    }
+  }
+}

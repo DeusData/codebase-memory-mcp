@@ -16,6 +16,8 @@
  * Aggregated children of one folder: sub-folders with file/symbol counts,
  * files directly inside it, per-child dominant region and missed-coverage
  * counts. `path` is a repo-relative folder ("" or "." = root). */
+char *cbm_atlas_repository_json(cbm_store_t *store, const char *project);
+
 char *cbm_atlas_tree_json(cbm_store_t *store, const char *project, const char *path);
 
 /* ── Symbol bundle (GET /api/symbol) ──────────────────────────────
@@ -88,6 +90,15 @@ char *cbm_atlas_trace_json(cbm_store_t *store, const char *project, int64_t from
  * reach it (the tests to run first). id or qualified name. */
 char *cbm_atlas_impact_json(cbm_store_t *store, const char *project, int64_t node_id,
                             const char *node_qn);
+
+/* Selection impact: bounded reverse graph paths plus independent local Git
+ * co-change evidence. The HTTP entry returns pending while its single retained
+ * worker computes on a separate query connection. No shell or network I/O. */
+char *cbm_atlas_impact_analysis_json(cbm_store_t *store, const char *project, const char *file,
+                                     int64_t node_id, const char *node_qn);
+char *cbm_atlas_impact_analysis_request(cbm_store_t *store, const char *project, const char *file,
+                                        int64_t node_id, const char *node_qn, bool refresh);
+void cbm_atlas_impact_analysis_shutdown(void);
 
 /* Attach runtime observation (observed_calls) to a trace ("path") or
  * flow-detail ("steps") JSON: observed hops gain {count, label,

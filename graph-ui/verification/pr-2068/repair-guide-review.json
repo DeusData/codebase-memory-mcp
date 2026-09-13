@@ -1,0 +1,23 @@
+{
+  "started": "2026-09-09T21:08:18.481Z",
+  "origin": "http://127.0.0.1:9749",
+  "method": "Fresh browser context; normal Overview navigation; 1440x1000 viewport; no preset application state",
+  "screenshot": "repair-guide-review.png",
+  "source_quote_count": 13,
+  "page_errors": [],
+  "console_error_count": 0,
+  "requests": {
+    "total": 105,
+    "rpc": 53,
+    "source_reads": 25,
+    "external_count": 0
+  },
+  "raw_evidence": {
+    "file": "repair-guide-review.json.gz",
+    "encoding": "gzip; original JSON bytes preserved",
+    "sha256_uncompressed": "b7e15c6b9591b6f12ed62f16eeb840c8a3a16d1975f2461b8ea58d10eba75b75",
+    "uncompressed_bytes": 814270,
+    "compressed_bytes": 104048
+  },
+  "scope_note": "Captured before subsequent comment-boundary, source-order and layout repairs; raw responses are repository content, not application-authored claims."
+}

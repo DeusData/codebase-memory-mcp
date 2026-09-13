@@ -1,0 +1,448 @@
+{
+  "schemaVersion": 1,
+  "symbol": {
+    "nodeId": "codeatlas-atlas-sample.src.services.userService.listUsers",
+    "name": "listUsers",
+    "qualifiedName": "codeatlas-atlas-sample.src.services.userService.listUsers",
+    "kind": "function",
+    "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+    "range": {
+      "start": {
+        "line": 17,
+        "character": 0
+      },
+      "end": {
+        "line": 20,
+        "character": 0
+      }
+    },
+    "projectName": "codeatlas-atlas-sample"
+  },
+  "generation": 2,
+  "snippetHash": "d7a6867752f24c681915f9a9f18c130bed573b3589ea4cf662e948bcc4757b03",
+  "purpose": {
+    "value": "Function listUsers in userService.ts. Makes 1 call, touches 0 environment values, can raise 0 error types.",
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "graph-node",
+        "strategy": "derived-summary",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "steps": {
+    "value": [
+      {
+        "targetName": "query",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "targetFile": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 19,
+        "targetLine": 17,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 19,
+          "endLine": 19
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calls": {
+    "value": [
+      {
+        "targetName": "query",
+        "targetQualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "targetFile": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "line": 19,
+        "targetLine": 17,
+        "strategy": "direct-call"
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "startLine": 19,
+          "endLine": 19
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "calledBy": {
+    "value": [
+      {
+        "name": "registerUserRoutes",
+        "qualifiedName": "codeatlas-atlas-sample.src.routes.users.registerUserRoutes",
+        "file": "file:///workspace/atlas-sample/src/routes/users.ts",
+        "line": 10,
+        "isTest": false
+      },
+      {
+        "name": "test/userService.test.ts",
+        "qualifiedName": "codeatlas-atlas-sample.test.userService.test",
+        "file": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "line": 14,
+        "isTest": true,
+        "sourceKind": "module"
+      },
+      {
+        "name": "createUser",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.userService.createUser",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "line": 29,
+        "isTest": false
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/routes/users.ts",
+        "range": {
+          "startLine": 10,
+          "endLine": 10
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "range": {
+          "startLine": 14,
+          "endLine": 14
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      },
+      {
+        "source": "graph-edge",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "startLine": 29,
+          "endLine": 29
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "reads": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "writes": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "typeRefs": {
+    "value": [
+      {
+        "name": "User",
+        "kind": "unknown",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.User",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "line": 27
+      }
+    ],
+    "state": "known",
+    "evidence": [
+      {
+        "source": "graph-edge",
+        "relation": "type-reference",
+        "file": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "startLine": 27,
+          "endLine": 27
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm"
+      }
+    ]
+  },
+  "throws": {
+    "value": [],
+    "state": "known",
+    "evidence": []
+  },
+  "externalEffects": {
+    "value": [],
+    "state": "unsupported",
+    "evidence": []
+  },
+  "tests": {
+    "value": [
+      {
+        "name": "test/userService.test.ts",
+        "file": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "line": 14,
+        "kind": "unit"
+      }
+    ],
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "test",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "range": {
+          "startLine": 14,
+          "endLine": 14
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm",
+        "strategy": "is-test-caller"
+      }
+    ]
+  },
+  "missingTests": {
+    "value": false,
+    "state": "inferred",
+    "evidence": [
+      {
+        "source": "test",
+        "relation": "invocation",
+        "file": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "range": {
+          "startLine": 14,
+          "endLine": 14
+        },
+        "engineGeneration": 2,
+        "providerId": "cbm",
+        "strategy": "is-test-caller"
+      }
+    ]
+  },
+  "complexity": {
+    "value": {
+      "cyclomatic": 0,
+      "cognitive": 0,
+      "loopDepth": 0,
+      "transitiveLoopDepth": 0,
+      "linearScanInLoop": false,
+      "allocInLoop": false,
+      "unguardedRecursion": false,
+      "recursive": false,
+      "isEntryPoint": false,
+      "isExported": false
+    },
+    "state": "unsupported",
+    "evidence": []
+  },
+  "risks": [],
+  "checklist": [
+    {
+      "id": "eb143f2b436c85c8494980deacb81bf60a7eab36",
+      "category": "core-logic",
+      "label": "Understand the call to query",
+      "target": {
+        "name": "query",
+        "qualifiedName": "codeatlas-atlas-sample.src.repo.db.query",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/repo/db.ts",
+        "range": {
+          "start": {
+            "line": 16,
+            "character": 0
+          },
+          "end": {
+            "line": 17,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 16,
+            "character": 0
+          },
+          "end": {
+            "line": 16,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "376f13c6ba7b77fdbf95156c3303b42a3fd365cd",
+      "category": "inputs",
+      "label": "Know the shape of User",
+      "target": {
+        "name": "User",
+        "qualifiedName": "codeatlas-atlas-sample.src.types.User",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/types.ts",
+        "range": {
+          "start": {
+            "line": 26,
+            "character": 0
+          },
+          "end": {
+            "line": 27,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 26,
+            "character": 0
+          },
+          "end": {
+            "line": 26,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "1d857bc5ae376e5e6575c80184107dba652f64b8",
+      "category": "callers",
+      "label": "See who calls this: registerUserRoutes",
+      "target": {
+        "name": "registerUserRoutes",
+        "qualifiedName": "codeatlas-atlas-sample.src.routes.users.registerUserRoutes",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/routes/users.ts",
+        "range": {
+          "start": {
+            "line": 9,
+            "character": 0
+          },
+          "end": {
+            "line": 10,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 9,
+            "character": 0
+          },
+          "end": {
+            "line": 9,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "19c355c71dad68933cd7ab130782684d012a703b",
+      "category": "callers",
+      "label": "See who calls this: test/userService.test.ts",
+      "target": {
+        "name": "test/userService.test.ts",
+        "qualifiedName": "codeatlas-atlas-sample.test.userService.test",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "range": {
+          "start": {
+            "line": 13,
+            "character": 0
+          },
+          "end": {
+            "line": 14,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 13,
+            "character": 0
+          },
+          "end": {
+            "line": 13,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "554c45e5690078fa26b2f02f67b87aef6cc57df8",
+      "category": "callers",
+      "label": "See who calls this: createUser",
+      "target": {
+        "name": "createUser",
+        "qualifiedName": "codeatlas-atlas-sample.src.services.userService.createUser",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/src/services/userService.ts",
+        "range": {
+          "start": {
+            "line": 28,
+            "character": 0
+          },
+          "end": {
+            "line": 29,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 28,
+            "character": 0
+          },
+          "end": {
+            "line": 28,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    },
+    {
+      "id": "40dec418462d67fcbd08bc89339d64e451022524",
+      "category": "tests",
+      "label": "Re-read the test test/userService.test.ts",
+      "target": {
+        "name": "test/userService.test.ts",
+        "kind": "unknown",
+        "uri": "file:///workspace/atlas-sample/test/userService.test.ts",
+        "range": {
+          "start": {
+            "line": 13,
+            "character": 0
+          },
+          "end": {
+            "line": 14,
+            "character": 0
+          }
+        },
+        "selectionRange": {
+          "start": {
+            "line": 13,
+            "character": 0
+          },
+          "end": {
+            "line": 13,
+            "character": 0
+          }
+        }
+      },
+      "done": false
+    }
+  ]
+}

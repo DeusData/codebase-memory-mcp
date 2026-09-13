@@ -1,0 +1,261 @@
+{
+  "chatAnswersWithoutModel": true,
+  "cardsWithoutModel": 6,
+  "citationsWithoutModel": 6,
+  "answerWithoutModel": "getOrder (src/services/orderService.ts:8) is a function in this project. [K1]getOrder, in body order: calls validateId [line 10], calls query [line 11]. [K2]The index records no error type raised by getOrder. [K3]registerOrderRoutes (src/routes/orders.ts:10) calls getOrder at line 10. [K4]getOrder calls query (src/repo/db.ts:17). [K5]getOrder calls validateId (src/util/validate.ts:33). [K6]",
+  "offNoticeReplacesAnswer": false,
+  "cardsByHops": {
+    "0": 3,
+    "1": 6,
+    "2": 8
+  },
+  "addedByHop": [
+    {
+      "depth": 0,
+      "cardsAdded": [
+        {
+          "id": "K1",
+          "text": "getOrder (src/services/orderService.ts:8) is a function in this project.The index records no test that reaches it.It makes 2 call(s), reads 0 environment value(s) and can raise 0 error type(s)."
+        },
+        {
+          "id": "K2",
+          "text": "getOrder, in body order: calls validateId [line 10], calls query [line 11]."
+        },
+        {
+          "id": "K3",
+          "text": "The index records no error type raised by getOrder."
+        }
+      ]
+    },
+    {
+      "depth": 1,
+      "cardsAdded": [
+        {
+          "id": "K4",
+          "text": "registerOrderRoutes (src/routes/orders.ts:10) calls getOrder at line 10."
+        },
+        {
+          "id": "K5",
+          "text": "getOrder calls query (src/repo/db.ts:17)."
+        },
+        {
+          "id": "K6",
+          "text": "getOrder calls validateId (src/util/validate.ts:33)."
+        }
+      ]
+    },
+    {
+      "depth": 2,
+      "cardsAdded": [
+        {
+          "id": "K5",
+          "text": "createApp (src/server.ts:35) calls codeatlasweb-w15.src.routes.orders.registerOrderRoutes at line 35.This is 2 hops from the subject."
+        },
+        {
+          "id": "K8",
+          "text": "codeatlasweb-w15.src.util.validate.validateId constructs ValidationError (src/util/validate.ts:4).This is 2 hops from the subject."
+        }
+      ]
+    }
+  ],
+  "hopsAddCards": true,
+  "aiButtons": 3,
+  "aiButtonsWhenOff": 0,
+  "restoreButtons": 3,
+  "roundTripIdentical": true,
+  "provenanceEverywhere": true,
+  "modelName": "w15-router-b",
+  "areas": {
+    "twin": {
+      "hasAiButton": true,
+      "aiButtonEnabled": true,
+      "restoredIdentical": true,
+      "restoreAsksModelAgain": false,
+      "builtProvenance": "built from indexed facts and cited source lines.",
+      "aiProvenance": "The sentences above were reworded by the local model. Every name, number, file and line in them was checked against the built text. Model: w15-router-b.",
+      "requestsForAi": 1,
+      "requestModels": [
+        "models/w15-router-b.gguf"
+      ],
+      "requestModelPresent": true,
+      "provenanceMatchesSelection": true,
+      "guardIsTheRealOne": true,
+      "refusals": [
+        {
+          "answer": "",
+          "applied": false,
+          "reason": "the model answered with nothing"
+        },
+        {
+          "answer": "inventedFact is always required.",
+          "applied": false,
+          "reason": "the rewrite has 1 sentences instead of 6"
+        },
+        {
+          "answer": "Function getOrder in orderService.ts. Makes 2 calls, touches 0 environment values, can raise 0 error types.\n4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.\nThe dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.\nThis symbol raises no error type that the index recorded.\nThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.\nNo test callers found (inferred from callers, not from a test relation): decide if this needs a test.\ninventedFact is always required.",
+          "applied": false,
+          "reason": "the rewrite has 7 sentences instead of 6"
+        },
+        {
+          "answer": "4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.\nThe dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.\nThis symbol raises no error type that the index recorded.\nThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.\nNo test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "applied": false,
+          "reason": "the rewrite has 5 sentences instead of 6"
+        },
+        {
+          "answer": "inventedFact getOrder in orderService.ts. Makes 2 calls, touches 0 environment values, can raise 0 error types.\n4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.\nThe dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.\nThis symbol raises no error type that the index recorded.\nThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.\nNo test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "applied": false,
+          "reason": "sentence 1 says \"inventedFact\" where the built sentence says \"getOrder\""
+        },
+        {
+          "answer": "Function getOrder in orderService.ts. Makes 3 calls, touches 0 environment values, can raise 0 error types.\n4 used in this file, 0 not used in it, 0 that CodeAtlas cannot check.\nThe dependency comes from the index; the statement, its line and the name it binds are CodeAtlas reading this file. Use is checked against the recorded facts of every callable symbol in the file.\nThis symbol raises no error type that the index recorded.\nThe index of this server records no routes, no outbound calls and no writes, so this block stays empty: that is a gap in the index and not a finding about this symbol. It is written down as Ask 2 in UPSTREAM-ASKS.md.\nNo test callers found (inferred from callers, not from a test relation): decide if this needs a test.",
+          "applied": false,
+          "reason": "sentence 1 says \"3\" where the built sentence says \"2\""
+        }
+      ]
+    },
+    "flow": {
+      "hasAiButton": true,
+      "aiButtonEnabled": true,
+      "restoredIdentical": true,
+      "restoreAsksModelAgain": false,
+      "builtProvenance": "built from indexed flow steps.",
+      "aiProvenance": "worded by local model w15-router-b; every required fact passed the rewrite guard.",
+      "requestsForAi": 1,
+      "requestModels": [
+        "models/w15-router-b.gguf"
+      ],
+      "requestModelPresent": true,
+      "provenanceMatchesSelection": true,
+      "guardIsTheRealOne": true,
+      "refusals": [
+        {
+          "answer": "",
+          "applied": false,
+          "reason": "the model answered with nothing"
+        },
+        {
+          "answer": "inventedFact is always required.",
+          "applied": false,
+          "reason": "the rewrite has 1 sentences instead of 23"
+        },
+        {
+          "answer": "createUser:\n1. call validateUser\n2. construct ValidationError\n3. construct UserEntity\n4. call listUsers\n5. call insert\n6. call toUser\n7. may raise ValidationError\n8. read DB_URL from the environment\ninsert:\nthe index recorded no calls, raised errors or environment reads for insert\nlistUsers:\n9. call query\ntoUser:\nthe index recorded no calls, raised errors or environment reads for toUser\nUserEntity:\nthe index recorded no calls, raised errors or environment reads for UserEntity\nValidationError:\nthe index recorded no calls, raised errors or environment reads for ValidationError\nvalidateUser:\n10. construct ValidationError\n11. may raise ValidationError\nand 1 more symbol not expanded: the walk stopped at its bound\ninventedFact is always required.",
+          "applied": false,
+          "reason": "the rewrite has 24 sentences instead of 23"
+        },
+        {
+          "answer": "1. call validateUser\n2. construct ValidationError\n3. construct UserEntity\n4. call listUsers\n5. call insert\n6. call toUser\n7. may raise ValidationError\n8. read DB_URL from the environment\ninsert:\nthe index recorded no calls, raised errors or environment reads for insert\nlistUsers:\n9. call query\ntoUser:\nthe index recorded no calls, raised errors or environment reads for toUser\nUserEntity:\nthe index recorded no calls, raised errors or environment reads for UserEntity\nValidationError:\nthe index recorded no calls, raised errors or environment reads for ValidationError\nvalidateUser:\n10. construct ValidationError\n11. may raise ValidationError\nand 1 more symbol not expanded: the walk stopped at its bound",
+          "applied": false,
+          "reason": "the rewrite has 22 sentences instead of 23"
+        },
+        {
+          "answer": "inventedFact:\n1. call validateUser\n2. construct ValidationError\n3. construct UserEntity\n4. call listUsers\n5. call insert\n6. call toUser\n7. may raise ValidationError\n8. read DB_URL from the environment\ninsert:\nthe index recorded no calls, raised errors or environment reads for insert\nlistUsers:\n9. call query\ntoUser:\nthe index recorded no calls, raised errors or environment reads for toUser\nUserEntity:\nthe index recorded no calls, raised errors or environment reads for UserEntity\nValidationError:\nthe index recorded no calls, raised errors or environment reads for ValidationError\nvalidateUser:\n10. construct ValidationError\n11. may raise ValidationError\nand 1 more symbol not expanded: the walk stopped at its bound",
+          "applied": false,
+          "reason": "sentence 1 says \"inventedFact\" where the built sentence says \"createUser\""
+        },
+        {
+          "answer": "createUser:\n2. call validateUser\n2. construct ValidationError\n3. construct UserEntity\n4. call listUsers\n5. call insert\n6. call toUser\n7. may raise ValidationError\n8. read DB_URL from the environment\ninsert:\nthe index recorded no calls, raised errors or environment reads for insert\nlistUsers:\n9. call query\ntoUser:\nthe index recorded no calls, raised errors or environment reads for toUser\nUserEntity:\nthe index recorded no calls, raised errors or environment reads for UserEntity\nValidationError:\nthe index recorded no calls, raised errors or environment reads for ValidationError\nvalidateUser:\n10. construct ValidationError\n11. may raise ValidationError\nand 1 more symbol not expanded: the walk stopped at its bound",
+          "applied": false,
+          "reason": "sentence 2 says \"2\" where the built sentence says \"1\""
+        }
+      ]
+    },
+    "chat": {
+      "hasAiButton": true,
+      "aiButtonEnabled": true,
+      "restoredIdentical": true,
+      "restoreAsksModelAgain": false,
+      "builtProvenance": "built from indexed cards and their citations.",
+      "aiProvenance": "worded by local model w15-router-b; every required fact passed the rewrite guard.",
+      "requestsForAi": 1,
+      "requestModels": [
+        "models/w15-router-b.gguf"
+      ],
+      "requestModelPresent": true,
+      "provenanceMatchesSelection": true,
+      "guardIsTheRealOne": true,
+      "refusals": [
+        {
+          "answer": "",
+          "applied": false,
+          "reason": "the model answered with nothing"
+        },
+        {
+          "answer": "inventedFact is always required.",
+          "applied": false,
+          "reason": "the rewrite has 1 sentences instead of 6"
+        },
+        {
+          "answer": "getOrder (src/services/orderService.ts:8) is a function in this project. [K1]\ngetOrder, in body order: calls validateId [line 10], calls query [line 11]. [K2]\nThe index records no error type raised by getOrder. [K3]\nregisterOrderRoutes (src/routes/orders.ts:10) calls getOrder at line 10. [K4]\ngetOrder calls query (src/repo/db.ts:17). [K5]\ngetOrder calls validateId (src/util/validate.ts:33). [K6]\ninventedFact is always required.",
+          "applied": false,
+          "reason": "the rewrite has 7 sentences instead of 6"
+        },
+        {
+          "answer": "getOrder, in body order: calls validateId [line 10], calls query [line 11]. [K2]\nThe index records no error type raised by getOrder. [K3]\nregisterOrderRoutes (src/routes/orders.ts:10) calls getOrder at line 10. [K4]\ngetOrder calls query (src/repo/db.ts:17). [K5]\ngetOrder calls validateId (src/util/validate.ts:33). [K6]",
+          "applied": false,
+          "reason": "the rewrite has 5 sentences instead of 6"
+        },
+        {
+          "answer": "inventedFact (src/services/orderService.ts:8) is a function in this project. [K1]\ngetOrder, in body order: calls validateId [line 10], calls query [line 11]. [K2]\nThe index records no error type raised by getOrder. [K3]\nregisterOrderRoutes (src/routes/orders.ts:10) calls getOrder at line 10. [K4]\ngetOrder calls query (src/repo/db.ts:17). [K5]\ngetOrder calls validateId (src/util/validate.ts:33). [K6]",
+          "applied": false,
+          "reason": "sentence 1 says \"inventedFact\" where the built sentence says \"getOrder\""
+        },
+        {
+          "answer": "getOrder (src/services/orderService.ts:9) is a function in this project. [K1]\ngetOrder, in body order: calls validateId [line 10], calls query [line 11]. [K2]\nThe index records no error type raised by getOrder. [K3]\nregisterOrderRoutes (src/routes/orders.ts:10) calls getOrder at line 10. [K4]\ngetOrder calls query (src/repo/db.ts:17). [K5]\ngetOrder calls validateId (src/util/validate.ts:33). [K6]",
+          "applied": false,
+          "reason": "sentence 1 says \"9\" where the built sentence says \"8\""
+        }
+      ]
+    }
+  },
+  "guardRefusals": 18,
+  "autoRequests": 0,
+  "requestsAfterClick": 3,
+  "touchedUserSidecar": false,
+  "offButtonReadings": {
+    "chat": 0,
+    "twin": 0,
+    "flow": 0
+  },
+  "autoRequestReadings": [
+    {
+      "area": "enable",
+      "requests": 0
+    },
+    {
+      "area": "twin-navigation",
+      "requests": 0
+    },
+    {
+      "area": "flow-navigation",
+      "requests": 0
+    },
+    {
+      "area": "chat-navigation",
+      "requests": 0
+    }
+  ],
+  "overlapViolations": 0,
+  "clippingViolations": 0,
+  "cutWithoutHint": 0,
+  "port": 4681,
+  "ownedPorts": [
+    4680,
+    4681
+  ],
+  "reusedIsolatedPreviewUpstream": false,
+  "leftoverProcesses": 0,
+  "ordinaryChatAfterEnable": {
+    "completionRequests": 0,
+    "status": "answered",
+    "cards": 6,
+    "citations": 6,
+    "builtProvenanceVisible": true,
+    "aiProvenanceVisible": false,
+    "aiButtonVisible": true
+  },
+  "selectedRouterModel": "models/w15-router-b.gguf",
+  "selectedRouterModelName": "w15-router-b",
+  "immediateProbeModel": "models/w15-router-b.gguf",
+  "requestsBeforeFirstAiClick": 0
+}

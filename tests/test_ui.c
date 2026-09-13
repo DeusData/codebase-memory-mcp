@@ -12,7 +12,9 @@
 #include "ui/layout3d.h"
 #include "ui/atlas.h"
 #include "store/store.h"
+#include "foundation/subprocess.h"
 
+#include <sqlite3/sqlite3.h>
 #include <yyjson/yyjson.h>
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
@@ -2110,6 +2112,183 @@ TEST(atlas_symbol_history_log_l_and_remote) {
     PASS();
 }
 
+TEST(atlas_repository_map_snapshot_evidence) {
+    cbm_store_t *store = regions_fixture();
+    ASSERT_NOT_NULL(store);
+    ASSERT_EQ(sqlite3_exec(
+                  cbm_store_get_db(store),
+                  "UPDATE edges SET "
+                  "properties='{\"line\":6989,\"strategy\":\"unique_name\",\"confidence\":0.75}' "
+                  "WHERE id=(SELECT min(id) FROM edges);"
+                  "UPDATE edges SET properties='{\"strategy\":42,\"confidence\":\"0.8\"}' "
+                  "WHERE id=(SELECT id FROM edges ORDER BY id LIMIT 1 OFFSET 1)",
+                  NULL, NULL, NULL),
+              SQLITE_OK);
+    char *json = cbm_atlas_repository_json(store, "regions-test");
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total_nodes")), 6);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(root, "total_edges")), 9);
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "nodes_truncated")));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(root, "edges_truncated")));
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "nodes")), 6);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(root, "edges")), 9);
+    ASSERT_NOT_NULL(yyjson_get_str(yyjson_obj_get(root, "generation")));
+    yyjson_val *edge = yyjson_arr_get(yyjson_obj_get(root, "edges"), 0);
+    ASSERT_GT(yyjson_get_int(yyjson_obj_get(edge, "id")), 0);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(edge, "line")), 6989);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(edge, "strategy")), "unique_name");
+    ASSERT_TRUE(yyjson_get_num(yyjson_obj_get(edge, "confidence")) == 0.75);
+    yyjson_val *invalid = yyjson_arr_get(yyjson_obj_get(root, "edges"), 1);
+    ASSERT_NULL(yyjson_obj_get(invalid, "strategy"));
+    ASSERT_NULL(yyjson_obj_get(invalid, "confidence"));
+    yyjson_val *missing = yyjson_arr_get(yyjson_obj_get(root, "edges"), 2);
+    ASSERT_NULL(yyjson_obj_get(missing, "strategy"));
+    ASSERT_NULL(yyjson_obj_get(missing, "confidence"));
+    yyjson_doc_free(doc);
+    free(json);
+    cbm_store_close(store);
+    PASS();
+}
+
+TEST(atlas_selection_impact_evidence_and_missing_history) {
+    cbm_store_t *store = regions_fixture();
+    ASSERT_NOT_NULL(store);
+    char *json = cbm_atlas_impact_analysis_json(store, "regions-test", "src/beta/b1.c", -1,
+                                                "regions-test::beta_one");
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *root = yyjson_doc_get_root(doc);
+    yyjson_val *graph = yyjson_obj_get(root, "structural");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(graph, "available")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(graph, "seed_count")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(graph, "reachable")), 5);
+    yyjson_val *findings = yyjson_obj_get(graph, "findings");
+    ASSERT_EQ((int)yyjson_arr_size(findings), 5);
+    for (size_t i = 0; i < yyjson_arr_size(findings); i++) {
+        yyjson_val *finding = yyjson_arr_get(findings, i);
+        yyjson_val *path = yyjson_obj_get(finding, "path");
+        ASSERT_EQ((int)yyjson_arr_size(path), yyjson_get_int(yyjson_obj_get(finding, "distance")));
+        long long current = yyjson_get_int(yyjson_obj_get(finding, "id"));
+        for (size_t j = 0; j < yyjson_arr_size(path); j++) {
+            yyjson_val *edge = yyjson_arr_get(path, j);
+            ASSERT_GT(yyjson_get_int(yyjson_obj_get(edge, "edge_id")), 0);
+            ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(edge, "type")), "CALLS");
+            ASSERT_EQ(current, yyjson_get_int(yyjson_obj_get(yyjson_obj_get(edge, "from"), "id")));
+            current = yyjson_get_int(yyjson_obj_get(yyjson_obj_get(edge, "to"), "id"));
+        }
+        yyjson_val *last = yyjson_arr_get(path, yyjson_arr_size(path) - 1);
+        ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_obj_get(last, "to"), "qualified_name")),
+                      "regions-test::beta_one");
+    }
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(yyjson_obj_get(root, "history"), "available")));
+    ASSERT_STR_EQ(
+        yyjson_get_str(yyjson_obj_get(yyjson_obj_get(root, "snapshot"), "index_revision")),
+        "unknown");
+    yyjson_doc_free(doc);
+    free(json);
+    json = cbm_atlas_impact_analysis_json(store, "regions-test", "src/new.c", -1, NULL);
+    ASSERT_NOT_NULL(json);
+    doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_FALSE(yyjson_get_bool(
+        yyjson_obj_get(yyjson_obj_get(yyjson_doc_get_root(doc), "structural"), "available")));
+    yyjson_doc_free(doc);
+    free(json);
+    ASSERT_NULL(cbm_atlas_impact_analysis_json(store, "regions-test", "../private.c", -1, NULL));
+    cbm_store_close(store);
+    PASS();
+}
+
+static bool impact_test_git(const char *root, const char *const *args) {
+    const char *argv[30] = {"git",
+                            "-C",
+                            root,
+                            "-c",
+                            "user.name=Impact fixture",
+                            "-c",
+                            "user.email=fixture@localhost",
+                            "-c",
+                            "commit.gpgsign=false"};
+    int n = 9;
+    while (*args && n < 29)
+        argv[n++] = *args++;
+    cbm_proc_opts_t opts = {.bin = "git", .argv = argv, .quiet_timeout_ms = 3000};
+    cbm_proc_result_t result;
+    return cbm_subprocess_run(&opts, &result) == 0 && result.outcome == CBM_PROC_CLEAN;
+}
+
+static bool impact_test_write(const char *root, const char *file, const char *value) {
+    char path[1024];
+    snprintf(path, sizeof(path), "%s/%s", root, file);
+    FILE *fp = cbm_fopen(path, "wb");
+    if (!fp)
+        return false;
+    fputs(value, fp);
+    return fclose(fp) == 0;
+}
+
+TEST(atlas_selection_impact_git_filters_and_worktree) {
+    char tmpl[256] = "/tmp/cbm_impact_git_XXXXXX";
+    char *root = cbm_mkdtemp(tmpl);
+    ASSERT_NOT_NULL(root);
+    const char *init[] = {"init", "-q", NULL};
+    ASSERT_TRUE(impact_test_git(root, init));
+    const char *add[] = {"add", ".", NULL};
+    const char *commit[] = {"commit", "-qm", "explicit impact test fixture", NULL};
+    ASSERT_TRUE(impact_test_write(root, "core.c", "int core(void) { return 1; }\n"));
+    ASSERT_TRUE(impact_test_write(root, "consumer.c", "int consumer(void) { return 1; }\n"));
+    ASSERT_TRUE(impact_test_git(root, add));
+    ASSERT_TRUE(impact_test_git(root, commit));
+    ASSERT_TRUE(impact_test_write(root, "core.c", "int core(void) { return 2; }\n"));
+    ASSERT_TRUE(impact_test_write(root, "consumer.c", "int consumer(void) { return 2; }\n"));
+    ASSERT_TRUE(impact_test_git(root, add));
+    ASSERT_TRUE(impact_test_git(root, commit));
+    for (int i = 0; i < 31; i++) {
+        char file[80];
+        snprintf(file, sizeof(file), "mass-%d.c", i);
+        ASSERT_TRUE(impact_test_write(root, file, "/* explicit mass-change fixture */\n"));
+    }
+    ASSERT_TRUE(impact_test_write(root, "core.c", "int core(void) { return 3; }\n"));
+    ASSERT_TRUE(impact_test_git(root, add));
+    ASSERT_TRUE(impact_test_git(root, commit));
+    const char *side[] = {"checkout", "-qb", "fixture-side", NULL};
+    const char *empty[] = {"commit", "--allow-empty", "-qm", "fixture branch", NULL};
+    const char *back[] = {"checkout", "-q", "-", NULL};
+    const char *merge[] = {"merge", "--no-ff", "-qm", "fixture merge", "fixture-side", NULL};
+    ASSERT_TRUE(impact_test_git(root, side));
+    ASSERT_TRUE(impact_test_git(root, empty));
+    ASSERT_TRUE(impact_test_git(root, back));
+    ASSERT_TRUE(impact_test_git(root, merge));
+    ASSERT_TRUE(impact_test_write(root, "core.c", "int core(void) { return 4; }\n"));
+    cbm_store_t *store = cbm_store_open_memory();
+    ASSERT_NOT_NULL(store);
+    cbm_store_upsert_project(store, "impact-fixture", root);
+    char *json = cbm_atlas_impact_analysis_json(store, "impact-fixture", "core.c", -1, NULL);
+    ASSERT_NOT_NULL(json);
+    yyjson_doc *doc = yyjson_read(json, strlen(json), 0);
+    ASSERT_NOT_NULL(doc);
+    yyjson_val *history = yyjson_obj_get(yyjson_doc_get_root(doc), "history");
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(history, "available")));
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(history, "selection_commits")), 2);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(history, "merges_excluded")), 1);
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(history, "mass_changes_excluded")), 1);
+    ASSERT_TRUE(yyjson_get_bool(yyjson_obj_get(history, "selection_uncommitted")));
+    ASSERT_FALSE(yyjson_get_bool(yyjson_obj_get(history, "shallow")));
+    yyjson_val *co = yyjson_obj_get(history, "cochanges");
+    ASSERT_EQ((int)yyjson_arr_size(co), 1);
+    ASSERT_STR_EQ(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(co, 0), "file_path")), "consumer.c");
+    ASSERT_EQ(yyjson_get_int(yyjson_obj_get(yyjson_arr_get(co, 0), "shared_commits")), 2);
+    ASSERT_EQ((int)yyjson_arr_size(yyjson_obj_get(yyjson_arr_get(co, 0), "commit_refs")), 2);
+    yyjson_doc_free(doc);
+    free(json);
+    cbm_store_close(store);
+    (void)th_rmtree(root);
+    PASS();
+}
+
 TEST(atlas_why_extracts_guard_chains) {
     /* Same CBM_SZ_256 convention: the Windows expansion must fit. */
     char tmpl[256] = "/tmp/cbm_why_XXXXXX";
@@ -2274,4 +2453,7 @@ SUITE(ui) {
     RUN_TEST(atlas_who_reports_authorship_evidence);
     RUN_TEST(atlas_symbol_history_log_l_and_remote);
     RUN_TEST(atlas_why_extracts_guard_chains);
+    RUN_TEST(atlas_selection_impact_evidence_and_missing_history);
+    RUN_TEST(atlas_selection_impact_git_filters_and_worktree);
+    RUN_TEST(atlas_repository_map_snapshot_evidence);
 }

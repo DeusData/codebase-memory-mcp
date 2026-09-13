@@ -53,6 +53,7 @@ enum {
 #define SLEN(s) (sizeof(s) - 1)
 #include "mcp/mcp.h"
 #include "mcp/mcp_internal.h"
+#include "mcp/architecture_jobs.h"
 #include "store/store.h"
 #include <sqlite3.h>
 #include "cypher/cypher.h"
@@ -614,18 +615,26 @@ static const tool_def_t TOOLS[] = {
      "\"additionalProperties\":false}"},
 
     {"get_architecture",
-     "Compact counts, languages, packages, entry points. Request structure, dependencies, "
-     "routes, hotspots, boundaries, layers, clusters, cycles, or file_tree; path scopes a "
-     "directory.",
+     "Bounded static architecture; poll pending jobs. include_behavior_evidence=true adds "
+     "indexed call arguments, parameter declarations and return types; not full dataflow or "
+     "runtime traces.",
      /* The aspects enum mirrors VALID_ASPECTS (see aspect_is_valid) — update both together. */
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"path\":{\"type\":"
-     "\"string\",\"description\":\"Directory prefix (for example apps/hoa).\"},"
+     "\"string\",\"description\":\"Directory prefix.\"},"
      "\"aspects\":{\"type\":\"array\",\"items\":{\"type\":\"string\",\"enum\":[\"all\","
      "\"overview\",\"structure\",\"dependencies\",\"routes\",\"languages\",\"packages\","
      "\"entry_points\",\"hotspots\",\"boundaries\",\"layers\",\"file_tree\",\"clusters\","
-     "\"cycles\"]},"
-     "\"description\":\"all=everything; overview=compact except file_tree; omitted=languages/"
-     "packages/entry_points; cycles is opt-in.\"},"
+     "\"cycles\",\"system_structure\"]},"
+     "\"description\":\"Default: languages/packages/entry_points. overview omits file_tree. "
+     "cycles/system_structure opt-in; system_structure alone, no path.\"},"
+     "\"entry_node_id\":{\"type\":\"integer\",\"minimum\":1,"
+     "\"description\":\"Start symbol.\"},"
+     "\"target_node_id\":{\"type\":\"integer\",\"minimum\":1,"
+     "\"description\":\"Requires entry_node_id.\"},"
+     "\"expected_generation\":{\"type\":\"string\",\"minLength\":1,"
+     "\"description\":\"Required generation.\"},"
+     "\"include_behavior_evidence\":{\"type\":\"boolean\",\"default\":false,"
+     "\"description\":\"system_structure only.\"},"
      "\"format\":{\"type\":\"string\",\"enum\":[\"tree\",\"json\"],\"default\":\"tree\"}},"
      "\"required\":[\"project\"]}"},
 
@@ -1702,6 +1711,7 @@ struct cbm_mcp_server {
     int64_t active_request_id;       /* JSON-RPC id of the in-progress tool call */
     char *active_request_id_str;     /* string JSON-RPC id of the in-progress tool call */
     cbm_mcp_tool_profile_t tool_profile;
+    cbm_architecture_jobs_t *architecture_jobs;
 };
 
 cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
@@ -1723,6 +1733,7 @@ cbm_mcp_server_t *cbm_mcp_server_new(const char *store_path) {
     srv->owns_store = true;
     srv->tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     srv->background_tasks = true;
+    srv->architecture_jobs = cbm_architecture_jobs_new();
 
     return srv;
 }
@@ -1875,6 +1886,7 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv) {
     if (!srv) {
         return;
     }
+    cbm_architecture_jobs_free(srv->architecture_jobs);
     if (srv->autoindex_active) {
         cbm_thread_join(&srv->autoindex_tid);
     }
@@ -6821,10 +6833,10 @@ static char *handle_delete_project(cbm_mcp_server_t *srv, const char *args) {
  * of truth for the server-side validation (authoritative); the JSON-Schema
  * enum in the TOOLS entry above is the advisory client-side mirror — update
  * both together when the aspect set changes. */
-static const char *VALID_ASPECTS[] = {"all",      "overview",   "structure", "dependencies",
-                                      "routes",   "languages",  "packages",  "entry_points",
-                                      "hotspots", "boundaries", "layers",    "file_tree",
-                                      "clusters", "cycles",     NULL};
+static const char *VALID_ASPECTS[] = {"all",      "overview",   "structure",        "dependencies",
+                                      "routes",   "languages",  "packages",         "entry_points",
+                                      "hotspots", "boundaries", "layers",           "file_tree",
+                                      "clusters", "cycles",     "system_structure", NULL};
 
 /* ── SCC / cycle condensation (get_architecture "cycles") ─────────
  * Iterative Tarjan over the CALLS call graph. Recursion would overflow on a
@@ -7304,9 +7316,19 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
     /* Parse aspects array from args */
     yyjson_doc *aspects_doc = NULL;
     yyjson_val *aspects_arr = NULL;
+    bool include_behavior_evidence = false;
     {
         yyjson_doc *args_doc = yyjson_read(args, strlen(args), 0);
         if (args_doc) {
+            yyjson_val *evidence =
+                yyjson_obj_get(yyjson_doc_get_root(args_doc), "include_behavior_evidence");
+            if (evidence && !yyjson_is_bool(evidence)) {
+                yyjson_doc_free(args_doc);
+                free(project);
+                free(scope_path);
+                return cbm_mcp_text_result("include_behavior_evidence must be a boolean.", true);
+            }
+            include_behavior_evidence = yyjson_get_bool(evidence);
             yyjson_val *aval = yyjson_obj_get(yyjson_doc_get_root(args_doc), "aspects");
             if (yyjson_is_arr(aval)) {
                 aspects_doc = args_doc; /* keep alive */
@@ -7315,6 +7337,14 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
                 yyjson_doc_free(args_doc);
             }
         }
+    }
+
+    if (include_behavior_evidence && !aspect_explicitly_named(aspects_arr, "system_structure")) {
+        yyjson_doc_free(aspects_doc);
+        free(project);
+        free(scope_path);
+        return cbm_mcp_text_result(
+            "include_behavior_evidence=true requires aspects:[\"system_structure\"].", true);
     }
 
     /* Build a C string array from aspects for cbm_store_get_architecture.
@@ -7360,6 +7390,41 @@ static char *handle_get_architecture(cbm_mcp_server_t *srv, const char *args) {
             }
             return err;
         }
+    }
+
+    if (aspect_explicitly_named(aspects_arr, "system_structure")) {
+        yyjson_val *entry = yyjson_obj_get(yyjson_doc_get_root(aspects_doc), "entry_node_id");
+        yyjson_val *target = yyjson_obj_get(yyjson_doc_get_root(aspects_doc), "target_node_id");
+        yyjson_val *generation =
+            yyjson_obj_get(yyjson_doc_get_root(aspects_doc), "expected_generation");
+        bool valid_entry = !entry || (yyjson_is_int(entry) && yyjson_get_sint(entry) > 0);
+        bool valid_target =
+            !target || (entry && yyjson_is_int(target) && yyjson_get_sint(target) > 0);
+        bool valid_generation =
+            !generation || (yyjson_is_str(generation) && yyjson_get_len(generation) > 0 &&
+                            yyjson_get_len(generation) < 512);
+        char *json = NULL;
+        char *reply = NULL;
+        if (yyjson_arr_size(aspects_arr) != 1 || (scope_path && scope_path[0]) || !valid_entry ||
+            !valid_target || !valid_generation) {
+            reply = cbm_mcp_text_result(
+                "Request system_structure alone, without path; entry_node_id must be a positive "
+                "integer when supplied. target_node_id requires entry_node_id; expected_generation "
+                "must be a nonempty generation token.",
+                true);
+        } else {
+            json = cbm_architecture_jobs_request_query(
+                srv->architecture_jobs, store, project, entry ? yyjson_get_sint(entry) : 0,
+                target ? yyjson_get_sint(target) : 0,
+                generation ? yyjson_get_str(generation) : NULL, include_behavior_evidence);
+            reply = cbm_mcp_text_result(json ? json : "Architecture request allocation failed.",
+                                        json == NULL);
+        }
+        free(json);
+        free(project);
+        free(scope_path);
+        yyjson_doc_free(aspects_doc);
+        return reply;
     }
 
     /* Default (no aspects) = compact summary. The old default rendered ALL

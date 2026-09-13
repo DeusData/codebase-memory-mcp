@@ -1,0 +1,331 @@
+{
+  "auditedCommit": "2c3562f",
+  "auditDate": "2026-08-29",
+  "requirementsChecked": 42,
+  "metAndProven": 32,
+  "partiallyMet": 7,
+  "notMet": 0,
+  "notProvable": 3,
+  "adversarialProbes": 6,
+  "ranSuitesItself": true,
+  "suiteNumbers": {
+    "scaffoldAtAudit": "73/77 (4 rot: der zum Pruefzeitpunkt entstehende w6b-Block)",
+    "unitAtAudit": "1367/1367",
+    "freshCloneOfCommit": "scaffold 73/73, unit 1367/1367, build ok"
+  },
+  "notProvableJustified": [
+    {
+      "item": "icca-Gate- und Red-Proof-Historie",
+      "reason": "Der Prozessstaat (Contracts, Red-Proofs, Gates) lebt konstruktionsbedingt ausserhalb des Repos unter ~/.claude/red-proof/; der Ledger im selben Verzeichnis ist Navigationsindex, kein Beweis. Im Repo beweisbar sind nur die Ergebnisse (eingefrorene Tests, Artefakte), und die sind gruen."
+    },
+    {
+      "item": "Push-Historie in das private GitHub-Repo",
+      "reason": "Ohne Netzzugriff aus dem Audit heraus nicht pruefbar; die origin-URL (BernhardJackiewicz/CodeAtlasWeb) und die Push-Protokolle der Session liegen ausserhalb des Repos. Strukturell nicht aus dem Arbeitsbaum beweisbar."
+    },
+    {
+      "item": "llama.cpp-Runtime b10675 aus Quellen",
+      "reason": "Das Binary meldet die interne Version 0.3.0-dev (commit 90c26fc); die Zuordnung zum Tag b10675 haengt am Quellbaum ausserhalb des Repos. vendor/llama/HERKUNFT.md dokumentiert Quelle, Kommando und SHA256; reproduzierbar, aber im Repo nur selbstbezeugt."
+    }
+  ],
+  "partiallyMetDispositions": [
+    {
+      "item": "Buchstaben-Shortcut an jedem Menuepunkt (PLAN §4)",
+      "disposition": "fixed",
+      "detail": "F12-Fix: [w]hy [b]ug [c]hange [l]lm verdrahtet (WIRED_MENU_SHORTCUTS), im Gesamtlauf live bewiesen (atlasRowOpenedByKey true, Walk-Bild 14b)."
+    },
+    {
+      "item": "Tourkarten-Aktion [d] diagram (PLAN §4)",
+      "disposition": "fixed",
+      "detail": "F13-Fix: vierte Karten-Aktion [d] diagram oeffnet das Flow-Overlay des Schritt-Symbols, bei Dateischritt ehrlich inaktiv (data-available=false); Walk-Bild 18b; deckte einen Overlay-Layout-Bug auf, der mitbehoben wurde (0 Ueberlagerungen)."
+    },
+    {
+      "item": "ADR-Belege der Modellwahl (PLAN §5)",
+      "disposition": "fixed",
+      "detail": "ADR korrigiert: Ein-Lauf-Aussage ehrlich gemacht, Nominierungs-Quellen als Anhang, Groessen auf reale Bytes, interne Widersprueche als Korrektur-Notizen (Befunde 3/4/5/18)."
+    },
+    {
+      "item": "Eval als Regressionstest (PLAN §6.5)",
+      "disposition": "fixed",
+      "detail": "F6/F9-Fix: eval-bounds erzwungen (exit!=0 bei Riss, 15 Trockentests); tools/eval-check.mjs faehrt die zwei Sieger echt als Pflichtschritt des Release-Gates: 107s, Klasse A 0.705/0.909 (+0.023 vs Baseline), Klasse B 0.841/1.000, evalCheckPass true, classDrift leer."
+    },
+    {
+      "item": "PR-1860-Views im selben Chrome (PLAN §7)",
+      "disposition": "accepted",
+      "detail": "Haengt an Upstream-Ask 3/5 (offizieller Platz fuer Zusatz-Frontends); der C-Server ist Martins Hoheit, eigenmaechtige graph-ui-Aenderungen sind per CLAUDE.md verboten. Die PR-Views bleiben auf Martins Port vollstaendig nutzbar; die Zusammenfuehrung folgt, sobald die Ask erfuellt ist."
+    },
+    {
+      "item": "W6-Abschluss inkl. Audit und Demo (PLAN §10)",
+      "disposition": "fixed",
+      "detail": "Dieser Commit schliesst W6b: Demo aufgezeichnet, Audit-Bericht committet, Release-Gate gruen."
+    },
+    {
+      "item": "Abwesenheit nie als Wissen: CALLERS_EMPTY (CLAUDE.md Regel 7)",
+      "disposition": "fixed",
+      "detail": "F1-Fix: CALLERS_EMPTY auf Index-Attribution umgestellt (\"No caller of this symbol appears in what the index resolved.\"), Header-Notiz mit Audit-Beweis, Eigenschafts-Unit-Test; verwandte impact-strings-Saetze als Folge-Kandidat dokumentiert."
+    }
+  ],
+  "structuralFindingsAccepted": [
+    {
+      "item": "Befund 10: Scaffold-Tests als Aktenpruefer",
+      "detail": "Gegengewichte: gate:release faehrt beide Suiten und eval:check selbst; W6a fuhr die Gesamtstrecke live; jede Phase hat ihren Playwright-Beweislauf. Die Aktenform bleibt bewusst: sie macht die Abnahme im Fresh-Clone ohne Server reproduzierbar."
+    },
+    {
+      "item": "Befund 15: Fresh-Clone mit Arbeitsbaum-Overlay",
+      "detail": "Deklariert im Artefakt; der unabhaengige Audit-Lauf am reinen Commit 2c3562f schliesst die Luecke (73/73, 1367/1367, build ok)."
+    }
+  ],
+  "findingFixVerification": {
+    "unitAfterFixes": "1410/1410",
+    "fullWalkAfterFixes": "37 Halte, 30 Bilder, 0 Ueberlagerungen, 0 Beschneidungen, 7 Bereiche durchgescrollt, 0 outbound bei 189 Stichproben",
+    "evalCheck": {
+      "classA": {
+        "model": "Qwen3.5-2B",
+        "passRate": 0.705,
+        "recorded": 0.682,
+        "citation": 0.909
+      },
+      "classB": {
+        "model": "gemma-4-E4B",
+        "passRate": 0.841,
+        "recorded": 0.841,
+        "citation": 1.0
+      },
+      "pass": true
+    }
+  },
+  "reAudits": [
+    {
+      "id": "corrected-release-candidate-b7801f1",
+      "auditDate": "2026-08-31",
+      "auditedCommit": "b7801f187c50b144e12c3737fdc5466f5b3b50db",
+      "commitSubject": "Release blockers: close W12 W14 W15 and proof gaps",
+      "isolatedDetachedWorktree": true,
+      "decision": {
+        "readyForFinalCleanGate": true,
+        "releaseBlockers": 0,
+        "newProductOrCodeBlocker": false,
+        "note": "Alle sechs vorigen Blocker sind geschlossen. Das alte Release-/Eval-Proof-Paar ist der ausdruecklich ausstehende letzte Gate-Schritt und kein Produktblocker."
+      },
+      "previousBlockers": [
+        {
+          "id": "ordinary-chat-auto-completion",
+          "status": "closed",
+          "source": [
+            "src/App.tsx:3325-3357",
+            "src/chat/AtlasChatPanel.tsx:405-420"
+          ],
+          "runtime": {
+            "completionRequests": 0,
+            "status": "answered",
+            "cards": 6,
+            "citations": 6,
+            "builtProvenanceVisible": true,
+            "aiProvenanceVisible": false,
+            "aiButtonVisible": true
+          }
+        },
+        {
+          "id": "router-id-and-immediate-probe",
+          "status": "closed",
+          "source": [
+            "src/App.tsx:3122-3132",
+            "src/App.tsx:3184-3193",
+            "src/chat/AtlasChatPanel.tsx:298-308",
+            "src/twin/TwinPanel.tsx:1609-1623",
+            "src/pseudocode/FlowOverlay.tsx:164-174"
+          ],
+          "runtime": {
+            "selectedRouterId": "models/independent-router-b.gguf",
+            "immediateProbeId": "models/independent-router-b.gguf",
+            "visibleModelName": "independent-router-b",
+            "chat": {
+              "requests": 1,
+              "models": ["models/independent-router-b.gguf"],
+              "provenanceMatches": true
+            },
+            "twin": {
+              "requests": 1,
+              "models": ["models/independent-router-b.gguf"],
+              "provenanceMatches": true
+            },
+            "flow": {
+              "requests": 1,
+              "models": ["models/independent-router-b.gguf"],
+              "provenanceMatches": true
+            }
+          }
+        },
+        {
+          "id": "w12-real-mouse-effect",
+          "status": "closed",
+          "source": [
+            "tools/smoke-w12.mjs:4254-4286",
+            "tools/smoke-w12.mjs:4321-4324",
+            "verification/w12/buttons.json"
+          ],
+          "raw": {
+            "controls": 246,
+            "enabled": 244,
+            "enabledWithMouseChanged": 244,
+            "enabledWithoutMouseChanged": 0,
+            "splitters": 4,
+            "splitterRoute": "drag",
+            "readerRangeRoute": "range position",
+            "entryInputRoute": "mouse focus"
+          }
+        },
+        {
+          "id": "w12-replay-freshness",
+          "status": "closed",
+          "source": [
+            "tools/smoke-w12.mjs:3181-3213",
+            "verification/w12/buttons.json"
+          ],
+          "raw": {
+            "agentStates": ["agents-live", "agents-fullscreen"],
+            "eventsPerFreshSource": 73,
+            "emittedBeforeAdvance": 0,
+            "advance": {
+              "emitted": 73,
+              "total": 73,
+              "remaining": 0
+            },
+            "actors": {
+              "total": 9,
+              "foreign": 8,
+              "you": 1
+            },
+            "rounds": [
+              {
+                "n": 4,
+                "complete": true,
+                "states": 22,
+                "filters": 30,
+                "findings": 0,
+                "durationMs": 1064729
+              },
+              {
+                "n": 5,
+                "complete": true,
+                "states": 22,
+                "filters": 30,
+                "findings": 0,
+                "durationMs": 1063145
+              }
+            ]
+          }
+        },
+        {
+          "id": "w14-leaf-honesty",
+          "status": "closed",
+          "source": [
+            "src/twin/render-model.ts:739-745",
+            "src/twin/render-model.ts:753-774",
+            "src/twin/strings.ts:728-729",
+            "src/i18n/messages.ts:185-190",
+            "verification/w14/symbols.json"
+          ],
+          "raw": {
+            "leavesMeasured": ["query", "toUser", "insert"],
+            "queryAndInsertLevelsNamingRows": 10,
+            "contradictoryLevels": 0,
+            "helpExplainsBuiltCardsAndExplicitAi": true,
+            "committedImageBlobs": {
+              "verification/w14/leaf-vibe.png": "18dddd9c0a623312baddfba6625b44d5ed4bb056",
+              "verification/w14/leaf-junior.png": "89f4f5dd0772451eca557d5376cd840b955f3dbd",
+              "verification/w14/flow-empty.png": "a0d694bdde1541fe3e38a2888a6f537a7f94e251"
+            },
+            "imageSize": "1680x1050",
+            "visibleTooltipsInLeafShots": 0
+          }
+        },
+        {
+          "id": "citation-denominator-and-proof-binding",
+          "status": "closed-in-code-final-artifacts-pending",
+          "source": [
+            "tools/lib/eval-citation-summary.mjs:8-15",
+            "tools/eval-check.mjs:382-396",
+            "tools/release-gate.mjs:204-208",
+            "tools/release-gate.mjs:791-802",
+            "tools/release-gate.mjs:547-550"
+          ],
+          "syntheticCounterexample": {
+            "inputs": "one measured pass, one measured fail, one unmeasured",
+            "citationCompliance": 0.5,
+            "citationMeasured": 2,
+            "citationUnmeasured": 1
+          },
+          "generatedProofFiles": [
+            "verification/w6/evalcheck.json",
+            "verification/w6/release.json"
+          ],
+          "plannedCommitSubjectsPresentExactly": [
+            "Release blockers: close W12 W14 W15 and proof gaps",
+            "Audit: verify corrected release candidate"
+          ]
+        }
+      ],
+      "agentHud": {
+        "status": "closed",
+        "source": [
+          "src/agents/AgentsHud.tsx:465-472",
+          "src/styles/terminal.css:5889-5897",
+          "src/styles/terminal.css:5935-5940",
+          "src/styles/terminal.css:5969-5978"
+        ],
+        "adversarialBrowser": {
+          "rootWidth": 320,
+          "orderClientWidth": 89,
+          "orderScrollWidth": 265,
+          "overflow": "hidden",
+          "textOverflow": "ellipsis",
+          "whiteSpace": "nowrap",
+          "withinRoot": true,
+          "withinRow": true
+        },
+        "secondaryCleanRuntime": {
+          "text": "230880 events missed",
+          "clientWidth": 83,
+          "scrollWidth": 120,
+          "insideRow": true
+        }
+      },
+      "ownRuns": {
+        "node": "v24.9.0",
+        "targetedScaffold": "11/11",
+        "targetedUnit": "188/188 in 7 files",
+        "fullUnit": "2024/2024 in 117 files",
+        "build": "pass; 1609 modules; 5.64 s",
+        "fullScaffoldBeforeFinalProof": "209/213",
+        "expectedFinalProofFailures": 4,
+        "scaffoldWithoutFinalProofTests": "203/203",
+        "diffCheck": "clean"
+      },
+      "expectedFinalGateStep": {
+        "required": true,
+        "currentReleaseSourceHead": "1be92929a2a58f780e38eb8cd442e7cd5f46d365",
+        "currentEvalcheckSha256": "757c2197b71e434ad4de699de6062b5152794107080e90db9645b95de668a32b",
+        "currentArtifactsHaveNewBinding": false,
+        "currentArtifactsHaveCitationDenominators": false,
+        "classification": "expected pending release-proof regeneration, not a code blocker",
+        "requiredAuditCommitSubject": "Audit: verify corrected release candidate"
+      },
+      "cleanup": {
+        "ownedPorts": [4900, 4901],
+        "listenersAfter": [0, 0],
+        "consoleErrors": 0,
+        "pageErrors": 0,
+        "cloudRequests": 0,
+        "userSidecarTouched": false,
+        "staged": false,
+        "committed": false
+      },
+      "findings": {
+        "releaseBlockers": [],
+        "medium": [],
+        "low": [],
+        "notProvable": []
+      }
+    }
+  ]
+}
