@@ -9,6 +9,14 @@ LANG="${2:?}"
 REPO="${3:?}"
 RESULTS_DIR="${4:?}"
 
+# The index must run against a daemon rendezvous and cache this run owns: only
+# CBM_RUNTIME_DIR moves the rendezvous, and without a private cache the
+# benchmark repository was indexed into the operator's live store (#1696).
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+
 # Resolve symlinks
 REPO=$(cd "$REPO" && pwd -P)
 
@@ -33,6 +41,16 @@ LOC=$(find "$REPO" -type f \
 echo "$FILE_COUNT" > "$OUT/file-count.txt"
 echo "$LOC" > "$OUT/loc.txt"
 
+# Start the private daemon before timing so index-time.txt measures the index
+# alone. setup-time.txt keeps the activation cost attributable and
+# total-time.txt is their sum — the figure comparable with earlier runs, which
+# paid activation inside the index timing whenever no daemon was already warm.
+SETUP_START_MS=$(python3 -c "import time; print(int(time.time()*1000))")
+if ! "$BINARY" daemon start >/dev/null 2>&1; then
+  echo "  $LANG: private daemon did not start" >&2
+  exit 1
+fi
+
 # Index via CLI and capture timing
 START_MS=$(python3 -c "import time; print(int(time.time()*1000))")
 
@@ -43,6 +61,8 @@ ELAPSED=$((END_MS - START_MS))
 
 echo "$INDEX_JSON" > "$OUT/00-index.json"
 echo "$ELAPSED" > "$OUT/index-time.txt"
+echo "$((START_MS - SETUP_START_MS))" > "$OUT/setup-time.txt"
+echo "$((END_MS - SETUP_START_MS))" > "$OUT/total-time.txt"
 
 # Extract node/edge counts (CLI wraps in MCP content envelope)
 NODES=$(echo "$INDEX_JSON" | python3 -c "
