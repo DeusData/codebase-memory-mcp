@@ -12,6 +12,9 @@
 #include <stdatomic.h>
 #include <stdlib.h>
 #include <unistd.h>
+#ifndef _WIN32
+#include <sys/stat.h> /* chmod for the symlink-policy mode legs */
+#endif
 
 #ifdef __linux__
 /* Linux-only cgroup tests need stdio for FILE*, stdlib for mkdtemp,
@@ -75,6 +78,375 @@ TEST(platform_file_apis_survive_max_path_overflow) {
     }
     (void)cbm_rmdir(base);
     PASS();
+}
+
+/* A directory reached through a symlink the invoking account owns is that
+ * account's own arrangement ONLY where the caller says so. The plain walk
+ * (cbm_mkdir_p) keeps refusing such a link: it is what repository-derived
+ * paths use, where a user-owned link can be a checked-in file. A caller that
+ * opts in with CBM_MKDIR_FOLLOW_OWNED -- paths rooted in HOME, XDG or the
+ * cache, the dotfile-manager shape ~/.config/opencode -> /mnt/... -- walks
+ * through it and creates the missing tail INSIDE the target. Even opted in, a
+ * dangling link or a link to a regular file fails closed with nothing created
+ * on either side. */
+TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-ownlink-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char target[CBM_SZ_1K];
+    char link[CBM_SZ_1K];
+    char through_link[CBM_SZ_1K];
+    char child[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+    (void)snprintf(target, sizeof(target), "%s/target", base);
+    (void)snprintf(link, sizeof(link), "%s/link", base);
+    (void)snprintf(through_link, sizeof(through_link), "%s/child/grandchild", link);
+    (void)snprintf(child, sizeof(child), "%s/child", target);
+    (void)snprintf(created, sizeof(created), "%s/child/grandchild", target);
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_EQ(symlink(target, link), 0);
+
+    /* "Own" means owned by the invoking account. Root owns everything it
+     * creates and root-owned links are trusted by BOTH walks, so under euid 0
+     * the link is given to a non-root account to keep the contrast real: then
+     * the plain walk refuses it, and so does the opted-in walk, because a
+     * privileged walk never follows a user's link. */
+    bool privileged = geteuid() == 0;
+    enum { LINK_OWNER_UID = 65533 };
+    if (privileged) {
+        ASSERT_EQ(lchown(link, LINK_OWNER_UID, LINK_OWNER_UID), 0);
+    }
+
+    /* The plain walk refuses the user-owned link and creates nothing. */
+    ASSERT_FALSE(cbm_mkdir_p(through_link, 0700));
+    ASSERT_FALSE(cbm_is_dir(child));
+
+    if (privileged) {
+        ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_FALSE(cbm_is_dir(child));
+        /* Root-owned again: infrastructure, followed by both walks as always. */
+        ASSERT_EQ(lchown(link, 0, 0), 0);
+        ASSERT_TRUE(cbm_mkdir_p(through_link, 0700));
+        ASSERT_TRUE(cbm_is_dir(created));
+    } else {
+        /* The opted-in walk follows it into the target. */
+        ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(created));
+    }
+
+    char dangling[CBM_SZ_1K];
+    char through_dangling[CBM_SZ_1K];
+    char dangling_target[CBM_SZ_1K];
+    (void)snprintf(dangling, sizeof(dangling), "%s/dangling", base);
+    (void)snprintf(through_dangling, sizeof(through_dangling), "%s/child", dangling);
+    (void)snprintf(dangling_target, sizeof(dangling_target), "%s/missing", base);
+    ASSERT_EQ(symlink("missing", dangling), 0);
+    ASSERT_FALSE(cbm_mkdir_p_ex(through_dangling, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_FALSE(cbm_is_dir(dangling_target));
+
+    /* An own link to a regular FILE is not a directory to walk into: refused,
+     * and the file it points at is left exactly as it was. */
+    char file_target[CBM_SZ_1K];
+    char file_link[CBM_SZ_1K];
+    char through_file_link[CBM_SZ_1K];
+    (void)snprintf(file_target, sizeof(file_target), "%s/file", base);
+    (void)snprintf(file_link, sizeof(file_link), "%s/file-link", base);
+    (void)snprintf(through_file_link, sizeof(through_file_link), "%s/child", file_link);
+    FILE *file = cbm_fopen(file_target, "wb");
+    ASSERT_NOT_NULL(file);
+    ASSERT_GTE(fputs("data\n", file), 0);
+    ASSERT_EQ(fclose(file), 0);
+    ASSERT_EQ(symlink(file_target, file_link), 0);
+    ASSERT_FALSE(cbm_mkdir_p_ex(through_file_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_FALSE(cbm_is_dir(file_target));
+    ASSERT_EQ(cbm_file_size(file_target), 5);
+
+    ASSERT_EQ(cbm_unlink(file_link), 0);
+    ASSERT_EQ(cbm_unlink(file_target), 0);
+    ASSERT_EQ(cbm_unlink(dangling), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_rmdir(child), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
+/* A followed link is resolved from its own text, so the text has to be
+ * resolved the way the kernel resolves it: a relative text against the link's
+ * directory (never the process's working directory), an absolute text as is,
+ * and links inside the text followed in turn. The test changes into an
+ * unrelated directory first so a CWD-relative resolution would miss. */
+TEST(platform_mkdir_p_resolves_link_text_from_the_link_directory) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-linktext-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+    char elsewhere[CBM_SZ_1K];
+    char target[CBM_SZ_1K];
+    char nested[CBM_SZ_1K];
+    (void)snprintf(elsewhere, sizeof(elsewhere), "%s/elsewhere", base);
+    (void)snprintf(target, sizeof(target), "%s/dir/target", base);
+    (void)snprintf(nested, sizeof(nested), "%s/dir/nested", base);
+    ASSERT_TRUE(cbm_mkdir_p(elsewhere, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(nested, 0700));
+
+    char saved_cwd[CBM_SZ_1K];
+    ASSERT_NOT_NULL(getcwd(saved_cwd, sizeof(saved_cwd)));
+    ASSERT_EQ(chdir(elsewhere), 0);
+
+    /* relative text, sibling: dir/relative -> target */
+    char link[CBM_SZ_1K];
+    char through[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+    (void)snprintf(link, sizeof(link), "%s/dir/relative", base);
+    ASSERT_EQ(symlink("target", link), 0);
+    (void)snprintf(through, sizeof(through), "%s/child-relative", link);
+    (void)snprintf(created, sizeof(created), "%s/child-relative", target);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+
+    /* relative text through the parent: dir/nested/up -> ../target */
+    (void)snprintf(link, sizeof(link), "%s/up", nested);
+    ASSERT_EQ(symlink("../target", link), 0);
+    (void)snprintf(through, sizeof(through), "%s/child-up", link);
+    (void)snprintf(created, sizeof(created), "%s/child-up", target);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+
+    /* absolute text, and a chain whose text names another link */
+    (void)snprintf(link, sizeof(link), "%s/absolute", base);
+    ASSERT_EQ(symlink(target, link), 0);
+    char chain[CBM_SZ_1K];
+    (void)snprintf(chain, sizeof(chain), "%s/chain", base);
+    ASSERT_EQ(symlink("absolute", chain), 0);
+    (void)snprintf(through, sizeof(through), "%s/child-chain", chain);
+    (void)snprintf(created, sizeof(created), "%s/child-chain", target);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(cbm_rmdir(created), 0);
+    ASSERT_EQ(cbm_unlink(chain), 0);
+    ASSERT_EQ(cbm_unlink(link), 0);
+
+    ASSERT_EQ(chdir(saved_cwd), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(nested), 0);
+    char *slash = strrchr(target, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(target), 0); /* dir */
+    ASSERT_EQ(cbm_rmdir(elsewhere), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
+/* The trust an opted-in walk extends to a symlink is bounded on BOTH ends of
+ * the link. What the follow lands on must be a directory owned by root or the
+ * invoking user and not world-writable unless sticky; the mode legs bind on
+ * every run. Two more legs need root, because a non-root process cannot give
+ * a file away: a target owned by another account is refused even behind a
+ * root-owned link, and a link owned by a non-root account is refused when the
+ * walk itself runs as root, so a privileged install never follows a user's
+ * link. Each refusal is followed by restoring the state and walking again,
+ * which pins that state as the reason for the refusal. */
+TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-linkowner-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    char target[CBM_SZ_1K];
+    char link[CBM_SZ_1K];
+    (void)snprintf(target, sizeof(target), "%s/target", base);
+    (void)snprintf(link, sizeof(link), "%s/link", base);
+    ASSERT_TRUE(cbm_mkdir_p(target, 0700));
+    ASSERT_EQ(symlink(target, link), 0);
+
+    static const char *const children[] = {"control",   "world-writable", "sticky",
+                                           "private",   "foreign-target", "target-restored",
+                                           "user-link", "link-restored"};
+    enum {
+        CHILD_CONTROL,
+        CHILD_WORLD_WRITABLE,
+        CHILD_STICKY,
+        CHILD_PRIVATE,
+        CHILD_FOREIGN_TARGET,
+        CHILD_TARGET_RESTORED,
+        CHILD_USER_LINK,
+        CHILD_LINK_RESTORED
+    };
+    char through_link[CBM_SZ_1K];
+    char created[CBM_SZ_1K];
+#define LINKOWNER_PATHS(index)                                                              \
+    do {                                                                                    \
+        (void)snprintf(through_link, sizeof(through_link), "%s/%s", link, children[index]); \
+        (void)snprintf(created, sizeof(created), "%s/%s", target, children[index]);         \
+    } while (0)
+
+    LINKOWNER_PATHS(CHILD_CONTROL);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+
+    /* World-writable target without the sticky bit: anyone could pre-plant
+     * entries in it, so it is refused. Sticky (the /tmp shape) is fine, and
+     * so is an ordinary private directory. */
+    ASSERT_EQ(chmod(target, 0777), 0);
+    LINKOWNER_PATHS(CHILD_WORLD_WRITABLE);
+    ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_FALSE(cbm_is_dir(created));
+    ASSERT_EQ(chmod(target, 01777), 0);
+    LINKOWNER_PATHS(CHILD_STICKY);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+    ASSERT_EQ(chmod(target, 0755), 0);
+    LINKOWNER_PATHS(CHILD_PRIVATE);
+    ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(created));
+
+    if (geteuid() == 0) {
+        enum { FOREIGN_UID = 65534, USER_UID = 65533 };
+
+        /* Root-owned link, target owned by another account: refused. */
+        ASSERT_EQ(chown(target, FOREIGN_UID, FOREIGN_UID), 0);
+        LINKOWNER_PATHS(CHILD_FOREIGN_TARGET);
+        ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_FALSE(cbm_is_dir(created));
+        ASSERT_EQ(chown(target, 0, 0), 0);
+        LINKOWNER_PATHS(CHILD_TARGET_RESTORED);
+        ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(created));
+
+        /* Link AND target owned by a non-root account -- the shape of a
+         * privileged install into that account's home -- walked as root:
+         * refused even when opted in, because root trusts only root-owned
+         * links. */
+        ASSERT_EQ(lchown(link, USER_UID, USER_UID), 0);
+        ASSERT_EQ(chown(target, USER_UID, USER_UID), 0);
+        LINKOWNER_PATHS(CHILD_USER_LINK);
+        ASSERT_FALSE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_FALSE(cbm_is_dir(created));
+        ASSERT_EQ(lchown(link, 0, 0), 0);
+        ASSERT_EQ(chown(target, 0, 0), 0);
+        LINKOWNER_PATHS(CHILD_LINK_RESTORED);
+        ASSERT_TRUE(cbm_mkdir_p_ex(through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(created));
+    }
+#undef LINKOWNER_PATHS
+
+    for (size_t index = 0; index < sizeof(children) / sizeof(children[0]); index++) {
+        (void)snprintf(created, sizeof(created), "%s/%s", target, children[index]);
+        if (cbm_is_dir(created)) {
+            ASSERT_EQ(cbm_rmdir(created), 0);
+        }
+    }
+    ASSERT_EQ(cbm_unlink(link), 0);
+    ASSERT_EQ(cbm_rmdir(target), 0);
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
+}
+
+/* The policy is per CALL SITE, not per path. The same user-owned link is
+ * followed by the opted-in walk a configuration root uses and refused by the
+ * plain walk a checkout uses: `~/.claude -> ~/dotfiles/claude` works for the
+ * installer, while a repository that ships `.codebase-memory -> <a directory
+ * the user owns>` cannot redirect the artifact writer. Under euid 0 the
+ * checked-in link is demoted to a non-root owner, since root-owned links are
+ * trusted by both walks and a privileged walk never follows a user's link. */
+TEST(platform_mkdir_p_follow_owned_is_per_call_site) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink ownership contract");
+#else
+    char base[CBM_SZ_512];
+    int written = snprintf(base, sizeof(base), "/tmp/cbm-linksite-XXXXXX");
+    ASSERT_TRUE(written > 0 && written < (int)sizeof(base));
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+
+    /* The dotfile-manager shape under a home directory. */
+    char dotfiles[CBM_SZ_1K];
+    char claude_link[CBM_SZ_1K];
+    char agents_through_link[CBM_SZ_1K];
+    char agents_in_dotfiles[CBM_SZ_1K];
+    (void)snprintf(dotfiles, sizeof(dotfiles), "%s/home/dotfiles/claude", base);
+    (void)snprintf(claude_link, sizeof(claude_link), "%s/home/.claude", base);
+    (void)snprintf(agents_through_link, sizeof(agents_through_link), "%s/agents", claude_link);
+    (void)snprintf(agents_in_dotfiles, sizeof(agents_in_dotfiles), "%s/agents", dotfiles);
+    ASSERT_TRUE(cbm_mkdir_p(dotfiles, 0700));
+    ASSERT_EQ(symlink(dotfiles, claude_link), 0);
+    ASSERT_TRUE(cbm_mkdir_p_ex(agents_through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+    ASSERT_TRUE(cbm_is_dir(agents_in_dotfiles));
+
+    /* A checked-in link inside a repository, pointing at a directory the
+     * same user owns: the plain walk refuses it and creates nothing behind
+     * it. The identical link IS followed once opted in, so the refusal comes
+     * from the call site's policy and nothing else. */
+    char outside[CBM_SZ_1K];
+    char artifact_link[CBM_SZ_1K];
+    char artifacts_through_link[CBM_SZ_1K];
+    char artifacts_outside[CBM_SZ_1K];
+    (void)snprintf(outside, sizeof(outside), "%s/outside", base);
+    (void)snprintf(artifact_link, sizeof(artifact_link), "%s/repo/.codebase-memory", base);
+    (void)snprintf(artifacts_through_link, sizeof(artifacts_through_link), "%s/artifacts",
+                   artifact_link);
+    (void)snprintf(artifacts_outside, sizeof(artifacts_outside), "%s/artifacts", outside);
+    char repo[CBM_SZ_1K];
+    (void)snprintf(repo, sizeof(repo), "%s/repo", base);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0700));
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0700));
+    ASSERT_EQ(symlink(outside, artifact_link), 0);
+    /* Git creates the checked-in link owned by whoever cloned. A root run
+     * must model that account as non-root: root-owned links are trusted
+     * infrastructure for both walks, which is the pre-existing contract. */
+    bool privileged = geteuid() == 0;
+    enum { CLONING_UID = 65533 };
+    if (privileged) {
+        ASSERT_EQ(lchown(artifact_link, CLONING_UID, CLONING_UID), 0);
+    }
+    ASSERT_FALSE(cbm_mkdir_p(artifacts_through_link, 0700));
+    ASSERT_FALSE(cbm_is_dir(artifacts_outside));
+    if (!privileged) {
+        /* Same link, opted in: followed. Not under euid 0, where a privileged
+         * walk never follows a user's link whatever the call site says. */
+        ASSERT_TRUE(cbm_mkdir_p_ex(artifacts_through_link, 0700, CBM_MKDIR_FOLLOW_OWNED));
+        ASSERT_TRUE(cbm_is_dir(artifacts_outside));
+        ASSERT_EQ(cbm_rmdir(artifacts_outside), 0);
+    }
+
+    ASSERT_EQ(cbm_unlink(artifact_link), 0);
+    ASSERT_EQ(cbm_rmdir(repo), 0);
+    ASSERT_EQ(cbm_rmdir(outside), 0);
+    ASSERT_EQ(cbm_rmdir(agents_in_dotfiles), 0);
+    ASSERT_EQ(cbm_unlink(claude_link), 0);
+    ASSERT_EQ(cbm_rmdir(dotfiles), 0);
+    char *slash = strrchr(dotfiles, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(dotfiles), 0); /* home/dotfiles */
+    slash = strrchr(dotfiles, '/');
+    ASSERT_NOT_NULL(slash);
+    *slash = '\0';
+    ASSERT_EQ(cbm_rmdir(dotfiles), 0); /* home */
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+#endif
 }
 
 TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
@@ -758,6 +1130,10 @@ TEST(cgroup_no_mem_files) {
 
 SUITE(platform) {
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
+    RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
+    RUN_TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode);
+    RUN_TEST(platform_mkdir_p_follow_owned_is_per_call_site);
+    RUN_TEST(platform_mkdir_p_resolves_link_text_from_the_link_directory);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
     RUN_TEST(platform_mkdtemp_is_thread_safe);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);

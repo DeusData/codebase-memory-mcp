@@ -5245,12 +5245,157 @@ TEST(daemon_application_default_limit_admits_four_and_rejects_fifth) {
     ASSERT_EQ(atomic_load(&fake.starts), DEFAULT_CAP_RUNNING);
     ASSERT_EQ(atomic_load(&fake.cancels), DEFAULT_CAP_RUNNING);
     ASSERT_EQ(atomic_load(&fake.destroys), DEFAULT_CAP_RUNNING);
-    size_t assigned_budget = 0;
+    /* Decision 2 (#1997 #832): each worker's slice is the aggregate divided by
+     * the jobs active when IT was spawned. Four requests race through
+     * admission, so which divisor each saw is scheduling-dependent — but every
+     * slice is one of aggregate/1..4 and never exceeds the aggregate. */
     for (int i = 0; i < DEFAULT_CAP_RUNNING; i++) {
-        ASSERT_EQ(fake.memory_budgets[i], aggregate_budget / DEFAULT_CAP_RUNNING);
-        assigned_budget += fake.memory_budgets[i];
+        bool valid_slice = false;
+        for (size_t divisor = 1; divisor <= DEFAULT_CAP_RUNNING; divisor++) {
+            valid_slice = valid_slice || fake.memory_budgets[i] == aggregate_budget / divisor;
+        }
+        ASSERT_TRUE(valid_slice);
+        ASSERT_TRUE(fake.memory_budgets[i] <= aggregate_budget);
     }
-    ASSERT_TRUE(assigned_budget <= aggregate_budget);
+    PASS();
+}
+
+/* Decision 2 (#1997 #832): the worker slice is aggregate / jobs ACTIVE at
+ * spawn time. Sequenced admission makes the divisor deterministic: the first
+ * job spawns alone and receives the whole aggregate; the second spawns while
+ * the first still runs and receives half. */
+TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs) {
+    const size_t aggregate_budget = 4099;
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {
+        .worker_ops = &worker_ops,
+        .aggregate_memory_budget_bytes = aggregate_budget,
+    };
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    char roots[2][APP_TEST_PATH_CAP];
+    bool roots_ok = true;
+    for (int i = 0; i < 2; i++) {
+        (void)snprintf(roots[i], sizeof(roots[i]), "%s/cbm-app-slice-%d-XXXXXX", cbm_tmpdir(), i);
+        roots_ok = roots_ok && cbm_mkdtemp(roots[i]) != NULL;
+    }
+    app_index_thread_t requests[2] = {
+        {.application = application, .project = "slice-first", .root = roots[0], .result = -1},
+        {.application = application, .project = "slice-second", .root = roots[1], .result = -1},
+    };
+    cbm_thread_t threads[2];
+    bool first_started = application && roots_ok &&
+                         cbm_thread_create(&threads[0], 0, app_index_thread, &requests[0]) == 0;
+    bool first_spawned = first_started && app_wait_for_atomic_int(&fake.starts, 1);
+    bool second_started =
+        first_spawned && cbm_thread_create(&threads[1], 0, app_index_thread, &requests[1]) == 0;
+    bool second_spawned = second_started && app_wait_for_atomic_int(&fake.starts, 2);
+    atomic_store(&fake.allow_completion, true);
+    if (first_started) {
+        (void)cbm_thread_join(&threads[0]);
+    }
+    if (second_started) {
+        (void)cbm_thread_join(&threads[1]);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    for (int i = 0; i < 2; i++) {
+        (void)cbm_rmdir(roots[i]);
+    }
+
+    ASSERT_TRUE(roots_ok);
+    ASSERT_TRUE(first_spawned);
+    ASSERT_TRUE(second_spawned);
+    ASSERT_EQ(requests[0].result, 0);
+    ASSERT_EQ(requests[1].result, 0);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(fake.memory_budgets[0], aggregate_budget);
+    ASSERT_EQ(fake.memory_budgets[1], aggregate_budget / 2);
+    PASS();
+}
+
+/* Decision A (#1997 #832): the over-budget verdict travels as a CLEAN worker
+ * exit carrying an error response. The daemon passes that response through
+ * verbatim on the first attempt — no crash/hang recovery loop, no quarantine
+ * of innocent files — because a healthy process reported an honest failure. */
+TEST(daemon_application_over_budget_response_passes_through_without_recovery) {
+    static const char over_budget_response[] =
+        "{\"content\":[{\"type\":\"text\",\"text\":\"{\\\"project\\\":\\\"budget\\\","
+        "\\\"status\\\":\\\"error\\\",\\\"reason\\\":\\\"over_memory_budget\\\","
+        "\\\"previous_index\\\":\\\"preserved\\\"}\"}],\"isError\":true}";
+    app_fake_worker_context_t fake;
+    app_fake_worker_context_init(&fake);
+    atomic_store(&fake.scripted, true);
+    fake.outcomes[0] = CBM_PROC_CLEAN;
+    fake.responses[0] = over_budget_response;
+    fake.outcomes[1] = CBM_PROC_CLEAN; /* a second start would be the recovery loop */
+    cbm_daemon_application_worker_ops_t worker_ops = {
+        .context = &fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &worker_ops};
+    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
+    cbm_daemon_runtime_application_callbacks_t callbacks =
+        cbm_daemon_application_runtime_callbacks(application);
+    cbm_daemon_runtime_application_session_t *session =
+        application ? app_test_open(&callbacks, 71) : NULL;
+    char root[APP_TEST_PATH_CAP];
+    snprintf(root, sizeof(root), "%s/cbm-app-over-budget-XXXXXX", cbm_tmpdir());
+    bool root_ok = cbm_mkdtemp(root) != NULL;
+    uint8_t *context = NULL;
+    uint32_t context_length = 0;
+    char args[APP_TEST_PATH_CAP + 32];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", root);
+    uint8_t *tool = NULL;
+    uint32_t tool_length = 0;
+    bool setup = application && session && root_ok &&
+                 app_test_context_request(root, root, &context, &context_length) &&
+                 app_test_tool_request("index_repository", args, &tool, &tool_length);
+    uint8_t *response = NULL;
+    uint32_t response_length = 0;
+    if (setup) {
+        setup = app_test_request(&callbacks, session, context, context_length, &response,
+                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+        free(response);
+        response = NULL;
+        response_length = 0;
+    }
+    cbm_daemon_runtime_application_status_t status =
+        setup
+            ? app_test_request(&callbacks, session, tool, tool_length, &response, &response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    bool passed_through = response && response_length > 0 &&
+                          strstr((char *)response, "over_memory_budget") != NULL &&
+                          strstr((char *)response, "\"isError\":true") != NULL;
+    free(response);
+    free(context);
+    free(tool);
+    if (session) {
+        callbacks.session_cancel(callbacks.context, session);
+        callbacks.session_close(callbacks.context, session);
+    }
+    bool stopped = application && cbm_daemon_application_shutdown(application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(application);
+    (void)cbm_rmdir(root);
+
+    ASSERT_TRUE(setup);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(passed_through);
+    ASSERT_EQ(atomic_load(&fake.starts), 1);
+    ASSERT_EQ(atomic_load(&fake.destroys), 1);
+    ASSERT_TRUE(stopped);
     PASS();
 }
 
@@ -5458,6 +5603,8 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_thread_start_failure_rolls_back_job_reservation);
     RUN_TEST(daemon_application_queues_explicit_index_behind_physical_job_limit);
     RUN_TEST(daemon_application_default_limit_admits_four_and_rejects_fifth);
+    RUN_TEST(daemon_application_worker_slice_is_aggregate_over_active_jobs);
+    RUN_TEST(daemon_application_over_budget_response_passes_through_without_recovery);
     RUN_TEST(daemon_application_free_reports_retained_live_ownership);
     RUN_TEST(daemon_application_rejects_clean_exit_when_process_tree_is_not_contained);
 }

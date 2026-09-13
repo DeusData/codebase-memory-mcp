@@ -37,7 +37,9 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/secure_random.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +74,8 @@ static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
 static atomic_bool g_persist_test_fail_adr_capture = false;
 static cbm_pipeline_test_hook_fn g_persist_test_before_final_manifest = NULL;
 static void *g_persist_test_before_final_manifest_userdata = NULL;
+static cbm_pipeline_test_hook_fn g_persist_test_after_stage_created = NULL;
+static void *g_persist_test_after_stage_created_userdata = NULL;
 
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void) {
     atomic_store(&g_persist_test_fail_after_stage_dump, true);
@@ -105,6 +109,29 @@ void cbm_pipeline_persist_test_run_before_final_manifest(void) {
     }
 }
 
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata) {
+    g_persist_test_after_stage_created = hook;
+    g_persist_test_after_stage_created_userdata = userdata;
+}
+
+/* Fired by create_staging_path() right after the stage's main file is created
+ * with O_EXCL -- and, in the current lock-before-visible ordering, after its
+ * sidecar lock is already held. A test hook installed here can run a
+ * concurrent sweep (another cbm_pipeline_run() against the same final_path) at
+ * this instant to prove the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked TOCTOU window, so the same
+ * hook binds RED if that ordering ever regresses. */
+void cbm_pipeline_persist_test_run_after_stage_created(void) {
+    cbm_pipeline_test_hook_fn hook = g_persist_test_after_stage_created;
+    void *userdata = g_persist_test_after_stage_created_userdata;
+    g_persist_test_after_stage_created = NULL;
+    g_persist_test_after_stage_created_userdata = NULL;
+    if (hook) {
+        hook(userdata);
+    }
+}
+
 bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void) {
     return atomic_exchange(&g_persist_test_fail_after_stage_dump, false);
 }
@@ -124,6 +151,8 @@ void cbm_pipeline_persist_test_reset_faults(void) {
     atomic_store(&g_persist_test_fail_adr_capture, false);
     g_persist_test_before_final_manifest = NULL;
     g_persist_test_before_final_manifest_userdata = NULL;
+    g_persist_test_after_stage_created = NULL;
+    g_persist_test_after_stage_created_userdata = NULL;
 }
 #endif
 
@@ -194,6 +223,15 @@ struct cbm_pipeline {
     /* #769: set when a stale-format index was routed through the one-time
      * full rebuild, so the MCP response can surface the migration. */
     bool format_migration;
+
+    /* Recorded by cbm_pipeline_run for the staged run beneath it: whether
+     * the destination existed, and whether it was copied into the stage so
+     * that an incremental route has a real previous generation to work
+     * from. Without a copy the stage is the run's empty placeholder, and
+     * probing THAT for integrity is what reported every first index as
+     * "invalid_existing_db" (#1864). */
+    bool final_existed;
+    bool existing_generation;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -1402,6 +1440,16 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
                                         int baseline_count, bool force_full_on_mismatch) {
+    if (!p->existing_generation) {
+        /* Nothing to be incremental against: a first index, or a
+         * destination that could not be copied (already reported as
+         * backup_failed_full_rebuild). The stage is an empty placeholder,
+         * not a database, so it is not probed -- "invalid_existing_db"
+         * stays reserved for a real copy that fails its integrity check. */
+        cbm_log_info("pipeline.route", "path", "full", "reason",
+                     p->final_existed ? "existing_db_backup_failed" : "no_existing_db");
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
@@ -1530,12 +1578,148 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
 /* Defined below, next to the other publication helpers. */
 static char *create_staging_path(const char *final_path);
 
+/* ── Stage ownership (#1839) ─────────────────────────────────────
+ *
+ * A stage used to be recognisable only by its name: the mkstemp descriptor
+ * was closed at once and nothing marked who was writing it. A worker killed
+ * mid-run (the daemon cancels with SIGTERM then SIGKILL after one second of
+ * grace, which a gigabyte backup or clone never finishes inside) left its
+ * full-size stage behind forever, and no later run could tell a dead stage
+ * from a live one -- so none tried.
+ *
+ * Ownership is now an exclusive kernel lock on the sidecar "<stage>.lock",
+ * held from minting until the stage is discarded or renamed into place. The
+ * kernel releases it on any death, so "can I take this lock?" is exactly
+ * "is this stage dead?" -- no pid, no mtime, no grace period. The lock lives
+ * on a sidecar rather than the stage itself because on macOS an flock on a
+ * file conflicts with SQLite's fcntl byte locks on that same file.
+ *
+ * The stage path is passed around as a plain string through publish and
+ * finalize, so the descriptor is kept in this per-process registry keyed by
+ * path, and released by the same helpers that remove the file. */
+typedef struct stage_owner {
+    char *stage_path;
+    int lock_fd;
+    struct stage_owner *next;
+} stage_owner_t;
+
+static stage_owner_t *g_stage_owners = NULL;
+static atomic_flag g_stage_owners_spin = ATOMIC_FLAG_INIT;
+
+static void stage_owners_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_stage_owners_spin, memory_order_acquire)) {}
+}
+
+static void stage_owners_unlock(void) {
+    atomic_flag_clear_explicit(&g_stage_owners_spin, memory_order_release);
+}
+
+static char *stage_lock_sidecar_path(const char *stage_path) {
+    static const char suffix[] = ".lock";
+    size_t len = strlen(stage_path);
+    if (len > SIZE_MAX - sizeof(suffix)) {
+        return NULL;
+    }
+    char *sidecar = (char *)malloc(len + sizeof(suffix));
+    if (!sidecar) {
+        return NULL;
+    }
+    memcpy(sidecar, stage_path, len);
+    memcpy(sidecar + len, suffix, sizeof(suffix));
+    return sidecar;
+}
+
+int cbm_pipeline_stage_lock_hold(const char *stage_path) {
+    if (!stage_path) {
+        return -1;
+    }
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    if (!sidecar) {
+        return -1;
+    }
+    int fd = cbm_lockfile_open(sidecar, true);
+    free(sidecar);
+    return fd;
+}
+
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd) {
+    if (!stage_path || lock_fd < 0) {
+        return;
+    }
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    /* Close before unlinking: Windows refuses to delete an open file. The
+     * sidecar exists unlocked for that instant, but by every drop the stage
+     * itself is already gone (discarded or renamed), so there is nothing a
+     * sweeper could take from us. */
+    cbm_lockfile_close(lock_fd);
+    if (sidecar) {
+        (void)cbm_unlink(sidecar);
+        free(sidecar);
+    }
+}
+
+/* Record an already-held stage lock in the per-process owner table, keyed by
+ * path so publish/finalize/discard can release it later. On success the table
+ * owns lock_fd; on failure the caller still does and must drop it.
+ *
+ * The lock must ALREADY be held: create_staging_path() takes it before the
+ * stage's main file is created (so the file is never visible on disk without
+ * its lock), then hands the descriptor here. Re-taking the lock in this helper
+ * would self-conflict -- both flock() and Windows _SH_DENYRW deny a second
+ * acquire of the same sidecar even from this same process. */
+static bool stage_owner_adopt(const char *stage_path, int lock_fd) {
+    stage_owner_t *owner = (stage_owner_t *)malloc(sizeof(*owner));
+    char *path_copy = strdup(stage_path);
+    if (!owner || !path_copy) {
+        free(owner);
+        free(path_copy);
+        return false;
+    }
+    owner->stage_path = path_copy;
+    owner->lock_fd = lock_fd;
+    stage_owners_lock();
+    owner->next = g_stage_owners;
+    g_stage_owners = owner;
+    stage_owners_unlock();
+    return true;
+}
+
+/* Release ownership of a stage that no longer exists under this name. A path
+ * this process never registered is a no-op. */
+static void stage_owner_release(const char *stage_path) {
+    if (!stage_path) {
+        return;
+    }
+    stage_owner_t *found = NULL;
+    stage_owners_lock();
+    for (stage_owner_t **link = &g_stage_owners; *link; link = &(*link)->next) {
+        if (strcmp((*link)->stage_path, stage_path) == 0) {
+            found = *link;
+            *link = found->next;
+            break;
+        }
+    }
+    stage_owners_unlock();
+    if (!found) {
+        return;
+    }
+    cbm_pipeline_stage_lock_drop(found->stage_path, found->lock_fd);
+    free(found->stage_path);
+    free(found);
+}
+
+/* Remove a stage's main file and SQLite sidecars, keeping ownership. */
+static void remove_stage_files(const char *stage_path) {
+    (void)cbm_unlink(stage_path);
+    (void)cbm_remove_db_sidecars(stage_path);
+}
+
 static void discard_generation_stage(const char *stage_path) {
     if (!stage_path) {
         return;
     }
-    cbm_unlink(stage_path);
-    cbm_remove_db_sidecars(stage_path);
+    remove_stage_files(stage_path);
+    stage_owner_release(stage_path);
 }
 
 typedef struct {
@@ -1929,6 +2113,7 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
         discard_generation_stage(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
+    stage_owner_release(stage_path);
     cbm_log_info("finalize.timing", "block", "rename", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_fin)));
     return 0;
@@ -1956,7 +2141,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 #endif
     if (last_slash) {
         *last_slash = '\0';
-        cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
+        cbm_mkdir_p_ex(db_dir, CBM_DIR_PERMS, CBM_MKDIR_FOLLOW_OWNED);
     }
 
     cbm_file_hash_t *manifest = NULL;
@@ -2386,8 +2571,8 @@ static void cleanup_staging_db(const char *path) {
     if (!path) {
         return;
     }
-    (void)cbm_unlink(path);
-    (void)cbm_remove_db_sidecars(path);
+    remove_stage_files(path);
+    stage_owner_release(path);
 }
 
 static bool ensure_db_parent(const char *path) {
@@ -2410,9 +2595,53 @@ static bool ensure_db_parent(const char *path) {
         return true;
     }
     *slash = '\0';
-    bool ok = dir[0] == '\0' || cbm_mkdir_p(dir, CBM_DIR_PERMS);
+    bool ok = dir[0] == '\0' || cbm_mkdir_p_ex(dir, CBM_DIR_PERMS, CBM_MKDIR_FOLLOW_OWNED);
     free(dir);
     return ok;
+}
+
+/* Length of the path a stage was minted for: the input itself unless its
+ * basename has exactly the minted shape "<name>.stage.<6 alphanumerics>", in
+ * which case the root is <name>. The outer run rewrites the pipeline's db_path
+ * to its stage, so the inner publication (dump and delta clone) used to mint
+ * ITS stage from that stage: <db>.stage.A.stage.B, with -wal/-shm beside it
+ * (#1839). Minting from the root keeps every generation's stage a sibling of
+ * the live database. Only the exact minted shape is recognised: a database
+ * named "x.stage.y.db" is not a stage and keeps its full name. */
+enum { CBM_STAGE_SUFFIX_RANDOM_CHARS = 6 };
+static const char cbm_stage_marker[] = ".stage.";
+
+static bool stage_suffix_at(const char *tail) {
+    if (strncmp(tail, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
+        return false;
+    }
+    const char *random = tail + sizeof(cbm_stage_marker) - 1;
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        if (!isalnum((unsigned char)random[i])) {
+            return false;
+        }
+    }
+    return random[CBM_STAGE_SUFFIX_RANDOM_CHARS] == '\0';
+}
+
+static size_t stage_root_length(const char *path) {
+    size_t len = strlen(path);
+    const size_t suffix_len = sizeof(cbm_stage_marker) - 1 + CBM_STAGE_SUFFIX_RANDOM_CHARS;
+    if (len <= suffix_len) {
+        return len;
+    }
+    size_t root_len = len - suffix_len;
+    /* The marker must sit inside the basename, never span a separator. */
+    for (size_t i = root_len; i < len; i++) {
+        if (path[i] == '/'
+#ifdef _WIN32
+            || path[i] == '\\'
+#endif
+        ) {
+            return len;
+        }
+    }
+    return stage_suffix_at(path + root_len) ? root_len : len;
 }
 
 static char *create_staging_path(const char *final_path) {
@@ -2420,7 +2649,7 @@ static char *create_staging_path(const char *final_path) {
         return NULL;
     }
     static const char suffix[] = ".stage.XXXXXX";
-    size_t final_len = strlen(final_path);
+    size_t final_len = stage_root_length(final_path);
     if (final_len > SIZE_MAX - sizeof(suffix)) {
         return NULL;
     }
@@ -2440,17 +2669,79 @@ static char *create_staging_path(const char *final_path) {
     }
     memcpy(path, final_path, final_len);
     memcpy(path + final_len, suffix, sizeof(suffix));
-    int fd = cbm_mkstemp(path);
-    if (fd < 0) {
-        free(path);
-        return NULL;
-    }
-#ifdef _WIN32
-    _close(fd);
-#else
-    close(fd);
+    /* The six random chars sit directly after the ".stage." marker; each
+     * attempt overwrites the "XXXXXX" template in place. Alphanumerics only,
+     * matching stage_suffix_at()/stage_entry_stage_length() so the sweep
+     * recognises the minted name and its sidecars. */
+    char *random_at = path + final_len + (sizeof(cbm_stage_marker) - 1);
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    /* Lock BEFORE the stage becomes visible: take the sidecar lock first, then
+     * create the stage's main file with O_EXCL. The main file is therefore
+     * never present on disk without its lock already held, so a concurrent
+     * run's sweep_orphan_stages() against the same final_path can only ever
+     * find this stage lock-held -- it reaches the stage through the .lock
+     * sidecar too (stage_entry_stage_length() matches it), probes the lock,
+     * sees a live holder, and keeps it. That closes the old create->register
+     * window that let a racing sweep delete a live-but-unlocked stage (POSIX)
+     * or collide on the sidecar with EACCES (Windows) -- #2111's windows-guards
+     * red. A pre-lock-era orphan minted by an OLDER binary still carries no
+     * lock, so the sweep's ENOENT path still removes it (#1839 preserved).
+     *
+     * A minted suffix collides with an existing stage only about 1 in 62^6;
+     * retry a bounded number of times, the way mkstemp/mkdtemp do, then fail. */
+    for (int attempt = 0; attempt < 128; attempt++) {
+        unsigned char rnd[CBM_STAGE_SUFFIX_RANDOM_CHARS];
+        if (!cbm_secure_random(rnd, sizeof(rnd))) {
+            free(path);
+            errno = EIO;
+            return NULL;
+        }
+        for (size_t i = 0; i < sizeof(rnd); i++) {
+            random_at[i] = alphabet[rnd[i] % (sizeof(alphabet) - 1)];
+        }
+        errno = 0;
+        int lock_fd = cbm_pipeline_stage_lock_hold(path);
+        if (lock_fd < 0) {
+            /* A live twin already owns this exact suffix's sidecar (EAGAIN /
+             * EACCES), or the sidecar could not be created. Mint a fresh suffix
+             * and try again rather than contend for this one. */
+            continue;
+        }
+        FILE *main_file = cbm_fopen(path, "wbx");
+        if (!main_file) {
+            /* The suffix collided with a lock-less orphan's main file -- its
+             * sidecar was takeable, so it is not a live writer. Never inherit a
+             * stranger's bytes: drop the lock, remove the sidecar we just took,
+             * and mint a fresh suffix. The orphan's main file is left for a
+             * later sweep, which removes it as a pre-lock-era orphan. */
+            cbm_pipeline_stage_lock_drop(path, lock_fd);
+            continue;
+        }
+        (void)fclose(main_file);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        /* Main file now exists and its lock is already held. Under the OLD
+         * create-then-lock ordering this was the unlocked window; the
+         * concurrent-sweep test fires here to prove the stage now survives a
+         * racing sweep, and to bind RED if that ordering ever regresses. */
+        cbm_pipeline_persist_test_run_after_stage_created();
 #endif
-    return path;
+        if (!stage_owner_adopt(path, lock_fd)) {
+            cbm_pipeline_stage_lock_drop(path, lock_fd);
+            (void)cbm_unlink(path);
+            free(path);
+            return NULL;
+        }
+        return path;
+    }
+    /* Every attempt failed to take a lock -- keep the observability the old
+     * stage_owner_register() emitted for a lock failure. */
+    char errno_text[16];
+    (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+    cbm_log_warn("pipeline.stage", "action", "lock_failed", "errno", errno_text, "path", path);
+    free(path);
+    errno = EEXIST;
+    return NULL;
 }
 
 /* A backup-failed destination may still have the only recoverable WAL or
@@ -2554,6 +2845,200 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
     return 0;
 }
 
+/* ── Orphan sweep (#1839) ────────────────────────────────────────
+ *
+ * Nothing on the worker-death path ever cleaned a stage up, so the sweep
+ * runs at the start of every run, before this run mints its own stage. It
+ * considers ONLY names of the exact minted shape for THIS database --
+ * "<basename>.stage.<6 alphanumerics>" plus that stage's -wal/-shm/-journal
+ * and .lock sidecars -- never the live database, a quarantined .corrupt, or
+ * another project's files. A stage is removed when its ownership lock can be
+ * taken (its writer is dead, or the stage predates ownership) and kept when
+ * a live writer holds the lock. The pre-ownership case is the one honest
+ * gap: a stage an OLDER binary is still writing against this database has
+ * no lock and is swept; that writer's final rename then fails and it
+ * discards. The live database is never named here on either path. */
+
+static const char *const cbm_stage_sidecar_tails[] = {"", "-wal", "-shm", "-journal", ".lock"};
+
+/* If `name` is "<base>.stage.<6 alphanumerics><known tail>", return the
+ * length of the stage name proper (without the tail); 0 otherwise. */
+static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len) {
+    if (strncmp(name, base, base_len) != 0) {
+        return 0;
+    }
+    const char *at = name + base_len;
+    if (strncmp(at, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
+        return 0;
+    }
+    at += sizeof(cbm_stage_marker) - 1;
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        /* NUL is not alphanumeric, so a short name fails here too. */
+        if (!isalnum((unsigned char)at[i])) {
+            return 0;
+        }
+    }
+    at += CBM_STAGE_SUFFIX_RANDOM_CHARS;
+    for (size_t i = 0; i < sizeof(cbm_stage_sidecar_tails) / sizeof(cbm_stage_sidecar_tails[0]);
+         i++) {
+        if (strcmp(at, cbm_stage_sidecar_tails[i]) == 0) {
+            return (size_t)(at - name);
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    char **names;
+    int count;
+    int cap;
+} stage_name_list_t;
+
+/* Add a stage name once, however many of its files were listed. */
+static void stage_name_list_add(stage_name_list_t *list, const char *name, size_t len) {
+    for (int i = 0; i < list->count; i++) {
+        if (strlen(list->names[i]) == len && strncmp(list->names[i], name, len) == 0) {
+            return;
+        }
+    }
+    if (list->count == list->cap) {
+        int cap = list->cap ? list->cap * 2 : 8;
+        char **grown = (char **)realloc(list->names, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        list->names = grown;
+        list->cap = cap;
+    }
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) {
+        return;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    list->names[list->count++] = copy;
+}
+
+static int64_t stage_bytes_on_disk(const char *stage_path) {
+    static const char *const files[] = {"", "-wal", "-shm", "-journal"};
+    int64_t total = 0;
+    char side[CBM_SZ_4K];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        int n = snprintf(side, sizeof(side), "%s%s", stage_path, files[i]);
+        if (n <= 0 || (size_t)n >= sizeof(side)) {
+            continue;
+        }
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(side, &info) == CBM_PATH_INFO_OK && info.is_regular) {
+            total += info.size;
+        }
+    }
+    return total;
+}
+
+static void sweep_one_stage(const char *stage_path) {
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    if (!sidecar) {
+        return;
+    }
+    errno = 0;
+    int lock_fd = cbm_lockfile_open(sidecar, false);
+    int probe_errno = errno;
+    free(sidecar);
+    if (lock_fd < 0 && probe_errno != ENOENT) {
+        bool live = probe_errno == EAGAIN || probe_errno == EACCES;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        live = live || probe_errno == EWOULDBLOCK;
+#endif
+        if (live) {
+            cbm_log_info("pipeline.stage", "action", "orphan_kept", "reason", "live_writer", "path",
+                         stage_path);
+            return;
+        }
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", probe_errno);
+        cbm_log_warn("pipeline.stage", "action", "orphan_kept", "reason", "lock_probe_failed",
+                     "errno", errno_text, "path", stage_path);
+        return;
+    }
+    /* No owner: absent sidecar (an ENOENT probe) or a lock the kernel released
+     * with its writer. Ours now, from the lock down.
+     *
+     * The absent-sidecar (ENOENT) case is exactly a pre-lock-era orphan: a
+     * stage an OLDER binary minted with no sidecar at all (#1839 pins that
+     * these ARE swept). It is NOT an in-flight stage of a current run: since
+     * create_staging_path() now takes the sidecar lock BEFORE the stage's main
+     * file becomes visible on disk, a live stage always has its sidecar, so a
+     * concurrent sweep landing here for one would instead find the lock held
+     * above and keep it. Removing on ENOENT therefore reclaims genuine orphans
+     * without ever deleting a live stage (the create->register race behind
+     * #2111's windows-guards red is closed at the source). */
+    int64_t bytes = stage_bytes_on_disk(stage_path);
+    remove_stage_files(stage_path);
+    if (lock_fd >= 0) {
+        cbm_pipeline_stage_lock_drop(stage_path, lock_fd);
+    }
+    char bytes_text[32];
+    (void)snprintf(bytes_text, sizeof(bytes_text), "%lld", (long long)bytes);
+    cbm_log_info("pipeline.stage", "action", "orphan_removed", "bytes", bytes_text, "path",
+                 stage_path);
+}
+
+static void sweep_orphan_stages(const char *final_path) {
+    /* Directory part INCLUDING its trailing separator, so the stage paths
+     * are joined exactly as the final path was spelled. */
+    size_t prefix_len = 0;
+    for (const char *c = final_path; *c; c++) {
+        if (*c == '/'
+#ifdef _WIN32
+            || *c == '\\'
+#endif
+        ) {
+            prefix_len = (size_t)(c - final_path) + 1;
+        }
+    }
+    const char *base = final_path + prefix_len;
+    size_t base_len = strlen(base);
+    if (base_len == 0) {
+        return;
+    }
+    char *dir_path = prefix_len ? (char *)malloc(prefix_len + 1) : strdup(".");
+    if (!dir_path) {
+        return;
+    }
+    if (prefix_len) {
+        memcpy(dir_path, final_path, prefix_len);
+        dir_path[prefix_len] = '\0';
+    }
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        free(dir_path);
+        return;
+    }
+    stage_name_list_t list = {0};
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        size_t stage_len = stage_entry_stage_length(entry->name, base, base_len);
+        if (stage_len) {
+            stage_name_list_add(&list, entry->name, stage_len);
+        }
+    }
+    cbm_closedir(dir);
+    for (int i = 0; i < list.count; i++) {
+        size_t name_len = strlen(list.names[i]);
+        char *stage_path = (char *)malloc(prefix_len + name_len + 1);
+        if (stage_path) {
+            memcpy(stage_path, final_path, prefix_len);
+            memcpy(stage_path + prefix_len, list.names[i], name_len + 1);
+            sweep_one_stage(stage_path);
+            free(stage_path);
+        }
+        free(list.names[i]);
+    }
+    free(list.names);
+    free(dir_path);
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
     if (!p) {
         return CBM_NOT_FOUND;
@@ -2565,6 +3050,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
+    sweep_orphan_stages(final_path);
     char *staging_path = create_staging_path(final_path);
     if (!staging_path) {
         free(final_path);
@@ -2577,10 +3063,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         if (!backup_succeeded) {
             cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
                          final_path);
-            cleanup_staging_db(staging_path);
+            /* The copy is gone but the NAME stays ours: the rebuilt
+             * generation is renamed over it by the inner finalize and then
+             * published from it below, so its lock is held to the end. */
+            remove_stage_files(staging_path);
         }
     }
 
+    p->final_existed = final_existed;
+    p->existing_generation = final_existed && backup_succeeded;
     char *configured_db_path = p->db_path;
     p->db_path = strdup(staging_path);
     if (!p->db_path) {
@@ -2660,6 +3151,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
+    stage_owner_release(staging_path);
     rc = export_after_publish(p, final_path);
     free(staging_path);
     free(final_path);

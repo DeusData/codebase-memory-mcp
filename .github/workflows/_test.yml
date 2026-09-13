@@ -227,12 +227,12 @@ jobs:
       - name: Install deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
 
-      - name: Install LLVM 22 (pinned diagnostic toolchain)
+      - name: Install LLVM 21 (pinned diagnostic toolchain)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update
-          sudo apt-get install -y clang-22
+          sudo apt-get install -y clang-21
 
       - name: Compiler cache (content-verified, restore)
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -247,11 +247,11 @@ jobs:
       # lane: stack-use-after-return, stack-use-after-scope, and strict string
       # checks. Mirrors `make -f Makefile.cbm diag`, including its reasoning
       # for leaving detect_invalid_pointer_pairs out.
-      - name: Test (clang-22, ASan+UBSan + off-by-default ASan checks)
+      - name: Test (clang-21, ASan+UBSan + off-by-default ASan checks)
         env:
           ASAN_OPTIONS: "detect_stack_use_after_return=1:strict_string_checks=1:detect_stack_use_after_scope=1"
         run: |
-          scripts/test.sh CC=clang-22 CXX=clang++-22 \
+          scripts/test.sh CC=clang-21 CXX=clang++-21 \
             SANITIZE="-fsanitize=address,undefined -fno-omit-frame-pointer -fno-optimize-sibling-calls"
 
       - name: Compiler cache (save)

@@ -30,7 +30,9 @@ enum {
     /* Extraction memory back-pressure: when the process is over its RSS budget,
      * a worker reclaims + naps before pulling another file so peers can finish
      * and return pages. Bounded spins avoid deadlock when the resident graph
-     * itself is near budget (then proceed with a soft overshoot). */
+     * itself is near budget: then ONE confirmation cycle decides — drained
+     * means continue, still over means the attempt fails whole (decision A,
+     * #1997 #832) instead of the former open-ended soft overshoot. */
     PP_BACKPRESSURE_MAX_SPINS = 40,
     PP_BACKPRESSURE_NAP_NS = 3000000, /* 3 ms */
 };
@@ -667,6 +669,11 @@ typedef struct {
      * While set, pulls skip the nap (the designed soft overshoot); the cheap
      * over-budget probe re-arms the gate once RSS drains under budget. */
     _Atomic int bp_futile;
+    /* Decision A (#1997 #832): set once futility was CONFIRMED by a second
+     * full cycle that still ended over budget. Every pull loop breaks on it
+     * and extract returns CBM_PIPELINE_ABORT_OVER_BUDGET. Deliberately not
+     * the shared cancel token — that one belongs to client cancellation. */
+    _Atomic int over_budget_abort;
 
     const CBMMacroTable *macro_table;            /* ObjectScript $$$macros (NULL if none) */
     const CBMReturnTypeTable *return_type_table; /* ObjectScript return types (NULL if none) */
@@ -722,6 +729,39 @@ static void log_extract_done(int pos, uint64_t ms, int defs, const char *path) {
     }
 }
 
+/* One back-pressure cycle: reclaim this thread's freed pages, then nap in
+ * bounded 3 ms steps while the process stays over budget. Counted for test
+ * observability. Returns true when the FULL cycle elapsed still over budget —
+ * the resident floor, not in-flight transients, holds the memory. */
+static bool pp_backpressure_cycle_still_over(extract_ctx_t *ec) {
+    cbm_mem_collect();
+    atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
+    int bp = 0;
+    for (; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
+           !atomic_load_explicit(ec->cancelled, memory_order_relaxed) &&
+           !atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed);
+         bp++) {
+        struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
+        cbm_nanosleep(&nap, NULL);
+    }
+    return bp == PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget();
+}
+
+/* Decision A (#1997 #832): back-pressure was futile and the confirmation
+ * cycle still ended over budget. The budget stops being advisory here: flag
+ * the attempt so every worker stops pulling and extract returns
+ * CBM_PIPELINE_ABORT_OVER_BUDGET. Cooperative on purpose — the failure must
+ * travel as a clean-exit worker response, never a kill, or the supervisor
+ * would quarantine innocent files. */
+static void pp_fail_whole_over_budget(extract_ctx_t *ec) {
+    if (atomic_exchange_explicit(&ec->over_budget_abort, 1, memory_order_relaxed) == 0) {
+        cbm_log_error("mem.budget.exceeded", "rss_mb",
+                      itoa_log((int)(cbm_mem_rss() / (1024 * 1024))), "budget_mb",
+                      itoa_log((int)(cbm_mem_budget() / (1024 * 1024))), "phase",
+                      "parallel_extract", "action", "fail_whole");
+    }
+}
+
 static void extract_worker(int worker_id, void *ctx_ptr) {
     extract_ctx_t *ec = ctx_ptr;
     extract_worker_state_t *ws = &ec->workers[worker_id];
@@ -739,7 +779,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
             break;
         }
         cbm_scale_tick(&ec->scale, sort_pos);
-        if (atomic_load_explicit(ec->cancelled, memory_order_relaxed)) {
+        if (atomic_load_explicit(ec->cancelled, memory_order_relaxed) ||
+            atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
             break;
         }
 
@@ -750,38 +791,40 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
          * near the budget instead of letting all workers parse their biggest
          * files at once. Self-disabling when the budget is unset (tests) or RSS
          * is under budget; bounded spins avoid deadlock when the resident graph
-         * is itself near budget (then proceed with a soft overshoot).
+         * is itself near budget.
          *
          * Futility latch: when a FULL nap cycle ends still over budget, the
          * resident floor — not transients — holds the memory; napping again on
          * the next pull cannot reclaim it and only idles workers (linux kernel:
-         * one full cycle per pull ≈ 390 s at 79% avg CPU). Latch bp_futile and
-         * proceed with the soft overshoot; the over-budget probe below re-arms
-         * the gate as soon as RSS drains under budget. */
+         * one full cycle per pull ≈ 390 s at 79% avg CPU). The worker that
+         * latches bp_futile (0→1) runs ONE confirmation cycle while its peers
+         * skip the nap. A confirmation that ends under budget re-arms the gate
+         * (RSS drained after all); one that still ends over budget fails the
+         * attempt whole (decision A, #1997 #832): every worker stops pulling,
+         * extract returns CBM_PIPELINE_ABORT_OVER_BUDGET, nothing is published
+         * and the previously serving index keeps answering. */
         if (cbm_mem_budget() > 0) {
             bool over = cbm_mem_over_budget();
             bool futile = atomic_load_explicit(&ec->bp_futile, memory_order_relaxed) != 0;
             if (over && !futile) {
-                cbm_mem_collect();
-                atomic_fetch_add_explicit(&g_bp_nap_cycles, SKIP_ONE, memory_order_relaxed);
-                int bp = 0;
-                for (; bp < PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget() &&
-                       !atomic_load_explicit(ec->cancelled, memory_order_relaxed);
-                     bp++) {
-                    struct timespec nap = {0, PP_BACKPRESSURE_NAP_NS};
-                    cbm_nanosleep(&nap, NULL);
-                }
-                if (bp == PP_BACKPRESSURE_MAX_SPINS && cbm_mem_over_budget()) {
-                    /* Log only the 0→1 transition: all workers race into the
-                     * gate before anyone latches, so a plain store would WARN
-                     * once per worker (12 lines per latch event). */
-                    if (atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
-                        cbm_log_warn("mem.backpressure.futile", "action", "soft_overshoot");
+                /* Act only on the 0→1 transition: all workers race into the
+                 * gate before anyone latches, so a plain store would confirm
+                 * (and WARN) once per worker. */
+                if (pp_backpressure_cycle_still_over(ec) &&
+                    atomic_exchange_explicit(&ec->bp_futile, 1, memory_order_relaxed) == 0) {
+                    cbm_log_warn("mem.backpressure.futile", "action", "confirm");
+                    if (pp_backpressure_cycle_still_over(ec)) {
+                        pp_fail_whole_over_budget(ec);
+                    } else {
+                        atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
                     }
                 }
             } else if (!over && futile) {
                 atomic_store_explicit(&ec->bp_futile, 0, memory_order_relaxed);
             }
+        }
+        if (atomic_load_explicit(&ec->over_budget_abort, memory_order_relaxed)) {
+            break;
         }
 
         int file_idx = ec->sorted[sort_pos].idx;
@@ -1129,6 +1172,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     atomic_init(&ec.retain_cap_warned, 0);
     atomic_init(&ec.oversized_warned, 0);
     atomic_init(&ec.bp_futile, 0);
+    atomic_init(&ec.over_budget_abort, 0);
 
     /* Sub-phase: Dispatch workers (parse + extract per file, PARALLEL) */
     CBM_PROF_START(t_dispatch);
@@ -1176,6 +1220,12 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
     free(sorted);
     cbm_macro_table_free(pp_macro_table); /* ObjectScript macro table (NULL-safe) */
 
+    /* The over-budget verdict outranks the cancel sentinel: a caller must be
+     * able to name the cause, and the orchestrator discards the staging DB on
+     * every non-zero code alike (the live generation is never touched). */
+    if (atomic_load(&ec.over_budget_abort)) {
+        return CBM_PIPELINE_ABORT_OVER_BUDGET;
+    }
     if (atomic_load(ctx->cancelled)) {
         return CBM_NOT_FOUND;
     }

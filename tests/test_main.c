@@ -36,6 +36,7 @@ int tf_skip_count = 0;
 #include <fcntl.h>
 #include <io.h>
 #include <winsock2.h> /* #798 follow-up: socket-isolation re-exec probe */
+#include <windows.h>
 #else
 #include <unistd.h>
 #ifdef __APPLE__
@@ -52,6 +53,29 @@ int tf_skip_count = 0;
  * invocations see the marker and exit cleanly, allowing the parent shell to
  * unwind after either production containment or the test's verified backstop. */
 #define TF_BLOCKING_GIT_MARKER_ENV "CBM_TEST_RUNTIME_BLOCKING_GIT_PID_FILE"
+
+/* Native child for subprocess_windows_job_object_enforces_memory_limit. The
+ * fixed-size commit keeps the RED path bounded: without a Job memory limit it
+ * succeeds and exits 0; with the limit it is denied and exits with the sentinel
+ * code expected by the parent test. */
+static int tf_maybe_run_windows_memory_limit_probe(int argc, char **argv) {
+#ifdef _WIN32
+    if (argc == 2 && argv && strcmp(argv[1], "__cbm_windows_memory_limit_probe") == 0) {
+        const SIZE_T allocation_size = (SIZE_T)2U * 1024U * 1024U * 1024U;
+        void *allocation =
+            VirtualAlloc(NULL, allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (!allocation) {
+            return 73;
+        }
+        (void)VirtualFree(allocation, 0, MEM_RELEASE);
+        return 0;
+    }
+#else
+    (void)argc;
+    (void)argv;
+#endif
+    return -1;
+}
 
 #ifdef _WIN32
 static bool tf_invoked_as_windows_git_module(void) {
@@ -896,6 +920,10 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    int memory_limit_probe_rc = tf_maybe_run_windows_memory_limit_probe(argc, argv);
+    if (memory_limit_probe_rc >= 0) {
+        return memory_limit_probe_rc;
+    }
     int blocking_git_rc = tf_maybe_run_blocking_git_probe(argc, argv);
     if (blocking_git_rc >= 0) {
         return blocking_git_rc;
