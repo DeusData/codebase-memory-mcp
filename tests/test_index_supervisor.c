@@ -6,6 +6,7 @@
 #include "daemon/bootstrap.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/profile.h"
 #include "mcp/index_supervisor.h"
@@ -560,7 +561,8 @@ static bool index_supervisor_test_run_probe(const char *mode, bool profiling,
     (void)snprintf(args, sizeof(args), "{\"__cbm_test_worker\":\"%s\"}", mode);
     cbm_profile_active = profiling;
     cbm_index_worker_handle_t *handle = NULL;
-    if (cbm_index_worker_start(args, 0, false, NULL, NULL, &handle) != 0 || !handle) {
+    const size_t budget = (size_t)1024U * 1024U * 1024U;
+    if (cbm_index_worker_start(args, budget, false, NULL, NULL, &handle) != 0 || !handle) {
         return false;
     }
     char log_path[INDEX_SUPERVISOR_TEST_PATH_CAP];
@@ -588,6 +590,17 @@ static bool index_supervisor_test_run_probe(const char *mode, bool profiling,
     return terminal;
 }
 
+static char g_index_supervisor_memory_log[1024];
+static int g_index_supervisor_memory_log_count;
+
+static void index_supervisor_test_memory_log_sink(const char *line) {
+    if (strstr(line, "index.supervisor.worker_memory")) {
+        g_index_supervisor_memory_log_count++;
+        (void)snprintf(g_index_supervisor_memory_log, sizeof(g_index_supervisor_memory_log), "%s",
+                       line);
+    }
+}
+
 TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     char cache[INDEX_SUPERVISOR_TEST_PATH_CAP];
     (void)snprintf(cache, sizeof(cache), "%s/cbm-index-logs-XXXXXX", cbm_tmpdir());
@@ -596,6 +609,14 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
     bool saved_profile = cbm_profile_active;
     (void)cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    CBMLogLevel saved_level = cbm_log_get_level();
+    CBMLogFormat saved_format = cbm_log_get_format();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
+    g_index_supervisor_memory_log[0] = '\0';
+    g_index_supervisor_memory_log_count = 0;
+    cbm_log_set_sink_ex(index_supervisor_test_memory_log_sink, CBM_LOG_SINK_TEE);
 
     cbm_proc_outcome_t clean_outcome = CBM_PROC_SPAWN_FAILED;
     cbm_proc_outcome_t profile_outcome = CBM_PROC_SPAWN_FAILED;
@@ -621,6 +642,9 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     bool crash_classified_failure = crash_outcome == CBM_PROC_CRASH;
 #endif
 
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(saved_level);
+    cbm_log_set_format(saved_format);
     cbm_profile_active = saved_profile;
     index_supervisor_test_restore_env("CBM_CACHE_DIR", saved_cache);
     (void)th_rmtree(cache);
@@ -640,6 +664,14 @@ TEST(index_supervisor_terminal_log_lifecycle_matches_outcome_and_profiling) {
     ASSERT_FALSE(crash_response);
     ASSERT_TRUE(crash_log);
     ASSERT_FALSE(crash_response_file);
+#ifdef _WIN32
+    ASSERT_EQ(g_index_supervisor_memory_log_count, 1); /* crash only, never clean */
+    ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "job_limit_bytes=1610612736") != NULL);
+    ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "peak_job_memory_bytes=") != NULL);
+    ASSERT_TRUE(strstr(g_index_supervisor_memory_log, "unavailable") == NULL);
+#else
+    ASSERT_EQ(g_index_supervisor_memory_log_count, 0);
+#endif
     PASS();
 }
 
@@ -893,7 +925,24 @@ TEST(index_supervisor_killed_worker_log_is_never_empty_and_names_the_run) {
     PASS();
 }
 
+TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow) {
+    const size_t mib = (size_t)1024U * 1024U;
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(0) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(4096) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(8192) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(512U * mib - 1) == 0);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(512U * mib) == 768U * mib);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(512U * mib + 1) == 768U * mib + 1);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(1024U * mib) == 1536U * mib);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(SIZE_MAX / 2) ==
+                SIZE_MAX / 2 + (SIZE_MAX / 2) / 2);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(SIZE_MAX - 1) == SIZE_MAX);
+    ASSERT_TRUE(cbm_index_worker_job_memory_limit(SIZE_MAX) == SIZE_MAX);
+    PASS();
+}
+
 SUITE(index_supervisor) {
+    RUN_TEST(index_supervisor_job_memory_limit_has_floor_headroom_and_no_overflow);
     RUN_TEST(index_supervisor_worker_argv_requires_exact_build_bound_grammar);
     RUN_TEST(index_supervisor_async_jobs_are_isolated_cancellable_and_terminal_cached);
     RUN_TEST(index_supervisor_sync_wrapper_forwards_cancel_and_drains_tree);

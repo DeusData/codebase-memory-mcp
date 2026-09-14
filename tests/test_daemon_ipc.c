@@ -13,6 +13,7 @@
 #include "daemon/ipc_internal.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/log.h"
 #include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/subprocess.h"
@@ -920,6 +921,120 @@ TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor)
     ASSERT_TRUE(acl_injected);
     ASSERT_TRUE(secured);
     ASSERT_TRUE(cache_created);
+    PASS();
+}
+
+/* Derive THIS machine's account-domain SID (S-1-5-21-a-b-c) from the current
+ * process token (S-1-5-21-a-b-c-<rid>), independently of production's LSA-based
+ * resolution. Caller frees with FreeSid. */
+static PSID ipc_test_local_account_domain_sid(void) {
+    HANDLE token = NULL;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        return NULL;
+    }
+    DWORD needed = 0;
+    (void)GetTokenInformation(token, TokenUser, NULL, 0, &needed);
+    PSID domain = NULL;
+    if (needed > 0) {
+        void *buffer = calloc(1, needed);
+        if (buffer && GetTokenInformation(token, TokenUser, buffer, needed, &needed)) {
+            PSID user = ((TOKEN_USER *)buffer)->User.Sid;
+            if (user && IsValidSid(user)) {
+                UCHAR count = *GetSidSubAuthorityCount(user);
+                SID_IDENTIFIER_AUTHORITY *authority = GetSidIdentifierAuthority(user);
+                /* Machine/domain account SID: NT authority (Value[5]==5), first
+                 * sub-authority 21, at least the three domain sub-authorities plus
+                 * the account RID. Drop the RID to recover the domain SID. */
+                if (count >= 4 && authority->Value[5] == 5 && *GetSidSubAuthority(user, 0) == 21U) {
+                    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+                    (void)AllocateAndInitializeSid(
+                        &nt, 4, *GetSidSubAuthority(user, 0), *GetSidSubAuthority(user, 1),
+                        *GetSidSubAuthority(user, 2), *GetSidSubAuthority(user, 3), 0, 0, 0, 0,
+                        &domain);
+                }
+            }
+        }
+        free(buffer);
+    }
+    (void)CloseHandle(token);
+    return domain;
+}
+
+/* Synthesize the RID-500 built-in Administrator SID for a given account-domain
+ * SID, exactly as production does. Caller frees with free(). */
+static PSID ipc_test_admin_sid_for_domain(PSID domain_sid) {
+    if (!domain_sid) {
+        return NULL;
+    }
+    DWORD needed = 0;
+    (void)CreateWellKnownSid(WinAccountAdministratorSid, domain_sid, NULL, &needed);
+    if (needed == 0) {
+        return NULL;
+    }
+    PSID admin = malloc(needed);
+    if (admin && CreateWellKnownSid(WinAccountAdministratorSid, domain_sid, admin, &needed) &&
+        IsValidSid(admin)) {
+        return admin;
+    }
+    free(admin);
+    return NULL;
+}
+
+/* #1705: THIS machine's built-in Administrator ACCOUNT (RID-500 under the local
+ * account-domain SID) is a trusted directory owner/grantee, while a FOREIGN
+ * S-1-5-21-*-500 (a domain administrator, or another machine's built-in
+ * Administrator) must never be.
+ *
+ * RED without the fix: win_sid_trusted rejects the local RID-500 — on the VM this
+ * process runs as `test`, whose RID is not 500, so the -500 SID matches neither
+ * the current user nor SYSTEM, the Administrators GROUP, or TrustedInstaller — so
+ * local_ok is false. GREEN with the fix. foreign_ok is false either way, which is
+ * the exact cross-machine bypass this must never open. */
+TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500) {
+    PSID local_domain = ipc_test_local_account_domain_sid();
+    PSID local_admin = ipc_test_admin_sid_for_domain(local_domain);
+
+    SID_IDENTIFIER_AUTHORITY nt = {SECURITY_NT_AUTHORITY};
+    PSID foreign_domain = NULL;
+    (void)AllocateAndInitializeSid(&nt, 4, 21U, 111U, 222U, 333U, 0, 0, 0, 0, &foreign_domain);
+    PSID foreign_admin = ipc_test_admin_sid_for_domain(foreign_domain);
+
+    PSID builtin_admins = NULL;
+    DWORD builtin_needed = 0;
+    (void)CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, NULL, &builtin_needed);
+    if (builtin_needed > 0) {
+        builtin_admins = malloc(builtin_needed);
+        if (builtin_admins &&
+            !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins, &builtin_needed)) {
+            free(builtin_admins);
+            builtin_admins = NULL;
+        }
+    }
+
+    bool local_built = local_admin != NULL;
+    bool foreign_built = foreign_admin != NULL;
+    bool builtin_built = builtin_admins != NULL;
+
+    bool local_ok = local_built && cbm_daemon_ipc_win_sid_trusted_for_testing(local_admin);
+    bool foreign_ok = foreign_built && cbm_daemon_ipc_win_sid_trusted_for_testing(foreign_admin);
+    bool builtin_ok = builtin_built && cbm_daemon_ipc_win_sid_trusted_for_testing(builtin_admins);
+
+    free(local_admin);
+    free(foreign_admin);
+    free(builtin_admins);
+    if (local_domain) {
+        FreeSid(local_domain);
+    }
+    if (foreign_domain) {
+        FreeSid(foreign_domain);
+    }
+
+    ASSERT_TRUE(local_built);
+    ASSERT_TRUE(foreign_built);
+    ASSERT_TRUE(builtin_built);
+    ASSERT_TRUE(builtin_ok);  /* the seam works: an already-trusted SID passes */
+    ASSERT_TRUE(local_ok);    /* #1705 fix: THIS machine's RID-500 is trusted */
+    ASSERT_FALSE(foreign_ok); /* safety: a foreign -500 is NEVER trusted */
     PASS();
 }
 
@@ -5009,6 +5124,49 @@ TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue183
     PASS();
 }
 
+/* #1830 regression guard, and the test that would have caught the original bug
+ * with no namespace at all. The overflow uid used to be memoised per process
+ * via pthread_once. That made a SECURITY decision sticky: pthread_once state
+ * survives fork(), unshare(CLONE_NEWUSER) rewrites /proc/self/uid_map, so a
+ * process that forked and then entered a namespace kept the parent verdict.
+ * Nothing in the suite could see it, because every deterministic #1830 test
+ * drives the override seam rather than the real derivation -- they bind the
+ * decision TABLE, not the WIRING.
+ *
+ * So assert the wiring directly: two ancestor checks must perform two real
+ * derivations. Re-introduce any cache and the second call derives zero times
+ * and this fails by name, on every platform, with no namespace required. */
+TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830) {
+#if defined(__linux__)
+    char parent[TEST_PATH_CAP];
+    if (!ipc_test_parent_new(parent, "overflow-nocache")) {
+        FAIL("could not create the probe parent directory");
+    }
+    char probe[TEST_PATH_CAP];
+    (void)snprintf(probe, sizeof(probe), "%s/x", parent);
+
+    /* The override seam short-circuits derivation, so it must be OFF here or
+     * the test would measure nothing. */
+    cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(false, 0);
+
+    unsigned before = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+    (void)cbm_daemon_ipc_private_directory_secure(probe);
+    unsigned after_first = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+    (void)cbm_daemon_ipc_private_directory_secure(probe);
+    unsigned after_second = cbm_daemon_ipc_posix_overflow_compute_count_for_test();
+
+    (void)rmdir(probe);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(after_first > before);
+    /* The decisive half: the SECOND call must derive again. */
+    ASSERT_TRUE(after_second > after_first);
+    PASS();
+#else
+    SKIP_PLATFORM("the overflow-uid derivation is Linux-only");
+#endif
+}
+
 /* #1830 real end-to-end smoke: inside a single-uid user namespace the
  * root-owned ancestors (/, /tmp) are overflow-owned, and the daemon must still
  * create its private directory there. An overflow-owned ancestor cannot be
@@ -5016,9 +5174,23 @@ TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue183
  * namespace is actually available. O10 whitelisted-skip everywhere it is not:
  * macOS has no user namespaces (compile-gated out); Docker's default seccomp
  * blocks unshare(CLONE_NEWUSER) on the Colima container leg; some kernels ship
- * user namespaces disabled. WHAT WAS TRIED when it skips: fork + unshare
+ * user namespaces disabled. NOT on that list any more: Ubuntu 23.10+ restricts
+ * unprivileged userns via AppArmor, which used to confine this test to the two
+ * ubuntu-22.04 legs -- broad-matrix only, so it ran in no PR and sat on
+ * GitHub's 2027-04-17 retirement clock. _test.yml now lifts that with
+ * kernel.apparmor_restrict_unprivileged_userns=0 on every ubuntu leg, so this
+ * runs on the CORE matrix. WHAT WAS TRIED when it skips: fork + unshare
  * CLONE_NEWUSER + a 1:1 uid_map write, which the sandbox denied (EPERM). The
- * deterministic decision coverage above is what binds the fix. */
+ * deterministic decision coverage above is what binds the fix.
+ *
+ * TO REPRODUCE IT LOCALLY two things are needed, and the second is easy to
+ * miss: run the container with --security-opt seccomp=unconfined so unshare is
+ * permitted, AND run the suite as a NON-ROOT uid. As root the mapped range
+ * covers uid 0, so root-owned /tmp stays 1:1 inside the namespace, never turns
+ * overflow, and this test passes without ever reaching the branch it exists to
+ * cover -- it passes just as happily with the fix reverted. Under `su tester`
+ * (uid 1001, the shape CI's runner user has) the ancestors do go overflow and
+ * the assertion becomes real. */
 TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
 #if defined(__linux__)
     uid_t host_uid = geteuid();
@@ -5049,9 +5221,20 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
             _exit(2);
         }
         /* Inside the ns / and /tmp now show the overflow uid. With #1830 the
-         * daemon can still build its private tree there; without it, refused. */
-        bool secured = cbm_daemon_ipc_private_directory_secure(probe);
-        _exit(secured ? 0 : 1);
+         * daemon can still build its private tree there; without it, refused.
+         *
+         * EXEC, do not just call. The overflow uid is derived once per process
+         * (pthread_once) from /proc/self/uid_map, and that state survives
+         * fork(): seven earlier call sites in this suite prime it with the HOST
+         * answer, so a forked child keeps "no overflow uid" and refuses no
+         * matter what its namespace says. That made this test fail on the only
+         * platform where it actually runs (ubuntu-22.04; macOS compile-gates it
+         * out, Colima's seccomp blocks unshare, and 23.10+ restricts
+         * unprivileged userns) -- while looking like a product regression.
+         * Re-exec so the decision is made by a process that STARTED here, which
+         * is also the only shape production ever takes. */
+        (void)execl("/proc/self/exe", "test-runner", "--userns-secure-probe", probe, (char *)NULL);
+        _exit(3); /* exec failed -- distinct from secure(0)/refused(1)/skip(2) */
     }
     if (child < 0) {
         FAIL("fork failed for userns smoke");
@@ -5063,7 +5246,24 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
     if (WIFEXITED(status) && WEXITSTATUS(status) == 2) {
         SKIP_PLATFORM("user namespaces unavailable (no CLONE_NEWUSER / seccomp-blocked)");
     }
-    ASSERT_TRUE(WIFEXITED(status));
+    /* A failed re-exec must never read as a product refusal: 3 is its own code
+     * so a broken probe is a loud harness failure, not a quiet "refused". */
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 3) {
+        FAIL("userns smoke could not re-exec /proc/self/exe for the probe");
+    }
+    /* {0,1,2,3} is the whole protocol. Any other code -- a sanitizer exit (LSan
+     * defaults to 23), an abort, a signal -- is a broken harness, not a refusal,
+     * and must say so with the code it actually saw. */
+    if (!WIFEXITED(status)) {
+        FAIL("userns probe did not exit normally (signalled) -- not a security verdict");
+    }
+    if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
+        char unexpected[128];
+        (void)snprintf(unexpected, sizeof(unexpected),
+                       "userns probe exited %d -- not a security verdict",
+                       WEXITSTATUS(status));
+        FAIL(unexpected);
+    }
     ASSERT_EQ(0, WEXITSTATUS(status));
     PASS();
 #else
@@ -5072,6 +5272,83 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
 }
 #endif /* CBM_ENABLE_TEST_SEAMS */
 #endif /* !_WIN32 */
+
+#ifndef _WIN32
+enum { IPC_TEST_LOG_CAPTURE_CAP = 16384 };
+static char ipc_test_log_capture[IPC_TEST_LOG_CAPTURE_CAP];
+static size_t ipc_test_log_capture_used;
+
+static void ipc_test_log_capture_sink(const char *line) {
+    if (!line) {
+        return;
+    }
+    size_t length = strlen(line);
+    if (ipc_test_log_capture_used + length + 2 > sizeof(ipc_test_log_capture)) {
+        return;
+    }
+    memcpy(ipc_test_log_capture + ipc_test_log_capture_used, line, length);
+    ipc_test_log_capture_used += length;
+    ipc_test_log_capture[ipc_test_log_capture_used++] = '\n';
+    ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
+}
+
+/* #1828: a full /tmp made every daemon start die at pending publication, and
+ * the only durable trace was `daemon.ipc.listen_failed stage=pending_publication`
+ * -- no syscall, no errno, no path. The reporter needed hours (and a wrong
+ * `df` on the wrong mount) to find the cause. The failure line must name the
+ * errno and the exact artifact path that could not be written. */
+TEST(daemon_ipc_listen_failure_names_errno_and_path) {
+    static const char key[] = "1828000000000001";
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    char socket_path[TEST_PATH_CAP] = {0};
+    char pending_path[TEST_PATH_CAP] = {0};
+    char expected_path[TEST_PATH_CAP + 16] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    cbm_daemon_ipc_listener_t *listener = NULL;
+
+    bool parent_ok = ipc_test_parent_new(parent, "enospc-diag");
+    if (parent_ok) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+        ipc_test_copy_path(socket_path, cbm_daemon_ipc_endpoint_address(endpoint));
+    }
+    bool paths_ok = endpoint && ipc_test_socket_pending_path(pending_path, socket_path) &&
+                    snprintf(expected_path, sizeof(expected_path), "path=%s.tmp", pending_path) > 0;
+    if (paths_ok) {
+        ipc_test_log_capture_used = 0;
+        ipc_test_log_capture[0] = '\0';
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(ENOSPC);
+        cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+        listener = cbm_daemon_ipc_listen(endpoint);
+        cbm_log_set_sink(NULL);
+        cbm_daemon_ipc_posix_record_write_failure_set_for_test(0);
+    }
+    const char *failed = strstr(ipc_test_log_capture, "msg=daemon.ipc.listen_failed");
+    bool stage_named = failed && strstr(failed, "stage=pending_publication") != NULL;
+    bool errno_named = failed && strstr(failed, "errno=ENOSPC") != NULL;
+    bool path_named = failed && strstr(failed, expected_path) != NULL;
+    struct stat leftover;
+    bool namespace_clean = paths_ok && lstat(socket_path, &leftover) != 0 && errno == ENOENT &&
+                           lstat(pending_path, &leftover) != 0 && errno == ENOENT;
+
+    cbm_daemon_ipc_listener_close(listener);
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    th_cleanup(parent_ok ? parent : NULL);
+
+    ASSERT_TRUE(parent_ok);
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(listener == NULL);
+    ASSERT_TRUE(failed != NULL);
+    ASSERT_TRUE(stage_named);
+    ASSERT_TRUE(errno_named);
+    ASSERT_TRUE(path_named);
+    ASSERT_TRUE(namespace_clean);
+    PASS();
+}
+#endif
 
 SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_pending_timeout_race_returns_completed_io);
@@ -5085,6 +5362,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
+    RUN_TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
     RUN_TEST(daemon_ipc_windows_local_transition_atomically_reserves_legacy_pipe);
     RUN_TEST(daemon_ipc_windows_startup_retries_transient_rendezvous_reader);
@@ -5116,6 +5394,7 @@ SUITE(daemon_ipc) {
 #ifdef CBM_ENABLE_TEST_SEAMS
     RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
+    RUN_TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830);
     RUN_TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830);
 #endif
     RUN_TEST(daemon_ipc_posix_startup_lock_is_cross_process);
@@ -5145,5 +5424,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_private_directory_rejects_world_writable_ancestor);
     RUN_TEST(daemon_ipc_posix_private_log_rejects_symlinks_and_is_owner_only);
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
+#ifndef _WIN32
+    RUN_TEST(daemon_ipc_listen_failure_names_errno_and_path);
+#endif
 #endif
 }

@@ -8,6 +8,8 @@
 
 #define CBM_YAML_ENABLE_TEST_API 1
 #include <cli/config_yaml_edit.h>
+#define CBM_CONFIG_EDIT_PATH_ENABLE_TEST_API 1
+#include <cli/config_edit_path.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -476,7 +478,13 @@ TEST(config_yaml_edit_rejects_symlinks_without_touching_target) {
     ASSERT_EQ(th_write_file(target, original), 0);
     ASSERT_EQ(symlink(target, fixture.path), 0);
 
-    ASSERT_EQ(cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md"), -1);
+    /* Foreign-owned link (observer moved by the test seam): still refused. */
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(fixture.dir), 0);
+    cbm_config_edit_path_set_invoking_uid_for_test((unsigned)geteuid() + 1U, 1);
+    int foreign_rc = cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md");
+    cbm_config_edit_path_set_invoking_uid_for_test(0U, 0);
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(foreign_rc, -1);
     struct stat link_state;
     ASSERT_EQ(lstat(fixture.path, &link_state), 0);
     ASSERT(S_ISLNK(link_state.st_mode));
@@ -488,6 +496,64 @@ TEST(config_yaml_edit_rejects_symlinks_without_touching_target) {
 
     ASSERT_EQ(cbm_unlink(fixture.path), 0);
     ASSERT_EQ(cbm_unlink(target), 0);
+    th_cleanup(fixture.dir);
+    PASS();
+}
+
+/* Decision C (#1954): a user-owned symlink is edited through — the link
+ * survives and the target carries the bytes the same edit yields on a plain file. */
+TEST(config_yaml_edit_follows_user_owned_symlink_in_place) {
+    const char *original = "model: safe\n";
+    yaml_fixture_t fixture;
+    ASSERT_EQ(yaml_fixture_init(&fixture, NULL), 0);
+    char target[sizeof(fixture.path) + 32U];
+    char control[sizeof(fixture.path) + 32U];
+    ASSERT(snprintf(target, sizeof(target), "%s/target.yaml", fixture.dir) > 0);
+    ASSERT(snprintf(control, sizeof(control), "%s/control.yaml", fixture.dir) > 0);
+    ASSERT_EQ(th_write_file(target, original), 0);
+    ASSERT_EQ(th_write_file(control, original), 0);
+    ASSERT_EQ(symlink("target.yaml", fixture.path), 0);
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(fixture.dir), 0);
+
+    int through_rc = cbm_yaml_upsert_string_list_item(fixture.path, "read", "AGENTS.md");
+    int plain_rc = cbm_yaml_upsert_string_list_item(control, "read", "AGENTS.md");
+    if (through_rc != 0 || plain_rc != 0) {
+        cbm_config_edit_path_follow_clear();
+    }
+    ASSERT_EQ(through_rc, 0);
+    ASSERT_EQ(plain_rc, 0);
+    struct stat link_state;
+    ASSERT_EQ(lstat(fixture.path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    char *through = yaml_read_alloc(target);
+    char *plain = yaml_read_alloc(control);
+    ASSERT_NOT_NULL(through);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_STR_EQ(through, plain);
+    ASSERT_NOT_NULL(strstr(through, "AGENTS.md"));
+    free(through);
+    free(plain);
+
+    int through_remove_rc = cbm_yaml_remove_string_list_item(fixture.path, "read", "AGENTS.md");
+    int plain_remove_rc = cbm_yaml_remove_string_list_item(control, "read", "AGENTS.md");
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(through_remove_rc, 0);
+    ASSERT_EQ(plain_remove_rc, 0);
+    ASSERT_EQ(lstat(fixture.path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    through = yaml_read_alloc(target);
+    plain = yaml_read_alloc(control);
+    ASSERT_NOT_NULL(through);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_STR_EQ(through, plain);
+    ASSERT_NULL(strstr(through, "AGENTS.md"));
+    free(through);
+    free(plain);
+    ASSERT_EQ(yaml_temp_file_count(&fixture), 0U);
+
+    ASSERT_EQ(cbm_unlink(fixture.path), 0);
+    ASSERT_EQ(cbm_unlink(target), 0);
+    ASSERT_EQ(cbm_unlink(control), 0);
     th_cleanup(fixture.dir);
     PASS();
 }
@@ -2038,9 +2104,15 @@ TEST(config_yaml_edit_nested_sequence_rejects_symlink_byte_identically) {
     ASSERT(snprintf(target, sizeof(target), "%s/target-hooks.yaml", fixture.dir) > 0);
     ASSERT_EQ(th_write_file(target, original), 0);
     ASSERT_EQ(symlink(target, fixture.path), 0);
-    ASSERT_EQ(cbm_yaml_upsert_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
-                                                    yaml_hook_identity, yaml_hook_canonical_item),
-              CBM_YAML_IDENTITY_EDIT_ERROR);
+    /* Foreign-owned link (observer moved by the test seam): still refused. */
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(fixture.dir), 0);
+    cbm_config_edit_path_set_invoking_uid_for_test((unsigned)geteuid() + 1U, 1);
+    int foreign_rc =
+        cbm_yaml_upsert_mapping_sequence_item(fixture.path, yaml_hook_sequence_path, 2U, "id",
+                                              yaml_hook_identity, yaml_hook_canonical_item);
+    cbm_config_edit_path_set_invoking_uid_for_test(0U, 0);
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(foreign_rc, CBM_YAML_IDENTITY_EDIT_ERROR);
     char *after = yaml_read_alloc(target);
     ASSERT_NOT_NULL(after);
     ASSERT_STR_EQ(after, original);
@@ -2071,6 +2143,7 @@ SUITE(config_yaml_edit) {
     RUN_TEST(config_yaml_edit_rejects_non_regular_path);
 #ifndef _WIN32
     RUN_TEST(config_yaml_edit_rejects_symlinks_without_touching_target);
+    RUN_TEST(config_yaml_edit_follows_user_owned_symlink_in_place);
     RUN_TEST(config_yaml_edit_rejects_dangling_symlink);
     RUN_TEST(config_yaml_edit_preserves_owner_group_and_mode);
     RUN_TEST(config_yaml_edit_rejects_hard_links_without_splitting_identity);

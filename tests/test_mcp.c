@@ -19099,22 +19099,72 @@ TEST(mcp_auto_watch_false_skips_watcher_on_connect) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
- *  #1466 — autoindex.skip must report the effective numeric limit
+ *  #1466 / #713 — the auto_index_limit guard
+ *
+ *  #1466: autoindex.skip must report the effective numeric limit.
+ *  #713:  the guard must bound NON-git roots. The 0.8.x guard counted
+ *         `git ls-files | wc -l`, which is 0 outside a checkout, so a plain
+ *         directory of 60k files was walked in full (tens of GB RSS). The
+ *         bounded discovery count applies to every root, and the skip line
+ *         names the limit AND the root so the reporter can act on it.
  * ══════════════════════════════════════════════════════════════════ */
 
 static char autoindex_skip_log[1024];
+static bool autoindex_saw_done;
 
-/* Keeps only the too_many_files skip line, so later lines cannot displace it. */
-static void autoindex_skip_capture_log(const char *line) {
-    if (line && strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
+/* Keeps only the too_many_files skip line, so later lines cannot displace it,
+ * and records whether an admitted auto-index actually ran to completion. */
+static void autoindex_limit_capture_log(const char *line) {
+    if (!line) {
+        return;
+    }
+    if (strstr(line, "msg=autoindex.skip") && strstr(line, "reason=too_many_files")) {
         snprintf(autoindex_skip_log, sizeof(autoindex_skip_log), "%s", line);
+    }
+    if (strstr(line, "msg=autoindex.done")) {
+        autoindex_saw_done = true;
     }
 }
 
-/* Drive initialize → maybe_auto_index over a fresh project holding more tracked
- * files than auto_index_limit, and capture the resulting skip warning.
+typedef struct {
+    int files;     /* indexable .py files written into the root */
+    int limit;     /* auto_index_limit */
+    bool git_root; /* emulate a checkout via <root>/.git/HEAD (no git binary) */
+} autoindex_limit_probe_t;
+
+static bool autoindex_limit_write_fixture(const char *repodir,
+                                          const autoindex_limit_probe_t *probe) {
+    if (th_mkdir_p(repodir) != 0) {
+        return false;
+    }
+    for (int i = 0; i < probe->files; i++) {
+        char path[640];
+        char body[96];
+        snprintf(path, sizeof(path), "%s/f%d.py", repodir, i);
+        snprintf(body, sizeof(body), "def f%d():\n    return %d\n", i, i);
+        if (th_write_file(path, body) != 0) {
+            return false;
+        }
+    }
+    if (probe->git_root) {
+        char gitdir[640];
+        char head[700];
+        snprintf(gitdir, sizeof(gitdir), "%s/.git", repodir);
+        snprintf(head, sizeof(head), "%s/HEAD", gitdir);
+        if (th_mkdir_p(gitdir) != 0 || th_write_file(head, "ref: refs/heads/main\n") != 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Drive initialize → maybe_auto_index over a fresh root holding probe->files
+ * indexable files under auto_index_limit=probe->limit. skip_out receives the
+ * too_many_files warning (empty when admitted); *done_out reports whether an
+ * admitted auto-index ran to completion (the server free joins the thread).
  * Returns false on fixture setup failure. */
-static bool autoindex_skip_warning(char *out, size_t out_size) {
+static bool autoindex_limit_probe(const autoindex_limit_probe_t *probe, char *skip_out,
+                                  size_t skip_size, bool *done_out) {
     char cache[256];
     snprintf(cache, sizeof(cache), "%s/cbm-autoindex-limit-XXXXXX", cbm_tmpdir());
     if (!cbm_mkdtemp(cache)) {
@@ -19123,12 +19173,7 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
 
     char repodir[512];
     snprintf(repodir, sizeof(repodir), "%s/repo", cache);
-    char file_a[640];
-    char file_b[640];
-    snprintf(file_a, sizeof(file_a), "%s/a.py", repodir);
-    snprintf(file_b, sizeof(file_b), "%s/b.py", repodir);
-    if (th_mkdir_p(repodir) != 0 || th_write_file(file_a, "def a():\n    return 1\n") != 0 ||
-        th_write_file(file_b, "def b():\n    return 2\n") != 0) {
+    if (!autoindex_limit_write_fixture(repodir, probe)) {
         th_rmtree(cache);
         return false;
     }
@@ -19148,27 +19193,31 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
     bool ok = false;
     cbm_config_t *cfg = cbm_config_open(cache);
     if (cfg) {
+        char limit[32];
+        snprintf(limit, sizeof(limit), "%d", probe->limit);
         cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX, "true");
-        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, "1");
+        cbm_config_set(cfg, CBM_CONFIG_AUTO_INDEX_LIMIT, limit);
 
         cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
         if (srv) {
             autoindex_skip_log[0] = '\0';
+            autoindex_saw_done = false;
             CBMLogLevel prev_level = cbm_log_get_level();
-            cbm_log_set_level(CBM_LOG_WARN);
+            cbm_log_set_level(CBM_LOG_INFO);
             cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
-            cbm_log_set_sink_ex(autoindex_skip_capture_log, CBM_LOG_SINK_REPLACE);
+            cbm_log_set_sink_ex(autoindex_limit_capture_log, CBM_LOG_SINK_REPLACE);
 
             cbm_mcp_server_set_config(srv, cfg);
             char *resp = cbm_mcp_server_handle(
                 srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
             free(resp);
-            cbm_mcp_server_free(srv);
+            cbm_mcp_server_free(srv); /* joins an admitted autoindex thread */
 
             cbm_log_set_sink(NULL);
             cbm_log_set_level(prev_level);
 
-            snprintf(out, out_size, "%s", autoindex_skip_log);
+            snprintf(skip_out, skip_size, "%s", autoindex_skip_log);
+            *done_out = autoindex_saw_done;
             ok = true;
         }
         cbm_config_close(cfg);
@@ -19184,8 +19233,10 @@ static bool autoindex_skip_warning(char *out, size_t out_size) {
 /* RED before the fix: the warning carries `limit=auto_index_limit`, the config
  * key constant, instead of the configured value. */
 TEST(autoindex_skip_reports_numeric_limit_issue1466) {
+    autoindex_limit_probe_t probe = {.files = 2, .limit = 1, .git_root = false};
     char warning[1024];
-    if (!autoindex_skip_warning(warning, sizeof(warning))) {
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
         PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
     }
     /* Not vacuous: the skip path must actually have been taken. */
@@ -19194,6 +19245,58 @@ TEST(autoindex_skip_reports_numeric_limit_issue1466) {
     ASSERT_NOT_NULL(strstr(warning, "files=2"));
     ASSERT_NOT_NULL(strstr(warning, "limit=1"));
     ASSERT_NULL(strstr(warning, "limit=auto_index_limit"));
+    ASSERT_FALSE(done);
+    PASS();
+}
+
+/* #713 at the reporter's shape scaled down (60 files vs limit 50, from
+ * 60k vs 50k): a PLAIN directory over the limit is refused, and the line
+ * names the limit and the root. RED on the `git ls-files` guard (count 0 →
+ * admitted → indexed) and RED while the line does not name the root. */
+TEST(autoindex_limit_guards_non_git_root_issue713) {
+    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = false};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+    const char *root = strstr(warning, "root=");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(strstr(root, "/repo"));
+    ASSERT_FALSE(done);
+    PASS();
+}
+
+/* The same plain directory one file UNDER the limit is admitted and indexed:
+ * the guard bounds, it does not fail closed on every non-git root. */
+TEST(autoindex_limit_admits_non_git_root_under_limit_issue713) {
+    autoindex_limit_probe_t probe = {.files = 49, .limit = 50, .git_root = false};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT(warning[0] == '\0');
+    ASSERT_TRUE(done);
+    PASS();
+}
+
+/* A checkout keeps its behaviour: one bounded count for both root kinds. */
+TEST(autoindex_limit_guards_git_root_issue713) {
+    autoindex_limit_probe_t probe = {.files = 60, .limit = 50, .git_root = true};
+    char warning[1024];
+    bool done = false;
+    if (!autoindex_limit_probe(&probe, warning, sizeof(warning), &done)) {
+        PASS(); /* fixture setup failed (tmpdir/cwd unavailable) — skip */
+    }
+    ASSERT_NOT_NULL(strstr(warning, "msg=autoindex.skip"));
+    ASSERT_NOT_NULL(strstr(warning, "reason=too_many_files"));
+    ASSERT_NOT_NULL(strstr(warning, "limit=50"));
+    ASSERT_NOT_NULL(strstr(warning, "root="));
+    ASSERT_FALSE(done);
     PASS();
 }
 
@@ -20477,6 +20580,9 @@ SUITE(mcp) {
     RUN_TEST(mcp_auto_watch_false_skips_watcher_on_connect);
     RUN_TEST(mcp_auto_watch_false_skips_supervised_autoindex_issue853);
     RUN_TEST(autoindex_skip_reports_numeric_limit_issue1466);
+    RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
+    RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
+    RUN_TEST(autoindex_limit_guards_git_root_issue713);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without

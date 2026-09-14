@@ -113,6 +113,18 @@ int cbm_canonical_path(const char *path, char *out, size_t out_sz);
 /* Delete an empty directory. Returns 0 on success. */
 int cbm_rmdir(const char *path);
 
+/* Exclusive lock file. Opens `path` and takes an exclusive lock the KERNEL
+ * releases on any process death -- POSIX open(O_CLOEXEC|O_NOFOLLOW) +
+ * flock(LOCK_EX|LOCK_NB); Windows _wsopen with _SH_DENYRW (deny every other
+ * open) and _O_NOINHERIT -- so ownership never outlives its holder and is
+ * never inherited by a spawned child. `create` false never creates the file.
+ * Returns the descriptor, or -1 with errno: EWOULDBLOCK/EAGAIN (POSIX) or
+ * EACCES (Windows sharing violation) when another holder is live, ENOENT
+ * when absent, otherwise the open error. Never use this on a SQLite file:
+ * on macOS an flock conflicts with SQLite's own fcntl byte locks. */
+int cbm_lockfile_open(const char *path, bool create);
+void cbm_lockfile_close(int fd);
+
 /* Open a file by UTF-8 path.
  * On Windows, converts to wide-char and calls _wfopen so paths with
  * non-ASCII characters (accents, CJK, etc.) are handled correctly.

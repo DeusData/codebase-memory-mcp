@@ -107,6 +107,32 @@ jobs:
         if: startsWith(matrix.os, 'ubuntu')
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev ccache
 
+      # Ubuntu 23.10+ ships kernel.apparmor_restrict_unprivileged_userns=1, which
+      # blocks unshare(CLONE_NEWUSER) for unprivileged users. Without this, the
+      # #1830 single-uid-userns smoke test SKIPS on every 24.04 leg, and its only
+      # real-namespace coverage lived on the two ubuntu-22.04 legs -- which are
+      # broad-matrix only (never PR CI) and which GitHub retires on 2027-04-17.
+      # A deliberate relaxation of a security check was therefore guarded by a
+      # test that ran in no PR and was on a clock. Hosted runners have
+      # passwordless sudo, so one sysctl puts it on the CORE matrix instead.
+      # Best-effort: a runner that refuses simply returns to skipping.
+      - name: Permit unprivileged user namespaces (Ubuntu)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || \
+            echo "could not lift the userns restriction; namespace tests will skip"
+          # Then SAY whether it worked. The runner prints per-shard aggregates
+          # ("N passed, M skipped") and never individual test names, so a
+          # namespace test that silently returns to skipping is invisible in a
+          # green log -- the same false assurance that let #1830 ship with a
+          # test that never executed. This line is the evidence. Probed exactly
+          # as the test does it: unprivileged, no sudo.
+          if unshare -U -r true 2>/dev/null; then
+            echo "CBM_USERNS_AVAILABLE=yes"
+          else
+            echo "CBM_USERNS_AVAILABLE=no (namespace-dependent tests will skip)"
+          fi
+
       - name: Install ccache (macOS)
         if: startsWith(matrix.os, 'macos')
         run: command -v ccache >/dev/null 2>&1 || brew install ccache
