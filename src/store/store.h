@@ -584,6 +584,9 @@ int cbm_store_insert_edge_batch(cbm_store_t *s, const cbm_edge_t *edges, int cou
 int cbm_store_fetch_call_edges(cbm_store_t *s, const char *project, int max_edges,
                                int64_t **out_src, int64_t **out_tgt, int *count, bool *truncated);
 
+/* Free the (source_id, target_id) arrays returned by cbm_store_fetch_call_edges. */
+void cbm_store_free_call_edges(int64_t *src, int64_t *tgt);
+
 /* Find edges by source node. */
 int cbm_store_find_edges_by_source(cbm_store_t *s, int64_t source_id, cbm_edge_t **out, int *count);
 
@@ -1012,6 +1015,9 @@ int cbm_leiden(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *e
 /* Convenience wrapper: cbm_leiden with resolution 1.0. */
 int cbm_louvain(const int64_t *nodes, int node_count, const cbm_louvain_edge_t *edges,
                 int edge_count, cbm_louvain_result_t **out, int *out_count);
+
+/* Free the result array returned by cbm_leiden / cbm_louvain. */
+void cbm_leiden_free(cbm_louvain_result_t *result);
 
 /* ── Memory management helpers ──────────────────────────────────── */
 
