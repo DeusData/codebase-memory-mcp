@@ -27,6 +27,7 @@
  */
 
 #include "ts_lsp.h"
+#include "extract_node_stack.h"
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -4634,13 +4635,15 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
     if (ts_node_is_null(body))
         return cbm_type_unknown();
 
-    // Iterative DFS using a small fixed-size stack to avoid C-stack blowup on big bodies.
-    enum { STACK_CAP = 256 };
-    TSNode stack[STACK_CAP];
-    int top = 0;
-    stack[top++] = body;
-    while (top > 0) {
-        TSNode n = stack[--top];
+    // Iterative DFS to avoid C-stack blowup on big bodies. The stack grows, so a
+    // body wider than any fixed cap is still walked in full: a fixed 256 slots
+    // used to stop pushing without a word, and this function then answered
+    // "unknown return type" for a body whose return it had never reached.
+    TSNodeStack stack;
+    ts_nstack_init_arena(&stack, ctx->arena, 256);
+    ts_nstack_push(&stack, body);
+    while (stack.count > 0) {
+        TSNode n = ts_nstack_pop(&stack);
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
@@ -4662,10 +4665,7 @@ static const CBMType *infer_return_type_from_body(TSLSPContext *ctx, TSNode body
             strcmp(k, "arrow_function") == 0 || strcmp(k, "method_definition") == 0)
             continue;
 
-        uint32_t cnt = ts_node_child_count(n);
-        for (uint32_t i = 0; i < cnt && top < STACK_CAP; i++) {
-            stack[top++] = ts_node_child(n, i);
-        }
+        ts_nstack_push_children(&stack, n);
     }
     return cbm_type_unknown();
 }
@@ -4681,31 +4681,29 @@ static void rebuild_signatures_from_ast(TSLSPContext *ctx, TSNode root, CBMTypeR
     if (ts_node_is_null(root) || !reg || !ctx->module_qn)
         return;
 
-    enum { STACK_CAP = 256 };
-    TSNode stack[STACK_CAP];
-    int top = 0;
-    uint32_t nc = ts_node_child_count(root);
-    for (uint32_t i = 0; i < nc && top < STACK_CAP; i++)
-        stack[top++] = ts_node_child(root, i);
+    /* The stack grows. A fixed 256 slots used to be filled by the seeding loop
+     * alone on a file with that many top-level children, and every declaration
+     * past it was then skipped without a word — it kept whatever signature
+     * extract_defs had guessed. */
+    TSNodeStack stack;
+    ts_nstack_init_arena(&stack, ctx->arena, 256);
+    ts_nstack_push_children(&stack, root);
 
-    while (top > 0) {
-        TSNode n = stack[--top];
+    while (stack.count > 0) {
+        TSNode n = ts_nstack_pop(&stack);
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
 
         // Recurse into export_statement and class bodies.
         if (strcmp(k, "export_statement") == 0 || strcmp(k, "class_body") == 0) {
-            uint32_t cnt = ts_node_child_count(n);
-            for (uint32_t i = 0; i < cnt && top < STACK_CAP; i++) {
-                stack[top++] = ts_node_child(n, i);
-            }
+            ts_nstack_push_children(&stack, n);
             continue;
         }
         if (strcmp(k, "class_declaration") == 0) {
             TSNode body = ts_node_child_by_field_name(n, "body", TS_LSP_FIELD_LEN("body"));
-            if (!ts_node_is_null(body) && top < STACK_CAP)
-                stack[top++] = body;
+            if (!ts_node_is_null(body))
+                ts_nstack_push(&stack, body);
             continue;
         }
 
@@ -4845,31 +4843,29 @@ static void convert_signature_type_params(TSLSPContext *ctx, TSNode root, CBMTyp
         return;
 
     // Walk: function_declaration, class_declaration { method_definition }, plus exported.
-    enum { STACK_CAP = 256 };
-    TSNode stack[STACK_CAP];
-    int top = 0;
-    uint32_t nc = ts_node_child_count(root);
-    for (uint32_t i = 0; i < nc && top < STACK_CAP; i++)
-        stack[top++] = ts_node_child(root, i);
+    /* The stack grows. A fixed 256 slots used to be filled by the seeding loop
+     * alone on a file with that many top-level children, and every declaration
+     * past it was then skipped without a word — it kept whatever signature
+     * extract_defs had guessed. */
+    TSNodeStack stack;
+    ts_nstack_init_arena(&stack, ctx->arena, 256);
+    ts_nstack_push_children(&stack, root);
 
-    while (top > 0) {
-        TSNode n = stack[--top];
+    while (stack.count > 0) {
+        TSNode n = ts_nstack_pop(&stack);
         if (ts_node_is_null(n))
             continue;
         const char *k = ts_node_type(n);
 
         // Recurse into export_statement and class_body.
         if (strcmp(k, "export_statement") == 0 || strcmp(k, "class_body") == 0) {
-            uint32_t cnt = ts_node_child_count(n);
-            for (uint32_t i = 0; i < cnt && top < STACK_CAP; i++) {
-                stack[top++] = ts_node_child(n, i);
-            }
+            ts_nstack_push_children(&stack, n);
             continue;
         }
         if (strcmp(k, "class_declaration") == 0) {
             TSNode body = ts_node_child_by_field_name(n, "body", TS_LSP_FIELD_LEN("body"));
-            if (!ts_node_is_null(body) && top < STACK_CAP)
-                stack[top++] = body;
+            if (!ts_node_is_null(body))
+                ts_nstack_push(&stack, body);
             continue;
         }
 
