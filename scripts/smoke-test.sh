@@ -1395,11 +1395,21 @@ if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex \
   cat "$CODEX_ONLY_LOG"
   exit 1
 fi
+mkdir -p "$CODEX_ONLY_HOME/.openhands"
+if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex,openhands \
+     --dir="$CODEX_ONLY_INSTALL" ||
+   ! grep -q '^name: codebase-memory$' "$CODEX_ONLY_SKILL" 2>/dev/null ||
+   [ "$(smoke_file_sha256 "$CODEX_ONLY_LEGACY")" != "$CODEX_ONLY_FOREIGN_HASH" ]; then
+  echo "FAIL 8-codex-5: a foreign Codex legacy skill blocked a shared-client install"
+  cat "$CODEX_ONLY_LOG"
+  exit 1
+fi
+rm -f "$CODEX_ONLY_SKILL"
 if ! run_codex_only "$CODEX_ONLY_BIN" install --force -y --clients=codex \
      --dir="$CODEX_ONLY_INSTALL" ||
    ! grep -q '^name: codebase-memory$' "$CODEX_ONLY_SKILL" 2>/dev/null ||
    [ -e "$CODEX_ONLY_LEGACY" ]; then
-  echo "FAIL 8-codex-5: force did not converge a foreign legacy skill"
+  echo "FAIL 8-codex-6: force did not converge a foreign legacy skill"
   cat "$CODEX_ONLY_LOG"
   exit 1
 fi
@@ -1407,7 +1417,7 @@ CODEX_ONLY_HASH=$(smoke_file_sha256 "$CODEX_ONLY_SKILL")
 if ! run_codex_only "$CODEX_ONLY_BIN" install -y --clients=codex \
      --dir="$CODEX_ONLY_INSTALL" ||
    [ "$(smoke_file_sha256 "$CODEX_ONLY_SKILL")" != "$CODEX_ONLY_HASH" ]; then
-  echo "FAIL 8-codex-6: repeated Codex install was not idempotent"
+  echo "FAIL 8-codex-7: repeated Codex install was not idempotent"
   cat "$CODEX_ONLY_LOG"
   exit 1
 fi
@@ -1826,6 +1836,8 @@ fi
 CODEX_LIFECYCLE_HOME=$(smoke_mktemp_dir)
 CODEX_LIFECYCLE_ROOT="$CODEX_LIFECYCLE_HOME/.codex"
 CODEX_INSTRUCTIONS="$CODEX_LIFECYCLE_ROOT/AGENTS.md"
+CODEX_LIFECYCLE_SKILL="$CODEX_LIFECYCLE_HOME/.agents/skills/codebase-memory/SKILL.md"
+CODEX_LIFECYCLE_LEGACY_SKILL="$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md"
 mkdir -p "$CODEX_LIFECYCLE_ROOT"
 
 CODEX_FRESH_LOG=$(smoke_mktemp_file)
@@ -1839,7 +1851,8 @@ if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
    [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
      "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
    ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
-   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_SKILL" ||
+   [ -e "$CODEX_LIFECYCLE_LEGACY_SKILL" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
    [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
@@ -1936,8 +1949,10 @@ if ! HOME="$CODEX_LIFECYCLE_HOME" \
 fi
 if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
    [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
-     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ]; then
-  echo "FAIL 8i: Codex uninstall did not remove only the activation pointer"
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ] ||
+   [ -e "$CODEX_LIFECYCLE_SKILL" ] ||
+   [ -e "$CODEX_LIFECYCLE_LEGACY_SKILL" ]; then
+  echo "FAIL 8i: Codex uninstall did not remove only installer-owned surfaces"
   exit 1
 fi
 echo "OK 8i: isolated Codex activation-pointer lifecycle"

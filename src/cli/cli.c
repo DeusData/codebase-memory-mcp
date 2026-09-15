@@ -1421,6 +1421,232 @@ int cbm_replace_binary(const char *path, const unsigned char *data, int len, int
 /* Consolidated from 4 separate skills into 1 with progressive disclosure.
  * This embedded version is the single source of truth for the CLI installer.
  * Based on PR #81 by @gdilla — factual corrections applied. */
+static const char released_skill_content_v0_6_0[] =
+    "---\n"
+    "name: codebase-memory\n"
+    "description: Use the codebase knowledge graph for structural code queries. "
+    "Triggers on: explore the codebase, understand the architecture, what functions exist, "
+    "show me the structure, who calls this function, what does X call, trace the call chain, "
+    "find callers of, show dependencies, impact analysis, dead code, unused functions, "
+    "high fan-out, refactor candidates, code quality audit, graph query syntax, "
+    "Cypher query examples, edge types, how to use search_graph.\n"
+    "---\n"
+    "\n"
+    "# Codebase Memory — Knowledge Graph Tools\n"
+    "\n"
+    "Graph tools return precise structural results in ~500 tokens vs ~80K for grep.\n"
+    "\n"
+    "## Quick Decision Matrix\n"
+    "\n"
+    "| Question | Tool call |\n"
+    "|----------|----------|\n"
+    "| Who calls X? | `trace_path(direction=\"inbound\")` |\n"
+    "| What does X call? | `trace_path(direction=\"outbound\")` |\n"
+    "| Full call context | `trace_path(direction=\"both\")` |\n"
+    "| Find by name pattern | `search_graph(name_pattern=\"...\")` |\n"
+    "| Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |\n"
+    "| Cross-service edges | `query_graph` with Cypher |\n"
+    "| Impact of local changes | `detect_changes()` |\n"
+    "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"
+    "| Text search | `search_code` or Grep |\n"
+    "\n"
+    "## Exploration Workflow\n"
+    "1. `list_projects` — check if project is indexed\n"
+    "2. `get_graph_schema` — understand node/edge types\n"
+    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"
+    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"
+    "\n"
+    "## Tracing Workflow\n"
+    "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"
+    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace\n"
+    "3. `detect_changes()` — map git diff to affected symbols\n"
+    "\n"
+    "## Quality Analysis\n"
+    "- Dead code: `search_graph(max_degree=0, exclude_entry_points=true)`\n"
+    "- High fan-out: `search_graph(min_degree=10, relationship=\"CALLS\", "
+    "direction=\"outbound\")`\n"
+    "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "
+    "direction=\"inbound\")`\n"
+    "\n"
+    "## 14 MCP Tools\n"
+    "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"
+    "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"
+    "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"
+    "`manage_adr`, `ingest_traces`\n"
+    "\n"
+    "## Edge Types\n"
+    "CALLS, HTTP_CALLS, ASYNC_CALLS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
+    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, FILE_CHANGES_WITH,\n"
+    "CONTAINS_FILE, CONTAINS_FOLDER, CONTAINS_PACKAGE\n"
+    "\n"
+    "## Cypher Examples (for query_graph)\n"
+    "```\n"
+    "MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, "
+    "r.confidence LIMIT 20\n"
+    "MATCH (f:Function) WHERE f.name =~ '.*Handler.*' RETURN f.name, f.file_path\n"
+    "MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'main' RETURN b.name\n"
+    "```\n"
+    "\n"
+    "## Gotchas\n"
+    "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "
+    "use `query_graph` with Cypher to see actual edges.\n"
+    "2. `query_graph` has a 200-row cap — use `search_graph` with degree filters "
+    "for counting.\n"
+    "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n"
+    "4. `direction=\"outbound\"` misses cross-service callers — use "
+    "`direction=\"both\"`.\n"
+    "5. Results default to 10 per page — check `has_more` and use `offset`.\n";
+
+#define CBM_RELEASED_SKILL_HEADER_UNQUOTED                                                     \
+    "---\n"                                                                                    \
+    "name: codebase-memory\n"                                                                  \
+    "description: Use the codebase knowledge graph for structural code queries. "              \
+    "Triggers on: explore the codebase, understand the architecture, what functions exist, "   \
+    "show me the structure, who calls this function, what does X call, trace the call chain, " \
+    "find callers of, show dependencies, impact analysis, dead code, unused functions, "       \
+    "high fan-out, refactor candidates, code quality audit, graph query syntax, "              \
+    "Cypher query examples, edge types, how to use search_graph.\n"                            \
+    "---\n"
+
+#define CBM_RELEASED_SKILL_HEADER_QUOTED                                                       \
+    "---\n"                                                                                    \
+    "name: codebase-memory\n"                                                                  \
+    "description: \"Use the codebase knowledge graph for structural code queries. "            \
+    "Triggers on: explore the codebase, understand the architecture, what functions exist, "   \
+    "show me the structure, who calls this function, what does X call, trace the call chain, " \
+    "find callers of, show dependencies, impact analysis, dead code, unused functions, "       \
+    "high fan-out, refactor candidates, code quality audit, graph query syntax, "              \
+    "Cypher query examples, edge types, how to use search_graph.\"\n"                          \
+    "---\n"
+
+#define CBM_RELEASED_SKILL_BODY_BEFORE_EDGE_TYPES                                                  \
+    "\n"                                                                                           \
+    "# Codebase Memory — Knowledge Graph Tools\n"                                                  \
+    "\n"                                                                                           \
+    "Graph tools return precise structural results in ~500 tokens vs ~80K for grep.\n"             \
+    "\n"                                                                                           \
+    "## Quick Decision Matrix\n"                                                                   \
+    "\n"                                                                                           \
+    "| Question | Tool call |\n"                                                                   \
+    "|----------|----------|\n"                                                                    \
+    "| Who calls X? | `trace_path(direction=\"inbound\")` |\n"                                     \
+    "| What does X call? | `trace_path(direction=\"outbound\")` |\n"                               \
+    "| Full call context | `trace_path(direction=\"both\")` |\n"                                   \
+    "| Find by name pattern | `search_graph(name_pattern=\"...\")` |\n"                            \
+    "| Dead code | `search_graph(max_degree=0, exclude_entry_points=true)` |\n"                    \
+    "| Cross-service edges | `query_graph` with Cypher |\n"                                        \
+    "| Impact of local changes | `detect_changes()` |\n"                                           \
+    "| Risk-classified trace | `trace_path(risk_labels=true)` |\n"                                 \
+    "| Text search | `search_code` or Grep |\n"                                                    \
+    "\n"                                                                                           \
+    "## Exploration Workflow\n"                                                                    \
+    "1. `list_projects` — check if project is indexed\n"                                           \
+    "2. `get_graph_schema` — understand node/edge types\n"                                         \
+    "3. `search_graph(label=\"Function\", name_pattern=\".*Pattern.*\")` — find code\n"            \
+    "4. `get_code_snippet(qualified_name=\"project.path.FuncName\")` — read source\n"              \
+    "\n"                                                                                           \
+    "## Tracing Workflow\n"                                                                        \
+    "1. `search_graph(name_pattern=\".*FuncName.*\")` — discover exact name\n"                     \
+    "2. `trace_path(function_name=\"FuncName\", direction=\"both\", depth=3)` — trace\n"           \
+    "3. `detect_changes()` — map git diff to affected symbols\n"                                   \
+    "\n"                                                                                           \
+    "## Evidence Tiers\n"                                                                          \
+    "- **Scout (Tier 1):** fast positive lookup with few graph calls and targeted source checks. " \
+    "Treat results as provisional; never make absence, exhaustive, dead-code, or complete-impact " \
+    "claims.\n"                                                                                    \
+    "- **Verify (Tier 2, default):** task-directed searches, relevant trace directions, exact "    \
+    "snippets for material claims, and all relevant result pages.\n"                               \
+    "- **Auditor (Tier 3):** bounded-scope full verification with a current graph generation, "    \
+    "complete relevant pagination, both call directions and broader relationships when material, " \
+    "plus explicit unresolved limitations.\n"                                                      \
+    "- **Every tier:** after candidate paths are known, call `check_index_coverage` once with "    \
+    "every "                                                                                       \
+    "evidence path. For negative or exhaustive claims also include the relevant scopes. A clean "  \
+    "result means no recorded gap, not proof of completeness. For partial, skipped, excluded, "    \
+    "stale, pending, or unknown coverage, read/grep the reported ranges or scope before relying "  \
+    "on "                                                                                          \
+    "the graph.\n"                                                                                 \
+    "\n"                                                                                           \
+    "## Sessions and Subagents\n"                                                                  \
+    "- At session start or after compaction, call `list_projects`/`index_status` before "          \
+    "structural exploration, then choose Scout, Verify, or Auditor for the task.\n"                \
+    "- Before delegating, query the graph and coverage in the parent. Pass the tier, exact "       \
+    "project, "                                                                                    \
+    "generation/freshness, bounded scope, queries and pagination state, qualified symbols, "       \
+    "paths, "                                                                                      \
+    "call-chain findings, coverage ranges/reasons, source fallback already performed, and "        \
+    "unresolved "                                                                                  \
+    "questions to the child.\n"                                                                    \
+    "- Runtimes such as Hermes isolate child context: put those graph findings in the "            \
+    "`context` argument to `delegate_task`; do not assume the child inherits MCP access or "       \
+    "the parent's conversation.\n"                                                                 \
+    "- A child without MCP tools must not call or claim MCP access. It should work from the "      \
+    "supplied "                                                                                    \
+    "evidence and use read/grep on exact source, especially every reported missed-coverage "       \
+    "range.\n"                                                                                     \
+    "\n"                                                                                           \
+    "## Quality Analysis\n"                                                                        \
+    "- Dead code: `search_graph(max_degree=0, exclude_entry_points=true)`\n"                       \
+    "- High fan-out: `search_graph(min_degree=10, relationship=\"CALLS\", "                        \
+    "direction=\"outbound\")`\n"                                                                   \
+    "- High fan-in: `search_graph(min_degree=10, relationship=\"CALLS\", "                         \
+    "direction=\"inbound\")`\n"                                                                    \
+    "\n"                                                                                           \
+    "## 15 MCP Tools\n"                                                                            \
+    "`index_repository`, `index_status`, `list_projects`, `delete_project`,\n"                     \
+    "`search_graph`, `search_code`, `trace_path`, `detect_changes`,\n"                             \
+    "`query_graph`, `get_graph_schema`, `get_code_snippet`, `get_architecture`,\n"                 \
+    "`check_index_coverage`, `manage_adr`, `ingest_traces`\n"                                      \
+    "\n"                                                                                           \
+    "## Edge Types\n"                                                                              \
+    "CALLS, HTTP_CALLS, ASYNC_CALLS, DATA_FLOWS, IMPORTS, DEFINES, DEFINES_METHOD,\n"
+
+#define CBM_RELEASED_SKILL_EDGE_TYPES_PRE_V0_10 \
+    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CONFIGURES, FILE_CHANGES_WITH,\n"
+
+#define CBM_RELEASED_SKILL_EDGE_TYPES_V0_10 \
+    "HANDLES, IMPLEMENTS, OVERRIDE, USAGE, CALL_REFERENCE, CONFIGURES, FILE_CHANGES_WITH,\n"
+
+#define CBM_RELEASED_SKILL_BODY_AFTER_EDGE_TYPES                                        \
+    "SIMILAR_TO, SEMANTICALLY_RELATED, CONTAINS_FILE, CONTAINS_FOLDER,\n"               \
+    "CONTAINS_PACKAGE\n"                                                                \
+    "\n"                                                                                \
+    "## Cypher Examples (for query_graph)\n"                                            \
+    "```\n"                                                                             \
+    "MATCH (a)-[r:HTTP_CALLS]->(b) RETURN a.name, b.name, r.url_path, "                 \
+    "r.confidence LIMIT 20\n"                                                           \
+    "MATCH (f:Function) WHERE f.name =~ '.*Handler.*' RETURN f.name, f.file_path\n"     \
+    "MATCH (a)-[r:CALLS]->(b) WHERE a.name = 'main' RETURN b.name\n"                    \
+    "```\n"                                                                             \
+    "\n"                                                                                \
+    "## Gotchas\n"                                                                      \
+    "1. `search_graph(relationship=\"HTTP_CALLS\")` filters nodes by degree — "         \
+    "use `query_graph` with Cypher to see actual edges.\n"                              \
+    "2. `query_graph` has a 100k row ceiling — add a Cypher `LIMIT` for broad queries " \
+    "or use `search_graph` pagination.\n"                                               \
+    "3. `trace_path` needs exact names — use `search_graph(name_pattern=...)` first.\n" \
+    "4. `direction=\"outbound\"` misses cross-service callers — use "                   \
+    "`direction=\"both\"`.\n"                                                           \
+    "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n"
+
+/* Exact payload generations shipped before the current skill text. */
+static const char released_skill_content_v0_9_1[] =
+    CBM_RELEASED_SKILL_HEADER_UNQUOTED CBM_RELEASED_SKILL_BODY_BEFORE_EDGE_TYPES
+        CBM_RELEASED_SKILL_EDGE_TYPES_PRE_V0_10 CBM_RELEASED_SKILL_BODY_AFTER_EDGE_TYPES;
+static const char released_skill_content_v0_10_0[] =
+    CBM_RELEASED_SKILL_HEADER_UNQUOTED CBM_RELEASED_SKILL_BODY_BEFORE_EDGE_TYPES
+        CBM_RELEASED_SKILL_EDGE_TYPES_V0_10 CBM_RELEASED_SKILL_BODY_AFTER_EDGE_TYPES;
+static const char released_skill_content_v0_10_3[] =
+    CBM_RELEASED_SKILL_HEADER_QUOTED CBM_RELEASED_SKILL_BODY_BEFORE_EDGE_TYPES
+        CBM_RELEASED_SKILL_EDGE_TYPES_V0_10 CBM_RELEASED_SKILL_BODY_AFTER_EDGE_TYPES;
+
+#undef CBM_RELEASED_SKILL_BODY_AFTER_EDGE_TYPES
+#undef CBM_RELEASED_SKILL_EDGE_TYPES_V0_10
+#undef CBM_RELEASED_SKILL_EDGE_TYPES_PRE_V0_10
+#undef CBM_RELEASED_SKILL_BODY_BEFORE_EDGE_TYPES
+#undef CBM_RELEASED_SKILL_HEADER_QUOTED
+#undef CBM_RELEASED_SKILL_HEADER_UNQUOTED
+
 static const char skill_content[] =
     "---\n"
     "name: codebase-memory\n"
@@ -1535,6 +1761,19 @@ static const char skill_content[] =
     "`direction=\"both\"`.\n"
     "5. `search_graph` results default to 50 per page — check `has_more` and use `offset`.\n";
 
+/* Byte-exact consolidated skill payloads shipped by each release range. */
+static const char *const released_skill_contents[] = {
+    /* 0.6.0 through v0.9.0 */
+    released_skill_content_v0_6_0,
+    /* v0.9.1-rc.1 */
+    released_skill_content_v0_9_1,
+    /* v0.10.0 through v0.10.2 */
+    released_skill_content_v0_10_0,
+    /* v0.10.3 through v0.10.8 */
+    released_skill_content_v0_10_3,
+};
+enum { RELEASED_SKILL_CONTENT_COUNT = 4 };
+
 static const char codex_instructions_content[] =
     "For structural codebase exploration, use the installed `codebase-memory` skill.\n";
 
@@ -1554,6 +1793,16 @@ static const cbm_skill_t skills[CBM_SKILL_COUNT] = {
 const cbm_skill_t *cbm_get_skills(void) {
     return skills;
 }
+
+#ifdef CBM_CLI_ENABLE_TEST_API
+size_t cbm_cli_released_skill_content_count(void) {
+    return RELEASED_SKILL_CONTENT_COUNT;
+}
+
+const char *cbm_cli_released_skill_content_at(size_t index) {
+    return index < RELEASED_SKILL_CONTENT_COUNT ? released_skill_contents[index] : NULL;
+}
+#endif
 
 const char *cbm_get_codex_instructions(void) {
     return codex_instructions_content;
@@ -8125,7 +8374,6 @@ typedef struct {
 static cbm_install_plan_t *g_install_plan = NULL;
 static int g_agent_install_errors = 0;
 static int g_agent_uninstall_errors = 0;
-static char g_blocked_shared_skill_dir[CLI_BUF_1K];
 
 /* Every agent configuration uninstall could not clean, kept for the closing
  * summary. A cleanup failure no longer stops executable and index removal
@@ -8611,14 +8859,6 @@ static void install_agent_skill(const char *label, const char *skills_dir, bool 
     if (written < 0 || (size_t)written >= sizeof(skill_path)) {
         return;
     }
-    if (g_blocked_shared_skill_dir[0] &&
-        (cbm_json_mcp_paths_equal(skills_dir, g_blocked_shared_skill_dir) ||
-         cbm_same_file(skills_dir, g_blocked_shared_skill_dir))) {
-        if (!g_install_plan) {
-            printf("  skill: %s (skipped to avoid a duplicate Codex skill)\n", skill_path);
-        }
-        return;
-    }
     if (g_install_plan) {
         plan_record(label, "skill", skill_path);
         return;
@@ -8702,7 +8942,8 @@ static cbm_codex_skill_state_t cbm_codex_skill_state(const char *skills_dir,
         return CBM_CODEX_SKILL_UNSAFE;
     }
 
-    int ownership = cbm_text_owned_document_status(skill_file, skill_content, NULL, 0);
+    int ownership = cbm_text_owned_document_status(
+        skill_file, skill_content, released_skill_contents, RELEASED_SKILL_CONTENT_COUNT);
     if (ownership == CLI_OK) {
         return CBM_CODEX_SKILL_MANAGED;
     }
@@ -8716,23 +8957,18 @@ static void cbm_warn_codex_skill_conflict(const cbm_codex_skill_paths_t *paths,
                   reason, paths->canonical_file, paths->legacy_file);
 }
 
-static void cbm_block_shared_skill_install(const cbm_codex_skill_paths_t *paths) {
-    (void)snprintf(g_blocked_shared_skill_dir, sizeof(g_blocked_shared_skill_dir), "%s",
-                   paths->canonical_dir);
-}
-
-static void cbm_block_shared_skill_if_codex_conflicts(const char *home, const char *config_dir) {
-    cbm_codex_skill_paths_t paths;
-    if (!cbm_codex_skill_paths_init(home, config_dir, &paths) || paths.same_dir) {
-        return;
+static bool cbm_refresh_codex_managed_skill(const cbm_codex_skill_paths_t *paths, bool dry_run) {
+    if (dry_run) {
+        return true;
     }
-
-    cbm_codex_skill_state_t canonical =
-        cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file);
-    cbm_codex_skill_state_t legacy = cbm_codex_skill_state(paths.legacy_dir, paths.legacy_file);
-    if (canonical == CBM_CODEX_SKILL_ABSENT && legacy != CBM_CODEX_SKILL_ABSENT) {
-        cbm_block_shared_skill_install(&paths);
+    int result =
+        cbm_text_migrate_owned_document(paths->canonical_file, skill_content,
+                                        released_skill_contents, RELEASED_SKILL_CONTENT_COUNT);
+    if (result == CLI_OK) {
+        return true;
     }
+    record_agent_config_error(false, "Codex CLI", "skill_install", paths->canonical_file);
+    return false;
 }
 
 static bool cbm_remove_codex_managed_skill(const char *skills_dir, const char *skill_file,
@@ -8755,9 +8991,15 @@ static bool cbm_remove_codex_managed_skill(const char *skills_dir, const char *s
         printf("  Codex skill: %s (would remove)\n", skill_file);
         return true;
     }
-    int removed = cbm_remove_skills(skills_dir, false);
-    if (removed == CBM_SKILL_COUNT &&
+    int removed = cbm_text_remove_owned_document_any(
+        skill_file, skill_content, released_skill_contents, RELEASED_SKILL_CONTENT_COUNT);
+    if (removed == CLI_OK &&
         cbm_codex_skill_state(skills_dir, skill_file) == CBM_CODEX_SKILL_ABSENT) {
+        char skill_dir[CLI_BUF_1K];
+        int written = snprintf(skill_dir, sizeof(skill_dir), "%s/codebase-memory", skills_dir);
+        if (written > 0 && (size_t)written < sizeof(skill_dir)) {
+            (void)cbm_remove_empty_directory(skill_dir, false);
+        }
         return true;
     }
     record_agent_config_error(uninstalling, "Codex CLI", operation, skill_file);
@@ -8789,10 +9031,6 @@ static void install_codex_skill(const char *home, const char *config_dir, bool f
             (canonical == CBM_CODEX_SKILL_ABSENT || canonical == CBM_CODEX_SKILL_MANAGED)) {
             plan_record("Codex CLI", "cleanup_skill", paths.legacy_file);
         }
-        if (canonical == CBM_CODEX_SKILL_ABSENT &&
-            (legacy == CBM_CODEX_SKILL_UNOWNED || legacy == CBM_CODEX_SKILL_UNSAFE)) {
-            cbm_block_shared_skill_install(&paths);
-        }
         return;
     }
 
@@ -8806,6 +9044,9 @@ static void install_codex_skill(const char *home, const char *config_dir, bool f
             return;
         }
         install_agent_skill("Codex CLI", paths.canonical_dir, force, dry_run);
+        if (!cbm_refresh_codex_managed_skill(&paths, dry_run)) {
+            return;
+        }
         if (!dry_run && cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file) !=
                             CBM_CODEX_SKILL_MANAGED) {
             record_agent_config_error(false, "Codex CLI", "skill_install", paths.canonical_file);
@@ -8822,9 +9063,6 @@ static void install_codex_skill(const char *home, const char *config_dir, bool f
         return;
     }
     if (legacy == CBM_CODEX_SKILL_UNSAFE) {
-        if (canonical == CBM_CODEX_SKILL_ABSENT) {
-            cbm_block_shared_skill_install(&paths);
-        }
         if (force && !dry_run) {
             record_agent_config_error(false, "Codex CLI", "legacy_skill_migration",
                                       paths.legacy_file);
@@ -8835,9 +9073,6 @@ static void install_codex_skill(const char *home, const char *config_dir, bool f
     }
 
     if (!force && legacy == CBM_CODEX_SKILL_UNOWNED) {
-        if (canonical == CBM_CODEX_SKILL_ABSENT) {
-            cbm_block_shared_skill_install(&paths);
-        }
         cbm_warn_codex_skill_conflict(&paths, "the legacy skill is not installer-owned");
         return;
     }
@@ -8880,6 +9115,9 @@ static void install_codex_skill(const char *home, const char *config_dir, bool f
             printf("  legacy Codex skill: %s (would remove after canonical install)\n",
                    paths.legacy_file);
         }
+        return;
+    }
+    if (!cbm_refresh_codex_managed_skill(&paths, false)) {
         return;
     }
     if (cbm_codex_skill_state(paths.canonical_dir, paths.canonical_file) !=
@@ -9801,7 +10039,6 @@ static void install_cli_agent_configs(const cbm_detected_agents_t *agents, const
                                                  true, &preflight_failure)
                                            : CLI_ERR;
         if (preflight_result != CLI_OK) {
-            cbm_block_shared_skill_if_codex_conflicts(home, config_dir);
             if (!g_install_plan) {
                 printf("Codex CLI:\n");
                 fflush(stdout);
@@ -10606,7 +10843,6 @@ static int cbm_install_agent_configs_in_scope(const char *home, const char *bina
 
 int cbm_install_agent_configs(const char *home, const char *binary_path, bool force, bool dry_run) {
     g_agent_install_errors = 0;
-    g_blocked_shared_skill_dir[0] = '\0';
     cbm_detected_agents_t agents = cbm_detect_agents(home);
     if (g_client_selection && !cli_clients_apply_selection(g_client_selection, &agents)) {
         return CLI_ERR;
