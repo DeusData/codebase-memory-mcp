@@ -119,6 +119,12 @@ TSNode cbm_resolve_func_name(TSNode node, CBMLanguage lang);
 // def extractor — drift dropped the class qualifier from in-body calls (#554/#621).
 char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *source);
 
+/* Go: resolve a method_declaration's receiver parameter_list down to the bare
+ * receiver type_identifier (unwrapping pointer_type / generic_type). Shared by
+ * def extraction (extract_defs.c) and call-scope attribution
+ * (extract_unified.c) so the receiver-qualified method QN has ONE formula. */
+char *cbm_go_receiver_type_name(CBMArena *a, TSNode recv, const char *source);
+
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 

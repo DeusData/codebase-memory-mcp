@@ -3444,8 +3444,9 @@ TEST(parallel_go_cross_package_field_chain_resolves) {
     cbm_gbuf_t *gbuf = run_go_field_chain_sequential("go_field_fold", tmpdir, files, 2);
     ASSERT_NOT_NULL(gbuf);
 
-    const cbm_gbuf_edge_t *edge =
-        find_call_edge_to_target_fragment(gbuf, "handler.PlaceOrder", ".service.PlaceOrder");
+    /* Since #1909, Go method QNs are receiver-qualified on both endpoints. */
+    const cbm_gbuf_edge_t *edge = find_call_edge_to_target_fragment(
+        gbuf, "OrderHandler.PlaceOrder", ".service.OrderService.PlaceOrder");
     const bool found = edge != NULL;
     const bool dispatch = edge && edge->properties_json &&
                           strstr(edge->properties_json, "\"strategy\":\"lsp_type_dispatch\"");
