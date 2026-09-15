@@ -1192,7 +1192,8 @@ static void handle_index_start(cbm_http_server_t *server, cbm_http_conn_t *c,
     }
     if (!cbm_workspace_root_allowed(canonical_root, cbm_workspace_home_dir(),
                                     cbm_workspace_cache_dir(), getenv("CBM_ALLOWED_ROOT"),
-                                    boundary_err, sizeof(boundary_err))) {
+                                    getenv("PATH_ALLOW_BROAD"), boundary_err,
+                                    sizeof(boundary_err))) {
         yyjson_doc_free(doc);
         char escaped[1024];
         cbm_json_escape(escaped, (int)sizeof(escaped), boundary_err);
