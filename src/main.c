@@ -854,6 +854,11 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     const char *worker_marker = cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_MARKER_ARG);
     const char *worker_quarantine =
         cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_QUARANTINE_ARG);
+    if (index_worker) {
+        /* The graph lives on this process's heaps: SQLite gets heaps of its
+         * own here, and only here (cbm_sqlite_dedicated_heap). */
+        cbm_sqlite_dedicated_heap(true);
+    }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
                                       cbm_index_worker_memory_budget_bytes());

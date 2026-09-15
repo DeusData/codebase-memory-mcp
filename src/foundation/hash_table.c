@@ -27,11 +27,26 @@
  * include below generates static inline functions named cbm_vt_init,
  * cbm_vt_cleanup, cbm_vt_get, cbm_vt_insert, etc., plus the cbm_vt
  * struct itself. */
+/* Verstable allocates its bucket/entry blocks through the memory core; the
+ * table's ctx is the class those blocks are charged to (Verstable hands the
+ * ctx and the block size to both hooks). Without this the graph buffer's
+ * 8.5M node keys and 15.8M edge keys on the kernel were memory no class
+ * could see. */
+static void *ht_alloc_in(size_t size, cbm_mem_class_t *cls) {
+    return cbm_alloc(*cls, size);
+}
+static void ht_free_in(void *ptr, size_t size, cbm_mem_class_t *cls) {
+    (void)size;
+    cbm_free(*cls, ptr);
+}
 #define NAME cbm_vt
 #define KEY_TY const char *
 #define VAL_TY void *
 #define HASH_FN vt_hash_string
 #define CMPR_FN vt_cmpr_string
+#define CTX_TY cbm_mem_class_t
+#define MALLOC_FN ht_alloc_in
+#define FREE_FN ht_free_in
 #include "../../internal/cbm/vendored/verstable/verstable.h"
 
 /* The opaque CBMHashTable struct holds the Verstable instance + a
@@ -42,16 +57,20 @@ struct CBMHashTable {
 };
 
 CBMHashTable *cbm_ht_create(uint32_t initial_capacity) {
-    CBMHashTable *ht = (CBMHashTable *)calloc(CBM_ALLOC_ONE, sizeof(*ht));
+    return cbm_ht_create_in(CBM_MEM_CLASS_HASH_TABLE, initial_capacity);
+}
+
+CBMHashTable *cbm_ht_create_in(cbm_mem_class_t cls, uint32_t initial_capacity) {
+    CBMHashTable *ht = (CBMHashTable *)cbm_calloc(cls, sizeof(*ht));
     if (!ht)
         return NULL;
-    cbm_vt_init(&ht->vt);
+    cbm_vt_init(&ht->vt, cls);
     if (initial_capacity > 0) {
         /* Reserve enough buckets for the requested entries. Verstable
          * computes the minimum bucket count internally. */
         if (!cbm_vt_reserve(&ht->vt, (size_t)initial_capacity)) {
             cbm_vt_cleanup(&ht->vt);
-            free(ht);
+            cbm_free(cls, ht);
             return NULL;
         }
     }
@@ -61,8 +80,9 @@ CBMHashTable *cbm_ht_create(uint32_t initial_capacity) {
 void cbm_ht_free(CBMHashTable *ht) {
     if (!ht)
         return;
+    cbm_mem_class_t cls = ht->vt.ctx;
     cbm_vt_cleanup(&ht->vt);
-    free(ht);
+    cbm_free(cls, ht);
 }
 
 void *cbm_ht_set(CBMHashTable *ht, const char *key, void *value) {

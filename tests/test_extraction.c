@@ -12,6 +12,8 @@
 #include "../src/foundation/compat_fs.h"
 #include <time.h>
 #include "macro_table.h"
+#include "result_spill.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "iris_export_xml.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -7120,7 +7122,375 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
     PASS();
 }
 
+/* ── Result compaction (cbm_result_compact) ────────────────────────────── */
+
+static const char *COMPACT_PY_SRC = "import os\n"
+                                    "from typing import List\n"
+                                    "\n"
+                                    "@app.route(\"/items\")\n"
+                                    "def list_items(limit: int, offset: int = 0) -> List[str]:\n"
+                                    "    \"\"\"Return items.\"\"\"\n"
+                                    "    rows = fetch(limit, offset=offset)\n"
+                                    "    total = len(rows)\n"
+                                    "    for r in rows:\n"
+                                    "        print(r, total)\n"
+                                    "    return rows\n"
+                                    "\n"
+                                    "class Store(Base):\n"
+                                    "    def get(self, key):\n"
+                                    "        return self.data.get(key, None)\n"
+                                    "\n"
+                                    "    def put(self, key, value):\n"
+                                    "        self.data[key] = value\n"
+                                    "        return fetch(key, value)\n";
+
+static bool cmp_str_eq(const char *a, const char *b) {
+    if (!a || !b) {
+        return a == b;
+    }
+    return strcmp(a, b) == 0;
+}
+
+static bool cmp_list_eq(const char **a, const char **b) {
+    if (!a || !b) {
+        return a == b;
+    }
+    int i = 0;
+    for (; a[i] && b[i]; i++) {
+        if (strcmp(a[i], b[i]) != 0) {
+            return false;
+        }
+    }
+    return a[i] == NULL && b[i] == NULL;
+}
+
+static size_t arena_capacity(const CBMArena *a) {
+    size_t total = 0;
+    for (int i = 0; i < a->nblocks; i++) {
+        total += a->block_sizes[i];
+    }
+    return total;
+}
+
+TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
+    CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    CBMFileResult *ref = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(ref);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(r->defs.count >= 4);  /* list_items, Store, get, put (+ module) */
+    ASSERT(r->calls.count >= 4); /* fetch x2, len, print, get */
+    ASSERT(r->usages.count >= 1);
+    ASSERT(r->imports.count >= 2);
+    bool saw_args = false;
+    for (int i = 0; i < ref->calls.count; i++) {
+        saw_args = saw_args || ref->calls.items[i].arg_count > 0;
+    }
+    ASSERT(saw_args);
+
+    size_t used_before = cbm_arena_total(&r->arena);
+    size_t cap_before = arena_capacity(&r->arena);
+    cbm_result_compact(r);
+
+    /* One exact block: capacity == bytes used, no dead headroom. */
+    ASSERT_EQ(r->arena.nblocks, 1);
+    ASSERT_EQ(arena_capacity(&r->arena), cbm_arena_total(&r->arena));
+    ASSERT(cbm_arena_total(&r->arena) < used_before);
+    ASSERT(arena_capacity(&r->arena) < cap_before);
+    ASSERT_EQ(r->defs.cap, r->defs.count);
+    ASSERT_EQ(r->calls.cap, r->calls.count);
+    ASSERT_EQ(r->usages.cap, r->usages.count);
+
+    /* Every field survives, by value. */
+    ASSERT_EQ(r->defs.count, ref->defs.count);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *a = &r->defs.items[i];
+        const CBMDefinition *b = &ref->defs.items[i];
+        ASSERT(cmp_str_eq(a->name, b->name));
+        ASSERT(cmp_str_eq(a->qualified_name, b->qualified_name));
+        ASSERT(cmp_str_eq(a->label, b->label));
+        ASSERT(cmp_str_eq(a->file_path, b->file_path));
+        ASSERT(cmp_str_eq(a->signature, b->signature));
+        ASSERT(cmp_str_eq(a->return_type, b->return_type));
+        ASSERT(cmp_str_eq(a->docstring, b->docstring));
+        ASSERT(cmp_str_eq(a->parent_class, b->parent_class));
+        ASSERT(cmp_str_eq(a->route_path, b->route_path));
+        ASSERT(cmp_str_eq(a->body_tokens, b->body_tokens));
+        ASSERT(cmp_str_eq(a->structural_profile, b->structural_profile));
+        ASSERT(cmp_list_eq(a->decorators, b->decorators));
+        ASSERT(cmp_list_eq(a->base_classes, b->base_classes));
+        ASSERT(cmp_list_eq(a->param_names, b->param_names));
+        ASSERT(cmp_list_eq(a->param_types, b->param_types));
+        ASSERT(cmp_list_eq(a->return_types, b->return_types));
+        ASSERT_EQ(a->signature_param_count, b->signature_param_count);
+        for (int k = 0; k < a->signature_param_count; k++) {
+            ASSERT(cmp_str_eq(a->signature_param_types[k], b->signature_param_types[k]));
+        }
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ(a->end_line, b->end_line);
+        ASSERT_EQ(a->complexity, b->complexity);
+        ASSERT_EQ(a->lines, b->lines);
+        ASSERT_EQ(a->is_exported, b->is_exported);
+        ASSERT_EQ(a->fingerprint_k, b->fingerprint_k);
+        if (a->fingerprint_k > 0) {
+            ASSERT_NOT_NULL(a->fingerprint);
+            ASSERT(memcmp(a->fingerprint, b->fingerprint,
+                          (size_t)a->fingerprint_k * sizeof(uint32_t)) == 0);
+        }
+    }
+    ASSERT_EQ(r->calls.count, ref->calls.count);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *a = &r->calls.items[i];
+        const CBMCall *b = &ref->calls.items[i];
+        ASSERT(cmp_str_eq(a->callee_name, b->callee_name));
+        ASSERT(cmp_str_eq(a->enclosing_func_qn, b->enclosing_func_qn));
+        ASSERT(cmp_str_eq(a->first_string_arg, b->first_string_arg));
+        ASSERT_EQ(a->arg_count, b->arg_count);
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ(a->site_start_byte, b->site_start_byte);
+        ASSERT_EQ(a->site_end_byte, b->site_end_byte);
+        ASSERT_EQ(a->is_method, b->is_method);
+        for (int k = 0; k < a->arg_count; k++) {
+            ASSERT(cmp_str_eq(a->args[k].expr, b->args[k].expr));
+            ASSERT(cmp_str_eq(a->args[k].value, b->args[k].value));
+            ASSERT(cmp_str_eq(a->args[k].keyword, b->args[k].keyword));
+            ASSERT_EQ(a->args[k].index, b->args[k].index);
+        }
+    }
+    ASSERT_EQ(r->usages.count, ref->usages.count);
+    for (int i = 0; i < r->usages.count; i++) {
+        ASSERT(cmp_str_eq(r->usages.items[i].ref_name, ref->usages.items[i].ref_name));
+        ASSERT(cmp_str_eq(r->usages.items[i].enclosing_func_qn,
+                          ref->usages.items[i].enclosing_func_qn));
+        ASSERT_EQ(r->usages.items[i].kind, ref->usages.items[i].kind);
+        ASSERT_EQ(r->usages.items[i].site_start_byte, ref->usages.items[i].site_start_byte);
+        ASSERT_EQ(r->usages.items[i].is_member_access, ref->usages.items[i].is_member_access);
+    }
+    ASSERT_EQ(r->imports.count, ref->imports.count);
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT(cmp_str_eq(r->imports.items[i].local_name, ref->imports.items[i].local_name));
+        ASSERT(cmp_str_eq(r->imports.items[i].module_path, ref->imports.items[i].module_path));
+    }
+    ASSERT_EQ(r->rw.count, ref->rw.count);
+    ASSERT_EQ(r->type_refs.count, ref->type_refs.count);
+    ASSERT(cmp_str_eq(r->module_qn, ref->module_qn));
+    ASSERT(cmp_list_eq(r->exports, ref->exports));
+
+    /* Interned by content: two records with the same enclosing QN share one
+     * copy after compaction. */
+    bool shared = false;
+    for (int i = 0; i < r->calls.count && !shared; i++) {
+        for (int j = i + 1; j < r->calls.count && !shared; j++) {
+            if (r->calls.items[i].enclosing_func_qn && r->calls.items[j].enclosing_func_qn &&
+                strcmp(r->calls.items[i].enclosing_func_qn, r->calls.items[j].enclosing_func_qn) ==
+                    0) {
+                shared = r->calls.items[i].enclosing_func_qn == r->calls.items[j].enclosing_func_qn;
+            }
+        }
+    }
+    ASSERT(shared);
+
+    /* The arena stays usable for the cross-file pass: growth restarts at the
+     * default block, never at twice the compact block. */
+    char *later = cbm_arena_strdup(&r->arena, "appended after compaction");
+    ASSERT_NOT_NULL(later);
+    ASSERT_EQ(r->arena.nblocks, 2);
+    ASSERT_EQ(r->arena.block_sizes[1], CBM_ARENA_DEFAULT_BLOCK_SIZE);
+
+    cbm_free_result(r);
+    cbm_free_result(ref);
+    PASS();
+}
+
+TEST(extract_compact_is_idempotent_and_survives_empty_results) {
+    CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    cbm_result_compact(r);
+    size_t once = cbm_arena_total(&r->arena);
+    int defs = r->defs.count;
+    cbm_result_compact(r);
+    ASSERT_EQ(cbm_arena_total(&r->arena), once);
+    ASSERT_EQ(r->defs.count, defs);
+    ASSERT_EQ(r->arena.nblocks, 1);
+    cbm_free_result(r);
+
+    CBMFileResult *empty = extract("", CBM_LANG_PYTHON, "t", "empty.py");
+    ASSERT_NOT_NULL(empty);
+    cbm_result_compact(empty);
+    ASSERT_EQ(empty->defs.count + empty->calls.count, empty->defs.count + empty->calls.count);
+    ASSERT(empty->arena.nblocks >= 1);
+    cbm_free_result(empty);
+
+    cbm_result_compact(NULL); /* no-op */
+    PASS();
+}
+
+/* ── Result spill (result_spill.c): park -> load is a faithful round trip ── */
+
+TEST(extract_spill_round_trip_keeps_every_field) {
+    CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    CBMFileResult *ref = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(ref);
+    cbm_result_compact(r);
+    cbm_result_compact(ref);
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    cbm_result_spill_t *sp = cbm_result_spill_open(dir, 2, 3);
+    ASSERT_NOT_NULL(sp);
+    ASSERT_FALSE(cbm_result_spill_has(sp, 1));
+
+    /* A result that is not compacted (two blocks) is refused, untouched. */
+    CBMFileResult *raw = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "raw.py");
+    ASSERT_NOT_NULL(raw);
+    if (raw->arena.nblocks > 1) {
+        ASSERT_FALSE(cbm_result_spill_park(sp, 0, 2, raw));
+        ASSERT_FALSE(cbm_result_spill_has(sp, 2));
+    }
+    cbm_free_result(raw);
+
+    /* Park frees the in-memory result; the slot is then on disk. Each
+     * precondition is named so a refusal says which one it was. */
+    int defs_before = r->defs.count;
+    int calls_before = r->calls.count;
+    ASSERT_EQ(r->arena.nblocks, 1);
+    ASSERT_EQ(r->owned_result_count, 0);
+    ASSERT_NOT_NULL(r->cached_tree); /* the extraction helper keeps the tree: park drops it */
+    ASSERT_TRUE(cbm_result_spill_park(sp, 1, 1, r));
+    r = NULL;
+    ASSERT_TRUE(cbm_result_spill_has(sp, 1));
+    int peek_defs = -1;
+    int peek_impls = -1;
+    cbm_result_spill_peek_counts(sp, 1, &peek_defs, &peek_impls);
+    ASSERT_EQ(peek_defs, defs_before);
+    ASSERT_EQ(peek_impls, 0);
+
+    CBMFileResult *back = cbm_result_spill_load(sp, 1);
+    ASSERT_NOT_NULL(back);
+    ASSERT_NULL(back->cached_tree);
+    ASSERT_EQ(back->arena.nblocks, 1);
+    ASSERT_EQ(back->defs.count, defs_before);
+    ASSERT_EQ(back->calls.count, calls_before);
+    for (int i = 0; i < back->defs.count; i++) {
+        const CBMDefinition *a = &back->defs.items[i];
+        const CBMDefinition *b = &ref->defs.items[i];
+        ASSERT(cmp_str_eq(a->name, b->name));
+        ASSERT(cmp_str_eq(a->qualified_name, b->qualified_name));
+        ASSERT(cmp_str_eq(a->label, b->label));
+        ASSERT(cmp_str_eq(a->file_path, b->file_path));
+        ASSERT(cmp_str_eq(a->signature, b->signature));
+        ASSERT(cmp_str_eq(a->docstring, b->docstring));
+        ASSERT(cmp_list_eq(a->decorators, b->decorators));
+        ASSERT(cmp_list_eq(a->param_names, b->param_names));
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ(a->fingerprint_k, b->fingerprint_k);
+        if (a->fingerprint_k > 0) {
+            ASSERT(memcmp(a->fingerprint, b->fingerprint,
+                          (size_t)a->fingerprint_k * sizeof(uint32_t)) == 0);
+        }
+        /* Every pointer now lives in the loaded block, none in the old one. */
+        const char *lo = back->arena.blocks[0];
+        const char *hi = lo + back->arena.used;
+        ASSERT(a->name >= lo && a->name < hi);
+        ASSERT(a->qualified_name >= lo && a->qualified_name < hi);
+    }
+    for (int i = 0; i < back->calls.count; i++) {
+        const CBMCall *a = &back->calls.items[i];
+        const CBMCall *b = &ref->calls.items[i];
+        ASSERT(cmp_str_eq(a->callee_name, b->callee_name));
+        ASSERT(cmp_str_eq(a->enclosing_func_qn, b->enclosing_func_qn));
+        ASSERT_EQ(a->arg_count, b->arg_count);
+        for (int k = 0; k < a->arg_count; k++) {
+            ASSERT(cmp_str_eq(a->args[k].expr, b->args[k].expr));
+        }
+    }
+    ASSERT_EQ(back->usages.count, ref->usages.count);
+    for (int i = 0; i < back->usages.count; i++) {
+        ASSERT(cmp_str_eq(back->usages.items[i].ref_name, ref->usages.items[i].ref_name));
+    }
+    ASSERT(cmp_str_eq(back->module_qn, ref->module_qn));
+    ASSERT(cmp_list_eq(back->exports, ref->exports));
+
+    /* Loading twice yields two independent copies. */
+    CBMFileResult *again = cbm_result_spill_load(sp, 1);
+    ASSERT_NOT_NULL(again);
+    ASSERT(again->arena.blocks[0] != back->arena.blocks[0]);
+    ASSERT_EQ(again->defs.count, defs_before);
+    int64_t parked = 0;
+    int64_t bytes = 0;
+    int64_t loads = 0;
+    cbm_result_spill_stats(sp, &parked, &bytes, &loads);
+    ASSERT_EQ(parked, 1);
+    ASSERT(bytes > 0);
+    ASSERT_EQ(loads, 2);
+
+    cbm_free_result(again);
+    cbm_free_result(back);
+    cbm_free_result(ref);
+    cbm_result_spill_close(sp);
+    cbm_rmdir(dir);
+    PASS();
+}
+
+/* ── LSP budget share: an oversized parse disqualifies the file from the walks ── */
+
+/* CBM_TEST_LSP_SKIP_ON names the file (no real timing): the result carries
+ * lsp_skipped, the per-file LSP walk did not run (no LSP-resolved calls),
+ * and the shared cross-file dispatcher returns without touching it. The
+ * unified extractor definitions are still there. */
+TEST(extract_lsp_skipped_when_parse_used_its_budget_share) {
+    cbm_setenv("CBM_TEST_LSP_SKIP_ON", "budget_share.py", 1);
+    CBMFileResult *skipped = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "budget_share.py");
+    cbm_unsetenv("CBM_TEST_LSP_SKIP_ON");
+    CBMFileResult *walked = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walked.py");
+    ASSERT_NOT_NULL(skipped);
+    ASSERT_NOT_NULL(walked);
+    ASSERT_TRUE(skipped->lsp_skipped);
+    ASSERT_FALSE(walked->lsp_skipped);
+    ASSERT_GT(skipped->defs.count, 0);                      /* the unified extractor still ran */
+    ASSERT_TRUE(skipped->defs.count <= walked->defs.count); /* the LSP walk adds its own defs */
+    ASSERT_EQ(skipped->resolved_calls.count, 0);
+
+    /* The dispatcher is the one gate for every language and both drivers. */
+    int calls_before = skipped->calls.count;
+    cbm_pxc_dispatch_file(CBM_LANG_PYTHON, skipped, COMPACT_PY_SRC, (int)strlen(COMPACT_PY_SRC),
+                          "budget_share.py", "t", NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL);
+    ASSERT_EQ(skipped->calls.count, calls_before);
+    ASSERT_EQ(skipped->resolved_calls.count, 0);
+
+    cbm_free_result(skipped);
+    cbm_free_result(walked);
+    PASS();
+}
+
+/* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes
+ * (no real timing): the result is walk_truncated, therefore lsp_skipped, and
+ * the definitions the walk had not reached are the only loss. */
+TEST(extract_walk_truncated_at_its_cpu_budget) {
+    cbm_setenv("CBM_TEST_WALK_BUDGET_NODES", "8", 1);
+    CBMFileResult *cut = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walk_budget.py");
+    cbm_unsetenv("CBM_TEST_WALK_BUDGET_NODES");
+    CBMFileResult *full = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walk_full.py");
+    ASSERT_NOT_NULL(cut);
+    ASSERT_NOT_NULL(full);
+    ASSERT_TRUE(cut->walk_truncated);
+    ASSERT_TRUE(cut->lsp_skipped);
+    ASSERT_FALSE(full->walk_truncated);
+    ASSERT_TRUE(cut->usages.count <= full->usages.count);
+    ASSERT_TRUE(cut->calls.count <= full->calls.count);
+    cbm_free_result(cut);
+    cbm_free_result(full);
+    PASS();
+}
+
 SUITE(extraction) {
+    RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
+    RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
+    RUN_TEST(extract_spill_round_trip_keeps_every_field);
+    RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
+    RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
     /* Initialize extraction library */
     cbm_init();
 

@@ -248,6 +248,7 @@ FOUNDATION_SRCS = \
     src/foundation/compat_fs.c \
     src/foundation/compat_regex.c \
     src/foundation/mem.c \
+    src/foundation/mem_core.c \
     src/foundation/diagnostics.c \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
@@ -275,6 +276,8 @@ EXTRACTION_SRCS = \
     $(CBM_DIR)/extract_k8s.c \
     $(CBM_DIR)/extract_dbt.c \
     $(CBM_DIR)/helpers.c \
+    $(CBM_DIR)/result_compact.c \
+    $(CBM_DIR)/result_spill.c \
     $(CBM_DIR)/lang_specs.c \
     $(CBM_DIR)/macro_table.c \
     $(CBM_DIR)/iris_export_xml.c \
@@ -1188,8 +1191,17 @@ lint-no-suppress:
 lint: lint-tidy lint-cppcheck lint-format lint-no-suppress
 	@echo "=== All linters passed ==="
 
+# Memory-core linter: memory is allocated through src/foundation/mem_core.h,
+# not through raw malloc/calloc/realloc/free/strdup. A checked-in baseline
+# (scripts/memory-core-baseline.txt) records each file's raw-site count and the
+# gate goes red the moment any file grows. Files only ever go down; lower the
+# baseline line in the same change that migrates the file.
+lint-memory-core:
+	@echo "=== memory-core linter ==="
+	@python3 scripts/lint-memory-core.py
+
 # CI linters (no clang-tidy — platform-dependent, enforced locally via pre-commit)
-lint-ci: lint-cppcheck lint-format lint-no-suppress
+lint-ci: lint-cppcheck lint-format lint-no-suppress lint-memory-core
 	@echo "=== CI linters passed ==="
 
 # ── Local memory-diagnostic lanes (not PR-CI gates by decision: the diag

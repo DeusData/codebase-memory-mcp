@@ -136,7 +136,40 @@ typedef struct {
     /* ObjectScript method-return-type table built from extracted definitions
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
+
+    /* Spill / admission control (2026-09-13). spill_mode latches on the first
+     * over-budget observation in the extract gate (or on CBM_MEM_SPILL=1):
+     * from then on every compacted result is parked on disk instead of held
+     * in the cache, results already cached are swept out, and every later
+     * consumer (registry build, def collection, resolve) loads a result only
+     * for the moment it reads it. Memory then sits at the floor -- graph +
+     * registries + in-flight files -- and the run pays with disk reads.
+     * NULL/0 = results stay in memory as always. Owned by pipeline.c. */
+    struct cbm_result_spill *spill;
+    _Atomic int spill_mode;
+    /* Set by the ONE owner whose every result-cache consumer goes through
+     * cbm_pipeline_result_acquire()/release() and that closes the store
+     * (run_parallel_pipeline). An owner that leaves it false never spills:
+     * the incremental and probe routes still hand the cache array to passes
+     * that index it directly, so they keep results in memory (follow-up). */
+    bool spill_allowed;
 } cbm_pipeline_ctx_t;
+
+/* ── Result-cache access contract (spill mode) ────────────────────────
+ * After extraction a slot of the result cache is either the in-memory result
+ * or NULL with the result parked on disk (ctx->spill). Every consumer reads a
+ * slot through this pair; a pass that indexes the array itself is blind to
+ * parked results (the infra-route passes lost every __route__infra__ node
+ * that way, 2026-09-13). `want` (NULL = always) sees the parked HEADER first
+ * -- counts are valid, pointers are not -- and can veto the load, so a pass
+ * after one rare list does not read every parked result back from disk. */
+typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
+CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                           int i, cbm_result_want_fn want, bool *loaded);
+void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
+
+/* Log the store counters, close and delete the store, drop the latch. */
+void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child

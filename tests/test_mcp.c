@@ -17773,8 +17773,15 @@ TEST(index_repository_over_budget_reports_named_reason) {
     bool reason_named = second_reason && strcmp(second_reason, "over_memory_budget") == 0;
     bool previous_preserved = second_previous && strcmp(second_previous, "preserved") == 0;
     bool hint_names_knob = second_hint && strstr(second_hint, "CBM_MEM_BUDGET_MB") != NULL;
+    /* The hint must also say that peak_rss_mb is NOT the requirement. The abort
+     * fires when RSS crosses the budget, so the peak is pinned just above it by
+     * construction; a caller who retries at peak+10% fails again. Measured on
+     * the linux kernel 2026-09-13: aborted at 25622 MB against a 24576 MB
+     * budget, but completing it took 31.75 GB. */
+    bool hint_warns_peak_is_not_need = second_hint && strstr(second_hint, "STOPPED") != NULL;
     int budget_mb = budget_doc_int(second_doc, "budget_mb", -1);
     int peak_rss_mb = budget_doc_int(second_doc, "peak_rss_mb", -1);
+    int suggested_mb = budget_doc_int(second_doc, "suggested_budget_mb", -1);
     yyjson_doc_free(second_doc);
     free(second);
     long db_size_after = (long)cbm_file_size(db_path);
@@ -17817,8 +17824,11 @@ TEST(index_repository_over_budget_reports_named_reason) {
     ASSERT_TRUE(reason_named);
     ASSERT_TRUE(previous_preserved);
     ASSERT_TRUE(hint_names_knob);
+    ASSERT_TRUE(hint_warns_peak_is_not_need);
     ASSERT_EQ(budget_mb, 1);
     ASSERT_GT(peak_rss_mb, budget_mb);
+    /* A CONCRETE retry value, not just the knob name: 1.5x the budget. */
+    ASSERT_GT(suggested_mb, budget_mb);
     /* Preserved on disk and still served: same file size, same node count. */
     ASSERT_GT(db_size_before, 0L);
     ASSERT_EQ(db_size_after, db_size_before);

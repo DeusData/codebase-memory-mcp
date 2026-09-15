@@ -5,6 +5,8 @@
 #include "lang_specs.h"      // CBMLangSpec, cbm_lang_spec, CBM_LANG_*
 #include "tree_sitter/api.h" // TSNode, TSTreeCursor, ts_tree_cursor_*, ts_node_*
 #include "foundation/constants.h"
+#include "foundation/compat.h" // cbm_thread_cpu_time_ns
+#include <stdlib.h>
 
 enum { MAX_INFRA_BINDINGS = 8 };
 
@@ -2596,9 +2598,33 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     state.branch_depth = 0;
 
     uint32_t depth = 0;
+    uint32_t visited = 0;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    /* CBM_TEST_WALK_BUDGET_NODES=<n>: the budget is "spent" after n nodes,
+     * no real timing involved. */
+    uint32_t seam_budget_nodes = 0;
+    {
+        const char *seam = getenv("CBM_TEST_WALK_BUDGET_NODES");
+        if (seam && seam[0]) {
+            seam_budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
+        }
+    }
+#endif
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
+        visited++;
+        if (ctx->walk_deadline_cpu_ns != 0 && (visited & 1023u) == 0 &&
+            cbm_thread_cpu_time_ns() > ctx->walk_deadline_cpu_ns) {
+            ctx->walk_budget_exhausted = true;
+            break;
+        }
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (seam_budget_nodes != 0 && visited > seam_budget_nodes) {
+            ctx->walk_budget_exhausted = true;
+            break;
+        }
+#endif
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred

@@ -248,31 +248,36 @@ typedef enum {
 } CBMSourceOrigin;
 
 typedef struct {
-    const char *callee_name;            // raw callee text ("pkg.Func", "foo")
-    const char *enclosing_func_qn;      // QN of enclosing function (or module QN)
-    const char *first_string_arg;       // first string literal argument (URL, topic, key) or NULL
-    const char *second_arg_name;        // second argument identifier (handler ref) or NULL
-    CBMCallArg args[CBM_MAX_CALL_ARGS]; // first N arguments with expressions
-    int arg_count;                      // number of captured arguments
-    int loop_depth;                     // enclosing loop nesting at the call site
-    int branch_depth;                   // enclosing branch nesting at the call site
-    int start_line;                     // 1-based source line of the call (for def range-match)
-    uint32_t site_start_byte;           // exact AST occurrence span; end > start when present
-    uint32_t site_end_byte;             // exclusive byte offset in the source file
-    CBMSourceOrigin source_origin;      // raw source or C-family preprocessed buffer
-    bool is_method;                     // method/member call with an UNRESOLVED receiver. Perl:
-                                        // arrow/method call ($obj->m). TS/JS/TSX: member call
-                                        // x.foo() whose receiver is not this/super. Python:
-                                        // x.foo() where x is not self/cls/super() and is not
-                                        // rooted in an imported name. Read by the weak-member
-                                        // guard and by the pxc synthetic-carrier dedup key in
-                                        // pass_lsp_cross.c. Default false.
-    bool requires_lsp_resolution;       // synthetic semantic candidate (for example an implicit
-                                        // C++ operator). Never fall back to textual resolution.
-    bool callee_is_locally_bound;       // bare call foo() whose callee identifier is bound as a
-                                        // parameter of an enclosing function, so it cannot be the
-                                        // module-level foo. Python only today. Read by the
-                                        // weak-local-binding guard. Default false.
+    const char *callee_name;       // raw callee text ("pkg.Func", "foo")
+    const char *enclosing_func_qn; // QN of enclosing function (or module QN)
+    const char *first_string_arg;  // first string literal argument (URL, topic, key) or NULL
+    const char *second_arg_name;   // second argument identifier (handler ref) or NULL
+    /* First arg_count captured arguments, arena-allocated on first capture;
+     * NULL when arg_count == 0. Was an inline args[CBM_MAX_CALL_ARGS] (256 of
+     * the record's 320 bytes) -- the Go corpus census (2026-09-13) put 825k
+     * calls at 251 MB with most of that empty slots. Readers index it exactly
+     * as before; only `sizeof` changed. */
+    CBMCallArg *args;
+    int arg_count;                 // number of captured arguments (<= CBM_MAX_CALL_ARGS)
+    int loop_depth;                // enclosing loop nesting at the call site
+    int branch_depth;              // enclosing branch nesting at the call site
+    int start_line;                // 1-based source line of the call (for def range-match)
+    uint32_t site_start_byte;      // exact AST occurrence span; end > start when present
+    uint32_t site_end_byte;        // exclusive byte offset in the source file
+    CBMSourceOrigin source_origin; // raw source or C-family preprocessed buffer
+    bool is_method;                // method/member call with an UNRESOLVED receiver. Perl:
+                                   // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                   // x.foo() whose receiver is not this/super. Python:
+                                   // x.foo() where x is not self/cls/super() and is not
+                                   // rooted in an imported name. Read by the weak-member
+                                   // guard and by the pxc synthetic-carrier dedup key in
+                                   // pass_lsp_cross.c. Default false.
+    bool requires_lsp_resolution;  // synthetic semantic candidate (for example an implicit
+                                   // C++ operator). Never fall back to textual resolution.
+    bool callee_is_locally_bound;  // bare call foo() whose callee identifier is bound as a
+                                   // parameter of an enclosing function, so it cannot be the
+                                   // module-level foo. Python only today. Read by the
+                                   // weak-local-binding guard. Default false.
 } CBMCall;
 
 typedef struct {
@@ -286,16 +291,18 @@ typedef enum {
 } CBMUsageKind;
 
 typedef struct {
-    const char *ref_name;            // referenced identifier
-    const char *enclosing_func_qn;   // QN of enclosing function (or module QN)
+    const char *ref_name;          // referenced identifier
+    const char *enclosing_func_qn; // QN of enclosing function (or module QN)
+    /* Fixed-width fields grouped so the record packs to 40 bytes (was 48; the
+     * Go corpus holds 4.68M of these). Field meanings unchanged. */
+    uint32_t lexical_scope_id;       // extraction-local scope instance; never graph identity
+    uint32_t site_start_byte;        // exact reference-token span; end > start when present
+    uint32_t site_end_byte;          // exclusive byte offset in the source file
     CBMUsageKind kind;               // ordinary USAGE or explicit callable reference
+    CBMSourceOrigin source_origin;   // raw source or C-family preprocessed buffer
     bool may_be_call_reference;      // syntactic candidate; exact LSP proof may upgrade its edge
     bool semantic_reference_blocked; // lexical evidence blocks only unproven textual fallback
     bool semantic_reference_local_shadow; // blocker belongs to a non-module lexical scope
-    uint32_t lexical_scope_id;            // extraction-local scope instance; never graph identity
-    uint32_t site_start_byte;             // exact reference-token span; end > start when present
-    uint32_t site_end_byte;               // exclusive byte offset in the source file
-    CBMSourceOrigin source_origin;        // raw source or C-family preprocessed buffer
     bool is_member_access;                // token is the member half of a selector/attribute
                                           // (Go x.f — field_identifier). The extractor strips
                                           // the receiver, so this is the only surviving record
@@ -541,7 +548,16 @@ typedef struct CBMFileResult {
     int error_region_count;
     bool is_test_file;
     int imports_count;
-    TSTree *cached_tree;     // retained parse tree (caller frees via cbm_free_tree)
+    TSTree *cached_tree; // retained parse tree (caller frees via cbm_free_tree)
+    /* The parse alone used more than its share of the per-file budget: the
+     * per-file LSP walk and the cross-file resolve skip this file (its
+     * unified-extractor defs stay). Set by cbm_extract_file_ex, honoured by
+     * cbm_pxc_dispatch_file -- one site for every language. */
+    bool lsp_skipped;
+    /* The unified walk stopped at its CPU budget: defs/calls/usages found up
+     * to that point are kept, the rest of the file is not walked. Implies
+     * lsp_skipped. */
+    bool walk_truncated;
     CBMLanguage cached_lang; // language of cached tree (for parser selection)
 
     // Retained source bytes — copied into `arena` by the parallel
@@ -632,6 +648,14 @@ typedef struct {
      * class-body variable def records which class declares it (parent_class)
      * without changing its module-level qualified name. NULL elsewhere. */
     const char *var_parent_class;
+    /* Per-file walk budget (thread CPU time, ns; 0 = unbounded). The unified
+     * cursor walk checks it every 1024 nodes and stops when it is spent, so
+     * no single file can hold a worker for minutes: a 23 MB single-expression
+     * C# test file cost 346 s in usage stamping alone (tree-sitter's
+     * ts_node_parent descends from the root, quadratic on a deep tree;
+     * 2026-09-14). What was extracted before the stop is kept. */
+    uint64_t walk_deadline_cpu_ns;
+    bool walk_budget_exhausted;
 } CBMExtractCtx;
 
 // --- Public API ---
@@ -645,6 +669,12 @@ typedef struct {
 // also calls it so non-main entry points (pipeline passes) still get the binds.
 // In the test build (no CBM_BIND_TS_ALLOCATOR) this is a no-op.
 void cbm_alloc_init(void);
+/* SQLite allocates from a dedicated mimalloc heap per thread while on; the
+ * index worker turns it on (its default heap holds the graph). Off elsewhere:
+ * a thread-per-connection daemon would pin connection-lifetime blocks to
+ * dead threads. The switch exists in every build; it changes nothing where
+ * the allocator binds are compiled out. */
+void cbm_sqlite_dedicated_heap(bool on);
 
 // Initialize the library. Call once at startup. Returns 0 on success.
 int cbm_init(void);
@@ -675,6 +705,31 @@ void cbm_index_mark_done(const char *rel_path);
 // Extract all data from one file. Caller must call cbm_free_result().
 // source must remain valid for the duration of the call.
 // timeout_micros: per-file parse timeout in microseconds (0 = no timeout).
+/* Compact a finished result: copy everything reachable from it -- every
+ * record array at exact count, every string once (interned by content within
+ * the file), the retained source -- into one exact-size arena, and destroy the
+ * working arena the extractors wrote into. Measured on the Go corpus
+ * (2026-09-13): 14.8 GB written per index, 3.4 GB reachable; the rest was
+ * node-text copies and abandoned array generations no one could free because
+ * the result owned the arena. Call once, after the last per-file write and
+ * before the result is cached for later passes. Later appends into the arena
+ * still work (growth restarts at the default block). A composite's owned
+ * per-unit results are released: after the deep copy nothing points at them.
+ * On allocation failure the result is left exactly as it was. */
+void cbm_result_compact(CBMFileResult *result);
+
+/* The working arena the extractors write into, per worker thread. Extraction
+ * takes it (rewound, pages still mapped) instead of allocating a fresh arena
+ * per file; compaction returns it instead of destroying it. Reusing the same
+ * addresses directly is what stops the purge/re-commit churn that kept a
+ * kernel worker at 15 GB resident with 4-5 GB charged. An arena that grew past
+ * CBM_WORK_ARENA_KEEP_BYTES (one giant file) is destroyed, not kept. */
+enum { CBM_WORK_ARENA_KEEP_BYTES = 16 * 1024 * 1024 };
+void cbm_work_arena_take(CBMArena *into);
+void cbm_work_arena_give(CBMArena *from);
+/* Drop this thread's kept working arena (end of an extraction pass). */
+void cbm_work_arena_release(void);
+
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL
@@ -695,6 +750,12 @@ CBMFileResult *cbm_extract_file_ex(
 
 // Free all memory associated with a result.
 void cbm_free_result(CBMFileResult *result);
+
+/* Allocate an empty result; cbm_free_result releases it. */
+CBMFileResult *cbm_result_alloc(void);
+
+/* Release a composite result's per-unit results (the owner of that array). */
+void cbm_result_release_owned(CBMFileResult *result);
 
 // Free only the cached tree from a result (caller retained it for reuse).
 void cbm_free_tree(CBMFileResult *result);

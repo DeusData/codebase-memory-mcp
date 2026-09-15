@@ -6,6 +6,7 @@
  * Uses xxHash for deterministic random vectors. Pure C, zero dependencies.
  */
 #include "semantic/semantic.h"
+#include "foundation/mem_core.h"
 #include "foundation/constants.h"
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
@@ -158,7 +159,7 @@ static bool is_camel_break(const char *name, int i) {
 static void flush_token(char *buf, int *blen, char **out, int *count, int max_out) {
     if (*blen > 0 && *count < max_out) {
         buf[*blen] = '\0';
-        out[(*count)++] = strdup(buf);
+        out[(*count)++] = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, buf);
     }
     *blen = 0;
 }
@@ -358,7 +359,7 @@ int cbm_sem_tokenize(const char *name, char **out, int max_out) {
     for (int t = 0; t < orig_count && count < max_out; t++) {
         for (int a = 0; abbrevs[a].abbrev; a++) {
             if (strcmp(out[t], abbrevs[a].abbrev) == 0) {
-                out[count++] = strdup(abbrevs[a].expanded);
+                out[count++] = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, abbrevs[a].expanded);
                 break;
             }
         }
@@ -422,7 +423,8 @@ static void ensure_pretrained_map(void) {
             const char *tok = PRETRAINED_TOKENS[i];
             if (tok && tok[0]) {
                 snprintf(idx_buf, sizeof(idx_buf), "%d", i);
-                cbm_ht_set(g_pretrained_map, strdup(tok), strdup(idx_buf));
+                cbm_ht_set(g_pretrained_map, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, tok),
+                           cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, idx_buf));
             }
         }
         atomic_store_explicit(&g_pretrained_ready, MAP_READY, memory_order_release);
@@ -524,7 +526,8 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
     }
     if (c->entry_count >= c->entry_cap) {
         int new_cap = c->entry_cap < CORPUS_INIT_CAP ? CORPUS_INIT_CAP : c->entry_cap * PAIR_LEN;
-        corpus_entry_t *grown = realloc(c->entries, (size_t)new_cap * sizeof(corpus_entry_t));
+        corpus_entry_t *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, c->entries,
+                                            (size_t)new_cap * sizeof(corpus_entry_t));
         if (!grown) {
             return CBM_NOT_FOUND;
         }
@@ -532,16 +535,17 @@ static int corpus_get_or_add(cbm_sem_corpus_t *c, const char *token) {
         c->entry_cap = new_cap;
     }
     int idx = c->entry_count++;
-    c->entries[idx].token = strdup(token);
+    c->entries[idx].token = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, token);
     c->entries[idx].doc_freq = 0;
     memset(&c->entries[idx].enriched_vec, 0, sizeof(cbm_sem_vec_t));
     snprintf(idx_buf, sizeof(idx_buf), "%d", idx);
-    cbm_ht_set(c->token_map, strdup(token), strdup(idx_buf));
+    cbm_ht_set(c->token_map, cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, token),
+               cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, idx_buf));
     return idx;
 }
 
 cbm_sem_corpus_t *cbm_sem_corpus_new(void) {
-    cbm_sem_corpus_t *c = calloc(SKIP_ONE, sizeof(cbm_sem_corpus_t));
+    cbm_sem_corpus_t *c = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(cbm_sem_corpus_t));
     if (c) {
         c->token_map = cbm_ht_create(CORPUS_INIT_CAP);
     }
@@ -556,11 +560,13 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
     if (corpus->doc_count >= corpus->doc_cap) {
         int new_cap =
             corpus->doc_cap < DOC_TOKENS_INIT ? DOC_TOKENS_INIT : corpus->doc_cap * PAIR_LEN;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
+        int **grown_ids = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids,
+                                      (size_t)new_cap * sizeof(int *));
+        int *grown_counts = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_counts,
+                                        (size_t)new_cap * sizeof(int));
         if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_ids);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_counts);
             return;
         }
         corpus->doc_token_ids = grown_ids;
@@ -568,11 +574,13 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
         corpus->doc_cap = new_cap;
     }
     int doc_idx = corpus->doc_count++;
-    corpus->doc_token_ids[doc_idx] = malloc((size_t)count * sizeof(int));
+    corpus->doc_token_ids[doc_idx] = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)count * sizeof(int));
     corpus->doc_token_counts[doc_idx] = count;
 
     /* Per-doc unique set for IDF */
-    int *seen = calloc((size_t)corpus->entry_cap + (size_t)count + CORPUS_INIT_CAP, sizeof(int));
+    int *seen =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC,
+                   ((size_t)corpus->entry_cap + (size_t)count + CORPUS_INIT_CAP) * sizeof(int));
     int seen_count = 0;
 
     for (int i = 0; i < count; i++) {
@@ -594,7 +602,7 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
             corpus->entries[tid].doc_freq++;
         }
     }
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, seen);
 }
 
 /* ── Parallel corpus batch build ──────────────────────────────────── */
@@ -612,8 +620,8 @@ void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int c
 typedef struct {
     cbm_sem_corpus_t *corpus;
     char **all_tokens;
+    const size_t *offsets; /* document d = all_tokens[offsets[d] ..] */
     const int *token_counts;
-    int max_tokens;
     int doc_count;
     _Atomic int *doc_freq_atomic; /* per-entry atomic counter (entry_count long) */
     _Atomic int next_idx;
@@ -630,12 +638,12 @@ static void batch_resolve_one_doc(batch_resolve_ctx_t *bc, int doc_index, int *s
         bc->corpus->doc_token_counts[doc_index] = 0;
         return;
     }
-    int *ids = malloc((size_t)count * sizeof(int));
+    int *ids = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)count * sizeof(int));
     bc->corpus->doc_token_ids[doc_index] = ids;
     bc->corpus->doc_token_counts[doc_index] = count;
 
     int seen_count = 0;
-    char **tokens = &bc->all_tokens[(ptrdiff_t)doc_index * bc->max_tokens];
+    char **tokens = &bc->all_tokens[bc->offsets[doc_index]];
     for (int i = 0; i < count; i++) {
         const char *idx_str = cbm_ht_get(bc->corpus->token_map, tokens[i]);
         int tid = CBM_NOT_FOUND;
@@ -671,7 +679,7 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
     batch_resolve_ctx_t *bc = ctx_ptr;
     /* Per-worker scratch for unique-per-doc tracking */
     int local_seen_cap = CBM_SEM_SEEN_INIT_CAP;
-    int *seen = malloc((size_t)local_seen_cap * sizeof(int));
+    int *seen = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)local_seen_cap * sizeof(int));
     if (!seen) {
         return;
     }
@@ -689,7 +697,7 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
         for (int d = start; d < end; d++) {
             int count = bc->token_counts[d];
             if (count > local_seen_cap) {
-                int *grown = realloc(seen, (size_t)count * sizeof(int));
+                int *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, seen, (size_t)count * sizeof(int));
                 if (!grown) {
                     continue;
                 }
@@ -699,12 +707,12 @@ static void batch_resolve_worker(int worker_id, void *ctx_ptr) {
             batch_resolve_one_doc(bc, d, seen);
         }
     }
-    free(seen);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, seen);
 }
 
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc) {
-    if (!corpus || !all_tokens || !token_counts || doc_count <= 0) {
+                                   const size_t *offsets, const int *token_counts, int doc_count) {
+    if (!corpus || !all_tokens || !offsets || !token_counts || doc_count <= 0) {
         return;
     }
 
@@ -712,11 +720,13 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
      * Hash table mutation can't be parallelized; strdup+insert is the cost. */
     if (corpus->doc_cap < corpus->doc_count + doc_count) {
         int new_cap = corpus->doc_count + doc_count;
-        int **grown_ids = realloc(corpus->doc_token_ids, (size_t)new_cap * sizeof(int *));
-        int *grown_counts = realloc(corpus->doc_token_counts, (size_t)new_cap * sizeof(int));
+        int **grown_ids = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids,
+                                      (size_t)new_cap * sizeof(int *));
+        int *grown_counts = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_counts,
+                                        (size_t)new_cap * sizeof(int));
         if (!grown_ids || !grown_counts) {
-            free(grown_ids);
-            free(grown_counts);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_ids);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, grown_counts);
             return;
         }
         corpus->doc_token_ids = grown_ids;
@@ -728,7 +738,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
 
     for (int d = 0; d < doc_count; d++) {
         int count = token_counts[d];
-        char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
+        char **tokens = &all_tokens[offsets[d]];
         for (int i = 0; i < count; i++) {
             /* Inserts token into token_map if new; we discard return here —
              * Phase B will re-lookup in read-only mode to get the ID. */
@@ -739,14 +749,15 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
     /* Phase B (PARALLEL): Resolve tokens → IDs and count doc_freq per entry.
      * token_map is now read-only; each worker owns its doc range (no writes
      * to shared state except atomic doc_freq counters). */
-    _Atomic int *doc_freq_atomic = calloc((size_t)corpus->entry_count, sizeof(_Atomic int));
+    _Atomic int *doc_freq_atomic =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)corpus->entry_count * sizeof(_Atomic int));
     if (!doc_freq_atomic) {
         /* OOM fallback: sequential path. Roll back doc_count first since
          * add_doc increments it itself. */
         corpus->doc_count = base_doc;
         for (int d = 0; d < doc_count; d++) {
             int count = token_counts[d];
-            char **tokens = &all_tokens[(ptrdiff_t)d * max_tokens_per_doc];
+            char **tokens = &all_tokens[offsets[d]];
             cbm_sem_corpus_add_doc(corpus, (const char **)tokens, count);
         }
         return;
@@ -757,7 +768,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         .corpus = corpus,
         .all_tokens = all_tokens,
         .token_counts = token_counts,
-        .max_tokens = max_tokens_per_doc,
+        .offsets = offsets,
         .doc_count = doc_count,
         .doc_freq_atomic = doc_freq_atomic,
     };
@@ -775,7 +786,7 @@ void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
         corpus->entries[i].doc_freq +=
             atomic_load_explicit(&doc_freq_atomic[i], memory_order_relaxed);
     }
-    free(doc_freq_atomic);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, doc_freq_atomic);
 }
 
 /* ── Parallel corpus_finalize ─────────────────────────────────────── */
@@ -1205,14 +1216,15 @@ static void pass1_quantize_worker(int worker_id, void *ctx_ptr) {
 /* Build reverse index: token_id → list of (doc_id, position) pairs.
  * SEQUENTIAL (fast: just pointer arithmetic + flat array fill). */
 static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
-    reverse_index_t *rev = calloc(SKIP_ONE, sizeof(reverse_index_t));
+    reverse_index_t *rev = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(reverse_index_t));
     if (!rev) {
         return NULL;
     }
     /* Phase A: count occurrences per token */
-    int *counts = calloc((size_t)corpus->entry_count + SKIP_ONE, sizeof(int));
+    int *counts =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)corpus->entry_count + SKIP_ONE) * sizeof(int));
     if (!counts) {
-        free(rev);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
         return NULL;
     }
     long total = 0;
@@ -1228,10 +1240,11 @@ static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
         }
     }
     /* Phase B: exclusive prefix sum → offsets[] */
-    rev->offsets = malloc(((size_t)corpus->entry_count + SKIP_ONE) * sizeof(int));
+    rev->offsets =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, ((size_t)corpus->entry_count + SKIP_ONE) * sizeof(int));
     if (!rev->offsets) {
-        free(counts);
-        free(rev);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, counts);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
         return NULL;
     }
     int running = 0;
@@ -1242,13 +1255,13 @@ static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
     }
     rev->offsets[corpus->entry_count] = running;
     /* Phase C: fill flat array. Ensure allocation size > 0 even for empty
-     * corpora (avoids malloc(0) which is implementation-defined). */
+     * corpora (avoids cbm_alloc(CBM_MEM_CLASS_SEMANTIC, 0) which is implementation-defined). */
     size_t flat_bytes = (total > 0 ? (size_t)total : SKIP_ONE) * sizeof(cooccur_pos_t);
-    rev->flat = malloc(flat_bytes);
+    rev->flat = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, flat_bytes);
     if (!rev->flat) {
-        free(rev->offsets);
-        free(counts);
-        free(rev);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev->offsets);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, counts);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
         return NULL;
     }
     for (int d = 0; d < corpus->doc_count; d++) {
@@ -1263,7 +1276,7 @@ static reverse_index_t *build_reverse_index(cbm_sem_corpus_t *corpus) {
             }
         }
     }
-    free(counts);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, counts);
     return rev;
 }
 
@@ -1271,9 +1284,9 @@ static void free_reverse_index(reverse_index_t *rev) {
     if (!rev) {
         return;
     }
-    free(rev->offsets);
-    free(rev->flat);
-    free(rev);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, rev->offsets);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, rev->flat);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, rev);
 }
 
 /* Bundle of parameters shared by the finalize sub-phases. */
@@ -1323,7 +1336,8 @@ static void finalize_pass1(finalize_params_t *p) {
 
 /* Sub-phases 4+5: quantize pass1 to int8, run RRI pass 2, blend + normalize. */
 static void finalize_pass2(finalize_params_t *p) {
-    int8_t *pass1_q = malloc((size_t)p->corpus->entry_count * CBM_SEM_DIM * sizeof(int8_t));
+    int8_t *pass1_q = cbm_alloc(CBM_MEM_CLASS_SEMANTIC,
+                                (size_t)p->corpus->entry_count * CBM_SEM_DIM * sizeof(int8_t));
     if (pass1_q) {
         pass1_quant_ctx_t qc = {
             .entries = p->corpus->entries,
@@ -1334,7 +1348,8 @@ static void finalize_pass2(finalize_params_t *p) {
         cbm_parallel_for(p->worker_count, pass1_quantize_worker, &qc, p->opts);
     }
 
-    cbm_sem_vec_t *pass1 = malloc((size_t)p->corpus->entry_count * sizeof(cbm_sem_vec_t));
+    cbm_sem_vec_t *pass1 =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)p->corpus->entry_count * sizeof(cbm_sem_vec_t));
     if (pass1) {
         for (int i = 0; i < p->corpus->entry_count; i++) {
             pass1[i] = p->corpus->entries[i].enriched_vec;
@@ -1366,13 +1381,23 @@ static void finalize_pass2(finalize_params_t *p) {
         };
         atomic_init(&bc.next_idx, 0);
         cbm_parallel_for(p->worker_count, blend_worker, &bc, p->opts);
-        free(pass1);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, pass1);
     }
-    free(pass1_q);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, pass1_q);
 
     norm_ctx_t nc = {.entries = p->corpus->entries, .entry_count = p->corpus->entry_count};
     atomic_init(&nc.next_idx, 0);
     cbm_parallel_for(p->worker_count, normalize_worker, &nc, p->opts);
+}
+
+/* The per-document token id lists exist for the co-occurrence pass only;
+ * released at the end of finalize so the vector phase runs without them
+ * (783k small blocks on the kernel). */
+static void corpus_release_docs(cbm_sem_corpus_t *corpus) {
+    for (int d = 0; d < corpus->doc_count; d++) {
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids[d]);
+        corpus->doc_token_ids[d] = NULL;
+    }
 }
 
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
@@ -1401,8 +1426,8 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
         corpus->finalized = true;
         return;
     }
-    cbm_sem_src_entry_t *src_entries =
-        calloc((size_t)corpus->entry_count, sizeof(cbm_sem_src_entry_t));
+    cbm_sem_src_entry_t *src_entries = cbm_calloc(
+        CBM_MEM_CLASS_SEMANTIC, (size_t)corpus->entry_count * sizeof(cbm_sem_src_entry_t));
     if (!src_entries) {
         free_reverse_index(rev);
         corpus->finalized = true;
@@ -1423,8 +1448,9 @@ void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus) {
     finalize_pass1(&params);
     finalize_pass2(&params);
 
-    free(src_entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, src_entries);
     free_reverse_index(rev);
+    corpus_release_docs(corpus);
     corpus->finalized = true;
 }
 
@@ -1490,8 +1516,8 @@ const char *cbm_sem_corpus_token_at(const cbm_sem_corpus_t *corpus, int index,
 
 static void free_ht_kv(const char *key, void *value, void *userdata) {
     (void)userdata;
-    free((void *)key);
-    free(value);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)key);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, value);
 }
 
 void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus) {
@@ -1499,19 +1525,19 @@ void cbm_sem_corpus_free(cbm_sem_corpus_t *corpus) {
         return;
     }
     for (int i = 0; i < corpus->entry_count; i++) {
-        free(corpus->entries[i].token);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->entries[i].token);
     }
-    free(corpus->entries);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->entries);
     for (int d = 0; d < corpus->doc_count; d++) {
-        free(corpus->doc_token_ids[d]);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids[d]);
     }
-    free(corpus->doc_token_ids);
-    free(corpus->doc_token_counts);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_ids);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus->doc_token_counts);
     if (corpus->token_map) {
         cbm_ht_foreach(corpus->token_map, free_ht_kv, NULL);
         cbm_ht_free(corpus->token_map);
     }
-    free(corpus);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, corpus);
 }
 
 /* ── Combined scoring ────────────────────────────────────────────── */

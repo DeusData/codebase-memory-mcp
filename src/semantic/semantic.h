@@ -24,6 +24,7 @@
 #ifndef CBM_SEMANTIC_H
 #define CBM_SEMANTIC_H
 
+#include <stddef.h> /* size_t */
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -166,11 +167,13 @@ cbm_sem_corpus_t *cbm_sem_corpus_new(void);
 void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count);
 
 /* Batch-build the corpus from pre-tokenized documents (PARALLEL variant).
- * `all_tokens` layout: all_tokens[f * max_tokens_per_doc + t] = token pointer.
- * `token_counts[f]` = number of tokens in document f.
+ * Document f's tokens are all_tokens[offsets[f] .. offsets[f] + token_counts[f]).
+ * Packed, not strided: a fixed CBM_SEM_MAX_TOKENS (512) slots per document
+ * was 4 KB per function up front -- 7.4 GB on the kernel for tokens that
+ * average a few dozen per function.
  * This replaces a loop of cbm_sem_corpus_add_doc() calls. */
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc);
+                                   const size_t *offsets, const int *token_counts, int doc_count);
 
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);

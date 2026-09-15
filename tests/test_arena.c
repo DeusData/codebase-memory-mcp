@@ -5,6 +5,45 @@
 #include "../src/foundation/arena.h"
 #include <stdint.h>
 
+TEST(arena_init_exact_one_block_then_default_growth) {
+    CBMArena a;
+    cbm_arena_init_exact(&a, 100);
+    ASSERT_EQ(a.nblocks, 1);
+    ASSERT_EQ(a.block_sizes[0], 104); /* rounded to the 8-byte allocation grain */
+    ASSERT_EQ(a.grow_size, CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    void *p = cbm_arena_alloc(&a, 100);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(a.used, 104);
+    ASSERT_EQ(a.nblocks, 1); /* the exact block is full, nothing wasted */
+    void *q = cbm_arena_alloc(&a, 8);
+    ASSERT_NOT_NULL(q);
+    ASSERT_EQ(a.nblocks, 2);
+    ASSERT_EQ(a.block_sizes[1], CBM_ARENA_DEFAULT_BLOCK_SIZE); /* not 2 x 104 */
+    ASSERT_EQ(a.grow_size, 2 * CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
+TEST(arena_growth_doubles_grow_size_and_reset_restores_it) {
+    CBMArena a;
+    cbm_arena_init_sized(&a, 64);
+    ASSERT_EQ(a.grow_size, 128);
+    ASSERT_NOT_NULL(cbm_arena_alloc(&a, 64));
+    ASSERT_NOT_NULL(cbm_arena_alloc(&a, 8)); /* -> block 128 */
+    ASSERT_EQ(a.nblocks, 2);
+    ASSERT_EQ(a.block_sizes[1], 128);
+    ASSERT_EQ(a.grow_size, 256);
+    ASSERT_NOT_NULL(cbm_arena_alloc(&a, 1000)); /* larger than grow_size: exact */
+    ASSERT_EQ(a.nblocks, 3);
+    ASSERT_EQ(a.block_sizes[2], 1000);
+    ASSERT_EQ(a.grow_size, 2000);
+    cbm_arena_reset(&a);
+    ASSERT_EQ(a.nblocks, 1);
+    ASSERT_EQ(a.grow_size, 128);
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(arena_init_default) {
     CBMArena a;
     cbm_arena_init(&a);
@@ -428,6 +467,8 @@ TEST(arena_strndup_zero_len) {
 }
 
 SUITE(arena) {
+    RUN_TEST(arena_init_exact_one_block_then_default_growth);
+    RUN_TEST(arena_growth_doubles_grow_size_and_reset_restores_it);
     RUN_TEST(arena_init_default);
     RUN_TEST(arena_init_sized);
     RUN_TEST(arena_alloc_basic);

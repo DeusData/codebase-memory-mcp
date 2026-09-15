@@ -16,6 +16,7 @@
 #include "pipeline/pass_lsp_cross.h"
 
 #include "pipeline/lsp_surface.h"
+#include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
 #include "lsp/go_lsp.h"
@@ -104,7 +105,11 @@ static char *pxc_read_file(const char *path, int *out_len) {
  * plus Protocol/Function/Method — variables, modules, decorators, etc. are
  * skipped. Struct passes through so Rust/Go struct type-registration via the
  * cross-file LSP path is not dropped. */
-static const char *pxc_map_label(const char *label) {
+/* The label a cross def keeps is a static spelling, never the result's own
+ * pointer: in spill mode the CBMFileResult is freed (parked on disk) the
+ * moment the collector is done with it, and the defs outlive it. A kept
+ * spelling outside the table falls back to an arena copy. */
+static const char *pxc_map_label(CBMArena *arena, const char *label) {
     if (!label)
         return NULL;
     if (cbm_label_is_type_like(label) || strcmp(label, "Protocol") == 0 ||
@@ -115,7 +120,14 @@ static const char *pxc_map_label(const char *label) {
          * name-only fallback). Every registrar filters by explicit label, so
          * the other languages ignore Variable defs untouched. */
         strcmp(label, "Variable") == 0) {
-        return label;
+        static const char *const canon[] = {"Class", "Struct",   "Interface", "Enum",   "Type",
+                                            "Trait", "Protocol", "Function",  "Method", "Variable"};
+        for (size_t i = 0; i < sizeof(canon) / sizeof(canon[0]); i++) {
+            if (strcmp(label, canon[i]) == 0) {
+                return canon[i];
+            }
+        }
+        return arena ? cbm_arena_strdup(arena, label) : NULL;
     }
     return NULL;
 }
@@ -268,22 +280,28 @@ static const char *pxc_last_component(const char *qn) {
     return dot ? dot + 1 : qn;
 }
 
+/* Every return is arena-owned: the fallback spelling is a copy, never the
+ * result's pointer (the result may be parked on disk before the def is read). */
 static const char *pxc_jvm_type_qn(CBMArena *arena, const char *namespace_name,
                                    const char *type_qn_or_name) {
-    if (!arena || !namespace_name || !namespace_name[0] || !type_qn_or_name) {
-        return type_qn_or_name;
+    if (!arena || !type_qn_or_name) {
+        return NULL;
     }
-    const char *short_name = pxc_last_component(type_qn_or_name);
+    const char *short_name =
+        (namespace_name && namespace_name[0]) ? pxc_last_component(type_qn_or_name) : NULL;
     if (!short_name || !short_name[0]) {
-        return type_qn_or_name;
+        return cbm_arena_strdup(arena, type_qn_or_name);
     }
     return cbm_arena_sprintf(arena, "%s.%s", namespace_name, short_name);
 }
 
 static const char *pxc_jvm_def_qn(CBMArena *arena, const CBMDefinition *src,
                                   const char *namespace_name, const char *label) {
-    if (!arena || !src || !namespace_name || !namespace_name[0]) {
-        return src ? src->qualified_name : NULL;
+    if (!arena || !src) {
+        return NULL;
+    }
+    if (!namespace_name || !namespace_name[0]) {
+        return cbm_arena_strdup(arena, src->qualified_name); /* a copy, see above */
     }
     if (strcmp(label, "Method") == 0 || strcmp(label, "Function") == 0 ||
         strcmp(label, "Constructor") == 0) {
@@ -373,7 +391,7 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
                              const char *namespace_name, CBMLanguage lang, CBMLSPDef *dst,
                              const cbm_registry_t *reg, const char **imp_keys,
                              const char **imp_vals, int imp_count) {
-    const char *label = pxc_map_label(src->label);
+    const char *label = pxc_map_label(arena, src->label);
     if (!label || !src->qualified_name || !src->name)
         return -1;
     memset(dst, 0, sizeof(*dst));
@@ -381,18 +399,20 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
         dst->qualified_name = pxc_jvm_def_qn(arena, src, namespace_name, label);
         dst->receiver_type = pxc_jvm_type_qn(arena, namespace_name, src->parent_class);
     } else {
-        dst->qualified_name = src->qualified_name;
-        dst->receiver_type = src->parent_class;
+        dst->qualified_name = cbm_arena_strdup(arena, src->qualified_name);
+        dst->receiver_type = src->parent_class ? cbm_arena_strdup(arena, src->parent_class) : NULL;
     }
-    dst->short_name = src->name;
+    /* Copies, not borrows: a result may be parked on disk (spill mode) the
+     * moment the collector is done with it; the def list outlives it. */
+    dst->short_name = cbm_arena_strdup(arena, src->name);
     dst->label = label;
     dst->def_module_qn = module_qn;
-    dst->namespace_name = namespace_name;
+    dst->namespace_name = namespace_name ? cbm_arena_strdup(arena, namespace_name) : NULL;
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     /* Single return-type string. The per-language registrars split on '|'
      * for multi-return languages (Go); single-return languages just see one
      * piece, which is what's already stored. */
-    dst->return_types = src->return_type;
+    dst->return_types = src->return_type ? cbm_arena_strdup(arena, src->return_type) : NULL;
     /* Languages whose cross registrars read embedded_types as QNs get their
      * bases resolved against the project registry; everyone else keeps the
      * raw source spelling their own registrar already knows how to handle. */
@@ -400,14 +420,42 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
                               ? pxc_join_base_qns(arena, src->base_classes, reg, module_qn,
                                                   imp_keys, imp_vals, imp_count)
                               : pxc_join_pipe(arena, src->base_classes);
-    dst->signature_param_types = src->signature_param_types;
-    dst->signature_param_count = src->signature_param_count;
+    dst->signature_param_types = NULL;
+    dst->signature_param_count = 0;
+    if (src->signature_param_types && src->signature_param_count > 0) {
+        const char **types = (const char **)cbm_arena_alloc(
+            arena, (size_t)src->signature_param_count * sizeof(const char *));
+        if (types) {
+            for (int i = 0; i < src->signature_param_count; i++) {
+                types[i] = src->signature_param_types[i]
+                               ? cbm_arena_strdup(arena, src->signature_param_types[i])
+                               : NULL;
+            }
+            dst->signature_param_types = types;
+            dst->signature_param_count = src->signature_param_count;
+        }
+    }
     dst->lang = lang;
-    dst->decorators = src->decorators;
+    dst->decorators = NULL;
+    if (src->decorators) {
+        int n = 0;
+        while (src->decorators[n]) {
+            n++;
+        }
+        const char **decos =
+            (const char **)cbm_arena_alloc(arena, (size_t)(n + 1) * sizeof(const char *));
+        if (decos) {
+            for (int i = 0; i < n; i++) {
+                decos[i] = cbm_arena_strdup(arena, src->decorators[i]);
+            }
+            decos[n] = NULL;
+            dst->decorators = decos;
+        }
+    }
     if (lang == CBM_LANG_RUST) {
         /* Exact impl-block provenance is captured while the Rust impl node is
          * still on hand.  Do not reconstruct it later from leaf names. */
-        dst->trait_qn = src->impl_trait;
+        dst->trait_qn = src->impl_trait ? cbm_arena_strdup(arena, src->impl_trait) : NULL;
         dst->is_abstract = src->is_abstract;
     }
     return 0;
@@ -490,14 +538,14 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
     if (!arena || !impl || !impl->trait_name || !impl->struct_name || !impl->struct_qn) {
         return -1;
     }
-    const char *receiver_qn = impl->struct_qn;
+    const char *receiver_qn = cbm_arena_strdup(arena, impl->struct_qn);
     memset(dst, 0, sizeof(*dst));
     dst->qualified_name = receiver_qn;
     dst->short_name = pxc_qn_leaf(receiver_qn);
     dst->label = "RustImpl";
     dst->receiver_type = receiver_qn;
     dst->def_module_qn = module_qn;
-    dst->trait_qn = impl->trait_name; /* raw; canonicalized by Rust registry */
+    dst->trait_qn = cbm_arena_strdup(arena, impl->trait_name); /* raw; canonicalized later */
     dst->lang = CBM_LANG_RUST;
     dst->is_rust_impl_relation = true;
     return 0;
@@ -506,17 +554,24 @@ static int pxc_build_rust_impl_relation(CBMArena *arena, const CBMImplTrait *imp
 /* Collect a project-wide CBMLSPDef[] from all cached results. Returns a
  * malloc'd array (caller frees) of length *out_count. String fields are
  * borrowed from cache[i]->arena and from def_modules[i] (also borrowed). */
-CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
-                                    const cbm_file_info_t *files, int file_count,
-                                    const char *project_name, char **def_modules, int *out_count,
-                                    int *out_def_starts) {
+CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMArena *arena,
+                                    CBMFileResult **cache, const cbm_file_info_t *files,
+                                    int file_count, const char *project_name, char **def_modules,
+                                    int *out_count, int *out_def_starts) {
+    const cbm_result_spill_t *spill = ctx ? ctx->spill : NULL;
     int total = 0;
     for (int i = 0; i < file_count; i++) {
+        int defs = 0;
+        int impls = 0;
         if (cache[i]) {
-            total += cache[i]->defs.count;
-            if (files[i].language == CBM_LANG_RUST) {
-                total += cache[i]->impl_traits.count;
-            }
+            defs = cache[i]->defs.count;
+            impls = cache[i]->impl_traits.count;
+        } else if (spill && cbm_result_spill_has(spill, i)) {
+            cbm_result_spill_peek_counts(spill, i, &defs, &impls);
+        }
+        total += defs;
+        if (files[i].language == CBM_LANG_RUST) {
+            total += impls;
         }
     }
     if (total == 0) {
@@ -540,19 +595,21 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult
             out_def_starts[fi] = idx;
         }
         const int file_start = idx;
-        if (!cache[fi])
+        CBMFileResult *fr = cache[fi];
+        bool fr_loaded = false;
+        if (!fr && spill && cbm_result_spill_has(spill, fi)) {
+            fr = cbm_result_spill_load(spill, fi);
+            fr_loaded = fr != NULL;
+        }
+        if (!fr)
             continue;
         if (!def_modules[fi]) {
             def_modules[fi] = cbm_pipeline_fqn_module_dir(project_name, files[fi].rel_path,
                                                           pxc_module_is_dir(files[fi].language));
         }
-        const char *namespace_name = cache[fi]->namespace_name;
+        const char *namespace_name = fr->namespace_name;
         if ((!namespace_name || !namespace_name[0]) && files[fi].rel_path) {
-            namespace_name =
-                pxc_infer_jvm_namespace(&cache[fi]->arena, files[fi].rel_path, files[fi].language);
-            if (namespace_name && namespace_name[0]) {
-                cache[fi]->namespace_name = namespace_name;
-            }
+            namespace_name = pxc_infer_jvm_namespace(arena, files[fi].rel_path, files[fi].language);
         }
         /* One import map per FILE (not per def, and not per base name): the
          * cross-file base-class resolution below needs the same local-name →
@@ -567,28 +624,30 @@ CBMLSPDef *cbm_pxc_collect_all_defs(const cbm_pipeline_ctx_t *ctx, CBMFileResult
         if (ctx && ctx->registry && pxc_lang_resolves_base_qns(files[fi].language)) {
             base_reg = ctx->registry;
             cbm_pxc_build_import_map(ctx->gbuf, project_name, files[fi].rel_path,
-                                     files[fi].language, cache[fi], &imp_keys, &imp_vals,
-                                     &imp_count);
+                                     files[fi].language, fr, &imp_keys, &imp_vals, &imp_count);
         }
-        for (int di = 0; di < cache[fi]->defs.count; di++) {
-            if (pxc_build_lsp_def(&cache[fi]->arena, &cache[fi]->defs.items[di], def_modules[fi],
-                                  namespace_name, files[fi].language, &defs[idx], base_reg,
-                                  imp_keys, imp_vals, imp_count) == 0) {
+        for (int di = 0; di < fr->defs.count; di++) {
+            if (pxc_build_lsp_def(arena, &fr->defs.items[di], def_modules[fi], namespace_name,
+                                  files[fi].language, &defs[idx], base_reg, imp_keys, imp_vals,
+                                  imp_count) == 0) {
                 idx++;
             }
         }
         cbm_pxc_free_import_map(imp_keys, imp_vals, imp_count); /* NULL-safe */
         if (files[fi].language == CBM_LANG_GO) {
-            pxc_fold_go_struct_fields(&cache[fi]->arena, cache[fi], defs, file_start, idx);
+            pxc_fold_go_struct_fields(arena, fr, defs, file_start, idx);
         }
         if (files[fi].language == CBM_LANG_RUST) {
-            for (int ii = 0; ii < cache[fi]->impl_traits.count; ii++) {
-                if (pxc_build_rust_impl_relation(
-                        &cache[fi]->arena, &cache[fi]->impl_traits.items[ii], project_name,
-                        files[fi].rel_path, def_modules[fi], &defs[idx]) == 0) {
+            for (int ii = 0; ii < fr->impl_traits.count; ii++) {
+                if (pxc_build_rust_impl_relation(arena, &fr->impl_traits.items[ii], project_name,
+                                                 files[fi].rel_path, def_modules[fi],
+                                                 &defs[idx]) == 0) {
                     idx++;
                 }
             }
+        }
+        if (fr_loaded) {
+            cbm_free_result(fr);
         }
     }
     if (out_def_starts) {
@@ -1065,7 +1124,15 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
             src->first_string_arg ? cbm_arena_strdup(dst_arena, src->first_string_arg) : NULL;
         dst.second_arg_name =
             src->second_arg_name ? cbm_arena_strdup(dst_arena, src->second_arg_name) : NULL;
-        for (int ai = 0; ai < CBM_MAX_CALL_ARGS; ai++) {
+        dst.args = NULL;
+        if (src->args && src->arg_count > 0) {
+            dst.args = cbm_arena_calloc(dst_arena, (size_t)src->arg_count * sizeof(CBMCallArg));
+            if (!dst.args) {
+                dst.arg_count = 0;
+            }
+        }
+        for (int ai = 0; dst.args && ai < src->arg_count; ai++) {
+            dst.args[ai].index = src->args[ai].index;
             dst.args[ai].expr =
                 src->args[ai].expr ? cbm_arena_strdup(dst_arena, src->args[ai].expr) : NULL;
             dst.args[ai].value =
@@ -1272,6 +1339,10 @@ void cbm_pxc_filter_stats(uint64_t *defs_registered, uint64_t *build_files, uint
         *filter_failed = atomic_load_explicit(&g_pxc_filter_failed, memory_order_relaxed);
 }
 
+/* A file the extractor marked lsp_skipped (its parse alone used more than its
+ * share of the per-file budget) takes no cross-file resolve either: the same
+ * tree the per-file walk could not afford. One check for every language and
+ * both drivers. */
 void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *source,
                            int source_len, const char *rel, const char *def_module,
                            const CBMCrossLspRegistries *cross_registries,
@@ -1279,6 +1350,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                            int all_def_count, const char **imp_keys, const char **imp_vals,
                            int imp_count, CBMTypeRegistry *(*rust_shared_get)(void *),
                            void *rust_shared_ctx) {
+    if (result && result->lsp_skipped) {
+        return;
+    }
     if (!result) {
         return;
     }
@@ -1286,63 +1360,64 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
     CBMTypeRegistry *prebuilt =
         cross_registries ? cbm_pxc_registry_for_lang(cross_registries, lang) : NULL;
     if (prebuilt) {
+        /* One lifecycle for every language (2026-09-13): the walk runs in a
+         * scratch arena against a per-file OVERLAY registry chained to the
+         * immutable shared base; whatever it registers or refines lands in
+         * the overlay and dies with the file; only the resolved calls it
+         * produces are copied into the result. Before this, Go/C/C#/Java/TS
+         * were handed the RESULT arena (and C/C#/TS the shared base to write
+         * into): the kernel proof measured that as 4.4 GB of resolve-time
+         * growth in retained results plus arena pointers stored into the
+         * shared registry -- a use-after-free class the moment the arena was
+         * not the result arena (ASan, lsp_resolution_probe). */
+        CBMArena scratch;
+        cbm_arena_init(&scratch);
+        CBMTypeRegistry overlay;
+        cbm_registry_init(&overlay, &scratch);
+        overlay.fallback = prebuilt;
+        CBMResolvedCallArray out = {0};
+        CBMCallArray synthetic_calls = {0};
         switch (lang) {
         case CBM_LANG_GO:
             /* Tier 3 (metadata-driven): pure lookup over the Tier-1
-             * lsp_unresolved entries — no parse, no AST walk. Then the
-             * AST walk on the shared Tier-2 registry (mirroring every
-             * other language) so NAMED receivers evaluated against
-             * project-wide defs also resolve. The walk variant below is
-             * read-only — the sealed registry is safe for parallel
-             * workers. */
+             * lsp_unresolved entries -- no parse, no AST walk -- then the
+             * AST walk against the overlay (chained to the sealed base). */
             cbm_go_fast_resolve_qualified_calls(result, prebuilt, imp_keys, imp_vals, imp_count);
-            cbm_run_go_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
-                                               prebuilt, imp_keys, imp_vals, imp_count,
-                                               result->cached_tree, &result->resolved_calls);
+            cbm_run_go_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
+                                               imp_keys, imp_vals, imp_count, result->cached_tree,
+                                               &out);
             used_prebuilt = true;
             break;
-        case CBM_LANG_PYTHON: {
-            CBMArena scratch;
-            cbm_arena_init(&scratch);
-            CBMResolvedCallArray out = {0};
-            CBMCallArray synthetic_calls = {0};
-            cbm_run_py_lsp_cross_with_registry(&scratch, source, source_len, def_module, prebuilt,
+        case CBM_LANG_PYTHON:
+            cbm_run_py_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
                                                imp_keys, imp_vals, imp_count, result->cached_tree,
                                                &out, &synthetic_calls);
-            pxc_append_results(&result->arena, &result->resolved_calls, &out);
-            pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
-            cbm_arena_destroy(&scratch);
             used_prebuilt = true;
             break;
-        }
         case CBM_LANG_C:
         case CBM_LANG_CPP:
         case CBM_LANG_CUDA:
-            cbm_run_c_lsp_cross_with_registry(
-                &result->arena, source, source_len, def_module, (lang != CBM_LANG_C), prebuilt,
-                imp_keys, imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+            cbm_run_c_lsp_cross_with_registry(&scratch, source, source_len, def_module,
+                                              (lang != CBM_LANG_C), &overlay, imp_keys, imp_vals,
+                                              imp_count, result->cached_tree, &out);
             used_prebuilt = true;
             break;
         case CBM_LANG_CSHARP:
-            cbm_run_cs_lsp_cross_with_registry(&result->arena, source, source_len, def_module,
-                                               prebuilt, imp_vals, imp_count, result->cached_tree,
-                                               &result->resolved_calls);
+            cbm_run_cs_lsp_cross_with_registry(&scratch, source, source_len, def_module, &overlay,
+                                               imp_vals, imp_count, result->cached_tree, &out);
             used_prebuilt = true;
             break;
         case CBM_LANG_JAVA:
-            /* Own-module defs go into a per-file overlay; imports and stdlib
-             * resolve through the shared base (#1669). */
-            cbm_run_java_lsp_cross_with_registry(
-                &result->arena, result, source, source_len, def_module, prebuilt, imp_keys,
-                imp_vals, imp_count, result->cached_tree, &result->resolved_calls);
+            /* Java builds its own-module overlay on top of the one it is
+             * handed; both live in scratch now. */
+            cbm_run_java_lsp_cross_with_registry(&scratch, result, source, source_len, def_module,
+                                                 &overlay, imp_keys, imp_vals, imp_count,
+                                                 result->cached_tree, &out);
             used_prebuilt = true;
             break;
         case CBM_LANG_JAVASCRIPT:
         case CBM_LANG_TYPESCRIPT:
         case CBM_LANG_TSX: {
-            /* TS: per-file OVERLAY chained to the shared base. Filter to
-             * own+imports so the overlay builder can pick out own-module
-             * defs without scanning the whole project. */
             bool js;
             bool jsx;
             bool dts;
@@ -1361,10 +1436,9 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                     ts_def_count = fc;
                 }
             }
-            cbm_run_ts_lsp_cross_with_registry(&result->arena, source, source_len, def_module, js,
-                                               jsx, dts, prebuilt, ts_defs, ts_def_count, imp_keys,
-                                               imp_vals, imp_count, result->cached_tree,
-                                               &result->resolved_calls);
+            cbm_run_ts_lsp_cross_with_registry(&scratch, source, source_len, def_module, js, jsx,
+                                               dts, &overlay, ts_defs, ts_def_count, imp_keys,
+                                               imp_vals, imp_count, result->cached_tree, &out);
             free(ts_filtered);
             used_prebuilt = true;
             break;
@@ -1374,6 +1448,11 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         default:
             break;
         }
+        if (used_prebuilt) {
+            pxc_append_results(&result->arena, &result->resolved_calls, &out);
+            pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
+        }
+        cbm_arena_destroy(&scratch);
     }
 
     if (used_prebuilt) {
@@ -1498,15 +1577,22 @@ int cbm_pipeline_pass_lsp_cross(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *
 
     int def_count = 0;
     int *def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
-    CBMLSPDef *all_defs = cbm_pxc_collect_all_defs(ctx, cache, files, file_count, ctx->project_name,
-                                                   def_modules, &def_count, def_starts);
+    /* The defs own their strings in the caller-owned seq_cross_arena, which
+     * the registries and later passes already borrow from (see below). */
+    if (!ctx->seq_cross_arena_live) {
+        cbm_arena_init(&ctx->seq_cross_arena);
+        ctx->seq_cross_arena_live = true;
+    }
+    CBMLSPDef *all_defs =
+        cbm_pxc_collect_all_defs(ctx, &ctx->seq_cross_arena, cache, files, file_count,
+                                 ctx->project_name, def_modules, &def_count, def_starts);
     /* Same seam as the parallel driver: serialize per-file surfaces while the
      * result cache is alive. Failure only degrades to a full rebuild on the
      * next incremental run. */
     if (ctx->pipeline && all_defs && def_starts) {
         cbm_lsp_surface_row_t *surface_rows = NULL;
         int surface_count = 0;
-        if (cbm_lsp_surface_build_rows(ctx->project_name, cache, files, file_count, all_defs,
+        if (cbm_lsp_surface_build_rows(ctx, ctx->project_name, cache, files, file_count, all_defs,
                                        def_starts, &surface_rows, &surface_count) == 0) {
             cbm_pipeline_set_lsp_surfaces(ctx->pipeline, surface_rows, surface_count);
         }

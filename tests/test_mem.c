@@ -6,6 +6,8 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "../src/foundation/mem.h"
+#include "../src/foundation/platform.h" /* cbm_system_info, cbm_system_available_ram */
+#include "../src/foundation/mem_core.h"
 #include "../src/foundation/arena.h"
 #include "../src/foundation/slab_alloc.h"
 #include "../src/foundation/compat_thread.h"
@@ -1336,6 +1338,237 @@ TEST(extract_traversal_stacks_come_from_ctx_scratch_issue2010) {
     PASS();
 }
 
+/* ── mem_core: the central allocation route ────────────────────────────
+ *
+ * Every assertion below is a DELTA, never an absolute. Other code in this
+ * process may allocate through the core concurrently, so a test that pinned an
+ * absolute total would be measuring the rest of the suite. */
+
+TEST(mem_core_accounts_alloc_and_free) {
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_NODE);
+    size_t blocks_before = cbm_mem_class_live_blocks(CBM_MEM_CLASS_GBUF_NODE);
+
+    void *p = cbm_alloc(CBM_MEM_CLASS_GBUF_NODE, 4096);
+    ASSERT_TRUE(p != NULL);
+    size_t during = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_NODE);
+    /* Charged at least what was asked for; usable size may round UP, never
+     * down, so a strict >= is the honest assertion. */
+    ASSERT_TRUE(during >= before + 4096);
+    ASSERT_EQ((int)(cbm_mem_class_live_blocks(CBM_MEM_CLASS_GBUF_NODE) - blocks_before), 1);
+
+    cbm_free(CBM_MEM_CLASS_GBUF_NODE, p);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_NODE) - before), 0);
+    ASSERT_EQ((int)(cbm_mem_class_live_blocks(CBM_MEM_CLASS_GBUF_NODE) - blocks_before), 0);
+    PASS();
+}
+
+/* The whole point of classes: attribution. If a gbuf allocation could show up
+ * under semantic, the table could not choose between "park workers" and
+ * "stream the vectors" -- the decision this core exists to inform. */
+TEST(mem_core_classes_do_not_bleed) {
+    size_t node_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_NODE);
+    size_t sem_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC);
+
+    void *p = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, 8192);
+    ASSERT_TRUE(p != NULL);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_NODE) - node_before), 0);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_SEMANTIC) >= sem_before + 8192);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, p);
+    PASS();
+}
+
+TEST(mem_core_realloc_replaces_the_old_charge) {
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_DUMP);
+    void *p = cbm_alloc(CBM_MEM_CLASS_DUMP, 1024);
+    ASSERT_TRUE(p != NULL);
+    p = cbm_realloc(CBM_MEM_CLASS_DUMP, p, 65536);
+    ASSERT_TRUE(p != NULL);
+    size_t grown = cbm_mem_class_live_bytes(CBM_MEM_CLASS_DUMP);
+    /* The old 1024 must be gone, not stacked on top: exactly one block is live,
+     * so the delta is bounded by the new size plus rounding, not by the sum. */
+    ASSERT_TRUE(grown >= before + 65536);
+    ASSERT_TRUE(grown < before + 65536 + 65536);
+    cbm_free(CBM_MEM_CLASS_DUMP, p);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_DUMP) - before), 0);
+    PASS();
+}
+
+/* realloc(NULL) is alloc, and free(NULL) is a no-op: the core must match the C
+ * library exactly or adoption stops being a mechanical rename. */
+TEST(mem_core_matches_libc_null_semantics) {
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE);
+    cbm_free(CBM_MEM_CLASS_STORE, NULL);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE) - before), 0);
+
+    void *p = cbm_realloc(CBM_MEM_CLASS_STORE, NULL, 2048);
+    ASSERT_TRUE(p != NULL);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE) >= before + 2048);
+    cbm_free(CBM_MEM_CLASS_STORE, p);
+
+    /* A zero-size request still yields a freeable pointer. */
+    void *z = cbm_alloc(CBM_MEM_CLASS_STORE, 0);
+    ASSERT_TRUE(z != NULL);
+    cbm_free(CBM_MEM_CLASS_STORE, z);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_STORE) - before), 0);
+    PASS();
+}
+
+TEST(mem_core_strdup_copies_and_accounts) {
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_STRING);
+    ASSERT_TRUE(cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, NULL) == NULL);
+
+    const char *src = "qualified::name::example";
+    char *copy = cbm_mem_strdup(CBM_MEM_CLASS_GBUF_STRING, src);
+    ASSERT_TRUE(copy != NULL);
+    ASSERT_TRUE(strcmp(copy, src) == 0);
+    ASSERT_TRUE(copy != src);
+    ASSERT_TRUE(cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_STRING) > before);
+    cbm_free(CBM_MEM_CLASS_GBUF_STRING, copy);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_STRING) - before), 0);
+    PASS();
+}
+
+/* A budget decision is about the PEAK, not about whatever was live when
+ * someone looked. Peak must survive the free that follows it. */
+TEST(mem_core_peak_survives_the_free) {
+    cbm_mem_class_reset_peaks();
+    size_t base = cbm_mem_class_peak_bytes(CBM_MEM_CLASS_EXTRACT);
+    void *p = cbm_alloc(CBM_MEM_CLASS_EXTRACT, 32768);
+    ASSERT_TRUE(p != NULL);
+    size_t peak_live = cbm_mem_class_peak_bytes(CBM_MEM_CLASS_EXTRACT);
+    ASSERT_TRUE(peak_live >= base + 32768);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, p);
+    ASSERT_EQ((int)(cbm_mem_class_peak_bytes(CBM_MEM_CLASS_EXTRACT) - peak_live), 0);
+    PASS();
+}
+
+/* Arena-backed memory reports in bulk rather than per object: the extraction
+ * engine has 1301 arena call sites and rewriting them to per-object cbm_alloc
+ * would undo the batching that keeps its allocation count low. */
+TEST(mem_core_external_bulk_accounting_is_symmetric) {
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_EXTRACT);
+    cbm_mem_class_add_external(CBM_MEM_CLASS_EXTRACT, 1024 * 1024);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_EXTRACT) - before), 1024 * 1024);
+    cbm_mem_class_remove_external(CBM_MEM_CLASS_EXTRACT, 1024 * 1024);
+    ASSERT_EQ((int)(cbm_mem_class_live_bytes(CBM_MEM_CLASS_EXTRACT) - before), 0);
+    PASS();
+}
+
+/* The one mistake a caller can actually make is freeing with the wrong class.
+ * That must never underflow the counter: an unsigned wrap would turn a small
+ * drift into a colossal bogus total that reads as a catastrophic leak and
+ * sends someone hunting a phantom. Clamp at zero instead. */
+TEST(mem_core_mismatched_class_never_wraps) {
+    void *p = cbm_alloc(CBM_MEM_CLASS_GBUF_EDGE, 4096);
+    ASSERT_TRUE(p != NULL);
+    /* Free against a class that was never charged for it. */
+    size_t other_before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_DUMP);
+    cbm_free(CBM_MEM_CLASS_DUMP, p);
+    size_t other_after = cbm_mem_class_live_bytes(CBM_MEM_CLASS_DUMP);
+    ASSERT_TRUE(other_after <= other_before); /* clamped, never wrapped */
+    ASSERT_TRUE(other_after < (size_t)-1 / 2);
+    PASS();
+}
+
+TEST(mem_core_report_json_is_wellformed_or_empty) {
+    void *p = cbm_alloc(CBM_MEM_CLASS_GBUF_INDEX, 4096);
+    ASSERT_TRUE(p != NULL);
+    char buf[CBM_SZ_1K];
+    int n = cbm_mem_class_report_json(buf, sizeof(buf));
+    ASSERT_TRUE(n > 0);
+    ASSERT_TRUE(buf[0] == '[');
+    ASSERT_TRUE(buf[n - 1] == ']');
+    ASSERT_TRUE(strstr(buf, "gbuf_index") != NULL);
+    /* A buffer too small must yield NOTHING, never a truncated array that a
+     * JSON reader would reject or, worse, silently mis-parse. */
+    char tiny[8];
+    ASSERT_EQ(cbm_mem_class_report_json(tiny, sizeof(tiny)), 0);
+    cbm_free(CBM_MEM_CLASS_GBUF_INDEX, p);
+    PASS();
+}
+
+/* ── Pressure primitives and the charged reading ─────────────────────── */
+
+TEST(mem_charged_is_positive_and_consistent_with_rss) {
+    size_t charged = cbm_mem_charged();
+    size_t rss = cbm_mem_rss();
+    ASSERT(charged > 0);
+    ASSERT(rss > 0);
+    /* Same order of magnitude as RSS on every platform: the charged value
+     * may sit below RSS (purged-but-resident pages) or slightly above it
+     * (compressed pages), never at zero or at a multiple. */
+    ASSERT(charged < rss * 4);
+    ASSERT(rss < charged * 4 + (size_t)64 * 1024 * 1024);
+    PASS();
+}
+
+/* The charged high-water mark never reads below a charge just taken, and a
+ * later, larger charge lifts it: it is a max over every reading. */
+TEST(mem_peak_charged_is_the_high_water_of_charged) {
+    size_t charged = cbm_mem_charged();
+    ASSERT_TRUE(charged > 0);
+    ASSERT_TRUE(cbm_mem_peak_charged() >= charged);
+    size_t peak_before = cbm_mem_peak_charged();
+    (void)cbm_mem_charged();
+    ASSERT_TRUE(cbm_mem_peak_charged() >= peak_before);
+    PASS();
+}
+
+TEST(mem_footprint_zero_or_plausible) {
+    size_t fp = cbm_mem_footprint();
+    if (fp > 0) {
+        ASSERT(fp >= (size_t)1024 * 1024); /* a live test process is more than 1 MB */
+    }
+    PASS();
+}
+
+TEST(mem_system_available_ram_is_within_total) {
+    size_t avail = cbm_system_available_ram();
+    cbm_system_info_t info = cbm_system_info();
+    if (avail == 0 || info.total_ram == 0) {
+        PASS(); /* platform cannot answer; the caller treats that as unknown */
+    }
+    ASSERT(avail <= info.total_ram);
+    PASS();
+}
+
+TEST(mem_system_under_pressure_is_a_pure_threshold) {
+    size_t avail = cbm_system_available_ram();
+    cbm_system_info_t info = cbm_system_info();
+    bool under = cbm_mem_system_under_pressure();
+    if (avail == 0 || info.total_ram == 0) {
+        ASSERT_FALSE(under); /* never abort on a guess */
+        PASS();
+    }
+    ASSERT_EQ(under, avail < info.total_ram / 8);
+    PASS();
+}
+
+TEST(mem_over_budget_follows_the_charged_reading) {
+    size_t saved = cbm_mem_budget();
+    size_t charged = cbm_mem_charged();
+    ASSERT(charged > 0);
+    cbm_mem_set_budget_for_tests(charged * 4);
+    ASSERT_FALSE(cbm_mem_over_budget());
+    cbm_mem_set_budget_for_tests(charged / 4 + 1);
+    ASSERT_TRUE(cbm_mem_over_budget());
+    cbm_mem_set_budget_for_tests(saved);
+    PASS();
+}
+
+TEST(mem_core_class_names_are_total) {
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_SEMANTIC), "semantic") == 0);
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_ARENA), "arena") == 0);
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_TS_TREE), "ts_tree") == 0);
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_STORE), "store") == 0);
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_HASH_TABLE), "hash_table") == 0);
+    ASSERT_TRUE(strcmp(cbm_mem_class_name(CBM_MEM_CLASS_DYN_ARRAY), "dyn_array") == 0);
+    /* Out of range must still answer, so a log line never takes a NULL. */
+    ASSERT_TRUE(cbm_mem_class_name((cbm_mem_class_t)(CBM_MEM_CLASS_COUNT + 5)) != NULL);
+    ASSERT_TRUE(cbm_mem_class_name((cbm_mem_class_t)-1) != NULL);
+    PASS();
+}
+
 SUITE(mem) {
     /* mem API */
     RUN_TEST(mem_arena_eager_commit_follows_platform_commit_cost);
@@ -1402,4 +1635,20 @@ SUITE(mem) {
 
     /* extraction scratch arena (#2010) */
     RUN_TEST(extract_traversal_stacks_come_from_ctx_scratch_issue2010);
+    RUN_TEST(mem_core_accounts_alloc_and_free);
+    RUN_TEST(mem_core_classes_do_not_bleed);
+    RUN_TEST(mem_core_realloc_replaces_the_old_charge);
+    RUN_TEST(mem_core_matches_libc_null_semantics);
+    RUN_TEST(mem_core_strdup_copies_and_accounts);
+    RUN_TEST(mem_core_peak_survives_the_free);
+    RUN_TEST(mem_core_external_bulk_accounting_is_symmetric);
+    RUN_TEST(mem_core_mismatched_class_never_wraps);
+    RUN_TEST(mem_core_report_json_is_wellformed_or_empty);
+    RUN_TEST(mem_core_class_names_are_total);
+    RUN_TEST(mem_charged_is_positive_and_consistent_with_rss);
+    RUN_TEST(mem_peak_charged_is_the_high_water_of_charged);
+    RUN_TEST(mem_footprint_zero_or_plausible);
+    RUN_TEST(mem_system_available_ram_is_within_total);
+    RUN_TEST(mem_system_under_pressure_is_a_pure_threshold);
+    RUN_TEST(mem_over_budget_follows_the_charged_reading);
 }

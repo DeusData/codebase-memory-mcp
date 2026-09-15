@@ -11228,11 +11228,34 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         yyjson_mut_obj_add_str(doc, root, "previous_index", "preserved");
         yyjson_mut_obj_add_int(doc, root, "budget_mb", budget_mb);
         yyjson_mut_obj_add_int(doc, root, "peak_rss_mb", peak_rss_mb);
-        yyjson_mut_obj_add_str(doc, root, "hint",
-                               "Indexing stopped: resident memory stayed above the budget after "
-                               "backpressure; no partial graph was published and the previous "
-                               "index still serves. Raise CBM_MEM_BUDGET_MB, lower CBM_WORKERS, "
-                               "or exclude large subtrees.");
+        /* A CONCRETE retry value, because "raise CBM_MEM_BUDGET_MB" alone makes
+         * the caller guess — and the obvious guess is wrong. peak_rss_mb is
+         * where the run was STOPPED (it is pinned just above the budget by
+         * construction), not what the repo needs, so retrying at peak+10% fails
+         * again. Measured 2026-09-13 on the linux kernel: aborted at 25622 MB
+         * against a 24576 MB budget, but completing it actually took 31.75 GB —
+         * 1.32x the budget, 1.24x the reported peak. Suggest 1.5x the budget so
+         * the first retry has a real chance, and say plainly that the peak is a
+         * floor rather than a requirement. */
+        /* (3*b+1)/2 rather than b + b/2: integer division makes the latter
+         * degenerate to b for b == 1, so the "suggestion" would repeat the
+         * budget that just failed. Rounding up keeps it strictly larger for
+         * every positive budget. */
+        int suggested_budget_mb = budget_mb > 0 ? (budget_mb * 3 + 1) / 2 : 0;
+        char hint_text[CBM_SZ_512];
+        (void)snprintf(hint_text, sizeof(hint_text),
+                       "Indexing stopped: resident memory stayed above the budget after "
+                       "backpressure; no partial graph was published and the previous index "
+                       "still serves. peak_rss_mb is where indexing was STOPPED, not what this "
+                       "repo needs — the real requirement is higher, so retrying just above the "
+                       "peak will fail again. Retry with CBM_MEM_BUDGET_MB=%d (1.5x the current "
+                       "budget) if the machine has the RAM, or lower CBM_WORKERS, or exclude "
+                       "large subtrees.",
+                       suggested_budget_mb);
+        if (suggested_budget_mb > 0) {
+            yyjson_mut_obj_add_int(doc, root, "suggested_budget_mb", suggested_budget_mb);
+        }
+        yyjson_mut_obj_add_strcpy(doc, root, "hint", hint_text);
     } else if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
         /* The truthful abort message (#2020): the old generic "check repo_path"
          * hint sent people debugging a path that was fine, when the run

@@ -95,8 +95,8 @@ static void append_complexity_props(cbm_gbuf_node_t *node, int tld, bool recursi
         free(neu);
         return;
     }
-    free(node->properties_json);
-    node->properties_json = neu;
+    (void)cbm_gbuf_node_set_properties_json(node, neu);
+    free(neu);
 }
 
 /* Content-only node order: qualified_name, then file path and start line.
