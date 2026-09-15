@@ -1180,6 +1180,15 @@ static int posix_lifetime_lock_probe(const cbm_daemon_ipc_endpoint_t *endpoint,
     if (process_claimed < 0) {
         return -1;
     }
+    if (process_claimed == 1) {
+        /* Already held by this process per the in-process registry: trust
+         * that alone. Opening a throwaway fd on the lock file here and then
+         * closing it would release the real fcntl(2) record lock, which is
+         * scoped to (process, inode) rather than (fd, inode): closing any
+         * fd on this inode drops every lock this process holds on it, even
+         * one held via a different, still-open fd. */
+        return endpoint_runtime_still_valid(endpoint) ? 1 : -1;
+    }
 
     int fd = openat(endpoint->dir_fd, lock_name, O_RDWR | O_CLOEXEC | O_NOFOLLOW);
     if (fd < 0) {
@@ -1190,10 +1199,6 @@ static int posix_lifetime_lock_probe(const cbm_daemon_ipc_endpoint_t *endpoint,
         !endpoint_runtime_still_valid(endpoint)) {
         (void)close(fd);
         return -1;
-    }
-    if (process_claimed == 1) {
-        bool still_private = endpoint_runtime_still_valid(endpoint);
-        return close(fd) == 0 && still_private ? 1 : -1;
     }
     struct flock record_lock = {
         .l_type = F_WRLCK,
