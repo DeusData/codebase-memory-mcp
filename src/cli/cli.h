@@ -57,6 +57,48 @@ bool cbm_cli_mcp_result_is_error(const char *result);
  * accepted cancellation into EXIT_FAILURE. */
 int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_cancelled);
 
+/* ── Index exit contract ──────────────────────────────────────────
+ *
+ * A freshness gate must not have to read anyone's account of itself: it reads
+ * the process status. `index_repository` therefore grades its own outcome.
+ *
+ *   0  indexed, quality at or above the thresholds
+ *   1  hard failure (pipeline fell over inside a reachable repository)
+ *   2  indexed, but below a quality threshold — a graph that exists and lies
+ *      about how much of the tree it covers is worse than no graph
+ *   3  target unavailable: repo_path is absent, unreadable, or not a directory
+ *
+ * 1 keeps its historical meaning so existing `|| fail` scripts are unaffected;
+ * 2 and 3 are new and carve out cases that used to return 0 and 1.
+ *
+ * The contract is opt-in: it applies only when CBM_GATE is set to a non-empty
+ * value other than "0". Without it the CLI exits exactly as before, so a
+ * caller that never asked for grading never sees a new code.
+ *
+ * Thresholds, both overridable by environment:
+ *   CBM_GATE_MAX_UNUSABLE     (default 0)   absolute count of unparsable files
+ *   CBM_GATE_MAX_PARTIAL_PCT  (default 10)  parse_partial_count / files_indexed
+ * A threshold set to a negative value disables that check.
+ *
+ * The two numbers differ on purpose and must not be collapsed into one: a file
+ * that did not parse at all is a defect and gets no tolerance, while partial
+ * parsing marks constructs this grammar does not cover — a property of language
+ * support, not of index quality, and normal at a few percent in a large tree.
+ * A gate its own repository cannot pass gets switched off, which protects
+ * nothing. */
+enum {
+    CBM_CLI_EXIT_OK = 0,
+    CBM_CLI_EXIT_FAILURE = 1,
+    CBM_CLI_EXIT_QUALITY = 2,
+    CBM_CLI_EXIT_TARGET = 3,
+};
+
+/* Grade an index_repository result envelope. `base_status` is what the
+ * ordinary isError mapping already produced; it is preserved unless the
+ * payload justifies a more specific code. Unparsable payloads change
+ * nothing — silence is never upgraded into a verdict. */
+int cbm_cli_index_exit_status(const char *result, int base_status);
+
 /* ── Self-update: version comparison ──────────────────────────── */
 
 /* Compare two semver strings (e.g. "0.2.1" vs "0.2.0").
