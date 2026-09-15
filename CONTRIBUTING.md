@@ -8,6 +8,9 @@ Contributions are welcome. This guide covers setup, testing, and PR guidelines.
 
 **Prerequisites**: C compiler (gcc or clang), make, zlib, Git. Optional: Node.js 22+ (for graph UI).
 
+CI builds and npm publishing use Node.js 24 from [.node-version](.node-version).
+Node.js 22 remains supported and is tested alongside Node.js 24.
+
 ```bash
 git clone https://github.com/DeusData/codebase-memory-mcp.git
 cd codebase-memory-mcp
@@ -32,6 +35,15 @@ This builds with ASan + UBSan and runs the full C test suite. Key test files:
 - `tests/test_mcp.c` — MCP protocol and tool handler tests
 - `tests/test_store_*.c` — SQLite graph store tests
 
+For the graph UI:
+
+```bash
+bash scripts/ci/test-frontend.sh
+```
+
+This installs locked dependencies, runs Vitest, and builds the production UI.
+CI runs the same entry point on Node.js 22 and 24.
+
 ## Run Linter
 
 ```bash
@@ -39,6 +51,16 @@ scripts/lint.sh
 ```
 
 Runs clang-tidy, cppcheck, and clang-format. All must pass before committing (also enforced by pre-commit hook).
+
+For GitHub Actions workflows, install [actionlint 1.7.12](https://github.com/rhysd/actionlint/releases/tag/v1.7.12)
+on PATH and run:
+
+```bash
+bash scripts/ci/lint-workflows.sh
+```
+
+This checks workflow syntax and expressions. ShellCheck and Pyflakes are not
+enabled by this entry point; existing repository checks remain unchanged.
 
 ## Run Security Audit
 

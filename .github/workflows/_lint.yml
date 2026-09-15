@@ -1,4 +1,4 @@
-# Reusable: lint only (cppcheck + clang-format).
+# Reusable: workflow and C lint (actionlint + cppcheck + clang-format).
 # Security-static and CodeQL gate are separate — see _security.yml.
 name: Lint & Security
 
@@ -9,8 +9,30 @@ permissions:
   contents: read
 
 jobs:
+  lint-workflows:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install actionlint 1.7.12
+        env:
+          ACTIONLINT_VERSION: "1.7.12"
+          ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
+        run: |
+          curl -fsSL --retry 3 \
+            "https://github.com/rhysd/actionlint/releases/download/v${ACTIONLINT_VERSION}/actionlint_${ACTIONLINT_VERSION}_linux_amd64.tar.gz" \
+            -o "$RUNNER_TEMP/actionlint.tar.gz"
+          echo "$ACTIONLINT_SHA256  $RUNNER_TEMP/actionlint.tar.gz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/actionlint"
+          tar -xzf "$RUNNER_TEMP/actionlint.tar.gz" -C "$RUNNER_TEMP/actionlint" actionlint
+          echo "$RUNNER_TEMP/actionlint" >> "$GITHUB_PATH"
+
+      - name: Lint GitHub Actions workflows
+        run: bash scripts/ci/lint-workflows.sh
+
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # 15 min proved too tight on a slow runner day and a timed-out lint reads
     # as "cancelled", which the release graph must treat as a hard stop; keep
     # a bound, but one only a genuine hang can hit (normal runtime ~5 min).
@@ -60,7 +82,7 @@ jobs:
   # provability (never suppressed — the NOLINT ban applies here too).
   # Vendored-tree diagnostics are path-filtered, mirroring .cppcheck.
   lint-mem:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
