@@ -136,6 +136,8 @@ Current format:
 Notes:
 
 - If a UI-enabled binary finds its verified external asset pack and no UI config file exists yet, the UI auto-enables on first run. Missing or invalid assets leave the MCP/daemon service available and keep the UI disabled.
+- A bare `daemon start` honors the saved `ui_enabled` value, including `false`. Enable the UI with `codebase-memory-mcp config set ui_enabled true`.
+- On a cold start, `daemon start --open` or `daemon start --port=N` explicitly enables the UI and persists that choice. An already-active daemon keeps its current settings; stop it first to change ports with `--port=N`.
 - `CBM_CACHE_DIR` changes both the UI config location and the runtime settings database location.
 - CBM resolves `CBM_CACHE_DIR` to one canonical per-account cache root. A process configured with a different root fails while any CBM session or command is active; close them before switching roots.
 
