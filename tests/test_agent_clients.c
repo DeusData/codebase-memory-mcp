@@ -1316,6 +1316,19 @@ TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction) {
     PASS();
 }
 
+/* #2077: OpenCode's V2 loader only reads the default export and needs an
+ * id plus a setup()/effect() function; the old named export had neither. */
+TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077) {
+    char *js = cbm_client_adapter_opencode("/usr/local/bin/codebase-memory-mcp");
+    ASSERT_NOT_NULL(js);
+    ASSERT_NOT_NULL(strstr(js, "export default {"));
+    ASSERT_NOT_NULL(strstr(js, "id: 'codebase-memory-augment'"));
+    ASSERT_NOT_NULL(strstr(js, "async setup(ctx) {"));
+    ASSERT_NULL(strstr(js, "export const CodebaseMemory"));
+    free(js);
+    PASS();
+}
+
 /* Empty/NULL inputs must not produce a module at all. */
 TEST(client_adapter_rejects_missing_binary_path) {
     ASSERT_NULL(cbm_client_adapter_pi(NULL));
@@ -1362,5 +1375,6 @@ SUITE(agent_clients) {
     RUN_TEST(client_adapter_escapes_windows_paths_and_quotes);
     RUN_TEST(client_adapter_opencode_sends_the_required_hook_event);
     RUN_TEST(client_adapter_opencode_covers_lifecycle_read_and_compaction);
+    RUN_TEST(client_adapter_opencode_exports_the_v2_default_definition_issue2077);
     RUN_TEST(client_adapter_rejects_missing_binary_path);
 }
