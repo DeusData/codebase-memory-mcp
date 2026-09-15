@@ -1029,32 +1029,28 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
         }
     }
 
-    /* Strategy 3: unique name */
+    /* Strategy 3: unique name - require imports for weak name-only matching.
+     * Without explicit imports, unique_name/suffix_match can fabricate spurious
+     * cross-language edges (e.g., Python builtin 'get' matching every unrelated
+     * project 'get'). Strict import requirement reduces false positives at the
+     * cost of missing legitimate same-language calls in import-sparse codebases. */
+    if (!import_vals || import_count == 0) {
+        return empty_result();
+    }
+
     if (arr->count == SKIP_ONE) {
         if (!receiver_chain_admits(callee_name, arr->items[0])) {
             return empty_result();
         }
         double conf = CONF_UNIQUE_NAME;
-        if (import_vals && import_count > 0 &&
-            !is_import_reachable(arr->items[0], import_vals, import_count)) {
+        if (!is_import_reachable(arr->items[0], import_vals, import_count)) {
             conf *= DEFAULT_CONFIDENCE;
         }
         return (cbm_resolution_t){arr->items[0], "unique_name", conf, REG_RESOLVED};
     }
 
     /* Strategy 4: multiple candidates */
-    if (import_vals && import_count > 0) {
-        return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
-    }
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
-    if (best) {
-        if (!receiver_chain_admits(callee_name, best)) {
-            return empty_result();
-        }
-        double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, arr->count);
-        return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
-    }
-    return empty_result();
+    return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
 }
 
 /* The strategy chain shared by both public resolve variants (no caching here —

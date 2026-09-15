@@ -1760,8 +1760,32 @@ static void resolve_static_call(PHPLSPContext *ctx, TSNode call, CBMResolvedKind
             }
         }
     }
-    if (!class_qn)
-        return;
+    if (!class_qn) {
+        /* Fallback: enclosing_class_qn is NULL (shouldn't happen in well-formed
+         * code, but may occur if process_class_decl didn't run). Emit a low-
+         * confidence self-reference so pass_calls can still attempt registry
+         * resolution instead of dropping the call entirely. */
+        if (ctx->enclosing_func_qn && strcmp(strategy, "php_self_static") == 0) {
+            /* Extract class QN from enclosing_func_qn: "Proj.path.Class.method" → "Proj.path.Class" */
+            const char *last_dot = strrchr(ctx->enclosing_func_qn, '.');
+            if (last_dot && last_dot > ctx->enclosing_func_qn) {
+                size_t class_len = (size_t)(last_dot - ctx->enclosing_func_qn);
+                char *inferred_class = (char *)cbm_arena_alloc(ctx->arena, class_len + 1);
+                if (inferred_class) {
+                    memcpy(inferred_class, ctx->enclosing_func_qn, class_len);
+                    inferred_class[class_len] = '\0';
+                    class_qn = inferred_class;
+                    /* Continue to method lookup with inferred class */
+                } else {
+                    return;
+                }
+            } else {
+                return;
+            }
+        } else {
+            return;
+        }
+    }
 
     const CBMRegisteredFunc *f = php_lookup_method(ctx, class_qn, method_name);
     if (f) {
