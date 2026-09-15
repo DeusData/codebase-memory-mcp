@@ -985,6 +985,11 @@ static const CallCase CALL_CASES[] = {
      "local function helper(x: number): number\n   return x + 1\nend\n\nlocal function run(): "
      "number\n   return helper(41)\nend\n",
      true, NULL},
+    {"vb6", "a.bas",
+     "Attribute VB_Name = \"ModA\"\nOption Explicit\n\nPrivate Function Helper() As Long\n"
+     "    Helper = 42\nEnd Function\n\nPublic Sub Run()\n    Dim v As Long\n    v = Helper()\n"
+     "    Helper\nEnd Sub\n",
+     true, NULL},
     {"vimscript", "a.vim",
      "function! Helper() abort\n  return 1\nendfunction\n\nfunction! Run() abort\n  call "
      "Helper()\nendfunction\n",

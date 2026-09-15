@@ -861,6 +861,24 @@ static const char CHIALISP_BARE[] = "(\n"
                                     "  (defun run (watched) watched)\n"
                                     ")\n";
 
+/* VB6: `accept watched` is a call_statement (callee field + argument list);
+ * the parameter binds through the grammar's `parameter` node. */
+static const char VB6_INSIDE[] = "Attribute VB_Name = \"Sample\"\n"
+                                 "Option Explicit\n"
+                                 "\n"
+                                 "Public Sub accept(value As Long)\n"
+                                 "End Sub\n"
+                                 "\n"
+                                 "Public Sub run(watched As Long)\n"
+                                 "    accept watched\n"
+                                 "End Sub\n";
+static const char VB6_BARE[] = "Attribute VB_Name = \"Sample\"\n"
+                               "Option Explicit\n"
+                               "\n"
+                               "Public Function run(watched As Long) As Long\n"
+                               "    run = watched\n"
+                               "End Function\n";
+
 static const char PLSQL_INSIDE[] = "CREATE OR REPLACE PACKAGE BODY sample_pkg AS\n"
                                    "  FUNCTION accept(value NUMBER) RETURN NUMBER IS\n"
                                    "  BEGIN\n"
@@ -1030,6 +1048,9 @@ static const RoutineArgumentCase PLSQL_CASE = ROUTINE_ARGUMENT_CASE(
 static const RoutineArgumentCase CHIALISP_CASE = ROUTINE_ARGUMENT_CASE(
     "CHIALISP", CBM_LANG_CHIALISP, "sample.clib", CHIALISP_INSIDE, CHIALISP_BARE, "list", "run",
     "accept", "watched", 1, 1, 0, "Chialisp list application and symbol-reference vocabulary");
+static const RoutineArgumentCase VB6_CASE = ROUTINE_ARGUMENT_CASE(
+    "VB6", CBM_LANG_VB6, "Sample.bas", VB6_INSIDE, VB6_BARE, "call_statement", "run", "accept",
+    "watched", 1, 1, 0, "native VB6 call_statement routine application");
 
 static const ModuleArgumentCase JUST_CASE = MODULE_ARGUMENT_CASE(
     "JUST", CBM_LANG_JUST, "justfile", JUST_INSIDE, JUST_BARE, "function_call", "uppercase",
@@ -1223,6 +1244,7 @@ DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_udl, OBJECTSCRIPT_UDL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(objectscript_routine, OBJECTSCRIPT_ROUTINE_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(plsql, PLSQL_CASE)
 DEFINE_ROUTINE_ARGUMENT_TEST(chialisp, CHIALISP_CASE)
+DEFINE_ROUTINE_ARGUMENT_TEST(vb6, VB6_CASE)
 
 #undef DEFINE_ROUTINE_ARGUMENT_TEST
 
@@ -1292,15 +1314,15 @@ TEST(repro_call_argument_matrix_b_domain_bitbake) {
 }
 
 enum {
-    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 39,
+    ROUTINE_ARGUMENT_LANGUAGE_COUNT = 40,
     MODULE_ARGUMENT_LANGUAGE_COUNT = 4,
     DOMAIN_CONTROL_LANGUAGE_COUNT = 6,
     MATRIX_LANGUAGE_COUNT = ROUTINE_ARGUMENT_LANGUAGE_COUNT + MODULE_ARGUMENT_LANGUAGE_COUNT +
                             DOMAIN_CONTROL_LANGUAGE_COUNT,
 };
 
-_Static_assert(MATRIX_LANGUAGE_COUNT == 49,
-               "RACKET..CHIALISP call-capable matrix must contain exactly 49 "
+_Static_assert(MATRIX_LANGUAGE_COUNT == 50,
+               "RACKET..VB6 call-capable matrix must contain exactly 50 "
                "language rows");
 
 #define MATRIX_B_LANGUAGE_ROWS(X)                                                               \
@@ -1345,6 +1367,7 @@ _Static_assert(MATRIX_LANGUAGE_COUNT == 49,
       OBJECTSCRIPT_ROUTINE_CASE.identity.language)                                              \
     X(repro_call_argument_matrix_b_routine_plsql, PLSQL_CASE.identity.language)                 \
     X(repro_call_argument_matrix_b_routine_chialisp, CHIALISP_CASE.identity.language)           \
+    X(repro_call_argument_matrix_b_routine_vb6, VB6_CASE.identity.language)                     \
     X(repro_call_argument_matrix_b_module_just, JUST_CASE.identity.language)                    \
     X(repro_call_argument_matrix_b_module_gotemplate, GOTEMPLATE_CASE.identity.language)        \
     X(repro_call_argument_matrix_b_module_linkerscript, LINKERSCRIPT_CASE.identity.language)    \
