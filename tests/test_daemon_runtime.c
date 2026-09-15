@@ -4911,6 +4911,54 @@ TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path) {
 }
 #endif
 
+/* The executable-image fingerprint cache short-circuits the ~2.3 s image hash
+ * for a repeated file identity, and rolls its key when the binary changes so a
+ * rebuild or atomic replacement never returns a stale digest. */
+TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll) {
+    /* 64-hex placeholders, distinct enough to tell "cached" from "recomputed". */
+    static const char digest_a[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    static const char digest_b[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] =
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    char out[CBM_DAEMON_BUILD_FINGERPRINT_SIZE] = {0};
+
+    /* Miss: first sight of this identity pays the hash and stores digest_a. */
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest_a);
+    ASSERT_TRUE(
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(1, 2, 3, 100, 200, 300, 400, out));
+    ASSERT_STR_EQ(out, digest_a);
+    ASSERT_EQ(cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(), 1);
+
+    /* Hit: the same identity returns the cached digest and never calls the hash,
+     * even though the stub would now yield a different value. */
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(digest_b);
+    memset(out, 0, sizeof(out));
+    ASSERT_TRUE(
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(1, 2, 3, 100, 200, 300, 400, out));
+    ASSERT_STR_EQ(out, digest_a);
+    ASSERT_EQ(cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(), 1);
+
+    /* Key roll: a changed mtime (as a rebuilt binary produces) misses and
+     * recomputes, yielding the current digest. */
+    memset(out, 0, sizeof(out));
+    ASSERT_TRUE(
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(1, 2, 3, 101, 200, 300, 400, out));
+    ASSERT_STR_EQ(out, digest_b);
+    ASSERT_EQ(cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(), 2);
+
+    /* A changed inode (atomic replacement) likewise rolls the key. */
+    memset(out, 0, sizeof(out));
+    ASSERT_TRUE(
+        cbm_daemon_runtime_fingerprint_cache_resolve_for_testing(1, 9, 3, 100, 200, 300, 400, out));
+    ASSERT_STR_EQ(out, digest_b);
+    ASSERT_EQ(cbm_daemon_runtime_fingerprint_hash_call_count_for_testing(), 3);
+
+    cbm_daemon_runtime_fingerprint_cache_set_hash_stub_for_testing(NULL);
+    cbm_daemon_runtime_fingerprint_cache_reset_for_testing();
+    PASS();
+}
+
 TEST(daemon_runtime_close_begin_releases_admission_with_inflight_request) {
     static const uint8_t request[] = {'b', 'l', 'o', 'c', 'k'};
     cbm_daemon_build_identity_t identity =
@@ -5105,6 +5153,7 @@ SUITE(daemon_runtime) {
 #if defined(_WIN32) || defined(__APPLE__) || defined(__linux__)
     RUN_TEST(daemon_runtime_process_fingerprint_never_hashes_replacement_path);
 #endif
+    RUN_TEST(daemon_runtime_fingerprint_cache_hit_miss_key_roll);
     RUN_TEST(daemon_runtime_convenience_service_owns_participant_guard);
     RUN_TEST(daemon_runtime_rendezvous_layout_is_frozen_and_detailed_abi_independent);
     RUN_TEST(daemon_runtime_exact_hello_issues_connection_bound_identity);
