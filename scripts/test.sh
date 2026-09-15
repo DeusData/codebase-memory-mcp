@@ -227,6 +227,9 @@ bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 echo "=== Step 0g: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
 
+echo "=== Step 0g2: memlab harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_memlab_runtime_isolation_contract.sh"
+
 echo "=== Step 0h: smoke release-fixture contract ==="
 bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 

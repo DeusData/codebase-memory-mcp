@@ -24,6 +24,16 @@ if [ ! -x "$BINARY" ]; then
     exit 2
 fi
 
+# The profiled process must reach a daemon rendezvous and cache this run owns:
+# only CBM_RUNTIME_DIR moves the rendezvous, so a private CBM_CACHE_DIR alone
+# joined the operator's account daemon (#1691, #1696). The helper also stops
+# that daemon before its cache is removed and leaves the root for diagnosis
+# when it will not stop.
+# shellcheck source=test-runtime.sh
+source "$(dirname "$0")/test-runtime.sh"
+cbm_test_runtime_init || exit 1
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+
 WORK=$(mktemp -d 2>/dev/null || mktemp -d -t memlab)
 
 # Native Windows: the server walks the full ancestor chain of both the binary
@@ -75,7 +85,12 @@ PROFILE_OUT="$PWD/memlab-${LABEL}.jsonl"
 RUN_LOG="$PWD/memlab-${LABEL}.log"
 rm -f "$PROFILE_OUT" "$RUN_LOG"
 
-cleanup() { rm -rf "$WORK" 2>/dev/null || true; rm -rf "${WIN_ROOT:-}" 2>/dev/null || true; }
+cleanup() {
+    # The helper probes with $BINARY, whose native-Windows copy lives in $WORK.
+    cbm_test_runtime_cleanup "$BINARY"
+    rm -rf "$WORK" 2>/dev/null || true
+    rm -rf "${WIN_ROOT:-}" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 # A fixed corpus: same file count and content on every platform, so a
@@ -108,12 +123,15 @@ done
 echo "=== memlab: binary=$BINARY requests=$REQUESTS label=$LABEL ==="
 echo "corpus: $(find "$CORPUS" -name '*.py' | wc -l | tr -d ' ') files"
 
-# The Windows binary needs a native path here; an msys /c/... path is not one.
-if command -v cygpath >/dev/null 2>&1 && ! command -v winepath >/dev/null 2>&1; then
+# The native Windows binary needs a native path here, under its stamped root;
+# an msys /c/... path is not one. Everywhere else the helper's owner-only cache
+# (already exported as CBM_CACHE_DIR) is the cache.
+if [ -n "${WIN_ROOT:-}" ]; then
     mkdir -p "$WORK/cache"
     export CBM_CACHE_DIR="$(cygpath -w "$WORK/cache")"
+    CACHE_HOST="$WORK/cache"
 else
-    export CBM_CACHE_DIR="$WORK/cache"
+    CACHE_HOST="$CBM_TEST_CACHE_DIR_HOST"
 fi
 export CBM_MEM_PROFILE=1
 export CBM_MEM_PROFILE_OUT="$PROFILE_OUT"
@@ -139,7 +157,7 @@ python3 "$(dirname "$0")/memlab-drive.py" "$DRIVE_BINARY" "$DRIVE_CORPUS" "$REQU
 RC=$?
 # With CBM_CACHE_DIR set the process logs to its own file rather than stderr,
 # so fold that in or the census series is invisible.
-cat "$WORK"/cache/logs/*.log >> "$RUN_LOG" 2>/dev/null || true
+cat "$CACHE_HOST"/logs/*.log >> "$RUN_LOG" 2>/dev/null || true
 cat "$WORK/server-stderr.log" >> "$RUN_LOG" 2>/dev/null || true
 RESPONSES=$(sed -n "s/.*served=\\([0-9]*\\).*/\\1/p" "$WORK/drive.out" | head -1); RESPONSES=${RESPONSES:-0}
 CENSUS=$(grep -c "mem.census" "$RUN_LOG" 2>/dev/null | head -1); CENSUS=${CENSUS:-0}
