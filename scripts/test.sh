@@ -233,6 +233,9 @@ bash "$ROOT/tests/test_smoke_fixture_contract.sh"
 echo "=== Step 0i: parallel suite scheduler contract ==="
 bash "$ROOT/tests/test_parallel_harness_contract.sh"
 
+echo "=== Step 0i2: benchmark harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_benchmark_runtime_isolation_contract.sh"
+
 echo "=== Step 0j: venue parity contract (one harness, every venue) ==="
 bash "$ROOT/tests/test_venue_parity_contract.sh"
 

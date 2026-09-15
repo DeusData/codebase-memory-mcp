@@ -3,18 +3,46 @@
 # codebase-memory-mcp binary to measure the regex / LIKE pre-filter performance.
 #
 # Usage:
-#   scripts/benchmark-search-graph.sh <binary-path> <project-name>
+#   scripts/benchmark-search-graph.sh <binary-path> <repo-path>
 #
 # Example:
-#   scripts/benchmark-search-graph.sh ./build/c/codebase-memory-mcp my-project
+#   scripts/benchmark-search-graph.sh ./build/c/codebase-memory-mcp ~/src/my-project
+#
+# The repository is indexed (untimed) into a private runtime and cache first;
+# the queries then run against that index through a daemon this run keeps warm,
+# so a timing never includes daemon activation and never touches the operator's
+# live store (#1696).
 
 set -euo pipefail
 
-BINARY="${1:?Usage: $0 <binary-path> <project-name>}"
-PROJECT="${2:?Usage: $0 <binary-path> <project-name>}"
+BINARY="${1:?Usage: $0 <binary-path> <repo-path>}"
+REPO="${2:?Usage: $0 <binary-path> <repo-path>}"
+REPO=$(cd "$REPO" && pwd -P)
+
+# shellcheck source=test-runtime.sh
+source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
+cbm_test_runtime_init
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+
+if ! "$BINARY" daemon start >/dev/null 2>&1; then
+    echo "private daemon did not start" >&2
+    exit 1
+fi
+INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":\"$REPO\",\"mode\":\"full\"}" 2>/dev/null || echo '{}')
+PROJECT=$(echo "$INDEX_JSON" | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+if 'content' in d:
+    d = json.loads(d['content'][0]['text'])
+print(d.get('project', ''))
+" 2>/dev/null || echo "")
+if [ -z "$PROJECT" ]; then
+    echo "index of $REPO did not report a project" >&2
+    exit 1
+fi
 
 echo "Binary:  $BINARY"
-echo "Project: $PROJECT"
+echo "Project: $PROJECT (indexed from $REPO)"
 echo ""
 
 run_case() {
