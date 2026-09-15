@@ -212,6 +212,9 @@ bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
 echo "=== Step 0d: daemon soak recovery contract ==="
 bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
 
+echo "=== Step 0d2: soak harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_soak_runtime_isolation_contract.sh"
+
 echo "=== Step 0e: Windows launcher bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
 
