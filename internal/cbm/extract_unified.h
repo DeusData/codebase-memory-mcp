@@ -132,7 +132,7 @@ typedef struct {
 // Replaces parent-chain walks for enclosing_func_qn, import context, etc.
 typedef struct {
     const char *enclosing_func_qn;      // current function QN (module_qn at top level)
-    const char *enclosing_class_qn;     // current class QN (NULL outside class)
+    const char *enclosing_class_qn;     // current class QN; NULL outside class (VB6: file class)
     const TSTreeCursor *current_cursor; // unified walk cursor at the current node
     TSTreeCursor *occurrence_cursor;    // reusable parent-preserving classifier cursor
     CBMInvocationKind invocation_kind;  // exact active invocation/reference role

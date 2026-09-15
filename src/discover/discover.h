@@ -41,12 +41,12 @@ CBMLanguage cbm_disambiguate_m(const char *path);
 
 /* Disambiguate .cls files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_UDL if a line starts with "Class <Uppercase>",
- * CBM_LANG_COUNT (unsupported) for a Visual Basic 6 class module (#721),
+ * CBM_LANG_VB6 for a Visual Basic 6 class module (#721),
  * otherwise CBM_LANG_APEX. On read failure, defaults to CBM_LANG_APEX. */
 CBMLanguage cbm_disambiguate_cls(const char *path);
 
 /* Disambiguate .frm files by reading first 4KB of content (#721).
- * Returns CBM_LANG_COUNT (unsupported) for a Visual Basic 6 form, otherwise
+ * Returns CBM_LANG_VB6 for a Visual Basic 6 form, otherwise
  * CBM_LANG_FORM. On read failure, defaults to CBM_LANG_FORM. */
 CBMLanguage cbm_disambiguate_frm(const char *path);
 

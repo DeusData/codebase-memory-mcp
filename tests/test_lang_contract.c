@@ -914,6 +914,13 @@ static const CallCase CALL_CASES[] = {
     {"chialisp", "a.clsp",
      "(mod ()\n  (defun helper (x)\n    (* x 2))\n  (defun run ()\n    (helper 21))\n)\n", true,
      NULL},
+    /* VB6 class module: the header markers route the .cls to VB6 in discover; the
+     * caller must be the Method the class synthesis promotes Run to. */
+    {"vb6-cls", "Widget.cls",
+     "VERSION 1.0 CLASS\nBEGIN\n  MultiUse = -1  'True\nEND\nAttribute VB_Name = \"Widget\"\n"
+     "Option Explicit\n\nPrivate Function Helper() As Long\n    Helper = 42\nEnd Function\n\n"
+     "Public Sub Run()\n    Helper\nEnd Sub\n",
+     true, NULL},
     {"clojure", "a.clj", "(defn helper [] 42)\n\n(defn run [] (helper))\n", false,
      "lisp: call is a list_lit whose head is a sym_lit (not a field, not a first-child "
      "'identifier'); no lisp branch in extract_callee_name"},
@@ -985,6 +992,11 @@ static const CallCase CALL_CASES[] = {
      "local function helper(x: number): number\n   return x + 1\nend\n\nlocal function run(): "
      "number\n   return helper(41)\nend\n",
      true, NULL},
+    {"vb6", "a.bas",
+     "Attribute VB_Name = \"ModA\"\nOption Explicit\n\nPrivate Function Helper() As Long\n"
+     "    Helper = 42\nEnd Function\n\nPublic Sub Run()\n    Dim v As Long\n    v = Helper()\n"
+     "    Helper\nEnd Sub\n",
+     true, NULL},
     {"vimscript", "a.vim",
      "function! Helper() abort\n  return 1\nendfunction\n\nfunction! Run() abort\n  call "
      "Helper()\nendfunction\n",
@@ -996,6 +1008,68 @@ static const CallCase CALL_CASES[] = {
     {"zsh", "a.zsh", "function helper {\n  print \"helping\"\n}\n\nfunction run {\n  helper\n}\n",
      true, NULL},
 };
+
+/* VB6 class module (#721): the file IS the class, so the pipeline must model it
+ * as Class + Methods and hang every in-body CALLS edge off the Method that
+ * contains the call -- never off the Module. Widget.cls carries the header
+ * markers discover uses to route a .cls to VB6 rather than Apex. */
+static const char *VB6_CLS_SRC = "VERSION 1.0 CLASS\nBEGIN\n  MultiUse = -1  'True\nEND\n"
+                                 "Attribute VB_Name = \"Widget\"\nOption Explicit\n\n"
+                                 "Private mCount As Long\n\n"
+                                 "Public Sub Go()\n    Helper\nEnd Sub\n\n"
+                                 "Private Function Helper() As Long\n    Helper = mCount\n"
+                                 "End Function\n";
+
+TEST(contract_vb6_class_module_calls_source_from_method) {
+    LangProj lp;
+    cbm_store_t *store = lang_index(&lp, "Widget.cls", VB6_CLS_SRC);
+    ASSERT_TRUE(store != NULL);
+    int classes = count_label(store, lp.project, "Class");
+    int methods = count_label(store, lp.project, "Method");
+    int functions = count_label(store, lp.project, "Function");
+    int calls = cbm_store_count_edges_by_type(store, lp.project, "CALLS");
+    /* Who calls Helper? Only the Method Go may. A Module-sourced edge would
+     * surface the module's name here instead. */
+    cbm_node_t *nodes = NULL;
+    int ncount = 0;
+    int saw_go = 0;
+    int saw_other_caller = 0;
+    if (cbm_store_find_nodes_by_name(store, lp.project, "Helper", &nodes, &ncount) ==
+        CBM_STORE_OK) {
+        for (int n = 0; n < ncount; n++) {
+            char **callers = NULL;
+            char **callees = NULL;
+            int n_callers = 0;
+            int n_callees = 0;
+            if (cbm_store_node_neighbor_names(store, nodes[n].id, 32, &callers, &n_callers,
+                                              &callees, &n_callees) != 0) {
+                continue;
+            }
+            for (int i = 0; i < n_callers; i++) {
+                if (callers[i] && strcmp(callers[i], "Go") == 0) {
+                    saw_go = 1;
+                } else {
+                    saw_other_caller = 1;
+                }
+                free(callers[i]);
+            }
+            for (int i = 0; i < n_callees; i++) {
+                free(callees[i]);
+            }
+            free(callers);
+            free(callees);
+        }
+        cbm_store_free_nodes(nodes, ncount);
+    }
+    lang_cleanup(&lp, store);
+    ASSERT_EQ(classes, 1);   /* the file itself */
+    ASSERT_EQ(methods, 2);   /* Go + Helper */
+    ASSERT_EQ(functions, 0); /* nothing left behind as a free Function */
+    ASSERT_TRUE(calls >= 1);
+    ASSERT_TRUE(saw_go);
+    ASSERT_FALSE(saw_other_caller);
+    PASS();
+}
 
 TEST(contract_calls_breadth) {
     /* EVERY language must resolve a same-file caller->callee into a CALLS edge.
@@ -1869,6 +1943,7 @@ SUITE(lang_contract) {
 
     /* CALLS-edge breadth across non-LSP languages (P5). */
     RUN_TEST(contract_calls_breadth);
+    RUN_TEST(contract_vb6_class_module_calls_source_from_method);
 
     /* Cross-cutting / semantic edge-type presence (P6). Each asserts the
      * pipeline still emits that edge type; a RED here is a real regression. */

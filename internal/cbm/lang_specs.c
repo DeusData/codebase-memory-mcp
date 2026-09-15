@@ -170,6 +170,7 @@ extern const TSLanguage *tree_sitter_objectscript_udl(void);
 extern const TSLanguage *tree_sitter_objectscript_routine(void);
 extern const TSLanguage *tree_sitter_arkts(void);
 extern const TSLanguage *tree_sitter_plsql(void);
+extern const TSLanguage *tree_sitter_vba(void);
 
 // -- Empty sentinel --
 static const char *empty_types[] = {NULL};
@@ -1707,6 +1708,44 @@ static const char *objectscript_routine_func_types[] = {"procedure", "tag", NULL
 static const char *objectscript_routine_call_types[] = {"extrinsic_function", "routine_tag_call",
                                                         NULL};
 static const char *objectscript_routine_module_types[] = {"source_file", NULL};
+
+// ==================== VISUAL BASIC 6 / VBA (harumiWeb/tree-sitter-vba) ====================
+// Every procedure kind exposes a `name` field, so the generic def extractor
+// applies. `Declare` statements are external (DLL) entry points — treated as
+// callables so `CALLS` edges to Win32 imports resolve to a node. Property
+// Get/Let/Set share a name (VB6 property triplets); each is its own def.
+static const char *vb6_func_types[] = {"sub_declaration",
+                                       "function_declaration",
+                                       "property_get_declaration",
+                                       "property_let_declaration",
+                                       "property_set_declaration",
+                                       "conditional_sub_declaration",
+                                       "conditional_function_declaration",
+                                       "conditional_property_declaration",
+                                       "declare_sub_statement",
+                                       "declare_function_statement",
+                                       "event_declaration",
+                                       NULL};
+// `Type ... End Type` (UDT/struct) -> Class; `Enum ... End Enum` -> Enum via
+// class_label_for_kind. Members are direct children (no body node) — see
+// find_class_body. The grammar has no node for the class module itself
+// (.cls/.frm/.ctl are one COM class per file).
+static const char *vb6_class_types[] = {"type_declaration", "enum_declaration", NULL};
+static const char *vb6_field_types[] = {"type_member", NULL};
+static const char *vb6_module_types[] = {"source_file", NULL};
+// call_statement: `Foo 1, 2` / `Call Foo(1)` / `obj.Bar x` (field `callee`).
+// call_expression: `y = Foo(1)` (field `function`) — VB6 syntax cannot separate
+// this from array indexing; unresolved callees simply produce no edge.
+static const char *vb6_call_types[] = {"call_statement", "call_expression", "raise_event_statement",
+                                       NULL};
+static const char *vb6_import_types[] = {"implements_statement", NULL};
+static const char *vb6_branch_types[] = {"if_statement",       "single_line_if_statement",
+                                         "select_statement",   "for_statement",
+                                         "for_each_statement", "do_statement",
+                                         "while_statement",    NULL};
+// Dim/Public/Private/Const at module level -> Variable (see extract_var_names).
+static const char *vb6_var_types[] = {"variable_declaration", "const_declaration", NULL};
+static const char *vb6_assign_types[] = {"assignment_statement", "set_statement", NULL};
 // ==================== SPEC TABLE ====================
 
 static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
@@ -2730,6 +2769,11 @@ static const CBMLangSpec lang_specs[CBM_LANG_COUNT] = {
                         plsql_module_types, plsql_call_types, empty_types, empty_types,
                         plsql_branch_types, empty_types, plsql_assign_types, plsql_throw_types,
                         NULL, empty_types, NULL, NULL, tree_sitter_plsql, NULL},
+    // CBM_LANG_VB6 — Visual Basic 6 / VBA. harumiWeb/tree-sitter-vba (MIT).
+    [CBM_LANG_VB6] = {CBM_LANG_VB6, vb6_func_types, vb6_class_types, vb6_field_types,
+                      vb6_module_types, vb6_call_types, vb6_import_types, empty_types,
+                      vb6_branch_types, vb6_var_types, vb6_assign_types, empty_types, NULL,
+                      empty_types, NULL, NULL, tree_sitter_vba, NULL},
 
 };
 
