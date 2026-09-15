@@ -15314,6 +15314,21 @@ TEST(cli_print_tool_help_issue680) {
     PASS();
 }
 
+/* #2102: top-level `cli --help` (CLI_USAGE) must point at tool-level
+ * `--format json` and distinguish it from outer `--json`. This is help-only:
+ * the usage synopsis still has no session-wide --format / CBM_CLI_FORMAT. */
+TEST(cli_usage_points_to_tool_format_json_issue2102) {
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--format tree|json"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "payload JSON"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "full MCP envelope"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--json      Print the raw MCP result envelope"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "cli [--quiet] [--progress] [--verbose] [--json] "
+                                          "<tool_name>"));
+    ASSERT_NULL(strstr(CBM_CLI_USAGE, "[--format"));
+    ASSERT_NULL(strstr(CBM_CLI_USAGE, "CBM_CLI_FORMAT"));
+    PASS();
+}
+
 /* #1359: `cli <tool>` with no argument-bearing token used to slurp stdin to EOF
  * for ANY non-terminal stdin. The ordinary automation caller never sends that
  * EOF — Node's child_process.spawn defaults to stdio:['pipe','pipe','pipe'] and
@@ -16353,6 +16368,7 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+    RUN_TEST(cli_usage_points_to_tool_format_json_issue2102);
 
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);
