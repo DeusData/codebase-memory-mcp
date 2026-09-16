@@ -2940,6 +2940,106 @@ TEST(commonlisp_defmacro) {
     PASS();
 }
 
+/* 2026-09-16 probe: config extractors handed multi-line node text over as a
+ * name (8,301 elasticsearch YAML Fields, 91 kernel Makefile/.conf nodes with a
+ * line break inside), and JS/TS baselines named functions `{}` and variables
+ * `1`. The definition push is the one place every extractor goes through. */
+TEST(defs_push_cuts_multiline_names_and_rejects_js_literal_names) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMDefArray defs = {0};
+
+    CBMDefinition make = {0};
+    make.name = "endif\n\n$(obj)/pm_data-offsets.h";
+    make.qualified_name = "proj.arch.arm.mach-at91.Makefile.endif\n\n$(obj)/pm_data-offsets.h";
+    make.label = "Function";
+    make.file_path = "arch/arm/mach-at91/Makefile";
+    cbm_defs_push(&defs, &a, make);
+    ASSERT_EQ(defs.count, 1);
+    ASSERT_STR_EQ(defs.items[0].name, "endif");
+    ASSERT_STR_EQ(defs.items[0].qualified_name, "proj.arch.arm.mach-at91.Makefile.endif");
+
+    CBMDefinition yaml = {0};
+    yaml.name = "Test get datafeed stats given missing datafeed_id   \r\n  - do:";
+    yaml.qualified_name =
+        "proj.spec.Test get datafeed stats given missing datafeed_id   \r\n  - do:";
+    yaml.label = "Field";
+    yaml.file_path = "rest-api-spec/test/ml/get_datafeed_stats.yml";
+    cbm_defs_push(&defs, &a, yaml);
+    ASSERT_EQ(defs.count, 2);
+    ASSERT_STR_EQ(defs.items[1].name, "Test get datafeed stats given missing datafeed_id");
+
+    /* JS/TS: a literal token is not a name. */
+    CBMDefinition brace = {0};
+    brace.name = "{}";
+    brace.qualified_name = "proj.tests.baselines.x.{}";
+    brace.label = "Function";
+    brace.file_path = "tests/baselines/reference/x.js";
+    cbm_defs_push(&defs, &a, brace);
+    CBMDefinition one = {0};
+    one.name = "1";
+    one.qualified_name = "proj.tests.cases.y.1";
+    one.label = "Variable";
+    one.file_path = "tests/cases/y.ts";
+    cbm_defs_push(&defs, &a, one);
+    ASSERT_EQ(defs.count, 2);
+
+    /* Real JS names, including private members and `$`-prefixed ones, stay. */
+    CBMDefinition priv = {0};
+    priv.name = "#secret";
+    priv.qualified_name = "proj.src.a.Klass.#secret";
+    priv.label = "Method";
+    priv.file_path = "src/a.ts";
+    cbm_defs_push(&defs, &a, priv);
+    CBMDefinition dollar = {0};
+    dollar.name = "$scope";
+    dollar.qualified_name = "proj.src.b.$scope";
+    dollar.label = "Variable";
+    dollar.file_path = "src/b.js";
+    cbm_defs_push(&defs, &a, dollar);
+    ASSERT_EQ(defs.count, 4);
+
+    /* Member keys JS spells without an identifier start are names too:
+     * computed, string-literal and escaped (1,782 real definitions in the
+     * TypeScript corpus wore these spellings). */
+    const char *member_keys[] = {"[Symbol.iterator]", "\"my-key\"", "'x'", "\\u0410"};
+    for (int i = 0; i < 4; i++) {
+        CBMDefinition member = {0};
+        member.name = member_keys[i];
+        member.qualified_name = member_keys[i];
+        member.label = "Method";
+        member.file_path = "src/c.ts";
+        cbm_defs_push(&defs, &a, member);
+    }
+    ASSERT_EQ(defs.count, 8);
+
+    /* Tokens that are not names in any spelling: patterns, numeric literals,
+     * parenthesised types, rest elements. */
+    const char *tokens[] = {"{ b11 } = { b11: \"string\" }", "0x0",  "3.2e1",
+                            "(x: number) => string",         "...a", "?"};
+    for (int i = 0; i < 6; i++) {
+        CBMDefinition token = {0};
+        token.name = tokens[i];
+        token.qualified_name = tokens[i];
+        token.label = "Variable";
+        token.file_path = "tests/cases/z.js";
+        cbm_defs_push(&defs, &a, token);
+    }
+    ASSERT_EQ(defs.count, 8);
+
+    /* Other languages may legitimately name operators: untouched. */
+    CBMDefinition op = {0};
+    op.name = "<$>";
+    op.qualified_name = "proj.Data.Functor.<$>";
+    op.label = "Function";
+    op.file_path = "src/Data/Functor.hs";
+    cbm_defs_push(&defs, &a, op);
+    ASSERT_EQ(defs.count, 9);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(makefile_rule_as_function) {
     CBMFileResult *r = extract("all:\n\t@echo hello\n", CBM_LANG_MAKEFILE, "test", "Makefile");
     ASSERT_NOT_NULL(r);
@@ -6678,6 +6778,38 @@ static int find_call_args(const CBMFileResult *r, const char *callee, const char
     return -1;
 }
 
+/* tree-sitter lists a comment inside an argument list as a named child; it is
+ * not an argument. A Java constructor call whose argument list opened with a
+ * slash-star comment handed the comment text to the Route pass as a URL
+ * (three Route nodes named by comments on elasticsearch, 2026-09-16). */
+TEST(call_args_skip_comments_between_arguments) {
+    CBMFileResult *r = extract("class A {\n"
+                               "  void f() {\n"
+                               "    app.get(/* the orders listing */ \"/orders\", handler);\n"
+                               "    new TestCase(\n"
+                               "        /*\n"
+                               "         * a multi-line note\n"
+                               "         */\n"
+                               "        \"x\", // trailing\n"
+                               "        1);\n"
+                               "  }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "A.java");
+    ASSERT_NOT_NULL(r);
+    const char *arg0 = NULL;
+    const char *arg1 = NULL;
+    int argc = find_call_args(r, "get", &arg0, &arg1);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(arg0, "\"/orders\"");
+    ASSERT_STR_EQ(arg1, "handler");
+    argc = find_call_args(r, "TestCase", &arg0, &arg1);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(arg0, "\"x\"");
+    ASSERT_STR_EQ(arg1, "1");
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(objectscript_data_flows_class_method_args) {
     CBMFileResult *r = extract("Class MyApp.Caller Extends %RegisteredObject\n"
                                "{\n"
@@ -7465,6 +7597,32 @@ TEST(extract_lsp_skipped_when_parse_used_its_budget_share) {
     PASS();
 }
 
+/* The budget share is measured in this thread's CPU time, like the budget
+ * itself. CBM_TEST_WALL_STALL_ON inflates every wall reading of the parse by
+ * budget + 1 s (no real timing): a wall-measured share would disqualify the
+ * file from the LSP walks; a CPU-measured one keeps it — the verdict is a
+ * function of the file, not of how long the scheduler kept the worker off
+ * the CPU (kernel CALLS churn between two indexes of one tree, 2026-09-16). */
+TEST(extract_lsp_share_is_cpu_time_not_wall_time) {
+    cbm_setenv("CBM_TEST_WALL_STALL_ON", "stalled_share.py", 1);
+    CBMFileResult *stalled =
+        cbm_extract_file(COMPACT_PY_SRC, (int)strlen(COMPACT_PY_SRC), CBM_LANG_PYTHON, "t",
+                         "stalled_share.py", 5 * 1000 * 1000, NULL, NULL);
+    cbm_unsetenv("CBM_TEST_WALL_STALL_ON");
+    CBMFileResult *walked =
+        cbm_extract_file(COMPACT_PY_SRC, (int)strlen(COMPACT_PY_SRC), CBM_LANG_PYTHON, "t",
+                         "walked_share.py", 5 * 1000 * 1000, NULL, NULL);
+    ASSERT_NOT_NULL(stalled);
+    ASSERT_NOT_NULL(walked);
+    ASSERT_FALSE(stalled->lsp_skipped);
+    ASSERT_FALSE(walked->lsp_skipped);
+    ASSERT_EQ(stalled->defs.count, walked->defs.count);
+    ASSERT_EQ(stalled->resolved_calls.count, walked->resolved_calls.count);
+    cbm_free_result(stalled);
+    cbm_free_result(walked);
+    PASS();
+}
+
 /* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes
  * (no real timing): the result is walk_truncated, therefore lsp_skipped, and
  * the definitions the walk had not reached are the only loss. */
@@ -7490,6 +7648,7 @@ SUITE(extraction) {
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
     RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
+    RUN_TEST(extract_lsp_share_is_cpu_time_not_wall_time);
     RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
     /* Initialize extraction library */
     cbm_init();
@@ -7538,6 +7697,7 @@ SUITE(extraction) {
     RUN_TEST(objectscript_macro_constant_no_extra_call);
     RUN_TEST(objectscript_udl_method_return_type);
     RUN_TEST(objectscript_udl_scalar_return_type_not_resolved);
+    RUN_TEST(call_args_skip_comments_between_arguments);
     RUN_TEST(objectscript_data_flows_class_method_args);
     RUN_TEST(objectscript_data_flows_instance_method_args);
     RUN_TEST(iris_export_xml_simple_class);
@@ -7748,6 +7908,7 @@ SUITE(extraction) {
     RUN_TEST(commonlisp_defun);
     RUN_TEST(commonlisp_multiple_functions);
     RUN_TEST(commonlisp_defmacro);
+    RUN_TEST(defs_push_cuts_multiline_names_and_rejects_js_literal_names);
     RUN_TEST(makefile_rule_as_function);
     RUN_TEST(makefile_multiple_targets);
     RUN_TEST(makefile_variable_extraction);

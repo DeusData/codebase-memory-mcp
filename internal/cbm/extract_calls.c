@@ -2059,6 +2059,14 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     for (uint32_t ai = 0; ai < argc && call->arg_count < CBM_MAX_CALL_ARGS; ai++) {
         TSNode arg_node = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg_node);
+        /* tree-sitter lists a comment inside the argument list as a named
+         * child (Java block_comment/line_comment, C-family comment). It is
+         * not an argument: taken as one, a leading block comment became
+         * args[0] and the Route pass read its text as a URL. */
+        if (strcmp(ak, "comment") == 0 || strcmp(ak, "line_comment") == 0 ||
+            strcmp(ak, "block_comment") == 0) {
+            continue;
+        }
         if (!call->args) {
             call->args = cbm_arena_calloc(ctx->arena, CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
             if (!call->args) {
@@ -2956,6 +2964,28 @@ static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const 
  * statically-known type here, so the call must not bind by short name alone.
  * Note `self.client.send()` is NOT exempt: the receiver is `self.client`, an
  * attribute of unknown type, not `self` itself. */
+/* True when a Python attribute-call receiver is an attribute chain ROOTED at
+ * self/cls but is not self/cls itself: `self.compiler.apply_converters()` has
+ * receiver `self.compiler`, an object the class owns. The weak-member guard's
+ * unique-name exemption keys on this shape (see cbm_weak_member_unique_name_
+ * exempt): a bare parameter (`accelerator.backward()`) carries no ownership
+ * evidence and stays suppressed. Direct `self.m()` is already exempt via
+ * python_receiver_is_exempt and is deliberately NOT flagged here. */
+static bool python_receiver_rooted_at_self(CBMExtractCtx *ctx, TSNode receiver) {
+    if (ts_node_is_null(receiver) || strcmp(ts_node_type(receiver), "attribute") != 0) {
+        return false;
+    }
+    TSNode root = receiver;
+    while (!ts_node_is_null(root) && strcmp(ts_node_type(root), "attribute") == 0) {
+        root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, root, ctx->source);
+    return name && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0);
+}
+
 static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
     if (ts_node_is_null(receiver)) {
         return false;
@@ -3685,6 +3715,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
+                    call.receiver_is_self_attribute = python_receiver_rooted_at_self(ctx, obj);
                 } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
                     call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, state, fn);
                 }

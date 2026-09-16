@@ -91,9 +91,16 @@ bool cbm_validate_project_name(const char *name);
         }                                                                            \
     } while (0)
 
+/* Drop a trailing INCOMPLETE UTF-8 sequence from a NUL-terminated buffer in
+ * place (a lead byte whose continuation bytes were cut off). Returns the new
+ * length. Complete sequences and ASCII are left untouched. Use after any
+ * byte-count truncation of text that will be stored or serialised. */
+int cbm_utf8_trim_partial(char *buf);
+
 /* Escape a string for safe embedding in JSON: escapes " \ and control chars.
  * Writes into buf (including NUL). Returns number of chars written (excl NUL).
- * If buf is too small, output is truncated but always NUL-terminated. */
+ * If buf is too small, output is truncated but always NUL-terminated, and it
+ * never ends inside a multibyte UTF-8 sequence. */
 int cbm_json_escape(char *buf, int bufsize, const char *src);
 
 #endif /* CBM_STR_UTIL_H */

@@ -63,6 +63,7 @@ enum {
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
+#include "foundation/mem_core.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -3762,6 +3763,8 @@ enum {
     BM25_BIND_OFFSET = 4,
     BM25_BIND_INNER = 5,
     BM25_BIND_FILE = 6,
+    BM25_BIND_LABEL = 7,
+    BM25_BIND_EXACT = 8,
     BM25_SQL_AUTO_LEN = -1,
     /* Inner FTS5 candidate cap.  SQLite can early-terminate a plain FTS5 query
      * (no JOIN/WHERE on outer table) of the form:
@@ -3878,7 +3881,7 @@ static void bm25_output_rows_free(bm25_output_row_t *rows, int count) {
         free(rows[i].label);
         free(rows[i].file_path);
     }
-    free(rows);
+    cbm_free(CBM_MEM_CLASS_OTHER, rows);
 }
 
 static void bm25_lines_str(char *out, size_t size, int start, int end) {
@@ -4019,8 +4022,8 @@ static char *bm25_render(const bm25_output_row_t *rows, int returned, int total,
  * Returns NULL if FTS5 is unavailable or the query produced no usable tokens,
  * in which case the caller falls back to the regex-based search path. */
 static char *bm25_search(cbm_store_t *store, const char *project, const char *query,
-                         const char *file_pattern, int limit, int offset, bool tree_format,
-                         size_t max_output_bytes) {
+                         const char *file_pattern, const char *label, int limit, int offset,
+                         bool tree_format, size_t max_output_bytes) {
     sqlite3 *db = cbm_store_get_db(store);
     if (!db) {
         return NULL;
@@ -4046,9 +4049,18 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
      * because no outer predicate blocks it.  We fetch BM25_INNER_LIMIT top candidates
      * from the FTS5 index, then join/filter/boost only those rows.  bm25() returns a
      * NEGATIVE score (lower = more relevant). */
+    /* Exact-name tier (2026-09-16 probe): a definition whose NAME is the query
+     * outranks every partial hit. BM25 term frequency otherwise rewards a long
+     * test-method name that repeats the token — `table references table with
+     * same name` — over the `Table` class itself, and the label tiers below
+     * then push the class's own methods above it (Method 10 > Class 5). The
+     * definition the reader asked for by name comes first; case-insensitive
+     * exact spelling comes next; everything else keeps its BM25 order. */
     const char *sql =
         "SELECT n.id, n.label, n.name, n.qualified_name, n.file_path, n.start_line, n.end_line, "
         "       (fts.base_rank "
+        "        - CASE WHEN n.name = ?8 THEN 30.0 "
+        "               WHEN lower(n.name) = lower(?8) THEN 20.0 ELSE 0.0 END "
         "        - CASE WHEN n.label IN ('Function','Method') THEN 10.0 "
         "               WHEN n.label = 'Route' THEN 8.0 "
         "               WHEN n.label IN (" CBM_SQL_TYPE_LIKE_LABELS ") THEN 5.0 "
@@ -4070,6 +4082,10 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
          * must be changed together or results desynchronise from counts. */
         "  AND n.label NOT IN ('File','Folder','Variable','Project') "
         "  AND (?6 IS NULL OR n.file_path LIKE ?6) "
+        /* The caller's label filter applies in query mode exactly as it does
+         * in the structural mode (2026-09-16 probe: `label=Class` was ignored
+         * here and five Methods came back). MIRRORED in the count query. */
+        "  AND (?7 IS NULL OR n.label = ?7) "
         /* rank ties are common (boosted floats) — the id tie-break makes
          * offset pages contractually stable across calls. */
         "ORDER BY rank, n.id "
@@ -4090,6 +4106,12 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     } else {
         sqlite3_bind_null(stmt, BM25_BIND_FILE);
     }
+    if (label && label[0]) {
+        sqlite3_bind_text(stmt, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt, BM25_BIND_LABEL);
+    }
+    sqlite3_bind_text(stmt, BM25_BIND_EXACT, query, BM25_SQL_AUTO_LEN, MCP_SQLITE_TRANSIENT);
 
     /* Count hits within the same inner-limit window — capped at BM25_INNER_LIMIT.
      * Uses the identical subquery structure so the FTS5 early-exit applies here too. */
@@ -4107,6 +4129,7 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                                  * not describe the rows returned. */
                                 "      AND n.label NOT IN ('File','Folder','Variable','Project')"
                                 "      AND (?6 IS NULL OR n.file_path LIKE ?6)"
+                                "      AND (?7 IS NULL OR n.label = ?7)"
                                 ")";
         sqlite3_stmt *cs = NULL;
         if (sqlite3_prepare_v2(db, count_sql, BM25_SQL_AUTO_LEN, &cs, NULL) == SQLITE_OK) {
@@ -4120,6 +4143,12 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
                                   MCP_SQLITE_TRANSIENT);
             } else {
                 sqlite3_bind_null(cs, BM25_BIND_FILE);
+            }
+            if (label && label[0]) {
+                sqlite3_bind_text(cs, BM25_BIND_LABEL, label, BM25_SQL_AUTO_LEN,
+                                  MCP_SQLITE_TRANSIENT);
+            } else {
+                sqlite3_bind_null(cs, BM25_BIND_LABEL);
             }
             if (sqlite3_step(cs) == SQLITE_ROW) {
                 total = sqlite3_column_int(cs, 0);
@@ -4149,14 +4178,15 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     }
 
     int row_cap = limit > 0 ? limit : BM25_DEFAULT_LIMIT;
-    bm25_output_row_t *rows = calloc((size_t)row_cap, sizeof(*rows));
+    bm25_output_row_t *rows =
+        (bm25_output_row_t *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)row_cap * sizeof(*rows));
     int row_count = 0;
     while (rows && row_count < row_cap && sqlite3_step(stmt) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(stmt, BM25_COL_QN);
-        const char *label = (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL);
+        const char *row_label = (const char *)sqlite3_column_text(stmt, BM25_COL_LABEL);
         const char *file = (const char *)sqlite3_column_text(stmt, BM25_COL_FILE);
         rows[row_count].qualified_name = heap_strdup(qn ? qn : "");
-        rows[row_count].label = heap_strdup(label ? label : "");
+        rows[row_count].label = heap_strdup(row_label ? row_label : "");
         rows[row_count].file_path = heap_strdup(file ? file : "");
         rows[row_count].start_line = sqlite3_column_int(stmt, BM25_COL_START);
         rows[row_count].end_line = sqlite3_column_int(stmt, BM25_COL_END);
@@ -5089,9 +5119,11 @@ static char *handle_search_graph(cbm_mcp_server_t *srv, const char *args) {
     }
     if (query && query[0]) {
         char *q_file_pattern = cbm_mcp_get_string_arg(args, "file_pattern");
-        char *bm25_json = bm25_search(store, project, query, q_file_pattern, limit, offset,
+        char *q_label = cbm_mcp_get_string_arg(args, "label");
+        char *bm25_json = bm25_search(store, project, query, q_file_pattern, q_label, limit, offset,
                                       !json_format, max_output_bytes);
         free(q_file_pattern);
+        free(q_label);
         if (bm25_json) {
             free(query);
             free(project);

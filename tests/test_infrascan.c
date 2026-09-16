@@ -32,6 +32,19 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/orders", "requests.get"));
     ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("https://orders.example/api/orders",
                                                           "requests.get"));
+    /* A comment that leads an argument list is not a route (elasticsearch
+     * RestHandler routes: three Java block comments became Route nodes). */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal(
+        "/*\n                 * Deprecated in #64227, 7.12/8.0.\n                 */",
+        "Route.builder"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("// legacy path", "Route.builder"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/_cat\n/indices", "Route.builder"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/* all */", "Route.builder"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/_cat/indices", "Route.builder"));
+    /* The wildcard path (slash-star alone) is a route, not a comment:
+     * elasticsearch's RestClient.buildUri(null, wildcard) registers one. */
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/*", "RestClient.buildUri"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/*", "app.get"));
     PASS();
 }
 

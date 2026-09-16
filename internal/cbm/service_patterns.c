@@ -714,6 +714,25 @@ static const char *strip_string_delimiters(const char *literal, char *buf, size_
     return buf;
 }
 
+/* A comment opens with the slash a route opens with, and an argument list
+ * that starts with one handed three Java block comments to the Route pass as
+ * URLs (elasticsearch, 2026-09-16). The wildcard route (slash-star alone) is a
+ * path, so the block-comment shape needs its closing star-slash; a route
+ * literal never holds a line break. */
+bool cbm_service_pattern_is_comment_text(const char *text) {
+    if (!text || text[0] != '/') {
+        return false;
+    }
+    if (strchr(text, '\n') != NULL || strchr(text, '\r') != NULL) {
+        return true;
+    }
+    size_t n = strlen(text);
+    if (text[1] == '*' && n >= 4 && text[n - 2] == '*' && text[n - 1] == '/') {
+        return true;
+    }
+    return text[1] == '/' && (text[2] == ' ' || text[2] == '\t');
+}
+
 bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *callee_name) {
     char path_buf[1024];
     const char *path = strip_string_delimiters(literal, path_buf, sizeof(path_buf));
@@ -727,6 +746,9 @@ bool cbm_service_pattern_is_http_route_literal(const char *literal, const char *
         return false;
     }
     if (path[0] != '/') {
+        return false;
+    }
+    if (cbm_service_pattern_is_comment_text(path)) {
         return false;
     }
     if (callee_is_delimiter_or_filesystem_builder(callee_name)) {

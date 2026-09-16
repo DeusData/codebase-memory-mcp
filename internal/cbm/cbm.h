@@ -258,26 +258,31 @@ typedef struct {
      * calls at 251 MB with most of that empty slots. Readers index it exactly
      * as before; only `sizeof` changed. */
     CBMCallArg *args;
-    int arg_count;                 // number of captured arguments (<= CBM_MAX_CALL_ARGS)
-    int loop_depth;                // enclosing loop nesting at the call site
-    int branch_depth;              // enclosing branch nesting at the call site
-    int start_line;                // 1-based source line of the call (for def range-match)
-    uint32_t site_start_byte;      // exact AST occurrence span; end > start when present
-    uint32_t site_end_byte;        // exclusive byte offset in the source file
-    CBMSourceOrigin source_origin; // raw source or C-family preprocessed buffer
-    bool is_method;                // method/member call with an UNRESOLVED receiver. Perl:
-                                   // arrow/method call ($obj->m). TS/JS/TSX: member call
-                                   // x.foo() whose receiver is not this/super. Python:
-                                   // x.foo() where x is not self/cls/super() and is not
-                                   // rooted in an imported name. Read by the weak-member
-                                   // guard and by the pxc synthetic-carrier dedup key in
-                                   // pass_lsp_cross.c. Default false.
-    bool requires_lsp_resolution;  // synthetic semantic candidate (for example an implicit
-                                   // C++ operator). Never fall back to textual resolution.
-    bool callee_is_locally_bound;  // bare call foo() whose callee identifier is bound as a
-                                   // parameter of an enclosing function, so it cannot be the
-                                   // module-level foo. Python only today. Read by the
-                                   // weak-local-binding guard. Default false.
+    int arg_count;                   // number of captured arguments (<= CBM_MAX_CALL_ARGS)
+    int loop_depth;                  // enclosing loop nesting at the call site
+    int branch_depth;                // enclosing branch nesting at the call site
+    int start_line;                  // 1-based source line of the call (for def range-match)
+    uint32_t site_start_byte;        // exact AST occurrence span; end > start when present
+    uint32_t site_end_byte;          // exclusive byte offset in the source file
+    CBMSourceOrigin source_origin;   // raw source or C-family preprocessed buffer
+    bool is_method;                  // method/member call with an UNRESOLVED receiver. Perl:
+                                     // arrow/method call ($obj->m). TS/JS/TSX: member call
+                                     // x.foo() whose receiver is not this/super. Python:
+                                     // x.foo() where x is not self/cls/super() and is not
+                                     // rooted in an imported name. Read by the weak-member
+                                     // guard and by the pxc synthetic-carrier dedup key in
+                                     // pass_lsp_cross.c. Default false.
+    bool requires_lsp_resolution;    // synthetic semantic candidate (for example an implicit
+                                     // C++ operator). Never fall back to textual resolution.
+    bool callee_is_locally_bound;    // bare call foo() whose callee identifier is bound as a
+                                     // parameter of an enclosing function, so it cannot be the
+                                     // module-level foo. Python only today. Read by the
+                                     // weak-local-binding guard. Default false.
+    bool receiver_is_self_attribute; // Python member call whose receiver is an attribute
+                                     // chain rooted at self/cls but not self/cls itself
+                                     // (self.compiler.apply_converters()). An object the
+                                     // class owns, not a parameter: read by the weak-member
+                                     // guard's unique-name exemption. Default false.
 } CBMCall;
 
 typedef struct {
