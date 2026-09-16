@@ -20,13 +20,14 @@ export function colorForLabel(label: string): string {
   return LABEL_COLORS[label] ?? DEFAULT_COLOR;
 }
 
-/* Dead-code status → color (matches layout3d.c status strings).
- *   dead     zero callers + zero usages, not entry/test/exported
+/* Status → color (matches layout3d.c status strings).
+ *   dead     no known inbound CALLS/USAGE/CALL_REFERENCE; not proven unused
+ *            (constructors, framework dispatch, and callbacks may be missed)
  *   single   exactly one caller
  *   entry    entry points / routes
  *   test     test code
  *   normal   healthy (>=2 callers)
- *   exported/structural → dimmed grey (not dead-code candidates) */
+ *   exported/structural → dimmed grey (not unreferenced-coverage candidates) */
 const STATUS_COLORS: Record<string, string> = {
   dead: "#ef4444",
   single: "#f97316",
@@ -44,7 +45,7 @@ export function colorForStatus(status?: string): string {
 }
 
 export const STATUS_LEGEND: { status: string; label: string; color: string }[] = [
-  { status: "dead", label: "Dead (0 callers)", color: STATUS_COLORS.dead },
+  { status: "dead", label: "No known inbound references", color: STATUS_COLORS.dead },
   { status: "single", label: "One caller", color: STATUS_COLORS.single },
   { status: "entry", label: "Entry / route", color: STATUS_COLORS.entry },
   { status: "test", label: "Test", color: STATUS_COLORS.test },

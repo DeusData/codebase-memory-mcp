@@ -43,18 +43,18 @@ function CheckRow({
   return (
     <button
       onClick={onToggle}
-      className={`flex items-center gap-1.5 text-[11px] font-medium transition-all ${
+      className={`flex items-start gap-1.5 w-full min-w-0 text-left text-[11px] font-medium leading-snug transition-all ${
         checked ? "text-primary" : "text-foreground/40"
       }`}
     >
       <span
-        className={`w-3.5 h-3.5 rounded border flex items-center justify-center transition-all ${
+        className={`w-3.5 h-3.5 mt-[1px] shrink-0 rounded border flex items-center justify-center transition-all ${
           checked ? "border-primary bg-primary/20" : "border-foreground/15"
         }`}
       >
         {checked && <span className="text-primary text-[9px]">✓</span>}
       </span>
-      {label}
+      <span className="min-w-0 whitespace-normal break-words">{label}</span>
       {count !== undefined && (
         <span className="text-foreground/25 tabular-nums">{count.toLocaleString()}</span>
       )}
@@ -196,14 +196,14 @@ export function FilterPanel({
         </p>
       </div>
 
-      {/* Dead-code view */}
+      {/* Reference coverage (backend status key remains "dead") */}
       <div className="px-4 pt-2 border-t border-border/30 space-y-2 shrink-0">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-wrap items-baseline justify-between gap-x-2 gap-y-0.5">
           <span className="text-[10px] text-foreground/30 uppercase tracking-widest">
-            Dead code
+            Reference coverage
           </span>
-          <span className="text-[10px] text-red-400/80 tabular-nums">
-            {deadCount.toLocaleString()} dead
+          <span className="text-[10px] text-red-400/80 tabular-nums leading-snug whitespace-normal break-words text-right">
+            {deadCount.toLocaleString()} with no known inbound references
           </span>
         </div>
 
@@ -215,7 +215,7 @@ export function FilterPanel({
         <CheckRow
           checked={showOnlyDead}
           onToggle={onToggleShowOnlyDead}
-          label="Show only dead code"
+          label="Show only nodes with no known inbound references"
         />
         <CheckRow
           checked={hideEntryPoints}
@@ -223,6 +223,11 @@ export function FilterPanel({
           label="Hide entry points"
         />
         <CheckRow checked={hideTests} onToggle={onToggleHideTests} label="Hide tests" />
+
+        <p className="text-[9px] leading-snug text-foreground/30 whitespace-normal break-words">
+          No known inbound references does not prove code is unused. Static analysis
+          may miss constructors, implicit or framework calls, and callbacks.
+        </p>
 
         {/* Legend (only meaningful while colored by status) */}
         {deadCodeView && (
