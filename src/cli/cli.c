@@ -13700,6 +13700,32 @@ static void cli_add_typed(yyjson_mut_doc *out, yyjson_mut_val *obj, const char *
             arr = yyjson_mut_arr(out);
             yyjson_mut_obj_add(obj, yyjson_mut_strcpy(out, key), arr);
         }
+        /* The help prints `--paths <array>`, and a caller who writes the
+         * array literally — `--paths '["lib","t"]'` — used to get ONE element
+         * holding that literal text (2026-09-16 probe: check_index_coverage
+         * reported the fake path `["lib","t"]`). A value that parses as a JSON
+         * array contributes its elements; anything else is one element. */
+        if (have_value && value && value[0] == '[') {
+            yyjson_doc *lit = yyjson_read(value, strlen(value), 0);
+            yyjson_val *lit_root = lit ? yyjson_doc_get_root(lit) : NULL;
+            if (lit_root && yyjson_is_arr(lit_root)) {
+                size_t idx;
+                size_t max;
+                yyjson_val *elem;
+                yyjson_arr_foreach(lit_root, idx, max, elem) {
+                    if (yyjson_is_str(elem)) {
+                        yyjson_mut_arr_add_strcpy(out, arr, yyjson_get_str(elem));
+                    } else {
+                        yyjson_mut_arr_add_val(arr, yyjson_val_mut_copy(out, elem));
+                    }
+                }
+                yyjson_doc_free(lit);
+                return;
+            }
+            if (lit) {
+                yyjson_doc_free(lit);
+            }
+        }
         yyjson_mut_arr_add_strcpy(out, arr, have_value ? value : "");
         return;
     }

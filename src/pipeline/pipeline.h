@@ -285,6 +285,20 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
 
+/* True if `name` is a method of a Python builtin type (str/bytes/list/dict/set/
+ * file) or a builtin function seen as an attribute call. A language fact, kept
+ * as a sorted table like the Perl builtins. */
+bool cbm_python_is_builtin_member(const char *name);
+
+/* The member guard's exemption: a Python member call whose receiver is an
+ * attribute chain rooted at self/cls (an object the class owns), whose callee has
+ * exactly one project definition (strategy unique_name) and is not a builtin
+ * type's own method keeps its edge. Combine at the call sites as
+ * `suppress && !exempt`; both pass_calls.c and pass_parallel.c must do the same.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy);
+
 /* Bare-call counterpart of the guard above. True when a resolved BARE call edge
  * binds a callee that is shadowed by an enclosing parameter, and the match came
  * from a weak short-name strategy — so the edge is fabricated by construction
