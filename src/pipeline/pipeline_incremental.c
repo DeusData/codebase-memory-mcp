@@ -2333,6 +2333,7 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
                     .ignored_files_total = run_ignored_total,
                     .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
                     .hash_records_complete = true,
+                    .indexed_checkout_sha = cbm_pipeline_indexed_checkout_sha(p),
                 },
             .surface_rows = NULL,
             .surface_row_count = 0,
@@ -2889,6 +2890,7 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
         .ignored_files_total = run_ignored_total,
         .coverage_version = CBM_SEMANTIC_INDEX_VERSION,
         .hash_records_complete = true,
+        .indexed_checkout_sha = cbm_pipeline_indexed_checkout_sha(p),
     };
     /* Publish surfaces: the surviving previous rows plus this run's fresh
      * ones (closure route). The legacy test route publishes none — its
