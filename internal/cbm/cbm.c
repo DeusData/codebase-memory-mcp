@@ -1235,7 +1235,8 @@ static uint32_t *cbm_line_offsets(const char *src, int src_len, uint32_t *out_li
             lines++;
         }
     }
-    uint32_t *offs = (uint32_t *)malloc((size_t)(lines + 1) * sizeof(uint32_t));
+    uint32_t *offs =
+        (uint32_t *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)(lines + 1) * sizeof(uint32_t));
     if (!offs) {
         *out_lines = 0;
         return NULL;
@@ -1496,7 +1497,7 @@ static void cbm_subtract_recovered_regions(cbm_error_regions_t *regs, const CBMD
     for (int i = 0; i < regs->count; i++) {
         cbm_region_uncovered_gaps(regs->starts[i], regs->ends[i], defs, src, offs, nlines, &out);
     }
-    free(offs);
+    cbm_free(CBM_MEM_CLASS_EXTRACT, offs);
     *regs = out;
 }
 

@@ -63,6 +63,7 @@ enum {
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
+#include "foundation/mem_core.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -3880,7 +3881,7 @@ static void bm25_output_rows_free(bm25_output_row_t *rows, int count) {
         free(rows[i].label);
         free(rows[i].file_path);
     }
-    free(rows);
+    cbm_free(CBM_MEM_CLASS_OTHER, rows);
 }
 
 static void bm25_lines_str(char *out, size_t size, int start, int end) {
@@ -4177,7 +4178,8 @@ static char *bm25_search(cbm_store_t *store, const char *project, const char *qu
     }
 
     int row_cap = limit > 0 ? limit : BM25_DEFAULT_LIMIT;
-    bm25_output_row_t *rows = calloc((size_t)row_cap, sizeof(*rows));
+    bm25_output_row_t *rows =
+        (bm25_output_row_t *)cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)row_cap * sizeof(*rows));
     int row_count = 0;
     while (rows && row_count < row_cap && sqlite3_step(stmt) == SQLITE_ROW) {
         const char *qn = (const char *)sqlite3_column_text(stmt, BM25_COL_QN);

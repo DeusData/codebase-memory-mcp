@@ -5071,12 +5071,15 @@ static void cypher_plan_seed_from_selective_end(cbm_query_t *q) {
     p->nodes[0] = p->nodes[1];
     p->nodes[1] = tmp;
     cbm_rel_pattern_t *r = &p->rels[0];
+    const char *inverted = NULL;
     if (r->direction && strcmp(r->direction, "outbound") == 0) {
-        free((void *)r->direction);
-        r->direction = heap_strdup("inbound");
+        inverted = "inbound";
     } else if (r->direction && strcmp(r->direction, "inbound") == 0) {
-        free((void *)r->direction);
-        r->direction = heap_strdup("outbound");
+        inverted = "outbound";
+    }
+    if (inverted) {
+        safe_str_free(&r->direction);
+        r->direction = heap_strdup(inverted);
     }
 }
 
