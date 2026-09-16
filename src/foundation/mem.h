@@ -56,6 +56,24 @@ size_t cbm_mem_rss(void);
 
 /* Peak RSS in bytes. */
 size_t cbm_mem_peak_rss(void);
+/* High-water mark of cbm_mem_charged() as seen by its callers (the extract
+ * gate reads it per file pull, the phase marks per pass): the peak of the
+ * budget metric itself, next to the RSS peak that counts reclaimable pages. */
+size_t cbm_mem_peak_charged(void);
+
+/* The number the budget is enforced against: what the OS charges this
+ * process. On macOS that is phys_footprint -- resident_size keeps every page
+ * mimalloc has purged until the kernel reclaims it, and the kernel proof
+ * (2026-09-13) had the worker at 17.4 GB RSS with 5.5 GB charged after
+ * extraction. Elsewhere the two are the same number. Falls back to RSS when
+ * the footprint is unavailable. */
+size_t cbm_mem_charged(void);
+
+/* Bytes mimalloc currently has committed (its own counter). With the core
+ * backed by mimalloc this is the allocator-level truth: tracked live bytes
+ * plus fragmentation and metadata, minus nothing the OS may or may not have
+ * reclaimed yet. 0 when unavailable. */
+size_t cbm_mem_allocator_committed(void);
 
 /* Total budget in bytes. */
 size_t cbm_mem_budget(void);
@@ -75,8 +93,38 @@ bool cbm_mem_over_budget(void);
 /* Per-worker budget hint: budget / num_workers. */
 size_t cbm_mem_worker_budget(int num_workers);
 
+/* True only when the SYSTEM is genuinely short of memory, not merely when this
+ * process is over its advisory budget.
+ *
+ * The budget is a static fraction of TOTAL ram, so on a large host it refuses
+ * work the machine can plainly do: measured 2026-09-13, the linux kernel needs
+ * 31.75 GB of a 48 GB host against a 24 GB budget, and the previous release
+ * completed the very same index by overshooting to 33.56 GB. Aborting on the
+ * budget alone therefore turned a working index into a refusal.
+ *
+ * So the budget keeps its job as the BACKPRESSURE trigger (workers park, peers
+ * return transients) and this answers the different question of whether giving
+ * up is warranted. Returns false when availability is unknown: never abort on
+ * a guess. */
+bool cbm_mem_system_under_pressure(void);
+
 /* Return unused pages to the OS. Call between files to bound per-file peak. */
 void cbm_mem_collect(void);
+
+/* What the OS charges this process for memory-pressure purposes. On macOS
+ * that is phys_footprint, which EXCLUDES pages the allocator has already
+ * marked reusable (MADV_FREE_REUSABLE) -- resident_size still counts them, so
+ * after a large free the two can differ by gigabytes. Elsewhere equals RSS.
+ * 0 when unavailable. */
+size_t cbm_mem_footprint(void);
+
+/* Hand freed memory back to the OS on every allocator this process uses:
+ * mimalloc (mi_collect) and, on macOS, the system zones
+ * (malloc_zone_pressure_relief). Never glibc's malloc_trim: on Linux mimalloc
+ * owns malloc, and the reference alone breaks the static release link. Costs
+ * a few ms; call at phase boundaries after a bulk release, never per
+ * allocation. */
+void cbm_mem_release_to_os(void);
 
 /* ── Memory map: where does the process's memory actually live? ──────
  *
@@ -207,6 +255,10 @@ void cbm_mem_phase_mark(const char *label);
 
 /* Drop all accumulated phase totals (call once at the start of a measurement). */
 void cbm_mem_phase_reset(void);
+
+/* True when CBM_MEM_PHASES=1 turned phase attribution on for this process.
+ * Instruments that walk large structures (the result census) gate on it. */
+bool cbm_mem_phases_enabled(void);
 
 /* Write the phase table as a JSON array of {label, bytes, hits}, biggest total
  * first. Returns bytes written (0 when disabled or empty). */

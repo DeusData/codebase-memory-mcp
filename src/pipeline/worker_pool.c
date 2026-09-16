@@ -14,6 +14,7 @@
 enum { WP_TRUE = 1, WP_MIN = 1, WP_STEP = 1 };
 #include "foundation/platform.h"
 #include "foundation/compat_thread.h"
+#include "foundation/mem_core.h"
 
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -48,6 +49,9 @@ static void *pthread_worker(void *arg) {
         }
         wa->fn(idx, wa->ctx);
     }
+    /* This thread ends here: hand its pending memory-class deltas to the
+     * shared counters, so the phase mark that follows the join is exact. */
+    cbm_mem_class_flush_thread();
     return NULL;
 }
 

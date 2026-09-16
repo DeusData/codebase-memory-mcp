@@ -1,7 +1,9 @@
 /* Full declaration set for the same CBMArena, and it must precede cbm.h:
  * internal/cbm/arena.h declares a subset and the two share the CBM_ARENA_H
  * guard, so whichever is included first is the one this file sees. */
-#include "foundation/arena.h" // cbm_arena_init_sized
+#include "foundation/arena.h"    // cbm_arena_init_sized
+#include "foundation/mem_core.h" // class accounting for the bound allocators
+#include "foundation/log.h"      // cbm_log_warn -- extract.lsp.skipped
 #include "cbm.h"
 #include "arena.h" // CBMArena, cbm_arena_init/alloc/strdup/destroy
 #include "helpers.h"
@@ -213,9 +215,49 @@ static const char *cbm_string_read(void *payload, uint32_t byte, TSPoint point,
 
 // --- Parse timeout callback ---
 
+/* Budget for the tree-sitter progress callback. The PRIMARY gate is per-thread
+ * CPU time: a worker descheduled under CI contention burns WALL time but not
+ * CPU, so a starved-but-parseable file must NOT be abandoned merely because the
+ * 5 s budget elapsed in wall-clock against near-zero CPU. That false "parse
+ * timeout" silently dropped a file's defs and, with them, every cross-file edge
+ * those defs anchored (e.g. a Celery.send_task definition backing an ASYNC_CALLS
+ * edge). A generous WALL ceiling stays as a backstop so a genuinely
+ * stuck/spinning parse still terminates in bounded time. */
+#define CBM_PARSE_WALL_CEILING_FACTOR 12ULL /* ~60 s ceiling for the 5 s CPU budget */
+/* A parse that used more than 1/N of the per-file budget disqualifies the file
+ * from the unbudgeted LSP walks (see cbm_extract_file_ex). */
+#define CBM_LSP_BUDGET_SHARE_DIV 2ULL
+/* The unified walk may spend this many parse budgets of thread CPU time: wide
+ * enough for a 7,873-definition reference file (~10 s), tight enough to stop the
+ * generated JIT tests (65-350 s). */
+#define CBM_WALK_BUDGET_FACTOR 6ULL
+
+typedef struct {
+    uint64_t cpu_deadline_ns; // trip once this thread's CPU time passes it
+    uint64_t wall_ceiling_ns; // hard wall backstop for a spinning/stuck parse
+} CBMParseBudget;
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Deterministic RED-repro seam (armed by CBM_TEST_WALL_STALL_ON in
+ * cbm_extract_file_ex): when set, the timeout callback reads the WALL clock this
+ * many ns ahead of reality while CPU time is untouched — emulating a worker
+ * descheduled long enough for the old wall-only budget to elapse against
+ * near-zero CPU. With the CPU-time budget the parse still completes; a wall-only
+ * / tight-ceiling budget drops the file. Thread-local so it cannot leak across
+ * worker threads. Compiled only into seam-enabled test artifacts. */
+static CBM_TLS uint64_t tl_parse_wall_seam_offset_ns = 0;
+#endif
+
+/* tree-sitter's TSProgressCallback mandates a non-const TSParseState*; a const
+ * parameter here would not match the opts.progress_callback assignment below. */
+// cppcheck-suppress constParameterCallback
 static bool cbm_timeout_cb(TSParseState *state) {
-    uint64_t deadline = *(uint64_t *)state->payload;
-    return now_ns() > deadline;
+    const CBMParseBudget *budget = (const CBMParseBudget *)state->payload;
+    uint64_t wall = now_ns();
+#ifdef CBM_ENABLE_TEST_SEAMS
+    wall += tl_parse_wall_seam_offset_ns;
+#endif
+    return cbm_thread_cpu_time_ns() > budget->cpu_deadline_ns || wall > budget->wall_ceiling_ns;
 }
 
 // --- Thread-local parser pool ---
@@ -258,6 +300,20 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
  * to mimalloc would mismatch ASan/CRT frees — there these binds compile to
  * no-ops and the build stays unchanged. */
 
+/* SQLite on a dedicated mimalloc heap per thread: ON only in the index worker,
+ * whose default heap holds the graph (SQLite churn on that heap paid a page
+ * walk per allocation: 132 s vs 9.7 s on the kernel's coverage publish). OFF
+ * everywhere else: the daemon runs a thread per connection, and a heap
+ * created per such thread pins every SQLite block the shared connection
+ * keeps (page cache, statement cache) to pages nobody's heap owns any more --
+ * the Linux soak grew 180 KB per query, 11 -> 144 MB in ten minutes, where
+ * the default thread heap had been flat (2026-09-14). */
+static _Atomic int g_sqlite_dedicated_heap;
+
+void cbm_sqlite_dedicated_heap(bool on) {
+    atomic_store_explicit(&g_sqlite_dedicated_heap, on ? 1 : 0, memory_order_relaxed);
+}
+
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
 #include <assert.h>
 
@@ -270,16 +326,49 @@ static TSParser *get_thread_parser(const TSLanguage *ts_lang, CBMLanguage lang) 
  * hook here the biggest per-request allocations in the process — SQLite's page
  * cache and its query working set — are invisible to the attribution profile
  * (#581). */
+/* SQLite allocates from a mimalloc heap of its own, one per thread. Its page
+ * queues then hold SQLite blocks only. Sharing the thread's default heap with
+ * the graph -- 40M+ blocks, millions of pages once the graph moved onto the
+ * core -- made every statement-journal chunk of the coverage publish step pay
+ * a walk over the graph's pages: 132 s on the kernel where v0.10.8, whose
+ * graph lived outside mimalloc, took 9.7 s (sampled 2026-09-14). mi_free
+ * works across heaps, so xFree and cross-thread frees are unchanged; a
+ * thread's heap is released with the thread. */
+static _Thread_local mi_heap_t *tl_sqlite_heap;
+
+/* NULL = the calling thread's default heap (mi_malloc); see the switch above. */
+static mi_heap_t *sqlite_heap(void) {
+    if (!atomic_load_explicit(&g_sqlite_dedicated_heap, memory_order_relaxed)) {
+        return NULL;
+    }
+    if (!tl_sqlite_heap) {
+        tl_sqlite_heap = mi_heap_new();
+    }
+    return tl_sqlite_heap;
+}
+
 static void *cbm_sqlite_malloc(int n) {
-    void *block = mi_malloc((size_t)n);
+    mi_heap_t *heap = sqlite_heap();
+    void *block = heap ? mi_heap_malloc(heap, (size_t)n) : mi_malloc((size_t)n);
+    if (block) {
+        cbm_mem_class_add_external(CBM_MEM_CLASS_STORE, mi_usable_size(block));
+    }
     return block;
 }
 static void cbm_sqlite_free(void *p) {
+    if (p) {
+        cbm_mem_class_remove_external(CBM_MEM_CLASS_STORE, mi_usable_size(p));
+    }
     mi_free(p);
 }
 static void *cbm_sqlite_realloc(void *p, int n) {
-    if (p) {}
-    void *grown = mi_realloc(p, (size_t)n);
+    size_t old_size = p ? mi_usable_size(p) : 0;
+    mi_heap_t *heap = sqlite_heap();
+    void *grown = heap ? mi_heap_realloc(heap, p, (size_t)n) : mi_realloc(p, (size_t)n);
+    if (grown) {
+        cbm_mem_class_remove_external(CBM_MEM_CLASS_STORE, old_size);
+        cbm_mem_class_add_external(CBM_MEM_CLASS_STORE, mi_usable_size(grown));
+    }
     return grown;
 }
 static int cbm_sqlite_size(void *p) {
@@ -292,18 +381,31 @@ static int cbm_sqlite_roundup(int n) {
  * through these, and they too skip the interposer. */
 static void *cbm_ts_malloc(size_t n) {
     void *block = mi_malloc(n);
+    if (block) {
+        cbm_mem_class_add_external(CBM_MEM_CLASS_TS_TREE, mi_usable_size(block));
+    }
     return block;
 }
 static void *cbm_ts_calloc(size_t count, size_t size) {
     void *block = mi_calloc(count, size);
+    if (block) {
+        cbm_mem_class_add_external(CBM_MEM_CLASS_TS_TREE, mi_usable_size(block));
+    }
     return block;
 }
 static void *cbm_ts_realloc(void *p, size_t n) {
-    if (p) {}
+    size_t old_size = p ? mi_usable_size(p) : 0;
     void *grown = mi_realloc(p, n);
+    if (grown) {
+        cbm_mem_class_remove_external(CBM_MEM_CLASS_TS_TREE, old_size);
+        cbm_mem_class_add_external(CBM_MEM_CLASS_TS_TREE, mi_usable_size(grown));
+    }
     return grown;
 }
 static void cbm_ts_free(void *p) {
+    if (p) {
+        cbm_mem_class_remove_external(CBM_MEM_CLASS_TS_TREE, mi_usable_size(p));
+    }
     mi_free(p);
 }
 
@@ -794,12 +896,47 @@ typedef struct {
 } cbm_error_regions_t;
 
 static void cbm_error_regions_push(cbm_error_regions_t *acc, TSNode n) {
+    TSPoint start = ts_node_start_point(n);
+    TSPoint end = ts_node_end_point(n);
+    uint32_t start_line = start.row + 1;
+    uint32_t end_line = end.row + 1;
+
+    /* A node that ends at column 0 stopped right after the previous line's
+     * newline, so it holds no text on the row it points at. Counting that row
+     * named a line past the end of the file whenever the region ran to EOF:
+     * scripts/setup-windows.ps1 has 326 lines and reported "245-327". */
+    if (end.column == 0 && end.row > start.row) {
+        end_line = end.row;
+    }
+
+    /* One line can carry several error nodes, and repeating the same line range
+     * says nothing new. Line 113 of scripts/setup-windows.ps1 has two error
+     * nodes, at columns 25-29 and 31-32, and the report read "113-113,113-113".
+     * Drop the repeat.
+     *
+     * Only an EXACT repeat of the range already open is dropped. Do not merge
+     * ranges that merely overlap. Each range is judged separately later by
+     * cbm_region_is_recovered, which asks whether definitions starting inside
+     * that range cover it. Two ranges with the same numbers always get the same
+     * verdict, so collapsing them changes nothing. Two DIFFERENT ranges do not:
+     * merging 3-3 into 2-3 hands the wider range's covering definition to an
+     * error the definition does not explain, and a real parse failure then
+     * disappears from the report. tests/test_parse_coverage.c pins that case in
+     * perl_malformed_source_remains_partial_issue1838.
+     *
+     * This runs BEFORE the cap check, so a dropped repeat never counts as a
+     * range the cap threw away. */
+    if (acc->count > 0 && start_line == acc->starts[acc->count - 1] &&
+        end_line == acc->ends[acc->count - 1]) {
+        return;
+    }
+
     if (acc->count >= CBM_MAX_ERROR_REGIONS) {
         acc->dropped++;
         return;
     }
-    acc->starts[acc->count] = ts_node_start_point(n).row + 1;
-    acc->ends[acc->count] = ts_node_end_point(n).row + 1;
+    acc->starts[acc->count] = start_line;
+    acc->ends[acc->count] = end_line;
     acc->count++;
 }
 
@@ -1507,13 +1644,12 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                                            const CBMReturnTypeTable *return_type_table,
                                            CBMArena *scratch) {
     // Allocate result on heap (arena inside for all string data)
-    enum { SINGLE = 1 };
-    CBMFileResult *result = (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
+    CBMFileResult *result = cbm_result_alloc();
     if (!result) {
         return NULL;
     }
 
-    cbm_arena_init(&result->arena);
+    cbm_work_arena_take(&result->arena);
     CBMArena *a = &result->arena;
 
     /* Crash-quarantine hard guard (Stage 3c): a file the supervisor pinned as a
@@ -1574,6 +1710,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     ts_parser_reset(parser);
 
     uint64_t t0 = now_ns();
+    uint64_t cpu_start_ns = cbm_thread_cpu_time_ns();
 
     // Build string input + timeout options for parse_with_options
     CBMStringInput str_input = {source, (uint32_t)source_len};
@@ -1585,11 +1722,27 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     };
 
     TSParseOptions opts = {0};
-    uint64_t deadline_ns = 0; // cppcheck-suppress unreadVariable
+    CBMParseBudget budget = {0}; // cppcheck-suppress unreadVariable
+    uint64_t budget_ns = 0;
     if (timeout_micros > 0) {
-        deadline_ns = t0 + ((uint64_t)timeout_micros * USEC_TO_NSEC);
-        opts.payload = &deadline_ns;
+        budget_ns = (uint64_t)timeout_micros * USEC_TO_NSEC;
+        // Descheduling burns wall time but not CPU: gate on this thread's CPU
+        // time so a starved-but-parseable file is not abandoned, with a generous
+        // wall ceiling as a backstop against a genuinely spinning/stuck parse.
+        budget.cpu_deadline_ns = cbm_thread_cpu_time_ns() + budget_ns;
+        budget.wall_ceiling_ns = t0 + budget_ns * CBM_PARSE_WALL_CEILING_FACTOR;
+        opts.payload = &budget;
         opts.progress_callback = cbm_timeout_cb;
+#ifdef CBM_ENABLE_TEST_SEAMS
+        tl_parse_wall_seam_offset_ns = 0;
+        const char *stall_on = getenv("CBM_TEST_WALL_STALL_ON");
+        if (stall_on && stall_on[0] && rel_path && strstr(rel_path, stall_on)) {
+            // Push the wall reading past the 1x budget (the old wall-only budget
+            // trips) but well under the generous ceiling (the CPU-time budget
+            // survives): budget + 1 s, deterministic, no real timing involved.
+            tl_parse_wall_seam_offset_ns = budget_ns + NSEC_PER_SEC;
+        }
+#endif
     }
 
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
@@ -1604,6 +1757,33 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     }
 
     TSNode root = ts_tree_root_node(tree);
+
+    /* Parse-budget share. A file whose parse alone consumed more than
+     * 1/CBM_LSP_BUDGET_SHARE_DIV of its budget is too large for the per-file
+     * LSP walk that follows: the walk is superlinear in expression size and
+     * has no budget of its own (C#, a 23 MB single-expression JIT test: 354 s
+     * in the walk, then a crash in the cross-file resolve on the same tree,
+     * 2026-09-14 -- the parse used to time out at 5 s and hide both). The
+     * unified extractor's defs stay; the LSP refinement here and the
+     * cross-file resolve (cbm_pxc_dispatch_file) skip the file, logged. The
+     * budget is the same for every parser, so the rule is too. */
+    bool lsp_skipped = timeout_micros > 0 && (t1 - t0) * CBM_LSP_BUDGET_SHARE_DIV > budget_ns;
+#ifdef CBM_ENABLE_TEST_SEAMS
+    {
+        const char *skip_on = getenv("CBM_TEST_LSP_SKIP_ON");
+        if (skip_on && skip_on[0] && rel_path && strstr(rel_path, skip_on)) {
+            lsp_skipped = true; /* the test names the file; no real timing involved */
+        }
+    }
+#endif
+    if (lsp_skipped) {
+        char parse_ms[CBM_SZ_32];
+        snprintf(parse_ms, sizeof(parse_ms), "%llu",
+                 (unsigned long long)((t1 - t0) / CBM_NSEC_PER_MSEC));
+        cbm_log_warn("extract.lsp.skipped", "reason", "parse_budget", "parse_ms", parse_ms, "path",
+                     rel_path ? rel_path : "");
+        result->lsp_skipped = true;
+    }
 
     // Compute module QN. Java/Go derive the module from the CONTAINING
     // DIRECTORY (package semantics) rather than baking the filename stem in,
@@ -1627,6 +1807,8 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         .root = root,
         .macro_table = macro_table,
         .return_type_table = return_type_table,
+        .walk_deadline_cpu_ns =
+            timeout_micros > 0 ? cbm_thread_cpu_time_ns() + budget_ns * CBM_WALK_BUDGET_FACTOR : 0,
     };
 
     // Run extractors: defs + imports use separate walks (unique recursion patterns),
@@ -1634,6 +1816,21 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     cbm_extract_definitions(&ctx);
     cbm_extract_imports(&ctx);
     cbm_extract_unified(&ctx);
+    if (ctx.walk_budget_exhausted) {
+        result->walk_truncated = true;
+        result->lsp_skipped = true;
+        cbm_log_warn("extract.walk.truncated", "reason", "cpu_budget", "path",
+                     rel_path ? rel_path : "");
+    }
+    /* A file that spent the budget on parse plus walk is too heavy for the
+     * unbudgeted LSP walks as well (the C# JIT test files: 65-73 s each in
+     * the per-file walk after a parse under the share rule). */
+    if (!result->lsp_skipped && timeout_micros > 0 &&
+        cbm_thread_cpu_time_ns() - cpu_start_ns > budget_ns) {
+        result->lsp_skipped = true;
+        cbm_log_warn("extract.lsp.skipped", "reason", "file_budget", "path",
+                     rel_path ? rel_path : "");
+    }
 
     // Channel detection (Socket.IO / EventEmitter) — JS/TS only.
     cbm_extract_channels(&ctx);
@@ -1653,7 +1850,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     // LSP type-aware call/usage resolution (per-file). Runs in every mode;
     // refines the tree-sitter + textual-resolution graph with type info.
     uint64_t lsp_start = now_ns();
-    {
+    if (!result->lsp_skipped) {
         if (language == CBM_LANG_GO) {
             cbm_run_go_lsp(a, result, source, source_len, root);
         }
@@ -1692,15 +1889,15 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         if (language == CBM_LANG_CSHARP) {
             cbm_run_cs_lsp(a, result, source, source_len, root);
         }
-    }
-    if (language == CBM_LANG_JAVA) {
-        cbm_run_java_lsp(a, result, source, source_len, root);
-    }
-    if (language == CBM_LANG_KOTLIN) {
-        cbm_run_kotlin_lsp(a, result, source, source_len, root);
-    }
-    if (language == CBM_LANG_RUST) {
-        cbm_run_rust_lsp(a, result, source, source_len, root);
+        if (language == CBM_LANG_JAVA) {
+            cbm_run_java_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_KOTLIN) {
+            cbm_run_kotlin_lsp(a, result, source, source_len, root);
+        }
+        if (language == CBM_LANG_RUST) {
+            cbm_run_rust_lsp(a, result, source, source_len, root);
+        }
     }
     atomic_fetch_add(&total_lsp_ns, now_ns() - lsp_start);
 
@@ -2073,6 +2270,40 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
     return result;
 }
 
+/* ── Per-worker working arena (see cbm.h) ───────────────────────────── */
+static CBM_TLS CBMArena tl_work_arena;
+static CBM_TLS bool tl_work_arena_live = false;
+
+void cbm_work_arena_take(CBMArena *into) {
+    if (tl_work_arena_live) {
+        *into = tl_work_arena;
+        tl_work_arena_live = false;
+        cbm_arena_rewind(into);
+        return;
+    }
+    cbm_arena_init(into);
+}
+
+void cbm_work_arena_release(void) {
+    if (tl_work_arena_live) {
+        cbm_arena_destroy(&tl_work_arena);
+        tl_work_arena_live = false;
+    }
+}
+
+void cbm_work_arena_give(CBMArena *from) {
+    if (!from || from->nblocks == 0) {
+        return;
+    }
+    if (tl_work_arena_live || cbm_arena_capacity(from) > (size_t)CBM_WORK_ARENA_KEEP_BYTES) {
+        cbm_arena_destroy(from);
+        return;
+    }
+    tl_work_arena = *from;
+    tl_work_arena_live = true;
+    memset(from, 0, sizeof(*from));
+}
+
 /* Public entry. Owns the traversal scratch arena for the whole of one file's
  * extraction: created here, handed to the body as ctx->scratch, destroyed on
  * the way out. The body has seven early returns, so bracketing it in a wrapper
@@ -2093,6 +2324,25 @@ CBMFileResult *cbm_extract_file_ex(const char *source, int source_len, CBMLangua
     return result;
 }
 
+CBMFileResult *cbm_result_alloc(void) {
+    /* The one raw allocation of a result: cbm_free_result releases it with
+     * the matching free. Extraction and the spill loader both come here. */
+    enum { SINGLE = 1 };
+    return (CBMFileResult *)calloc(SINGLE, sizeof(CBMFileResult));
+}
+
+void cbm_result_release_owned(CBMFileResult *result) {
+    if (!result) {
+        return;
+    }
+    for (int i = 0; i < result->owned_result_count; i++) {
+        cbm_free_result(result->owned_results[i]);
+    }
+    free(result->owned_results);
+    result->owned_results = NULL;
+    result->owned_result_count = 0;
+}
+
 void cbm_free_result(CBMFileResult *result) {
     if (!result) {
         return;
@@ -2101,12 +2351,7 @@ void cbm_free_result(CBMFileResult *result) {
         ts_tree_delete(result->cached_tree);
         result->cached_tree = NULL;
     }
-    for (int i = 0; i < result->owned_result_count; i++) {
-        cbm_free_result(result->owned_results[i]);
-    }
-    free(result->owned_results);
-    result->owned_results = NULL;
-    result->owned_result_count = 0;
+    cbm_result_release_owned(result);
     cbm_arena_destroy(&result->arena);
     free(result);
 }

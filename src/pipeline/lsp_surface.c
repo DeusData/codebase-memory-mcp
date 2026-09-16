@@ -17,6 +17,7 @@
  *     bytes is the early-cutoff key: a body edit reserializes identically.
  */
 #include "pipeline/lsp_surface.h"
+#include "pipeline/pipeline_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -126,8 +127,8 @@ static char *surface_file_to_json(const CBMFileResult *result, const CBMLSPDef *
     return json;
 }
 
-int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
-                               const cbm_file_info_t *files, int file_count,
+int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *project,
+                               CBMFileResult **cache, const cbm_file_info_t *files, int file_count,
                                const CBMLSPDef *all_defs, const int *def_starts,
                                cbm_lsp_surface_row_t **out_rows, int *out_count) {
     *out_rows = NULL;
@@ -141,7 +142,9 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
     }
     int n = 0;
     for (int i = 0; i < file_count; i++) {
-        if (!cache[i]) {
+        bool loaded = false;
+        CBMFileResult *fr = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+        if (!fr) {
             /* Never parsed this run (read/extract skip): no surface claim.
              * The routing layer treats a missing row as "must full-rebuild
              * before this file can be reasoned about", which is the correct
@@ -150,8 +153,8 @@ int cbm_lsp_surface_build_rows(const char *project, CBMFileResult **cache,
         }
         int start = def_starts ? def_starts[i] : 0;
         int end = def_starts ? def_starts[i + 1] : 0;
-        char *json =
-            surface_file_to_json(cache[i], all_defs ? all_defs + start : NULL, end - start);
+        char *json = surface_file_to_json(fr, all_defs ? all_defs + start : NULL, end - start);
+        cbm_pipeline_result_release(fr, loaded);
         if (!json) {
             cbm_store_free_lsp_surfaces(rows, n);
             return -1;

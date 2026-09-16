@@ -32,6 +32,7 @@
 #include <psapi.h>
 #elif defined(__APPLE__)
 #include <mach/mach.h>
+#include <malloc/malloc.h> /* malloc_zone_pressure_relief */
 #else
 #include <unistd.h>
 #endif
@@ -508,10 +509,73 @@ void cbm_mem_set_budget_for_tests(size_t bytes) {
     g_budget = bytes;
 }
 
+size_t cbm_mem_allocator_committed(void) {
+    size_t commit = 0;
+    mi_process_info(NULL, NULL, NULL, NULL, NULL, &commit, NULL, NULL);
+    /* The statistic behind this is a signed counter merged per thread at
+     * thread exit; a process whose long-lived thread commits what its
+     * short-lived threads free reads it NEGATIVE, cast to size_t here. The
+     * daemon's query-leak soak reported 2^64 - 121 MB from the second sample
+     * on (Linux, 2026-09-14). A negative reading is no reading: report 0 so
+     * the charge falls back to the OS number instead of a 16 EB budget breach. */
+    if (commit > (SIZE_MAX >> 1)) {
+        return 0;
+    }
+    return commit;
+}
+
+static _Atomic size_t g_peak_charged;
+size_t cbm_mem_charged(void) {
+    /* The OS number (phys_footprint on macOS, RSS elsewhere) is the charge
+     * for everything the process maps; the allocator's committed bytes are
+     * the floor for the memory we hold through mimalloc. macOS was measured
+     * under-reporting the former after MADV_FREE_REUSABLE cycles (kernel
+     * extraction: 4.1 GB charged, 15.6 GB committed, 13.4 GB tracked live),
+     * so the larger of the two is the honest reading. */
+#if defined(__APPLE__)
+    size_t os_charge = cbm_mem_footprint();
+    if (os_charge == 0) {
+        os_charge = cbm_mem_rss(); /* footprint unavailable: fall back */
+    }
+#else
+    size_t os_charge = cbm_mem_rss();
+#endif
+    size_t committed = cbm_mem_allocator_committed();
+    size_t charged = committed > os_charge ? committed : os_charge;
+    /* High-water mark of the charge itself, at the granularity of the gate
+     * that reads it (every file pull, every phase mark). RSS high-water
+     * counts pages already purged to the OS but not yet reclaimed
+     * (MADV_FREE); this is the number the budget is measured against. */
+    size_t seen = atomic_load_explicit(&g_peak_charged, memory_order_relaxed);
+    while (charged > seen &&
+           !atomic_compare_exchange_weak_explicit(&g_peak_charged, &seen, charged,
+                                                  memory_order_relaxed, memory_order_relaxed)) {}
+    return charged;
+}
+size_t cbm_mem_peak_charged(void) {
+    return atomic_load_explicit(&g_peak_charged, memory_order_relaxed);
+}
+
 bool cbm_mem_over_budget(void) {
-    size_t rss = cbm_mem_rss();
-    check_pressure(rss);
-    return rss > g_budget;
+    size_t charged = cbm_mem_charged();
+    check_pressure(charged);
+    return charged > g_budget;
+}
+
+/* Reclaimable memory below this share of total RAM is where paging starts to
+ * hurt, so it is the point at which pressing on stops being reasonable. */
+enum { MEM_PRESSURE_AVAIL_DIVISOR = 8 }; /* 12.5% of total RAM */
+
+bool cbm_mem_system_under_pressure(void) {
+    size_t available = cbm_system_available_ram();
+    if (available == 0) {
+        return false; /* platform cannot answer - do not abort on a guess */
+    }
+    cbm_system_info_t info = cbm_system_info();
+    if (info.total_ram == 0) {
+        return false;
+    }
+    return available < info.total_ram / MEM_PRESSURE_AVAIL_DIVISOR;
 }
 
 size_t cbm_mem_worker_budget(int num_workers) {
@@ -523,6 +587,32 @@ size_t cbm_mem_worker_budget(int num_workers) {
 
 void cbm_mem_collect(void) {
     mi_collect(true);
+}
+
+size_t cbm_mem_footprint(void) {
+#if defined(__APPLE__)
+    task_vm_info_data_t vm = {0};
+    mach_msg_type_number_t count = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vm, &count) == KERN_SUCCESS) {
+        return (size_t)vm.phys_footprint;
+    }
+    return 0;
+#else
+    return os_rss();
+#endif
+}
+
+void cbm_mem_release_to_os(void) {
+    /* mi_collect is the release: on Linux and Windows mimalloc owns malloc, so
+     * there is no libc heap to trim. glibc's malloc_trim was called here once
+     * and cost the static Linux release its link: the reference pulls
+     * libc.a(malloc.o) in beside mimalloc's malloc/free (multiple definition,
+     * release run 34948714902, 2026-09-15). macOS keeps the system heap for
+     * everything outside the core, hence the pressure-relief call there. */
+    mi_collect(true);
+#if defined(__APPLE__)
+    (void)malloc_zone_pressure_relief(NULL, 0);
+#endif
 }
 
 /* ── Memory map (see mem.h for how to read the triple) ─────────────── */
@@ -726,6 +816,10 @@ static bool mem_phase_enabled(void) {
     }
     atomic_store_explicit(&g_mem_phase_enabled, on ? 1 : 0, memory_order_release);
     return on;
+}
+
+bool cbm_mem_phases_enabled(void) {
+    return mem_phase_enabled();
 }
 
 void cbm_mem_phase_mark(const char *label) {

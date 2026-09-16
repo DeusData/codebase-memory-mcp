@@ -1551,8 +1551,10 @@ static void resolve_calls_in_node_inner(GoLSPContext* ctx, TSNode node) {
                                     int impl_count = 0;
                                     // Skip stdlib types when interface is from a project package
                                     bool iface_is_project = iface_qn && strchr(iface_qn, '/') != NULL;
-                                    for (int ti = 0; ti < ctx->registry->type_count && impl_count < 2; ti++) {
-                                        const CBMRegisteredType* cand = &ctx->registry->types[ti];
+                                    CBMTypeShortIter all_types;
+                                    cbm_registry_all_types_chain(ctx->registry, &all_types);
+                                    for (int ti = -1; impl_count < 2 && (ti = cbm_type_short_iter_next(&all_types)) >= 0;) {
+                                        const CBMRegisteredType* cand = &all_types.reg->types[ti];
                                         if (cand->is_interface) continue;
                                         if (!cand->qualified_name) continue;
                                         if (cand->alias_of) continue;

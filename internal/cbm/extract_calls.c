@@ -2059,6 +2059,12 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     for (uint32_t ai = 0; ai < argc && call->arg_count < CBM_MAX_CALL_ARGS; ai++) {
         TSNode arg_node = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg_node);
+        if (!call->args) {
+            call->args = cbm_arena_calloc(ctx->arena, CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+            if (!call->args) {
+                return;
+            }
+        }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
 
@@ -3767,6 +3773,13 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                         if (strcmp(ack, "method_arg") != 0) {
                             continue;
+                        }
+                        if (!call.args) {
+                            call.args = cbm_arena_calloc(ctx->arena,
+                                                         CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+                            if (!call.args) {
+                                break;
+                            }
                         }
                         CBMCallArg *ca = &call.args[call.arg_count];
                         memset(ca, 0, sizeof(*ca));

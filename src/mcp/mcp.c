@@ -10262,7 +10262,7 @@ static bool write_skip_logfile(const char *project, const cbm_file_error_t *errs
         }
         char logdir[CBM_SZ_1K];
         snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
+        cbm_mkdir_p_ex(logdir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(path, sizeof(path), "%s/%s-%lld.log", logdir, project ? project : "index",
                  (long long)time(NULL));
     }
@@ -10481,7 +10481,7 @@ static void supervisor_tmp_path(char *out, size_t out_sz, const char *suffix) {
     if (cdir && cdir[0]) {
         char logdir[CBM_SZ_1K];
         snprintf(logdir, sizeof(logdir), "%s/logs", cdir);
-        cbm_mkdir_p(logdir, 0755);
+        cbm_mkdir_p_ex(logdir, 0755, CBM_MKDIR_FOLLOW_OWNED);
         snprintf(out, out_sz, "%s/.supervisor-%d%s", logdir, (int)getpid(), suffix);
     } else {
         snprintf(out, out_sz, ".supervisor-%d%s", (int)getpid(), suffix);
@@ -11209,6 +11209,72 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         if (cbm_pipeline_had_format_migration(p)) {
             yyjson_mut_obj_add_bool(doc, root, "format_migration", true);
         }
+    } else if (rc == CBM_PIPELINE_ABORT_OVER_BUDGET) {
+        /* Decision A (#1997 #832): resident memory stayed above the budget
+         * after back-pressure and one confirmation cycle, so the run stopped
+         * before publication. Name the cause, the numbers and the fact that
+         * the previous index still serves — the generic "check repo_path"
+         * hint below sent people debugging a path that was fine. */
+        int budget_mb = (int)(cbm_mem_budget() / (1024 * 1024));
+        int peak_rss_mb = (int)(cbm_mem_peak_rss() / (1024 * 1024));
+        char budget_text[CBM_SZ_32];
+        char peak_text[CBM_SZ_32];
+        (void)snprintf(budget_text, sizeof(budget_text), "%d", budget_mb);
+        (void)snprintf(peak_text, sizeof(peak_text), "%d", peak_rss_mb);
+        cbm_log_error("index.abort", "reason", "over_memory_budget", "project", project_name,
+                      "budget_mb", budget_text, "peak_rss_mb", peak_text);
+        yyjson_mut_obj_add_str(doc, root, "status", "error");
+        yyjson_mut_obj_add_str(doc, root, "reason", "over_memory_budget");
+        yyjson_mut_obj_add_str(doc, root, "previous_index", "preserved");
+        yyjson_mut_obj_add_int(doc, root, "budget_mb", budget_mb);
+        yyjson_mut_obj_add_int(doc, root, "peak_rss_mb", peak_rss_mb);
+        /* A CONCRETE retry value, because "raise CBM_MEM_BUDGET_MB" alone makes
+         * the caller guess — and the obvious guess is wrong. peak_rss_mb is
+         * where the run was STOPPED (it is pinned just above the budget by
+         * construction), not what the repo needs, so retrying at peak+10% fails
+         * again. Measured 2026-09-13 on the linux kernel: aborted at 25622 MB
+         * against a 24576 MB budget, but completing it actually took 31.75 GB —
+         * 1.32x the budget, 1.24x the reported peak. Suggest 1.5x the budget so
+         * the first retry has a real chance, and say plainly that the peak is a
+         * floor rather than a requirement. */
+        /* (3*b+1)/2 rather than b + b/2: integer division makes the latter
+         * degenerate to b for b == 1, so the "suggestion" would repeat the
+         * budget that just failed. Rounding up keeps it strictly larger for
+         * every positive budget. */
+        int suggested_budget_mb = budget_mb > 0 ? (budget_mb * 3 + 1) / 2 : 0;
+        char hint_text[CBM_SZ_512];
+        (void)snprintf(hint_text, sizeof(hint_text),
+                       "Indexing stopped: resident memory stayed above the budget after "
+                       "backpressure; no partial graph was published and the previous index "
+                       "still serves. peak_rss_mb is where indexing was STOPPED, not what this "
+                       "repo needs — the real requirement is higher, so retrying just above the "
+                       "peak will fail again. Retry with CBM_MEM_BUDGET_MB=%d (1.5x the current "
+                       "budget) if the machine has the RAM, or lower CBM_WORKERS, or exclude "
+                       "large subtrees.",
+                       suggested_budget_mb);
+        if (suggested_budget_mb > 0) {
+            yyjson_mut_obj_add_int(doc, root, "suggested_budget_mb", suggested_budget_mb);
+        }
+        yyjson_mut_obj_add_strcpy(doc, root, "hint", hint_text);
+    } else if (rc == CBM_PIPELINE_ABORT_PRESERVE_DB) {
+        /* The truthful abort message (#2020): the old generic "check repo_path"
+         * hint sent people debugging a path that was fine, when the run
+         * aborted pre-publication (semantic inputs changed mid-run, or a
+         * discovery/manifest phase failed transiently) and the previous index
+         * is intact. A 99-test cascade on the Windows leg traced back to
+         * exactly this — the response said error, but not which kind. */
+        yyjson_mut_obj_add_str(doc, root, "status", "aborted_previous_preserved");
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "Indexing aborted before publication; the previous index is "
+                               "intact and still serving. Causes: files changed while the run "
+                               "was in flight, or a discovery/manifest phase failed "
+                               "transiently. Retry; if it repeats, check the run log.");
+    } else if (rc == CBM_PIPELINE_PERSIST_FAILED) {
+        yyjson_mut_obj_add_str(doc, root, "status", "persist_failed");
+        yyjson_mut_obj_add_str(doc, root, "hint",
+                               "The validated staging database could not be published. Check "
+                               "free disk space and permissions on the cache directory; the "
+                               "previous index may have been rolled back.");
     } else {
         yyjson_mut_obj_add_str(doc, root, "status", "error");
         yyjson_mut_obj_add_str(doc, root, "hint",
@@ -14817,7 +14883,8 @@ static bool mcp_command_output_path(char out[CBM_SZ_2K]) {
     int written;
     if (cache && cache[0]) {
         written = snprintf(directory, sizeof(directory), "%s/logs", cache);
-        if (written <= 0 || written >= (int)sizeof(directory) || !cbm_mkdir_p(directory, 0700)) {
+        if (written <= 0 || written >= (int)sizeof(directory) ||
+            !cbm_mkdir_p_ex(directory, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
             return false;
         }
     } else {
@@ -17383,6 +17450,16 @@ static void register_watcher_if_enabled(cbm_mcp_server_t *srv) {
 }
 
 /* Background auto-index thread function */
+/* Extraction builds a THREAD-LOCAL node-type bitset cache (cbm_kind_in_set).
+ * Every worker thread that runs extraction must free that cache before it exits,
+ * or the calloc'd bitsets are orphaned when the thread's TLS is torn down and
+ * LeakSanitizer reports them at process exit. Parallel workers do this in
+ * pass_parallel.c; the in-process (sequential) auto-index runs extraction on
+ * THIS short-lived thread, so it must free its own cache too. Declared extern
+ * (not via internal/cbm/helpers.h) to avoid pulling the extraction layer's
+ * header into the MCP TU — the same pattern test_main.c uses for teardown. */
+extern void cbm_kind_in_set_free_cache(void);
+
 static void *autoindex_thread(void *arg) {
     cbm_mcp_server_t *srv = (cbm_mcp_server_t *)arg;
 
@@ -17422,7 +17499,8 @@ static void *autoindex_thread(void *arg) {
     cbm_pipeline_unlock();
 
     cbm_pipeline_free(p);
-    cbm_mem_collect(); /* return mimalloc pages to OS after indexing (in-process only) */
+    cbm_kind_in_set_free_cache(); /* free THIS thread's extraction bitset cache (see above) */
+    cbm_mem_collect();            /* return mimalloc pages to OS after indexing (in-process only) */
 
     if (rc == 0) {
         cbm_log_info("autoindex.done", "project", srv->session_project);
@@ -17521,9 +17599,13 @@ static void maybe_auto_index(cbm_mcp_server_t *srv) {
         char limit[32];
         (void)snprintf(files, sizeof(files), "%d", file_count);
         (void)snprintf(limit, sizeof(limit), "%d", file_limit);
+        char root_disp[CBM_SZ_1K];
+        (void)snprintf(root_disp, sizeof(root_disp), "%s", srv->session_root);
+        cbm_normalize_path_sep(
+            root_disp); /* forward-slash paths in diagnostics (Windows \\ -> /) */
         cbm_log_warn("autoindex.skip", "reason",
                      file_count >= 0 ? "too_many_files" : "unsafe_or_unavailable_path", "files",
-                     files, "limit", limit);
+                     files, "limit", limit, "root", root_disp);
         return;
     }
 

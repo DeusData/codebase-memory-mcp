@@ -26,6 +26,7 @@ enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
 #endif
 #include <windows.h>
 #elif defined(__APPLE__)
+#include <mach/mach.h> /* host_statistics64 - reclaimable page accounting */
 #include <sys/sysctl.h>
 #elif defined(__NetBSD__) || defined(__FreeBSD__) || defined(__OpenBSD__)
 #include <unistd.h>
@@ -303,4 +304,65 @@ int cbm_default_worker_count(bool initial) {
     /* Incremental: leave headroom for user's apps */
     int workers = info.perf_cores - SKIP_ONE;
     return workers > 0 ? workers : MIN_WORKERS;
+}
+
+/* -- Available RAM --------------------------------------------------
+ *
+ * Bytes the system could hand out right now, or 0 when the platform cannot
+ * answer. Deliberately NOT cached: core counts and total RAM are immutable
+ * hardware facts, but this changes continuously and the entire point is to
+ * observe it DURING an index.
+ *
+ * Why this exists: the indexer decided "out of memory" by comparing its own
+ * RSS against a static fraction of TOTAL ram. That refuses work a machine can
+ * plainly do -- measured 2026-09-13, the linux kernel needs 31.75 GB on a
+ * 48 GB host (66 percent) against a 0.5 default budget, and the same index
+ * completed on the previous release by overshooting to 33.56 GB. Whether
+ * memory is actually scarce is a property of the SYSTEM, not of a constant. */
+size_t cbm_system_available_ram(void) {
+#ifdef _WIN32
+    MEMORYSTATUSEX status;
+    status.dwLength = sizeof(status);
+    if (GlobalMemoryStatusEx(&status)) {
+        return (size_t)status.ullAvailPhys;
+    }
+    return 0;
+#elif defined(__APPLE__)
+    /* free + inactive + purgeable. Counting only free_count would report
+     * pressure on any machine that is merely warm, because inactive and
+     * purgeable pages are reclaimed on demand. */
+    mach_port_t host = mach_host_self();
+    vm_size_t page_size = 0;
+    if (host_page_size(host, &page_size) != KERN_SUCCESS || page_size == 0) {
+        return 0;
+    }
+    vm_statistics64_data_t vm_stat = {0};
+    mach_msg_type_number_t count = HOST_VM_INFO64_COUNT;
+    if (host_statistics64(host, HOST_VM_INFO64, (host_info64_t)&vm_stat, &count) != KERN_SUCCESS) {
+        return 0;
+    }
+    uint64_t pages = (uint64_t)vm_stat.free_count + (uint64_t)vm_stat.inactive_count +
+                     (uint64_t)vm_stat.purgeable_count;
+    return (size_t)(pages * (uint64_t)page_size);
+#elif !defined(__NetBSD__) && !defined(__FreeBSD__) && !defined(__OpenBSD__)
+    /* Linux: MemAvailable is the kernel estimate and accounts for reclaimable
+     * slab and page cache, which MemFree does not. */
+    FILE *meminfo = fopen("/proc/meminfo", "re");
+    if (!meminfo) {
+        return 0;
+    }
+    char line[CBM_SZ_256];
+    size_t available = 0;
+    while (fgets(line, sizeof(line), meminfo) != NULL) {
+        unsigned long long kb = 0;
+        if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) {
+            available = (size_t)(kb * (unsigned long long)CBM_SZ_1K);
+            break;
+        }
+    }
+    (void)fclose(meminfo);
+    return available;
+#else
+    return 0; /* BSD: unknown rather than guessed */
+#endif
 }

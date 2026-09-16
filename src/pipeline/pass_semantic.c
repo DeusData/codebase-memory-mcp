@@ -12,6 +12,7 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "foundation/str_util.h" // cbm_json_escape
 #include "pipeline/pipeline.h"
 #include <stdint.h>
@@ -49,7 +50,7 @@ static char *read_file(const char *path, int *out_len) {
     }
     /* +pad: tree-sitter lexer lookahead reads past EOF; keep it in-bounds */
     enum { CBM_TS_LOOKAHEAD_PAD = 16 };
-    char *buf = malloc((size_t)size + CBM_TS_LOOKAHEAD_PAD);
+    char *buf = cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)size + CBM_TS_LOOKAHEAD_PAD);
     if (!buf) {
         (void)fclose(f);
         return NULL;
@@ -84,8 +85,12 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 
     /* Fast path: build from cached extraction result (no JSON parsing) */
     if (result && result->imports.count > 0) {
-        const char **keys = calloc((size_t)result->imports.count, sizeof(const char *));
-        const char **vals = calloc((size_t)result->imports.count, sizeof(const char *));
+        const char **keys =
+            cbm_calloc(CBM_MEM_CLASS_SEMANTIC,
+                       (size_t)((size_t)result->imports.count) * (sizeof(const char *)));
+        const char **vals =
+            cbm_calloc(CBM_MEM_CLASS_SEMANTIC,
+                       (size_t)((size_t)result->imports.count) * (sizeof(const char *)));
         int count = 0;
 
         for (int i = 0; i < result->imports.count; i++) {
@@ -99,7 +104,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
             if (!target) {
                 continue;
             }
-            keys[count] = strdup(imp->local_name);
+            keys[count] = cbm_mem_strdup(CBM_MEM_CLASS_SEMANTIC, imp->local_name);
             vals[count] = target->qualified_name;
             count++;
         }
@@ -126,8 +131,10 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
         return 0;
     }
 
-    const char **keys = calloc(edge_count, sizeof(const char *));
-    const char **vals = calloc(edge_count, sizeof(const char *));
+    const char **keys =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)(edge_count) * (sizeof(const char *)));
+    const char **vals =
+        cbm_calloc(CBM_MEM_CLASS_SEMANTIC, (size_t)(edge_count) * (sizeof(const char *)));
     int count = 0;
 
     for (int i = 0; i < edge_count; i++) {
@@ -158,12 +165,12 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
 static void free_import_map(const char **keys, const char **vals, int count) {
     if (keys) {
         for (int i = 0; i < count; i++) {
-            free((void *)keys[i]);
+            cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)keys[i]);
         }
-        free((void *)keys);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)keys);
     }
     if (vals) {
-        free((void *)vals);
+        cbm_free(CBM_MEM_CLASS_SEMANTIC, (void *)vals);
     }
 }
 
@@ -496,7 +503,7 @@ static CBMFileResult *sem_get_or_extract(cbm_pipeline_ctx_t *ctx, int file_idx,
     }
     CBMFileResult *r = cbm_extract_file(source, source_len, fi->language, ctx->project_name,
                                         fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL);
-    free(source);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, source);
     if (r) {
         *owned = true;
     }

@@ -94,6 +94,13 @@ uint64_t cbm_now_ns(void);
 /* Monotonic millisecond timestamp. */
 uint64_t cbm_now_ms(void);
 
+/* Symbolic name for an errno value ("ENOSPC"), or the decimal number when the
+ * value is not in the portable table. The fallback lives in thread-local
+ * storage; copy it before the next call on the same thread. Diagnostics only:
+ * a log line that says `errno=ENOSPC path=...` is a one-line diagnosis where
+ * `stage=pending_publication` alone cost a reporter hours (#1828). */
+const char *cbm_errno_name(int error);
+
 /* ── System info ───────────────────────────────────────────────── */
 
 /* Number of available CPU cores. */
@@ -108,6 +115,10 @@ typedef struct {
 
 /* Query system information. Results are cached after first call. */
 cbm_system_info_t cbm_system_info(void);
+
+/* Physical memory the system could hand out right now, or 0 when the platform
+ * cannot answer. NOT cached - it changes during a run, which is the point. */
+size_t cbm_system_available_ram(void);
 
 /* Recommended worker count for parallel indexing.
  * initial=true:  all cores (user is waiting for initial index)
