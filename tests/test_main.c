@@ -807,6 +807,7 @@ extern void suite_daemon_runtime(void);
 extern void suite_daemon_application(void);
 extern void suite_daemon_frontend(void);
 extern void suite_daemon_bootstrap(void);
+extern void suite_cache(void);
 extern void suite_daemon_ipc(void);
 extern void suite_language(void);
 extern void suite_userconfig(void);
@@ -1088,6 +1089,7 @@ int main(int argc, char **argv) {
     RUN_SELECTED_SUITE(cypher);
 
     /* MCP Server (M9) */
+    RUN_SELECTED_SUITE(cache);
     RUN_SELECTED_SUITE(mcp);
     RUN_SELECTED_SUITE(mcp_mutation_guard);
     RUN_SELECTED_SUITE(index_supervisor);

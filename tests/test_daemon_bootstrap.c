@@ -1133,7 +1133,26 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
 }
 #endif
 
+TEST(bootstrap_cache_inspection_is_stateless_and_deletion_is_coordinated) {
+    char *stats[] = {"cbm", "cache", "stats"};
+    char *prune[] = {"cbm", "cache", "prune", "--missing-root", "--dry-run"};
+    char *help[] = {"cbm", "cache", "prune", "--help"};
+    char *remove[] = {"cbm", "cache", "prune", "--missing-root"};
+    char *false_flag[] = {"cbm", "cache", "prune", "--missing-root", "--dry-run=false"};
+    char *true_flag[] = {"cbm", "cache", "prune", "--missing-root", "--dry-run=true"};
+    char *generic[] = {"cbm", "cli", "cache_prune", "--missing-root", "--dry-run"};
+    ASSERT_EQ(classify(3, stats), CBM_DAEMON_PROCESS_STATELESS);
+    ASSERT_EQ(classify(5, prune), CBM_DAEMON_PROCESS_STATELESS);
+    ASSERT_EQ(classify(4, remove), CBM_DAEMON_PROCESS_LOCAL_CLI);
+    ASSERT_EQ(classify(5, false_flag), CBM_DAEMON_PROCESS_LOCAL_CLI);
+    ASSERT_EQ(classify(5, true_flag), CBM_DAEMON_PROCESS_STATELESS);
+    ASSERT_EQ(classify(5, generic), CBM_DAEMON_PROCESS_LOCAL_CLI);
+    ASSERT_EQ(classify(4, help), CBM_DAEMON_PROCESS_STATELESS);
+    PASS();
+}
+
 SUITE(daemon_bootstrap) {
+    RUN_TEST(bootstrap_cache_inspection_is_stateless_and_deletion_is_coordinated);
     RUN_TEST(daemon_bootstrap_classifies_default_and_ui_as_mcp_clients);
     RUN_TEST(daemon_bootstrap_classifies_stateless_commands_without_client);
     RUN_TEST(daemon_bootstrap_classifies_config_as_coordinated_local_cli);

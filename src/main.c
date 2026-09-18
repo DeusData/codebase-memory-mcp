@@ -32,6 +32,8 @@
 #include "daemon/project_lock.h"
 #include "daemon/version_cohort.h"
 #include "mcp/mcp.h"
+#include "mcp/cache.h"
+#include "foundation/mem_core.h"
 #include "mcp/index_supervisor.h"
 #include "cli/cli.h"
 #include "cli/progress_sink.h"
@@ -841,7 +843,7 @@ static const char *main_index_worker_scope_request(cbm_mcp_server_t *srv, const 
 }
 
 static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
-                   main_local_maintenance_context_t *maintenance_context) {
+                   main_local_maintenance_context_t *maintenance_context, bool allow_stdin) {
     cbm_cli_output_flags_t output_flags;
     char output_error[CBM_SZ_512] = {0};
     if (!cbm_cli_output_flags_parse(&argc, argv, &output_flags, output_error,
@@ -952,6 +954,13 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
             return SKIP_ONE;
         }
         args_json = heap_args;
+    } else if (!allow_stdin) {
+        /* Cache commands use explicit flags and never wait for piped stdin. */
+        if (rem_argc != 0) {
+            fputs("error: unexpected cache argument; use cache --help\n", stderr);
+            return EXIT_FAILURE;
+        }
+        args_json = "{}";
     } else if (cbm_cli_args_from_stdin_allowed(tool_name, cli_isatty(0) != 0)) {
         /* piped stdin (UTF-8 clean, no shell quoting): cli <tool> < args.json.
          * Gated (#1359): a tool that declares no arguments must not read a pipe
@@ -1101,6 +1110,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
 static void print_help(void) {
     printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
     printf("Usage:\n");
+    printf("  codebase-memory-mcp cache <stats|prune> [options]  Manage project index caches\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
     printf("  codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool> "
            "[args]\n");
@@ -1252,6 +1262,81 @@ static int main_run_allow_root(int argc, char **argv) {
     return 0;
 }
 
+static int run_cache(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
+                     main_local_maintenance_context_t *maintenance_context) {
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            puts("Usage: codebase-memory-mcp cache stats\n"
+                 "       codebase-memory-mcp cache prune [--missing-root] [--older-than 30d] "
+                 "[--dry-run]\n"
+                 "       codebase-memory-mcp cache prune --orphan-sidecars [--dry-run]\n\n"
+                 "Prune requires at least one condition; multiple conditions are ANDed.\n"
+                 "Orphan sidecars must be selected alone (no root or index timestamp).\n"
+                 "Age is since last indexing, not last access. Units: s, m, h, d, w.\n"
+                 "Only project DB/WAL/SHM files are removed, including database-held ADRs.\n"
+                 "Busy or uninspectable projects are skipped. Output is JSON.");
+            return 0;
+        }
+    }
+    if (argc < 1 || (strcmp(argv[0], "stats") != 0 && strcmp(argv[0], "prune") != 0)) {
+        fputs("error: expected cache stats or cache prune (see cache --help)\n", stderr);
+        return EXIT_FAILURE;
+    }
+    bool prune = strcmp(argv[0], "prune") == 0;
+    if (!project_locks) {
+        /* Inspection is independent of the daemon's version and lifecycle.
+         * Pass NO mutation guard: even ambiguous/overridden --dry-run flags
+         * cannot turn this stateless path into an uncoordinated deletion. */
+        cbm_cli_output_flags_t flags;
+        char flag_error[CBM_SZ_512] = {0};
+        if (!cbm_cli_output_flags_parse(&argc, argv, &flags, flag_error, sizeof(flag_error))) {
+            fprintf(stderr, "error: %s\n", flag_error);
+            return EXIT_FAILURE;
+        }
+        bool raw_json = cli_strip_flag(&argc, argv, "--json");
+        char *argument_error = NULL;
+        char *args = cbm_cli_build_args_json(prune ? "cache_prune" : "cache_stats", argc - 1,
+                                             argv + 1, &argument_error);
+        if (!args) {
+            fprintf(stderr, "error: %s\n",
+                    argument_error ? argument_error : "invalid cache arguments");
+            cbm_free_untracked(argument_error);
+            return EXIT_FAILURE;
+        }
+        bool is_error = false;
+        char *json = cbm_cache_run(cbm_resolve_cache_dir(), args, prune, NULL, &is_error);
+        cbm_free_untracked(args);
+        if (!json) {
+            fputs("error: cache inspection ran out of memory\n", stderr);
+            return EXIT_FAILURE;
+        }
+        if (raw_json) {
+            char *envelope = cbm_mcp_text_result(json, is_error);
+            if (!envelope) {
+                cbm_free_untracked(json);
+                return EXIT_FAILURE;
+            }
+            puts(envelope);
+            cbm_free_untracked(envelope);
+        } else {
+            puts(json);
+        }
+        cbm_free_untracked(json);
+        return is_error ? EXIT_FAILURE : EXIT_SUCCESS;
+    }
+    char **cli_args = cbm_calloc(CBM_MEM_CLASS_OTHER, ((size_t)argc + 1) * sizeof(*cli_args));
+    if (!cli_args) {
+        return EXIT_FAILURE;
+    }
+    cli_args[0] = prune ? "cache_prune" : "cache_stats";
+    for (int i = 1; i < argc; i++) {
+        cli_args[i] = argv[i];
+    }
+    int result = run_cli(argc, cli_args, project_locks, maintenance_context, false);
+    cbm_free(CBM_MEM_CLASS_OTHER, cli_args);
+    return result;
+}
+
 static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                              main_local_maintenance_context_t *maintenance_context) {
     /* First scan: global flags */
@@ -1272,11 +1357,15 @@ static int handle_subcommand(int argc, char **argv, cbm_project_lock_manager_t *
         if (strcmp(argv[i], "allow-root") == 0) {
             return main_run_allow_root(argc - i - SKIP_ONE, argv + i + SKIP_ONE);
         }
+        if (strcmp(argv[i], "cache") == 0) {
+            return run_cache(argc - i - SKIP_ONE, argv + i + SKIP_ONE, project_locks,
+                             maintenance_context);
+        }
         if (strcmp(argv[i], "cli") == 0) {
             cbm_mem_init_with_cap(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram),
                                   cbm_index_worker_memory_budget_bytes());
             return run_cli(argc - i - SKIP_ONE, argv + i + SKIP_ONE, project_locks,
-                           maintenance_context);
+                           maintenance_context, true);
         }
         if (strcmp(argv[i], "hook-augment") == 0) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
@@ -1512,6 +1601,9 @@ static bool main_local_cli_feedback_enabled(int argc, char **argv) {
     bool requested = false;
     requested = main_cli_flag_present(argc, argv, "--progress");
     bool quiet = main_cli_flag_present(argc, argv, "--quiet");
+    if (argc > 1 && strcmp(argv[1], "cache") == 0 && !requested) {
+        return false; /* Cache maintenance is quiet unless --progress is explicit. */
+    }
     return cbm_cli_progress_enabled(requested, quiet, cli_isatty(2) != 0);
 }
 
@@ -2883,6 +2975,14 @@ int main(int argc, char **argv) {
                           formatted ? message
                                     : "CLI exact-build admission could not be verified; retry "
                                       "after active CBM operations exit");
+            if (cohort_status == CBM_VERSION_COHORT_CONFLICT && argc > 1 &&
+                strcmp(argv[1], "cache") == 0) {
+                (void)fprintf(stderr,
+                              "cache prune: no cache files were deleted. Close MCP sessions "
+                              "using the other build, then stop its daemon with that build's "
+                              "`codebase-memory-mcp daemon stop` and retry this command. "
+                              "Stats and --dry-run remain available while it is running.\n");
+            }
             goto local_cli_cleanup;
         }
         main_local_maintenance_context_init(&maintenance_context);
