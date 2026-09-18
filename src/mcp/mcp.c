@@ -7,6 +7,8 @@
 
 // operations
 
+#include "cache.h"
+#include "foundation/mem_core.h"
 #include "foundation/constants.h"
 
 enum {
@@ -670,6 +672,17 @@ static const tool_def_t TOOLS[] = {
      "\"offset\":{\"type\":\"integer\",\"default\":0,\"minimum\":0},"
      "\"metadata_only\":{\"type\":\"boolean\",\"default\":false,"
      "\"description\":\"Compatibility: omit counts, size, and branch.\"}}}"},
+    {"cache_stats", "Inspect project cache sizes, source roots and index ages.",
+     "{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}"},
+    {"cache_prune",
+     "Delete cached projects matching ALL conditions. Age is since last indexing, "
+     "not access. Alternatively, orphan_sidecars alone removes WAL/SHM with no DB. "
+     "Use dry_run to preview. Deletes database-held ADRs too.",
+     "{\"type\":\"object\",\"properties\":{"
+     "\"missing_root\":{\"type\":\"boolean\",\"default\":false},"
+     "\"orphan_sidecars\":{\"type\":\"boolean\",\"default\":false},"
+     "\"older_than\":{\"type\":\"string\",\"description\":\"Positive duration: 30d, 12h, 2w.\"},"
+     "\"dry_run\":{\"type\":\"boolean\",\"default\":false}},\"additionalProperties\":false}"},
     {"delete_project", "Delete a project from the index",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"}},\"required\":["
      "\"project\"]}"},
@@ -782,6 +795,8 @@ static const tool_annotation_def_t TOOL_ANNOTATIONS[] = {
     {"search_code", true, false, true, false},
     {"list_projects", true, false, true, false},
     {"delete_project", false, true, true, false},
+    {"cache_stats", true, false, true, false},
+    {"cache_prune", false, true, true, false},
     {"index_status", true, false, true, false},
     {"check_index_coverage", true, false, true, false},
     {"detect_changes", true, false, true, false},
@@ -2932,7 +2947,9 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         free(records);
         return cbm_mcp_text_result("out of memory while listing projects", true);
     }
-    qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+    if (record_count > 1) {
+        qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+    }
 
     int limit = cbm_mcp_get_int_arg(args, "limit", 50);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
@@ -6780,6 +6797,46 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
 
     char *result = mcp_result_from_json(args, json);
     free(json);
+    return result;
+}
+
+static bool cache_mutation_begin(void *context, const char *project) {
+    return mcp_project_mutation_try_begin(context, project);
+}
+
+static void cache_mutation_end(void *context, const char *project) {
+    mcp_project_mutation_end(context, project);
+}
+
+static void cache_before_delete(void *context, const char *project) {
+    cbm_mcp_server_t *srv = context;
+    if (srv->current_project && strcmp(srv->current_project, project) == 0) {
+        if (srv->owns_store && srv->store) {
+            cbm_store_close(srv->store);
+            srv->store = NULL;
+        }
+        cbm_free_untracked(srv->current_project);
+        srv->current_project = NULL;
+    }
+}
+
+static void cache_after_delete(void *context, const char *project) {
+    cbm_mcp_server_t *srv = context;
+    if (srv->watcher) {
+        cbm_watcher_unwatch(srv->watcher, project);
+    }
+}
+
+static char *handle_cache(cbm_mcp_server_t *srv, const char *args, bool prune) {
+    cbm_cache_ops_t ops = {.context = srv,
+                           .try_begin = cache_mutation_begin,
+                           .end = cache_mutation_end,
+                           .before_delete = cache_before_delete,
+                           .after_delete = cache_after_delete};
+    bool is_error = false;
+    char *json = cbm_cache_run(cbm_resolve_cache_dir(), args, prune, &ops, &is_error);
+    char *result = cbm_mcp_text_result(json ? json : "cache operation ran out of memory", is_error);
+    cbm_free_untracked(json);
     return result;
 }
 
@@ -17304,6 +17361,9 @@ static char *dispatch_tool(cbm_mcp_server_t *srv, const char *tool_name, const c
     }
     if (strcmp(tool_name, "check_index_coverage") == 0) {
         return handle_check_index_coverage(srv, args_json);
+    }
+    if (strcmp(tool_name, "cache_stats") == 0 || strcmp(tool_name, "cache_prune") == 0) {
+        return handle_cache(srv, args_json, strcmp(tool_name, "cache_prune") == 0);
     }
     if (strcmp(tool_name, "delete_project") == 0) {
         return handle_delete_project(srv, args_json);
