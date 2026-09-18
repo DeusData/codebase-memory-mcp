@@ -554,6 +554,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
 
     /* 3. Query edges — filter during fetch via binary search (O(e log n)) */
     int *deg = calloc((size_t)n, sizeof(int));
+    bool *framework_entry = calloc((size_t)n, sizeof(bool));
     int mapped = 0;
     int edge_cap = CBM_SZ_256;
     cbm_edge_t *all_edges = malloc((size_t)edge_cap * sizeof(cbm_edge_t));
@@ -561,8 +562,9 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     int *ed = malloc((size_t)edge_cap * sizeof(int));
     cbm_schema_info_t schema;
     memset(&schema, 0, sizeof(schema));
-    if (deg && all_edges && es && ed &&
-        cbm_store_get_schema(store, project, &schema) == CBM_STORE_OK) {
+    bool framework_entries_valid = deg && framework_entry && all_edges && es && ed;
+    if (framework_entries_valid) {
+        if (cbm_store_get_schema(store, project, &schema) == CBM_STORE_OK) {
         for (int t = 0; t < schema.edge_type_count; t++) {
             cbm_edge_t *te = NULL;
             int tc = 0;
@@ -571,6 +573,15 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                 for (int e = 0; e < tc; e++) {
                     int si = find_node_index(id_map, n, te[e].source_id);
                     int di = find_node_index(id_map, n, te[e].target_id);
+                    if (si >= 0 && te[e].type && strcmp(te[e].type, "HANDLES") == 0) {
+                        cbm_node_t route = {0};
+                        if (cbm_store_find_node_by_id(store, te[e].target_id, &route) == CBM_STORE_OK) {
+                            if (route.label && strcmp(route.label, "Route") == 0)
+                                framework_entry[si] = true;
+                            cbm_node_free_fields(&route);
+                        } else
+                            framework_entries_valid = false;
+                    }
                     if (si >= 0 && di >= 0) {
                         if (mapped >= edge_cap) {
                             int nc = edge_cap * PAIR_LEN;
@@ -578,6 +589,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                             int *ts = realloc(es, (size_t)nc * sizeof(int));
                             int *td = realloc(ed, (size_t)nc * sizeof(int));
                             if (!te2 || !ts || !td) {
+                                framework_entries_valid = false;
                                 if (te2)
                                     all_edges = te2;
                                 if (ts)
@@ -606,7 +618,11 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
                     }
                 }
                 free(te);
-            }
+            } else
+                framework_entries_valid = false;
+        }
+        } else {
+            framework_entries_valid = false;
         }
     edges_done:
         cbm_store_schema_free(&schema);
@@ -630,6 +646,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
     if (!result || !bodies) {
         free(bodies);
         free(deg);
+        free(framework_entry);
         free(es);
         free(ed);
         free(cdepth);
@@ -735,11 +752,12 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
             status = "structural";
         else if (testish)
             status = "test";
-        else if (nf.is_entry || nf.is_route)
+        else if (nf.is_entry || nf.is_route ||
+                 (framework_entries_valid && framework_entry && framework_entry[i]))
             status = "entry";
         else if (nf.is_exported)
             status = "exported";
-        else if (ic == 0 && iu == 0)
+        else if (framework_entries_valid && ic == 0 && iu == 0)
             status = "dead";
         else if (ic == 1)
             status = "single";
@@ -772,6 +790,7 @@ cbm_layout_result_t *cbm_layout_compute(cbm_store_t *store, const char *project,
 
     free(bodies);
     free(deg);
+    free(framework_entry);
     free(es);
     free(ed);
     free(cdepth);
