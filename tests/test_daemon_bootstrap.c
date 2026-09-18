@@ -887,7 +887,16 @@ TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous) {
 #endif
 
 #ifndef _WIN32
-enum { BOOTSTRAP_ENOSPC_MAX_CHILDREN = 16, BOOTSTRAP_ENOSPC_LOG_CAP = 65536 };
+enum {
+    BOOTSTRAP_ENOSPC_MAX_CHILDREN = 16,
+    BOOTSTRAP_ENOSPC_LOG_CAP = 65536,
+    /* Production MCP clients wait 30s. A real forked host under MSan still has
+     * to finish claim, mem_init, host_state_prepare, then listen before the
+     * injected ENOSPC can fire; that path can exceed 30s, so this budget is
+     * how long the client may wait, not the proof. Fast-fail is proven by
+     * the recorded cause. */
+    BOOTSTRAP_ENOSPC_STARTUP_TIMEOUT_MS = 120000,
+};
 
 typedef struct {
     char parent[BOOTSTRAP_TEST_PATH_CAP];
@@ -1068,7 +1077,7 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
         .identity = &host.identity,
         .executable_path = "/enospc-host-test",
         .connect_timeout_ms = 200,
-        .startup_timeout_ms = 30000,
+        .startup_timeout_ms = BOOTSTRAP_ENOSPC_STARTUP_TIMEOUT_MS,
     };
     cbm_daemon_bootstrap_result_t result;
     memset(&result, 0, sizeof(result));
@@ -1119,9 +1128,9 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
      * surfaced verbatim ("failed to start" + errno + path) and the slow
      * "active or starting" timeout wording is absent -- that message is emitted
      * ONLY on the fast-fail break (cbm_daemon_bootstrap_start_failure_format),
-     * never on the 30 s deadline path -- and the client stopped after exactly
+     * never on the startup-deadline path -- and the client stopped after exactly
      * one spawn instead of respawning a doomed daemon until the deadline. Any
-     * regression to the pre-#1828 30 s hang trips these deterministically. */
+     * regression to the pre-#1828 hang trips these deterministically. */
     ASSERT_FALSE(stale_wording);
     ASSERT_TRUE(message_names_failure);
     ASSERT_TRUE(message_names_errno);
