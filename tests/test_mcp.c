@@ -1410,6 +1410,8 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"search_code", true, false, true, false},
         {"list_projects", true, false, true, false},
         {"delete_project", false, true, true, false},
+        {"cache_stats", true, false, true, false},
+        {"cache_prune", false, true, true, false},
         {"index_status", true, false, true, false},
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},

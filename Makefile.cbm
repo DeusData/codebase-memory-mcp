@@ -330,7 +330,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+MCP_SRCS = src/mcp/cache.c src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
 
 # Shared MCP daemon coordination and local transport
 DAEMON_SRCS = \
@@ -568,7 +568,7 @@ TEST_STORE_SRCS = \
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
 
-TEST_MCP_SRCS = \
+TEST_MCP_SRCS = tests/test_cache.c \
     tests/test_mcp.c \
     tests/test_index_supervisor.c
 

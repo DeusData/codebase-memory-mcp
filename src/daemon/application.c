@@ -1052,7 +1052,17 @@ static bool application_session_mutation_try_begin(void *context, const char *pr
 static void application_session_mutation_end(void *context, const char *project) {
     cbm_daemon_application_session_t *session = context;
     if (session) {
-        cbm_daemon_application_project_mutation_end(session->application, project);
+        /* A cache prune can delete a project owned by another session. Drop
+         * every logical subscriber while the mutation lease is still held,
+         * so the old physical watch cannot recreate the deleted index. */
+        cbm_daemon_application_t *application = session->application;
+        cbm_mutex_lock(&application->mutex);
+        cbm_daemon_application_watch_t *watch = application_find_watch_locked(application, project);
+        if (watch && !application_regular_db_exists(project)) {
+            application_remove_watch_locked(application, watch);
+        }
+        cbm_mutex_unlock(&application->mutex);
+        cbm_daemon_application_project_mutation_end(application, project);
     }
 }
 

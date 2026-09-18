@@ -192,6 +192,24 @@ cbm_daemon_process_role_t cbm_daemon_process_role(int argc, char *const argv[]) 
         if (bootstrap_arg_is(argv[arg], "hook-augment")) {
             return CBM_DAEMON_PROCESS_HOOK_CLIENT;
         }
+        if (bootstrap_arg_is(argv[arg], "cache")) {
+            if (bootstrap_has_help_after(argc, argv, arg + 1) ||
+                (arg + 1 < argc && bootstrap_arg_is(argv[arg + 1], "stats"))) {
+                return CBM_DAEMON_PROCESS_STATELESS;
+            }
+            if (arg + 1 < argc && bootstrap_arg_is(argv[arg + 1], "prune")) {
+                for (int option = arg + 2; option < argc; option++) {
+                    if (bootstrap_arg_is(argv[option], "--dry-run") ||
+                        bootstrap_arg_is(argv[option], "--dry-run=true")) {
+                        /* This is only a routing hint. The stateless handler
+                         * validates the complete argument object and has no
+                         * mutation guard, so it cannot delete any database. */
+                        return CBM_DAEMON_PROCESS_STATELESS;
+                    }
+                }
+            }
+            return CBM_DAEMON_PROCESS_LOCAL_CLI;
+        }
         if (bootstrap_arg_is(argv[arg], "config")) {
             return bootstrap_has_help_after(argc, argv, arg + 1) ? CBM_DAEMON_PROCESS_STATELESS
                                                                  : CBM_DAEMON_PROCESS_LOCAL_CLI;

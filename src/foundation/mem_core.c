@@ -273,6 +273,12 @@ static void check_owned(const void *block, const char *op) {
 }
 #endif
 
+void cbm_free_untracked(void *block) {
+    /* Use the C allocator family of the originating API, including the
+     * process override where enabled; do not subtract tracked class bytes. */
+    free(block);
+}
+
 void cbm_free(cbm_mem_class_t cls, void *block) {
     if (!block) {
         return;
