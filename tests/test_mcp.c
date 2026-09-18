@@ -9706,9 +9706,37 @@ TEST(search_code_raw_preview_reversibly_pages_malformed_utf8_bytes) {
     PASS();
 }
 
+/* format=json is JSON only after a complete scan. A fail-closed grep
+ * (supervision / contained-command) returns an error string, so yyjson_read
+ * is NULL — that was "doc is NULL" on macos-15-intel while the same SHA's
+ * macos-14 job passed. One retry absorbs that host flake; a second miss
+ * still dumps `inner` instead of an opaque NULL. */
+static yyjson_doc *mcp_search_code_json_doc(cbm_mcp_server_t *srv, const char *args,
+                                           char **response_out, char **inner_out) {
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = NULL;
+    for (int attempt = 0; attempt < 2; attempt++) {
+        free(inner);
+        free(response);
+        response = cbm_mcp_handle_tool(srv, "search_code", args);
+        inner = extract_text_content(response);
+        if (!inner) {
+            continue;
+        }
+        doc = yyjson_read(inner, strlen(inner), 0);
+        if (doc) {
+            break;
+        }
+    }
+    *response_out = response;
+    *inner_out = inner;
+    return doc;
+}
+
 TEST(search_code_match_locations_are_explicitly_bounded_and_expandable) {
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_srch_match_locations_XXXXXX");
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s/cbm_srch_match_locations_XXXXXX", cbm_tmpdir());
     ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
     char source_path[512];
     snprintf(source_path, sizeof(source_path), "%s/many.c", tmp);
@@ -9734,14 +9762,19 @@ TEST(search_code_match_locations_are_explicitly_bounded_and_expandable) {
                        .end_line = 601};
     ASSERT_GT(cbm_store_upsert_node(store, &node), 0);
 
-    char *response = cbm_mcp_handle_tool(
-        srv, "search_code",
+    char *response = NULL;
+    char *inner = NULL;
+    yyjson_doc *doc = mcp_search_code_json_doc(
+        srv,
         "{\"pattern\":\"MATCH_LOCATION\",\"project\":\"search-match-locations\","
-        "\"max_output_tokens\":10000,\"format\":\"json\"}");
-    char *inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    yyjson_doc *doc = yyjson_read(inner, strlen(inner), 0);
-    ASSERT_NOT_NULL(doc);
+        "\"max_output_tokens\":10000,\"format\":\"json\"}",
+        &response, &inner);
+    if (!doc) {
+        char msg[CBM_SZ_512];
+        snprintf(msg, sizeof(msg), "expected search_code JSON, got: %.400s",
+                 inner ? inner : "(null)");
+        FAIL(msg);
+    }
     yyjson_val *root = yyjson_doc_get_root(doc);
     yyjson_val *rows = yyjson_obj_get(root, "rows");
     ASSERT_EQ((int)yyjson_arr_size(rows), 1);
@@ -9764,14 +9797,17 @@ TEST(search_code_match_locations_are_explicitly_bounded_and_expandable) {
     free(inner);
     free(response);
 
-    response = cbm_mcp_handle_tool(
-        srv, "search_code",
+    doc = mcp_search_code_json_doc(
+        srv,
         "{\"pattern\":\"MATCH_LOCATION\",\"project\":\"search-match-locations\","
-        "\"match_limit\":500,\"max_output_tokens\":10000,\"format\":\"json\"}");
-    inner = extract_text_content(response);
-    ASSERT_NOT_NULL(inner);
-    doc = yyjson_read(inner, strlen(inner), 0);
-    ASSERT_NOT_NULL(doc);
+        "\"match_limit\":500,\"max_output_tokens\":10000,\"format\":\"json\"}",
+        &response, &inner);
+    if (!doc) {
+        char msg[CBM_SZ_512];
+        snprintf(msg, sizeof(msg), "expected search_code JSON, got: %.400s",
+                 inner ? inner : "(null)");
+        FAIL(msg);
+    }
     root = yyjson_doc_get_root(doc);
     row = yyjson_arr_get(yyjson_obj_get(root, "rows"), 0);
     ASSERT_EQ((int)yyjson_arr_size(yyjson_arr_get(row, 4)), 500);
