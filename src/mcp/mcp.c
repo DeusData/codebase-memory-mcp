@@ -744,8 +744,9 @@ static const tool_def_t TOOLS[] = {
      "\"additionalProperties\":false,"
      "\"required\":[\"project\"]}"},
 
-    {"manage_memory", "Manage personal repo memory",
-     "Create or update local personal memory stored outside source repos",
+    {"manage_memory",
+     "Manage personal repo memory. Create or update local personal memory "
+     "stored outside source repos",
      "{\"type\":\"object\",\"properties\":{\"project\":{\"type\":\"string\"},\"mode\":{\"type\":"
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"settings\",\"bootstrap\",\"delete\","
      "\"list\",\"promote\"]},"
