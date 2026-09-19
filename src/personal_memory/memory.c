@@ -96,7 +96,6 @@ static bool memory_canonicalize_maybe_missing(const char *in, char *out, size_t 
     /* Path does not exist. Resolve the longest existing prefix. */
     char parent[CBM_SZ_1K];
     snprintf(parent, sizeof(parent), "%s", in);
-    const char *tail = "";
     for (;;) {
         char *slash = strrchr(parent, '/');
         if (!slash) {
@@ -107,8 +106,8 @@ static bool memory_canonicalize_maybe_missing(const char *in, char *out, size_t 
             break;
         }
         *slash = '\0';
-        tail = in + (slash - parent) + 1;
         if (cbm_canonical_path(parent, out, out_sz)) {
+            const char *tail = in + (slash - parent) + 1;
             size_t len = strlen(out);
             if (len + 1 + strlen(tail) + 1 > out_sz) {
                 return false;
