@@ -3,6 +3,7 @@
 #include "cli/cli.h"
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include <sqlite3.h>
 #include <stdio.h>
@@ -13,6 +14,12 @@
 #endif
 
 enum { MEMORY_DIR_PERMS = 0700 };
+
+/* Allocation class for personal-memory strings (db paths, repo ids, doc keys).
+ * Everything this module returns as a heap string is allocated through the
+ * core with this class; callers release it with cbm_free(CBM_MEM_CLASS_OTHER,
+ * p) -- see memory.h for the contract. */
+#define MEMORY_MEM_CLASS CBM_MEM_CLASS_OTHER
 
 bool cbm_memory_enabled(struct cbm_config *cfg) {
     if (!cfg) {
@@ -51,7 +58,7 @@ char *cbm_memory_db_path(struct cbm_config *cfg, bool create_dir) {
     if (n < 0) {
         return NULL;
     }
-    char *path = malloc((size_t)n + 1);
+    char *path = cbm_alloc(MEMORY_MEM_CLASS, (size_t)n + 1);
     if (!path) {
         return NULL;
     }
@@ -174,7 +181,7 @@ cbm_store_t *cbm_memory_open(struct cbm_config *cfg, char **out_path) {
     if (out_path) {
         *out_path = path;
     } else {
-        free(path);
+        cbm_free(MEMORY_MEM_CLASS, path);
     }
     return store;
 }
@@ -188,7 +195,7 @@ cbm_store_t *cbm_memory_open_existing(struct cbm_config *cfg, char **out_path) {
         if (out_path) {
             *out_path = path;
         } else {
-            free(path);
+            cbm_free(MEMORY_MEM_CLASS, path);
         }
         return NULL;
     }
@@ -196,7 +203,7 @@ cbm_store_t *cbm_memory_open_existing(struct cbm_config *cfg, char **out_path) {
     if (out_path) {
         *out_path = path;
     } else {
-        free(path);
+        cbm_free(MEMORY_MEM_CLASS, path);
     }
     return store;
 }
@@ -210,7 +217,7 @@ cbm_store_t *cbm_memory_open_query(struct cbm_config *cfg, char **out_path) {
     if (out_path) {
         *out_path = path;
     } else {
-        free(path);
+        cbm_free(MEMORY_MEM_CLASS, path);
     }
     return store;
 }
@@ -243,7 +250,7 @@ char *cbm_memory_repo_id(const char *project, const char *root_path, const cbm_g
     if (n < 0) {
         return NULL;
     }
-    char *out = malloc((size_t)n + 1);
+    char *out = cbm_alloc(MEMORY_MEM_CLASS, (size_t)n + 1);
     if (!out) {
         return NULL;
     }
@@ -259,7 +266,7 @@ char *cbm_memory_doc_key(const char *repo_id, const char *branch, const char *do
     if (n < 0) {
         return NULL;
     }
-    char *out = malloc((size_t)n + 1);
+    char *out = cbm_alloc(MEMORY_MEM_CLASS, (size_t)n + 1);
     if (!out) {
         return NULL;
     }

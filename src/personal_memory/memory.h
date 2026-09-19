@@ -9,6 +9,10 @@
 
 struct cbm_config;
 
+/* Heap strings returned by this module (cbm_memory_db_path, cbm_memory_repo_id,
+ * cbm_memory_doc_key, and the out_path of the cbm_memory_open* helpers) are
+ * allocated through the memory core (foundation/mem_core.h) with class
+ * CBM_MEM_CLASS_OTHER. Release them with cbm_free(CBM_MEM_CLASS_OTHER, p). */
 bool cbm_memory_enabled(struct cbm_config *cfg);
 const char *cbm_memory_resolve_dir(struct cbm_config *cfg);
 char *cbm_memory_db_path(struct cbm_config *cfg, bool create_dir);

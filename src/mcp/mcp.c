@@ -63,6 +63,7 @@ enum {
 #include "cli/cli.h"
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
+#include "foundation/mem_core.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -16969,21 +16970,21 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (!cbm_memory_enabled(srv->config) && strcmp(mode_str, "settings") != 0) {
-        free(project);
-        free(mode_str);
-        free(content);
-        free(doc_type);
-        free(branch_arg);
+        safe_free(project);
+        safe_free(mode_str);
+        safe_free(content);
+        safe_free(doc_type);
+        safe_free(branch_arg);
         return cbm_mcp_text_result("personal memory disabled by config memory_enabled=false", true);
     }
 
     char *root_path = get_project_root(srv, project);
     if (!root_path) {
-        free(project);
-        free(mode_str);
-        free(content);
-        free(doc_type);
-        free(branch_arg);
+        safe_free(project);
+        safe_free(mode_str);
+        safe_free(content);
+        safe_free(doc_type);
+        safe_free(branch_arg);
         return cbm_mcp_text_result("project not found", true);
     }
 
@@ -16996,15 +16997,15 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
     char *key = cbm_memory_doc_key(repo_id, current_branch, doc_type);
     char *base_key = cbm_memory_doc_key(repo_id, base_branch, doc_type);
     if (!repo_id || !key || !base_key) {
-        free(root_path);
-        free(repo_id);
-        free(key);
-        free(base_key);
-        free(project);
-        free(mode_str);
-        free(content);
-        free(doc_type);
-        free(branch_arg);
+        safe_free(root_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, repo_id);
+        cbm_free(CBM_MEM_CLASS_OTHER, key);
+        cbm_free(CBM_MEM_CLASS_OTHER, base_key);
+        safe_free(project);
+        safe_free(mode_str);
+        safe_free(content);
+        safe_free(doc_type);
+        safe_free(branch_arg);
         cbm_git_context_free(&ctx);
         return cbm_mcp_text_result("personal memory store unavailable", true);
     }
@@ -17039,7 +17040,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
     } else if (strcmp(mode_str, "settings") == 0) {
         char *db_path = cbm_memory_db_path(srv->config, false);
         cbm_memory_add_settings_json(srv->config, doc, root_obj, db_path, reveal_paths);
-        free(db_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     } else if (strcmp(mode_str, "list") == 0) {
         char *db_path = NULL;
         cbm_store_t *store = cbm_memory_open_query(srv->config, &db_path);
@@ -17047,7 +17048,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         if (store) {
             cbm_store_close(store);
         }
-        free(db_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     } else if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
         char *db_path = NULL;
         cbm_store_t *store = cbm_memory_open(srv->config, &db_path);
@@ -17064,7 +17065,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         if (store) {
             cbm_store_close(store);
         }
-        free(db_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     } else if (strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) {
         yyjson_mut_obj_add_str(doc, root_obj, "status", "missing_content");
         yyjson_mut_obj_add_str(doc, root_obj, "error", "content is required for update/store");
@@ -17098,7 +17099,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         if (store) {
             cbm_store_close(store);
         }
-        free(db_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     } else if (strcmp(mode_str, "delete") == 0) {
         char *db_path = NULL;
         cbm_store_t *store = cbm_memory_open_existing(srv->config, &db_path);
@@ -17122,7 +17123,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         if (store) {
             cbm_store_close(store);
         }
-        free(db_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     } else if (strcmp(mode_str, "bootstrap") == 0) {
         yyjson_mut_obj_add_str(
             doc, root_obj, "content",
@@ -17160,24 +17161,24 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         if (store) {
             cbm_store_close(store);
         }
-        free(db_path);
+        cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
-    free(root_path);
-    free(repo_id);
-    free(key);
-    free(base_key);
-    free(project);
-    free(mode_str);
-    free(content);
-    free(doc_type);
-    free(branch_arg);
+    safe_free(root_path);
+    cbm_free(CBM_MEM_CLASS_OTHER, repo_id);
+    cbm_free(CBM_MEM_CLASS_OTHER, key);
+    cbm_free(CBM_MEM_CLASS_OTHER, base_key);
+    safe_free(project);
+    safe_free(mode_str);
+    safe_free(content);
+    safe_free(doc_type);
+    safe_free(branch_arg);
     cbm_git_context_free(&ctx);
 
     char *result = cbm_mcp_text_result(json, is_error);
-    free(json);
+    safe_free(json);
     return result;
 }
 
@@ -17188,13 +17189,13 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *scope = cbm_mcp_get_string_arg(args, "scope");
 
     if (scope && strcmp(scope, "personal") == 0) {
-        free(project);
-        free(mode_str);
-        free(content);
-        free(scope);
+        safe_free(project);
+        safe_free(mode_str);
+        safe_free(content);
+        safe_free(scope);
         return handle_manage_memory(srv, args);
     }
-    free(scope);
+    safe_free(scope);
 
     if (!mode_str) {
         mode_str = heap_strdup("outline");
