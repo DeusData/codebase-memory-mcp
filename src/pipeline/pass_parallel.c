@@ -1343,7 +1343,11 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
     }
 
-    cbm_pipeline_namespace_map_free(namespace_map);
+    /* Publish instead of free: the call pass needs the same declared-package
+     * set to tell an in-tree package path from a third-party one (#1355).
+     * The pipeline owns it from here and frees it in its cleanup. */
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(namespace_map);
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
                  itoa_log(defines_edges), "imports", itoa_log(imports_edges));
@@ -2571,7 +2575,8 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         }
         if (target_node && source_node->id != target_node->id &&
             cbm_suppress_external_import_shadow(call->callee_name, res.strategy, &result->imports,
-                                                imp_keys, imp_count, cbm_pipeline_get_pkgmap())) {
+                                                imp_keys, imp_count, cbm_pipeline_get_pkgmap(),
+                                                cbm_pipeline_get_nsmap())) {
             /* #1355: same guard as pass_calls.c — a bare call bound by an
              * external package import must not become a CALLS edge to an
              * unrelated project symbol of the same name. */

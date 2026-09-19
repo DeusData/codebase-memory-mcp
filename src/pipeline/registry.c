@@ -565,6 +565,84 @@ static bool specifier_names_indexed_package(const CBMHashTable *indexed_packages
     return false;
 }
 
+/* True when the specifier is a package PATH the indexed tree itself DECLARES.
+ * `declared_packages` is the pipeline's namespace map, keyed by the
+ * dot-normalized `package` / `namespace` / `use` declaration of every indexed
+ * file (cbm_pipeline_namespace_map_build), so this is the JVM/CLR/PHP
+ * counterpart of the manifest-name test above: those languages have no
+ * specifier shape that separates in-tree from third-party, and their manifests
+ * (pom.xml, build.gradle) name artifacts, not packages.
+ *
+ * A package-path specifier names a member inside a package, so the trailing
+ * segment is walked off one at a time, exactly like the namespace-map lookup in
+ * cbm_pipeline_resolve_import_node: `org.jetbrains.exposed.v1.tests.shared
+ * .assertEquals` -> `org.jetbrains.exposed.v1.tests.shared`, which Exposed's
+ * own Assert.kt declares, so the call keeps its edge. `java.net.URL` walks to
+ * `java.net` then `java`, which no project file declares, so it stays external
+ * and the guard still cuts its bind to an in-tree `URL` class.
+ *
+ * Separator normalization mirrors the map builder's: PHP writes `\`, some
+ * grammars `::` or `/`. NULL disables the check. */
+static bool specifier_names_declared_package(const CBMHashTable *declared_packages,
+                                             const char *module_path) {
+    if (!declared_packages || !module_path || !module_path[0]) {
+        return false;
+    }
+    char buf[CBM_SZ_512];
+    if (strlen(module_path) >= sizeof(buf)) {
+        return false;
+    }
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    char *brace = strchr(buf, '{');
+    if (brace) {
+        *brace = '\0'; /* grouped import — the prefix is the package */
+    }
+    char *alias = strstr(buf, " as ");
+    if (alias) {
+        *alias = '\0';
+    }
+    for (char *p = buf; *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    /* Collapse the empty segments "::" just produced, then strip glob/
+     * separator noise off the tail. */
+    for (;;) {
+        char *dd = strstr(buf, "..");
+        if (!dd) {
+            break;
+        }
+        memmove(dd, dd + 1, strlen(dd + 1) + 1);
+    }
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '*' || buf[len - 1] == '.' || buf[len - 1] == ' ')) {
+        buf[--len] = '\0';
+    }
+    if (buf[0] == '\0') {
+        return false;
+    }
+    if (cbm_ht_has(declared_packages, buf)) {
+        return true;
+    }
+    /* The walk has no floor, and that is a deliberate false-NEGATIVE: once the
+     * tree declares `com.example`, EVERY specifier under `com.example.**` reads
+     * as in-tree, including a third-party library that happens to publish under
+     * a declared prefix. Such a call keeps the same-name fallback it has on
+     * main, so the cost is a fabricated edge this guard could have removed —
+     * never a real edge lost. Stopping earlier would need a rule for where a
+     * package path ends and a type begins, and getting that wrong fails the
+     * other way. Pinned by external_import_shadow_declared_prefix_is_permissive
+     * in test_registry.c. */
+    for (char *dot = strrchr(buf, '.'); dot != NULL; dot = strrchr(buf, '.')) {
+        *dot = '\0';
+        if (cbm_ht_has(declared_packages, buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool import_map_binds(const char **import_map_keys, int import_map_count,
                              const char *local_name) {
     if (!import_map_keys || import_map_count <= 0) {
@@ -612,11 +690,21 @@ static bool import_map_binds(const char **import_map_keys, int import_map_count,
  * specifier the tree's own manifests claim is treated exactly like a relative
  * one. NULL disables the check and restores the specifier-shape-only contract.
  *
+ * `declared_packages` closes the same hole for the package-path languages,
+ * where NO specifier shape says in-tree: `import
+ * org.jetbrains.exposed.v1.tests.shared.assertEquals` is spelled exactly like
+ * `import kotlin.test.assertEquals`, and only the tree's own `package`
+ * declarations tell them apart. It is permissive by construction — any
+ * specifier UNDER a declared package prefix counts as in-tree, see the note on
+ * the walk — so it can leave a fabricated edge in place, never remove a real
+ * one. NULL disables the check.
+ *
  * Pure + side-effect-free so the contract is unit-testable without a pipeline. */
 bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
                                          const CBMImportArray *file_imports,
                                          const char **import_map_keys, int import_map_count,
-                                         const CBMHashTable *indexed_packages) {
+                                         const CBMHashTable *indexed_packages,
+                                         const CBMHashTable *declared_packages) {
     if (!callee_name || !callee_name[0] || !strategy || !strategy[0]) {
         return false;
     }
@@ -640,7 +728,8 @@ bool cbm_suppress_external_import_shadow(const char *callee_name, const char *st
             continue;
         }
         if (specifier_is_relative(imp->module_path) ||
-            specifier_names_indexed_package(indexed_packages, imp->module_path)) {
+            specifier_names_indexed_package(indexed_packages, imp->module_path) ||
+            specifier_names_declared_package(declared_packages, imp->module_path)) {
             return false; /* an in-tree binding for this name — never suppress */
         }
         external_binding = true;

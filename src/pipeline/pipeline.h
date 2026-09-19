@@ -301,11 +301,16 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
  * strategy are all kept. `indexed_packages` is the pipeline package map: a
  * specifier naming a package the tree itself declares (a workspace sibling)
  * counts as in-tree and is kept too; NULL disables that check.
+ * `declared_packages` is the pipeline namespace map and does the same job for
+ * package-path specifiers, which have no in-tree/external shape of their own:
+ * `import org.example.util.assertThing` is kept when some indexed file
+ * declares `package org.example.util`; NULL disables that check.
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
                                          const CBMImportArray *file_imports,
                                          const char **import_map_keys, int import_map_count,
-                                         const CBMHashTable *indexed_packages);
+                                         const CBMHashTable *indexed_packages,
+                                         const CBMHashTable *declared_packages);
 
 /* #725: drop a suffix_match CALLS edge when the caller language and the
  * target file's language disagree. unique_name (candidates == 1) is #1572

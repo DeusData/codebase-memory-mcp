@@ -986,14 +986,19 @@ TEST(external_import_shadow_drops_package_bound_bare_call) {
     /* Only the relative import materialized an IMPORTS edge. */
     const char *keys[] = {"users"};
 
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, keys, 1, NULL));
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("sql", "unique_name", &arr, keys, 1, NULL));
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "suffix_match", &arr, keys, 1, NULL));
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "field_type_hint", &arr, keys, 1, NULL));
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "fuzzy", &arr, keys, 1, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("sql", "unique_name", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "suffix_match", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "field_type_hint", &arr, keys, 1, NULL, NULL));
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "fuzzy", &arr, keys, 1, NULL, NULL));
     /* A file whose imports all failed to materialize is still covered: the
      * evidence is the import statement, not the map. */
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL, NULL));
     PASS();
 }
 
@@ -1011,42 +1016,47 @@ TEST(external_import_shadow_keeps_everything_else) {
     const int nkeys = 2;
 
     /* Import-/receiver-/module-aware strategies are never this guard's business. */
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "import_map", &arr, keys, nkeys, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq", "import_map_suffix", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "same_module", &arr, keys, nkeys, NULL));
+        cbm_suppress_external_import_shadow("eq", "import_map", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "import_map_suffix", &arr, keys, nkeys,
+                                                     NULL, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq", "qualified_suffix", &arr, keys, nkeys, NULL));
+        cbm_suppress_external_import_shadow("eq", "same_module", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "qualified_suffix", &arr, keys, nkeys,
+                                                     NULL, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq", "lsp_ts_import", &arr, keys, nkeys, NULL));
+        cbm_suppress_external_import_shadow("eq", "lsp_ts_import", &arr, keys, nkeys, NULL, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq", "lsp_ts_method", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq", "service_pattern", &arr, keys, nkeys, NULL));
+        cbm_suppress_external_import_shadow("eq", "lsp_ts_method", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "service_pattern", &arr, keys, nkeys,
+                                                     NULL, NULL));
     /* A relative specifier names a path inside the tree — a missing IMPORTS edge
      * there is an in-project gap, not an external binding. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0, NULL));
+        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0, NULL, NULL));
     /* A package the import map DOES bind resolved in-graph (workspace package). */
     ASSERT_FALSE(cbm_suppress_external_import_shadow("getRootContainer", "unique_name", &arr, keys,
-                                                     nkeys, NULL));
+                                                     nkeys, NULL, NULL));
     /* A name the file never imports (called with no import at all). */
-    ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("helper", "unique_name", &arr, keys, nkeys, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("helper", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
     /* Member and package/namespace-qualified callees belong to the
      * receiver-aware guards, not to this one. */
-    ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq.apply", "unique_name", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("eq::apply", "unique_name", &arr, keys, nkeys, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq.apply", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq::apply", "unique_name", &arr, keys, nkeys,
+                                                     NULL, NULL));
     /* Empty / absent inputs. */
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", NULL, &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow(NULL, "unique_name", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("", "unique_name", &arr, keys, nkeys, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", NULL, keys, nkeys, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", NULL, &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow(NULL, "unique_name", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("", "unique_name", &arr, keys, nkeys, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", NULL, keys, nkeys, NULL, NULL));
     PASS();
 }
 
@@ -1065,8 +1075,8 @@ TEST(external_import_shadow_relative_binding_wins_the_tie) {
     };
     CBMImportArray a = {.items = pkg_first, .count = 2, .cap = 2};
     CBMImportArray b = {.items = rel_first, .count = 2, .cap = 2};
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &a, NULL, 0, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &b, NULL, 0, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &a, NULL, 0, NULL, NULL));
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &b, NULL, 0, NULL, NULL));
     PASS();
 }
 
@@ -1089,10 +1099,12 @@ TEST(external_import_shadow_windows_relative_specifier_kept) {
      * keep the edge because it is in-tree, not external. RED before the fix
      * (specifier_is_relative saw '.' / '/' only, so all three were classified
      * external and suppressed); GREEN after. */
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL));
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("sql", "unique_name", &arr, NULL, 0, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0, NULL));
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("sql", "unique_name", &arr, NULL, 0, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("normalize", "unique_name", &arr, NULL, 0, NULL, NULL));
     /* A bare package specifier without any drive letter or leading separator
      * (e.g. "drizzle-orm") must still be external — this predicate must not
      * become "anything with a colon or backslash". */
@@ -1100,7 +1112,8 @@ TEST(external_import_shadow_windows_relative_specifier_kept) {
         {.local_name = "eq", .module_path = "drizzle-orm"},
     };
     CBMImportArray parr = {.items = pkg_only, .count = 1, .cap = 1};
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &parr, NULL, 0, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &parr, NULL, 0, NULL, NULL));
     PASS();
 }
 
@@ -1127,30 +1140,137 @@ TEST(external_import_shadow_workspace_sibling_kept) {
 
     /* Exact name, subpath, and scoped subpath all resolve to an in-tree
      * package — the same-name fallback keeps its chance. */
-    ASSERT_FALSE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, pkgs));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("pgTable", "suffix_match", &arr, NULL, 0, pkgs));
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, pkgs, NULL));
     ASSERT_FALSE(
-        cbm_suppress_external_import_shadow("hoisted", "unique_name", &arr, NULL, 0, pkgs));
+        cbm_suppress_external_import_shadow("pgTable", "suffix_match", &arr, NULL, 0, pkgs, NULL));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("hoisted", "unique_name", &arr, NULL, 0, pkgs, NULL));
     /* A genuine third-party dependency is untouched by the new check: the tree
      * declares no package called "vitest", so the #1355 removal still happens. */
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("test", "suffix_match", &arr, NULL, 0, pkgs));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("test", "suffix_match", &arr, NULL, 0, pkgs, NULL));
 
     /* A tree with no manifests at all (pkgmap NULL) keeps the pre-existing
      * specifier-shape-only contract — every one of these is external again. */
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL));
     ASSERT_TRUE(
-        cbm_suppress_external_import_shadow("pgTable", "suffix_match", &arr, NULL, 0, NULL));
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("pgTable", "suffix_match", &arr, NULL, 0, NULL, NULL));
 
     /* An unrelated package map must not accidentally match by prefix: "drizzle"
      * is not "drizzle-orm", and the walk is by path segment, not by substring. */
     CBMHashTable *other = cbm_ht_create(8);
     ASSERT_NOT_NULL(other);
     cbm_ht_set(other, "drizzle", (void *)"qn");
-    ASSERT_TRUE(cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, other));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("eq", "unique_name", &arr, NULL, 0, other, NULL));
 
     cbm_ht_free(other);
     cbm_ht_free(pkgs);
+    PASS();
+}
+
+TEST(external_import_shadow_declared_package_kept) {
+    /* #1355: package-path specifiers (Java, Kotlin, C#, PHP) carry NO shape
+     * that separates in-tree from third-party — `import
+     * org.jetbrains.exposed.v1.tests.shared.assertEquals` is spelled exactly
+     * like `import kotlin.test.assertEquals`, and neither is "relative". Only
+     * the tree's own `package` declarations tell them apart; the manifests the
+     * package map reads (pom.xml, build.gradle) name artifacts, not packages.
+     * Measured on JetBrains/Exposed at 0e4d81a4: without this check the guard
+     * removed 426 CALLS edges, every one of them a real in-project call into
+     * the repository's own Assert.kt. */
+    CBMImport imports[] = {
+        {.local_name = "assertEquals", .module_path = "org.example.tests.shared.assertEquals"},
+        {.local_name = "assertEquals", .module_path = "kotlin.test.assertEquals"},
+        {.local_name = "Helper", .module_path = "org.example.util.Helper"},
+        {.local_name = "URL", .module_path = "java.net.URL"},
+        {.local_name = "Logger", .module_path = "App\\Support\\Logger"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 5, .cap = 5};
+
+    CBMHashTable *nspkgs = cbm_ht_create(8);
+    ASSERT_NOT_NULL(nspkgs);
+    cbm_ht_set(nspkgs, "org.example.tests.shared", (void *)"qn");
+    cbm_ht_set(nspkgs, "org.example.util", (void *)"qn");
+    cbm_ht_set(nspkgs, "App.Support", (void *)"qn");
+
+    /* The specifier names a member of a package the tree declares, so the walk
+     * strips the member segment and finds it — the call keeps its edge. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("assertEquals", "suffix_match", &arr, NULL, 0,
+                                                     NULL, nspkgs));
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("Helper", "unique_name", &arr, NULL, 0, NULL, nspkgs));
+    /* PHP writes its separator as a backslash; the key normalization has to
+     * match the namespace map's, which stores dots. */
+    ASSERT_FALSE(
+        cbm_suppress_external_import_shadow("Logger", "unique_name", &arr, NULL, 0, NULL, nspkgs));
+    /* Negative space, and the effect the census called valuable: `java.net.URL`
+     * walks to "java.net" then "java", neither declared by any project file, so
+     * a bare `URL` bound to an in-tree URL class is still cut. */
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("URL", "suffix_match", &arr, NULL, 0, NULL, nspkgs));
+    /* NULL restores the previous contract: without the declared-package set
+     * every one of these reads as external again. */
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("assertEquals", "suffix_match", &arr, NULL, 0,
+                                                    NULL, NULL));
+    ASSERT_TRUE(
+        cbm_suppress_external_import_shadow("Helper", "unique_name", &arr, NULL, 0, NULL, NULL));
+
+    /* The walk is by dotted segment, not by substring: a tree that declares
+     * "org.example.tests" must not claim "org.example.testsuite.helper". */
+    CBMImport near[] = {
+        {.local_name = "near", .module_path = "org.example.testsuite.helper.near"},
+    };
+    CBMImportArray narr = {.items = near, .count = 1, .cap = 1};
+    CBMHashTable *prefix_only = cbm_ht_create(8);
+    ASSERT_NOT_NULL(prefix_only);
+    cbm_ht_set(prefix_only, "org.example.tests", (void *)"qn");
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("near", "unique_name", &narr, NULL, 0, NULL,
+                                                    prefix_only));
+
+    cbm_ht_free(prefix_only);
+    cbm_ht_free(nspkgs);
+    PASS();
+}
+
+TEST(external_import_shadow_declared_prefix_is_permissive) {
+    /* #1355, known limitation pinned deliberately. The declared-package walk
+     * has no floor: once the tree declares `com.example`, a third-party
+     * library publishing under `com.example.vendor` reads as in-tree and the
+     * guard stands down. The call then keeps exactly the edge it has on main,
+     * so this direction costs a fabricated edge the guard could have removed —
+     * it never removes a real one, which is the side a call-resolution
+     * suppressor has to fail on.
+     *
+     * This test exists so the behaviour cannot change silently: tightening the
+     * walk (stopping at the first type-shaped segment, say) must flip these
+     * two assertions, not slip through unnoticed. */
+    CBMImport imports[] = {
+        {.local_name = "vendorCall", .module_path = "com.example.vendor.pkg.vendorCall"},
+    };
+    CBMImportArray arr = {.items = imports, .count = 1, .cap = 1};
+
+    CBMHashTable *declares_prefix = cbm_ht_create(8);
+    ASSERT_NOT_NULL(declares_prefix);
+    cbm_ht_set(declares_prefix, "com.example", (void *)"qn");
+    /* The tree declares only the prefix, yet the whole subtree is treated as
+     * in-tree — the permissive direction. */
+    ASSERT_FALSE(cbm_suppress_external_import_shadow("vendorCall", "unique_name", &arr, NULL, 0,
+                                                     NULL, declares_prefix));
+
+    /* Change nothing but the declared package and the guard fires again, which
+     * is what proves the previous assertion came from the prefix walk and not
+     * from some other clause standing down. */
+    CBMHashTable *declares_other = cbm_ht_create(8);
+    ASSERT_NOT_NULL(declares_other);
+    cbm_ht_set(declares_other, "com.other", (void *)"qn");
+    ASSERT_TRUE(cbm_suppress_external_import_shadow("vendorCall", "unique_name", &arr, NULL, 0,
+                                                    NULL, declares_other));
+
+    cbm_ht_free(declares_other);
+    cbm_ht_free(declares_prefix);
     PASS();
 }
 
@@ -1258,4 +1378,6 @@ SUITE(registry) {
     RUN_TEST(external_import_shadow_relative_binding_wins_the_tie);
     RUN_TEST(external_import_shadow_windows_relative_specifier_kept);
     RUN_TEST(external_import_shadow_workspace_sibling_kept);
+    RUN_TEST(external_import_shadow_declared_package_kept);
+    RUN_TEST(external_import_shadow_declared_prefix_is_permissive);
 }
