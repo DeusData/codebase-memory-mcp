@@ -634,10 +634,22 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * flag is set only for Python — this gate MUST match pass_parallel.c's
      * exactly, for the same divergence reason noted above. */
     bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+    /* #1355: `import { eq } from "drizzle-orm"` binds `eq` to a package that is
+     * not in the indexed tree, so a project-wide same-name guess must not turn
+     * `eq(...)` into a CALLS edge to an unrelated project `eq`. Joined to
+     * drop_plain_call for the reason spelled out above: dropping the call here
+     * would also skip route/HTTP/CONFIG classification, and a route
+     * registration reached through a static import (`import static
+     * spark.Spark.get` + `get("/x", handler)`) is exactly a bare call bound by
+     * a package specifier. Suppressing only the plain-CALLS fall-through keeps
+     * every Route node and service edge main-identical. */
     bool drop_plain_call =
         cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
         cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                             call->callee_is_locally_bound, res.strategy);
+                                             call->callee_is_locally_bound, res.strategy) ||
+        cbm_suppress_external_import_shadow(call->callee_name, res.strategy, file_imports, imp_keys,
+                                            imp_count, cbm_pipeline_get_pkgmap(),
+                                            cbm_pipeline_get_nsmap());
 
     /* Service-pattern HTTP/ASYNC calls to an EXTERNAL client library (e.g.
      * `requests.get("/api/orders/{id}")`) resolve to a QN containing the library
@@ -667,16 +679,6 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * Store.commit() call to a JS function named commit (or a Bash main
      * to a Python main). Drop that weak cross-language edge. */
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
-        return 0;
-    }
-    /* #1355: `import { eq } from "drizzle-orm"` binds `eq` to a package that is
-     * not in the indexed tree, so a project-wide same-name guess must not turn
-     * `eq(...)` into a CALLS edge to an unrelated project `eq`. Placed with the
-     * #725 guard, after the service-pattern bypasses above, so no HTTP/route
-     * edge can be lost to it. */
-    if (cbm_suppress_external_import_shadow(call->callee_name, res.strategy, file_imports, imp_keys,
-                                            imp_count, cbm_pipeline_get_pkgmap(),
-                                            cbm_pipeline_get_nsmap())) {
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,

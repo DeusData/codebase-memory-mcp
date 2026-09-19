@@ -2499,10 +2499,18 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
+        /* #1355: same guard as pass_calls.c, and joined to drop_plain_call for
+         * the same reason — a `continue` here would also skip route/HTTP/CONFIG
+         * classification, and a static-import route registration is a bare call
+         * bound by a package specifier. Suppress only the plain-CALLS
+         * fall-through so every Route node stays main-identical. */
         bool drop_plain_call =
             cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) ||
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                                 call->callee_is_locally_bound, res.strategy);
+                                                 call->callee_is_locally_bound, res.strategy) ||
+            cbm_suppress_external_import_shadow(call->callee_name, res.strategy, &result->imports,
+                                                imp_keys, imp_count, cbm_pipeline_get_pkgmap(),
+                                                cbm_pipeline_get_nsmap());
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
@@ -2571,15 +2579,6 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
             /* #725: same guard as pass_calls.c — do not emit a suffix_match
              * CALLS edge across a language boundary. */
-            continue;
-        }
-        if (target_node && source_node->id != target_node->id &&
-            cbm_suppress_external_import_shadow(call->callee_name, res.strategy, &result->imports,
-                                                imp_keys, imp_count, cbm_pipeline_get_pkgmap(),
-                                                cbm_pipeline_get_nsmap())) {
-            /* #1355: same guard as pass_calls.c — a bare call bound by an
-             * external package import must not become a CALLS edge to an
-             * unrelated project symbol of the same name. */
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {

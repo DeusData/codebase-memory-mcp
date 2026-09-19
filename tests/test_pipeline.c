@@ -5348,6 +5348,114 @@ TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355) {
     PASS();
 }
 
+/* #1355: the guard must suppress ONLY the plain-CALLS fall-through, never the
+ * route/HTTP/CONFIG classification that runs inside the emitters. A bare call
+ * bound by a package import is exactly the shape a route registration takes
+ * when the router is a dependency, and dropping it before classification costs
+ * the Route node and every HANDLES edge downstream of it. Same reasoning, and
+ * the same drop_plain_call seam, as the #592/#606 member guard. */
+static void write_route_shadow_fixture(const char *dir, int pad_files) {
+    /* The project symbols the guess would bind to. The file name puts "express"
+     * in their qualified names, which is what makes the resolved QN classify as
+     * a route registration — the same substring match main uses on real trees. */
+    write_temp_file(dir, "app/express-routes.ts",
+                    "export function regGet(path: string, handler: unknown): string {\n"
+                    "  return path;\n"
+                    "}\n"
+                    "export function regSpec(label: string): string {\n"
+                    "  return label;\n"
+                    "}\n");
+    /* Both names come from a package outside the tree. `regGet` carries a
+     * path-shaped first argument, so it is a route registration; `regSpec` is
+     * an ordinary fabricated edge and must still go. */
+    write_temp_file(dir, "app/server.ts",
+                    "import { regGet, regSpec } from 'vendor-router';\n"
+                    "export function boot(): string {\n"
+                    "  return regGet('/orders', () => 'ok') + regSpec('case');\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "app/pad_%02d.ts", i);
+        snprintf(body, sizeof(body), "export function routePad%02d(): number { return %d; }\n", i,
+                 i);
+        write_temp_file(dir, name, body);
+    }
+}
+
+static int assert_route_shadow_contract(const char *dir, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", dir, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(dir, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return 1;
+    }
+    if (cbm_pipeline_run(p) != 0) {
+        cbm_pipeline_free(p);
+        return 2;
+    }
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    if (!s) {
+        cbm_pipeline_free(p);
+        return 3;
+    }
+    int rc = 0;
+    /* (1) the Route node survives the guard. RED when the guard returns before
+     * the emitter: main mints __route__ANY__/orders here and the published
+     * guard lost it, together with every HANDLES edge that hangs off it. */
+    if (count_nodes_named(s, project, "/orders") < 1) {
+        rc = 4;
+    }
+    /* (2) the fabricated plain-CALLS edge in the same file is still removed, so
+     * (1) cannot pass by the guard having been disarmed. */
+    if (rc == 0 && cross_file_call_exists(s, project, "boot", "regSpec")) {
+        rc = 5;
+    }
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    return rc;
+}
+
+TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_route_import_shadow_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_route_shadow_fixture(tmp, EXTERNAL_IMPORT_SHADOW_PARALLEL_PAD);
+
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    int sequential = assert_route_shadow_contract(tmp, "route-sequential.db");
+
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    int parallel = assert_route_shadow_contract(tmp, "route-parallel.db");
+
+    if (saved_workers) {
+        cbm_setenv("CBM_WORKERS", saved_workers, 1);
+        free(saved_workers);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    if (saved_single) {
+        cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1);
+        free(saved_single);
+    } else {
+        cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    }
+    th_rmtree(tmp);
+
+    ASSERT_EQ(sequential, 0);
+    ASSERT_EQ(parallel, 0);
+    PASS();
+}
+
 TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_tsjs_par_XXXXXX");
@@ -13699,6 +13807,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_external_import_shadow_not_bound_to_local_homonym_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_workspace_sibling_issue1355);
     RUN_TEST(pipeline_external_import_shadow_keeps_declared_package_issue1355);
+    RUN_TEST(pipeline_external_import_shadow_keeps_route_registration_issue1355);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
