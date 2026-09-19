@@ -172,6 +172,10 @@ static int semantic_manifest_hash_file(const char *abs_path, char out[CBM_SHA256
         if (!f) {
             return CBM_NOT_FOUND;
         }
+        /* Reads go through buf below: a stdio buffer of its own was one unused
+         * 4 KB allocation per file (43 k on the Go corpus, waste sanitizer
+         * 2026-09-17). */
+        (void)setvbuf(f, NULL, _IONBF, 0);
         cbm_sha256_ctx sha;
         cbm_sha256_init(&sha);
         unsigned char buf[CBM_SZ_64K];

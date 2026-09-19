@@ -6,6 +6,17 @@
 #include "arena.h"
 #include "tree_sitter/api.h"
 
+/* Field lookups by NAME resolve the name with a linear strncmp scan over the
+ * grammar's field table on every call -- 951 M strncmp calls on the Go corpus
+ * (waste sanitizer, 2026-09-17) across ~1,200 call sites. Tree-sitter's own
+ * implementation is exactly "field id for name, then child by field id"; this
+ * caches the first half per thread (language, name) and keeps the second.
+ * Every extractor includes this header, so every call site gets it. */
+TSNode cbm_ts_child_by_field_name(TSNode node, const char *name, uint32_t name_length);
+/* Variadic: call sites spell the name and its length as ONE macro argument
+ * (TS_FIELD("body") expands to "body", 4), which must expand before the call. */
+#define ts_node_child_by_field_name(...) cbm_ts_child_by_field_name(__VA_ARGS__)
+
 // Language enum mirrors lang.Language in Go.
 // Order must match lang_specs.c tables.
 typedef enum {
@@ -558,6 +569,12 @@ typedef struct CBMFileResult {
      * to that point are kept, the rest of the file is not walked. Implies
      * lsp_skipped. */
     bool walk_truncated;
+    /* Size of this file's parse tree, and how much of it the unified walk got
+     * through. Reported for a truncated or LSP-skipped file so the coverage
+     * report says how much of it is missing, instead of leaving the gap
+     * silent. */
+    uint32_t tree_nodes;
+    uint32_t walk_nodes_visited;
     CBMLanguage cached_lang; // language of cached tree (for parser selection)
 
     // Retained source bytes — copied into `arena` by the parallel
@@ -648,14 +665,19 @@ typedef struct {
      * class-body variable def records which class declares it (parent_class)
      * without changing its module-level qualified name. NULL elsewhere. */
     const char *var_parent_class;
-    /* Per-file walk budget (thread CPU time, ns; 0 = unbounded). The unified
-     * cursor walk checks it every 1024 nodes and stops when it is spent, so
-     * no single file can hold a worker for minutes: a 23 MB single-expression
-     * C# test file cost 346 s in usage stamping alone (tree-sitter's
-     * ts_node_parent descends from the root, quadratic on a deep tree;
-     * 2026-09-14). What was extracted before the stop is kept. */
-    uint64_t walk_deadline_cpu_ns;
+    /* Per-file walk budget in VISITED NODES (0 = unbounded). The unified cursor
+     * walk stops once it is spent, so no single file can hold a worker for
+     * minutes: a 23 MB single-expression C# test file cost 346 s in usage
+     * stamping alone (tree-sitter's ts_node_parent descends from the root,
+     * quadratic on a deep tree; 2026-09-14). What was extracted before the stop
+     * is kept, and the file is named in the coverage report. Counted in nodes
+     * rather than CPU time so that the same file always stops at the same node
+     * — see CBM_WALK_MAX_NODES_DEFAULT for what a clock did here. */
+    uint32_t walk_budget_nodes;
     bool walk_budget_exhausted;
+    /* How many nodes the unified walk actually visited (whether or not it ran
+     * out of budget) — the measurement the budget has to be expressed in. */
+    uint32_t walk_nodes_visited;
 } CBMExtractCtx;
 
 // --- Public API ---
@@ -729,6 +751,16 @@ void cbm_work_arena_take(CBMArena *into);
 void cbm_work_arena_give(CBMArena *from);
 /* Drop this thread's kept working arena (end of an extraction pass). */
 void cbm_work_arena_release(void);
+/* True on a thread that has given a working arena back, i.e. a pipeline
+ * worker whose cbm_work_arena_release is guaranteed to run: only such a thread
+ * may keep per-thread scratch between files. */
+bool cbm_work_arena_keeping(void);
+/* Let this thread keep its per-file extraction scratch between the files of a
+ * sequential loop; the caller must call cbm_work_arena_release on the same
+ * thread when the loop ends (every return path). */
+void cbm_work_arena_keep_begin(void);
+/* Free the compaction scratch this thread kept (cbm_work_arena_release calls it). */
+void cbm_result_compact_release_thread(void);
 
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
@@ -770,6 +802,25 @@ void cbm_reset_thread_parser(void);
 
 // Destroy the thread-local parser. Call on worker thread exit.
 void cbm_destroy_thread_parser(void);
+
+// This thread's reusable tree cursor, reset to `node`. Child walks run once per
+// visited node; a cursor per walk was a malloc + free of its stack each time
+// (49.8 M on the Go corpus, waste sanitizer 2026-09-17). Valid until the next
+// call on this thread; released with the thread parser.
+TSTreeCursor *cbm_thread_cursor(TSNode node);
+
+// Reusable cursors for RECURSIVE walks: one per recursion depth on this thread,
+// so a walk that recurses from inside its child loop never shares a cursor with
+// its own callers. A slot already in use (another walker nested on this thread)
+// hands out a private cursor instead; release deletes it. Released with the
+// thread parser.
+typedef struct {
+    TSTreeCursor *cursor;
+    TSTreeCursor private_cursor;
+    int slot; /* -1: private */
+} cbm_cursor_lease_t;
+TSTreeCursor *cbm_cursor_acquire(cbm_cursor_lease_t *lease, int depth, TSNode node);
+void cbm_cursor_release(cbm_cursor_lease_t *lease);
 
 // Shutdown the library. Call once at exit.
 void cbm_shutdown(void);

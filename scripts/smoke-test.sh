@@ -174,6 +174,29 @@ cli() {
   return "$rc"
 }
 
+# A worker failure says "inspect log: <path>" — and in CI that path dies with the
+# job's sandbox, so the one artifact naming the cause is the one nobody can open.
+# A worker killed by a signal writes no summary of its own either, which is
+# exactly the case that most needs the log (PR #2233: "index worker ended with
+# killed (exit=-1, signal=9)" on ubuntu-latest, unreproducible on every local
+# venue). Print it while it still exists.
+smoke_dump_worker_log() {
+  local log
+  log=$(sed -n 's/.*inspect log: \([^ ]*\).*/\1/p' "$CLI_STDERR" 2>/dev/null | tail -1)
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    # The path is only printed for some failures; fall back to the newest log
+    # the run produced.
+    log=$(ls -t "${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"/logs/.worker-log-* 2>/dev/null | head -1)
+  fi
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    echo "--- worker log: $log ---"
+    tail -80 "$log"
+    echo "--- end worker log ---"
+  else
+    echo "--- no worker log found (cache ${CBM_CACHE_DIR:-unset}) ---"
+  fi
+}
+
 echo "=== Phase 1: version ==="
 VERSION_STATUS=0
 OUTPUT=$("$BINARY" --version 2>&1) || VERSION_STATUS=$?
@@ -334,6 +357,7 @@ GENEOF
 if ! RESULT=$(cli index_repository --repo-path "$TMPDIR"); then
   echo "FAIL: index_repository (flag form) exited non-zero"
   cat "$CLI_STDERR"
+  smoke_dump_worker_log
   exit 1
 fi
 echo "$RESULT"

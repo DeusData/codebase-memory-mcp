@@ -317,6 +317,7 @@ static void log_phase_mem(const char *phase) {
     cbm_log_info("mem.phase", "phase", phase, "rss_mb", rss_mb, "footprint_mb", footprint_mb,
                  "commit_mb", commit_mb, "tracked_mb", tracked_mb, "peak_mb", peak_mb,
                  "peak_charged_mb", peak_charged_mb);
+    cbm_mem_allocator_stats_log(phase);
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -1567,6 +1568,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * disk by now); the per-language cross registries share it. */
     CBMArena cross_lsp_arena;
     cbm_arena_init(&cross_lsp_arena);
+    CBM_PROF_START(t_collect_defs);
     if (run_cross_lsp) {
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
@@ -1575,10 +1577,12 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
                                                           def_modules, &def_count, def_starts)
                                : NULL;
     }
+    CBM_PROF_END_N("lsp_cross_prepare", "1_collect_all_defs", t_collect_defs, def_count);
     /* Serialize per-file LSP surfaces NOW — the result cache dies with this
      * pass, and the rows are what lets an incremental run detect body-only
      * edits and rehydrate cross registries without re-parsing the world.
      * Failure only degrades: no rows → the incremental route full-rebuilds. */
+    CBM_PROF_START(t_surfaces);
     if (ctx->pipeline && all_defs && def_starts) {
         cbm_lsp_surface_row_t *surface_rows = NULL;
         int surface_count = 0;
@@ -1589,6 +1593,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             cbm_log_warn("lsp_surface.serialize_failed", "files", itoa_buf(file_count));
         }
     }
+    CBM_PROF_END_N("lsp_cross_prepare", "2_surface_rows", t_surfaces, file_count);
     free(def_starts);
     /* Build inverted index: module_qn → defs. The fused resolve_worker
      * uses this to filter the global all_defs[] down to just the defs
@@ -1596,8 +1601,10 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * gopls "package summary" pattern. Drops per-file registry build
      * cost from O(all_defs) to O(relevant_defs), typically 50-100×
      * smaller per file. */
+    CBM_PROF_START(t_module_index);
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    CBM_PROF_END_N("lsp_cross_prepare", "3_module_def_index", t_module_index, def_count);
     /* Tier 2 full: pre-build per-language cross-LSP registries.
      * Built ONCE here; shared READ-ONLY across all files of that language
      * during resolve. Per-file work is then: parse + AST walk + O(1) lookups
@@ -3147,6 +3154,25 @@ static const char *const cbm_stage_sidecar_tails[] = {"", "-wal", "-shm", "-jour
 
 /* If `name` is "<base>.stage.<6 alphanumerics><known tail>", return the
  * length of the stage name proper (without the tail); 0 otherwise. */
+static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len);
+
+/* The same test with the base taken from the name itself, so a sweep reclaims
+ * stages belonging to ANY project in this cache directory.
+ *
+ * Why it must not be per-project: a run killed outright (OOM killer, SIGKILL)
+ * cleans nothing up, and until 2026-09-18 its staging database was only removed
+ * when THAT project was indexed again — a kernel index killed once left 15 GB
+ * parked until someone re-indexed the kernel, and forever if nobody did. The
+ * per-stage lock probe still decides safety, so a live writer's stage is kept
+ * whichever project it belongs to. */
+static size_t stage_entry_stage_length_any_base(const char *name) {
+    const char *marker = strstr(name, cbm_stage_marker);
+    if (!marker) {
+        return 0;
+    }
+    return stage_entry_stage_length(name, name, (size_t)(marker - name));
+}
+
 static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len) {
     if (strncmp(name, base, base_len) != 0) {
         return 0;
@@ -3302,7 +3328,10 @@ static void sweep_orphan_stages(const char *final_path) {
     stage_name_list_t list = {0};
     cbm_dirent_t *entry;
     while ((entry = cbm_readdir(dir)) != NULL) {
-        size_t stage_len = stage_entry_stage_length(entry->name, base, base_len);
+        /* Any project's orphan, not just this one's: see
+         * stage_entry_stage_length_any_base. `base` still anchors the log line
+         * and the path rebuild below. */
+        size_t stage_len = stage_entry_stage_length_any_base(entry->name);
         if (stage_len) {
             stage_name_list_add(&list, entry->name, stage_len);
         }

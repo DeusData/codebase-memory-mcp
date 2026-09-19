@@ -238,6 +238,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                                                CBMFileResult *const *results,
                                                const char *const *rels, int count);
+/* The same map built from the namespace names directly. The parallel pass needs
+ * this: results it has spilled are NULL in its cache, and a file missing from
+ * the map does not fail to resolve -- it resolves through the looser fallback,
+ * so an incomplete map CHANGES the graph instead of shrinking it. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */

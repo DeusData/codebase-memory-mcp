@@ -6193,6 +6193,96 @@ TEST(extract_wide_flat_reference_fields_are_linear) {
     }
     PASS();
 }
+
+/* The same guard for C#, whose callable-value site walk was the last one still
+ * climbing with ts_node_parent instead of the walk cursor. tree-sitter answers
+ * ts_node_parent by descending from the ROOT, so every step costs O(depth) and
+ * a deep file pays it per identifier. The .NET JIT tests are exactly that —
+ * single expressions megabytes deep — and they cost 18-48 us per node, which is
+ * why they were the only files a CPU-time budget ever cut off, and why the C#
+ * graph differed between two runs on one machine (2026-09-19). The budget is
+ * gone; this keeps the reason it was needed from coming back. */
+static uint64_t extract_csharp_argument_value_work(int statement_count, int *out_usages,
+                                                   uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "class C {\n"
+                                 "  static void Sink(object o) {}\n"
+                                 "  static void Target() {}\n"
+                                 "  static void Wide() {\n";
+    /* Parenthesised on purpose: a bare `Sink(Target)` needs no climb at all, so
+     * it cannot tell the cursor walk from the root-descending one and the test
+     * would pass either way. The wrapper makes the site walk take a step. */
+    static const char statement[] = "    Sink((Target));\n";
+    static const char suffix[] = "  }\n}\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement) + sizeof(suffix);
+    char *source = malloc(capacity);
+    if (!source) {
+        return UINT64_MAX;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    memcpy(source + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix) - 1U;
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, CBM_LANG_CSHARP, "proj", "Wide.cs", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return UINT64_MAX;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "Target") == 0) {
+            usages++;
+        }
+    }
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return work;
+}
+
+TEST(extract_csharp_argument_values_use_the_walk_cursor) {
+    enum { SMALL = 128, BIG = 1024, INPUT_GROWTH = 8, WORK_RATIO_MAX = 12 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_slow_parent_fallbacks = 0;
+    uint64_t big_slow_parent_fallbacks = 0;
+    uint64_t small_work =
+        extract_csharp_argument_value_work(SMALL, &small_usages, &small_slow_parent_fallbacks);
+    uint64_t big_work =
+        extract_csharp_argument_value_work(BIG, &big_usages, &big_slow_parent_fallbacks);
+    ASSERT_TRUE(small_work != UINT64_MAX);
+    ASSERT_TRUE(big_work != UINT64_MAX);
+    /* Anti-vacuous: the occurrences really were classified, so a zero fallback
+     * count means "took the cursor", not "never looked". */
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    /* The assertion this test exists for: not one occurrence fell back to the
+     * root-descending parent lookup. */
+    ASSERT_EQ(small_slow_parent_fallbacks, 0);
+    ASSERT_EQ(big_slow_parent_fallbacks, 0);
+    fprintf(stderr, "  [csharp-argument-values] work(%d)=%llu work(%d)=%llu input_growth=%dx\n",
+            SMALL, (unsigned long long)small_work, BIG, (unsigned long long)big_work, INPUT_GROWTH);
+    uint64_t maximum = small_work * WORK_RATIO_MAX + 256U;
+    if (big_work > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "csharp argument-value lookup grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- the site walk is not linear",
+                 (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
+                 WORK_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -7291,11 +7381,15 @@ TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
     ASSERT(shared);
 
     /* The arena stays usable for the cross-file pass: growth restarts at the
-     * default block, never at twice the compact block. */
+     * small append block, never at twice the compact block. (It restarted at
+     * the 64 KB default until 2026-09-17: the cross-file pass appends a few
+     * resolved calls, so that block was ~60 KB of untouched memory per
+     * appended-to result — 0.5 GB of the worker's peak on the Go corpus.
+     * See CBM_ARENA_APPEND_BLOCK.) */
     char *later = cbm_arena_strdup(&r->arena, "appended after compaction");
     ASSERT_NOT_NULL(later);
     ASSERT_EQ(r->arena.nblocks, 2);
-    ASSERT_EQ(r->arena.block_sizes[1], CBM_ARENA_DEFAULT_BLOCK_SIZE);
+    ASSERT_EQ(r->arena.block_sizes[1], CBM_ARENA_APPEND_BLOCK);
 
     cbm_free_result(r);
     cbm_free_result(ref);
@@ -7434,13 +7528,15 @@ TEST(extract_spill_round_trip_keeps_every_field) {
     PASS();
 }
 
-/* ── LSP budget share: an oversized parse disqualifies the file from the walks ── */
+/* ── A skipped file gets no LSP walk, per-file or cross-file ── */
 
-/* CBM_TEST_LSP_SKIP_ON names the file (no real timing): the result carries
- * lsp_skipped, the per-file LSP walk did not run (no LSP-resolved calls),
- * and the shared cross-file dispatcher returns without touching it. The
- * unified extractor definitions are still there. */
-TEST(extract_lsp_skipped_when_parse_used_its_budget_share) {
+/* CBM_TEST_LSP_SKIP_ON names the file: the result carries lsp_skipped, the
+ * per-file LSP walk did not run (no LSP-resolved calls), and the shared
+ * cross-file dispatcher returns without touching it. The unified extractor
+ * definitions are still there. Nothing in production sets lsp_skipped from a
+ * clock any more — this pins what the flag DOES, which is what the cross-file
+ * dispatcher and the per-file walks both have to honour. */
+TEST(extract_lsp_skipped_file_gets_no_walk) {
     cbm_setenv("CBM_TEST_LSP_SKIP_ON", "budget_share.py", 1);
     CBMFileResult *skipped = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "budget_share.py");
     cbm_unsetenv("CBM_TEST_LSP_SKIP_ON");
@@ -7465,10 +7561,12 @@ TEST(extract_lsp_skipped_when_parse_used_its_budget_share) {
     PASS();
 }
 
-/* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes
- * (no real timing): the result is walk_truncated, therefore lsp_skipped, and
- * the definitions the walk had not reached are the only loss. */
-TEST(extract_walk_truncated_at_its_cpu_budget) {
+/* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes: the
+ * result is walk_truncated, therefore lsp_skipped, and the definitions the walk
+ * had not reached are the only loss. There is no budget by default (see
+ * CBM_WALK_MAX_NODES_DEFAULT), so this drives the same node counter an operator
+ * would set with CBM_WALK_MAX_NODES rather than a mechanism of its own. */
+TEST(extract_walk_truncated_when_a_node_budget_is_set) {
     cbm_setenv("CBM_TEST_WALK_BUDGET_NODES", "8", 1);
     CBMFileResult *cut = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walk_budget.py");
     cbm_unsetenv("CBM_TEST_WALK_BUDGET_NODES");
@@ -7489,8 +7587,8 @@ SUITE(extraction) {
     RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
     RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
     RUN_TEST(extract_spill_round_trip_keeps_every_field);
-    RUN_TEST(extract_lsp_skipped_when_parse_used_its_budget_share);
-    RUN_TEST(extract_walk_truncated_at_its_cpu_budget);
+    RUN_TEST(extract_lsp_skipped_file_gets_no_walk);
+    RUN_TEST(extract_walk_truncated_when_a_node_budget_is_set);
     /* Initialize extraction library */
     cbm_init();
 
@@ -7498,6 +7596,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_file_is_linear);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
+    RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */

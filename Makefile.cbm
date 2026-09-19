@@ -76,8 +76,8 @@ endif
 # the prod build uses mimalloc (MI_OVERRIDE=1); the test build is CRT+ASan, where
 # binding would create an alloc/free mismatch, so the guard is prod-only.
 CFLAGS_PROD = $(CFLAGS_COMMON) -O2 -DCBM_BIND_TS_ALLOCATOR=1 $(TEST_SEAM_DEFINE) \
-              $(GLOBAL_OVERRIDE_DEFINE) $(CFLAGS_EXTRA)
-CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2
+              $(GLOBAL_OVERRIDE_DEFINE) $(MEMWASTE_CFLAGS) $(CFLAGS_EXTRA)
+CXXFLAGS_PROD = $(CXXFLAGS_COMMON) -O2 $(MEMWASTE_VENDOR_CFLAGS)
 
 # Test flags: debug + sanitizers (override SANITIZE= to disable on Windows)
 SANITIZE = -fsanitize=address,undefined -fno-omit-frame-pointer
@@ -216,6 +216,75 @@ ELF_HARDENING_FLAGS := -Wl,-z,noexecstack -Wl,-z,separate-code \
 endif
 endif
 
+# MEMWASTE=1: the waste-sanitizer flavour (src/foundation/mem_events.h). Built
+# like production -- -O2, mimalloc, the real allocator routing -- plus the event
+# layer and its observers, because waste measured under ASan's allocator would
+# describe ASan. Frame pointers stay so the macOS observer can walk to the
+# caller. On Linux this is also what finally LINKS the --wrap observation shim:
+# its flags and source were defined here but never reached a link line, so the
+# Linux profiler had been reporting nothing.
+#
+# Every object is built this way, VENDORED ones included (grammars, the
+# tree-sitter runtime, SQLite, tre, lz4, zstd, the C++ preprocessor): waste in
+# a vendored parser is waste in this program. mimalloc alone is left as it is --
+# its reads and writes are the allocator's own bookkeeping, not program data.
+#
+# MEMWASTE_ACCESS=1 adds the access lane (reads and writes of every tracked
+# block through the compiler's load/store callbacks; clang only). It builds at
+# -O1 without vectorisation: at -O2 the callbacks describe the OPTIMISED program,
+# and reads the optimiser removed would be reported as never read.
+# MEMWASTE_PROFILE=1 adds clang's execution counters (-fprofile-instr-generate)
+# for the CPU scaling lane (scripts/memwaste-scaling.py).
+# Each flavour needs its own BUILD_DIR: vendored objects are not rebuilt when
+# only the flavour changes.
+#
+# The libc wrappers (mem_override_libc.c) need --wrap on Linux and Windows;
+# macOS defines the symbols instead. STATIC=1 (musl) is not a memwaste target.
+MEMWASTE ?= 0
+MEMWASTE_ACCESS ?= 0
+MEMWASTE_PROFILE ?= 0
+ifeq ($(MEMWASTE_ACCESS),1)
+override MEMWASTE := 1
+endif
+ifeq ($(MEMWASTE_PROFILE),1)
+override MEMWASTE := 1
+endif
+MEMWASTE_CFLAGS :=
+MEMWASTE_VENDOR_CFLAGS :=
+MEMWASTE_LDFLAGS :=
+MEMWASTE_SRCS :=
+MEMWASTE_ALLOC_SYMS_LINUX := malloc calloc realloc free strdup strndup posix_memalign \
+                             aligned_alloc memalign
+MEMWASTE_LIBC_SYMS_LINUX := memcpy memmove memset memcmp strlen strcmp strncmp \
+                            __memcpy_chk __memmove_chk __memset_chk read __read_chk write \
+                            pread pwrite pread64 pwrite64 open open64 __open_2 __open64_2 \
+                            stat lstat fopen fopen64 fread __fread_chk fwrite opendir readdir \
+                            pthread_mutex_lock
+MEMWASTE_LIBC_SYMS_WIN := memcpy memmove memset memcmp strlen strcmp strncmp _wfopen fread fwrite
+ifeq ($(MEMWASTE),1)
+MEMWASTE_CFLAGS := -DCBM_MEMWASTE=1 -fno-omit-frame-pointer
+MEMWASTE_VENDOR_CFLAGS := -DCBM_MEMWASTE=1 -fno-omit-frame-pointer
+ifeq ($(IS_LINUX),yes)
+MEMWASTE_LDFLAGS := $(foreach sym,$(MEMWASTE_ALLOC_SYMS_LINUX) $(MEMWASTE_LIBC_SYMS_LINUX),-Wl,--wrap=$(sym))
+MEMWASTE_SRCS := src/foundation/mem_override_posix.c
+endif
+ifeq ($(IS_MINGW),yes)
+MEMWASTE_LDFLAGS := $(foreach sym,$(MEMWASTE_LIBC_SYMS_WIN),-Wl,--wrap=$(sym))
+endif
+endif
+ifeq ($(MEMWASTE_ACCESS),1)
+MEMWASTE_ACCESS_FLAGS := -DCBM_MEMWASTE_ACCESS=1 -O1 -fno-vectorize -fno-slp-vectorize \
+                         -fsanitize-coverage=inline-bool-flag,trace-loads,trace-stores
+MEMWASTE_CFLAGS += $(MEMWASTE_ACCESS_FLAGS)
+MEMWASTE_VENDOR_CFLAGS += $(MEMWASTE_ACCESS_FLAGS)
+endif
+ifeq ($(MEMWASTE_PROFILE),1)
+MEMWASTE_PROFILE_FLAGS := -DCBM_MEMWASTE_PROFILE=1 -fprofile-instr-generate -fprofile-update=atomic
+MEMWASTE_CFLAGS += $(MEMWASTE_PROFILE_FLAGS)
+MEMWASTE_VENDOR_CFLAGS += $(MEMWASTE_PROFILE_FLAGS)
+MEMWASTE_LDFLAGS += $(MEMWASTE_PROFILE_FLAGS)
+endif
+
 # The POSIX wrap shim exists only so the profiler can observe allocations. It
 # must never reach a sanitized build: the Linux/macOS test builds are CRT+ASan,
 # and redirecting malloc into mimalloc underneath ASan's own interception mixes
@@ -225,7 +294,7 @@ endif
 # instead of the system libstdc++ (scripts/msan.sh overrides both vars).
 CXX_STDLIB ?= -lstdc++
 CXX_STDLIB_FLAGS ?=
-LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
+LDFLAGS = -lm $(CXX_STDLIB) -lpthread -lz $(WIN32_LIBS) $(STATIC_FLAGS) $(MIMALLOC_WRAP_FLAGS) $(MEMWASTE_LDFLAGS) $(ELF_HARDENING_FLAGS)
 LDFLAGS_TEST = -lm $(CXX_STDLIB) -lpthread -lz $(SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 LDFLAGS_TSAN = -lm $(CXX_STDLIB) -lpthread -lz $(TSAN_SANITIZE) $(WIN32_LIBS) $(MIMALLOC_WRAP_FLAGS) $(ELF_HARDENING_FLAGS)
 
@@ -249,6 +318,9 @@ FOUNDATION_SRCS = \
     src/foundation/compat_regex.c \
     src/foundation/mem.c \
     src/foundation/mem_core.c \
+    src/foundation/mem_events.c \
+    src/foundation/mem_override_darwin.c \
+    src/foundation/mem_override_libc.c \
     src/foundation/diagnostics.c \
     src/foundation/profile.c \
     src/foundation/dump_verify.c \
@@ -472,10 +544,19 @@ ifneq ($(filter yes,$(IS_MINGW) $(IS_LINUX)),)
 MIMALLOC_OVERRIDE_DEFINE := -DMI_MALLOC_OVERRIDE=1
 GLOBAL_OVERRIDE_DEFINE := -DCBM_MEM_GLOBAL_OVERRIDE=1
 endif
+# MI_DEBUG=0: the production allocator is mimalloc's RELEASE build. Its header
+# defaults to MI_DEBUG=2 unless NDEBUG is defined, and nothing here defined it,
+# so every shipped binary up to v0.11.0 ran mimalloc's debug build: internal
+# assertions, fine-grained statistics, padding on every block and a memset of
+# every freed block. The waste sanitizer measured it on the Go corpus as 92 GB
+# (macOS) and 444 GB (Linux, where mimalloc also serves libc's malloc) of byte
+# work inside the allocator (2026-09-17). Committed-bytes accounting, which the
+# memory budget reads, is kept in every build (subproc stats, not MI_STAT).
+# The TEST build below keeps mimalloc's debug checks.
 MIMALLOC_CFLAGS = -std=c11 -O2 -w \
                   -Ivendored/mimalloc/include \
                   -Ivendored/mimalloc/src \
-                  -DMI_OVERRIDE=1 \
+                  -DMI_OVERRIDE=1 -DMI_DEBUG=0 \
                   $(MIMALLOC_OVERRIDE_DEFINE)
 MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
                        -Ivendored/mimalloc/include \
@@ -496,7 +577,7 @@ MIMALLOC_CFLAGS_TEST = -std=c11 -g -O1 -w \
 SQLITE3_OMIT_FLAGS = -DSQLITE_OMIT_LOAD_EXTENSION
 SQLITE3_SRC = vendored/sqlite3/sqlite3.c
 SQLITE3_CFLAGS = -std=c11 -O2 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
-                 $(SQLITE3_OMIT_FLAGS)
+                 $(SQLITE3_OMIT_FLAGS) $(MEMWASTE_VENDOR_CFLAGS)
 SQLITE3_CFLAGS_TEST = -std=c11 -g -O1 -w -DSQLITE_DQS=0 -DSQLITE_THREADSAFE=1 -DSQLITE_ENABLE_FTS5 \
                       $(SQLITE3_OMIT_FLAGS)
 
@@ -508,7 +589,7 @@ TRE_CFLAGS = -std=c11 -g -O1 -w -Ivendored/tre
 YYJSON_SRC = vendored/yyjson/yyjson.c
 
 # All production sources
-PROD_SRCS = $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
+PROD_SRCS = $(MEMWASTE_SRCS) $(FOUNDATION_SRCS) $(STORE_SRCS) $(CYPHER_SRCS) $(MCP_SRCS) $(DAEMON_SRCS) $(DISCOVER_SRCS) $(GRAPH_BUFFER_SRCS) $(PIPELINE_SRCS) $(SIMHASH_SRCS) $(SEMANTIC_SRCS) $(TRACES_SRCS) $(WATCHER_SRCS) $(GIT_SRCS) $(CLI_SRCS) $(UI_SRCS) $(YYJSON_SRC)
 EXISTING_C_SRCS = $(EXTRACTION_SRCS) $(LSP_SRCS) $(TS_RUNTIME_SRC) \
                   $(GRAMMAR_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
 
@@ -641,7 +722,7 @@ TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_pro
 	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
 	tests/test_activation_transaction.c
 
-TEST_MEM_SRCS = tests/test_mem.c
+TEST_MEM_SRCS = tests/test_mem.c tests/test_mem_events.c
 
 TEST_UI_SRCS = tests/test_ui.c
 TEST_HTTPD_SRCS = tests/test_httpd.c
@@ -746,7 +827,8 @@ BUILD_DIR = build/c
 # ── Object file compilation (grammars need relaxed warnings) ─────
 
 # Grammar + tree-sitter runtime: compiled without -Werror (upstream code has warnings)
-GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC)
+GRAMMAR_CFLAGS = -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
+                 $(MEMWASTE_VENDOR_CFLAGS)
 GRAMMAR_CFLAGS_TEST = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
                       -DCBM_ENABLE_TEST_SEAMS=1 $(SANITIZED_DEFINE) $(SANITIZE)
 GRAMMAR_CFLAGS_TSAN = -std=c11 -D_DEFAULT_SOURCE -g -O1 -w -I$(CBM_DIR) -I$(TS_INCLUDE) -I$(TS_SRC) \
@@ -764,7 +846,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security
+.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security fuzz
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -779,7 +861,24 @@ test-foundation: $(BUILD_DIR)/test-foundation
 
 # ── Grammar/TS/LSP object files (compiled with relaxed warnings) ─
 
-$(BUILD_DIR)/%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
+# Each grammar_<lang>.c is a unity object that #includes its own vendored
+# parser.c and, where the grammar has one, scanner.c. Those includes were
+# prerequisites of nothing, so editing a vendored scanner left the object
+# untouched and the edit silently absent from the binary: on 2026-09-19 a fix
+# to properties/scanner.c appeared not to work at all, and `nm` showed the old
+# symbol still sitting in prod_grammar_properties.o. MANIFEST.md's "Local
+# source patches" table means patching a vendored scanner is expected, so this
+# trap is reachable by design. Same reasoning as LSP_UNITY_DEPS and
+# TS_RUNTIME_DEPS above; secondary expansion is what lets one pattern rule name
+# each grammar's own directory ($$* is the stem, grammar_properties ->
+# properties). Non-grammar objects match no directory and gain no prerequisite.
+GRAMMAR_VENDOR_DIR = $(CBM_DIR)/vendored/grammars/$$(subst grammar_,,$$*)
+GRAMMAR_UNITY_DEPS = $$(wildcard $(GRAMMAR_VENDOR_DIR)/*.c) \
+                     $$(wildcard $(GRAMMAR_VENDOR_DIR)/*.h) \
+                     $$(wildcard $(GRAMMAR_VENDOR_DIR)/tree_sitter/*.h)
+.SECONDEXPANSION:
+
+$(BUILD_DIR)/%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TEST) -c -o $@ $<
 
 $(BUILD_DIR)/ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
@@ -791,7 +890,7 @@ $(BUILD_DIR)/lsp_all.o: $(LSP_UNITY_DEPS) | $(BUILD_DIR)
 $(BUILD_DIR)/preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS_TEST) -w -I$(CBM_DIR)/vendored -c -o $@ $<
 
-$(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/tsan_%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS_TSAN) -c -o $@ $<
 
 $(BUILD_DIR)/tsan_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
@@ -868,7 +967,7 @@ $(BUILD_DIR)/tsan_tre.o: $(TRE_SRC) | $(BUILD_DIR)
 	$(CC) $(TRE_CFLAGS) $(TSAN_SANITIZE) -c -o $@ $<
 
 $(BUILD_DIR)/prod_tre.o: $(TRE_SRC) | $(BUILD_DIR)
-	$(CC) $(TRE_CFLAGS) -O2 -c -o $@ $<
+	$(CC) $(TRE_CFLAGS) -O2 $(MEMWASTE_VENDOR_CFLAGS) -c -o $@ $<
 endif
 
 # Vendored LZ4 (test build)
@@ -1021,7 +1120,7 @@ TS_RUNTIME_OBJ_PROD = $(BUILD_DIR)/prod_ts_runtime.o
 LSP_OBJ_PROD = $(BUILD_DIR)/prod_lsp_all.o
 PP_OBJ_PROD = $(BUILD_DIR)/prod_preprocessor.o
 
-$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c | $(BUILD_DIR)
+$(BUILD_DIR)/prod_%.o: $(CBM_DIR)/%.c $(GRAMMAR_UNITY_DEPS) | $(BUILD_DIR)
 	$(CC) $(GRAMMAR_CFLAGS) -c -o $@ $<
 
 $(BUILD_DIR)/prod_ts_runtime.o: $(TS_RUNTIME_DEPS) | $(BUILD_DIR)
@@ -1036,14 +1135,14 @@ $(BUILD_DIR)/prod_preprocessor.o: $(CBM_DIR)/preprocessor.cpp | $(BUILD_DIR)
 # Vendored LZ4 (compiled separately, not unity-built via lz4_store.c)
 LZ4_OBJ_PROD = $(BUILD_DIR)/prod_lz4.o $(BUILD_DIR)/prod_lz4hc.o
 $(BUILD_DIR)/prod_lz4.o: $(CBM_DIR)/vendored/lz4/lz4.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR) -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR) -c -o $@ $<
 $(BUILD_DIR)/prod_lz4hc.o: $(CBM_DIR)/vendored/lz4/lz4hc.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/lz4 -c -o $@ $<
 
 # Vendored zstd (compiled separately, not unity-built via zstd_store.c)
 ZSTD_OBJ_PROD = $(BUILD_DIR)/prod_zstd.o
 $(BUILD_DIR)/prod_zstd.o: $(CBM_DIR)/vendored/zstd/zstd.c | $(BUILD_DIR)
-	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
+	$(CC) -std=c11 -D_DEFAULT_SOURCE -O2 -w $(MEMWASTE_VENDOR_CFLAGS) -I$(CBM_DIR)/vendored/zstd -c -o $@ $<
 
 OBJS_VENDORED_PROD = $(MIMALLOC_OBJ_PROD) $(SQLITE3_OBJ_PROD) $(TRE_OBJ_PROD) $(GRAMMAR_OBJS_PROD) $(TS_RUNTIME_OBJ_PROD) $(LSP_OBJ_PROD) $(PP_OBJ_PROD) $(LZ4_OBJ_PROD) $(ZSTD_OBJ_PROD) $(UNIXCODER_OBJ)
 
@@ -1065,7 +1164,7 @@ MAIN_SRC = src/main.c
 # for trap debugging -- silently re-run the previously instrumented binary,
 # which during this bisect produced a "crashes without sanitizers too" result
 # that was pure artifact and sent the investigation down the wrong path.
-BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)|SANITIZE=$(SANITIZE)
+BUILD_CONFIG_SIG := TEST_SEAMS=$(TEST_SEAMS)|CFLAGS_EXTRA=$(CFLAGS_EXTRA)|SANITIZE=$(SANITIZE)|MEMWASTE=$(MEMWASTE)|MEMWASTE_ACCESS=$(MEMWASTE_ACCESS)|MEMWASTE_PROFILE=$(MEMWASTE_PROFILE)
 .PHONY: build-config-check
 build-config-check:
 $(BUILD_DIR)/.build-config: build-config-check | $(BUILD_DIR)
@@ -1260,6 +1359,28 @@ test-lsan:
 		CC=$(LSAN_LLVM_BIN)/clang CXX=$(LSAN_LLVM_BIN)/clang++ BUILD_DIR=build/lsan
 	cd $(CURDIR) && ASAN_OPTIONS="detect_leaks=1:halt_on_error=1" \
 		./build/lsan/test-runner $(LSAN_SUITES)
+
+# ── Coverage-guided fuzzing (libFuzzer) ─────────────────────────
+# One binary, three targets (tests/fuzz/cbm_fuzz.c): the per-file extractor,
+# the Cypher parser, the TOML/YAML/JSON config editors. ASan+UBSan as in the
+# test lane, plus fuzzer-no-link on EVERY object -- the vendored grammars and
+# the tree-sitter runtime feed coverage back, which is where the parser state
+# space lives. Needs a clang that ships libFuzzer (Homebrew LLVM on macOS; Apple
+# clang does not). Run through scripts/fuzz.sh.
+FUZZ_CC ?= clang
+FUZZ_CXX ?= clang++
+FUZZ_SANITIZE = -fsanitize=address,undefined,fuzzer-no-link -fno-omit-frame-pointer
+FUZZ_SRC = tests/fuzz/cbm_fuzz.c
+fuzz:
+	$(MAKE) -f Makefile.cbm build/fuzz/cbm-fuzz BUILD_DIR=build/fuzz \
+		CC=$(FUZZ_CC) CXX=$(FUZZ_CXX) SANITIZE="$(FUZZ_SANITIZE)"
+
+$(BUILD_DIR)/cbm-fuzz: $(FUZZ_SRC) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) $(OBJS_VENDORED_TEST) $(PROJECT_HDRS) | $(BUILD_DIR)
+	$(CC) $(CFLAGS_TEST) -fsanitize=fuzzer -o $@ \
+		$(FUZZ_SRC) $(PROD_SRCS) \
+		$(EXTRACTION_SRCS) $(AC_LZ4_SRCS) $(ZSTD_SRCS) $(SQLITE_WRITER_SRC) \
+		$(OBJS_VENDORED_TEST) \
+		$(LDFLAGS_TEST)
 
 # Path-sensitive memory analysis: leak paths, null derefs, uninitialized reads.
 # Non-gating: triage findings against the code (this lane's first run produced

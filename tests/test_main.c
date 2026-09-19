@@ -23,7 +23,7 @@ int tf_skip_count = 0;
 #include "daemon/version_cohort.h" /* Windows crash-turnover re-exec probe */
 #include "mcp/index_supervisor.h"  /* cbm_index_set_worker_role */
 #include "mcp/mcp.h"               /* cbm_mcp_handle_tool — act as a real worker */
-#include "ui/http_server.h"       /* deleted-self executable probe */
+#include "ui/http_server.h"        /* deleted-self executable probe */
 #include <sqlite3.h>
 #include <errno.h>
 #include <stdbool.h>
@@ -880,6 +880,7 @@ extern void suite_repro_harness_cleanup(void);
 extern void suite_repro_runner_filter(void);
 extern void suite_call_reference_contract(void);
 extern void suite_mem(void);
+extern void suite_mem_events(void);
 extern void suite_ui(void);
 extern void suite_httpd(void);
 extern void suite_security(void);
@@ -1204,6 +1205,7 @@ int main(int argc, char **argv) {
     /* mem + arena + slab integration */
     RUN_SELECTED_SUITE(slab_alloc);
     RUN_SELECTED_SUITE(mem);
+    RUN_SELECTED_SUITE(mem_events);
 
     /* UI (config, external asset pack, layout) */
     RUN_SELECTED_SUITE(ui);

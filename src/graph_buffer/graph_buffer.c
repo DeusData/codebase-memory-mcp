@@ -1945,7 +1945,12 @@ int cbm_gbuf_dump_to_sqlite(cbm_gbuf_t *gb, const char *path) {
         if (rc != 0) {
             break;
         }
-        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_over_budget());
+        /* cbm_mem_should_relieve, not cbm_mem_over_budget: the dump is where
+         * the run died on 2026-09-18 with our charge UNDER budget and the host
+         * out of memory, so the only signal that would have fired here is the
+         * machine's. Dropping the property strings we have already written is
+         * pure relief — the rows are in the file by now. */
+        free_heavy = free_heavy || (cbm_mem_budget() > 0 && cbm_mem_should_relieve());
         if (free_heavy && src_nodes) {
             for (int j = off; j < off + chunk; j++) {
                 cbm_free(CBM_MEM_CLASS_GBUF_STRING, src_nodes[j]->properties_json);

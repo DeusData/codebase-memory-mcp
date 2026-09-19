@@ -223,6 +223,137 @@ TEST(store_bulk_persistence) {
     PASS();
 }
 
+static void write_temp_file(const char *dir, const char *name, const char *content);
+
+/* EVERY proto service gets its Routes, not the first 64 the graph buffer
+ * happened to hold.
+ *
+ * create_grpc_routes() collected services into a fixed `services[CBM_SZ_64]`
+ * and stopped there, in graph-buffer insertion order — which is parallel
+ * worker merge order. So on a repo with more than 64 services the extras were
+ * silently dropped, and WHICH ones were dropped changed between runs of the
+ * same binary: two kubernetes indexes differed by 5 Routes one way and 4 the
+ * other, plus their HANDLES edges (2026-09-18). 70 services here, so the old
+ * cap fails this test whatever order the workers produce. */
+TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_grpc_cap_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    enum { SERVICES = 70 }; /* > the 64 the fixed array used to hold */
+    for (int i = 0; i < SERVICES; i++) {
+        char name[64];
+        char body[512];
+        snprintf(name, sizeof(name), "svc%02d.proto", i);
+        snprintf(body, sizeof(body),
+                 "syntax = \"proto3\";\npackage demo%02d;\n\n"
+                 "message Req%02d { string id = 1; }\n"
+                 "message Resp%02d { string ok = 1; }\n\n"
+                 "service Svc%02d {\n"
+                 "  rpc Ping (Req%02d) returns (Resp%02d);\n}\n",
+                 i, i, i, i, i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/grpc.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count),
+              CBM_STORE_OK);
+    int grpc_routes = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strncmp(routes[i].qualified_name, "__grpc__", strlen("__grpc__")) == 0) {
+            grpc_routes++;
+        }
+    }
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    /* One rpc per service: every service must be represented. The old cap
+     * produced at most 64 however the workers interleaved. */
+    ASSERT_EQ(grpc_routes, SERVICES);
+    PASS();
+}
+
+/* Spilling must be invisible in the OUTPUT: the same repository indexed with
+ * results parked on disk must produce the same graph as one indexed entirely in
+ * memory. It did not. The namespace map that `use`/`using`/package imports
+ * resolve through was built from the in-memory result cache, where a PARKED
+ * result is NULL, so every spilled file contributed no namespace and its
+ * imports fell through to the looser fallback. Measured on the php corpus
+ * (2026-09-18, reproducible 3/3 each way, and present on main): 57,182 edges in
+ * memory against 59,379 while spilling — differing in BOTH directions, because
+ * a file missing from that map does not fail to resolve, it resolves
+ * differently.
+ *
+ * Why this needs its own fixture: test_parallel's spill-parity test uses the
+ * compact parity harness, which omits the production pass that builds the map,
+ * and its repo is Go+Java — neither reaches the namespace path. This one runs
+ * the REAL pipeline over >MIN_FILES_FOR_PARALLEL files so the parallel route is
+ * taken, with namespaced PHP that imports across files. */
+TEST(pipeline_spill_resolves_namespace_imports_like_memory) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_spill_ns_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    /* 60 modules: each declares a namespace and the next one imports it, so
+     * every file both contributes to the namespace map and depends on it. */
+    enum { NS_FILES = 60 };
+    for (int i = 0; i < NS_FILES; i++) {
+        char name[64];
+        char body[512];
+        snprintf(name, sizeof(name), "Mod%02d.php", i);
+        snprintf(body, sizeof(body),
+                 "<?php\nnamespace App\\Mod%02d;\n\nuse App\\Mod%02d\\Thing%02d;\n\n"
+                 "class Thing%02d {\n"
+                 "    public function run() { $t = new Thing%02d(); return $t->run(); }\n}\n",
+                 i, (i + 1) % NS_FILES, (i + 1) % NS_FILES, i, (i + 1) % NS_FILES);
+        write_temp_file(tmp, name, body);
+    }
+
+    int counts[2] = {0, 0};
+    int imports[2] = {0, 0};
+    for (int pass = 0; pass < 2; pass++) {
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/ns%d.db", tmp, pass);
+        if (pass == 1) {
+            cbm_setenv("CBM_MEM_SPILL", "1", 1); /* park every result on disk */
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        int rc = cbm_pipeline_run(p);
+        if (pass == 1) {
+            cbm_unsetenv("CBM_MEM_SPILL");
+        }
+        ASSERT_EQ(rc, 0);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(s);
+        const char *project = cbm_pipeline_project_name(p);
+        counts[pass] = cbm_store_count_edges(s, project);
+        imports[pass] = cbm_store_count_edges_by_type(s, project, "IMPORTS");
+        cbm_store_close(s);
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
+
+    /* The imports must actually have resolved, or this compares 0 == 0. */
+    ASSERT_GT(imports[0], 0);
+    ASSERT_EQ(imports[0], imports[1]);
+    ASSERT_EQ(counts[0], counts[1]);
+    PASS();
+}
+
 /* ── Integration: structure pass on temp repo ────────────────────── */
 
 TEST(pipeline_structure_nodes) {
@@ -3614,6 +3745,52 @@ TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_sw
     ASSERT_EQ(stage_count, 0);
     ASSERT_EQ(stable_count, 1);
     ASSERT_EQ(absent_count, 0);
+    PASS();
+}
+
+/* A killed run cleans up nothing, and until 2026-09-18 its staging database was
+ * reclaimed only when THAT project was indexed again: a kernel index killed by
+ * the OOM killer left ~15 GB parked until someone re-indexed the kernel, and
+ * indefinitely if nobody ever did. Indexing ANY project now reclaims the
+ * orphans of every project sharing that cache directory -- while the lock probe
+ * still keeps a LIVE writer's stage, whichever project owns it. */
+TEST(pipeline_sweep_reclaims_orphans_of_other_projects_and_keeps_their_live_stages) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_sweep_other_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mine.db", tmp);
+
+    /* Two stages of a DIFFERENT project sharing the cache directory: one whose
+     * writer died (nothing holds its lock) and one whose writer is alive. */
+    char other_dead[600];
+    char other_dead_wal[600];
+    char other_live[600];
+    snprintf(other_dead, sizeof(other_dead), "%s/other.db.stage.cccccc", tmp);
+    snprintf(other_dead_wal, sizeof(other_dead_wal), "%s/other.db.stage.cccccc-wal", tmp);
+    snprintf(other_live, sizeof(other_live), "%s/other.db.stage.dddddd", tmp);
+    static const char other_live_bytes[] = "other-project-live-bytes";
+    ASSERT_EQ(th_write_file(other_dead, "other-project-dead-bytes"), 0);
+    ASSERT_EQ(th_write_file(other_dead_wal, "other-project-dead-wal"), 0);
+    ASSERT_EQ(th_write_file(other_live, other_live_bytes), 0);
+    int other_live_fd = cbm_pipeline_stage_lock_hold(other_live);
+    ASSERT_TRUE(other_live_fd >= 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *mine = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(mine);
+    ASSERT_EQ(cbm_pipeline_run(mine), 0);
+    cbm_pipeline_free(mine);
+
+    bool dead_gone = !path_exists(other_dead);
+    bool dead_wal_gone = !path_exists(other_dead_wal);
+    bool live_kept = file_has_content(other_live, other_live_bytes);
+    cbm_pipeline_stage_lock_drop(other_live, other_live_fd);
+
+    ASSERT_TRUE(dead_gone);     /* reclaimed even though it belongs to "other" */
+    ASSERT_TRUE(dead_wal_gone); /* sidecars go with their stage */
+    ASSERT_TRUE(live_kept);     /* another project's LIVE stage is untouched */
     PASS();
 }
 
@@ -14558,6 +14735,8 @@ SUITE(pipeline) {
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
+    RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
+    RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
@@ -14902,6 +15081,7 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_stage_names_never_nest);
     RUN_TEST(pipeline_minted_stage_is_owned_until_released);
     RUN_TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept);
+    RUN_TEST(pipeline_sweep_reclaims_orphans_of_other_projects_and_keeps_their_live_stages);
     RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
     RUN_TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage);
     RUN_TEST(pipeline_fresh_index_never_reports_invalid_existing_db);

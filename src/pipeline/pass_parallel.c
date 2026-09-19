@@ -1020,6 +1020,20 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                     pp_spill_enter(ec, "near_budget");
                 }
             }
+            /* The MACHINE can be out of memory while our own charge sits well
+             * under the budget: measured 2026-09-18 on a 48 GB host, 22 GB
+             * charged against a 24 GB budget, and the OS killed the worker
+             * anyway because a VM held the rest. Spill on real scarcity too.
+             * RELIEF ONLY — `over` is deliberately NOT set from this, so the
+             * futility/abort path below stays keyed to OUR budget. Another
+             * process's allocation spike must never fail this run.
+             * The cheap charge comparison guards the syscall, so the pressure
+             * query costs nothing until we are already in the danger zone. */
+            if (!pp_spill_active(ec) && cbm_mem_charged() > cbm_mem_budget() / 2 &&
+                cbm_mem_system_under_pressure()) {
+                pp_spill_enter(ec, "system_pressure");
+                (void)pp_spill_sweep(ec, worker_id);
+            }
             bool settling = false;
             if (over) {
                 /* Admission control, first response: park what can be parked.
@@ -1173,6 +1187,28 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
              * naming the lines helps nobody; see parse_unusable in cbm.h. */
             pp_err_add(errs, fi->rel_path, result->error_ranges ? result->error_ranges : "unknown",
                        result->parse_unusable ? "parse_unusable" : "parse_partial");
+        }
+        /* A truncated walk is a coverage gap like a partial parse, and until now
+         * it was the only one we kept to ourselves: result->walk_truncated was
+         * set and never read by anything, so a file the walk abandoned halfway
+         * was reported as fully indexed. Say how far it got — "walked 812k of
+         * 3.4M nodes" is the difference between a graph with a known hole and a
+         * graph that quietly lies about its coverage. Independent of the
+         * branches above: a truncated walk is not a parse error. */
+        if (result->walk_truncated) {
+            char how_far[CBM_SZ_64];
+            snprintf(how_far, sizeof(how_far), "%u/%u nodes walked", result->walk_nodes_visited,
+                     result->tree_nodes);
+            pp_err_add(errs, fi->rel_path, how_far, "walk_truncated");
+        } else if (result->lsp_skipped) {
+            /* Indexed, but without the per-file and cross-file LSP refinement:
+             * the same kind of hole from the other direction. Nothing in
+             * production sets this any more except a truncated walk (handled
+             * above) and the test seam — it is reported anyway, so that if
+             * something sets it again the gap arrives named, not silent. */
+            char size_text[CBM_SZ_64];
+            snprintf(size_text, sizeof(size_text), "%u nodes", result->tree_nodes);
+            pp_err_add(errs, fi->rel_path, size_text, "lsp_skipped");
         }
 
         /* Create definition nodes in local gbuf */
@@ -1532,8 +1568,11 @@ int cbm_parallel_extract(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, 
 /* ── Phase 3B: Serial Registry Build ─────────────────────────────── */
 
 /* Register one definition and create DEFINES + DEFINES_METHOD edges. Returns edge count. */
-static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const char *rel,
-                                 int *reg_entries) {
+/* `file_node_id` is the defining file's node id (0 when it has none), looked up
+ * once per file by the caller: computing the file QN and finding its node for
+ * every definition was 700 k allocations and lookups on the Go corpus. */
+static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+                                 int64_t file_node_id, int *reg_entries) {
     int edges = 0;
     if (!def->name || !def->qualified_name || !def->label) {
         return 0;
@@ -1544,14 +1583,11 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
         (*reg_entries)++;
     }
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
     const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
-    if (file_node && def_node) {
-        cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, def_node->id, "DEFINES", "{}");
+    if (file_node_id > 0 && def_node) {
+        cbm_gbuf_insert_edge(ctx->gbuf, file_node_id, def_node->id, "DEFINES", "{}");
         edges++;
     }
-    free(file_qn);
     if (def->parent_class && strcmp(def->label, "Method") == 0) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
         if (parent && def_node) {
@@ -1652,8 +1688,23 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             rels[i] = files[i].rel_path;
         }
     }
-    CBMHashTable *namespace_map =
-        cbm_pipeline_namespace_map_build(ctx->project_name, result_cache, rels, file_count);
+    /* Built from every file, including the ones already parked on disk: their
+     * results are NULL in result_cache, and a file absent from this map does
+     * not fail to resolve, it resolves through the looser fallback. Spilling
+     * therefore used to CHANGE the graph rather than merely delay it -- php
+     * measured 57,182 edges in memory against 59,379 while spilling, the same
+     * binary and corpus (2026-09-18), differing in both directions. */
+    const char **namespaces = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)file_count * sizeof(char *));
+    CBMHashTable *namespace_map = NULL;
+    if (namespaces) {
+        for (int i = 0; i < file_count; i++) {
+            namespaces[i] = result_cache[i] ? result_cache[i]->namespace_name
+                                            : cbm_result_spill_namespace(ctx->spill, i);
+        }
+        namespace_map =
+            cbm_pipeline_namespace_map_build_names(ctx->project_name, namespaces, rels, file_count);
+        cbm_free(CBM_MEM_CLASS_OTHER, namespaces);
+    }
     free(rels);
 
     for (int i = 0; i < file_count; i++) {
@@ -1675,8 +1726,15 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         const char *rel = files[i].rel_path;
 
         /* Register callable symbols + DEFINES/DEFINES_METHOD edges */
-        for (int d = 0; d < result->defs.count; d++) {
-            defines_edges += register_and_link_def(ctx, &result->defs.items[d], rel, &reg_entries);
+        if (result->defs.count > 0) {
+            char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
+            const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
+            int64_t file_node_id = file_node ? file_node->id : 0;
+            free(file_qn);
+            for (int d = 0; d < result->defs.count; d++) {
+                defines_edges +=
+                    register_and_link_def(ctx, &result->defs.items[d], file_node_id, &reg_entries);
+            }
         }
 
         imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
@@ -2415,6 +2473,36 @@ static void emit_service_edge(cbm_gbuf_t *gbuf, const cbm_gbuf_node_t *source,
 }
 
 /* Find the source node for an edge: enclosing function or file node. */
+/* This worker's last file-node answer. The graph buffer is read-only for the
+ * whole of phase 4 and a file's rel_path pointer is stable within it, so the
+ * pair identifies the answer; resolve_worker clears it at both ends so a later
+ * phase can never match a recycled address. Computing the file QN and looking
+ * it up ran for every call, usage, throw and read/write whose enclosing
+ * function is not a graph node of its own. */
+static CBM_TLS const cbm_gbuf_t *tl_file_node_gbuf;
+static CBM_TLS const char *tl_file_node_rel;
+static CBM_TLS const cbm_gbuf_node_t *tl_file_node;
+
+static void file_node_cache_clear(void) {
+    tl_file_node_gbuf = NULL;
+    tl_file_node_rel = NULL;
+    tl_file_node = NULL;
+}
+
+static const cbm_gbuf_node_t *file_node_for(const cbm_gbuf_t *gbuf, const char *project,
+                                            const char *rel) {
+    if (tl_file_node_gbuf == gbuf && tl_file_node_rel == rel) {
+        return tl_file_node;
+    }
+    char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
+    const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(gbuf, file_qn);
+    free(file_qn);
+    tl_file_node_gbuf = gbuf;
+    tl_file_node_rel = rel;
+    tl_file_node = node;
+    return node;
+}
+
 static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const char *project,
                                                const char *rel, const char *enclosing_qn) {
     const cbm_gbuf_node_t *src = NULL;
@@ -2428,9 +2516,7 @@ static const cbm_gbuf_node_t *find_source_node(const cbm_gbuf_t *gbuf, const cha
         }
     }
     if (!src) {
-        char *file_qn = cbm_pipeline_fqn_compute(project, rel, "__file__");
-        src = cbm_gbuf_find_by_qn(gbuf, file_qn);
-        free(file_qn);
+        src = file_node_for(gbuf, project, rel);
     }
     return src;
 }
@@ -3353,6 +3439,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
      * lookup after the first miss for each QN. Scoped to the worker's
      * lifetime in the parallel_resolve phase. */
     cbm_service_pattern_cache_begin();
+    cbm_pxc_thread_scratch_begin();
+    file_node_cache_clear();
 
     while (SKIP_ONE) {
         int file_idx =
@@ -3604,6 +3692,8 @@ static void resolve_worker(int worker_id, void *ctx_ptr) {
     cbm_destroy_thread_parser();
     cbm_slab_destroy_thread();
     cbm_service_pattern_cache_end();
+    cbm_pxc_thread_scratch_end();
+    file_node_cache_clear();
 }
 
 int cbm_parallel_resolve(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *files, int file_count,

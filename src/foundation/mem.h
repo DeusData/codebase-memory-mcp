@@ -50,6 +50,12 @@ cbm_mem_budget_t cbm_mem_resolve_budget(size_t total_ram, double ram_fraction,
 cbm_mem_budget_t cbm_mem_resolve_budget_capped(size_t total_ram, double ram_fraction,
                                                const char *budget_mb, size_t hard_cap_bytes);
 
+/* Reduce a budget derived from TOTAL ram to something the machine can actually
+ * spare right now, keeping a headroom reserve for the OS and other processes.
+ * `available` of 0 means the platform could not answer and the budget stands.
+ * Pure, so the policy is testable without a machine in a particular state. */
+size_t cbm_mem_clamp_to_available(size_t budget, size_t available);
+
 /* Current RSS in bytes via mi_process_info().
  * Falls back to OS-specific queries when MI_OVERRIDE=0 (ASan builds). */
 size_t cbm_mem_rss(void);
@@ -89,6 +95,12 @@ void cbm_mem_set_budget_for_tests(size_t bytes);
 
 /* Returns true if current RSS exceeds the budget. */
 bool cbm_mem_over_budget(void);
+
+/* True when memory should be handed back NOW: our budget is exceeded, or the
+ * machine itself is short. Use this for spill/reclaim decisions; use
+ * cbm_mem_over_budget() for the decision to stop a run. System pressure must
+ * relieve, never abort — the spike may not even be ours. */
+bool cbm_mem_should_relieve(void);
 
 /* Per-worker budget hint: budget / num_workers. */
 size_t cbm_mem_worker_budget(int num_workers);
@@ -259,6 +271,12 @@ void cbm_mem_phase_reset(void);
 /* True when CBM_MEM_PHASES=1 turned phase attribution on for this process.
  * Instruments that walk large structures (the result census) gate on it. */
 bool cbm_mem_phases_enabled(void);
+
+/* CBM_MEM_ALLOCATOR_STATS=1: write the allocator's own reserved / committed /
+ * purged table into the log at `tag`. The worker leaves through _Exit, so
+ * mimalloc's at-exit statistics never appear; this is the way to see them.
+ * Inert unless the variable is set. */
+void cbm_mem_allocator_stats_log(const char *tag);
 
 /* Write the phase table as a JSON array of {label, bytes, hits}, biggest total
  * first. Returns bytes written (0 when disabled or empty). */

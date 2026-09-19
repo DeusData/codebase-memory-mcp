@@ -14,11 +14,16 @@
 
 enum { DEFAULT_CORES = 1, MIN_WORKERS = 1, CBM_WORKERS_MAX = 256 };
 #include "foundation/log.h"
+#include "foundation/mem_core.h" /* cbm_alloc: one accounted allocation path */
 #include "foundation/platform.h"
 #include "foundation/system_info_internal.h"
 #include <stdint.h> // uint64_t
 #include <stdlib.h> // strtol
 #include <string.h>
+
+#ifndef _WIN32
+#include <sys/statvfs.h> /* cbm_fs_free_bytes: free space before we spill into it */
+#endif
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -364,5 +369,43 @@ size_t cbm_system_available_ram(void) {
     return available;
 #else
     return 0; /* BSD: unknown rather than guessed */
+#endif
+}
+
+size_t cbm_fs_free_bytes(const char *path) {
+    if (!path || !path[0]) {
+        return 0;
+    }
+#ifdef _WIN32
+    /* The QUOTA figure, not the volume's: on a disk with per-user quotas the
+     * volume's free space is not what this process may actually write. */
+    ULARGE_INTEGER avail = {0};
+    /* Widened through the memory core rather than cbm_utf8_to_wide(), which
+     * allocates with raw malloc: every allocation in this binary goes through
+     * one accounted path (src/foundation/mem_core.h). */
+    int wide_len = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, NULL, 0);
+    if (wide_len <= 0) {
+        return 0;
+    }
+    wchar_t *wide = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)wide_len * sizeof(wchar_t));
+    if (!wide) {
+        return 0;
+    }
+    size_t free_bytes = 0;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, wide_len) == wide_len &&
+        GetDiskFreeSpaceExW(wide, &avail, NULL, NULL)) {
+        free_bytes = (size_t)avail.QuadPart;
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, wide);
+    return free_bytes;
+#else
+    struct statvfs st;
+    if (statvfs(path, &st) != 0) {
+        return 0;
+    }
+    /* f_bavail, not f_bfree: blocks free for an UNPRIVILEGED writer, which is
+     * what this process is. f_frsize is the fragment size the counts are in. */
+    uint64_t unit = st.f_frsize ? (uint64_t)st.f_frsize : (uint64_t)st.f_bsize;
+    return (size_t)((uint64_t)st.f_bavail * unit);
 #endif
 }
