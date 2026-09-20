@@ -19,6 +19,7 @@
 #include "daemon/runtime.h"
 #include "daemon/version_cohort.h"
 #include "foundation/compat.h"
+#include "foundation/compat_fs.h"
 #include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "foundation/log.h"
@@ -2600,12 +2601,8 @@ int cbm_remove_zed_mcp_owned(const char *binary_path, const char *config_path) {
 /* ── Agent detection ──────────────────────────────────────────── */
 
 static bool dir_exists(const char *path) {
-    struct stat st;
-#ifndef _WIN32
-    return lstat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#else
-    return stat(path, &st) == 0 && S_ISDIR(st.st_mode);
-#endif
+    cbm_path_info_t info = {0};
+    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK && info.is_directory;
 }
 
 /* Resolve the Claude Code config dir.
