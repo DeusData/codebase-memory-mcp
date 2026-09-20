@@ -4017,7 +4017,6 @@ TEST(solidity_modifier_decorator) {
     PASS();
 }
 
-
 /* ── ArkTS (HarmonyOS .ets) ─────────────────────────────────────── */
 
 TEST(arkts_component_struct) {
