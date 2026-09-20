@@ -522,8 +522,8 @@ bool cbm_workspace_grant_add(const char *cache_dir, const char *home_dir,
 }
 
 bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir,
-                                const char *cache_dir, const char *configured_root, char *err,
-                                size_t err_sz) {
+                                const char *cache_dir, const char *configured_root,
+                                const char *allow_broad_root, char *err, size_t err_sz) {
     if (err && err_sz) {
         err[0] = '\0';
     }
@@ -579,9 +579,22 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
         return true;
     }
     /* An explicit human approval recorded for exactly this path is the only thing
-     * that lifts a sensitive refusal. Absolute and shallow refusals cannot be
-     * lifted at all. */
+     * that lifts a sensitive refusal. Absolute refusals cannot be lifted at all. */
     if (verdict == CBM_WS_DENY_SENSITIVE && match.exact_sensitive) {
+        return true;
+    }
+    /* PATH_ALLOW_BROAD is a separate, narrower lever from the grant store above:
+     * an operator has named this exact root as one they have deliberately chosen
+     * to index whole, accepting that it may span multiple unrelated projects --
+     * the tradeoff CBM_WS_DENY_TOO_SHALLOW normally refuses on their behalf. It
+     * must match canonical_path exactly, the same way an exact sensitive grant
+     * does above: a prefix match would let one broad allowance quietly cover
+     * every root below it too, which is the "/Users"-style breadth this rule
+     * exists to catch. It is environment, not a recorded grant, so it is not
+     * listed by cbm_workspace_grant_list and cannot lift CBM_WS_DENY_ABSOLUTE or
+     * CBM_WS_DENY_SENSITIVE. */
+    if (verdict == CBM_WS_DENY_TOO_SHALLOW && allow_broad_root && allow_broad_root[0] &&
+        ws_paths_equal(canonical_path, allow_broad_root)) {
         return true;
     }
     if (err) {
@@ -589,6 +602,13 @@ bool cbm_workspace_root_allowed(const char *canonical_path, const char *home_dir
             snprintf(err, err_sz,
                      "%s: %s. To index it anyway, run: codebase-memory-mcp allow-root "
                      "--approve-sensitive %s",
+                     canonical_path, cbm_workspace_verdict_reason(verdict), canonical_path);
+        } else if (verdict == CBM_WS_DENY_TOO_SHALLOW) {
+            /* No allow-root command exists for this one -- the grant store is a
+             * human-approved list of real project roots, and this path is being
+             * refused for being the opposite of that. PATH_ALLOW_BROAD is the
+             * deliberate, narrower escape hatch: set it to this exact path. */
+            snprintf(err, err_sz, "%s: %s. To index it anyway, set PATH_ALLOW_BROAD=%s",
                      canonical_path, cbm_workspace_verdict_reason(verdict), canonical_path);
         } else {
             snprintf(err, err_sz, "%s: %s", canonical_path, cbm_workspace_verdict_reason(verdict));
