@@ -350,7 +350,9 @@ _cli._publish_runtime_set(
                 (directory / binary_name).write_text("corrupt:old")
                 (staged / binary_name).write_text("binary:candidate")
                 environment = os.environ.copy()
-                environment["PYTHONPYCACHEPREFIX"] = str(root_path / "pycache")
+                # A fresh pycache prefix forces every stdlib import to write
+                # bytecode on a cold Windows runner before reaching the gate.
+                environment["PYTHONDONTWRITEBYTECODE"] = "1"
                 process = subprocess.Popen(
                     [
                         sys.executable,
@@ -368,7 +370,9 @@ _cli._publish_runtime_set(
                     env=environment,
                 )
                 try:
-                    deadline = time.monotonic() + 10
+                    # This bounds helper startup, not publication correctness: the
+                    # crash must still occur at the exact post-rename marker.
+                    deadline = time.monotonic() + 60
                     while not marker.exists() and time.monotonic() < deadline:
                         if process.poll() is not None:
                             stderr = process.communicate()[1]

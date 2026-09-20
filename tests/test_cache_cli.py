@@ -2,6 +2,7 @@
 
 Run: python3 tests/test_cache_cli.py build/c/codebase-memory-mcp
 """
+from contextlib import closing
 import errno
 import hashlib
 import json
@@ -21,8 +22,25 @@ BINARY = str(Path(sys.argv.pop(1)).resolve()) if len(sys.argv) > 1 else str(
 
 
 class CacheCLI(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Use the same trusted roots as scripts/test-runtime.sh. macOS's
+        # default TMPDIR is too deep for Unix sockets; Windows runner TEMP
+        # inherits shared ACLs that the product correctly rejects.
+        cls.temp_parent = "/private/tmp" if sys.platform == "darwin" else None
+        if os.name == "nt":
+            helper = Path(__file__).resolve().parents[1] / "scripts/ci/new-protected-temp-root.ps1"
+            result = subprocess.run(
+                ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(helper), "-Prefix", "cbm-cache-cli-"],
+                check=True, capture_output=True, text=True, timeout=30)
+            cls.temp_parent = result.stdout.strip()
+            if not cls.temp_parent or not Path(cls.temp_parent).is_dir():
+                raise RuntimeError(f"Invalid protected temp root: {result.stdout!r}")
+            cls.addClassCleanup(shutil.rmtree, cls.temp_parent)
+
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="cbm-cache-cli-")
+        self.temp = tempfile.TemporaryDirectory(prefix="cbmc-", dir=self.temp_parent)
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.cache = self.root / "cache"
@@ -37,7 +55,7 @@ class CacheCLI(unittest.TestCase):
                         CBM_RUNTIME_DIR=str(blocked_runtime))
         self.env.pop("CBM_TEST_DAEMON_RUNTIME_PARENT", None)
         for name, root in (("live", self.source), ("gone", self.root / "gone")):
-            with sqlite3.connect(self.cache / f"{name}.db") as db:
+            with closing(sqlite3.connect(self.cache / f"{name}.db")) as db, db:
                 db.execute("CREATE TABLE projects(name TEXT, root_path TEXT, indexed_at TEXT)")
                 db.execute("INSERT INTO projects VALUES(?,?,?)",
                            (name, str(root), "2020-01-01T00:00:00Z"))
@@ -198,7 +216,7 @@ class CacheCLI(unittest.TestCase):
 
     def test_wal_inspection_never_creates_shm_or_reads_stale_metadata(self):
         seed = self.root / "seed.db"
-        with sqlite3.connect(seed) as db:
+        with closing(sqlite3.connect(seed)) as db, db:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA wal_autocheckpoint=0")
             db.execute("CREATE TABLE projects(name TEXT, root_path TEXT, indexed_at TEXT)")
@@ -231,7 +249,7 @@ class CacheCLI(unittest.TestCase):
         runtime = self.root / "runtime"
         runtime.mkdir(mode=0o700)
         self.env["CBM_RUNTIME_DIR"] = str(runtime)
-        with sqlite3.connect(self.cache / "gone.db") as db:
+        with closing(sqlite3.connect(self.cache / "gone.db")) as db, db:
             db.execute("CREATE TABLE project_summaries(project TEXT, summary TEXT)")
             db.execute("INSERT INTO project_summaries VALUES('gone', 'keep my ADR')")
         before = self.snapshot()
@@ -249,12 +267,12 @@ class CacheCLI(unittest.TestCase):
     def test_non_directory_and_unresolved_roots_are_not_missing(self):
         not_directory = self.root / "root-file"
         not_directory.write_text("not a source directory")
-        with sqlite3.connect(self.cache / "gone.db") as db:
+        with closing(sqlite3.connect(self.cache / "gone.db")) as db, db:
             db.execute("UPDATE projects SET root_path=?", (str(not_directory),))
         if os.name != "nt":
             unresolved = self.root / "unresolved-root"
             unresolved.symlink_to(self.root / "unmounted")
-            with sqlite3.connect(self.cache / "live.db") as db:
+            with closing(sqlite3.connect(self.cache / "live.db")) as db, db:
                 db.execute("UPDATE projects SET root_path=?", (str(unresolved),))
         before = self.snapshot()
         preview = self.run_cache("prune", "--missing-root", "--dry-run")
