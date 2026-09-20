@@ -792,6 +792,8 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 
 ## Troubleshooting
 
+Windows users: see [Windows troubleshooting](docs/WINDOWS_TROUBLESHOOTING.md) for versioned known issues and workarounds.
+
 | Problem | Fix |
 |---------|-----|
 | `/mcp` doesn't show the server | Check `.mcp.json` path is absolute. Restart agent. Test: `echo '{}' \| /path/to/binary` should output JSON. |
