@@ -12,6 +12,26 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# This contract reads REPOSITORY metadata (.gitattributes, through git's own
+# attribute matcher). The Linux container leg mounts the WORKING TREE only, and
+# a git worktree's .git is a file pointing at the host's main repository, which
+# is not inside the container — so `git ls-files` cannot run there at all
+# (verified 2026-09-17: `fatal: not a git repository`). The property is
+# platform-independent and stays gated in every venue that has the metadata:
+# the macOS host leg, the Windows VM (a real checkout at C:\cbm — 117 files
+# checked there), and every hosted-CI checkout.
+# Tried and rejected: mounting the host .git into the container — the worktree
+# gitdir path would have to be reproduced inside, and container-root writes to
+# the host repository are worse than a scoped skip; and matching .gitattributes
+# patterns ourselves, which is a partial copy of git's attribute semantics and
+# so a false-green risk. tests/test_version_metadata_contract.sh guards the
+# same way for the same reason.
+if ! git rev-parse --git-dir >/dev/null 2>&1; then
+    echo "SKIP: no repository metadata in this checkout (working tree without" \
+        "its git dir) — the line-ending contract gates on the host leg and CI"
+    exit 0
+fi
+
 failures=0
 checked=0
 while IFS= read -r -d '' path &&

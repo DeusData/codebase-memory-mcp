@@ -1775,7 +1775,8 @@ static bool rpc_is_allowed_for_ui(const char *body, size_t body_len) {
     const char *name_text = yyjson_is_str(name) ? yyjson_get_str(name) : NULL;
     bool allowed =
         method_text && strcmp(method_text, "tools/call") == 0 && name_text &&
-        (strcmp(name_text, "list_projects") == 0 || strcmp(name_text, "get_code_snippet") == 0);
+        (strcmp(name_text, "list_projects") == 0 || strcmp(name_text, "get_graph_schema") == 0 ||
+         strcmp(name_text, "get_code_snippet") == 0);
     yyjson_doc_free(document);
     return allowed;
 }

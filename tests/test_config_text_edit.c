@@ -2,6 +2,8 @@
  * test_config_text_edit.c — Hardened managed-text editor contracts.
  */
 #include "../src/cli/config_text_edit.h"
+#define CBM_CONFIG_EDIT_PATH_ENABLE_TEST_API 1
+#include "../src/cli/config_edit_path.h"
 #include "test_framework.h"
 #include "test_helpers.h"
 
@@ -384,8 +386,16 @@ TEST(config_text_rejects_links_privileged_mode_and_preserves_metadata) {
     ASSERT(snprintf(alias, sizeof(alias), "%s/alias.md", dir) > 0);
     ASSERT_EQ(th_write_file(target, "target\n"), 0);
     ASSERT_EQ(symlink(target, path), 0);
-    ASSERT_EQ(cbm_text_write_owned_document(path, "owned\n"), -1);
-    ASSERT_EQ(cbm_text_migrate_owned_document_mode(path, "owned\n", NULL, 0U, 0755U), -1);
+    /* Foreign-owned link (observer moved by the test seam): still refused. */
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(dir), 0);
+    cbm_config_edit_path_set_invoking_uid_for_test((unsigned)geteuid() + 1U, 1);
+    int foreign_write_rc = cbm_text_write_owned_document(path, "owned\n");
+    int foreign_migrate_rc = cbm_text_migrate_owned_document_mode(path, "owned\n", NULL, 0U, 0755U);
+    cbm_config_edit_path_set_invoking_uid_for_test(0U, 0);
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(foreign_write_rc, -1);
+    ASSERT_EQ(foreign_migrate_rc, -1);
+    ASSERT(cte_assert_bytes(target, "target\n", strlen("target\n")));
     ASSERT_EQ(cbm_unlink(path), 0);
 
     ASSERT_EQ(th_write_file(path, "shared\n"), 0);
@@ -409,6 +419,65 @@ TEST(config_text_rejects_links_privileged_mode_and_preserves_metadata) {
     ASSERT_EQ(after.st_mode & 0777U, before.st_mode & 0777U);
     ASSERT_EQ(after.st_uid, before.st_uid);
     ASSERT_EQ(after.st_gid, before.st_gid);
+    ASSERT_EQ(cte_temp_count(dir), 0U);
+    th_cleanup(dir);
+    PASS();
+}
+
+/* Decision C (#1954): a managed block behind a user-owned symlink is edited
+ * through the link — the link survives and the target carries the same bytes
+ * the same edit produces on a plain file. */
+TEST(config_text_follows_user_owned_symlink_in_place) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char target[CTE_PATH_CAP];
+    char control[CTE_PATH_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT(snprintf(target, sizeof(target), "%s/target.md", dir) > 0);
+    ASSERT(snprintf(control, sizeof(control), "%s/control.md", dir) > 0);
+    ASSERT_EQ(th_write_file(target, "# user notes\n"), 0);
+    ASSERT_EQ(th_write_file(control, "# user notes\n"), 0);
+    ASSERT_EQ(symlink("target.md", path), 0);
+    ASSERT_EQ(cbm_config_edit_path_follow_add_root(dir), 0);
+
+    int through_rc = cbm_text_upsert_managed_block(path, CTE_BEGIN, CTE_END, "owned");
+    int plain_rc = cbm_text_upsert_managed_block(control, CTE_BEGIN, CTE_END, "owned");
+    if (through_rc != 0 || plain_rc != 0) {
+        cbm_config_edit_path_follow_clear();
+    }
+    ASSERT_EQ(through_rc, 0);
+    ASSERT_EQ(plain_rc, 0);
+    struct stat link_state;
+    ASSERT_EQ(lstat(path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    size_t through_len = 0U;
+    size_t plain_len = 0U;
+    char *through = cte_read_bytes(target, &through_len);
+    char *plain = cte_read_bytes(control, &plain_len);
+    ASSERT_NOT_NULL(through);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_EQ(through_len, plain_len);
+    ASSERT_EQ(memcmp(through, plain, plain_len), 0);
+    ASSERT_NOT_NULL(strstr(through, "owned"));
+    free(through);
+    free(plain);
+
+    int through_remove_rc = cbm_text_remove_managed_block(path, CTE_BEGIN, CTE_END);
+    int plain_remove_rc = cbm_text_remove_managed_block(control, CTE_BEGIN, CTE_END);
+    cbm_config_edit_path_follow_clear();
+    ASSERT_EQ(through_remove_rc, 0);
+    ASSERT_EQ(plain_remove_rc, 0);
+    ASSERT_EQ(lstat(path, &link_state), 0);
+    ASSERT(S_ISLNK(link_state.st_mode));
+    through = cte_read_bytes(target, &through_len);
+    plain = cte_read_bytes(control, &plain_len);
+    ASSERT_NOT_NULL(through);
+    ASSERT_NOT_NULL(plain);
+    ASSERT_EQ(through_len, plain_len);
+    ASSERT_EQ(memcmp(through, plain, plain_len), 0);
+    ASSERT_NULL(strstr(through, "owned"));
+    free(through);
+    free(plain);
     ASSERT_EQ(cte_temp_count(dir), 0U);
     th_cleanup(dir);
     PASS();
@@ -670,6 +739,7 @@ SUITE(config_text_edit) {
     RUN_TEST(config_text_rejects_non_regular_paths);
 #ifndef _WIN32
     RUN_TEST(config_text_rejects_links_privileged_mode_and_preserves_metadata);
+    RUN_TEST(config_text_follows_user_owned_symlink_in_place);
     RUN_TEST(config_text_owned_document_mode_publishes_exact_bytes_atomically);
     RUN_TEST(config_text_owned_document_mode_rejects_prepublish_replacement);
     RUN_TEST(config_text_owned_document_mode_rejects_closed_temp_replacement);

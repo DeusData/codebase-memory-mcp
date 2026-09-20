@@ -10,9 +10,14 @@
 #
 # Usage: scripts/memlab.sh <binary> [requests] [label]
 #
-# Output: memlab-<label>.jsonl  (profiler records, one block per sample)
+# <binary> must be the waste-sanitizer flavour (make -f Makefile.cbm cbm
+# MEMWASTE=1 BUILD_DIR=build/memwaste): the attribution comes from its event
+# layer, which observes every allocation on Linux, macOS and Windows alike.
+#
+# Output: memlab-<label>.jsonl  (a waste-layer dump at every request-stage phase mark)
 #         memlab-<label>.log    (daemon log with mem.census lines)
-# Analyse with: scripts/memlab-report.py memlab-<label>.jsonl --census memlab-<label>.log
+# Analyse with: scripts/memlab-report.py memlab-<label>.jsonl --census memlab-<label>.log \
+#                   --binary <binary>
 set -u
 
 BINARY="${1:?usage: memlab.sh <binary> [requests] [label]}"
@@ -115,8 +120,13 @@ if command -v cygpath >/dev/null 2>&1 && ! command -v winepath >/dev/null 2>&1; 
 else
     export CBM_CACHE_DIR="$WORK/cache"
 fi
-export CBM_MEM_PROFILE=1
-export CBM_MEM_PROFILE_OUT="$PROFILE_OUT"
+export CBM_MEMWASTE=1
+export CBM_MEMWASTE_OUT="$PROFILE_OUT"
+# The server marks a memory phase at every request stage, and the layer dumps
+# at each mark: live bytes per site become a series over identical requests. The
+# series needs neither the fill scan nor the duplicate hash, which only cost time.
+export CBM_MEMWASTE_FILL=0
+export CBM_MEMWASTE_DUPES=0
 export CBM_MEM_CENSUS=1
 export CBM_LOG_LEVEL=info
 export CBM_LOG_FORMAT=text
@@ -155,9 +165,8 @@ if [ "$CENSUS" -eq 0 ]; then
     echo "WARN: no census samples — check CBM_MEM_CENSUS wiring" >&2
 fi
 if [ "$SITES" -eq 0 ]; then
-    # Not fatal, but never silent: on macOS there is no --wrap, so the
-    # profiler legitimately has no observation point.
-    echo "WARN: no profiler records — expected on macOS (no --wrap); a gap anywhere else" >&2
+    # Never silent: an empty dump means the binary is not the memwaste flavour.
+    echo "WARN: no waste-layer records -- is $BINARY built with MEMWASTE=1?" >&2
 fi
 echo "profile: $PROFILE_OUT"
 echo "log:     $RUN_LOG"

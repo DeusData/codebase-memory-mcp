@@ -15,6 +15,8 @@
 //   - Varints: 1-9 bytes, big-endian, MSB continuation
 
 #include "sqlite_writer.h"
+#include "foundation/arena.h"  /* index-cell arena */
+#include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/constants.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -301,29 +303,37 @@ typedef struct {
     uint8_t *data;
     int len;
     int cap;
+    bool heap; /* data is malloc-owned; otherwise it is the caller's inline space */
 } DynBuf;
 
-static void dynbuf_init(DynBuf *b) {
-    b->data = NULL;
+/* Start on caller-provided space (a record builder's stack array). Growth past
+ * it moves to the heap once; a buffer that never outgrows it never allocates. */
+static void dynbuf_init_inline(DynBuf *b, uint8_t *space, int cap) {
+    b->data = space;
     b->len = 0;
-    b->cap = 0;
+    b->cap = cap;
+    b->heap = false;
 }
 
 static bool dynbuf_ensure(DynBuf *b, int needed) {
     if (b->len + needed <= b->cap) {
         return true;
     }
-    int newcap = b->cap == 0 ? INITIAL_PAGE_CAP : b->cap;
+    int newcap = b->cap < INITIAL_PAGE_CAP ? INITIAL_PAGE_CAP : b->cap;
     while (newcap < b->len + needed) {
         newcap *= GROWTH_FACTOR;
     }
-    uint8_t *p = (uint8_t *)realloc(b->data, newcap);
+    uint8_t *p = b->heap ? (uint8_t *)realloc(b->data, newcap) : (uint8_t *)malloc(newcap);
     if (!p) {
         (void)fprintf(stderr, "cbm_write_db: dynbuf realloc failed size=%d\n", newcap);
         return false;
     }
+    if (!b->heap && b->len > 0) {
+        memcpy(p, b->data, (size_t)b->len);
+    }
     b->data = p;
     b->cap = newcap;
+    b->heap = true;
     return true;
 }
 
@@ -343,22 +353,35 @@ static bool dynbuf_append(DynBuf *b, const void *data, int len) {
 }
 
 static void dynbuf_free(DynBuf *b) {
-    free(b->data);
+    if (b->heap) {
+        free(b->data);
+    }
     b->data = NULL;
     b->len = b->cap = 0;
+    b->heap = false;
 }
 
 // --- Record builder ---
 // Builds a SQLite record: header (header_len varint + serial types) + body (values)
 
+/* Inline space for one record. Every node, edge and index row used to allocate
+ * a 4 KB header buffer and a 4 KB body buffer and free both after copying a few
+ * dozen bytes out: the waste sanitizer measured 32 M allocations and ~126 GB of
+ * churn on the Go corpus, ~99 % of it never written (2026-09-17). A header is
+ * one serial type per column; a body is the row's text. Rows that do not fit
+ * (long property JSON) still grow onto the heap. */
+enum { REC_HEADER_INLINE = 64, REC_BODY_INLINE = 1536 };
+
 typedef struct {
     DynBuf header; // serial type varints
     DynBuf body;   // column values
+    uint8_t header_space[REC_HEADER_INLINE];
+    uint8_t body_space[REC_BODY_INLINE];
 } RecordBuilder;
 
 static void rec_init(RecordBuilder *r) {
-    dynbuf_init(&r->header);
-    dynbuf_init(&r->body);
+    dynbuf_init_inline(&r->header, r->header_space, REC_HEADER_INLINE);
+    dynbuf_init_inline(&r->body, r->body_space, REC_BODY_INLINE);
 }
 
 static void rec_free(RecordBuilder *r) {
@@ -408,8 +431,7 @@ static void rec_add_blob(RecordBuilder *r, const uint8_t *data, int len) {
 
 // Finalize: returns the complete record bytes (header_len + header + body).
 // Caller must free the returned buffer.
-static uint8_t *rec_finalize(RecordBuilder *r, int *out_len) {
-    *out_len = 0;
+static int rec_total_header(const RecordBuilder *r) {
     int header_content_len = r->header.len;
     int header_len_varint_len = varint_len(header_content_len + varint_len(header_content_len));
     // The header size varint includes itself, so we may need to iterate
@@ -420,18 +442,71 @@ static uint8_t *rec_finalize(RecordBuilder *r, int *out_len) {
         header_len_varint_len = recalc;
         total_header = header_len_varint_len + header_content_len;
     }
+    return total_header;
+}
 
-    int total = total_header + r->body.len;
+// Bytes rec_write produces: the record exactly as rec_finalize returns it.
+static int rec_payload_len(const RecordBuilder *r) {
+    return rec_total_header(r) + r->body.len;
+}
+
+// Write the record (header_len + header + body) at dst; returns its length.
+static int rec_write(const RecordBuilder *r, uint8_t *dst) {
+    int pos = put_varint(dst, rec_total_header(r));
+    memcpy(dst + pos, r->header.data, r->header.len);
+    pos += r->header.len;
+    memcpy(dst + pos, r->body.data, r->body.len);
+    return pos + r->body.len;
+}
+
+static uint8_t *rec_finalize(RecordBuilder *r, int *out_len) {
+    *out_len = 0;
+    int total = rec_payload_len(r);
     uint8_t *buf = (uint8_t *)malloc(total);
     if (!buf) {
         return NULL;
     }
-    int pos = put_varint(buf, total_header);
-    memcpy(buf + pos, r->header.data, header_content_len);
-    pos += header_content_len;
-    memcpy(buf + pos, r->body.data, r->body.len);
-    *out_len = total;
+    *out_len = rec_write(r, buf);
     return buf;
+}
+
+/* One index build's cells live in an arena: they are all released together
+ * once the B-tree is written, where a malloc + free per row was 12.1 M
+ * allocations on the Go corpus (waste sanitizer, 2026-09-17). The writer
+ * builds one index at a time on one thread; NULL = the malloc path, which the
+ * unit tests and any other caller keep. */
+enum { CELLS_ARENA_BLOCK = 1024 * 1024 };
+static CBM_TLS CBMArena *tl_cells_arena;
+
+static uint8_t *cells_alloc(size_t bytes) {
+    if (tl_cells_arena) {
+        return (uint8_t *)cbm_arena_alloc(tl_cells_arena, bytes);
+    }
+    return (uint8_t *)malloc(bytes);
+}
+
+static void cells_free(uint8_t *cell) {
+    if (!tl_cells_arena) {
+        free(cell);
+    }
+}
+
+// An index leaf cell, varint(payload_len) + record, written in place: building
+// the record first and copying it into the cell was a second allocation and a
+// copy for every index entry (16 M record buffers of pure churn on the Go
+// corpus, waste sanitizer 2026-09-17). Same bytes.
+static uint8_t *rec_finalize_index_cell(const RecordBuilder *r, int *out_len) {
+    *out_len = 0;
+    int payload_len = rec_payload_len(r);
+    int total = varint_len(payload_len) + payload_len;
+    uint8_t *cell = cells_alloc((size_t)total);
+    if (!cell) {
+        return NULL;
+    }
+    int pos = put_varint(cell, payload_len);
+    pos += rec_write(r, cell + pos);
+    *out_len = pos;
+    return cell;
 }
 
 // --- Page builder ---
@@ -460,6 +535,11 @@ typedef struct {
     PageRef *leaves;
     int leaf_count;
     int leaf_cap;
+
+    // One reusable buffer every table cell is assembled in before it is copied
+    // into the page (grows to the largest cell, freed by pb_free).
+    uint8_t *cell_buf;
+    int cell_cap;
 } PageBuilder;
 
 static void pb_init(PageBuilder *pb, FILE *fp, uint32_t start_page, bool is_index) {
@@ -475,6 +555,8 @@ static void pb_init(PageBuilder *pb, FILE *fp, uint32_t start_page, bool is_inde
     pb->leaves = NULL;
     pb->leaf_count = 0;
     pb->leaf_cap = 0;
+    pb->cell_buf = NULL;
+    pb->cell_cap = 0;
 }
 
 static void pb_free(PageBuilder *pb) {
@@ -484,6 +566,21 @@ static void pb_free(PageBuilder *pb) {
         }
         free(pb->leaves);
     }
+    free(pb->cell_buf);
+    pb->cell_buf = NULL;
+    pb->cell_cap = 0;
+}
+
+static uint8_t *pb_cell_scratch(PageBuilder *pb, int len) {
+    if (pb->cell_cap < len) {
+        uint8_t *grown = (uint8_t *)realloc(pb->cell_buf, (size_t)len);
+        if (!grown) {
+            return NULL;
+        }
+        pb->cell_buf = grown;
+        pb->cell_cap = len;
+    }
+    return pb->cell_buf;
 }
 
 // Flush current leaf page to file
@@ -736,74 +833,46 @@ static uint32_t pb_build_interior(PageBuilder *pb, bool is_index) {
 
 // Build a nodes table record: (id, project, label, name, qualified_name, file_path, start_line,
 // end_line, properties)
-static uint8_t *build_node_record(const CBMDumpNode *n, int *out_len) {
-    RecordBuilder r;
-    rec_init(&r);
-
-    rec_add_int(&r, n->id);
-    rec_add_text(&r, n->project);
-    rec_add_text(&r, n->label);
-    rec_add_text(&r, n->name);
-    rec_add_text(&r, n->qualified_name);
-    rec_add_text(&r, n->file_path ? n->file_path : "");
-    rec_add_int(&r, n->start_line);
-    rec_add_int(&r, n->end_line);
-    rec_add_text(&r, n->properties ? n->properties : "{}");
-
-    uint8_t *data = rec_finalize(&r, out_len);
-    rec_free(&r);
-    return data;
+static void fill_node_record(RecordBuilder *r, const CBMDumpNode *n) {
+    rec_add_int(r, n->id);
+    rec_add_text(r, n->project);
+    rec_add_text(r, n->label);
+    rec_add_text(r, n->name);
+    rec_add_text(r, n->qualified_name);
+    rec_add_text(r, n->file_path ? n->file_path : "");
+    rec_add_int(r, n->start_line);
+    rec_add_int(r, n->end_line);
+    rec_add_text(r, n->properties ? n->properties : "{}");
 }
 
 // Build an edges table record: (id, project, source_id, target_id, type, properties)
 // url_path_gen and local_name_gen are VIRTUAL generated columns — NOT stored in the record.
-static uint8_t *build_edge_record(const CBMDumpEdge *e, int *out_len) {
-    RecordBuilder r;
-    rec_init(&r);
-
-    rec_add_int(&r, e->id);
-    rec_add_text(&r, e->project);
-    rec_add_int(&r, e->source_id);
-    rec_add_int(&r, e->target_id);
-    rec_add_text(&r, e->type);
-    rec_add_text(&r, e->properties ? e->properties : "{}");
-
-    uint8_t *data = rec_finalize(&r, out_len);
-    rec_free(&r);
-    return data;
+static void fill_edge_record(RecordBuilder *r, const CBMDumpEdge *e) {
+    rec_add_int(r, e->id);
+    rec_add_text(r, e->project);
+    rec_add_int(r, e->source_id);
+    rec_add_int(r, e->target_id);
+    rec_add_text(r, e->type);
+    rec_add_text(r, e->properties ? e->properties : "{}");
 }
 
 // Build a node_vectors table record: (node_id, project, vector)
-// Includes node_id in the record body (same pattern as build_node_record).
-static uint8_t *build_vector_record(const CBMDumpVector *v, int *out_len) {
-    RecordBuilder r;
-    rec_init(&r);
-
-    rec_add_int(&r, v->node_id);
-    rec_add_text(&r, v->project);
-    rec_add_blob(&r, v->vector, v->vector_len);
-
-    uint8_t *data = rec_finalize(&r, out_len);
-    rec_free(&r);
-    return data;
+// Includes node_id in the record body (same pattern as the node record).
+static void fill_vector_record(RecordBuilder *r, const CBMDumpVector *v) {
+    rec_add_int(r, v->node_id);
+    rec_add_text(r, v->project);
+    rec_add_blob(r, v->vector, v->vector_len);
 }
 
 // Build a token_vectors table record: (id, project, token, vector, idf)
-static uint8_t *build_token_vec_record(const CBMDumpTokenVec *tv, int *out_len) {
-    RecordBuilder r;
-    rec_init(&r);
-
-    rec_add_int(&r, tv->id);
-    rec_add_text(&r, tv->project);
-    rec_add_text(&r, tv->token);
-    rec_add_blob(&r, tv->vector, tv->vector_len);
+static void fill_token_vec_record(RecordBuilder *r, const CBMDumpTokenVec *tv) {
+    rec_add_int(r, tv->id);
+    rec_add_text(r, tv->project);
+    rec_add_text(r, tv->token);
+    rec_add_blob(r, tv->vector, tv->vector_len);
     /* Store IDF as integer × 1000 for fixed-point (avoid float in record) */
     enum { IDF_FIXED_POINT_SCALE = 1000 };
-    rec_add_int(&r, (int64_t)(tv->idf * IDF_FIXED_POINT_SCALE));
-
-    uint8_t *data = rec_finalize(&r, out_len);
-    rec_free(&r);
-    return data;
+    rec_add_int(r, (int64_t)(tv->idf * IDF_FIXED_POINT_SCALE));
 }
 
 // Build a projects table record: (name, indexed_at, root_path)
@@ -924,27 +993,8 @@ static uint8_t *build_index_entry_2text_rowid(const char *col1, const char *col2
     rec_add_text(&r, col1);
     rec_add_text(&r, col2);
     rec_add_int(&r, rowid);
-    int payload_len = 0;
-    uint8_t *payload = rec_finalize(&r, &payload_len);
+    uint8_t *cell = rec_finalize_index_cell(&r, out_len);
     rec_free(&r);
-    if (!payload) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    // Index cell: varint(payload_len) + payload
-    int vl = varint_len(payload_len);
-    int total = vl + payload_len;
-    uint8_t *cell = (uint8_t *)malloc(total);
-    if (!cell) {
-        free(payload);
-        *out_len = 0;
-        return NULL;
-    }
-    int pos = put_varint(cell, payload_len);
-    memcpy(cell + pos, payload, payload_len);
-    free(payload);
-    *out_len = total;
     return cell;
 }
 
@@ -956,26 +1006,8 @@ static uint8_t *build_index_entry_int_text_rowid(int64_t val, const char *text, 
     rec_add_int(&r, val);
     rec_add_text(&r, text);
     rec_add_int(&r, rowid);
-    int payload_len = 0;
-    uint8_t *payload = rec_finalize(&r, &payload_len);
+    uint8_t *cell = rec_finalize_index_cell(&r, out_len);
     rec_free(&r);
-    if (!payload) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    int vl = varint_len(payload_len);
-    int total = vl + payload_len;
-    uint8_t *cell = (uint8_t *)malloc(total);
-    if (!cell) {
-        free(payload);
-        *out_len = 0;
-        return NULL;
-    }
-    int pos = put_varint(cell, payload_len);
-    memcpy(cell + pos, payload, payload_len);
-    free(payload);
-    *out_len = total;
     return cell;
 }
 
@@ -988,26 +1020,8 @@ static uint8_t *build_index_entry_text_int_text_rowid(const char *t1, int64_t va
     rec_add_int(&r, val);
     rec_add_text(&r, t2);
     rec_add_int(&r, rowid);
-    int payload_len = 0;
-    uint8_t *payload = rec_finalize(&r, &payload_len);
+    uint8_t *cell = rec_finalize_index_cell(&r, out_len);
     rec_free(&r);
-    if (!payload) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    int vl = varint_len(payload_len);
-    int total = vl + payload_len;
-    uint8_t *cell = (uint8_t *)malloc(total);
-    if (!cell) {
-        free(payload);
-        *out_len = 0;
-        return NULL;
-    }
-    int pos = put_varint(cell, payload_len);
-    memcpy(cell + pos, payload, payload_len);
-    free(payload);
-    *out_len = total;
     return cell;
 }
 
@@ -1023,26 +1037,8 @@ static uint8_t *build_index_entry_unique_2int_2text_rowid(int64_t v1, int64_t v2
     rec_add_text(&r, text);
     rec_add_text(&r, text2);
     rec_add_int(&r, rowid);
-    int payload_len = 0;
-    uint8_t *payload = rec_finalize(&r, &payload_len);
+    uint8_t *cell = rec_finalize_index_cell(&r, out_len);
     rec_free(&r);
-    if (!payload) {
-        *out_len = 0;
-        return NULL;
-    }
-
-    int vlen = varint_len(payload_len);
-    int total = vlen + payload_len;
-    uint8_t *cell = (uint8_t *)malloc(total);
-    if (!cell) {
-        free(payload);
-        *out_len = 0;
-        return NULL;
-    }
-    int pos = put_varint(cell, payload_len);
-    memcpy(cell + pos, payload, payload_len);
-    free(payload);
-    *out_len = total;
     return cell;
 }
 
@@ -1115,17 +1111,33 @@ static uint8_t *overflowize_index_cell(FILE *fp, uint32_t *next_page, uint8_t *c
     uint32_t first_ovfl =
         write_overflow_pages(fp, next_page, cell + vlen + local, (int)plen - local);
     int nlen = vlen + local + BTREE_PTR_SIZE;
-    uint8_t *data = (uint8_t *)malloc((size_t)nlen);
+    uint8_t *data = cells_alloc((size_t)nlen);
     if (!data) {
         return cell; /* fall back to the (broken) inline form on OOM */
     }
     memcpy(data, cell, (size_t)(vlen + local));
     put_u32(data + vlen + local, first_ovfl);
-    free(cell);
+    cells_free(cell);
     *cell_len = nlen;
     return data;
 }
 #define TABLE_OVERFLOW_MIN_LOCAL 8199
+
+// Put a finished table cell on the current leaf, flushing a full leaf first.
+static bool pb_place_table_cell(PageBuilder *pb, const uint8_t *cell, int cell_len,
+                                int64_t prev_rowid) {
+    if (!pb_cell_fits(pb, cell_len) && pb->cell_count > 0) {
+        if (!pb_ensure_leaf_cap(pb)) {
+            return false;
+        }
+        pb->leaves[pb->leaf_count].max_key = prev_rowid;
+        pb->leaves[pb->leaf_count].sep_cell = NULL;
+        pb->leaves[pb->leaf_count].sep_cell_len = 0;
+        pb_flush_leaf(pb);
+    }
+    pb_add_cell(pb, cell, cell_len);
+    return true;
+}
 
 // Add a table cell to the PageBuilder, flushing leaf pages as needed.
 // If the payload exceeds max_local, overflow pages are written and only the
@@ -1160,20 +1172,37 @@ static void pb_add_table_cell_with_flush(PageBuilder *pb, int64_t rowid, const u
     if (!cell) {
         return;
     }
-
-    if (!pb_cell_fits(pb, cell_len) && pb->cell_count > 0) {
-        if (!pb_ensure_leaf_cap(pb)) {
-            free(cell);
-            return;
-        }
-        pb->leaves[pb->leaf_count].max_key = prev_rowid;
-        pb->leaves[pb->leaf_count].sep_cell = NULL;
-        pb->leaves[pb->leaf_count].sep_cell_len = 0;
-        pb_flush_leaf(pb);
-    }
-
-    pb_add_cell(pb, cell, cell_len);
+    (void)pb_place_table_cell(pb, cell, cell_len, prev_rowid);
     free(cell);
+}
+
+// A table record written straight into the page builder's cell buffer: the
+// record builder's bytes go to the cell once, where rec_finalize +
+// build_table_cell allocated the record, allocated the cell, copied, and freed
+// both for every row. Same bytes; a record too large for the page takes the
+// overflow path unchanged. False only on allocation failure.
+static bool pb_add_table_record_with_flush(PageBuilder *pb, int64_t rowid, const RecordBuilder *r,
+                                           int64_t prev_rowid) {
+    int payload_len = rec_payload_len(r);
+    if (payload_len > TABLE_OVERFLOW_MAX_LOCAL) {
+        int rec_len = 0;
+        uint8_t *rec = rec_finalize((RecordBuilder *)r, &rec_len);
+        if (!rec) {
+            return false;
+        }
+        pb_add_table_cell_with_flush(pb, rowid, rec, rec_len, prev_rowid);
+        free(rec);
+        return true;
+    }
+    int total = varint_len(payload_len) + varint_len(rowid) + payload_len;
+    uint8_t *cell = pb_cell_scratch(pb, total);
+    if (!cell) {
+        return false;
+    }
+    int pos = put_varint(cell, payload_len);
+    pos += put_varint(cell + pos, rowid);
+    pos += rec_write(r, cell + pos);
+    return pb_place_table_cell(pb, cell, pos, prev_rowid);
 }
 
 // Finalize a table PageBuilder: flush last leaf and build interior pages.
@@ -1607,21 +1636,8 @@ static uint8_t *ecell_url_path(const CBMDumpEdge *e, int *out_len) {
         rec_add_null(&r);
     }
     rec_add_int(&r, e->id);
-    int payload_len = 0;
-    uint8_t *payload = rec_finalize(&r, &payload_len);
+    uint8_t *cell = rec_finalize_index_cell(&r, out_len);
     rec_free(&r);
-    int vlen = varint_len(payload_len);
-    int total = vlen + payload_len;
-    uint8_t *cell = (uint8_t *)malloc(total);
-    if (!cell) {
-        free(payload);
-        *out_len = 0;
-        return NULL;
-    }
-    int pos = put_varint(cell, payload_len);
-    memcpy(cell + pos, payload, payload_len);
-    free(payload);
-    *out_len = total;
     return cell;
 }
 
@@ -1636,19 +1652,21 @@ static uint32_t build_edge_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpEd
     }
     uint8_t **idx_cells = (uint8_t **)malloc(edge_count * sizeof(uint8_t *));
     int *idx_lens = (int *)malloc(edge_count * sizeof(int));
+    CBMArena cells;
+    cbm_arena_init_lazy(&cells, CELLS_ARENA_BLOCK);
     if (!idx_cells || !idx_lens) {
         free(perm);
         free(idx_cells);
         free(idx_lens);
         return 0;
     }
+    tl_cells_arena = &cells;
     for (int i = 0; i < edge_count; i++) {
         int si = perm[i];
         idx_cells[i] = cell_fn(&edges[si], &idx_lens[i]);
         if (!idx_cells[i]) {
-            for (int j = 0; j < i; j++) {
-                free(idx_cells[j]);
-            }
+            tl_cells_arena = NULL;
+            cbm_arena_destroy(&cells);
             free(idx_cells);
             free(idx_lens);
             free(perm);
@@ -1657,9 +1675,8 @@ static uint32_t build_edge_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpEd
     }
     free(perm);
     uint32_t root = write_index_btree(fp, next_page, idx_cells, idx_lens, edge_count);
-    for (int i = 0; i < edge_count; i++) {
-        free(idx_cells[i]);
-    }
+    tl_cells_arena = NULL;
+    cbm_arena_destroy(&cells);
     free(idx_cells);
     free(idx_lens);
     return root;
@@ -1691,20 +1708,22 @@ static uint32_t build_node_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpNo
     }
     uint8_t **idx_cells = (uint8_t **)malloc(node_count * sizeof(uint8_t *));
     int *idx_lens = (int *)malloc(node_count * sizeof(int));
+    CBMArena cells;
+    cbm_arena_init_lazy(&cells, CELLS_ARENA_BLOCK);
     if (!idx_cells || !idx_lens) {
         free(perm);
         free(idx_cells);
         free(idx_lens);
         return 0;
     }
+    tl_cells_arena = &cells;
     for (int i = 0; i < node_count; i++) {
         int si = perm[i];
         idx_cells[i] = build_index_entry_2text_rowid(nodes[si].project, col_fn(&nodes[si]),
                                                      nodes[si].id, &idx_lens[i]);
         if (!idx_cells[i]) {
-            for (int j = 0; j < i; j++) {
-                free(idx_cells[j]);
-            }
+            tl_cells_arena = NULL;
+            cbm_arena_destroy(&cells);
             free(idx_cells);
             free(idx_lens);
             free(perm);
@@ -1713,9 +1732,8 @@ static uint32_t build_node_index_sorted(FILE *fp, uint32_t *next_page, CBMDumpNo
     }
     free(perm);
     uint32_t root = write_index_btree(fp, next_page, idx_cells, idx_lens, node_count);
-    for (int i = 0; i < node_count; i++) {
-        free(idx_cells[i]);
-    }
+    tl_cells_arena = NULL;
+    cbm_arena_destroy(&cells);
     free(idx_cells);
     free(idx_lens);
     return root;
@@ -1796,13 +1814,13 @@ static int publish_writer_output(write_db_ctx_t *w) {
     return 0;
 }
 
-/* Callback type for building a record from an item at index i. */
-typedef uint8_t *(*build_record_fn)(const void *items, int i, int *out_len);
+/* Callback type for filling a record from an item at index i. */
+typedef void (*fill_record_fn)(RecordBuilder *r, const void *items, int i);
 typedef int64_t (*get_rowid_fn)(const void *items, int i);
 
 /* Write a streaming B-tree table from count items, or an empty table if count == 0. */
 static int write_one_table(write_db_ctx_t *w, uint32_t *root, const void *items, int count,
-                           build_record_fn build_rec, get_rowid_fn get_id) {
+                           fill_record_fn fill_rec, get_rowid_fn get_id) {
     if (count <= 0 || !items) {
         *root = write_table_btree(w->fp, &w->next_page, NULL, NULL, NULL, 0, false);
         return 0;
@@ -1810,15 +1828,17 @@ static int write_one_table(write_db_ctx_t *w, uint32_t *root, const void *items,
     PageBuilder pb;
     pb_init(&pb, w->fp, w->next_page, false);
     for (int i = 0; i < count; i++) {
-        int rec_len;
-        uint8_t *rec = build_rec(items, i, &rec_len);
-        if (!rec) {
-            return ERR_WRITE_FAILED;
-        }
+        RecordBuilder r;
+        rec_init(&r);
+        fill_rec(&r, items, i);
         int64_t rowid = get_id(items, i);
         int64_t prev_id = i > 0 ? get_id(items, i - SKIP_ONE) : 0;
-        pb_add_table_cell_with_flush(&pb, rowid, rec, rec_len, prev_id);
-        free(rec);
+        bool placed = pb_add_table_record_with_flush(&pb, rowid, &r, prev_id);
+        rec_free(&r);
+        if (!placed) {
+            pb_free(&pb);
+            return ERR_WRITE_FAILED;
+        }
     }
     *root = pb_finalize_table(&pb, &w->next_page, get_id(items, count - SKIP_ONE));
     return 0;
@@ -1826,20 +1846,20 @@ static int write_one_table(write_db_ctx_t *w, uint32_t *root, const void *items,
 
 /* Adapter functions for write_one_table (nodes are written via the streaming
  * PageBuilder in cbm_writer_append_nodes, so no node adapter is needed here). */
-static uint8_t *adapt_build_edge(const void *items, int i, int *out_len) {
-    return build_edge_record(&((const CBMDumpEdge *)items)[i], out_len);
+static void adapt_fill_edge(RecordBuilder *r, const void *items, int i) {
+    fill_edge_record(r, &((const CBMDumpEdge *)items)[i]);
 }
 static int64_t adapt_edge_id(const void *items, int i) {
     return ((const CBMDumpEdge *)items)[i].id;
 }
-static uint8_t *adapt_build_vector(const void *items, int i, int *out_len) {
-    return build_vector_record(&((const CBMDumpVector *)items)[i], out_len);
+static void adapt_fill_vector(RecordBuilder *r, const void *items, int i) {
+    fill_vector_record(r, &((const CBMDumpVector *)items)[i]);
 }
 static int64_t adapt_vector_id(const void *items, int i) {
     return ((const CBMDumpVector *)items)[i].node_id;
 }
-static uint8_t *adapt_build_token_vec(const void *items, int i, int *out_len) {
-    return build_token_vec_record(&((const CBMDumpTokenVec *)items)[i], out_len);
+static void adapt_fill_token_vec(RecordBuilder *r, const void *items, int i) {
+    fill_token_vec_record(r, &((const CBMDumpTokenVec *)items)[i]);
 }
 static int64_t adapt_token_vec_id(const void *items, int i) {
     return ((const CBMDumpTokenVec *)items)[i].id;
@@ -2066,17 +2086,17 @@ static int write_db_after_nodes(write_db_ctx_t *w, uint32_t nodes_root) {
     uint32_t vectors_root;
     uint32_t token_vecs_root;
     int rc =
-        write_one_table(w, &edges_root, w->edges, w->edge_count, adapt_build_edge, adapt_edge_id);
+        write_one_table(w, &edges_root, w->edges, w->edge_count, adapt_fill_edge, adapt_edge_id);
     if (rc != 0) {
         return discard_writer_output(w, rc);
     }
-    rc = write_one_table(w, &vectors_root, w->vectors, w->vector_count, adapt_build_vector,
+    rc = write_one_table(w, &vectors_root, w->vectors, w->vector_count, adapt_fill_vector,
                          adapt_vector_id);
     if (rc != 0) {
         return discard_writer_output(w, rc);
     }
     rc = write_one_table(w, &token_vecs_root, w->token_vecs, w->token_vec_count,
-                         adapt_build_token_vec, adapt_token_vec_id);
+                         adapt_fill_token_vec, adapt_token_vec_id);
     if (rc != 0) {
         return discard_writer_output(w, rc);
     }
@@ -2307,16 +2327,18 @@ int cbm_writer_append_nodes(cbm_db_writer_t *w, const CBMDumpNode *nodes, int co
         return w->err;
     }
     for (int i = 0; i < count; i++) {
-        int rec_len;
-        uint8_t *rec = build_node_record(&nodes[i], &rec_len);
-        if (!rec) {
+        RecordBuilder r;
+        rec_init(&r);
+        fill_node_record(&r, &nodes[i]);
+        /* prev_rowid is the previous node's id (0 for the very first), matching
+         * the one-shot write_one_table loop — so output is byte-identical. */
+        bool placed =
+            pb_add_table_record_with_flush(&w->nodes_pb, nodes[i].id, &r, w->last_node_rowid);
+        rec_free(&r);
+        if (!placed) {
             w->err = ERR_WRITE_FAILED;
             return w->err;
         }
-        /* prev_rowid is the previous node's id (0 for the very first), matching
-         * the one-shot write_one_table loop — so output is byte-identical. */
-        pb_add_table_cell_with_flush(&w->nodes_pb, nodes[i].id, rec, rec_len, w->last_node_rowid);
-        free(rec);
         w->last_node_rowid = nodes[i].id;
         w->node_rows_written++;
     }

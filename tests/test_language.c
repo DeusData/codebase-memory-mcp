@@ -97,6 +97,12 @@ TEST(lang_ext_razor) {
     ASSERT_EQ(cbm_language_for_extension(".razor"), CBM_LANG_CSHARP);
     PASS();
 }
+/* Razor Pages / MVC views were unmapped for the same reason .razor was, so an
+ * ASP.NET Core app's entire view layer was invisible to discovery. */
+TEST(lang_ext_cshtml) {
+    ASSERT_EQ(cbm_language_for_extension(".cshtml"), CBM_LANG_CSHARP);
+    PASS();
+}
 TEST(lang_ext_php) {
     ASSERT_EQ(cbm_language_for_extension(".php"), CBM_LANG_PHP);
     PASS();
@@ -632,6 +638,72 @@ static CBMLanguage disambiguate_cfc_content(const char *name, const char *conten
     CBMLanguage lang = cbm_disambiguate_cfc(path);
     remove(path);
     return lang;
+}
+
+/* ── .cls / .frm: VB6 vs Apex / ObjectScript / FORM (#721) ────────── */
+
+static bool write_probe_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    fputs(content, f);
+    fclose(f);
+    return true;
+}
+
+TEST(lang_cls_vb6_class_module_unsupported) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_vb6.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "VERSION 1.0 CLASS\r\nBEGIN\r\n  MultiUse = -1  'True\r\n"
+                                       "END\r\nAttribute VB_Name = \"Widget\"\r\n"
+                                       "Option Explicit\r\n\r\nPublic Sub Go()\r\nEnd Sub\r\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_cls_apex_stays_apex) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_apex.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "public with sharing class Widget {\n"
+                                       "  public void go() {}\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_APEX);
+    remove(path);
+    /* Unreadable file keeps the pre-existing owner. */
+    ASSERT_EQ(cbm_disambiguate_cls("/tmp/nonexistent_file_12345.cls"), CBM_LANG_APEX);
+    PASS();
+}
+
+TEST(lang_cls_objectscript_stays_objectscript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_udl.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "Class MyPkg.Widget Extends %RegisteredObject\n{\n\n"
+                                       "Method Go()\n{\n}\n\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_OBJECTSCRIPT_UDL);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_frm_vb6_form_unsupported) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_vb6.frm", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "VERSION 5.00\r\nBegin VB.Form Form1 \r\n"
+                                       "   Caption         =   \"Hi\"\r\nEnd\r\n"
+                                       "Attribute VB_Name = \"Form1\"\r\nOption Explicit\r\n"));
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_frm_form_stays_form) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_form.frm", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "Symbols x, y;\nLocal F = x + y;\nPrint;\n.end\n"));
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_FORM);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_frm("/tmp/nonexistent_file_12345.frm"), CBM_LANG_FORM);
+    PASS();
 }
 
 TEST(lang_cfc_tag_component) {
@@ -1206,6 +1278,7 @@ SUITE(language) {
     RUN_TEST(lang_ext_ixx);
     RUN_TEST(lang_ext_csharp);
     RUN_TEST(lang_ext_razor);
+    RUN_TEST(lang_ext_cshtml);
     RUN_TEST(lang_ext_php);
     RUN_TEST(lang_ext_lua);
     RUN_TEST(lang_ext_scala);
@@ -1344,6 +1417,11 @@ SUITE(language) {
     RUN_TEST(lang_cfc_tag_after_license_comment);
     RUN_TEST(lang_cfc_script_after_license_comment);
     RUN_TEST(lang_cfc_default_on_read_fail);
+    RUN_TEST(lang_cls_vb6_class_module_unsupported);
+    RUN_TEST(lang_cls_apex_stays_apex);
+    RUN_TEST(lang_cls_objectscript_stays_objectscript);
+    RUN_TEST(lang_frm_vb6_form_unsupported);
+    RUN_TEST(lang_frm_form_stays_form);
 
     /* Go test ports */
     /* New languages */

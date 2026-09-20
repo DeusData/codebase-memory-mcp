@@ -45,4 +45,10 @@ int cbm_daemon_application_busy_queue_waits_for_test(void);
 char *cbm_daemon_application_framable_response_for_test(char *response,
                                                         const cbm_jsonrpc_request_t *request);
 
+/* The job registry's index-argument equality: the running job's args against
+ * a request's. Exposed because the two repo_path spellings it folds - the
+ * session policy's native root and a handler's forward-slash one - only differ
+ * on Windows, while the fold itself runs on every platform. */
+bool cbm_daemon_application_index_args_equal_for_test(const char *left, const char *right);
+
 #endif /* CBM_DAEMON_APPLICATION_INTERNAL_H */

@@ -6,6 +6,8 @@
  *   cli <tool> <json>  Run a single tool call and print result
  *   --version       Print version and exit
  *   --help          Print usage and exit
+ *   cli --quiet     Show errors only; disable automatic terminal progress
+ *   cli --verbose   Include informational logs for one-shot commands
  *   --ui=true/false Enable/disable HTTP UI server (persisted)
  *   --port=N        Set HTTP UI port (persisted, default 9749)
  *   --tool-profile=analysis|scout  Expose a restricted agent tool surface
@@ -58,7 +60,15 @@ enum {
     MAIN_HOOK_NOTICE_INTERVAL_SECONDS = 900,
     MAIN_CLOSE_TIMEOUT_MS = 5000,
     MAIN_COORDINATION_CLEANUP_MS = 500,
-    PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
+    /* The watchdog only polls, so the STACK it needs is tiny — but on glibc the
+     * thread's static TLS block is carved out of this same allocation, and this
+     * image's TLS is ~50 KB. At the old 64 KB the request was almost entirely
+     * TLS, and when TLS grew past it the thread stopped being creatable at all:
+     * the worker then refused to index without containment and SIGKILLed its own
+     * group, reported everywhere as a bare "killed (signal 9)" (PR #2233).
+     * Sized to hold the TLS block AND a real stack; tests/
+     * test_thread_stack_tls_contract.sh keeps the two from converging again. */
+    PARENT_WATCHDOG_STACK_SIZE = 256 * CBM_SZ_1K,
 };
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
@@ -69,6 +79,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
+#include "foundation/mem_events.h"
 #include "foundation/profile.h"
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
@@ -76,6 +87,7 @@ enum {
 #ifdef _WIN32
 #include <shellapi.h> /* CommandLineToArgvW — not pulled in by windows.h under WIN32_LEAN_AND_MEAN */
 #include <io.h>
+#include <tlhelp32.h> /* CreateToolhelp32Snapshot — parent PID discovery for the parent-death watchdog */
 #endif
 #include "ui/http_server.h"
 #include "ui/embedded_assets.h"
@@ -388,7 +400,15 @@ static void signal_handler(int sig) {
  * otherwise linger forever blocked on stdin. POSIX has no portable "notify on
  * parent death" primitive (PR_SET_PDEATHSIG is Linux-only), so we poll getppid:
  * once the parent dies the process is reparented (ppid changes, typically to 1)
- * and we shut down. Windows is unaffected (job objects handle this) — #ifndef. */
+ * and we shut down.
+ *
+ * Windows used to be excluded here on the assumption that job objects cover it
+ * (#914 proved they do not): the KILL_ON_JOB_CLOSE job in subprocess.c only
+ * wraps processes CBM itself spawns. An MCP stdio server is spawned BY the
+ * client as its child, and Windows does not propagate parent termination to
+ * children, so the orphan lingers holding SQLite WAL read locks. The Windows
+ * branch below waits on a handle to the parent process instead — a signaled
+ * handle is exact (no PID-reuse window), so no polling of the PID is needed. */
 
 #ifndef _WIN32
 typedef struct {
@@ -440,10 +460,22 @@ static bool worker_prepare_process_group(void) {
  * identically — write() and _exit() rather than fprintf/exit, because this runs
  * after fork-sensitive setup and must not touch stdio locks or atexit handlers.
  */
-static void worker_containment_unavailable(void) {
-    static const char message[] =
-        "CBM index worker could not start: process-tree containment unavailable\n";
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+static void worker_containment_unavailable(const char *why) {
+    /* WHICH of the containment conditions failed, and the pids behind it. The
+     * bare sentence cost a full CI cycle and two emulated builds to attribute
+     * (PR #2233): every venue reported the same line, and the supervisor only
+     * ever sees `killed (signal 9)` because the refusal SIGKILLs its own group.
+     * snprintf into a local buffer touches no stdio lock and no atexit handler,
+     * so the fork-sensitivity contract above still holds. */
+    char message[256];
+    int n = snprintf(message, sizeof(message),
+                     "CBM index worker could not start: process-tree containment unavailable "
+                     "(%s; pid=%ld pgrp=%ld ppid=%ld)\n",
+                     why ? why : "unspecified", (long)getpid(), (long)getpgrp(), (long)getppid());
+    if (n > 0) {
+        (void)write(STDERR_FILENO, message,
+                    (size_t)n < sizeof(message) ? (size_t)n : sizeof(message) - 1);
+    }
     (void)kill(-getpid(), SIGKILL);
     _exit(EXIT_FAILURE);
 }
@@ -535,11 +567,121 @@ static bool client_start_parent_watchdog(pid_t initial_ppid) {
     }
     return true;
 }
+#else /* _WIN32 */
+/* Windows parent-death watchdog — the #914 half of the story.
+ *
+ * The KILL_ON_JOB_CLOSE job in subprocess.c only contains processes CBM
+ * spawns itself; a stdio MCP server is the CLIENT's child, and Windows never
+ * propagates a parent's termination to its children, so a force-killed client
+ * leaves the server lingering on stdin while pinning SQLite WAL read locks.
+ * There is no reparenting to poll for either — instead we open a handle to
+ * the parent at startup and wait on it: the kernel signals a process handle
+ * exactly once, when the process terminates, and the held handle pins the
+ * process object, so PID reuse cannot fool the wait the way re-reading a ppid
+ * could. The 500 ms timeout exists only to re-check g_shutdown, mirroring the
+ * POSIX poll cadence.
+ *
+ * The worker path keeps its POSIX-only guard: workers are spawned by CBM's own
+ * subprocess layer inside a kill-on-close job, so containment there is already
+ * the job object's job. */
+typedef struct {
+    HANDLE parent_process;
+    bool exit_on_parent_death;
+} parent_watchdog_config_t;
+
+static void *parent_watchdog_thread(void *arg) {
+    parent_watchdog_config_t config = *(parent_watchdog_config_t *)arg;
+
+    while (!atomic_load(&g_shutdown)) {
+        DWORD wait_status = WaitForSingleObject(config.parent_process, 500);
+        if (wait_status == WAIT_OBJECT_0) {
+            static const char msg[] = "level=warn msg=parent.exited reason=handle_signaled\n";
+            (void)_write(_fileno(stderr), msg, sizeof(msg) - 1);
+            if (config.exit_on_parent_death) {
+                /* Same deliberate hard stop as the POSIX branch: a lingering
+                 * orphan must release its daemon connection, file locks and
+                 * WAL read lock through kernel handle reclamation, and no
+                 * atexit cleanup is trustworthy after the owning client is
+                 * gone. */
+                _exit(0);
+            }
+            request_shutdown();
+            break;
+        }
+        if (wait_status != WAIT_TIMEOUT) {
+            break; /* handle became unwaitable — stop watching, never spin */
+        }
+    }
+    return NULL;
+}
+
+/* Toolhelp is the documented way to learn one's own parent PID on Windows;
+ * the PEB value is not exposed through any public API. Returns 0 when the
+ * lookup itself fails; callers treat that as "no parent signal available". */
+static DWORD win_parent_pid_from_snapshot(void) {
+    DWORD parent_pid = 0;
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        return 0;
+    }
+    PROCESSENTRY32W entry;
+    ZeroMemory(&entry, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+    DWORD self_pid = GetCurrentProcessId();
+    if (Process32FirstW(snapshot, &entry)) {
+        do {
+            if (entry.th32ProcessID == self_pid) {
+                parent_pid = entry.th32ParentProcessID;
+                break;
+            }
+        } while (Process32NextW(snapshot, &entry));
+    }
+    CloseHandle(snapshot);
+    return parent_pid;
+}
+
+static bool client_start_parent_watchdog(DWORD initial_ppid) {
+    /* Mirrors the POSIX initial_ppid <= 1 bail-out: when no trustworthy parent
+     * signal exists at startup — snapshot failed, reserved PID, or the parent
+     * already exited so the handle cannot be opened — keep running and rely on
+     * the stdin EOF path instead of watching nothing or dying on a false
+     * alarm. A watchdog thread creation failure, by contrast, is fatal: the
+     * same fail-closed choice as POSIX. */
+    if (initial_ppid == 0) {
+        return true;
+    }
+    HANDLE parent_process = OpenProcess(SYNCHRONIZE, FALSE, initial_ppid);
+    if (!parent_process) {
+        return true;
+    }
+    static parent_watchdog_config_t client_config;
+    client_config.parent_process = parent_process;
+    client_config.exit_on_parent_death = true;
+    cbm_thread_t watchdog;
+    if (cbm_thread_create(&watchdog, PARENT_WATCHDOG_STACK_SIZE, parent_watchdog_thread,
+                          &client_config) != 0) {
+        CloseHandle(parent_process);
+        return false;
+    }
+    if (cbm_thread_detach(&watchdog) != 0) {
+        atomic_store(&g_shutdown, 1);
+        (void)cbm_thread_join(&watchdog);
+        CloseHandle(parent_process);
+        return false;
+    }
+    return true;
+}
 #endif
 
 /* ── CLI mode ───────────────────────────────────────────────────── */
 
-#define CLI_USAGE "Usage: codebase-memory-mcp cli [--progress] [--json] <tool_name> [json_args]\n"
+#define CLI_USAGE                                                                             \
+    "Usage: codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool_name> " \
+    "[json_args]\n"                                                                           \
+    "  --quiet     Show errors only; cannot combine with --progress or outer --verbose\n"     \
+    "  --progress  Show lifecycle progress even when stderr is redirected\n"                  \
+    "  --verbose   Include informational logs (preserves CBM_LOG_LEVEL=debug)\n"              \
+    "  --json      Print the raw MCP result envelope\n"
 
 /* Extract text content from MCP tool result envelope and print it.
  * MCP results: {"content":[{"type":"text","text":"..."}],"isError":...}
@@ -665,10 +807,51 @@ static bool cli_first_nonspace_is_brace(const char *s) {
     return *s == '{';
 }
 
-static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json);
+static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json,
+                                           bool quiet_requested);
+
+/* A supervised worker runs in the DAEMON's environment, not the requesting
+ * client's. The daemon admitted this request under the client's session policy
+ * and re-executed us with the canonical repo_path in the args (both daemon
+ * spawn paths rewrite it), so the request itself is the worker's workspace
+ * scope: repository == session root == allowed root. Without this, a fresh
+ * server fell back to the process-wide CBM_ALLOWED_ROOT inherited from whoever
+ * started the daemon and refused every admitted session outside it. Returns
+ * NULL once scoped, otherwise the reason to fail closed: a worker never indexes
+ * under an ambient policy.
+ *
+ * A repository that cannot be canonicalized (it does not exist) can only have
+ * been admitted by a session with no declared boundary, because containment
+ * needs a real path. The worker mirrors that with an explicit unrestricted
+ * policy - still never the environment fallback - so the pipeline reports the
+ * missing repository as the tool error it always was, instead of the
+ * supervisor misreading a refused worker as a crash. */
+static const char *main_index_worker_scope_request(cbm_mcp_server_t *srv, const char *args_json) {
+    char *repo_path = cbm_mcp_get_string_arg(args_json, "repo_path");
+    if (!repo_path || !repo_path[0]) {
+        free(repo_path);
+        return "request names no repo_path";
+    }
+    char canonical[MAIN_PATH_CAP];
+    bool exists = cbm_canonical_path(repo_path, canonical, sizeof(canonical)) != 0;
+    const char *scope = exists ? canonical : repo_path;
+    bool scoped = cbm_mcp_server_set_session_context(srv, scope, exists ? scope : NULL);
+    free(repo_path);
+    return scoped ? NULL : "session context could not be installed";
+}
 
 static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                    main_local_maintenance_context_t *maintenance_context) {
+    cbm_cli_output_flags_t output_flags;
+    char output_error[CBM_SZ_512] = {0};
+    if (!cbm_cli_output_flags_parse(&argc, argv, &output_flags, output_error,
+                                    sizeof(output_error))) {
+        (void)fprintf(stderr, "error: %s\n",
+                      output_error[0] ? output_error : "invalid output mode");
+        (void)fprintf(stderr, CLI_USAGE);
+        return SKIP_ONE;
+    }
+    cbm_cli_diagnostics_configure(output_flags.quiet_requested, output_flags.verbose_requested);
     if (argc == 1 && argv && (strcmp(argv[0], "--help") == 0 || strcmp(argv[0], "-h") == 0)) {
         (void)fputs(CLI_USAGE, stdout);
         return 0;
@@ -678,7 +861,6 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         return SKIP_ONE;
     }
 
-    bool progress_requested = cli_strip_flag(&argc, argv, "--progress");
     bool raw_json = cli_strip_flag(&argc, argv, "--json");
 
     /* Supervisor worker role: when this process was spawned as a supervised index
@@ -693,6 +875,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     const char *worker_marker = cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_MARKER_ARG);
     const char *worker_quarantine =
         cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_QUARANTINE_ARG);
+    if (index_worker) {
+        /* The graph lives on this process's heaps: SQLite gets heaps of its
+         * own here, and only here (cbm_sqlite_dedicated_heap). */
+        cbm_sqlite_dedicated_heap(true);
+        cbm_memev_process_role("worker");
+    }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
                                       cbm_index_worker_memory_budget_bytes());
@@ -746,11 +934,13 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     } else if (rem_argc >= SKIP_ONE && cli_first_nonspace_is_brace(rem_argv[0])) {
         /* raw-JSON back-compat: cli <tool> '{"k":"v"}' (deprecated path). Warn on
          * STDERR only — stdout must stay clean JSON for piping. */
-        (void)fprintf(stderr,
-                      "warning: passing raw JSON to 'cli %s' is deprecated and "
-                      "will be removed in a future release; use flags (run 'cli "
-                      "%s --help'), --args-file <path>, or piped stdin.\n",
-                      tool_name, tool_name);
+        if (!output_flags.quiet_requested) {
+            (void)fprintf(stderr,
+                          "warning: passing raw JSON to 'cli %s' is deprecated and "
+                          "will be removed in a future release; use flags (run 'cli "
+                          "%s --help'), --args-file <path>, or piped stdin.\n",
+                          tool_name, tool_name);
+        }
         args_json = rem_argv[0];
     } else if (rem_argc >= SKIP_ONE && strncmp(rem_argv[0], "--", 2) == 0) {
         /* flag form: cli <tool> --flag value --bare-bool ... */
@@ -777,7 +967,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     }
 
     bool progress =
-        !index_worker && cbm_cli_progress_enabled(progress_requested, cli_isatty(2) != 0);
+        !index_worker && cbm_cli_progress_enabled(output_flags.progress_requested,
+                                                  output_flags.quiet_requested, cli_isatty(2) != 0);
     uint64_t progress_started_ms = cbm_now_ms();
     if (progress) {
         cbm_progress_sink_init(stderr);
@@ -796,11 +987,15 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     };
     bool maintenance_binding_failed = false;
     bool maintenance_cancelled = false;
+    const char *worker_scope_refused = NULL;
     if (!index_worker) {
-        result = main_local_cli_daemon_execute(tool_name, args_json);
+        result = main_local_cli_daemon_execute(tool_name, args_json, output_flags.quiet_requested);
     } else {
         srv = cbm_mcp_server_new(NULL);
         if (srv) {
+            worker_scope_refused = main_index_worker_scope_request(srv, args_json);
+        }
+        if (srv && !worker_scope_refused) {
             /* The in-process worker is a standalone instance: it may not
              * launch MCP-session background tasks. It receives project_locks
              * from its own process-level coordination setup and therefore
@@ -813,8 +1008,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
                                                               main_local_cli_mutation_try_begin);
             }
         }
-        maintenance_binding_failed = srv && !maintenance_context;
-        if (srv && maintenance_context) {
+        maintenance_binding_failed = srv && !worker_scope_refused && !maintenance_context;
+        if (srv && !worker_scope_refused && maintenance_context) {
             main_local_maintenance_server_bind(maintenance_context, srv);
             result = cbm_mcp_handle_tool(srv, tool_name, args_json);
             /* Unbind under the same mutex used by cancellation before any
@@ -826,7 +1021,10 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         }
     }
     if (!result) {
-        if (maintenance_binding_failed) {
+        if (worker_scope_refused) {
+            (void)fprintf(stderr, "error: request workspace scope invalid: %s\n",
+                          worker_scope_refused);
+        } else if (maintenance_binding_failed) {
             (void)fprintf(stderr,
                           "error: local %s maintenance cancellation could not bind safely\n",
                           index_worker ? "worker" : "CLI");
@@ -848,6 +1046,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         /* Supervised worker: hand the full result string to the parent via the
          * response file before printing (parent reads it back on a clean exit). */
         const char *ro = cbm_index_worker_response_out();
+        if (cbm_index_worker_active()) {
+            /* Waste dump + execution counts BEFORE the response: the parent may
+             * end the worker as soon as the response file is complete, and the
+             * fast exit below skips every at-exit writer anyway. */
+            cbm_memev_process_exit();
+        }
         bool worker_response_written = false;
         if (ro) {
             FILE *rf = cbm_fopen(ro, "wb");
@@ -898,7 +1102,8 @@ static void print_help(void) {
     printf("codebase-memory-mcp %s\n\n", CBM_VERSION);
     printf("Usage:\n");
     printf("  codebase-memory-mcp              Run MCP server on stdio\n");
-    printf("  codebase-memory-mcp cli [--progress] [--json] <tool> [args]\n");
+    printf("  codebase-memory-mcp cli [--quiet] [--progress] [--verbose] [--json] <tool> "
+           "[args]\n");
     printf("                                      Run one tool locally, then exit\n");
     printf("  codebase-memory-mcp install [-y|-n] [--force] [--dry-run] "
            "[--dir=<path>] [--skip-config]\n");
@@ -909,6 +1114,12 @@ static void print_help(void) {
     printf("  codebase-memory-mcp config <list|get|set|reset>\n");
     printf("  codebase-memory-mcp --version    Print version\n");
     printf("  codebase-memory-mcp --help       Print this help\n");
+    printf("\nCLI output options:\n");
+    printf("  --quiet       Show errors only; disable automatic terminal progress\n");
+    printf("  --progress    Show lifecycle progress even with redirected stderr\n");
+    printf("  --verbose     Include informational diagnostics\n");
+    printf("  --json        Print the raw MCP result envelope\n");
+    printf("  --quiet cannot be combined with --progress or outer --verbose.\n");
     printf("\nUI options:\n");
     printf("  --ui=true    Enable HTTP graph visualization (persisted)\n");
     printf("  --ui=false   Disable HTTP graph visualization (persisted)\n");
@@ -1231,7 +1442,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * only the resulting canonical path, so retargeting the original alias
      * cannot move storage after cohort admission. */
     bool cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
-    if (!cache_ready && cbm_mkdir_p(cache, 0700)) {
+    if (!cache_ready && cbm_mkdir_p_ex(cache, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
         cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
     }
     if (!cache_ready || !cbm_is_dir(canonical_cache)) {
@@ -1285,15 +1496,23 @@ static cbm_daemon_ipc_endpoint_t *main_daemon_endpoint_new(void) {
     return cbm_daemon_bootstrap_endpoint_new(runtime_parent);
 }
 
-static bool main_local_cli_feedback_enabled(int argc, char **argv) {
-    bool requested = false;
+static bool main_cli_flag_present(int argc, char **argv, const char *flag) {
+    if (!argv || !flag) {
+        return false;
+    }
     for (int index = 1; index < argc; index++) {
-        if (argv[index] && strcmp(argv[index], "--progress") == 0) {
-            requested = true;
-            break;
+        if (argv[index] && strcmp(argv[index], flag) == 0) {
+            return true;
         }
     }
-    return cbm_cli_progress_enabled(requested, cli_isatty(2) != 0);
+    return false;
+}
+
+static bool main_local_cli_feedback_enabled(int argc, char **argv) {
+    bool requested = false;
+    requested = main_cli_flag_present(argc, argv, "--progress");
+    bool quiet = main_cli_flag_present(argc, argv, "--quiet");
+    return cbm_cli_progress_enabled(requested, quiet, cli_isatty(2) != 0);
 }
 
 /* Acquire the exclusive startup transition, waiting out whatever currently holds it.
@@ -1546,7 +1765,8 @@ static void main_report_client_bootstrap_failure(cbm_daemon_process_role_t role,
  * lifecycle used to, instead of deadlocking behind the pinned daemon. Same-
  * or newer-build daemons and dev builds are never auto-drained. */
 static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
-    const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result) {
+    const cbm_daemon_bootstrap_config_t *config, cbm_daemon_bootstrap_result_t *result,
+    bool report_lifecycle) {
     cbm_daemon_bootstrap_status_t status = cbm_daemon_bootstrap_execute(config, result);
     if (status != CBM_DAEMON_BOOTSTRAP_CONFLICT) {
         return status;
@@ -1558,11 +1778,13 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
         !main_semver_newer(config->identity->semantic_version, active.semantic_version)) {
         return status;
     }
-    (void)fprintf(stderr,
-                  "codebase-memory-mcp: retiring the active permanent daemon (%s, pid %lu) for "
-                  "this newer build (%s)\n",
-                  active.semantic_version, (unsigned long)active.daemon_pid,
-                  config->identity->semantic_version);
+    if (report_lifecycle) {
+        (void)fprintf(stderr,
+                      "codebase-memory-mcp: retiring the active permanent daemon (%s, pid %lu) "
+                      "for this newer build (%s)\n",
+                      active.semantic_version, (unsigned long)active.daemon_pid,
+                      config->identity->semantic_version);
+    }
     cbm_daemon_runtime_activation_result_t drain;
     if (!cbm_daemon_runtime_request_activation_shutdown(config->endpoint, config->identity,
                                                         CBM_DAEMON_RUNTIME_ACTIVATION_UPDATE,
@@ -1579,8 +1801,9 @@ static cbm_daemon_bootstrap_status_t main_client_bootstrap_with_upgrade(
  * sessions and hooks: an active daemon (any starter) is recycled, an absent
  * one is spawned for this command — with a hint that `daemon start` removes
  * that per-command cost. Only supervised index workers stay in-process. */
-static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json) {
-    cbm_daemon_ipc_endpoint_t *endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json,
+                                           bool quiet_requested) {
+    cbm_daemon_ipc_endpoint_t *endpoint = main_daemon_endpoint_new();
     char executable_path[MAIN_PATH_CAP] = {0};
     cbm_daemon_build_identity_t identity;
     bool prepared =
@@ -1601,7 +1824,8 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
         .startup_timeout_ms = MAIN_MCP_STARTUP_TIMEOUT_MS,
     };
     cbm_daemon_bootstrap_result_t bootstrap;
-    cbm_daemon_bootstrap_status_t status = main_client_bootstrap_with_upgrade(&config, &bootstrap);
+    cbm_daemon_bootstrap_status_t status =
+        main_client_bootstrap_with_upgrade(&config, &bootstrap, !quiet_requested);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap.client) {
         (void)fprintf(stderr, "error: %s\n",
@@ -1609,7 +1833,12 @@ static char *main_local_cli_daemon_execute(const char *tool_name, const char *ar
                                            : "no CBM daemon connection for CLI execution");
         return NULL;
     }
-    if (bootstrap.daemon_spawned) {
+    if (bootstrap.daemon_spawned && cbm_log_get_level() <= CBM_LOG_INFO) {
+        /* Routine cold-start advice is informational. Default one-shot CLI
+         * output stays pipe-clean; `cli --verbose ...` (or CBM_LOG_LEVEL=info)
+         * opts into this detail. It is advice for a person, so it is a plain
+         * stderr line rather than a structured record whose value escaping
+         * would turn `daemon start` into `daemon_start`. */
         (void)fprintf(stderr, "hint: this command started a temporary CBM daemon. "
                               "`codebase-memory-mcp daemon start` keeps one warm and removes this "
                               "startup cost from every CLI command.\n");
@@ -2177,6 +2406,26 @@ static void main_daemon_ctl_open_browser(int port) {
     }
 }
 
+/* Ask the daemon to enable the UI on `port`; true when it accepted.
+ *
+ * The seam below forces the refusal that the caller must survive. Reproducing it
+ * for real needs a machine loaded enough to miss a bounded handshake, which is
+ * not a state a test can ask for; it is COMPILED OUT of ordinary builds (see
+ * TEST_SEAMS in Makefile.cbm). */
+static bool main_daemon_ctl_apply_ui_config(cbm_daemon_runtime_client_t *client,
+                                            uint8_t update_mask, int port) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    char forced[8];
+    if (cbm_safe_getenv("CBM_TEST_DAEMON_UI_CONFIG_REFUSED", forced, sizeof(forced), NULL) &&
+        forced[0] == '1') {
+        return false;
+    }
+#endif
+    return cbm_daemon_application_client_set_ui_config(client, update_mask, true, port,
+                                                       MAIN_CONNECT_TIMEOUT_MS) ==
+           CBM_DAEMON_RUNTIME_APPLICATION_OK;
+}
+
 static int main_daemon_ctl_finish_ui_open(cbm_daemon_runtime_client_t **client_io, int port,
                                           bool open_browser) {
     if (!open_browser) {
@@ -2380,7 +2629,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     };
     cbm_daemon_bootstrap_result_t start_result;
     cbm_daemon_bootstrap_status_t start_status =
-        main_client_bootstrap_with_upgrade(&start_config, &start_result);
+        main_client_bootstrap_with_upgrade(&start_config, &start_result, true);
     if (start_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !start_result.client) {
         (void)fprintf(stderr, "error: %s\n",
                       start_result.message[0] ? start_result.message
@@ -2395,6 +2644,7 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     /* The committed control connection satisfied the daemon's no-client
      * startup window; configure the UI before departing. */
     int ui_port = 0;
+    bool ui_configured = false;
     if ((CBM_EMBEDDED_FILE_COUNT > 0)) {
         cbm_ui_config_t ui_config;
         cbm_ui_config_load(&ui_config);
@@ -2403,14 +2653,30 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
         bool context_set =
             main_set_client_context(start_result.client, ".", CBM_MCP_TOOL_PROFILE_ALL, NULL, NULL,
                                     MAIN_CONNECT_TIMEOUT_MS);
-        if (!context_set || cbm_daemon_application_client_set_ui_config(
-                                start_result.client, update_mask, true, ui_port,
-                                MAIN_CONNECT_TIMEOUT_MS) != CBM_DAEMON_RUNTIME_APPLICATION_OK) {
+        ui_configured = context_set &&
+                        main_daemon_ctl_apply_ui_config(start_result.client, update_mask, ui_port);
+        if (!ui_configured) {
+            /* Reaching here means the daemon is up: the control connection above
+             * already satisfied its startup window. Only the UI handshake — two
+             * requests bounded by MAIN_CONNECT_TIMEOUT_MS — came back short.
+             *
+             * Whether that is fatal depends on what was asked for. `--port`/`--open`
+             * make the UI the point of the command, so failing to configure it is a
+             * failed command. A bare `daemon start` asks for a daemon, and it got
+             * one; reporting failure there sent operators hunting for a daemon that
+             * was in fact running and healthy. It also made a loaded machine look
+             * like a broken one, because a second of scheduling delay after an
+             * abrupt shutdown is enough to miss this handshake. */
+            if (requested_port > 0 || open_browser) {
+                (void)fprintf(stderr,
+                              "error: the daemon did not accept the UI configuration; browser was "
+                              "not opened\n");
+                (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
+                return EXIT_FAILURE;
+            }
             (void)fprintf(stderr,
-                          "error: the daemon did not accept the UI configuration; browser was "
-                          "not opened\n");
-            (void)cbm_daemon_runtime_client_close(start_result.client, MAIN_CLOSE_TIMEOUT_MS);
-            return EXIT_FAILURE;
+                          "warning: the daemon started but did not accept the UI configuration; "
+                          "the UI is unavailable until the next `daemon start`\n");
         }
     } else if (requested_port > 0 || open_browser) {
         (void)fprintf(stderr, "warning: this binary was built without UI support; "
@@ -2427,8 +2693,10 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     }
     printf("It survives idle periods and session ends; `codebase-memory-mcp daemon stop` "
            "retires it.\n");
+    /* Skipped when the handshake was refused: that path announces the port as
+     * warming, which would be a promise nothing is keeping. */
     int ui_result =
-        (CBM_EMBEDDED_FILE_COUNT > 0)
+        (CBM_EMBEDDED_FILE_COUNT > 0 && ui_configured)
             ? main_daemon_ctl_finish_ui_open(&start_result.client, ui_port, open_browser)
             : EXIT_SUCCESS;
     if (start_result.client) {
@@ -2442,6 +2710,11 @@ int main(int argc, char **argv) {
     cbm_alloc_init();
 #ifndef _WIN32
     pid_t process_initial_ppid = getppid();
+#else
+    /* Captured at the same instant as POSIX: the later OpenProcess in
+     * client_start_parent_watchdog must target the process that spawned us,
+     * not whatever may have recycled the PID meanwhile. */
+    DWORD process_initial_ppid = win_parent_pid_from_snapshot();
 #endif
 #ifdef _WIN32
     {
@@ -2474,7 +2747,19 @@ int main(int argc, char **argv) {
 
     cbm_cli_set_version(CBM_VERSION);
     cbm_profile_init();
-    cbm_log_init_from_env();
+    /* The library default stays INFO (embedders and the test runner observe
+     * INFO records through the sink); the process policy is applied here, as
+     * early as argv can be classified: thin frontends go quiet, detached
+     * daemons retain INFO lifecycle records, and physical workers require
+     * INFO because those records are their supervisor's quiet-timeout
+     * heartbeat. */
+    bool quiet_log_default = role != CBM_DAEMON_PROCESS_DAEMON && role != CBM_DAEMON_PROCESS_WORKER;
+    cbm_log_init_for_process(quiet_log_default, role == CBM_DAEMON_PROCESS_WORKER);
+    if (role == CBM_DAEMON_PROCESS_LOCAL_CLI && main_cli_flag_present(argc, argv, "--quiet")) {
+        /* Apply quiet before local coordination begins, not only once tool
+         * dispatch is reached, so pre-dispatch WARN chatter is suppressed. */
+        cbm_cli_diagnostics_configure(true, false);
+    }
 
     cbm_mcp_tool_profile_t tool_profile = CBM_MCP_TOOL_PROFILE_ALL;
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT &&
@@ -2532,7 +2817,7 @@ int main(int argc, char **argv) {
             (void)fputs("Preparing one-shot local CBM command...\n", feedback);
             (void)fflush(feedback);
         }
-        cbm_daemon_ipc_endpoint_t *local_endpoint = cbm_daemon_bootstrap_endpoint_new(NULL);
+        cbm_daemon_ipc_endpoint_t *local_endpoint = main_daemon_endpoint_new();
         char local_executable[MAIN_PATH_CAP];
         cbm_daemon_build_identity_t local_identity;
         cbm_project_lock_manager_t *project_locks =
@@ -2816,17 +3101,22 @@ int main(int argc, char **argv) {
          * unconditional in the source, so with the seam compiled out cppcheck
          * correctly reported `!probe()` as always false. Guarding the STEP, not
          * stubbing the function, means release builds simply do not have it. */
-        if (!worker_prepare_process_group() || process_initial_ppid <= 1 ||
-            getppid() != process_initial_ppid) {
-            worker_containment_unavailable();
+        if (!worker_prepare_process_group()) {
+            worker_containment_unavailable("own process group not established");
+        }
+        if (process_initial_ppid <= 1) {
+            worker_containment_unavailable("no supervising parent at startup");
+        }
+        if (getppid() != process_initial_ppid) {
+            worker_containment_unavailable("parent changed since startup");
         }
 #ifdef CBM_ENABLE_TEST_SEAMS
         if (!worker_start_watchdog_test_descendant()) {
-            worker_containment_unavailable();
+            worker_containment_unavailable("watchdog test descendant refused");
         }
 #endif
         if (!worker_start_parent_watchdog(process_initial_ppid)) {
-            worker_containment_unavailable();
+            worker_containment_unavailable("parent-death watchdog would not start");
         }
 #endif
         cbm_index_supervisor_mark_host();
@@ -2972,7 +3262,7 @@ int main(int argc, char **argv) {
     };
     cbm_daemon_bootstrap_result_t bootstrap_result;
     cbm_daemon_bootstrap_status_t bootstrap_status =
-        main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result);
+        main_client_bootstrap_with_upgrade(&bootstrap_config, &bootstrap_result, true);
     cbm_daemon_ipc_endpoint_free(endpoint);
     if (bootstrap_status != CBM_DAEMON_BOOTSTRAP_CONNECTED || !bootstrap_result.client) {
         main_report_client_bootstrap_failure(role, &bootstrap_result);
@@ -3017,7 +3307,9 @@ int main(int argc, char **argv) {
                                   "cbm-with-ui`.\n");
         }
     }
-#ifndef _WIN32
+    /* The Windows branch of this call is the #914 fix: identical placement and
+     * failure handling as POSIX (fail-closed — a client that cannot arm its
+     * parent watchdog would linger as an orphan after the editor dies). */
     if (!client_start_parent_watchdog(process_initial_ppid)) {
         (void)fprintf(stderr, "codebase-memory-mcp: parent-death watchdog could not start\n");
         (void)cbm_daemon_runtime_client_close(g_daemon_client, MAIN_CLOSE_TIMEOUT_MS);
@@ -3025,7 +3317,6 @@ int main(int argc, char **argv) {
         (void)main_version_cohort_close(&client_cohort_lease, &client_cohort_manager);
         return EXIT_FAILURE;
     }
-#endif
 
     setup_signal_handlers();
     int result = cbm_daemon_frontend_mcp_run(g_daemon_client, client_cohort_manager, stdin, stdout);

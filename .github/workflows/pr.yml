@@ -22,6 +22,13 @@ concurrency:
 jobs:
   security:
     uses: ./.github/workflows/_security.yml
+    # The called job requests security-events:read to count code-scanning
+    # alerts; a reusable workflow cannot request more than its caller grants,
+    # so withholding this here fails the whole run at startup.
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
     secrets: inherit
 
   lint:
@@ -146,6 +153,17 @@ jobs:
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
+
+  # ── Waste sanitizer, REPORT-ONLY: memory + CPU waste on this repository and
+  #    the per-function scaling lane (Linux). Deliberately NOT in ci-ok's needs:
+  #    it uploads evidence and prints the ratchet, it never blocks a merge. Only
+  #    product-code PRs pay for it. ──
+  memwaste:
+    needs: [changes]
+    if: ${{ !cancelled() && needs.changes.outputs.product == 'true' }}
+    uses: ./.github/workflows/_memwaste.yml
+    with:
+      mode: pr
 
   ci-ok:
     # The one required context (besides dco) — fails unless every PR stage

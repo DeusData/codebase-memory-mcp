@@ -292,8 +292,8 @@ void cbm_pipeline_importance_append_prop(cbm_gbuf_node_t *node, double score) {
     if (!neu) {
         return;
     }
-    free(node->properties_json);
-    node->properties_json = neu;
+    (void)cbm_gbuf_node_set_properties_json(node, neu);
+    free(neu);
 }
 
 /* ── The scoring rule ─────────────────────────────────────────────────

@@ -15250,6 +15250,167 @@ TEST(clsp_tier2_shared_registry_readonly_c) {
     PASS();
 }
 
+/* The method-return refinement in the C++ class walk used to cast the chained
+ * lookup result and write a scratch-arena signature into it. With the entry in
+ * the sealed shared base, every other worker read that signature after the
+ * arena of this file had died (ASan heap-use-after-free in c_adl_resolve on
+ * dotnet/runtime, 2026-09-14). Contract: the refinement is copy-on-write into
+ * the overlay; the base signature pointer never changes. min_params = 7 is a
+ * marker only a COPY of the base entry carries (a fresh registration sets -1),
+ * so the assertion proves the upgrade path ran, not a re-registration. */
+TEST(clsp_method_return_refinement_is_copy_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    const CBMType *rets[2] = {cbm_type_named(&arena, "test.mod.Item"), NULL};
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "test.mod.Box.items";
+    f.short_name = "items";
+    f.receiver_type = "test.mod.Box";
+    f.signature = cbm_type_func(&arena, NULL, NULL, rets);
+    f.min_params = 7;
+    cbm_registry_add_func(&base, f);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+    const CBMRegisteredFunc *base_entry = cbm_registry_lookup_func(&base, "test.mod.Box.items");
+    ASSERT_NOT_NULL(base_entry);
+    const CBMType *base_sig = base_entry->signature;
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+    /* The in-class declaration refines the NAMED return to a POINTER. */
+    const char *src = "struct Item { int v; };\n"
+                      "struct Box {\n"
+                      "    Item *items();\n"
+                      "};\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&scratch, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, &overlay, NULL, NULL, 0, NULL, &out);
+
+    ASSERT(base_entry->signature == base_sig);
+    ASSERT_EQ(base_sig->data.func.return_types[0]->kind, CBM_TYPE_NAMED);
+    const CBMRegisteredFunc *refined = cbm_registry_lookup_func(&overlay, "test.mod.Box.items");
+    ASSERT_NOT_NULL(refined);
+    ASSERT(refined >= overlay.funcs && refined < overlay.funcs + overlay.func_count);
+    ASSERT_EQ(refined->min_params, 7);
+    ASSERT_EQ(refined->signature->data.func.return_types[0]->kind, CBM_TYPE_POINTER);
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
+/* The per-file overlay contract (type_registry.c chain API): a walk is handed
+ * an overlay chained to a sealed base. Lookups and iterators see the base
+ * through the overlay, every yielded index belongs to it.reg, a refinement is
+ * copy-on-write into the overlay (the base never changes), and an overlay copy
+ * shadows its base original in chained iteration. */
+TEST(registry_overlay_chain_iterates_and_copies_on_write) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMTypeRegistry base;
+    cbm_registry_init(&base, &arena);
+    CBMRegisteredFunc f;
+    memset(&f, 0, sizeof(f));
+    f.qualified_name = "pkg.alpha";
+    f.short_name = "alpha";
+    f.min_params = -1;
+    cbm_registry_add_func(&base, f);
+    f.qualified_name = "pkg.beta";
+    f.short_name = "beta";
+    cbm_registry_add_func(&base, f);
+    CBMRegisteredType t;
+    memset(&t, 0, sizeof(t));
+    t.qualified_name = "pkg.T";
+    t.short_name = "T";
+    cbm_registry_add_type(&base, t);
+    cbm_registry_finalize(&base);
+    base.read_only = true;
+
+    CBMArena scratch;
+    cbm_arena_init(&scratch);
+    CBMTypeRegistry overlay;
+    cbm_registry_init(&overlay, &scratch);
+    overlay.fallback = &base;
+
+    /* Lookups chain through the empty overlay. */
+    ASSERT_NOT_NULL(cbm_registry_lookup_func(&overlay, "pkg.alpha"));
+    ASSERT_NOT_NULL(cbm_registry_lookup_type(&overlay, "pkg.T"));
+
+    /* Chained iteration reaches the base; it.reg names where the index lives. */
+    CBMFreeFuncIter it;
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int i = cbm_free_func_iter_next(&it);
+    ASSERT(i >= 0);
+    ASSERT(it.reg == &base);
+    ASSERT(strcmp(it.reg->funcs[i].qualified_name, "pkg.alpha") == 0);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+    /* The plain iterator on the overlay alone sees nothing -- unchanged. */
+    cbm_registry_free_funcs_by_short_name(&overlay, "alpha", &it);
+    ASSERT_EQ(cbm_free_func_iter_next(&it), -1);
+
+    /* Copy-on-write: the refinement lands in the overlay, the base is untouched,
+     * and chained lookup now returns the refined copy. */
+    CBMRegisteredFunc *w = cbm_registry_func_for_update(&overlay, "pkg.alpha");
+    ASSERT_NOT_NULL(w);
+    ASSERT(w >= overlay.funcs && w < overlay.funcs + overlay.func_count);
+    w->min_params = 2;
+    ASSERT_EQ(base.funcs[0].min_params, -1);
+    ASSERT_EQ(cbm_registry_lookup_func(&overlay, "pkg.alpha")->min_params, 2);
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.alpha") ==
+           w); /* own entry, no second copy */
+    ASSERT_EQ(overlay.func_count, 1);
+
+    /* The base original is shadowed: chained iteration yields exactly one alpha,
+     * from the overlay. */
+    cbm_registry_free_funcs_by_short_name_chain(&overlay, "alpha", &it);
+    int seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        ASSERT(it.reg == &overlay);
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+    /* Linear chain over everything: alpha (overlay copy) + beta (base). */
+    cbm_registry_all_funcs_chain(&overlay, &it);
+    seen = 0;
+    while (cbm_free_func_iter_next(&it) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 2);
+
+    /* Types: same contract. */
+    CBMTypeShortIter ti;
+    cbm_registry_types_by_short_name_chain(&overlay, "T", &ti);
+    int k = cbm_type_short_iter_next(&ti);
+    ASSERT(k >= 0);
+    ASSERT(ti.reg == &base);
+    CBMRegisteredType *wt = cbm_registry_type_for_update(&overlay, "pkg.T");
+    ASSERT_NOT_NULL(wt);
+    ASSERT_EQ(overlay.type_count, 1);
+    cbm_registry_all_types_chain(&overlay, &ti);
+    seen = 0;
+    while (cbm_type_short_iter_next(&ti) >= 0) {
+        seen++;
+    }
+    ASSERT_EQ(seen, 1);
+
+    /* A sealed head refuses refinement; an unknown QN yields nothing. */
+    overlay.read_only = true;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.beta") == NULL);
+    overlay.read_only = false;
+    ASSERT(cbm_registry_func_for_update(&overlay, "pkg.nope") == NULL);
+    ASSERT_EQ(base.func_count, 2);
+
+    cbm_arena_destroy(&scratch);
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* Direct guard for the type-name / embedded-type / free-function registry
  * indexes and their iterators (type_registry.c). Verifies that every iterator
  * preserves ascending registry order, which is part of resolver tie-breaking. */
@@ -16216,6 +16377,8 @@ SUITE(c_lsp) {
     RUN_TEST(clsp_tier2_shared_registry_readonly_c);
     RUN_TEST(clsp_tier2_shared_registry_readonly_cpp);
     RUN_TEST(seal_py_shared_registry_readonly);
+    RUN_TEST(registry_overlay_chain_iterates_and_copies_on_write);
+    RUN_TEST(clsp_method_return_refinement_is_copy_on_write);
     RUN_TEST(seal_py_shared_registry_readonly_fields);
     RUN_TEST(seal_cs_shared_registry_readonly);
     RUN_TEST(seal_ts_shared_registry_readonly);

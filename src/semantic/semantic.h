@@ -24,6 +24,7 @@
 #ifndef CBM_SEMANTIC_H
 #define CBM_SEMANTIC_H
 
+#include <stddef.h> /* size_t */
 #include <stdbool.h>
 #include <stdint.h>
 
@@ -166,11 +167,13 @@ cbm_sem_corpus_t *cbm_sem_corpus_new(void);
 void cbm_sem_corpus_add_doc(cbm_sem_corpus_t *corpus, const char **tokens, int count);
 
 /* Batch-build the corpus from pre-tokenized documents (PARALLEL variant).
- * `all_tokens` layout: all_tokens[f * max_tokens_per_doc + t] = token pointer.
- * `token_counts[f]` = number of tokens in document f.
+ * Document f's tokens are all_tokens[offsets[f] .. offsets[f] + token_counts[f]).
+ * Packed, not strided: a fixed CBM_SEM_MAX_TOKENS (512) slots per document
+ * was 4 KB per function up front -- 7.4 GB on the kernel for tokens that
+ * average a few dozen per function.
  * This replaces a loop of cbm_sem_corpus_add_doc() calls. */
 void cbm_sem_corpus_add_docs_batch(cbm_sem_corpus_t *corpus, char **all_tokens,
-                                   const int *token_counts, int doc_count, int max_tokens_per_doc);
+                                   const size_t *offsets, const int *token_counts, int doc_count);
 
 /* Finalize: compute IDF, build enriched token vectors via co-occurrence. */
 void cbm_sem_corpus_finalize(cbm_sem_corpus_t *corpus);
@@ -180,6 +183,14 @@ float cbm_sem_corpus_idf(const cbm_sem_corpus_t *corpus, const char *token);
 
 /* Get the enriched Random Indexing vector for a token (after co-occurrence). */
 const cbm_sem_vec_t *cbm_sem_corpus_ri_vec(const cbm_sem_corpus_t *corpus, const char *token);
+
+/* The same two answers by token index, for a caller that asks both about many
+ * tokens: resolve each token once (cbm_sem_corpus_token_index, -1 when unknown)
+ * and read idf and vector by index. The name-keyed pair costs one hash lookup and
+ * one strtol per question -- three per token in the vector build. */
+int cbm_sem_corpus_token_index(const cbm_sem_corpus_t *corpus, const char *token);
+float cbm_sem_corpus_idf_at(const cbm_sem_corpus_t *corpus, int index);
+const cbm_sem_vec_t *cbm_sem_corpus_ri_vec_at(const cbm_sem_corpus_t *corpus, int index);
 
 /* Get the total document count. */
 int cbm_sem_corpus_doc_count(const cbm_sem_corpus_t *corpus);
