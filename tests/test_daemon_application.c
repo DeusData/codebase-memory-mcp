@@ -1217,100 +1217,6 @@ TEST(daemon_application_free_releases_live_watch_once) {
     PASS();
 }
 
-TEST(daemon_application_cache_prune_clears_another_sessions_watch) {
-    const char *old_cache = getenv("CBM_CACHE_DIR");
-    char *saved_cache = old_cache ? cbm_strdup(old_cache) : NULL;
-    char *base = th_mktempdir("cbm-cache-watch");
-    ASSERT_NOT_NULL(base);
-    char root[APP_TEST_PATH_CAP], cache[APP_TEST_PATH_CAP], db_path[APP_TEST_PATH_CAP];
-    snprintf(root, sizeof(root), "%s/root", base);
-    snprintf(cache, sizeof(cache), "%s/cache", base);
-    ASSERT_TRUE(cbm_mkdir_p(root, 0700));
-    ASSERT_TRUE(cbm_mkdir_p(cache, 0700));
-    char *project = cbm_project_name_from_path(root);
-    ASSERT_NOT_NULL(project);
-    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
-    cbm_setenv("CBM_CACHE_DIR", cache, 1);
-    cbm_store_t *seed = cbm_store_open_path(db_path);
-    bool seeded = seed && cbm_store_upsert_project(seed, project, root) == CBM_STORE_OK;
-    cbm_store_close(seed);
-    cbm_store_t *store = cbm_store_open_memory();
-    cbm_watcher_t *watcher = cbm_watcher_new(store, app_test_index_noop, NULL);
-    cbm_daemon_application_config_t config = {.watcher = watcher};
-    cbm_daemon_application_t *application = cbm_daemon_application_new(&config);
-    cbm_daemon_runtime_application_callbacks_t callbacks =
-        cbm_daemon_application_runtime_callbacks(application);
-    cbm_daemon_runtime_application_session_t *owner = app_test_open(&callbacks, 113);
-    cbm_daemon_runtime_application_session_t *collector = app_test_open(&callbacks, 114);
-    uint8_t *context = NULL, *other_context = NULL, *ping = NULL, *prune = NULL, *response = NULL;
-    uint32_t context_length = 0, other_length = 0, ping_length = 0, prune_length = 0,
-             response_length = 0;
-    bool ready =
-        seeded && owner && collector &&
-        app_test_context_request(root, root, &context, &context_length) &&
-        app_test_context_request(base, base, &other_context, &other_length) &&
-        app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP,
-                              "{\"jsonrpc\":\"2.0\",\"id\":9,\"method\":\"ping\"}", &ping,
-                              &ping_length) &&
-        app_test_tool_request("cache_prune", "{\"missing_root\":true}", &prune, &prune_length);
-    bool registered =
-        ready && app_test_request(&callbacks, owner, context, context_length, &response,
-                                  &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
-    free(response);
-    response = NULL;
-    registered = registered &&
-                 app_test_request(&callbacks, owner, ping, ping_length, &response,
-                                  &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-                 cbm_watcher_watch_count(watcher) == 1;
-    free(response);
-    response = NULL;
-    bool collected = registered &&
-                     app_test_request(&callbacks, collector, other_context, other_length, &response,
-                                      &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-                     cbm_rmdir(root) == 0;
-    free(response);
-    response = NULL;
-    collected = collected &&
-                app_test_request(&callbacks, collector, prune, prune_length, &response,
-                                 &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-                !cbm_file_exists(db_path) && cbm_watcher_watch_count(watcher) == 0;
-    free(response);
-    response = NULL;
-    bool restored = collected && cbm_mkdir_p(root, 0700);
-    seed = restored ? cbm_store_open_path(db_path) : NULL;
-    restored = seed && cbm_store_upsert_project(seed, project, root) == CBM_STORE_OK;
-    cbm_store_close(seed);
-    restored = restored &&
-               app_test_request(&callbacks, owner, ping, ping_length, &response,
-                                &response_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
-               cbm_watcher_watch_count(watcher) == 1;
-    free(response);
-    if (owner)
-        callbacks.session_close(callbacks.context, owner);
-    if (collector)
-        callbacks.session_close(callbacks.context, collector);
-    cbm_daemon_application_free(application);
-    cbm_watcher_stop(watcher);
-    cbm_watcher_free(watcher);
-    cbm_store_close(store);
-    free(context);
-    free(other_context);
-    free(ping);
-    free(prune);
-    free(project);
-    if (saved_cache)
-        cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
-    else
-        cbm_unsetenv("CBM_CACHE_DIR");
-    free(saved_cache);
-    th_rmtree(base);
-    ASSERT_TRUE(ready);
-    ASSERT_TRUE(registered);
-    ASSERT_TRUE(collected);
-    ASSERT_TRUE(restored);
-    PASS();
-}
-
 TEST(daemon_application_prune_clears_logical_watch_for_reregistration) {
     const char *old_cache = getenv("CBM_CACHE_DIR");
     bool had_cache = old_cache != NULL;
@@ -5743,7 +5649,6 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_reference_counts_one_shared_watch);
     RUN_TEST(daemon_application_free_releases_live_watch_once);
     RUN_TEST(daemon_application_prune_clears_logical_watch_for_reregistration);
-    RUN_TEST(daemon_application_cache_prune_clears_another_sessions_watch);
     RUN_TEST(daemon_application_initialize_coalesces_auto_index_for_full_sessions);
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);

@@ -1,11 +1,15 @@
 #include "test_framework.h"
 #include "test_helpers.h"
-#include "mcp/cache.h"
+#include "cli/cache.h"
 #include "cli/cli.h"
 #include "daemon/bootstrap.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
 #include <errno.h>
+#ifndef _WIN32
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
 static bool cache_fixture(const char *directory, const char *name, const char *root,
                           const char *timestamp) {
@@ -42,6 +46,8 @@ typedef struct {
     int began;
     int ended;
     bool busy;
+    bool cancelled;
+    bool cancel_after_begin;
     const char *restore_root;
     const char *refresh_db;
     const char *replace_db;
@@ -52,6 +58,9 @@ static bool cache_guard_begin(void *context, const char *project) {
     (void)project;
     cache_guard_t *guard = context;
     guard->began++;
+    if (guard->cancel_after_begin) {
+        guard->cancelled = true;
+    }
     if (guard->publish_db) {
         (void)th_write_file(guard->publish_db, "new database");
     }
@@ -143,7 +152,7 @@ TEST(cache_prune_dry_run_and_conditions_are_conjunctive) {
     ASSERT(cbm_file_exists(TH_PATH(directory, "old-gone.db")));
     yyjson_doc_free(doc);
     doc =
-        cache_call(directory, "{\"missing_root\":true,\"older_than\":\"30d\"}", true, &ops, &error);
+        cache_call(directory, "{\"missing_root\":true,\"older_than\":\"30d\",\"confirm_missing_root\":true}", true, &ops, &error);
     ASSERT(!error);
     ASSERT_EQ(cache_number(doc, "deleted_count"), 1);
     ASSERT_GT(cache_number(doc, "removed_bytes"), 0);
@@ -169,7 +178,7 @@ TEST(cache_prune_skips_busy_and_rechecks_after_lock) {
     cbm_cache_ops_t ops = {
         .context = &guard, .try_begin = cache_guard_begin, .end = cache_guard_end};
     bool error;
-    yyjson_doc *doc = cache_call(directory, "{\"missing_root\":true}", true, &ops, &error);
+    yyjson_doc *doc = cache_call(directory, "{\"missing_root\":true,\"confirm_missing_root\":true}", true, &ops, &error);
     ASSERT_NOT_NULL(doc);
     ASSERT(error);
     ASSERT_EQ(cache_number(doc, "busy_count"), 1);
@@ -178,7 +187,7 @@ TEST(cache_prune_skips_busy_and_rechecks_after_lock) {
     yyjson_doc_free(doc);
     guard.busy = false;
     guard.restore_root = root;
-    doc = cache_call(directory, "{\"missing_root\":true}", true, &ops, &error);
+    doc = cache_call(directory, "{\"missing_root\":true,\"confirm_missing_root\":true}", true, &ops, &error);
     ASSERT(!error);
     ASSERT_EQ(cache_number(doc, "deleted_count"), 0);
     ASSERT_EQ(guard.ended, 1);
@@ -220,7 +229,7 @@ TEST(cache_prune_rejects_invalid_or_unfiltered_requests) {
         yyjson_doc_free(doc);
     }
     bool error;
-    yyjson_doc *doc = cache_call("unused", "{\"missing_root\":true}", true, NULL, &error);
+    yyjson_doc *doc = cache_call("unused", "{\"missing_root\":true,\"confirm_missing_root\":true}", true, NULL, &error);
     ASSERT(error); /* actual pruning cannot bypass the lease */
     yyjson_doc_free(doc);
     PASS();
@@ -240,7 +249,7 @@ TEST(cache_prune_keeps_unreadable_ambiguous_and_unknown_roots) {
     cbm_cache_ops_t ops = {
         .context = &guard, .try_begin = cache_guard_begin, .end = cache_guard_end};
     bool error;
-    yyjson_doc *doc = cache_call(directory, "{\"missing_root\":true}", true, &ops, &error);
+    yyjson_doc *doc = cache_call(directory, "{\"missing_root\":true,\"confirm_missing_root\":true}", true, &ops, &error);
     ASSERT_NOT_NULL(doc);
     ASSERT(!error);
     ASSERT_EQ(cache_number(doc, "candidate_count"), 0);
@@ -265,7 +274,7 @@ TEST(cache_prune_failed_db_delete_preserves_sidecars) {
                            .end = cache_guard_end,
                            .before_delete = cache_guard_before};
     bool error;
-    yyjson_doc *doc = cache_call(directory, "{\"missing_root\":true}", true, &ops, &error);
+    yyjson_doc *doc = cache_call(directory, "{\"missing_root\":true,\"confirm_missing_root\":true}", true, &ops, &error);
     ASSERT_NOT_NULL(doc);
     ASSERT(error);
     ASSERT_EQ(cache_number(doc, "failed_count"), 1);
@@ -327,7 +336,7 @@ TEST(cache_reads_and_prunes_through_directory_alias) {
     cache_guard_t guard = {0};
     cbm_cache_ops_t ops = {
         .context = &guard, .try_begin = cache_guard_begin, .end = cache_guard_end};
-    doc = cache_call(alias, "{\"missing_root\":true}", true, &ops, &error);
+    doc = cache_call(alias, "{\"missing_root\":true,\"confirm_missing_root\":true}", true, &ops, &error);
     ASSERT_NOT_NULL(doc);
     bool deleted = !error && cache_number(doc, "deleted_count") == 1 &&
                    guard.began == 1 && guard.ended == 1 &&
@@ -344,9 +353,7 @@ TEST(cache_reads_and_prunes_through_directory_alias) {
 
 TEST(cache_cli_flags_map_to_tool_conditions) {
     char *argv[] = {"--missing-root", "--older-than", "30d", "--dry-run"};
-    char *error = NULL;
-    char *args = cbm_cli_build_args_json("cache_prune", 4, argv, &error);
-    ASSERT_NULL(error);
+    char *args = cbm_cache_cli_args(true, 4, argv);
     ASSERT_NOT_NULL(args);
     yyjson_doc *doc = yyjson_read(args, strlen(args), 0);
     ASSERT_NOT_NULL(doc);
@@ -415,7 +422,175 @@ TEST(cache_orphan_sidecars_preview_delete_and_recheck) {
     PASS();
 }
 
+static bool cache_guard_cancelled(void *context) {
+    return ((cache_guard_t *)context)->cancelled;
+}
+
+static int cache_fail_shm_unlink(void *context, const char *path) {
+    (void)context;
+    if (strstr(path, ".db-shm")) {
+        errno = EACCES;
+        return -1;
+    }
+    return cbm_unlink(path);
+}
+
+TEST(cache_partial_delete_reports_db_loss_and_orphans_are_retryable) {
+    char *directory = th_mktempdir("cbm-cache-partial");
+    ASSERT_NOT_NULL(directory);
+    ASSERT(cache_fixture(directory, "gone", TH_PATH(directory, "gone"), "2020-01-01T00:00:00Z"));
+    ASSERT_EQ(th_write_file(TH_PATH(directory, "gone.db-shm"), "keep"), 0);
+    cache_guard_t guard = {0};
+    cbm_cache_ops_t ops = {.context = &guard, .try_begin = cache_guard_begin,
+                           .end = cache_guard_end, .unlink_file = cache_fail_shm_unlink};
+    bool error;
+    yyjson_doc *doc = cache_call(directory, "{\"older_than\":\"30d\"}", true, &ops, &error);
+    ASSERT_NOT_NULL(doc);
+    bool partial = error && cache_number(doc, "deleted_count") == 1 &&
+                   cache_number(doc, "failed_count") == 1 && cache_number(doc, "partial_count") == 1 &&
+                   cache_number(doc, "removed_bytes") > 0 && guard.ended == 1;
+    yyjson_doc_free(doc);
+    bool db_gone = !cbm_file_exists(TH_PATH(directory, "gone.db"));
+    bool shm_kept = cbm_file_exists(TH_PATH(directory, "gone.db-shm"));
+    ops.unlink_file = NULL;
+    doc = cache_call(directory, "{\"orphan_sidecars\":true}", true, &ops, &error);
+    bool recovered = doc && !error && cache_number(doc, "deleted_count") == 1;
+    yyjson_doc_free(doc);
+    doc = cache_call(directory, "{\"orphan_sidecars\":true}", true, &ops, &error);
+    bool repeated = doc && !error && cache_number(doc, "candidate_count") == 0;
+    yyjson_doc_free(doc);
+    th_rmtree(directory);
+    ASSERT(partial && db_gone && shm_kept && recovered && repeated);
+    PASS();
+}
+
+TEST(cache_cancellation_releases_guard_and_preserves_database) {
+    char *directory = th_mktempdir("cbm-cache-cancel");
+    ASSERT_NOT_NULL(directory);
+    ASSERT(cache_fixture(directory, "gone", TH_PATH(directory, "gone"), "2020-01-01T00:00:00Z"));
+    cache_guard_t guard = {.cancel_after_begin = true};
+    cbm_cache_ops_t ops = {.context = &guard, .try_begin = cache_guard_begin,
+                           .end = cache_guard_end, .cancelled = cache_guard_cancelled};
+    bool error;
+    yyjson_doc *doc = cache_call(directory, "{\"older_than\":\"30d\"}", true, &ops, &error);
+    ASSERT_NOT_NULL(doc);
+    bool cancelled = error && cache_number(doc, "deleted_count") == 0 && guard.ended == 1 &&
+                     yyjson_get_bool(yyjson_obj_get(yyjson_doc_get_root(doc), "cancelled")) &&
+                     cbm_file_exists(TH_PATH(directory, "gone.db"));
+    yyjson_doc_free(doc);
+    guard.cancelled = false;
+    guard.cancel_after_begin = false;
+    doc = cache_call(directory, "{\"older_than\":\"30d\"}", true, &ops, &error);
+    bool retried = doc && !error && cache_number(doc, "deleted_count") == 1 && guard.ended == 2;
+    yyjson_doc_free(doc);
+    th_rmtree(directory);
+    ASSERT(cancelled && retried);
+    PASS();
+}
+
+TEST(cache_adrs_are_protected_unless_explicitly_included) {
+    char *directory = th_mktempdir("cbm-cache-adr");
+    ASSERT_NOT_NULL(directory);
+    ASSERT(cache_fixture(directory, "gone", TH_PATH(directory, "gone"), "2020-01-01T00:00:00Z"));
+    sqlite3 *db = NULL;
+    ASSERT_EQ(sqlite3_open(TH_PATH(directory, "gone.db"), &db), SQLITE_OK);
+    ASSERT_EQ(sqlite3_exec(db, "CREATE TABLE project_summaries(project TEXT, summary TEXT);"
+                               "INSERT INTO project_summaries VALUES('gone','irreplaceable ADR')",
+                          NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_close(db);
+    cache_guard_t guard = {0};
+    cbm_cache_ops_t ops = {.context = &guard, .try_begin = cache_guard_begin, .end = cache_guard_end};
+    bool error;
+    yyjson_doc *doc = cache_call(directory,
+        "{\"missing_root\":true,\"confirm_missing_root\":true}", true, &ops, &error);
+    ASSERT_NOT_NULL(doc);
+    bool protected = !error && cache_number(doc, "candidate_count") == 0 && guard.began == 0 &&
+                     cbm_file_exists(TH_PATH(directory, "gone.db"));
+    yyjson_doc_free(doc);
+    doc = cache_call(directory,
+        "{\"missing_root\":true,\"confirm_missing_root\":true,\"include_adrs\":true}",
+        true, &ops, &error);
+    bool included = doc && !error && cache_number(doc, "deleted_count") == 1;
+    yyjson_doc_free(doc);
+    th_rmtree(directory);
+    ASSERT(protected && included);
+    PASS();
+}
+
+TEST(cache_missing_root_requires_explicit_confirmation) {
+    bool error;
+    yyjson_doc *doc = cache_call("unused", "{\"missing_root\":true}", true, NULL, &error);
+    ASSERT_NOT_NULL(doc);
+    const char *message = yyjson_get_str(yyjson_obj_get(yyjson_doc_get_root(doc), "error"));
+    bool confirmed = error && message && strstr(message, "confirm-missing-root");
+    yyjson_doc_free(doc);
+    ASSERT(confirmed);
+    PASS();
+}
+
+TEST(cache_cli_parser_rejects_duplicate_and_unknown_flags) {
+    char *duplicate[] = {"--missing-root", "--dry-run", "--dry-run=false"};
+    char *unknown[] = {"--missing-root", "--include-adrs=yes"};
+    char *missing[] = {"--older-than"};
+    ASSERT_NULL(cbm_cache_cli_args(true, 3, duplicate));
+    ASSERT_NULL(cbm_cache_cli_args(true, 2, unknown));
+    ASSERT_NULL(cbm_cache_cli_args(true, 1, missing));
+    ASSERT_NULL(cbm_cache_cli_args(false, 1, duplicate));
+    PASS();
+}
+
+#ifndef _WIN32
+static int cache_exit_after_database_unlink(void *context, const char *path) {
+    (void)context;
+    int rc = cbm_unlink(path);
+    size_t length = strlen(path);
+    if (rc == 0 && length >= 3 && strcmp(path + length - 3, ".db") == 0) {
+        _exit(17); /* abrupt loss after DB removal, before sidecar cleanup */
+    }
+    return rc;
+}
+
+TEST(cache_interrupted_database_delete_can_recover_orphan_sidecars) {
+    char *directory = th_mktempdir("cbm-cache-interrupted");
+    ASSERT_NOT_NULL(directory);
+    ASSERT(cache_fixture(directory, "gone", TH_PATH(directory, "gone"), "2020-01-01T00:00:00Z"));
+    ASSERT_EQ(th_write_file(TH_PATH(directory, "gone.db-shm"), "keep"), 0);
+    cache_guard_t guard = {0};
+    cbm_cache_ops_t ops = {.context = &guard, .try_begin = cache_guard_begin,
+                           .end = cache_guard_end, .unlink_file = cache_exit_after_database_unlink};
+    pid_t child = fork();
+    ASSERT(child >= 0);
+    if (child == 0) {
+        bool error;
+        yyjson_doc *doc = cache_call(directory, "{\"older_than\":\"30d\"}", true, &ops, &error);
+        yyjson_doc_free(doc);
+        _exit(18);
+    }
+    int status = 0;
+    bool interrupted = waitpid(child, &status, 0) == child && WIFEXITED(status) &&
+                       WEXITSTATUS(status) == 17 &&
+                       !cbm_file_exists(TH_PATH(directory, "gone.db")) &&
+                       cbm_file_exists(TH_PATH(directory, "gone.db-shm"));
+    ops.unlink_file = NULL;
+    bool error;
+    yyjson_doc *doc = cache_call(directory, "{\"orphan_sidecars\":true}", true, &ops, &error);
+    bool recovered = doc && !error && cache_number(doc, "deleted_count") == 1 && guard.ended == 1;
+    yyjson_doc_free(doc);
+    th_rmtree(directory);
+    ASSERT(interrupted && recovered);
+    PASS();
+}
+#endif
+
 SUITE(cache) {
+#ifndef _WIN32
+    RUN_TEST(cache_interrupted_database_delete_can_recover_orphan_sidecars);
+#endif
+    RUN_TEST(cache_partial_delete_reports_db_loss_and_orphans_are_retryable);
+    RUN_TEST(cache_cancellation_releases_guard_and_preserves_database);
+    RUN_TEST(cache_adrs_are_protected_unless_explicitly_included);
+    RUN_TEST(cache_missing_root_requires_explicit_confirmation);
+    RUN_TEST(cache_cli_parser_rejects_duplicate_and_unknown_flags);
 #ifndef _WIN32
     RUN_TEST(cache_reads_and_prunes_through_directory_alias);
 #endif

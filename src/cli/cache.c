@@ -33,13 +33,22 @@ enum {
     CACHE_OPTION_MISSING = 1,
     CACHE_OPTION_DRY_RUN = 2,
     CACHE_OPTION_AGE = 4,
-    CACHE_OPTION_ORPHANS = 8
+    CACHE_OPTION_ORPHANS = 8,
+    CACHE_OPTION_CONFIRM = 16,
+    CACHE_OPTION_ADRS = 32,
+    CACHE_URI_ESCAPE = 3,
+    CACHE_URI_EXTRA = 32,
+    CACHE_URI_PREFIX_LENGTH = sizeof("file:") - 1,
+    CACHE_HEX_SHIFT = 4,
+    CACHE_HEX_MASK = 15
 };
 
 typedef struct {
     bool missing_root;
     bool orphan_sidecars;
     bool dry_run;
+    bool confirm_missing_root;
+    bool include_adrs;
     int64_t older_than;
 } cache_options_t;
 
@@ -47,6 +56,7 @@ typedef struct {
     char *name;
     char *root;
     char *indexed_at;
+    bool has_adrs;
     int64_t indexed_seconds;
     int64_t bytes;
     const char *root_status;
@@ -121,6 +131,14 @@ static bool cache_parse_option(const char *name, yyjson_val *value, cache_option
         options->dry_run = yyjson_get_bool(value);
         return true;
     }
+    if (strcmp(name, "confirm_missing_root") == 0 && yyjson_is_bool(value)) {
+        options->confirm_missing_root = yyjson_get_bool(value);
+        return true;
+    }
+    if (strcmp(name, "include_adrs") == 0 && yyjson_is_bool(value)) {
+        options->include_adrs = yyjson_get_bool(value);
+        return true;
+    }
     return strcmp(name, "older_than") == 0 && yyjson_is_str(value) &&
            cache_duration(yyjson_get_str(value), &options->older_than);
 }
@@ -147,6 +165,10 @@ static const char *cache_parse_options(const char *args, bool prune, cache_optio
                 bit = CACHE_OPTION_AGE;
             } else if (strcmp(name, "orphan_sidecars") == 0) {
                 bit = CACHE_OPTION_ORPHANS;
+            } else if (strcmp(name, "confirm_missing_root") == 0) {
+                bit = CACHE_OPTION_CONFIRM;
+            } else if (strcmp(name, "include_adrs") == 0) {
+                bit = CACHE_OPTION_ADRS;
             }
             if (seen & bit) {
                 error = "duplicate cache option";
@@ -163,8 +185,13 @@ static const char *cache_parse_options(const char *args, bool prune, cache_optio
             error = "prune requires missing_root, older_than, or orphan_sidecars";
         }
     }
-    if (!error && options->orphan_sidecars && (options->missing_root || options->older_than)) {
+    if (!error && options->orphan_sidecars &&
+        (options->missing_root || options->older_than || options->confirm_missing_root ||
+         options->include_adrs)) {
         error = "orphan_sidecars must be used alone: orphan files have no root or index timestamp";
+    }
+    if (!error && options->confirm_missing_root && !options->missing_root) {
+        error = "confirm_missing_root requires missing_root";
     }
     yyjson_doc_free(doc);
     return error;
@@ -175,7 +202,7 @@ static void cache_read_root_status(cache_record_t *record) {
         cbm_path_info_t info;
         int status = cbm_path_info_utf8(record->root, &info);
         if (status == CBM_PATH_INFO_OK && !info.is_symlink) {
-            record->root_status = info.is_directory ? "present" : "missing";
+            record->root_status = info.is_directory ? "present" : "unknown";
         } else if (status == CBM_PATH_INFO_ABSENT) {
             record->root_status = "missing";
         } else if (status == CBM_PATH_INFO_OK && info.is_symlink && cbm_is_dir(record->root)) {
@@ -186,6 +213,80 @@ static void cache_read_root_status(cache_record_t *record) {
     }
 }
 
+/* Immutable reads never create SHM, acquire SQLite locks, or recover journals.
+ * They are valid only for a stable main DB with NO WAL/rollback journal. Never
+ * silently read stale main-file metadata while committed data lives in a WAL. */
+static bool cache_has_no_journal(const char *directory, const char *file) {
+    const char *suffixes[] = {"-wal", "-journal"};
+    for (size_t i = 0; i < sizeof(suffixes) / sizeof(suffixes[0]); i++) {
+        char *path = cache_path(directory, file, suffixes[i]);
+        cbm_path_info_t info;
+        int status = path ? cbm_path_info_utf8(path, &info) : CBM_PATH_INFO_UNAVAILABLE;
+        cbm_free(CBM_MEM_CLASS_OTHER, path);
+        if (status != CBM_PATH_INFO_ABSENT) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static char *cache_immutable_uri(const char *path) {
+    size_t length = strlen(path);
+    if (length > (SIZE_MAX - CACHE_URI_EXTRA) / CACHE_URI_ESCAPE) {
+        return NULL;
+    }
+    char *uri = cbm_alloc(CBM_MEM_CLASS_OTHER, length * CACHE_URI_ESCAPE + CACHE_URI_EXTRA);
+    if (!uri) {
+        return NULL;
+    }
+    char *out = uri;
+    memcpy(out, "file:", CACHE_URI_PREFIX_LENGTH);
+    out += CACHE_URI_PREFIX_LENGTH;
+    static const char hex[] = "0123456789ABCDEF";
+    for (const unsigned char *in = (const unsigned char *)path; *in; in++) {
+        unsigned char ch = *in;
+#ifdef _WIN32
+        if (ch == '\\') {
+            ch = '/';
+        }
+#endif
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ||
+            ch == '/' || ch == ':' || ch == '-' || ch == '_' || ch == '.') {
+            *out++ = (char)ch;
+        } else {
+            *out++ = '%';
+            *out++ = hex[ch >> CACHE_HEX_SHIFT];
+            *out++ = hex[ch & CACHE_HEX_MASK];
+        }
+    }
+    memcpy(out, "?immutable=1", sizeof("?immutable=1"));
+    return uri;
+}
+
+static void cache_read_adrs(sqlite3 *db, cache_record_t *record) {
+    sqlite3_stmt *stmt = NULL;
+    int rc = sqlite3_prepare_v2(db, "SELECT 1 FROM sqlite_master WHERE name='project_summaries'",
+                                -1, &stmt, NULL);
+    int step = rc == SQLITE_OK ? sqlite3_step(stmt) : rc;
+    sqlite3_finalize(stmt);
+    if (step == SQLITE_DONE) {
+        return; /* Legacy cache without ADR storage. */
+    }
+    if (step != SQLITE_ROW) {
+        record->problem = "unreadable_adr_metadata";
+        return;
+    }
+    stmt = NULL;
+    rc = sqlite3_prepare_v2(db, "SELECT 1 FROM project_summaries LIMIT 1", CACHE_SQL_NUL_TERMINATED,
+                            &stmt, NULL);
+    step = rc == SQLITE_OK ? sqlite3_step(stmt) : rc;
+    record->has_adrs = step == SQLITE_ROW;
+    if (step != SQLITE_ROW && step != SQLITE_DONE) {
+        record->problem = "unreadable_adr_metadata";
+    }
+    sqlite3_finalize(stmt);
+}
+
 static void cache_read_metadata(const char *directory, const char *file, cache_record_t *record) {
     /* SQLite NOFOLLOW rejects links in any path component, including macOS
      * /var -> /private/var. Resolve only the directory: the database itself
@@ -194,11 +295,22 @@ static void cache_read_metadata(const char *directory, const char *file, cache_r
     char *path = cbm_canonical_path(directory, canonical, sizeof(canonical))
                      ? cache_path(canonical, file, "")
                      : NULL;
+    cbm_path_info_t before = {0}, after = {0};
+    bool stable = path && cbm_path_info_utf8(path, &before) == CBM_PATH_INFO_OK &&
+                  before.is_regular && !before.is_symlink && cache_has_no_journal(directory, file);
+    if (!stable) {
+        record->problem = "journal_or_unavailable_database";
+        cbm_free(CBM_MEM_CLASS_OTHER, path);
+        return;
+    }
+    char *uri = cache_immutable_uri(path);
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
-    int rc = path ? sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW, NULL)
-                  : SQLITE_NOMEM;
-    cbm_free(CBM_MEM_CLASS_OTHER, path);
+    int rc =
+        uri ? sqlite3_open_v2(uri, &db,
+                              SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW | SQLITE_OPEN_URI, NULL)
+            : SQLITE_NOMEM;
+    cbm_free(CBM_MEM_CLASS_OTHER, uri);
     if (rc == SQLITE_OK) {
         rc = sqlite3_prepare_v2(
             db,
@@ -226,7 +338,16 @@ static void cache_read_metadata(const char *directory, const char *file, cache_r
         record->problem = "unreadable_metadata";
     }
     sqlite3_finalize(stmt);
+    if (!record->problem) {
+        cache_read_adrs(db, record);
+    }
     sqlite3_close(db);
+    if (cbm_path_info_utf8(path, &after) != CBM_PATH_INFO_OK || !after.is_regular ||
+        after.is_symlink || before.size != after.size || before.mtime_ns != after.mtime_ns ||
+        !cache_has_no_journal(directory, file)) {
+        record->problem = "database_changed";
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, path);
 }
 
 /* Read only metadata, without schema migration, recovery, or opening a graph store.
@@ -255,7 +376,7 @@ static void cache_read_record(const char *directory, const char *file, cache_rec
 
 static bool cache_matches(const cache_record_t *record, const cache_options_t *options,
                           int64_t now) {
-    return !record->problem &&
+    return !record->problem && (!record->has_adrs || options->include_adrs) &&
            (!options->missing_root || strcmp(record->root_status, "missing") == 0) &&
            (!options->older_than ||
             (record->indexed_seconds > 0 && record->indexed_seconds <= now &&
@@ -264,7 +385,8 @@ static bool cache_matches(const cache_record_t *record, const cache_options_t *o
 
 /* Delete DB first. If that fails, leave its WAL intact. Count only bytes from
  * successful unlinks, and report partial failures rather than claiming success. */
-static bool cache_remove(const char *directory, const char *file, int64_t *removed_bytes) {
+static int cache_remove(const char *directory, const char *file, int64_t *removed_bytes,
+                        const cbm_cache_ops_t *ops) {
     bool ok = true;
     for (size_t i = 0; i < sizeof(cache_suffixes) / sizeof(cache_suffixes[0]); i++) {
         char *path = cache_path(directory, file, cache_suffixes[i]);
@@ -274,8 +396,9 @@ static bool cache_remove(const char *directory, const char *file, int64_t *remov
             cbm_free(CBM_MEM_CLASS_OTHER, path);
             continue;
         }
-        bool removed = status == CBM_PATH_INFO_OK && info.is_regular && !info.is_symlink &&
-                       cbm_unlink(path) == 0;
+        bool removed =
+            status == CBM_PATH_INFO_OK && info.is_regular && !info.is_symlink &&
+            (ops->unlink_file ? ops->unlink_file(ops->context, path) : cbm_unlink(path)) == 0;
         if (removed) {
             *removed_bytes += info.size;
         } else {
@@ -283,10 +406,10 @@ static bool cache_remove(const char *directory, const char *file, int64_t *remov
         }
         cbm_free(CBM_MEM_CLASS_OTHER, path);
         if (!removed && i == 0) {
-            break;
+            return 0;
         }
     }
-    return ok;
+    return ok ? 1 : 2;
 }
 
 /* Immediate children only. Do not follow links or silently include log-tree
@@ -351,7 +474,7 @@ static void cache_inventory_add(cache_inventory_t *inventory, const char *direct
 }
 
 static void cache_inventory_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
-                                 const cache_inventory_t *inventory) {
+                                 const cache_inventory_t *inventory, bool cancelled) {
     static const char *const names[CACHE_ENTRY_KIND_COUNT] = {
         "project_database", "internal_database", "wal",   "shm",
         "directory",        "symlink",           "other", "unavailable"};
@@ -377,7 +500,7 @@ static void cache_inventory_json(yyjson_mut_doc *doc, yyjson_mut_val *root,
     yyjson_mut_obj_add_int(doc, inventory_json, "orphan_sidecar_count", inventory->orphan_sidecars);
     yyjson_mut_obj_add_int(doc, inventory_json, "orphan_sidecar_bytes", inventory->orphan_bytes);
     yyjson_mut_obj_add_bool(doc, inventory_json, "complete",
-                            inventory->counts[CACHE_ENTRY_UNAVAILABLE] == 0);
+                            inventory->counts[CACHE_ENTRY_UNAVAILABLE] == 0 && !cancelled);
 }
 
 typedef struct {
@@ -391,7 +514,13 @@ typedef struct {
     int64_t removed_bytes;
     int64_t failed;
     int64_t busy;
+    int64_t partial;
+    bool cancelled;
 } cache_totals_t;
+
+static bool cache_cancelled(const cbm_cache_ops_t *ops) {
+    return ops && ops->cancelled && ops->cancelled(ops->context);
+}
 
 static const char *cache_prune_record(const char *directory, const char *file,
                                       const cache_record_t *record, const cache_options_t *options,
@@ -410,12 +539,20 @@ static const char *cache_prune_record(const char *directory, const char *file,
             if (ops->before_delete) {
                 ops->before_delete(ops->context, record->name);
             }
-            bool removed = cache_remove(directory, file, &totals->removed_bytes);
-            status = removed ? "deleted" : "delete_failed";
-            totals->deleted += removed;
-            totals->failed += !removed;
-            if (removed && ops->after_delete) {
-                ops->after_delete(ops->context, record->name);
+            if (cache_cancelled(ops)) {
+                totals->cancelled = true;
+                status = "cancelled";
+            } else {
+                int removed = cache_remove(directory, file, &totals->removed_bytes, ops);
+                status = removed == 1   ? "deleted"
+                         : removed == 2 ? "partial_delete"
+                                        : "delete_failed";
+                totals->deleted += removed != 0;
+                totals->failed += removed != 1;
+                totals->partial += removed == 2;
+                if (removed && ops->after_delete) {
+                    ops->after_delete(ops->context, record->name);
+                }
             }
         }
         cache_record_free(&current);
@@ -435,7 +572,9 @@ static void cache_process_record(const char *directory, const char *file,
     totals->valid += !record.problem;
     totals->missing += strcmp(record.root_status, "missing") == 0;
     bool match = prune && !options->orphan_sidecars && cache_matches(&record, options, now);
-    const char *status = record.problem ? record.problem : "kept";
+    const char *status = record.problem                              ? record.problem
+                         : record.has_adrs && !options->include_adrs ? "protected_adrs"
+                                                                     : "kept";
     if (match) {
         totals->candidates++;
         totals->candidate_bytes += record.bytes;
@@ -454,6 +593,11 @@ static void cache_process_record(const char *directory, const char *file,
     }
     if (record.indexed_at) {
         yyjson_mut_obj_add_strcpy(doc, item, "indexed_at", record.indexed_at);
+    }
+    if (record.problem) {
+        yyjson_mut_obj_add_null(doc, item, "has_adrs");
+    } else {
+        yyjson_mut_obj_add_bool(doc, item, "has_adrs", record.has_adrs);
     }
     yyjson_mut_obj_add_str(doc, item, "root_status", record.root_status);
     yyjson_mut_obj_add_int(doc, item, "size_bytes", record.bytes);
@@ -500,8 +644,11 @@ static const char *cache_remove_orphan(const char *path, const char *database, c
             ops->before_delete(ops->context, project);
         }
         /* Closing a stale store can checkpoint or remove its sidecars. */
-        if (cache_orphan_info(path, database, &info)) {
-            if (cbm_unlink(path) == 0) {
+        if (cache_cancelled(ops)) {
+            totals->cancelled = true;
+            status = "cancelled";
+        } else if (cache_orphan_info(path, database, &info)) {
+            if ((ops->unlink_file ? ops->unlink_file(ops->context, path) : cbm_unlink(path)) == 0) {
                 totals->deleted++;
                 totals->removed_bytes += info.size;
                 status = "deleted";
@@ -574,6 +721,10 @@ static void cache_scan(const char *directory, cbm_dir_t *dir, const cache_option
     cache_inventory_t inventory = {0};
     cbm_dirent_t *entry;
     while (dir && (entry = cbm_readdir(dir))) {
+        if (cache_cancelled(ops)) {
+            totals.cancelled = true;
+            break;
+        }
         if (strcmp(entry->name, ".") == 0 || strcmp(entry->name, "..") == 0) {
             continue;
         }
@@ -590,8 +741,9 @@ static void cache_scan(const char *directory, cbm_dir_t *dir, const cache_option
                              &totals);
     }
     cbm_closedir(dir);
-    cache_inventory_json(doc, root, &inventory);
-    yyjson_mut_obj_add_bool(doc, root, "has_more", false);
+    cache_inventory_json(doc, root, &inventory, totals.cancelled);
+    yyjson_mut_obj_add_bool(doc, root, "has_more", totals.cancelled);
+    yyjson_mut_obj_add_bool(doc, root, "cancelled", totals.cancelled);
     yyjson_mut_obj_add_int(doc, root, "returned", totals.count);
     yyjson_mut_obj_add_int(doc, root, "database_count", totals.count);
     yyjson_mut_obj_add_int(doc, root, "project_count", totals.valid);
@@ -605,7 +757,8 @@ static void cache_scan(const char *directory, cbm_dir_t *dir, const cache_option
         yyjson_mut_obj_add_int(doc, root, "removed_bytes", totals.removed_bytes);
         yyjson_mut_obj_add_int(doc, root, "failed_count", totals.failed);
         yyjson_mut_obj_add_int(doc, root, "busy_count", totals.busy);
-        *is_error = totals.failed > 0 || totals.busy > 0;
+        yyjson_mut_obj_add_int(doc, root, "partial_count", totals.partial);
+        *is_error = totals.failed > 0 || totals.busy > 0 || totals.cancelled;
     }
 }
 
@@ -621,6 +774,11 @@ char *cbm_cache_run(const char *directory, const char *args, bool prune, const c
     }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
     yyjson_mut_doc_set_root(doc, root);
+    if (!error && prune && !options.dry_run && options.missing_root &&
+        !options.confirm_missing_root) {
+        error = "missing-root deletion requires --confirm-missing-root: verify the source is not "
+                "temporarily offline";
+    }
     if (!error && prune && !options.dry_run && (!ops || !ops->try_begin || !ops->end)) {
         error = "prune requires a project mutation guard";
     }
@@ -650,6 +808,46 @@ char *cbm_cache_run(const char *directory, const char *args, bool prune, const c
     yyjson_mut_doc_free(doc);
     if (!json) {
         *is_error = true;
+    }
+    return json;
+}
+
+char *cbm_cache_cli_args(bool prune, int argc, char **argv) {
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    const char *flags[] = {"--missing-root", "--dry-run", "--orphan-sidecars",
+                           "--confirm-missing-root", "--include-adrs"};
+    const char *keys[] = {"missing_root", "dry_run", "orphan_sidecars", "confirm_missing_root",
+                          "include_adrs"};
+    bool valid = true;
+    for (int i = 0; valid && i < argc; i++) {
+        bool found = false;
+        for (size_t j = 0; j < sizeof(flags) / sizeof(flags[0]); j++) {
+            size_t length = strlen(flags[j]);
+            if (strncmp(argv[i], flags[j], length) != 0) {
+                continue;
+            }
+            const char *value = argv[i] + length;
+            if (*value == '\0' || strcmp(value, "=true") == 0 || strcmp(value, "=false") == 0) {
+                found = yyjson_mut_obj_add_bool(doc, root, keys[j], strcmp(value, "=false") != 0);
+                break;
+            }
+        }
+        if (!found && strcmp(argv[i], "--older-than") == 0 && i + 1 < argc) {
+            found = yyjson_mut_obj_add_strcpy(doc, root, "older_than", argv[++i]);
+        }
+        valid = found;
+    }
+    char *json = valid ? yyjson_mut_write(doc, 0, NULL) : NULL;
+    yyjson_mut_doc_free(doc);
+    cache_options_t options = {0};
+    if (json && cache_parse_options(json, prune, &options)) {
+        cbm_free_untracked(json);
+        return NULL;
     }
     return json;
 }

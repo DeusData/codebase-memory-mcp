@@ -22,6 +22,7 @@
 #endif
 #include <windows.h>
 #else
+#include <signal.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -1022,7 +1023,81 @@ TEST(version_cohort_crash_releases_process_lifetime_lease) {
 #endif
 }
 
+TEST(version_cohort_idle_maintenance_refuses_users_and_blocks_admission) {
+    version_cohort_fixture_t fixture;
+    ASSERT(version_cohort_fixture_start(&fixture, "idle-maintenance"));
+    cbm_version_cohort_manager_t *user = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_manager_t *collector = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_lease_t *active = NULL, *exclusive = NULL;
+    cbm_daemon_conflict_t conflict;
+    cbm_daemon_build_identity_t identity = version_cohort_identity("1.0.0", VERSION_COHORT_BUILD_A);
+    bool admitted = cbm_version_cohort_acquire(user, &identity, cbm_now_ms(), &active,
+                                               &conflict) == CBM_VERSION_COHORT_OK;
+    bool refused = cbm_version_cohort_reserve_idle(collector, cbm_now_ms(), &exclusive) ==
+                       CBM_VERSION_COHORT_BUSY && exclusive == NULL &&
+                   cbm_version_cohort_maintenance_presence(user) == CBM_VERSION_COHORT_MAINTENANCE_ABSENT;
+    version_cohort_release(&exclusive);
+    version_cohort_release(&active);
+    bool reserved = cbm_version_cohort_reserve_idle(collector, cbm_now_ms(), &exclusive) ==
+                    CBM_VERSION_COHORT_OK;
+    bool blocked = cbm_version_cohort_acquire(user, &identity, cbm_now_ms(), &active,
+                                              &conflict) == CBM_VERSION_COHORT_BUSY;
+    version_cohort_release(&active);
+    version_cohort_release(&exclusive);
+    bool retried = cbm_version_cohort_acquire(user, &identity, cbm_now_ms(), &active,
+                                              &conflict) == CBM_VERSION_COHORT_OK;
+    version_cohort_release(&active);
+    version_cohort_manager_close(&collector);
+    version_cohort_manager_close(&user);
+    version_cohort_fixture_finish(&fixture);
+    ASSERT(admitted && refused && reserved && blocked && retried);
+    PASS();
+}
+
+#ifndef _WIN32
+TEST(version_cohort_idle_maintenance_is_released_on_process_death) {
+    version_cohort_fixture_t fixture;
+    ASSERT(version_cohort_fixture_start(&fixture, "idle-crash"));
+    int ready[2];
+    ASSERT_EQ(pipe(ready), 0);
+    pid_t child = fork();
+    ASSERT(child >= 0);
+    if (child == 0) {
+        close(ready[0]);
+        cbm_version_cohort_manager_t *manager = cbm_version_cohort_manager_new(fixture.endpoint);
+        cbm_version_cohort_lease_t *lease = NULL;
+        char acquired = cbm_version_cohort_reserve_idle(manager, cbm_now_ms(), &lease) ==
+                        CBM_VERSION_COHORT_OK;
+        (void)write(ready[1], &acquired, 1);
+        close(ready[1]);
+        for (;;) {
+            pause();
+        }
+    }
+    close(ready[1]);
+    char acquired = 0;
+    bool signalled = read(ready[0], &acquired, 1) == 1 && acquired;
+    close(ready[0]);
+    kill(child, SIGKILL);
+    int status = 0;
+    bool reaped = waitpid(child, &status, 0) == child && WIFSIGNALED(status);
+    cbm_version_cohort_manager_t *manager = cbm_version_cohort_manager_new(fixture.endpoint);
+    cbm_version_cohort_lease_t *lease = NULL;
+    bool recovered = cbm_version_cohort_reserve_idle(manager, cbm_now_ms(), &lease) ==
+                     CBM_VERSION_COHORT_OK;
+    version_cohort_release(&lease);
+    version_cohort_manager_close(&manager);
+    version_cohort_fixture_finish(&fixture);
+    ASSERT(signalled && reaped && recovered);
+    PASS();
+}
+#endif
+
 SUITE(version_cohort) {
+    RUN_TEST(version_cohort_idle_maintenance_refuses_users_and_blocks_admission);
+#ifndef _WIN32
+    RUN_TEST(version_cohort_idle_maintenance_is_released_on_process_death);
+#endif
     RUN_TEST(version_cohort_shares_exact_build_rejects_conflict_and_turns_over);
     RUN_TEST(version_cohort_rejects_same_hash_with_different_abi);
     RUN_TEST(version_cohort_rejects_missing_cache_fingerprint);

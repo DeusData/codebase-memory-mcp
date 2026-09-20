@@ -403,7 +403,7 @@ STORE_SRCS = src/store/store.c
 CYPHER_SRCS = src/cypher/cypher.c
 
 # MCP server module (new)
-MCP_SRCS = src/mcp/cache.c src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
+MCP_SRCS = src/mcp/mcp.c src/mcp/index_supervisor.c src/mcp/compact_out.c
 
 # Shared MCP daemon coordination and local transport
 DAEMON_SRCS = \
@@ -483,7 +483,7 @@ WATCHER_SRCS = src/watcher/watcher.c
 GIT_SRCS = src/git/git_context.c
 
 # CLI module (new)
-CLI_SRCS = src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
+CLI_SRCS = src/cli/cache.c src/cli/cli.c src/cli/progress_sink.c src/cli/hook_augment.c src/cli/client_adapter.c \
 	src/cli/agent_clients.c src/cli/agent_profiles.c \
 	src/cli/config_json_like.c src/cli/config_toml_edit.c src/cli/config_yaml_edit.c \
 	src/cli/config_text_edit.c src/cli/config_edit_path.c src/cli/activation_transaction.c
@@ -651,7 +651,7 @@ TEST_STORE_SRCS = \
 TEST_CYPHER_SRCS = \
     tests/test_cypher.c
 
-TEST_MCP_SRCS = tests/test_cache.c \
+TEST_MCP_SRCS = \
     tests/test_mcp.c \
     tests/test_index_supervisor.c
 
@@ -719,7 +719,7 @@ TEST_INTEGRATION_SRCS = tests/test_integration.c tests/test_incremental.c tests/
 TEST_TRACES_SRCS = tests/test_traces.c
 
 
-TEST_CLI_SRCS = tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
+TEST_CLI_SRCS = tests/test_cache.c tests/test_cli.c tests/test_agent_clients.c tests/test_agent_profiles.c \
 	tests/test_config_json_like.c \
 	tests/test_config_toml_edit.c tests/test_config_yaml_edit.c tests/test_config_text_edit.c \
 	tests/test_activation_transaction.c
@@ -1425,3 +1425,7 @@ security: cbm
 	scripts/security-fuzz.sh $(BUILD_DIR)/codebase-memory-mcp
 	scripts/security-vendored.sh
 	@echo "=== All security checks passed ==="
+
+.PHONY: test-cache-cli
+test-cache-cli: $(BUILD_DIR)/codebase-memory-mcp
+	python3 tests/test_cache_cli.py $(BUILD_DIR)/codebase-memory-mcp

@@ -733,6 +733,40 @@ cbm_version_cohort_status_t cbm_version_cohort_reserve_exclusive(
                                                         &ignored_quiesce, lease_out, false);
 }
 
+cbm_version_cohort_status_t cbm_version_cohort_reserve_idle(
+    cbm_version_cohort_manager_t *manager, uint64_t deadline_ms,
+    cbm_version_cohort_lease_t **lease_out) {
+    if (lease_out) {
+        *lease_out = NULL;
+    }
+    if (!manager || !lease_out) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    cbm_version_cohort_lease_t *lease = version_cohort_lease_new(manager);
+    if (!lease) {
+        return CBM_VERSION_COHORT_IO;
+    }
+    /* SH is deliberate: a failed cleanup attempt must never publish the EX
+     * maintenance intent that active daemons interpret as a shutdown request. */
+    cbm_private_file_lock_status_t status =
+        version_cohort_lock_until(manager, VERSION_COHORT_MAINTENANCE_FILE,
+                                  CBM_PRIVATE_FILE_LOCK_SH, deadline_ms, &lease->maintenance);
+    if (status == CBM_PRIVATE_FILE_LOCK_OK) {
+        status =
+            version_cohort_lock_until(manager, VERSION_COHORT_ADMISSION_FILE,
+                                      CBM_PRIVATE_FILE_LOCK_EX, deadline_ms, &lease->admission);
+    }
+    if (status == CBM_PRIVATE_FILE_LOCK_OK) {
+        status = cbm_private_file_lock_try_acquire(manager->directory, VERSION_COHORT_LIFETIME_FILE,
+                                                   CBM_PRIVATE_FILE_LOCK_EX, &lease->lifetime);
+    }
+    if (status != CBM_PRIVATE_FILE_LOCK_OK) {
+        return version_cohort_failed(lease, version_cohort_status_from_lock(status), lease_out);
+    }
+    *lease_out = lease;
+    return CBM_VERSION_COHORT_OK;
+}
+
 static cbm_version_cohort_maintenance_presence_t version_cohort_maintenance_presence_internal(
     cbm_version_cohort_manager_t *manager, bool terminal_observer) {
     if (!manager || !version_cohort_manager_register(manager)) {

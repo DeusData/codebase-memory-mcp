@@ -1410,8 +1410,6 @@ TEST(mcp_tools_have_behavior_annotations) {
         {"search_code", true, false, true, false},
         {"list_projects", true, false, true, false},
         {"delete_project", false, true, true, false},
-        {"cache_stats", true, false, true, false},
-        {"cache_prune", false, true, true, false},
         {"index_status", true, false, true, false},
         {"check_index_coverage", true, false, true, false},
         {"detect_changes", true, false, true, false},
@@ -20281,7 +20279,23 @@ TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
     PASS();
 }
 
+TEST(mcp_cache_maintenance_is_not_a_public_tool) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    const char *names[] = {"cache_stats", "cache_prune"};
+    bool rejected = true;
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        char *result = cbm_mcp_handle_tool(srv, names[i], "{}");
+        rejected = rejected && result && strstr(result, "unknown tool:") != NULL;
+        free(result);
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT(rejected);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(mcp_cache_maintenance_is_not_a_public_tool);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
     RUN_TEST(bm25_finds_module_by_promoted_description_issue519);

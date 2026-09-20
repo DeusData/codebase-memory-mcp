@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -115,7 +116,7 @@ class CacheCLI(unittest.TestCase):
         preview = self.run_cache("prune", "--missing-root", "--dry-run")
         self.assertEqual(preview.returncode, 0, preview.stderr)
         self.assertEqual(json.loads(preview.stdout)["candidate_count"], 1)
-        result = self.run_cache("prune", "--missing-root")
+        result = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn(b"Preparing one-shot", result.stderr)
         report = json.loads(result.stdout)
@@ -124,7 +125,7 @@ class CacheCLI(unittest.TestCase):
         self.assertFalse((self.cache / "gone.db").exists())
         self.assertEqual((self.cache / "live.db").read_bytes(), live_before)
         self.assertTrue(self.source.is_dir())
-        again = self.run_cache("prune", "--missing-root")
+        again = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertEqual(json.loads(again.stdout)["deleted_count"], 0)
 
@@ -152,7 +153,7 @@ class CacheCLI(unittest.TestCase):
         self.assertFalse(list(self.cache.glob("*.db-wal")))
         self.assertFalse(list(self.cache.glob("*.db-shm")))
 
-    def test_real_prune_with_running_daemon(self):
+    def test_real_prune_refuses_running_daemon_without_stopping_it(self):
         runtime = self.root / "runtime"
         runtime.mkdir(mode=0o700)
         self.env["CBM_RUNTIME_DIR"] = str(runtime)
@@ -160,15 +161,28 @@ class CacheCLI(unittest.TestCase):
                                env=self.env, capture_output=True, timeout=30)
         self.assertEqual(start.returncode, 0, start.stderr)
         try:
-            result = self.run_cache("prune", "--missing-root")
-            self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertEqual(json.loads(result.stdout)["deleted_count"], 1)
-            self.assertFalse((self.cache / "gone.db").exists())
+            result = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn(b"cache is busy", result.stderr)
+            prefixed = subprocess.run(
+                [BINARY, "--quiet", "cache", "prune", "--missing-root", "--confirm-missing-root"],
+                cwd=self.source, env=self.env, capture_output=True, timeout=30)
+            self.assertNotEqual(prefixed.returncode, 0, prefixed.stdout)
+            self.assertIn(b"cache is busy", prefixed.stderr)
+            self.assertTrue((self.cache / "gone.db").exists())
             self.assertTrue((self.cache / "live.db").exists())
+            status = subprocess.run([BINARY, "daemon", "status"], cwd=self.source,
+                                    env=self.env, capture_output=True, timeout=30)
+            self.assertEqual(status.returncode, 0, status.stderr)
+            preview = self.run_cache("prune", "--missing-root", "--dry-run")
+            self.assertEqual(preview.returncode, 0, preview.stderr)
         finally:
             stop = subprocess.run([BINARY, "daemon", "stop"], cwd=self.source,
                                   env=self.env, capture_output=True, timeout=30)
             self.assertEqual(stop.returncode, 0, stop.stderr)
+        retry = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
+        self.assertEqual(retry.returncode, 0, retry.stderr)
+        self.assertEqual(json.loads(retry.stdout)["deleted_count"], 1)
 
     def test_destructive_or_ambiguous_arguments_cannot_use_stateless_deletion(self):
         before = self.snapshot()
@@ -181,6 +195,85 @@ class CacheCLI(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertNotIn(b"Preparing one-shot", result.stderr)
                 self.assertEqual(self.snapshot(), before)
+
+    def test_wal_inspection_never_creates_shm_or_reads_stale_metadata(self):
+        seed = self.root / "seed.db"
+        with sqlite3.connect(seed) as db:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA wal_autocheckpoint=0")
+            db.execute("CREATE TABLE projects(name TEXT, root_path TEXT, indexed_at TEXT)")
+            db.execute("INSERT INTO projects VALUES(?,?,?)",
+                       ("walcase", str(self.root / "missing"), "2020-01-01T00:00:00Z"))
+            db.commit()
+            shutil.copy2(seed, self.cache / "walcase.db")
+            shutil.copy2(str(seed) + "-wal", self.cache / "walcase.db-wal")
+        before = self.snapshot()
+        for args in (("stats",), ("prune", "--missing-root", "--dry-run")):
+            result = self.run_cache(*args)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = next(p for p in json.loads(result.stdout)["projects"]
+                          if p["db_file"] == "walcase.db")
+            self.assertEqual(record["status"], "journal_or_unavailable_database")
+            self.assertEqual(self.snapshot(), before)
+
+    def test_journal_backed_database_is_preserved_even_for_real_pruning(self):
+        runtime = self.root / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.env["CBM_RUNTIME_DIR"] = str(runtime)
+        (self.cache / "gone.db-journal").write_bytes(b"unrecovered journal")
+        before = self.snapshot()
+        result = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["deleted_count"], 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_missing_root_confirmation_and_adr_protection(self):
+        runtime = self.root / "runtime"
+        runtime.mkdir(mode=0o700)
+        self.env["CBM_RUNTIME_DIR"] = str(runtime)
+        with sqlite3.connect(self.cache / "gone.db") as db:
+            db.execute("CREATE TABLE project_summaries(project TEXT, summary TEXT)")
+            db.execute("INSERT INTO project_summaries VALUES('gone', 'keep my ADR')")
+        before = self.snapshot()
+        rejected = self.run_cache("prune", "--missing-root")
+        self.assertNotEqual(rejected.returncode, 0)
+        self.assertIn(b"confirm-missing-root", rejected.stdout)
+        kept = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
+        self.assertEqual(kept.returncode, 0, kept.stderr)
+        self.assertEqual(json.loads(kept.stdout)["deleted_count"], 0)
+        self.assertEqual(self.snapshot(), before)
+        removed = self.run_cache("prune", "--missing-root", "--confirm-missing-root", "--include-adrs")
+        self.assertEqual(removed.returncode, 0, removed.stderr)
+        self.assertEqual(json.loads(removed.stdout)["deleted_count"], 1)
+
+    def test_non_directory_and_unresolved_roots_are_not_missing(self):
+        not_directory = self.root / "root-file"
+        not_directory.write_text("not a source directory")
+        with sqlite3.connect(self.cache / "gone.db") as db:
+            db.execute("UPDATE projects SET root_path=?", (str(not_directory),))
+        if os.name != "nt":
+            unresolved = self.root / "unresolved-root"
+            unresolved.symlink_to(self.root / "unmounted")
+            with sqlite3.connect(self.cache / "live.db") as db:
+                db.execute("UPDATE projects SET root_path=?", (str(unresolved),))
+        before = self.snapshot()
+        preview = self.run_cache("prune", "--missing-root", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        report = json.loads(preview.stdout)
+        self.assertEqual(report["candidate_count"], 0)
+        self.assertEqual(report["missing_root_count"], 0)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_unicode_and_uri_characters_in_cache_path(self):
+        renamed = self.root / ("cache 日本語 #%" + ("?" if os.name != "nt" else ""))
+        self.cache.rename(renamed)
+        self.cache = renamed
+        self.env["CBM_CACHE_DIR"] = str(renamed)
+        before = self.snapshot()
+        result = self.run_cache("stats")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["project_count"], 2)
+        self.assertEqual(self.snapshot(), before)
 
 
 if __name__ == "__main__":

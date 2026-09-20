@@ -66,7 +66,7 @@ jobs:
           # The paginated files endpoint remains filename-only for this gate.
           FILES=$(gh api --paginate "repos/$REPO/pulls/$PR/files?per_page=100" --jq '.[].filename')
           printf '%s\n' "$FILES"
-          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
+          if printf '%s\n' "$FILES" | grep -qE '^(src/|internal/|install\.(sh|ps1)|tests/test_cache_cli\.py|scripts/build\.sh|scripts/smoke-test\.sh|scripts/smoke-local\.sh|scripts/smoke-fixture-server\.py|scripts/gen-third-party-notices\.sh|scripts/env\.sh|test-infrastructure/vm/(vm-smoke\.sh|windows-user-path-guard\.ps1)|Makefile\.cbm)'; then
             echo "product=true" >> "$GITHUB_OUTPUT"
           else
             echo "product=false" >> "$GITHUB_OUTPUT"
@@ -130,6 +130,7 @@ jobs:
         run: |
           scripts/build.sh CC=gcc CXX=g++
           scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
+          python3 tests/test_cache_cli.py build/c/codebase-memory-mcp
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -140,6 +141,7 @@ jobs:
           scripts/build.sh CC=cc CXX=c++
           codesign --sign - --force build/c/codebase-memory-mcp
           scripts/smoke-local.sh "$(pwd)/build/c/codebase-memory-mcp"
+          python3 tests/test_cache_cli.py build/c/codebase-memory-mcp
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M
@@ -150,6 +152,7 @@ jobs:
         run: |
           scripts/build.sh CC=clang CXX=clang++
           SMOKE_ARCH=amd64 bash test-infrastructure/vm/vm-smoke.sh
+          python3 tests/test_cache_cli.py build/c/codebase-memory-mcp
         env:
           CCACHE_DIR: ${{ github.workspace }}/.ccache
           CCACHE_MAXSIZE: 1000M

@@ -79,6 +79,13 @@ cbm_version_cohort_status_t cbm_version_cohort_reserve_exclusive(
     cbm_version_cohort_manager_t *manager, uint64_t deadline_ms,
     cbm_version_cohort_lease_t **lease_out);
 
+/* Offline cache maintenance: refuse any active participant without publishing
+ * shutdown intent. Retain admission EX and lifetime EX until release; existing
+ * sessions are never cancelled. The lease must be released even on IO failure. */
+cbm_version_cohort_status_t cbm_version_cohort_reserve_idle(cbm_version_cohort_manager_t *manager,
+                                                            uint64_t deadline_ms,
+                                                            cbm_version_cohort_lease_t **lease_out);
+
 /* Coordinated install/update/uninstall barrier for modern CBM participants.
  * It first publishes maintenance intent EX, then retains admission EX so no
  * new participant can enter, and finally probes lifetime EX. If lifetime is

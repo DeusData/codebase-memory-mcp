@@ -665,86 +665,81 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 ### Project cache management
 
-Inspect all cached project indexes, including indexes whose worktrees have been removed:
+Cache maintenance is CLI-only; it is not exposed as an MCP tool.
 
 ```bash
 codebase-memory-mcp cache stats
 codebase-memory-mcp cache prune --missing-root --dry-run
-codebase-memory-mcp cache prune --missing-root
+codebase-memory-mcp cache prune --missing-root --confirm-missing-root
 codebase-memory-mcp cache prune --older-than 30d --dry-run
 codebase-memory-mcp cache prune --missing-root --older-than 30d --dry-run
 codebase-memory-mcp cache prune --orphan-sidecars --dry-run
 codebase-memory-mcp cache prune --orphan-sidecars
 ```
 
-`cache stats` and `cache prune --dry-run` run locally without starting or connecting
-to a daemon. They work while another CBM version is running and do not print
-startup progress messages. Actual deletion remains daemon-coordinated: use the
-same binary/build as your running sessions, or close those sessions before
-switching builds. A development binary cannot delete through an older daemon
-that does not implement `cache_prune`. If builds conflict, no cache files are
-removed: close MCP sessions using the other build, run `codebase-memory-mcp daemon
-stop` with that build, and retry the new binary. Reconnect sessions using the new
-binary afterward. Changing only `CBM_CACHE_DIR` does not isolate runtime coordination;
-never change `CBM_RUNTIME_DIR` to bypass this protection against a live cache.
-`--progress` explicitly enables startup
-feedback for actual deletion. Generic `cli`/MCP tool calls still use the daemon.
+Stats and dry-run run locally without daemon startup or coordination. They do
+not change cache contents, even for WAL databases. Real pruning is **offline
+maintenance**: close CBM sessions and stop the daemon first. It refuses while any
+coordinated CBM participant is active, including readers, without stopping that
+participant. An exclusive lifetime/admission lease prevents new sessions and
+commands from starting throughout the deletion window. Legacy/unverified daemon
+coordination also fails closed. Each project additionally uses its normal native
+mutation lock. Do not change `CBM_RUNTIME_DIR` to bypass a live cache's coordination.
 
-`stats` returns JSON with project/database counts, logical file sizes in bytes,
-missing-root counts, and per-project root paths, timestamps, sizes, and status.
-The `projects` array includes missing-root projects and is not paginated:
-`returned` reports its length and `has_more` is false. `directory_inventory`
-separately counts **all immediate children**, including hidden entries, by type
-(project/internal DB, WAL, SHM, directory, symlink, other, unavailable). Its
-`regular_file_bytes` counts logical file lengths without following symlinks or
-recursing into log directories; it is not filesystem-allocated usage (`du`).
-`orphan_sidecar_count` identifies WAL/SHM files whose parent DB is absent; these
-are reported by stats and can be selected explicitly with `--orphan-sidecars`.
-Inventory is a live observation, not an atomic filesystem snapshot. Categories
-include unreadable entries and `complete` is false when entry metadata is unavailable.
+Prune requires a filter. Project filters use AND; `--older-than 30d` refers to last
+index time, not last query/access time or file mtime. Positive integer durations
+use `s`, `m`, `h`, `d`, or `w`. Future/invalid timestamps do not match an age filter.
+Age alone can select a still-existing source directory; sources are never deleted.
 
-The top-level `size_bytes` remains the project-index total.
-Sizes cover project `.db`, `.db-wal`, and `.db-shm` files. Configuration databases,
-logs, runtime files, temporary indexes, and repository `.codebase-memory/` artifacts
-are outside this scope. Unreadable or ambiguous databases are reported separately
-and are never pruned automatically by this command.
+A missing root does not prove a project was abandoned: removable/network storage
+may be temporarily offline. Actual deletion using `--missing-root` therefore also
+requires **`--confirm-missing-root`**, after reviewing the preview and checking that
+source storage is available. Permission errors, unresolved links, non-directory
+roots and unknown paths remain unknown and do not match that filter. Eligibility
+is checked again after taking the project lock.
 
-`--orphan-sidecars` removes regular project `.db-wal` and `.db-shm` files whose
-corresponding `.db` is absent. Use it alone: combining it with `--missing-root`
-or `--older-than` is rejected because orphan files have no stored root or index
-timestamp. Internal files beginning with `_`, invalid project names, symlinks,
-and sidecars with an existing or inaccessible DB are excluded. Each deletion
-acquires the project mutation lease and rechecks DB absence under that lease,
-so an in-flight publisher is skipped rather than mistaken for an orphan.
-The `sidecars` array lists individual candidates and their status. In this mode,
-`count_unit` is `sidecar_files`: candidate/deleted/busy/failed counts refer to
-files; `removed_bytes` counts successful unlinks. Project-mode counts retain
-`count_unit: project_databases`. Run `stats` again for the post-cleanup inventory.
-This does not remove `.db.corrupt`, logs, configuration, or healthy project DBs.
+**ADRs are preserved by default.** Databases with rows in `project_summaries` are
+reported as `protected_adrs` and excluded. `--include-adrs` explicitly opts into
+permanent deletion of those database-held documents; export them first. Unknown
+or unreadable ADR metadata never authorizes deletion. No periodic cleanup is added.
 
-`prune` requires at least one filter. Project filters use **AND**:
-`--missing-root --older-than 30d` selects only projects whose source directories
-are gone **and** whose last index is older than 30 days. `--older-than` uses the
-stored `indexed_at` timestamp, **not last query/access time or file mtime**; an old
-index can still be actively queried. Durations are positive integers followed by
-`s`, `m`, `h`, `d`, or `w`. A future/invalid index timestamp does not match the age
-filter. Root permission/I/O errors and unknown root paths do not match
-`--missing-root`.
+To guarantee inspection has no SQLite side effects, metadata is read only from
+stable main database files without a WAL or rollback journal. Databases with
+`.db-wal` or `.db-journal` (even empty ones) are listed as
+`journal_or_unavailable_database`, counted in size/inventory, and never pruned.
+This avoids creating/updating SHM files or silently ignoring committed WAL data.
+Use the database owner's normal close/checkpoint/recovery procedure before
+retrying; do not delete a WAL merely to make its database eligible. A standalone
+SHM file does not contain committed database data and is included in project size.
 
-`--dry-run` lists candidates and their total bytes without deleting files. Without
-it, matching project databases and their WAL/SHM sidecars are deleted, including
-any ADRs stored only in those databases. Source directories are untouched. The
-command obtains a nonblocking project mutation lease and rechecks eligibility
-before deletion; busy projects are skipped. Actual removed bytes and failed/busy
-counts are reported, and failed or busy deletions return a nonzero exit status so
-scripts can retry. Files that become ineligible while acquiring a lease are
-reported as `changed`.
+`--orphan-sidecars` is a separate mode: it removes regular project `.db-wal` and
+`.db-shm` files only when the corresponding DB is absent, rechecked under the
+project lock. It cannot be combined with root/age/ADR options. Internal `_` files,
+invalid names, symlinks and sidecars with inaccessible/existing DBs are excluded.
+It never removes rollback journals, configuration, logs, `.db.corrupt`, temporary
+indexes, repository `.codebase-memory/` artifacts or source files.
 
-The equivalent MCP tools are `cache_stats` with `{}` and `cache_prune` with, for
-example, `{"missing_root":true,"older_than":"30d","dry_run":true}`. These commands
-scan the cache independently of active watcher subscriptions, so they also cover
-worktrees removed after their AI sessions ended. They do not install a periodic
-cleanup job.
+Output is JSON. `projects` lists every inspected project DB, including unavailable
+ones; `project_count` counts readable identities and `uninspectable_count` counts
+the remainder. `size_bytes` covers project DB/WAL/SHM logical file lengths.
+`directory_inventory` counts all immediate entries, including hidden files, by
+type; it does not recurse, follow links, or claim filesystem-allocated (`du`) usage.
+It is a live observation, not an atomic snapshot. `has_adrs` is null when metadata
+cannot be inspected. A dry-run reports candidates, not a guarantee that a later
+run will delete the same files.
+
+Deletion is not a transaction across files or projects. DB removal happens first;
+if it fails, sidecars are preserved. `deleted_count` counts DBs actually removed,
+including partial deletions; `partial_count` counts DBs removed whose sidecar
+cleanup failed, and those also contribute to `failed_count`. `removed_bytes`
+counts successful unlinks only. In orphan mode these counts use individual files
+instead (`count_unit: sidecar_files`). Partial/busy/cancelled operations exit nonzero.
+An interrupt stops before the next deletion and releases leases; an in-progress
+DB/sidecar group finishes cleanup when possible. A hard kill may leave orphan
+sidecars: rerun stats and then preview/retry `--orphan-sidecars`. Native leases are
+released on process death. Already deleted data is not rolled back. Interrupted
+reports set `cancelled` and `has_more`; inventory completeness is false and counts
+cover only the entries visited. Successful retries are idempotent.
 
 ## MCP Tools
 
@@ -755,8 +750,6 @@ cleanup job.
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
-| `cache_stats` | Inspect cached project sizes, source-root status, and index timestamps. |
-| `cache_prune` | Preview or delete cached projects by age/root conditions, or orphan WAL/SHM files. |
 | `index_status` | Check indexing status of a project. |
 
 ### Querying
