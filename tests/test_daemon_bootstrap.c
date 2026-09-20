@@ -887,7 +887,19 @@ TEST(daemon_bootstrap_darwin_launch_failure_is_synchronous) {
 #endif
 
 #ifndef _WIN32
-enum { BOOTSTRAP_ENOSPC_MAX_CHILDREN = 16, BOOTSTRAP_ENOSPC_LOG_CAP = 65536 };
+enum {
+    BOOTSTRAP_ENOSPC_MAX_CHILDREN = 16,
+    BOOTSTRAP_ENOSPC_LOG_CAP = 65536,
+    /* The real host hashes the full test executable before IPC publication.
+     * MSan's instrumented grammar binary can take longer than 30 seconds.
+     * This is a hang guard; failure-record and spawn-count assertions below
+     * prove fast-fail without depending on sanitizer execution speed. */
+#ifdef CBM_SANITIZED_BUILD
+    BOOTSTRAP_ENOSPC_STARTUP_MS = 180000,
+#else
+    BOOTSTRAP_ENOSPC_STARTUP_MS = 30000,
+#endif
+};
 
 typedef struct {
     char parent[BOOTSTRAP_TEST_PATH_CAP];
@@ -1068,7 +1080,7 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
         .identity = &host.identity,
         .executable_path = "/enospc-host-test",
         .connect_timeout_ms = 200,
-        .startup_timeout_ms = 30000,
+        .startup_timeout_ms = BOOTSTRAP_ENOSPC_STARTUP_MS,
     };
     cbm_daemon_bootstrap_result_t result;
     memset(&result, 0, sizeof(result));
@@ -1093,6 +1105,10 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
     bool message_names_errno = strstr(result.message, "ENOSPC") != NULL;
     bool message_names_path = strstr(result.message, expected_path) != NULL;
     bool stale_wording = strstr(result.message, "active or starting") != NULL;
+    if (!daemon_named_cause) {
+        fprintf(stderr, "ENOSPC host bootstrap: %s\ndaemon log:\n%s\n", result.message,
+                log_read ? log : "<unavailable>");
+    }
 
     if (saved_cache) {
         (void)cbm_setenv("CBM_CACHE_DIR", saved_cache, 1);
@@ -1119,7 +1135,7 @@ TEST(daemon_bootstrap_fails_fast_when_daemon_dies_at_publication) {
      * surfaced verbatim ("failed to start" + errno + path) and the slow
      * "active or starting" timeout wording is absent -- that message is emitted
      * ONLY on the fast-fail break (cbm_daemon_bootstrap_start_failure_format),
-     * never on the 30 s deadline path -- and the client stopped after exactly
+     * never on the deadline path -- and the client stopped after exactly
      * one spawn instead of respawning a doomed daemon until the deadline. Any
      * regression to the pre-#1828 30 s hang trips these deterministically. */
     ASSERT_FALSE(stale_wording);

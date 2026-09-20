@@ -5,6 +5,7 @@
 #include "daemon/bootstrap.h"
 #include <sqlite3.h>
 #include <yyjson/yyjson.h>
+#include <errno.h>
 
 static bool cache_fixture(const char *directory, const char *name, const char *root,
                           const char *timestamp) {
@@ -280,10 +281,17 @@ TEST(cache_empty_directory_and_duration_units) {
     char *directory = th_mktempdir("cbm-cache-empty");
     ASSERT_NOT_NULL(directory);
     bool error;
+    errno = EACCES; /* Directory wrappers need not set POSIX errno on Windows. */
     yyjson_doc *doc = cache_call(TH_PATH(directory, "absent"), "{}", false, NULL, &error);
     ASSERT_NOT_NULL(doc);
     ASSERT(!error);
     ASSERT_EQ(cache_number(doc, "project_count"), 0);
+    yyjson_doc_free(doc);
+    ASSERT_EQ(th_write_file(TH_PATH(directory, "not-a-directory"), "keep"), 0);
+    errno = ENOENT; /* A stale errno must not hide an existing invalid path. */
+    doc = cache_call(TH_PATH(directory, "not-a-directory"), "{}", false, NULL, &error);
+    ASSERT_NOT_NULL(doc);
+    ASSERT(error);
     yyjson_doc_free(doc);
     const char *durations[] = {"1s", "2m", "3h", "4d", "5w"};
     const int64_t seconds[] = {1, 120, 10800, 345600, 3024000};
@@ -299,6 +307,40 @@ TEST(cache_empty_directory_and_duration_units) {
     th_rmtree(directory);
     PASS();
 }
+
+#ifndef _WIN32
+TEST(cache_reads_and_prunes_through_directory_alias) {
+    char *directory = th_mktempdir("cbm-cache-alias");
+    ASSERT_NOT_NULL(directory);
+    char alias[1024];
+    snprintf(alias, sizeof(alias), "%s/alias", directory);
+    ASSERT_EQ(symlink(directory, alias), 0);
+    ASSERT(cache_fixture(directory, "gone", TH_PATH(directory, "missing"),
+                         "2020-01-01T00:00:00Z"));
+    ASSERT_EQ(symlink(TH_PATH(directory, "gone.db"), TH_PATH(directory, "link.db")), 0);
+    bool error;
+    yyjson_doc *doc = cache_call(alias, "{}", false, NULL, &error);
+    ASSERT_NOT_NULL(doc);
+    bool inspected = !error && cache_number(doc, "project_count") == 1 &&
+                     cache_number(doc, "uninspectable_count") == 1;
+    yyjson_doc_free(doc);
+    cache_guard_t guard = {0};
+    cbm_cache_ops_t ops = {
+        .context = &guard, .try_begin = cache_guard_begin, .end = cache_guard_end};
+    doc = cache_call(alias, "{\"missing_root\":true}", true, &ops, &error);
+    ASSERT_NOT_NULL(doc);
+    bool deleted = !error && cache_number(doc, "deleted_count") == 1 &&
+                   guard.began == 1 && guard.ended == 1 &&
+                   !cbm_file_exists(TH_PATH(directory, "gone.db"));
+    yyjson_doc_free(doc);
+    cbm_unlink(alias);
+    cbm_unlink(TH_PATH(directory, "link.db"));
+    th_rmtree(directory);
+    ASSERT_TRUE(inspected);
+    ASSERT_TRUE(deleted);
+    PASS();
+}
+#endif
 
 TEST(cache_cli_flags_map_to_tool_conditions) {
     char *argv[] = {"--missing-root", "--older-than", "30d", "--dry-run"};
@@ -374,6 +416,9 @@ TEST(cache_orphan_sidecars_preview_delete_and_recheck) {
 }
 
 SUITE(cache) {
+#ifndef _WIN32
+    RUN_TEST(cache_reads_and_prunes_through_directory_alias);
+#endif
     RUN_TEST(cache_orphan_sidecars_preview_delete_and_recheck);
     RUN_TEST(cache_empty_directory_and_duration_units);
     RUN_TEST(cache_cli_flags_map_to_tool_conditions);

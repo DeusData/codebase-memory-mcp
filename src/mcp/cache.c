@@ -3,6 +3,7 @@
 #include "foundation/compat.h"
 #include "foundation/mem_core.h"
 #include "foundation/compat_fs.h"
+#include "foundation/constants.h"
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include <sqlite3.h>
@@ -186,7 +187,13 @@ static void cache_read_root_status(cache_record_t *record) {
 }
 
 static void cache_read_metadata(const char *directory, const char *file, cache_record_t *record) {
-    char *path = cache_path(directory, file, "");
+    /* SQLite NOFOLLOW rejects links in any path component, including macOS
+     * /var -> /private/var. Resolve only the directory: the database itself
+     * must still pass NOFOLLOW, even if replaced after the inventory check. */
+    char canonical[CBM_SZ_4K];
+    char *path = cbm_canonical_path(directory, canonical, sizeof(canonical))
+                     ? cache_path(canonical, file, "")
+                     : NULL;
     sqlite3 *db = NULL;
     sqlite3_stmt *stmt = NULL;
     int rc = path ? sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOFOLLOW, NULL)
@@ -623,8 +630,13 @@ char *cbm_cache_run(const char *directory, const char *args, bool prune, const c
             error = "cache directory is unavailable";
         } else {
             dir = cbm_opendir(directory);
-            if (!dir && errno != ENOENT) {
-                error = "cannot read cache directory";
+            if (!dir) {
+                /* cbm_opendir uses Win32 APIs on Windows, which do not set
+                 * errno. Only a confirmed absent path is an empty cache. */
+                cbm_path_info_t info;
+                if (cbm_path_info_utf8(directory, &info) != CBM_PATH_INFO_ABSENT) {
+                    error = "cannot read cache directory";
+                }
             }
         }
     }
