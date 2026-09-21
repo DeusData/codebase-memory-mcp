@@ -42,6 +42,283 @@ static bool has_preprocessor_work(const char *source, int source_len) {
     return false;
 }
 
+// ── Export-macro candidates (#1989) ─────────────────────────────────────────
+// Build systems define symbol-export macros empty on the compiler command line
+// (UE's UBT: `/D "MODULE_API="`; CMake generate_export_header: `<lib>_EXPORT`),
+// so they never appear as #define lines in the source. tree-sitter has no
+// preprocessor state either, and `class MODULE_API Foo` misparses with the
+// macro token as the type name (worse: enums and free functions are lost to
+// ERROR regions entirely). To mirror the real compile line, the preprocessed
+// second pass predefines the conventional export-macro-shaped identifiers found
+// in the file as empty. The shape is deliberately narrow — ALL_CAPS identifier
+// ending in a known export suffix, with a non-trivial prefix — and the list is
+// capped, so ordinary all-caps identifiers cannot be swept in wholesale.
+static const char *kExportMacroSuffixes[] = {"_API",       "_EXPORT",     "_IMPORT",
+                                             "_DLLEXPORT", "_DEPRECATED", NULL};
+
+static bool is_export_macro_shape(const char *id, size_t len) {
+    if (id[0] < 'A' || id[0] > 'Z') {
+        return false;
+    }
+    for (size_t i = 0; i < len; i++) {
+        char c = id[i];
+        bool upper = c >= 'A' && c <= 'Z';
+        bool digit = c >= '0' && c <= '9';
+        if (!upper && !digit && c != '_') {
+            return false;
+        }
+    }
+    for (int s = 0; kExportMacroSuffixes[s]; s++) {
+        size_t slen = strlen(kExportMacroSuffixes[s]);
+        // Require at least two prefix characters before the suffix so a bare
+        // "X_API"-style token (single-letter, easily a genuine symbol) stays out.
+        if (len >= slen + 2 && strncmp(id + len - slen, kExportMacroSuffixes[s], slen) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_identifier_start(char c) {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+}
+
+static bool is_identifier_char(char c) {
+    return is_identifier_start(c) || (c >= '0' && c <= '9');
+}
+
+// C++ raw string literals (R"delim(...)delim"). Returns the index one past
+// the closing quote, or -1 when the form cannot be confidently recognized
+// (unterminated, malformed delimiter) — the caller then STOPS collecting so
+// the mis-modeled literal cannot poison the scan state of the rest of the
+// file (#1989 review).
+static int skip_raw_string(const char *source, int source_len, int quote) {
+    int j = quote + 1;
+    int delim_start = j;
+    while (j < source_len) {
+        char c = source[j];
+        if (c == '(') {
+            break;
+        }
+        // Delimiter chars: the standard d-char set excludes space, parens,
+        // backslash, and the line breaks — a double quote IS a legal d-char
+        // (R"""(...)""" compiles), so it must not end the delimiter (#1989
+        // review round 3).
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == ')' || c == '\\' ||
+            j - delim_start >= 16) {
+            return -1;
+        }
+        j++;
+    }
+    if (j >= source_len || source[j] != '(') {
+        return -1;
+    }
+    int delim_len = j - delim_start;
+    j++; // past the opening "("
+    while (j < source_len) {
+        if (source[j] == ')') {
+            int k = j + 1;
+            int m = 0;
+            while (m < delim_len && k + m < source_len &&
+                   source[k + m] == source[delim_start + m]) {
+                m++;
+            }
+            if (m == delim_len && k + m < source_len && source[k + m] == '"') {
+                return k + m + 1;
+            }
+        }
+        j++;
+    }
+    return -1; // unterminated raw string: uncertain
+}
+
+// If the identifier just scanned is a raw-string prefix (R, LR, uR, UR, u8R)
+// immediately followed by a quote, return skip_raw_string(...). Returns 0 for
+// an ordinary identifier (including an identifier merely ENDING in R — only a
+// standalone prefix token starts a raw string) and -1 on an unrecognizable
+// raw form.
+static int raw_string_after_prefix(const char *source, int source_len, int start, int end) {
+    static const char *prefixes[] = {"R", "LR", "uR", "UR", "u8R", NULL};
+    size_t idlen = (size_t)(end - start);
+    bool is_prefix = false;
+    for (int p = 0; prefixes[p]; p++) {
+        if (idlen == strlen(prefixes[p]) && strncmp(source + start, prefixes[p], idlen) == 0) {
+            is_prefix = true;
+            break;
+        }
+    }
+    if (!is_prefix || end >= source_len || source[end] != '"') {
+        return 0;
+    }
+    return skip_raw_string(source, source_len, end);
+}
+
+// Advance past comments and string/char literals so only real code tokens
+// consume the candidate budget (#1989 review). Handles line-spliced //
+// comments (a backslash before the newline continues the comment — line
+// splicing happens before comment recognition) and, via the identifier-scan
+// hook in the callers, C++ raw string literals. A digit separator (1'000'000)
+// can still over-skip — that fails safe, toward NOT collecting a candidate.
+static int skip_non_code(const char *source, int source_len, int i) {
+    while (i < source_len) {
+        char c = source[i];
+        if (c == '/' && i + 1 < source_len && source[i + 1] == '/') {
+            i += 2;
+            for (;;) {
+                while (i < source_len && source[i] != '\n') {
+                    i++;
+                }
+                if (i >= source_len) {
+                    break;
+                }
+                // Line splice: a backslash right before the newline (allowing
+                // \r\n) means the comment continues on the next line.
+                int back = i - 1;
+                if (back >= 0 && source[back] == '\r') {
+                    back--;
+                }
+                if (back >= 0 && source[back] == '\\') {
+                    i++; // spliced: keep consuming inside the comment
+                    continue;
+                }
+                i++; // real end-of-comment newline
+                break;
+            }
+        } else if (c == '/' && i + 1 < source_len && source[i + 1] == '*') {
+            i += 2;
+            while (i + 1 < source_len && !(source[i] == '*' && source[i + 1] == '/')) {
+                i++;
+            }
+            if (i + 1 < source_len) {
+                i += 2; // past the closing "*/"
+            } else {
+                i = source_len; // unterminated comment runs to EOF
+            }
+        } else if (c == '"' || c == '\'') {
+            char quote = c;
+            i++;
+            while (i < source_len) {
+                if (source[i] == '\\') {
+                    i += 2;
+                    continue;
+                }
+                if (source[i] == quote) {
+                    i++;
+                    break;
+                }
+                i++;
+            }
+        } else {
+            return i;
+        }
+    }
+    return i;
+}
+
+// Count-only scan used by the early gate (no storage).
+static bool has_export_macro_candidates(const char *source, int source_len) {
+    if (!source || source_len <= 0) {
+        return false;
+    }
+    int i = 0;
+    while (i < source_len) {
+        i = skip_non_code(source, source_len, i);
+        if (i >= source_len) {
+            break;
+        }
+        if (!is_identifier_start(source[i])) {
+            i++;
+            continue;
+        }
+        int start = i;
+        while (i < source_len && is_identifier_char(source[i])) {
+            i++;
+        }
+        // A raw-string prefix consumes everything up to its closing quote;
+        // an unrecognizable raw form poisons the scan state, so fail toward
+        // NOT running the second pass (raw behavior preserved).
+        int raw = raw_string_after_prefix(source, source_len, start, i);
+        if (raw < 0) {
+            return false;
+        }
+        if (raw > 0) {
+            i = raw;
+            continue;
+        }
+        if (is_export_macro_shape(source + start, (size_t)(i - start))) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static int collect_export_macro_candidates(const char *source, int source_len,
+                                           char (*out)[CBM_EXPORT_MACRO_NAME_MAX], int max_out) {
+    if (!source || source_len <= 0 || !out || max_out <= 0) {
+        return 0;
+    }
+    int stored = 0;
+    int i = 0;
+    while (i < source_len) {
+        i = skip_non_code(source, source_len, i);
+        if (i >= source_len) {
+            break;
+        }
+        if (!is_identifier_start(source[i])) {
+            i++;
+            continue;
+        }
+        int start = i;
+        while (i < source_len && is_identifier_char(source[i])) {
+            i++;
+        }
+        // Raw string (see has_export_macro_candidates): skip its body, or stop
+        // collecting entirely when the form cannot be confidently recognized —
+        // continuing would mis-tokenize the rest of the file and could both
+        // mint phantom candidates and mask real ones (#1989 review).
+        int raw = raw_string_after_prefix(source, source_len, start, i);
+        if (raw < 0) {
+            break;
+        }
+        if (raw > 0) {
+            i = raw;
+            continue;
+        }
+        size_t len = (size_t)(i - start);
+        /* Length gate FIRST: the dedup below reads out[k][0..len] against rows
+         * of CBM_EXPORT_MACRO_NAME_MAX bytes — an over-long candidate must be
+         * rejected before any compare touches them. */
+        if (len >= CBM_EXPORT_MACRO_NAME_MAX) {
+            continue;
+        }
+        if (!is_export_macro_shape(source + start, len)) {
+            continue;
+        }
+        bool dup = false;
+        for (int k = 0; k < stored; k++) {
+            if (strncmp(out[k], source + start, len) == 0 && out[k][len] == '\0') {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            continue;
+        }
+        if (stored >= max_out) {
+            break; // bounded: stop collecting once the cap is reached
+        }
+        memcpy(out[stored], source + start, len);
+        out[stored][len] = '\0';
+        stored++;
+    }
+    return stored;
+}
+
+int cbm_export_macro_candidates(const char *source, int source_len,
+                                char (*out)[CBM_EXPORT_MACRO_NAME_MAX], int max_out) {
+    return collect_export_macro_candidates(source, source_len, out, max_out);
+}
+
 static int count_expanded_lines(const std::string &text) {
     int count = 1;
     for (char c : text) {
@@ -146,7 +423,11 @@ static bool build_line_map(const std::string &expanded, const std::string &main_
 CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_len,
                                                const char *filename, const char **extra_defines,
                                                const char **include_paths, int cpp_mode) {
-    if (!has_preprocessor_work(source, source_len)) {
+    // Run the second pass when there are directives to evaluate OR when the file
+    // carries export-macro-shaped identifiers to predefine empty (#1989) — a UE
+    // plugin header with only `#pragma once` + `#include` lines still needs it.
+    if (!has_preprocessor_work(source, source_len) &&
+        !has_export_macro_candidates(source, source_len)) {
         return NULL; // NULL = no expansion needed, use original
     }
 
@@ -155,6 +436,28 @@ CBMPreprocessedSource *cbm_preprocess_with_map(const char *source, int source_le
         if (extra_defines) {
             for (int i = 0; extra_defines[i]; i++)
                 dui.defines.push_back(extra_defines[i]);
+        }
+        // Predefine collected export-macro candidates as empty, mirroring the
+        // real compile command line (`/D "MODULE_API="`). Names already provided
+        // by the caller win — never override an explicit define.
+        char export_cands[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+        int export_cand_count =
+            collect_export_macro_candidates(source, source_len, export_cands, CBM_EXPORT_MACRO_MAX);
+        for (int i = 0; i < export_cand_count; i++) {
+            bool provided = false;
+            for (std::list<std::string>::const_iterator it = dui.defines.begin();
+                 it != dui.defines.end(); ++it) {
+                const std::string &def = *it;
+                size_t eq = def.find('=');
+                std::string name = (eq == std::string::npos) ? def : def.substr(0, eq);
+                if (name == export_cands[i]) {
+                    provided = true;
+                    break;
+                }
+            }
+            if (!provided) {
+                dui.defines.push_back(std::string(export_cands[i]) + "=");
+            }
         }
         if (include_paths) {
             for (int i = 0; include_paths[i]; i++)
