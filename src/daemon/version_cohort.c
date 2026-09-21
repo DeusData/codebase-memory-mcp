@@ -363,6 +363,25 @@ cbm_private_file_lock_status_t cbm_version_cohort_lease_release(
     return result;
 }
 
+static bool version_cohort_lock_touch(cbm_private_file_lock_t *lock) {
+    return !lock || cbm_private_file_lock_touch(lock) == CBM_PRIVATE_FILE_LOCK_OK;
+}
+
+bool cbm_version_cohort_lease_touch(cbm_version_cohort_lease_t *lease) {
+    if (!lease) {
+        return false;
+    }
+    /* Evaluate all three so one lost file does not leave the others to age. */
+    bool lifetime = version_cohort_lock_touch(lease->lifetime);
+    bool admission = version_cohort_lock_touch(lease->admission);
+    bool maintenance = version_cohort_lock_touch(lease->maintenance);
+    return lifetime && admission && maintenance;
+}
+
+bool cbm_version_cohort_daemon_claim_touch(cbm_version_cohort_daemon_claim_t *claim) {
+    return claim && claim->marker && version_cohort_lock_touch(claim->marker);
+}
+
 static cbm_version_cohort_status_t version_cohort_failed(cbm_version_cohort_lease_t *lease,
                                                          cbm_version_cohort_status_t status,
                                                          cbm_version_cohort_lease_t **lease_out) {

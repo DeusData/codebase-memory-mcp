@@ -61,6 +61,13 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
                                                                    const void *buffer,
                                                                    size_t length);
 
+/* Long-lived holders call this periodically. It refreshes the held file's
+ * timestamps through the validated handle so age-based temp cleaners (macOS
+ * tmp_cleaner, systemd-tmpfiles) never select it, and returns UNSAFE once the
+ * handle no longer names a linked file: a peer opening the path would then
+ * lock a different inode and the lock coordinates nothing (#2178). */
+cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock_t *lock);
+
 /* Forces the next successfully acquired native lock down the post-lock
  * validation cleanup path and injects pre-call release failures there. */
 bool cbm_private_lock_directory_fail_post_acquire_cleanup_for_test(

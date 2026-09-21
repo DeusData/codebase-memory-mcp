@@ -482,6 +482,24 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
     return valid ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
 }
 
+cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock_t *lock) {
+    if (!lock) {
+        return CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    }
+    if (!cbm_private_file_lock_fork_guard_enter()) {
+        return CBM_PRIVATE_FILE_LOCK_IO;
+    }
+    /* An unlinked file keeps its inode alive for this handle with st_nlink 0,
+     * which the payload validity check already rejects. */
+    bool linked = private_payload_fd_valid(lock, NULL);
+    bool touched = linked && futimens(lock->fd, NULL) == 0;
+    cbm_private_file_lock_fork_guard_leave();
+    if (!linked) {
+        return CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    }
+    return touched ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
+}
+
 cbm_private_file_lock_status_t cbm_private_file_lock_release(cbm_private_file_lock_t **lock_io) {
     if (!lock_io || !*lock_io) {
         return CBM_PRIVATE_FILE_LOCK_IO;
@@ -1448,6 +1466,20 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
     valid = valid && FlushFileBuffers(lock->handle) != 0;
     cbm_private_file_lock_fork_guard_leave();
     return valid ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
+}
+
+cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock_t *lock) {
+    /* Windows has no age-based cleaner of the private lock directory; only
+     * confirm the held handle still names a linked file. */
+    if (!lock) {
+        return CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    }
+    if (!cbm_private_file_lock_fork_guard_enter()) {
+        return CBM_PRIVATE_FILE_LOCK_IO;
+    }
+    bool linked = private_win_payload_handle_valid(lock);
+    cbm_private_file_lock_fork_guard_leave();
+    return linked ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_UNSAFE;
 }
 
 static bool private_win_release_unlock(cbm_private_file_lock_t *lock) {

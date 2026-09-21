@@ -336,6 +336,10 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
  * an unbounded idle hang. The host lifetime loop calls this every tick; it is a
  * no-op unless a last-committed-client linger is armed. */
 void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
+/* #2178 heartbeat over the listener's runtime artifacts; see
+ * cbm_daemon_ipc_listener_touch. Call only from the thread that stops and
+ * frees the service, which is the only thread that closes the listener. */
+bool cbm_daemon_runtime_service_touch_listener(cbm_daemon_runtime_service_t *service);
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key);
 uint64_t cbm_daemon_runtime_service_client_process_id(cbm_daemon_runtime_service_t *service,

@@ -1004,8 +1004,8 @@ TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500) {
     (void)CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, NULL, &builtin_needed);
     if (builtin_needed > 0) {
         builtin_admins = malloc(builtin_needed);
-        if (builtin_admins &&
-            !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins, &builtin_needed)) {
+        if (builtin_admins && !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins,
+                                                  &builtin_needed)) {
             free(builtin_admins);
             builtin_admins = NULL;
         }
@@ -2061,6 +2061,54 @@ TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen) {
     ASSERT_EQ(free_after_close, 0);
     ASSERT_TRUE(after_close_started);
     PASS();
+}
+
+/* #2178: an age-based temp cleaner unlinked the live daemon's lifetime lock
+ * and identity marker. The heartbeat must report either loss, so the daemon
+ * exits instead of serving under a lifetime file that coordinates nothing or
+ * leaving an unremovable socket pair behind at close. */
+TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
+#ifdef _WIN32
+    SKIP_PLATFORM("unlink-while-held of runtime files is POSIX behavior");
+#else
+    static const char key[] = "2178a2178a2178a0";
+    static const char *const lost_files[] = {"lifetime.lock", "sock.identity"};
+    char parent[TEST_PATH_CAP] = {0};
+    char runtime_dir[TEST_PATH_CAP] = {0};
+    cbm_daemon_ipc_endpoint_t *endpoint = NULL;
+    bool started[2] = {false, false};
+    bool touched_intact[2] = {false, false};
+    bool unlinked[2] = {false, false};
+    bool touched_after_loss[2] = {true, true};
+
+    if (ipc_test_parent_new(parent, "listener-touch")) {
+        endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
+    }
+    if (endpoint) {
+        ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    }
+    for (size_t i = 0; endpoint && i < 2; i++) {
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        started[i] = listener != NULL;
+        touched_intact[i] = started[i] && cbm_daemon_ipc_listener_touch(listener);
+        char path[TEST_PATH_CAP];
+        int written = snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, lost_files[i]);
+        unlinked[i] =
+            touched_intact[i] && written > 0 && written < (int)sizeof(path) && unlink(path) == 0;
+        touched_after_loss[i] = unlinked[i] && cbm_daemon_ipc_listener_touch(listener);
+        cbm_daemon_ipc_listener_close(listener);
+    }
+    cbm_daemon_ipc_endpoint_free(endpoint);
+    ipc_test_remove_tree(runtime_dir, parent);
+
+    for (size_t i = 0; i < 2; i++) {
+        ASSERT_TRUE(started[i]);
+        ASSERT_TRUE(touched_intact[i]);
+        ASSERT_TRUE(unlinked[i]);
+        ASSERT_FALSE(touched_after_loss[i]);
+    }
+    PASS();
+#endif
 }
 
 TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window) {
@@ -5260,8 +5308,7 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
     if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
         char unexpected[128];
         (void)snprintf(unexpected, sizeof(unexpected),
-                       "userns probe exited %d -- not a security verdict",
-                       WEXITSTATUS(status));
+                       "userns probe exited %d -- not a security verdict", WEXITSTATUS(status));
         FAIL(unexpected);
     }
     ASSERT_EQ(0, WEXITSTATUS(status));
@@ -5376,6 +5423,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_rejects_uppercase_instance_key);
     RUN_TEST(daemon_ipc_no_spawn_probe_distinguishes_absent_active_and_busy);
     RUN_TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen);
+    RUN_TEST(daemon_ipc_listener_touch_detects_lost_runtime_files);
     RUN_TEST(daemon_ipc_lifetime_reservation_transfers_without_unlock_window);
     RUN_TEST(daemon_ipc_local_frame_roundtrip);
     RUN_TEST(daemon_ipc_bounded_receive_rejects_oversize_before_payload);

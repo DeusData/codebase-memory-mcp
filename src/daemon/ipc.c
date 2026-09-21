@@ -3220,6 +3220,46 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     free(listener);
 }
 
+/* Touch through the held descriptor only after proving the path still names
+ * it: refreshing by path would keep a replacement inode fresh and hide the
+ * loss (#2178). */
+static bool posix_held_file_touch(int directory_fd, const char *base_name, int fd) {
+    return private_regular_file_snapshot(directory_fd, base_name, fd, 1, NULL) &&
+           futimens(fd, NULL) == 0;
+}
+
+static bool posix_held_lock_touch(int directory_fd, const process_lock_entry_t *entry, int fd) {
+    return entry && posix_held_file_touch(directory_fd, entry->lock_name, fd);
+}
+
+bool cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener) {
+    if (!listener || listener->dir_fd < 0 || listener->owner_pid != getpid() ||
+        !listener->lifetime_reservation) {
+        return false;
+    }
+    bool lifetime =
+        posix_held_lock_touch(listener->dir_fd, listener->lifetime_reservation->process_entry,
+                              listener->lifetime_reservation->fd);
+    const cbm_daemon_ipc_participant_guard_t *guard = listener->participant_guard;
+    bool participant =
+        !guard ||
+        posix_held_lock_touch(listener->dir_fd, guard->legacy_process_entry, guard->legacy_fd);
+    /* The marker is not held open; reopen it and require the published inode. */
+    int marker_fd = openat(listener->dir_fd, listener->socket_identity_name,
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    struct stat marker_status;
+    bool marker = marker_fd >= 0 &&
+                  private_regular_file_snapshot(listener->dir_fd, listener->socket_identity_name,
+                                                marker_fd, 1, &marker_status) &&
+                  marker_status.st_dev == listener->identity_device &&
+                  marker_status.st_ino == listener->identity_inode &&
+                  futimens(marker_fd, NULL) == 0;
+    if (marker_fd >= 0) {
+        (void)close(marker_fd);
+    }
+    return lifetime && participant && marker;
+}
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -3601,6 +3641,12 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+bool cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                            cbm_daemon_ipc_participant_guard_t *guard) {
+    return endpoint && guard && guard->owner_pid == getpid() &&
+           posix_held_lock_touch(endpoint->dir_fd, guard->legacy_process_entry, guard->legacy_fd);
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(
@@ -6744,6 +6790,17 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+/* Windows has no age-based cleaner of the private runtime directory, and its
+ * held handles deny deletion; the #2178 heartbeat has nothing to refresh. */
+bool cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener) {
+    return listener != NULL;
+}
+
+bool cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                            cbm_daemon_ipc_participant_guard_t *guard) {
+    return endpoint && guard;
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(
