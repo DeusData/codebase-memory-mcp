@@ -1830,20 +1830,27 @@ tail:
         }
     }
 
-    /* Optional SKIP */
+    /* Optional SKIP. A non-numeric operand is a loud parse error: expect() has
+     * already filled p->error, and dropping the clause instead would leave
+     * r->skip at its "none" default while the query still reports success. */
     if (match(p, TOK_SKIP)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->skip = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
-    /* Optional LIMIT */
+    /* Optional LIMIT. Same rule: a dropped LIMIT is the failure mode #1334
+     * banned - the caller would silently receive the whole result set. */
     if (match(p, TOK_LIMIT)) {
         const cbm_token_t *num = expect(p, TOK_NUMBER);
-        if (num) {
-            r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
+        if (!num) {
+            free_return_clause(r);
+            return CBM_NOT_FOUND;
         }
+        r->limit = (int)strtol(num->text, NULL, CBM_DECIMAL_BASE);
     }
 
     *out = r;
@@ -4450,9 +4457,31 @@ static void ret_agg_init_group(ret_agg_entry_t *entry, const char *key, int item
 }
 
 /* Accumulate a binding into RETURN aggregation */
+static bool binding_has_value(binding_t *b, const char *var, const char *prop) {
+    if (!var || strcmp(var, "*") == 0) {
+        return true;
+    }
+    char full[CBM_SZ_256];
+    if (prop) {
+        snprintf(full, sizeof(full), "%s.%s", var, prop);
+    } else {
+        snprintf(full, sizeof(full), "%s", var);
+    }
+    for (int i = 0; i < b->var_count; i++) {
+        if (strcmp(b->var_names[i], full) == 0) {
+            return true;
+        }
+    }
+    return binding_get_edge(b, var) != NULL || binding_get(b, var) != NULL;
+}
+
 static void ret_agg_accumulate(ret_agg_entry_t *entry, cbm_return_clause_t *ret, binding_t *b) {
     for (int ci = 0; ci < ret->count; ci++) {
         if (!is_aggregate_func(ret->items[ci].func)) {
+            continue;
+        }
+        if (strcmp(ret->items[ci].func, "COUNT") == 0 &&
+            !binding_has_value(b, ret->items[ci].variable, ret->items[ci].property)) {
             continue;
         }
         entry->counts[ci]++;

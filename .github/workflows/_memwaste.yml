@@ -1,0 +1,183 @@
+# Reusable: the waste sanitizer (memory + CPU waste), REPORT-ONLY.
+#
+# What runs (scripts/memwaste.sh, memwaste-scaling.py, memwaste-ratchet.py):
+#   mode=pr    Linux: the event lane (memory waste + CPU work) indexing this
+#              repository at the checked-out commit, and the CPU scaling lane
+#              (src/ replicated 2x against 4x, per-function counter ratios).
+#   mode=full  the same, plus the event lane on macOS and Windows and the access
+#              lane (read/write verdicts per allocation) on Linux.
+#
+# The corpus is the repository itself: pinned by the commit, no network, and a
+# real mix of C, C++, Python, JavaScript and vendored code.
+#
+# REPORT-ONLY: every job uploads its report and prints the ratchet comparison
+# against scripts/memwaste-baseline.json, but nothing here can turn a PR red --
+# the ratchet runs without --enforce and the PR's ci-ok gate does not depend on
+# these jobs. A job fails only when the MEASUREMENT is unsound (a table
+# overflowed, frees the layer never saw): that is a defect of the tool, and a
+# red job is how it gets noticed. Switching the ratchet to --enforce is a
+# separate, deliberate change once the numbers have been stable across reruns.
+name: Memwaste
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "pr (Linux event + scaling) or full (all platforms, access lane)"
+        type: string
+        default: pr
+
+permissions:
+  contents: read
+
+jobs:
+  event-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 clang llvm
+      - name: Event lane on this repository
+        run: |
+          # `cmd | tee` reports TEE's status: without this a failing lane
+          # (a missing exec bit, a build error) passes the step and only
+          # surfaces as the ratchet not finding its JSON.
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/memwaste-event"
+          scripts/memwaste.sh "$GITHUB_WORKSPACE" --top 40 --out "$RUNNER_TEMP/memwaste-event" \
+            | tee "$RUNNER_TEMP/memwaste-event/report.txt"
+      - name: Ratchet (report-only)
+        run: python3 scripts/memwaste-ratchet.py --out "$RUNNER_TEMP/memwaste-event" --venue ${{ inputs.mode }}-linux
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memwaste-event-linux-${{ inputs.mode }}
+          path: |
+            ${{ runner.temp }}/memwaste-event/report.txt
+            ${{ runner.temp }}/memwaste-event/memwaste.json
+            ${{ runner.temp }}/memwaste-event/index.json
+          if-no-files-found: warn
+
+  scaling-linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 clang llvm
+      - name: CPU scaling lane (src/ at 2x against 4x)
+        # Report-only: the script exits 1 when it flags a super-linear function.
+        continue-on-error: true
+        run: |
+          # `cmd | tee` reports TEE's status: without this a failing lane
+          # (a missing exec bit, a build error) passes the step and only
+          # surfaces as the ratchet not finding its JSON.
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/memwaste-scaling"
+          python3 scripts/memwaste-scaling.py --corpus src --replicas 2 \
+            --out "$RUNNER_TEMP/memwaste-scaling" | tee "$RUNNER_TEMP/memwaste-scaling/report.txt"
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memwaste-scaling-linux-${{ inputs.mode }}
+          path: ${{ runner.temp }}/memwaste-scaling/report.txt
+          if-no-files-found: warn
+
+  access-linux:
+    if: ${{ inputs.mode == 'full' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev python3 clang llvm
+      - name: Access lane on this repository
+        run: |
+          # `cmd | tee` reports TEE's status: without this a failing lane
+          # (a missing exec bit, a build error) passes the step and only
+          # surfaces as the ratchet not finding its JSON.
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/memwaste-access"
+          scripts/memwaste.sh "$GITHUB_WORKSPACE" --lane access --top 40 --sort untouched \
+            --out "$RUNNER_TEMP/memwaste-access" | tee "$RUNNER_TEMP/memwaste-access/report.txt"
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memwaste-access-linux-${{ inputs.mode }}
+          path: |
+            ${{ runner.temp }}/memwaste-access/report.txt
+            ${{ runner.temp }}/memwaste-access/memwaste.json
+          if-no-files-found: warn
+
+  event-macos:
+    if: ${{ inputs.mode == 'full' }}
+    runs-on: macos-14
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Event lane on this repository
+        run: |
+          # `cmd | tee` reports TEE's status: without this a failing lane
+          # (a missing exec bit, a build error) passes the step and only
+          # surfaces as the ratchet not finding its JSON.
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/memwaste-event"
+          scripts/memwaste.sh "$GITHUB_WORKSPACE" --top 40 --out "$RUNNER_TEMP/memwaste-event" \
+            | tee "$RUNNER_TEMP/memwaste-event/report.txt"
+      - name: Ratchet (report-only)
+        run: python3 scripts/memwaste-ratchet.py --out "$RUNNER_TEMP/memwaste-event" --venue full-macos
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memwaste-event-macos-${{ inputs.mode }}
+          path: |
+            ${{ runner.temp }}/memwaste-event/report.txt
+            ${{ runner.temp }}/memwaste-event/memwaste.json
+          if-no-files-found: warn
+
+  event-windows:
+    if: ${{ inputs.mode == 'full' }}
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: CLANG64
+          path-type: inherit
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-python3
+            make
+            git
+            coreutils
+      - name: Event lane on this repository
+        shell: msys2 {0}
+        run: |
+          # `cmd | tee` reports TEE's status: without this a failing lane
+          # (a missing exec bit, a build error) passes the step and only
+          # surfaces as the ratchet not finding its JSON.
+          set -o pipefail
+          out="$(cygpath -u "$RUNNER_TEMP")/memwaste-event"
+          mkdir -p "$out"
+          CC=clang CXX=clang++ scripts/memwaste.sh "$(cygpath -u "$GITHUB_WORKSPACE")" --top 40 --out "$out" \
+            | tee "$out/report.txt"
+      - name: Ratchet (report-only)
+        shell: msys2 {0}
+        run: python3 scripts/memwaste-ratchet.py --out "$(cygpath -u "$RUNNER_TEMP")/memwaste-event" --venue full-windows
+      - name: Upload report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: memwaste-event-windows-${{ inputs.mode }}
+          path: |
+            ${{ runner.temp }}/memwaste-event/report.txt
+            ${{ runner.temp }}/memwaste-event/memwaste.json
+          if-no-files-found: warn

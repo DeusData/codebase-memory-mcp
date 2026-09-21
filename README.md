@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-8050_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -425,7 +425,7 @@ scripts/build.sh                    # without the UI (development only)
 
 Every platform ships **one self-contained executable**: the graph UI and the agent integration templates are linked into the binary, so an extracted archive is immediately complete.
 
-Run the test suite (6,768 tests across 120 suites):
+Run the test suite (8,060 tests across 141 suites):
 
 ```bash
 scripts/test.sh                     # full: clean sanitizer build + all suites + guards
@@ -733,8 +733,14 @@ codebase-memory-mcp config set auto_index true           # auto-index on session
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
+codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
+codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+index attempt rather than publishing a partial graph; an existing serving index
+is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables
 

@@ -5726,20 +5726,15 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     ASSERT_NOT_NULL(store);
     char source_path[512];
     snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
-    struct stat source_stat;
-    ASSERT_EQ(stat(source_path, &source_stat), 0);
-#ifdef __APPLE__
-    int64_t source_mtime_ns =
-        ((int64_t)source_stat.st_mtimespec.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-        (int64_t)source_stat.st_mtimespec.tv_nsec;
-#elif defined(_WIN32)
-    int64_t source_mtime_ns = (int64_t)source_stat.st_mtime * (int64_t)CBM_NSEC_PER_SEC;
-#else
-    int64_t source_mtime_ns = ((int64_t)source_stat.st_mtim.tv_sec * (int64_t)CBM_NSEC_PER_SEC) +
-                              (int64_t)source_stat.st_mtim.tv_nsec;
-#endif
-    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", source_mtime_ns,
-                                         source_stat.st_size),
+    /* The fixture must record the hash with the SAME mtime source the indexer
+     * writes with — cbm_path_info_utf8 — not struct stat. On Windows stat
+     * truncates to seconds while the stored record carries FILETIME-derived
+     * nanoseconds, so a stat-written fixture would never compare equal and the
+     * metadata_match contract below would fail. */
+    cbm_path_info_t path_info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &path_info), 0);
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", path_info.mtime_ns,
+                                         path_info.size),
               CBM_STORE_OK);
     cbm_project_t project = {0};
     ASSERT_EQ(cbm_store_get_project(store, "test-project", &project), CBM_STORE_OK);
@@ -5779,6 +5774,63 @@ TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_
     free(response);
     cbm_mcp_server_free(srv);
     cleanup_snippet_dir(tmp);
+    PASS();
+}
+
+/* #1714: coverage freshness must compare mtime_ns at the SAME precision the
+ * indexer records it. The pipeline records cbm_path_info_utf8's value (which
+ * on Windows derives from FILETIME — nanosecond), while the freshness reader
+ * used to recompute from struct stat, which on Windows truncates to seconds
+ * (st_mtime). A byte-identical file therefore never matched and every path was
+ * reported metadata_changed. The reader now uses the indexer's own source. */
+TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714) {
+    char tmp[256];
+    cbm_mcp_server_t *srv = setup_snippet_server(tmp, sizeof(tmp));
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+
+    char source_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/project/main.go", tmp);
+    cbm_path_info_t info;
+    ASSERT_EQ(cbm_path_info_utf8(source_path, &info), 0);
+
+    /* The hash exactly as the indexer writes it: same source, ns precision. */
+    ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "", info.mtime_ns,
+                                         info.size),
+              CBM_STORE_OK);
+
+    /* format=json, like every other coverage test here: the DEFAULT response is
+     * the compact table, in which a field name never appears. Keeping the
+     * assertion on the JSON field is what makes it exact — a bare strstr for
+     * "metadata_match" would also be satisfied by a neighbouring column or by
+     * another path's row. */
+    char *response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                         "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                         "\"format\":\"json\"}");
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(response, "\"freshness\":\"metadata_match\""));
+    free(response);
+
+    /* A hash stored at seconds precision — what a stat-based reader previously
+     * compared against — must NOT match an unchanged file: the comparison must
+     * stay nanosecond-exact, or part of mtime resolution is silently dropped. */
+    int64_t seconds_mtime_ns = (info.mtime_ns / (int64_t)CBM_NSEC_PER_SEC) *
+                               (int64_t)CBM_NSEC_PER_SEC;
+    if (seconds_mtime_ns != info.mtime_ns) {
+        ASSERT_EQ(cbm_store_upsert_file_hash(store, "test-project", "main.go", "",
+                                             seconds_mtime_ns, info.size),
+                  CBM_STORE_OK);
+        response = cbm_mcp_handle_tool(srv, "check_index_coverage",
+                                       "{\"project\":\"test-project\",\"paths\":[\"main.go\"],"
+                                       "\"format\":\"json\"}");
+        ASSERT_NOT_NULL(response);
+        ASSERT_NOT_NULL(strstr(response, "\"freshness\":\"metadata_changed\""));
+        free(response);
+    }
+
+    cleanup_snippet_dir(tmp);
+    cbm_mcp_server_free(srv);
     PASS();
 }
 
@@ -17773,8 +17825,15 @@ TEST(index_repository_over_budget_reports_named_reason) {
     bool reason_named = second_reason && strcmp(second_reason, "over_memory_budget") == 0;
     bool previous_preserved = second_previous && strcmp(second_previous, "preserved") == 0;
     bool hint_names_knob = second_hint && strstr(second_hint, "CBM_MEM_BUDGET_MB") != NULL;
+    /* The hint must also say that peak_rss_mb is NOT the requirement. The abort
+     * fires when RSS crosses the budget, so the peak is pinned just above it by
+     * construction; a caller who retries at peak+10% fails again. Measured on
+     * the linux kernel 2026-09-13: aborted at 25622 MB against a 24576 MB
+     * budget, but completing it took 31.75 GB. */
+    bool hint_warns_peak_is_not_need = second_hint && strstr(second_hint, "STOPPED") != NULL;
     int budget_mb = budget_doc_int(second_doc, "budget_mb", -1);
     int peak_rss_mb = budget_doc_int(second_doc, "peak_rss_mb", -1);
+    int suggested_mb = budget_doc_int(second_doc, "suggested_budget_mb", -1);
     yyjson_doc_free(second_doc);
     free(second);
     long db_size_after = (long)cbm_file_size(db_path);
@@ -17817,8 +17876,11 @@ TEST(index_repository_over_budget_reports_named_reason) {
     ASSERT_TRUE(reason_named);
     ASSERT_TRUE(previous_preserved);
     ASSERT_TRUE(hint_names_knob);
+    ASSERT_TRUE(hint_warns_peak_is_not_need);
     ASSERT_EQ(budget_mb, 1);
     ASSERT_GT(peak_rss_mb, budget_mb);
+    /* A CONCRETE retry value, not just the knob name: 1.5x the budget. */
+    ASSERT_GT(suggested_mb, budget_mb);
     /* Preserved on disk and still served: same file size, same node count. */
     ASSERT_GT(db_size_before, 0L);
     ASSERT_EQ(db_size_after, db_size_before);
@@ -20379,6 +20441,7 @@ SUITE(mcp) {
     RUN_TEST(tool_check_index_coverage_preserves_multiple_scope_labels);
     RUN_TEST(tool_check_index_coverage_accepts_truncated_ignored_catalog_for_fresh_path_issue1613);
     RUN_TEST(tool_check_index_coverage_rejects_stale_generation);
+    RUN_TEST(tool_check_index_coverage_freshness_uses_indexer_mtime_source_issue1714);
     RUN_TEST(tool_check_index_coverage_requires_source_when_file_metadata_changed);
     RUN_TEST(tool_check_index_coverage_surfaces_lookup_errors);
     RUN_TEST(tool_index_status_includes_git_metadata);

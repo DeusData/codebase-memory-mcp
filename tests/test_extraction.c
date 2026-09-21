@@ -8,10 +8,13 @@
 #include "test_framework.h"
 #include "cbm.h"
 #include "foundation/constants.h"     /* CBM_SZ_* */
+#include "preprocessor.h"             /* cbm_export_macro_candidates (#1989) */
 #include "../src/foundation/compat.h" /* cbm_clock_gettime (wide-flat scaling guard) */
 #include "../src/foundation/compat_fs.h"
 #include <time.h>
 #include "macro_table.h"
+#include "result_spill.h"
+#include "pipeline/pass_lsp_cross.h"
 #include "iris_export_xml.h"
 
 /* ── Helpers ───────────────────────────────────────────────────── */
@@ -4424,6 +4427,18 @@ TEST(swift_labeled_call_string_arg_issue1892) {
  * literal, consumed as client(buildPath(id)). The builder's URL is recorded in
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
+TEST(extract_ts_await_generic_call_issue2210) {
+    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
+                               "async function plain() { return await parseJsonBody(); }\n"
+                               "async function generic() { return await parseJsonBody<string>(); }\n",
+                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_ts_url_builder_issue1009) {
     CBMFileResult *r = extract("function thingDetail(id: string): string {\n"
                                "  return `/api/v1/things/${id}/detail`;\n"
@@ -5801,6 +5816,370 @@ TEST(extract_c_clean_file_no_recovery_duplicates_issue961) {
     PASS();
 }
 
+/* #1989: build-system export macros (UE "<MOD>_API", CMake generate_export_header
+ * "<lib>_EXPORT") are empty on the real compile line but opaque to tree-sitter,
+ * so `class MOD_API Foo` misparses. The preprocessed second pass predefines the
+ * conventional export-macro-shaped identifiers found in the file as empty, and
+ * the recovery loop adopts the corrected type defs (superseding the raw
+ * misparse artifacts). */
+TEST(extract_cpp_export_macro_class_recovery_issue1989) {
+    CBMFileResult *r = extract("#pragma once\n"
+                               "UCLASS()\n"
+                               "class DUMMY_API UFoo : public UObject\n"
+                               "{\n"
+                               "    GENERATED_BODY()\n"
+                               "public:\n"
+                               "    int32 X = 0;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "UFoo");
+    ASSERT_NOT_NULL(cls); /* was missing entirely before the fix */
+    ASSERT_EQ(cls->start_line, 3u);
+    ASSERT_NULL(find_def(r, "DUMMY_API")); /* macro-as-name artifact superseded */
+    /* The raw misparse also mints a phantom Function def NAMED AFTER THE BASE
+     * CLASS spanning the whole class ("UObject" from the declarator of the
+     * broken function_definition shape) — it must be suppressed, not just the
+     * macro-named artifact. */
+    ASSERT_NULL(find_def(r, "UObject"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_struct_recovery_issue1989) {
+    /* The struct case is the SILENT failure: the raw tree parses "successfully"
+     * with the macro token as the name and raises no error flag at all. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "USTRUCT()\n"
+                               "struct DUMMY_API FBar\n"
+                               "{\n"
+                               "    int32 Y;\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue_struct.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *st = find_def(r, "FBar");
+    ASSERT_NOT_NULL(st);
+    ASSERT(st->label && strcmp(st->label, "Class") == 0); /* struct_specifier -> Class */
+    ASSERT_NULL(find_def(r, "DUMMY_API"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_enum_recovery_issue1989) {
+    /* `enum class MOD_API EKind` is lost to an ERROR region entirely. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "UENUM()\n"
+                               "enum class DUMMY_API EKind : uint8\n"
+                               "{\n"
+                               "    A,\n"
+                               "    B\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue_enum.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "EKind"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_free_function_recovery_issue1989) {
+    /* A free function DEFINED with the export macro is lost to an ERROR region
+     * on the raw tree (prototypes never mint defs — same as clean code). */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "DUMMY_API int Add(int a, int b)\n"
+                               "{\n"
+                               "    return a + b;\n"
+                               "}\n",
+                               CBM_LANG_CPP, "p", "ue_fn.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "Add"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_inline_method_recovery_issue1989) {
+    /* The misparsed class parsed as a function body on the raw tree, so the
+     * raw walk never extracted its inline methods — the rescued class def must
+     * carry them in via the nested-span adoption. */
+    CBMFileResult *r = extract("#pragma once\n"
+                               "class DUMMY_API FCalc\n"
+                               "{\n"
+                               "public:\n"
+                               "    int Add(int a, int b) { return a + b; }\n"
+                               "};\n",
+                               CBM_LANG_CPP, "p", "ue_inline.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "FCalc");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0); /* not the raw "Function" mislabel */
+    const CBMDefinition *m = find_def(r, "Add");
+    ASSERT_NOT_NULL(m);
+    ASSERT(m->label && strcmp(m->label, "Method") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Negative control the maintainer asked for: ordinary ALL_CAPS identifiers
+ * (constants, enum values) must NOT be swept in as export-macro candidates and
+ * stripped from the graph. Only the narrow _API/_EXPORT/... suffix shape is. */
+TEST(extract_cpp_export_macro_negative_control_ordinary_caps_issue1989) {
+    CBMFileResult *r = extract("#pragma once\n"
+                               "#define MAX_CONNECTIONS 16\n"
+                               "const int TIMEOUT_MS = 250;\n"
+                               "enum class State { IDLE, RUNNING };\n"
+                               "struct Config { int MAX_RETRIES; };\n",
+                               CBM_LANG_CPP, "p", "caps.h");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "Config"));
+    ASSERT_TRUE(has_def(r, "Variable", "TIMEOUT_MS"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* C files get the same rescue (SQLITE_API-style prefixes are C, not C++). */
+TEST(extract_c_export_macro_recovery_issue1989) {
+    CBMFileResult *r = extract("typedef struct sqlite3 sqlite3;\n"
+                               "SQLITE_API int sqlite3_open(const char *path)\n"
+                               "{\n"
+                               "    return 0;\n"
+                               "}\n",
+                               CBM_LANG_C, "p", "db.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(find_def(r, "sqlite3_open"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review (P1): an over-long candidate-shaped identifier (>= 96 chars)
+ * arriving AFTER a stored candidate must be rejected BEFORE the dedup
+ * compares — the pre-fix dedup ran strncmp(out[k], src, len) with
+ * len >= CBM_EXPORT_MACRO_NAME_MAX against 96-byte rows (out-of-bounds read;
+ * sanitizer lanes crash). Locally unsanitized, so this pins the behavior
+ * (normal candidate still recovers, no crash); CI's sanitized lanes guard
+ * the memory error itself. */
+TEST(extract_cpp_export_macro_overlong_candidate_safe_issue1989) {
+    char src[4096];
+    int off = snprintf(src, sizeof(src), "class MOD_API First { int v; };\nclass ");
+    ASSERT_GTE(off, 0);
+    memset(src + off, 'A', 100);
+    off += 100;
+    ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off, "_API Long { int w; };\n"), 0);
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "overlong.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *first = find_def(r, "First");
+    ASSERT_NOT_NULL(first);
+    ASSERT(first->label && strcmp(first->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review (P2): candidate-shaped tokens inside comments and string
+ * literals must NOT consume the bounded budget — 32 of them ahead of the real
+ * class would otherwise exhaust the cap and leave the real macro undefined. */
+TEST(extract_cpp_export_macro_comment_string_budget_issue1989) {
+    char src[8192];
+    int off = 0;
+    for (int n = 0; n < 31; n++) {
+        ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off, "// see DOC%02d_API notes\n", n),
+                   0);
+        off += (int)strlen(src + off);
+    }
+    ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off,
+                        "static const char *kRef = \"STRING_DOC_API\";\n"
+                        "class REALMOD_API Real { int v; };\n"),
+               0);
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "budget.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Real");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review: the bounded-budget contract — 33 distinct candidates collect
+ * only the first CBM_EXPORT_MACRO_MAX (32, in source order); the 33rd stays
+ * unpredefined and its class keeps the raw misparse (value label, not Class). */
+TEST(extract_cpp_export_macro_candidate_cap_issue1989) {
+    char src[8192];
+    int off = 0;
+    for (int n = 0; n < 33; n++) {
+        ASSERT_GTE(
+            snprintf(src + off, sizeof(src) - (size_t)off, "class CAP%02d_API K%02d {};\n", n, n),
+            0);
+        off += (int)strlen(src + off);
+    }
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "cap.h");
+    ASSERT_NOT_NULL(r);
+    int recovered = 0;
+    for (int n = 0; n < 33; n++) {
+        char name[8];
+        snprintf(name, sizeof(name), "K%02d", n);
+        const CBMDefinition *d = find_def(r, name);
+        if (d && d->label && strcmp(d->label, "Class") == 0) {
+            recovered++;
+        }
+    }
+    ASSERT_EQ(recovered, 32);
+    /* The cap contract's other half: the 33rd candidate (K32) must STILL be
+     * present with its raw misparse — dropping the def entirely would be a
+     * regression, not a graceful cap. */
+    const CBMDefinition *cap_tail = find_def(r, "K32");
+    ASSERT_NOT_NULL(cap_tail);
+    ASSERT_TRUE(!cap_tail->label || strcmp(cap_tail->label, "Class") != 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review round 2: line-spliced // comments. A backslash before the
+ * newline continues the comment (splicing happens before comment
+ * recognition), so "FAKE_API" below is comment text and must NOT consume
+ * budget. 32 spliced fake comments would otherwise exhaust the cap and leave
+ * the real class unrecovered. */
+TEST(extract_cpp_export_macro_spliced_comment_budget_issue1989) {
+    char src[8192];
+    int off = 0;
+    for (int n = 0; n < 31; n++) {
+        ASSERT_GTE(
+            snprintf(src + off, sizeof(src) - (size_t)off, "// fake \\\nFAKE%02d_API notes\n", n),
+            0);
+        off += (int)strlen(src + off);
+    }
+    ASSERT_GTE(snprintf(src + off, sizeof(src) - (size_t)off,
+                        "// last \\\r\nSPLICEFAKE_API notes\n"
+                        "class REALMOD_API Real { int v; };\n"),
+               0);
+    CBMFileResult *r = extract(src, CBM_LANG_CPP, "p", "spliced.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Real");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review round 2: C++ raw string literals. Tokens inside R"(...)"
+ * must not be collected, and code after the literal must still be scanned —
+ * an unmodeled raw string previously let "BAR_API" leak in AND masked the
+ * real candidate after the literal's closing quote. An unrecognizable raw
+ * form (unterminated/malformed delimiter) stops collection entirely so scan
+ * state cannot be poisoned. */
+TEST(extract_cpp_export_macro_raw_string_issue1989) {
+    CBMFileResult *r = extract("const char *s = R\"(foo \" BAR_API)\";\n"
+                               "class REALMOD_API Real { int v; };\n",
+                               CBM_LANG_CPP, "p", "raw.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Real");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_cpp_export_macro_raw_string_delimited_issue1989) {
+    CBMFileResult *r = extract("auto log = R\"log(FOO_API \"quote\")log\";\n"
+                               "class DELIMMOD_API Delim { int v; };\n",
+                               CBM_LANG_CPP, "p", "raw_delim.h");
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Delim");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review: every conventional suffix variant must be collected and
+ * recovered, not just _API. */
+TEST(extract_cpp_export_macro_suffix_variants_issue1989) {
+    CBMFileResult *r = extract("class LIB_EXPORT A1 { int v; };\n"
+                               "class LIB_IMPORT B2 { int v; };\n"
+                               "class LIB_DLLEXPORT C3 { int v; };\n"
+                               "class LIB_DEPRECATED D4 { int v; };\n",
+                               CBM_LANG_CPP, "p", "suffix.h");
+    ASSERT_NOT_NULL(r);
+    const char *names[] = {"A1", "B2", "C3", "D4"};
+    for (int n = 0; n < 4; n++) {
+        const CBMDefinition *d = find_def(r, names[n]);
+        ASSERT_NOT_NULL(d);
+        ASSERT(d->label && strcmp(d->label, "Class") == 0);
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+/* #1989 review: caller-provided defines win — the collector must not push a
+ * define for a name the caller already provided (a duplicate could flip the
+ * expansion and silently change what parses). With an explicit empty define
+ * the class still recovers; with a caller define that corrupts the header,
+ * the injected empty define must NOT clobber it back into parsing. */
+TEST(extract_cpp_export_macro_explicit_define_priority_issue1989) {
+    const char *src = "class MYMOD_API Foo { int v; };\n";
+
+    const char *empty_defines[] = {"MYMOD_API=", NULL};
+    CBMFileResult *r = cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "p", "prio_empty.h", 0,
+                                        empty_defines, NULL);
+    ASSERT_NOT_NULL(r);
+    const CBMDefinition *cls = find_def(r, "Foo");
+    ASSERT_NOT_NULL(cls);
+    ASSERT(cls->label && strcmp(cls->label, "Class") == 0);
+    cbm_free_result(r);
+
+    const char *body_defines[] = {"MYMOD_API=Junk", NULL};
+    CBMFileResult *r2 = cbm_extract_file(src, (int)strlen(src), CBM_LANG_CPP, "p", "prio_body.h", 0,
+                                         body_defines, NULL);
+    ASSERT_NOT_NULL(r2);
+    const CBMDefinition *foo2 = find_def(r2, "Foo");
+    ASSERT_TRUE(foo2 == NULL || (foo2->label && strcmp(foo2->label, "Class") != 0));
+    cbm_free_result(r2);
+    PASS();
+}
+
+/* #1989 review round 2: the collector CONTRACT itself, called directly (the
+ * reviewer's method): the raw string's inner token is not a candidate and the
+ * code after the literal IS. */
+TEST(extract_cpp_export_macro_collector_raw_string_contract_issue1989) {
+    const char *src = "const char *s = R\"(foo \" BAR_API)\";\n"
+                      "class REALMOD_API Real { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 1);
+    ASSERT(strcmp(out[0], "REALMOD_API") == 0);
+    PASS();
+}
+
+/* Delimiter form R"log(...)log" works the same way. */
+TEST(extract_cpp_export_macro_collector_raw_string_delim_contract_issue1989) {
+    const char *src = "auto log = R\"log(FOO_API \"q\")log\";\n"
+                      "class DELIMMOD_API Delim { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 1);
+    ASSERT(strcmp(out[0], "DELIMMOD_API") == 0);
+    PASS();
+}
+
+/* A double quote is a legal raw-string delimiter character. Keep scanning
+ * after R"""(...)""" so a later export macro is still collected. */
+TEST(extract_cpp_export_macro_collector_raw_string_quote_delim_issue1989) {
+    const char *src = "const char *s = R\"\"\"(FOO_API)\"\"\";\n"
+                      "class QUOTEMOD_API Quoted { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 1);
+    ASSERT(strcmp(out[0], "QUOTEMOD_API") == 0);
+    PASS();
+}
+
+/* Unterminated raw literal: the scan stops rather than mis-tokenizing the
+ * rest of the file (uncertain state -> fail toward raw behavior). */
+TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989) {
+    const char *src = "const char *s = R\"(never closed BAR_API\n"
+                      "class REALMOD_API Real { int v; };\n";
+    char out[CBM_EXPORT_MACRO_MAX][CBM_EXPORT_MACRO_NAME_MAX];
+    int n = cbm_export_macro_candidates(src, (int)strlen(src), out, CBM_EXPORT_MACRO_MAX);
+    ASSERT_EQ(n, 0);
+    PASS();
+}
+
 /* #668: walk_defs used a fixed `walk_defs_frame_t stack[4096]` — a ~160 KB
  * C-stack frame that overflowed small thread stacks (the reporter's crash was in
  * the "definitions pass" on a large SQL file), and whose `top < 4096` push guards
@@ -6249,6 +6628,96 @@ TEST(extract_wide_flat_reference_fields_are_linear) {
         snprintf(message, sizeof(message),
                  "wide-reference field lookup grew from %llu to %llu for %dx input "
                  "(maximum %dx + 256) -- quadratic sibling scan",
+                 (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
+                 WORK_RATIO_MAX);
+        FAIL(message);
+    }
+    PASS();
+}
+
+/* The same guard for C#, whose callable-value site walk was the last one still
+ * climbing with ts_node_parent instead of the walk cursor. tree-sitter answers
+ * ts_node_parent by descending from the ROOT, so every step costs O(depth) and
+ * a deep file pays it per identifier. The .NET JIT tests are exactly that —
+ * single expressions megabytes deep — and they cost 18-48 us per node, which is
+ * why they were the only files a CPU-time budget ever cut off, and why the C#
+ * graph differed between two runs on one machine (2026-09-19). The budget is
+ * gone; this keeps the reason it was needed from coming back. */
+static uint64_t extract_csharp_argument_value_work(int statement_count, int *out_usages,
+                                                   uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "class C {\n"
+                                 "  static void Sink(object o) {}\n"
+                                 "  static void Target() {}\n"
+                                 "  static void Wide() {\n";
+    /* Parenthesised on purpose: a bare `Sink(Target)` needs no climb at all, so
+     * it cannot tell the cursor walk from the root-descending one and the test
+     * would pass either way. The wrapper makes the site walk take a step. */
+    static const char statement[] = "    Sink((Target));\n";
+    static const char suffix[] = "  }\n}\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement) + sizeof(suffix);
+    char *source = malloc(capacity);
+    if (!source) {
+        return UINT64_MAX;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    memcpy(source + offset, suffix, sizeof(suffix));
+    offset += sizeof(suffix) - 1U;
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, CBM_LANG_CSHARP, "proj", "Wide.cs", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return UINT64_MAX;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "Target") == 0) {
+            usages++;
+        }
+    }
+    uint64_t work = cbm_usage_field_lookup_test_work();
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return work;
+}
+
+TEST(extract_csharp_argument_values_use_the_walk_cursor) {
+    enum { SMALL = 128, BIG = 1024, INPUT_GROWTH = 8, WORK_RATIO_MAX = 12 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_slow_parent_fallbacks = 0;
+    uint64_t big_slow_parent_fallbacks = 0;
+    uint64_t small_work =
+        extract_csharp_argument_value_work(SMALL, &small_usages, &small_slow_parent_fallbacks);
+    uint64_t big_work =
+        extract_csharp_argument_value_work(BIG, &big_usages, &big_slow_parent_fallbacks);
+    ASSERT_TRUE(small_work != UINT64_MAX);
+    ASSERT_TRUE(big_work != UINT64_MAX);
+    /* Anti-vacuous: the occurrences really were classified, so a zero fallback
+     * count means "took the cursor", not "never looked". */
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    /* The assertion this test exists for: not one occurrence fell back to the
+     * root-descending parent lookup. */
+    ASSERT_EQ(small_slow_parent_fallbacks, 0);
+    ASSERT_EQ(big_slow_parent_fallbacks, 0);
+    fprintf(stderr, "  [csharp-argument-values] work(%d)=%llu work(%d)=%llu input_growth=%dx\n",
+            SMALL, (unsigned long long)small_work, BIG, (unsigned long long)big_work, INPUT_GROWTH);
+    uint64_t maximum = small_work * WORK_RATIO_MAX + 256U;
+    if (big_work > maximum) {
+        char message[192];
+        snprintf(message, sizeof(message),
+                 "csharp argument-value lookup grew from %llu to %llu for %dx input "
+                 "(maximum %dx + 256) -- the site walk is not linear",
                  (unsigned long long)small_work, (unsigned long long)big_work, INPUT_GROWTH,
                  WORK_RATIO_MAX);
         FAIL(message);
@@ -7184,7 +7653,383 @@ TEST(non_config_language_module_has_no_promoted_description_issue519) {
     PASS();
 }
 
+/* ── Result compaction (cbm_result_compact) ────────────────────────────── */
+
+static const char *COMPACT_PY_SRC = "import os\n"
+                                    "from typing import List\n"
+                                    "\n"
+                                    "@app.route(\"/items\")\n"
+                                    "def list_items(limit: int, offset: int = 0) -> List[str]:\n"
+                                    "    \"\"\"Return items.\"\"\"\n"
+                                    "    rows = fetch(limit, offset=offset)\n"
+                                    "    total = len(rows)\n"
+                                    "    for r in rows:\n"
+                                    "        print(r, total)\n"
+                                    "    return rows\n"
+                                    "\n"
+                                    "class Store(Base):\n"
+                                    "    def get(self, key):\n"
+                                    "        return self.data.get(key, None)\n"
+                                    "\n"
+                                    "    def put(self, key, value):\n"
+                                    "        self.data[key] = value\n"
+                                    "        return fetch(key, value)\n";
+
+static bool cmp_str_eq(const char *a, const char *b) {
+    if (!a || !b) {
+        return a == b;
+    }
+    return strcmp(a, b) == 0;
+}
+
+static bool cmp_list_eq(const char **a, const char **b) {
+    if (!a || !b) {
+        return a == b;
+    }
+    int i = 0;
+    for (; a[i] && b[i]; i++) {
+        if (strcmp(a[i], b[i]) != 0) {
+            return false;
+        }
+    }
+    return a[i] == NULL && b[i] == NULL;
+}
+
+static size_t arena_capacity(const CBMArena *a) {
+    size_t total = 0;
+    for (int i = 0; i < a->nblocks; i++) {
+        total += a->block_sizes[i];
+    }
+    return total;
+}
+
+TEST(extract_compact_keeps_every_field_and_shrinks_the_arena) {
+    CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    CBMFileResult *ref = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(ref);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(r->defs.count >= 4);  /* list_items, Store, get, put (+ module) */
+    ASSERT(r->calls.count >= 4); /* fetch x2, len, print, get */
+    ASSERT(r->usages.count >= 1);
+    ASSERT(r->imports.count >= 2);
+    bool saw_args = false;
+    for (int i = 0; i < ref->calls.count; i++) {
+        saw_args = saw_args || ref->calls.items[i].arg_count > 0;
+    }
+    ASSERT(saw_args);
+
+    size_t used_before = cbm_arena_total(&r->arena);
+    size_t cap_before = arena_capacity(&r->arena);
+    cbm_result_compact(r);
+
+    /* One exact block: capacity == bytes used, no dead headroom. */
+    ASSERT_EQ(r->arena.nblocks, 1);
+    ASSERT_EQ(arena_capacity(&r->arena), cbm_arena_total(&r->arena));
+    ASSERT(cbm_arena_total(&r->arena) < used_before);
+    ASSERT(arena_capacity(&r->arena) < cap_before);
+    ASSERT_EQ(r->defs.cap, r->defs.count);
+    ASSERT_EQ(r->calls.cap, r->calls.count);
+    ASSERT_EQ(r->usages.cap, r->usages.count);
+
+    /* Every field survives, by value. */
+    ASSERT_EQ(r->defs.count, ref->defs.count);
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *a = &r->defs.items[i];
+        const CBMDefinition *b = &ref->defs.items[i];
+        ASSERT(cmp_str_eq(a->name, b->name));
+        ASSERT(cmp_str_eq(a->qualified_name, b->qualified_name));
+        ASSERT(cmp_str_eq(a->label, b->label));
+        ASSERT(cmp_str_eq(a->file_path, b->file_path));
+        ASSERT(cmp_str_eq(a->signature, b->signature));
+        ASSERT(cmp_str_eq(a->return_type, b->return_type));
+        ASSERT(cmp_str_eq(a->docstring, b->docstring));
+        ASSERT(cmp_str_eq(a->parent_class, b->parent_class));
+        ASSERT(cmp_str_eq(a->route_path, b->route_path));
+        ASSERT(cmp_str_eq(a->body_tokens, b->body_tokens));
+        ASSERT(cmp_str_eq(a->structural_profile, b->structural_profile));
+        ASSERT(cmp_list_eq(a->decorators, b->decorators));
+        ASSERT(cmp_list_eq(a->base_classes, b->base_classes));
+        ASSERT(cmp_list_eq(a->param_names, b->param_names));
+        ASSERT(cmp_list_eq(a->param_types, b->param_types));
+        ASSERT(cmp_list_eq(a->return_types, b->return_types));
+        ASSERT_EQ(a->signature_param_count, b->signature_param_count);
+        for (int k = 0; k < a->signature_param_count; k++) {
+            ASSERT(cmp_str_eq(a->signature_param_types[k], b->signature_param_types[k]));
+        }
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ(a->end_line, b->end_line);
+        ASSERT_EQ(a->complexity, b->complexity);
+        ASSERT_EQ(a->lines, b->lines);
+        ASSERT_EQ(a->is_exported, b->is_exported);
+        ASSERT_EQ(a->fingerprint_k, b->fingerprint_k);
+        if (a->fingerprint_k > 0) {
+            ASSERT_NOT_NULL(a->fingerprint);
+            ASSERT(memcmp(a->fingerprint, b->fingerprint,
+                          (size_t)a->fingerprint_k * sizeof(uint32_t)) == 0);
+        }
+    }
+    ASSERT_EQ(r->calls.count, ref->calls.count);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *a = &r->calls.items[i];
+        const CBMCall *b = &ref->calls.items[i];
+        ASSERT(cmp_str_eq(a->callee_name, b->callee_name));
+        ASSERT(cmp_str_eq(a->enclosing_func_qn, b->enclosing_func_qn));
+        ASSERT(cmp_str_eq(a->first_string_arg, b->first_string_arg));
+        ASSERT_EQ(a->arg_count, b->arg_count);
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ(a->site_start_byte, b->site_start_byte);
+        ASSERT_EQ(a->site_end_byte, b->site_end_byte);
+        ASSERT_EQ(a->is_method, b->is_method);
+        for (int k = 0; k < a->arg_count; k++) {
+            ASSERT(cmp_str_eq(a->args[k].expr, b->args[k].expr));
+            ASSERT(cmp_str_eq(a->args[k].value, b->args[k].value));
+            ASSERT(cmp_str_eq(a->args[k].keyword, b->args[k].keyword));
+            ASSERT_EQ(a->args[k].index, b->args[k].index);
+        }
+    }
+    ASSERT_EQ(r->usages.count, ref->usages.count);
+    for (int i = 0; i < r->usages.count; i++) {
+        ASSERT(cmp_str_eq(r->usages.items[i].ref_name, ref->usages.items[i].ref_name));
+        ASSERT(cmp_str_eq(r->usages.items[i].enclosing_func_qn,
+                          ref->usages.items[i].enclosing_func_qn));
+        ASSERT_EQ(r->usages.items[i].kind, ref->usages.items[i].kind);
+        ASSERT_EQ(r->usages.items[i].site_start_byte, ref->usages.items[i].site_start_byte);
+        ASSERT_EQ(r->usages.items[i].is_member_access, ref->usages.items[i].is_member_access);
+    }
+    ASSERT_EQ(r->imports.count, ref->imports.count);
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT(cmp_str_eq(r->imports.items[i].local_name, ref->imports.items[i].local_name));
+        ASSERT(cmp_str_eq(r->imports.items[i].module_path, ref->imports.items[i].module_path));
+    }
+    ASSERT_EQ(r->rw.count, ref->rw.count);
+    ASSERT_EQ(r->type_refs.count, ref->type_refs.count);
+    ASSERT(cmp_str_eq(r->module_qn, ref->module_qn));
+    ASSERT(cmp_list_eq(r->exports, ref->exports));
+
+    /* Interned by content: two records with the same enclosing QN share one
+     * copy after compaction. */
+    bool shared = false;
+    for (int i = 0; i < r->calls.count && !shared; i++) {
+        for (int j = i + 1; j < r->calls.count && !shared; j++) {
+            if (r->calls.items[i].enclosing_func_qn && r->calls.items[j].enclosing_func_qn &&
+                strcmp(r->calls.items[i].enclosing_func_qn, r->calls.items[j].enclosing_func_qn) ==
+                    0) {
+                shared = r->calls.items[i].enclosing_func_qn == r->calls.items[j].enclosing_func_qn;
+            }
+        }
+    }
+    ASSERT(shared);
+
+    /* The arena stays usable for the cross-file pass: growth restarts at the
+     * small append block, never at twice the compact block. (It restarted at
+     * the 64 KB default until 2026-09-17: the cross-file pass appends a few
+     * resolved calls, so that block was ~60 KB of untouched memory per
+     * appended-to result — 0.5 GB of the worker's peak on the Go corpus.
+     * See CBM_ARENA_APPEND_BLOCK.) */
+    char *later = cbm_arena_strdup(&r->arena, "appended after compaction");
+    ASSERT_NOT_NULL(later);
+    ASSERT_EQ(r->arena.nblocks, 2);
+    ASSERT_EQ(r->arena.block_sizes[1], CBM_ARENA_APPEND_BLOCK);
+
+    cbm_free_result(r);
+    cbm_free_result(ref);
+    PASS();
+}
+
+TEST(extract_compact_is_idempotent_and_survives_empty_results) {
+    CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    cbm_result_compact(r);
+    size_t once = cbm_arena_total(&r->arena);
+    int defs = r->defs.count;
+    cbm_result_compact(r);
+    ASSERT_EQ(cbm_arena_total(&r->arena), once);
+    ASSERT_EQ(r->defs.count, defs);
+    ASSERT_EQ(r->arena.nblocks, 1);
+    cbm_free_result(r);
+
+    CBMFileResult *empty = extract("", CBM_LANG_PYTHON, "t", "empty.py");
+    ASSERT_NOT_NULL(empty);
+    cbm_result_compact(empty);
+    ASSERT_EQ(empty->defs.count + empty->calls.count, empty->defs.count + empty->calls.count);
+    ASSERT(empty->arena.nblocks >= 1);
+    cbm_free_result(empty);
+
+    cbm_result_compact(NULL); /* no-op */
+    PASS();
+}
+
+/* ── Result spill (result_spill.c): park -> load is a faithful round trip ── */
+
+TEST(extract_spill_round_trip_keeps_every_field) {
+    CBMFileResult *r = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    CBMFileResult *ref = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(ref);
+    cbm_result_compact(r);
+    cbm_result_compact(ref);
+
+    char dir[512];
+    snprintf(dir, sizeof(dir), "%s/cbm_spill_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(dir));
+    cbm_result_spill_t *sp = cbm_result_spill_open(dir, 2, 3);
+    ASSERT_NOT_NULL(sp);
+    ASSERT_FALSE(cbm_result_spill_has(sp, 1));
+
+    /* A result that is not compacted (two blocks) is refused, untouched. */
+    CBMFileResult *raw = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "raw.py");
+    ASSERT_NOT_NULL(raw);
+    if (raw->arena.nblocks > 1) {
+        ASSERT_FALSE(cbm_result_spill_park(sp, 0, 2, raw));
+        ASSERT_FALSE(cbm_result_spill_has(sp, 2));
+    }
+    cbm_free_result(raw);
+
+    /* Park frees the in-memory result; the slot is then on disk. Each
+     * precondition is named so a refusal says which one it was. */
+    int defs_before = r->defs.count;
+    int calls_before = r->calls.count;
+    ASSERT_EQ(r->arena.nblocks, 1);
+    ASSERT_EQ(r->owned_result_count, 0);
+    ASSERT_NOT_NULL(r->cached_tree); /* the extraction helper keeps the tree: park drops it */
+    ASSERT_TRUE(cbm_result_spill_park(sp, 1, 1, r));
+    r = NULL;
+    ASSERT_TRUE(cbm_result_spill_has(sp, 1));
+    int peek_defs = -1;
+    int peek_impls = -1;
+    cbm_result_spill_peek_counts(sp, 1, &peek_defs, &peek_impls);
+    ASSERT_EQ(peek_defs, defs_before);
+    ASSERT_EQ(peek_impls, 0);
+
+    CBMFileResult *back = cbm_result_spill_load(sp, 1);
+    ASSERT_NOT_NULL(back);
+    ASSERT_NULL(back->cached_tree);
+    ASSERT_EQ(back->arena.nblocks, 1);
+    ASSERT_EQ(back->defs.count, defs_before);
+    ASSERT_EQ(back->calls.count, calls_before);
+    for (int i = 0; i < back->defs.count; i++) {
+        const CBMDefinition *a = &back->defs.items[i];
+        const CBMDefinition *b = &ref->defs.items[i];
+        ASSERT(cmp_str_eq(a->name, b->name));
+        ASSERT(cmp_str_eq(a->qualified_name, b->qualified_name));
+        ASSERT(cmp_str_eq(a->label, b->label));
+        ASSERT(cmp_str_eq(a->file_path, b->file_path));
+        ASSERT(cmp_str_eq(a->signature, b->signature));
+        ASSERT(cmp_str_eq(a->docstring, b->docstring));
+        ASSERT(cmp_list_eq(a->decorators, b->decorators));
+        ASSERT(cmp_list_eq(a->param_names, b->param_names));
+        ASSERT_EQ(a->start_line, b->start_line);
+        ASSERT_EQ(a->fingerprint_k, b->fingerprint_k);
+        if (a->fingerprint_k > 0) {
+            ASSERT(memcmp(a->fingerprint, b->fingerprint,
+                          (size_t)a->fingerprint_k * sizeof(uint32_t)) == 0);
+        }
+        /* Every pointer now lives in the loaded block, none in the old one. */
+        const char *lo = back->arena.blocks[0];
+        const char *hi = lo + back->arena.used;
+        ASSERT(a->name >= lo && a->name < hi);
+        ASSERT(a->qualified_name >= lo && a->qualified_name < hi);
+    }
+    for (int i = 0; i < back->calls.count; i++) {
+        const CBMCall *a = &back->calls.items[i];
+        const CBMCall *b = &ref->calls.items[i];
+        ASSERT(cmp_str_eq(a->callee_name, b->callee_name));
+        ASSERT(cmp_str_eq(a->enclosing_func_qn, b->enclosing_func_qn));
+        ASSERT_EQ(a->arg_count, b->arg_count);
+        for (int k = 0; k < a->arg_count; k++) {
+            ASSERT(cmp_str_eq(a->args[k].expr, b->args[k].expr));
+        }
+    }
+    ASSERT_EQ(back->usages.count, ref->usages.count);
+    for (int i = 0; i < back->usages.count; i++) {
+        ASSERT(cmp_str_eq(back->usages.items[i].ref_name, ref->usages.items[i].ref_name));
+    }
+    ASSERT(cmp_str_eq(back->module_qn, ref->module_qn));
+    ASSERT(cmp_list_eq(back->exports, ref->exports));
+
+    /* Loading twice yields two independent copies. */
+    CBMFileResult *again = cbm_result_spill_load(sp, 1);
+    ASSERT_NOT_NULL(again);
+    ASSERT(again->arena.blocks[0] != back->arena.blocks[0]);
+    ASSERT_EQ(again->defs.count, defs_before);
+    int64_t parked = 0;
+    int64_t bytes = 0;
+    int64_t loads = 0;
+    cbm_result_spill_stats(sp, &parked, &bytes, &loads);
+    ASSERT_EQ(parked, 1);
+    ASSERT(bytes > 0);
+    ASSERT_EQ(loads, 2);
+
+    cbm_free_result(again);
+    cbm_free_result(back);
+    cbm_free_result(ref);
+    cbm_result_spill_close(sp);
+    cbm_rmdir(dir);
+    PASS();
+}
+
+/* ── A skipped file gets no LSP walk, per-file or cross-file ── */
+
+/* CBM_TEST_LSP_SKIP_ON names the file: the result carries lsp_skipped, the
+ * per-file LSP walk did not run (no LSP-resolved calls), and the shared
+ * cross-file dispatcher returns without touching it. The unified extractor
+ * definitions are still there. Nothing in production sets lsp_skipped from a
+ * clock any more — this pins what the flag DOES, which is what the cross-file
+ * dispatcher and the per-file walks both have to honour. */
+TEST(extract_lsp_skipped_file_gets_no_walk) {
+    cbm_setenv("CBM_TEST_LSP_SKIP_ON", "budget_share.py", 1);
+    CBMFileResult *skipped = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "budget_share.py");
+    cbm_unsetenv("CBM_TEST_LSP_SKIP_ON");
+    CBMFileResult *walked = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walked.py");
+    ASSERT_NOT_NULL(skipped);
+    ASSERT_NOT_NULL(walked);
+    ASSERT_TRUE(skipped->lsp_skipped);
+    ASSERT_FALSE(walked->lsp_skipped);
+    ASSERT_GT(skipped->defs.count, 0);                      /* the unified extractor still ran */
+    ASSERT_TRUE(skipped->defs.count <= walked->defs.count); /* the LSP walk adds its own defs */
+    ASSERT_EQ(skipped->resolved_calls.count, 0);
+
+    /* The dispatcher is the one gate for every language and both drivers. */
+    int calls_before = skipped->calls.count;
+    cbm_pxc_dispatch_file(CBM_LANG_PYTHON, skipped, COMPACT_PY_SRC, (int)strlen(COMPACT_PY_SRC),
+                          "budget_share.py", "t", NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL);
+    ASSERT_EQ(skipped->calls.count, calls_before);
+    ASSERT_EQ(skipped->resolved_calls.count, 0);
+
+    cbm_free_result(skipped);
+    cbm_free_result(walked);
+    PASS();
+}
+
+/* CBM_TEST_WALK_BUDGET_NODES stops the unified walk after that many nodes: the
+ * result is walk_truncated, therefore lsp_skipped, and the definitions the walk
+ * had not reached are the only loss. There is no budget by default (see
+ * CBM_WALK_MAX_NODES_DEFAULT), so this drives the same node counter an operator
+ * would set with CBM_WALK_MAX_NODES rather than a mechanism of its own. */
+TEST(extract_walk_truncated_when_a_node_budget_is_set) {
+    cbm_setenv("CBM_TEST_WALK_BUDGET_NODES", "8", 1);
+    CBMFileResult *cut = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walk_budget.py");
+    cbm_unsetenv("CBM_TEST_WALK_BUDGET_NODES");
+    CBMFileResult *full = extract(COMPACT_PY_SRC, CBM_LANG_PYTHON, "t", "walk_full.py");
+    ASSERT_NOT_NULL(cut);
+    ASSERT_NOT_NULL(full);
+    ASSERT_TRUE(cut->walk_truncated);
+    ASSERT_TRUE(cut->lsp_skipped);
+    ASSERT_FALSE(full->walk_truncated);
+    ASSERT_TRUE(cut->usages.count <= full->usages.count);
+    ASSERT_TRUE(cut->calls.count <= full->calls.count);
+    cbm_free_result(cut);
+    cbm_free_result(full);
+    PASS();
+}
+
 SUITE(extraction) {
+    RUN_TEST(extract_compact_keeps_every_field_and_shrinks_the_arena);
+    RUN_TEST(extract_compact_is_idempotent_and_survives_empty_results);
+    RUN_TEST(extract_spill_round_trip_keeps_every_field);
+    RUN_TEST(extract_lsp_skipped_file_gets_no_walk);
+    RUN_TEST(extract_walk_truncated_when_a_node_budget_is_set);
     /* Initialize extraction library */
     cbm_init();
 
@@ -7192,6 +8037,7 @@ SUITE(extraction) {
     RUN_TEST(extract_wide_flat_file_is_linear);
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
+    RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
@@ -7527,6 +8373,7 @@ SUITE(extraction) {
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
+    RUN_TEST(extract_ts_await_generic_call_issue2210);
     RUN_TEST(extract_ts_route_handler_after_named_middleware);
     RUN_TEST(extract_ts_route_handler_after_inline_middleware);
     RUN_TEST(extract_ts_url_builder_composed_issue1009);
@@ -7558,6 +8405,25 @@ SUITE(extraction) {
     RUN_TEST(extract_cpp_preproc_macro_generated_callable_skipped_issue949);
     RUN_TEST(extract_c_ifdef_split_brace_after_include_remapped_issue949);
     RUN_TEST(extract_c_clean_file_no_recovery_duplicates_issue961);
+    RUN_TEST(extract_cpp_export_macro_class_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_struct_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_enum_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_free_function_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_inline_method_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_negative_control_ordinary_caps_issue1989);
+    RUN_TEST(extract_c_export_macro_recovery_issue1989);
+    RUN_TEST(extract_cpp_export_macro_overlong_candidate_safe_issue1989);
+    RUN_TEST(extract_cpp_export_macro_comment_string_budget_issue1989);
+    RUN_TEST(extract_cpp_export_macro_candidate_cap_issue1989);
+    RUN_TEST(extract_cpp_export_macro_spliced_comment_budget_issue1989);
+    RUN_TEST(extract_cpp_export_macro_raw_string_issue1989);
+    RUN_TEST(extract_cpp_export_macro_raw_string_delimited_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_contract_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_delim_contract_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_quote_delim_issue1989);
+    RUN_TEST(extract_cpp_export_macro_collector_raw_string_unterminated_issue1989);
+    RUN_TEST(extract_cpp_export_macro_suffix_variants_issue1989);
+    RUN_TEST(extract_cpp_export_macro_explicit_define_priority_issue1989);
     RUN_TEST(walk_defs_no_truncation_over_4096_issue668);
     RUN_TEST(extract_rust_test_attr_marks_is_test_issue855);
     RUN_TEST(extract_c_test_dir_marks_is_test_issue1294);

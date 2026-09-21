@@ -136,7 +136,40 @@ typedef struct {
     /* ObjectScript method-return-type table built from extracted definitions
      * (NULL until pass_calls builds it). Owned by pipeline.c. */
     const CBMReturnTypeTable *return_type_table;
+
+    /* Spill / admission control (2026-09-13). spill_mode latches on the first
+     * over-budget observation in the extract gate (or on CBM_MEM_SPILL=1):
+     * from then on every compacted result is parked on disk instead of held
+     * in the cache, results already cached are swept out, and every later
+     * consumer (registry build, def collection, resolve) loads a result only
+     * for the moment it reads it. Memory then sits at the floor -- graph +
+     * registries + in-flight files -- and the run pays with disk reads.
+     * NULL/0 = results stay in memory as always. Owned by pipeline.c. */
+    struct cbm_result_spill *spill;
+    _Atomic int spill_mode;
+    /* Set by the ONE owner whose every result-cache consumer goes through
+     * cbm_pipeline_result_acquire()/release() and that closes the store
+     * (run_parallel_pipeline). An owner that leaves it false never spills:
+     * the incremental and probe routes still hand the cache array to passes
+     * that index it directly, so they keep results in memory (follow-up). */
+    bool spill_allowed;
 } cbm_pipeline_ctx_t;
+
+/* ── Result-cache access contract (spill mode) ────────────────────────
+ * After extraction a slot of the result cache is either the in-memory result
+ * or NULL with the result parked on disk (ctx->spill). Every consumer reads a
+ * slot through this pair; a pass that indexes the array itself is blind to
+ * parked results (the infra-route passes lost every __route__infra__ node
+ * that way, 2026-09-13). `want` (NULL = always) sees the parked HEADER first
+ * -- counts are valid, pointers are not -- and can veto the load, so a pass
+ * after one rare list does not read every parked result back from disk. */
+typedef bool (*cbm_result_want_fn)(const CBMFileResult *header);
+CBMFileResult *cbm_pipeline_result_acquire(const cbm_pipeline_ctx_t *ctx, CBMFileResult **cache,
+                                           int i, cbm_result_want_fn want, bool *loaded);
+void cbm_pipeline_result_release(CBMFileResult *r, bool loaded);
+
+/* Log the store counters, close and delete the store, drop the latch. */
+void cbm_pipeline_spill_close(cbm_pipeline_ctx_t *ctx);
 
 /* Transcode an ObjectScript Studio Export XML file and compose every generated
  * UDL class into one cacheable result. The returned result owns all child
@@ -205,6 +238,13 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
                                                CBMFileResult *const *results,
                                                const char *const *rels, int count);
+/* The same map built from the namespace names directly. The parallel pass needs
+ * this: results it has spilled are NULL in its cache, and a file missing from
+ * the map does not fail to resolve -- it resolves through the looser fallback,
+ * so an incomplete map CHANGES the graph instead of shrinking it. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count);
 void cbm_pipeline_namespace_map_free(CBMHashTable *map);
 
 /* Parse a manifest file and collect pkg entries. Returns true if basename matched. */
@@ -741,7 +781,7 @@ bool cbm_pipeline_semantic_manifests_equal(const cbm_file_hash_t *left, int left
                                            const cbm_file_hash_t *right, int right_count);
 /* Re-run discovery and hash its exact semantic inputs. Used at the publication
  * boundary so late additions/deletions cannot escape a frozen file list. */
-int cbm_pipeline_build_fresh_semantic_manifest(const char *project, const char *repo_path, int mode,
+int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *project,
                                                cbm_file_hash_t **out, int *out_count);
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
@@ -834,6 +874,8 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p);
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p);
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p);
 /* Record committed graph size (#334 gate axis) from the incremental path,
  * which cannot see the opaque cbm_pipeline struct. Call before the dump. */

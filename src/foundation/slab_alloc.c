@@ -39,6 +39,7 @@
 #include "foundation/slab_alloc.h"
 #include "foundation/compat.h"
 #include "foundation/compat_thread.h"
+#include "foundation/mem_core.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -177,7 +178,7 @@ static bool slab_map_set(uintptr_t base, slab_page_t *val) {
             slab_map_unlock();
             return true; /* nothing to unregister */
         }
-        l2 = (slab_map_l2_t *)calloc(1, sizeof(*l2));
+        l2 = (slab_map_l2_t *)cbm_calloc(CBM_MEM_CLASS_TS_TREE, sizeof(*l2));
         if (!l2) {
             slab_map_unlock();
             return false;
@@ -190,7 +191,7 @@ static bool slab_map_set(uintptr_t base, slab_page_t *val) {
             slab_map_unlock();
             return true;
         }
-        l3 = (slab_map_l3_t *)calloc(1, sizeof(*l3));
+        l3 = (slab_map_l3_t *)cbm_calloc(CBM_MEM_CLASS_TS_TREE, sizeof(*l3));
         if (!l3) {
             slab_map_unlock();
             return false;
@@ -217,6 +218,7 @@ static bool slab_grow(slab_state_t *s) {
     if (cbm_aligned_alloc(&mem, SLAB_PAGE_SIZE, SLAB_PAGE_SIZE) != 0 || !mem) {
         return false;
     }
+    cbm_mem_class_add_external(CBM_MEM_CLASS_TS_TREE, SLAB_PAGE_SIZE);
     slab_page_t *page = (slab_page_t *)mem;
     page->next = s->pages;
     atomic_init(&page->owner, s);
@@ -224,6 +226,7 @@ static bool slab_grow(slab_state_t *s) {
     atomic_init(&page->refcount, 1u); /* owner guard */
 
     if (!slab_map_register_page(page)) {
+        cbm_mem_class_remove_external(CBM_MEM_CLASS_TS_TREE, SLAB_PAGE_SIZE);
         cbm_aligned_free(page);
         return false;
     }
@@ -269,6 +272,7 @@ static void slab_reclaim_pages(slab_state_t *s, bool clear_installed) {
         unsigned prev = atomic_fetch_sub_explicit(&p->refcount, 1u, memory_order_acq_rel);
         if (prev == 1u) {
             slab_map_unregister_page(p);
+            cbm_mem_class_remove_external(CBM_MEM_CLASS_TS_TREE, SLAB_PAGE_SIZE);
             cbm_aligned_free(p);
         }
         p = next;
@@ -292,7 +296,7 @@ static void *slab_malloc(size_t size) {
         if (!s->freelist) {
             slab_refill(s);
             if (!s->freelist) {
-                return malloc(size); /* grow failed → heap fallback */
+                return cbm_alloc(CBM_MEM_CLASS_TS_TREE, size); /* grow failed → heap fallback */
             }
         }
         slab_free_node_t *node = s->freelist;
@@ -302,8 +306,8 @@ static void *slab_malloc(size_t size) {
         return node;
     }
 
-    /* >64B: straight to malloc (= mimalloc in production) */
-    return malloc(size);
+    /* >64B: straight to the core (= mimalloc in production) */
+    return cbm_alloc(CBM_MEM_CLASS_TS_TREE, size);
 }
 
 static void *slab_calloc(size_t count, size_t size) {
@@ -338,7 +342,7 @@ static void *slab_realloc(void *ptr, size_t new_size) {
             return ptr;
         }
         /* Promote slab → heap */
-        void *new_ptr = malloc(new_size);
+        void *new_ptr = cbm_alloc(CBM_MEM_CLASS_TS_TREE, new_size);
         if (!new_ptr) {
             return NULL;
         }
@@ -347,8 +351,8 @@ static void *slab_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    /* Case 2: heap pointer (from malloc) */
-    return realloc(ptr, new_size);
+    /* Case 2: heap pointer (from the core) */
+    return cbm_realloc(CBM_MEM_CLASS_TS_TREE, ptr, new_size);
 }
 
 static void slab_free(void *ptr) {
@@ -359,7 +363,7 @@ static void slab_free(void *ptr) {
     slab_page_t *page = slab_map_lookup(base);
     if (!page) {
         /* Not a slab chunk → plain heap pointer (>64B or grow-fallback). */
-        free(ptr);
+        cbm_free(CBM_MEM_CLASS_TS_TREE, ptr);
         return;
     }
 
@@ -386,6 +390,7 @@ static void slab_free(void *ptr) {
     if (prev == 1u) {
         /* We returned the final chunk of a retired page → release it. */
         slab_map_unregister_page(page);
+        cbm_mem_class_remove_external(CBM_MEM_CLASS_TS_TREE, SLAB_PAGE_SIZE);
         cbm_aligned_free(page);
     }
 }

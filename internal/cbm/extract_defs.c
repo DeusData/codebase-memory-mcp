@@ -7065,6 +7065,13 @@ typedef struct {
     int cap;
     const char *path; // for the WARN when the ceiling is hit (may be NULL)
     bool warned;
+    /* The per-file traversal scratch (ctx->scratch) when there is one: frames
+     * then come from memory the thread reuses file after file, where a malloc
+     * of 256 frames per file was 28 k allocations and 255 MB never written on
+     * the Go corpus (waste sanitizer, 2026-09-17). Growth copies into a
+     * doubled buffer and abandons the old one to the arena, like TSNodeStack.
+     * NULL: the heap, freed by the walk. */
+    CBMArena *arena;
 } wd_stack_t;
 
 // Generous safety ceiling (frames), env-overridable via CBM_WALK_DEFS_MAX.
@@ -7094,7 +7101,16 @@ static void wd_push(wd_stack_t *s, TSNode node, const char *enclosing_qn) {
             }
             return; // bounded: stop growing (warned, not silent)
         }
-        walk_defs_frame_t *nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        walk_defs_frame_t *nd = NULL;
+        if (s->arena) {
+            nd = (walk_defs_frame_t *)cbm_arena_alloc(s->arena,
+                                                      (size_t)ncap * sizeof(walk_defs_frame_t));
+            if (nd && s->top > 0) {
+                memcpy(nd, s->data, (size_t)s->top * sizeof(walk_defs_frame_t));
+            }
+        } else {
+            nd = safe_realloc(s->data, (size_t)ncap * sizeof(walk_defs_frame_t));
+        }
         if (!nd) {
             /* OOM — safe_realloc already freed the old buffer. Bail cleanly: drop
              * pending frames so the walk_defs loop drains and exits without a NULL
@@ -7759,6 +7775,7 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
     (void)depth_unused;
     wd_stack_t s = {0};
     s.path = ctx->rel_path;
+    s.arena = ctx->scratch;
     wd_push(&s, root, ctx->enclosing_class_qn);
 
     while (s.top > 0) {
@@ -7911,7 +7928,9 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
          * collection is mandatory (see wd_push_children_reverse). */
         wd_push_children_reverse(&s, node, frame.enclosing_class_qn);
     }
-    free(s.data);
+    if (!s.arena) {
+        free(s.data);
+    }
 }
 
 void cbm_extract_definitions_without_module(CBMExtractCtx *ctx) {

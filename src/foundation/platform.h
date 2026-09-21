@@ -116,6 +116,16 @@ typedef struct {
 /* Query system information. Results are cached after first call. */
 cbm_system_info_t cbm_system_info(void);
 
+/* Physical memory the system could hand out right now, or 0 when the platform
+ * cannot answer. NOT cached - it changes during a run, which is the point. */
+size_t cbm_system_available_ram(void);
+
+/* Free bytes on the filesystem holding `path`, or 0 when the platform cannot
+ * answer. Spilling trades a memory problem for a disk problem, so the disk has
+ * to be ASKED before that trade, not discovered through a failed write halfway
+ * through. Not cached: free space changes while we spill into it. */
+size_t cbm_fs_free_bytes(const char *path);
+
 /* Recommended worker count for parallel indexing.
  * initial=true:  all cores (user is waiting for initial index)
  * initial=false: max(1, perf_cores-1) (leave headroom for user apps) */
