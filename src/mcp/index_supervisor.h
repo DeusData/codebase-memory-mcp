@@ -186,18 +186,23 @@ int cbm_index_worker_start(const char *args_json, size_t memory_budget_bytes, bo
 int cbm_index_worker_start_with_policy(const char *args_json, size_t memory_budget_bytes,
                                        const cbm_index_resource_policy_t *resource_policy,
                                        bool single_thread, const char *marker_file,
-                                       const char *quarantine_file,
+                                       const char *quarantine_file, uint64_t duration_origin_ms,
                                        cbm_index_worker_handle_t **handle_out);
 
 /* Policy plus the request-scoped log callback. The daemon default start path
  * needs both: a missing policy fails closed, and worker diagnostics still
- * reach the daemon journal. */
+ * reach the daemon journal. duration_origin_ms is the request clock; 0 means now. */
 int cbm_index_worker_start_with_policy_log(const char *args_json, size_t memory_budget_bytes,
                                            const cbm_index_resource_policy_t *resource_policy,
                                            bool single_thread, const char *marker_file,
                                            const char *quarantine_file,
                                            cbm_proc_log_cb log_callback, void *log_context,
+                                           uint64_t duration_origin_ms,
                                            cbm_index_worker_handle_t **handle_out);
+
+/* Supervisor clock used to stamp a request-scoped duration origin. Tests may
+ * replace it; production is cbm_now_ms(). */
+uint64_t cbm_index_worker_now_ms(void);
 
 /* Request-scoped variant used by interactive local CLI calls. The callback is
  * invoked by the owner thread while it polls the contained worker; log_context
@@ -264,7 +269,8 @@ int cbm_index_spawn_worker_with_log_cancel(const char *args_json, bool single_th
 int cbm_index_spawn_worker_with_policy_log_cancel(
     const char *args_json, const cbm_index_resource_policy_t *resource_policy, bool single_thread,
     const char *marker_file, const char *quarantine_file, cbm_proc_log_cb log_callback,
-    void *log_context, const atomic_int *cancel_requested, cbm_index_worker_result_t *result);
+    void *log_context, const atomic_int *cancel_requested, uint64_t duration_origin_ms,
+    cbm_index_worker_result_t *result);
 
 void cbm_index_worker_result_free(cbm_index_worker_result_t *result);
 

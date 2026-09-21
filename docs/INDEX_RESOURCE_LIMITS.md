@@ -27,24 +27,30 @@ ranges are rejected without changing the stored value.
 
 | Key | Default | Accepted value | Protects |
 |---|---:|---:|---|
-| `index_max_rss_mb` | `off` | `off` or `64..1048576` | Current RSS of the complete worker process tree |
-| `index_max_duration_seconds` | `off` | `off` or `1..86400` | Total worker wall-clock duration |
+| `index_max_rss_mb` | `off` | `off` or `64..1048576` | Charged memory of the complete worker process tree |
+| `index_max_duration_seconds` | `off` | `off` or `1..86400` | Wall-clock duration of the whole index request |
 
 ```bash
 codebase-memory-mcp config set index_max_rss_mb 8192
 codebase-memory-mcp config set index_max_duration_seconds 3600
 ```
 
-RSS is the current resident memory of the contained worker and every descendant,
-not the worker's allocation budget and not peak memory. This hard watchdog is
+RSS is the charged memory of the contained worker and every descendant, not
+the worker's allocation budget and not peak memory. On macOS that quantity is
+`phys_footprint` (the same number `cbm_mem_charged()` enforces), not
+`resident_size`, which still counts pages the allocator has already handed
+back. Linux and Windows use RSS / working set. This hard watchdog is
 separate from the internal `CBM_MEM_BUDGET_MB` soft budget. The supervisor
-samples RSS at most once every 250 milliseconds so the watchdog does not turn
-full process-table enumeration into a busy loop.
+samples the tree at most once every 250 milliseconds so the watchdog does not
+turn full process-table enumeration into a busy loop.
 
-Duration uses a monotonic clock from successful spawn. It is independent of the
-existing 15-minute quiet timeout: continuous log progress does not reset total
-duration, while the quiet timeout continues to identify a worker that stops
-making progress.
+Duration is per request: the clock starts at the first worker spawn and is
+not reset when crash/hang recovery starts a later attempt. Continuous log
+progress does not reset it. It is independent of the existing 15-minute quiet
+timeout, which still identifies a worker that stops making progress. A
+duration limit shorter than that quiet timeout kills a hung worker before hang
+quarantine can name the in-flight file, so the next attempt may hang on the
+same file.
 
 Equality is allowed. The first RSS or elapsed-duration observation above its
 limit starts the existing graceful-to-force process-tree shutdown. CBM reports

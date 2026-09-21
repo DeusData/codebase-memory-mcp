@@ -93,8 +93,8 @@ Current keys:
 | `watch_non_git` | `false` | Also poll project roots that are **not git repositories**. By default the watcher only follows git projects, so a project indexed from a plain directory is never refreshed after its first index — reindex it manually with `index_repository`. Set `true` to poll such roots on the same adaptive cadence with a file-tree scan: the indexer's own discovery walk (same skip lists, `.gitignore` and `.cbmignore` rules) hashed over each file's path, size and mtime. Any change reindexes once; paths the indexer skips (including cbm's own `.codebase-memory/` output) never trigger. The first poll after the daemon starts reindexes each such project once, since nothing records which tree state the index holds. The scan walks the whole tree every poll, so it costs more than git polling on very large trees. Read once when the daemon starts, like `watcher_enabled`. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
-| `index_max_rss_mb` | `off` | Optional maximum current RSS in MiB for the complete contained index-worker process tree (`64..1048576`). |
-| `index_max_duration_seconds` | `off` | Optional maximum total worker duration in seconds (`1..86400`). |
+| `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
+| `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). |
 
 For a watched project, `index_status` names the polling method in `watch.strategy`:
 `git` (HEAD and dirty-state polling), `tree` (a non-git root polled by the
