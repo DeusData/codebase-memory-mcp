@@ -495,6 +495,12 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
     bool root_failed = false;
     for (DWORD index = 0; index < processes->NumberOfProcessIdsInList; index++) {
         DWORD pid = (DWORD)processes->ProcessIdList[index];
+        /* GetProcessMemoryInfo documents PROCESS_QUERY_INFORMATION |
+         * PROCESS_VM_READ. PROCESS_QUERY_LIMITED_INFORMATION is a lesser
+         * alternative on newer Windows; the Job Object membership list
+         * already closes most of the pid-reuse window between listing and
+         * opening. A member we cannot open is a probe failure when it is
+         * the root. */
         HANDLE member = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
         if (!member) {
             root_failed = root_failed || pid == process->process_id;
@@ -574,7 +580,11 @@ static cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_platform(cbm_subproces
             root_failed = root_failed || pids[index] == process->pid;
             continue;
         }
-        cbm_rss_add_saturated(&total, usage.ri_resident_size);
+        /* phys_footprint is what the OS charges, matching cbm_mem_charged().
+         * ri_resident_size still counts pages mimalloc already marked
+         * MADV_FREE_REUSABLE, so a Mac worker can look like 17 GB RSS while
+         * the kernel holds it to 5.5 GB. */
+        cbm_rss_add_saturated(&total, usage.ri_phys_footprint);
         measured++;
     }
     cbm_free(CBM_MEM_CLASS_OTHER, pids);

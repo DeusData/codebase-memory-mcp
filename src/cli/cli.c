@@ -7449,8 +7449,9 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},
     {CBM_INDEX_CONFIG_MAX_FILES, "off", "Max accepted source files per index, or off"},
     {CBM_INDEX_CONFIG_MAX_SOURCE_MB, "off", "Max accepted source MiB per index, or off"},
-    {CBM_INDEX_CONFIG_MAX_RSS_MB, "off", "Max worker process-tree RSS MiB, or off"},
-    {CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "off", "Max worker duration in seconds, or off"},
+    {CBM_INDEX_CONFIG_MAX_RSS_MB, "off", "Max worker process-tree charged memory MiB, or off"},
+    {CBM_INDEX_CONFIG_MAX_DURATION_SECONDS, "off",
+     "Max wall-clock seconds for the whole index request, or off"},
 };
 
 /* #1558: ui_enabled and ui_port were reachable ONLY by hand-editing

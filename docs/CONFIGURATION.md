@@ -91,8 +91,8 @@ Current keys:
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
 | `index_max_source_mb` | `off` | Optional maximum accepted source size in MiB in one discovery run. |
-| `index_max_rss_mb` | `off` | Optional maximum current RSS in MiB for the complete contained index-worker process tree (`64..1048576`). |
-| `index_max_duration_seconds` | `off` | Optional maximum total worker duration in seconds (`1..86400`). |
+| `index_max_rss_mb` | `off` | Optional maximum charged memory in MiB for the complete contained index-worker process tree (`64..1048576`). On macOS this is phys_footprint, not resident size. |
+| `index_max_duration_seconds` | `off` | Optional maximum wall-clock duration in seconds for the whole index request, including crash/hang recovery (`1..86400`). |
 
 > **`watcher_enabled` vs `auto_watch`.** `watcher_enabled` controls whether the
 > watcher *subsystem* starts at all (the background poll thread). `auto_watch` is

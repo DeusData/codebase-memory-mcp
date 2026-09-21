@@ -1417,7 +1417,9 @@ static void app_fake_worker_read_file(const char *path, char *out, size_t out_si
 
 static int app_fake_worker_start(void *opaque, const char *args_json, size_t memory_budget_bytes,
                                  const char *marker_file, const char *quarantine_file,
+                                 uint64_t duration_origin_ms,
                                  cbm_daemon_application_worker_t *worker_out) {
+    (void)duration_origin_ms;
     app_fake_worker_context_t *context = opaque;
     app_fake_worker_t *worker = calloc(1, sizeof(*worker));
     if (!worker) {

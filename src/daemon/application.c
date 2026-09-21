@@ -147,6 +147,7 @@ struct cbm_daemon_application_job {
     bool cancelled;
     bool cancel_requested;
     bool supervision_failed;
+    uint64_t request_started_ms;
     cbm_daemon_application_job_t *next;
 };
 
@@ -303,6 +304,7 @@ static void application_project_lock_release_fully(cbm_project_lock_lease_t **le
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
+                                            uint64_t duration_origin_ms,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
     cbm_index_resource_policy_t resource_policy;
@@ -314,9 +316,9 @@ static int application_worker_start_default(void *context, const char *args_json
         return -1;
     }
     cbm_index_worker_handle_t *worker = NULL;
-    int result =
-        cbm_index_worker_start_with_policy(args_json, memory_budget_bytes, &resource_policy, false,
-                                           marker_file, quarantine_file, &worker);
+    int result = cbm_index_worker_start_with_policy(args_json, memory_budget_bytes,
+                                                    &resource_policy, false, marker_file,
+                                                    quarantine_file, duration_origin_ms, &worker);
     *worker_out = worker;
     return result;
 }
@@ -1124,10 +1126,13 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     }
 
     cbm_daemon_application_worker_t worker = NULL;
+    if (job->request_started_ms == 0) {
+        job->request_started_ms = cbm_index_worker_now_ms();
+    }
     application_tmp_lock();
-    int start_result =
-        application->worker_ops.start(application->worker_ops.context, job->args_json,
-                                      memory_budget_bytes, marker_path, quarantine_path, &worker);
+    int start_result = application->worker_ops.start(
+        application->worker_ops.context, job->args_json, memory_budget_bytes, marker_path,
+        quarantine_path, job->request_started_ms, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED

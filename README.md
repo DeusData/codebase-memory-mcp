@@ -738,8 +738,8 @@ codebase-memory-mcp config set auto_watch false          # don't register backgr
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
 codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
 codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
-codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree current RSS limit
-codebase-memory-mcp config set index_max_duration_seconds 3600 # optional total worker duration
+codebase-memory-mcp config set index_max_rss_mb 8192     # optional worker-tree charged-memory limit
+codebase-memory-mcp config set index_max_duration_seconds 3600 # optional per-request duration
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
 

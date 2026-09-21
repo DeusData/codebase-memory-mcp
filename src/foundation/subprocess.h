@@ -129,10 +129,12 @@ int cbm_subprocess_spawn(const cbm_proc_opts_t *opts, cbm_subprocess_t **out);
  * tree when cancel_grace_ms elapses. Callers must keep polling to make progress. */
 cbm_proc_poll_t cbm_subprocess_poll(cbm_subprocess_t *process, cbm_proc_result_t *out);
 
-/* Read the current resident-set size of the complete contained process tree.
- * OK returns an overflow-safe byte total, EMPTY means the owned tree currently
- * has no observable members, and ERROR means no trustworthy measurement could
- * be obtained. Individual processes that exit during enumeration are ignored. */
+/* Read the current charged memory of the complete contained process tree.
+ * On macOS this is phys_footprint (what the OS holds against the process);
+ * elsewhere it is RSS. OK returns an overflow-safe byte total, EMPTY means
+ * the owned tree currently has no observable members, and ERROR means no
+ * trustworthy measurement could be obtained. Individual processes that exit
+ * during enumeration are ignored. */
 cbm_proc_tree_rss_status_t cbm_subprocess_tree_rss_bytes(cbm_subprocess_t *process,
                                                          uint64_t *rss_bytes);
 bool cbm_subprocess_root_running(const cbm_subprocess_t *process);

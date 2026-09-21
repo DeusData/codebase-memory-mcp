@@ -10783,12 +10783,14 @@ int cbm_index_restart_cap_for_testing(void) {
 static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
                                   const cbm_index_resource_policy_t *resource_policy) {
     invalidate_cached_store(srv);
+    uint64_t request_started_ms = cbm_index_worker_now_ms();
 
     /* First attempt: normal parallel run. */
     cbm_index_worker_result_t wr;
     int rc = cbm_index_spawn_worker_with_policy_log_cancel(
         args, resource_policy, false, NULL, NULL, srv ? srv->index_log_callback : NULL,
-        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL, &wr);
+        srv ? srv->index_log_context : NULL, srv ? &srv->pipeline_cancel_requested : NULL,
+        request_started_ms, &wr);
     cbm_mcp_supervised_result_disposition_t disposition =
         cbm_mcp_supervised_result_disposition(rc, &wr);
 
@@ -10863,7 +10865,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
         int rc2 = cbm_index_spawn_worker_with_policy_log_cancel(
             args, resource_policy, /*single_thread=*/false, marker_path, quarantine_path,
             srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
-            srv ? &srv->pipeline_cancel_requested : NULL, &wr2);
+            srv ? &srv->pipeline_cancel_requested : NULL, request_started_ms, &wr2);
         cbm_mcp_supervised_result_disposition_t recovery_disposition =
             cbm_mcp_supervised_result_disposition(rc2, &wr2);
         if (recovery_disposition == CBM_MCP_SUPERVISED_RESULT_FALLBACK) {
@@ -10980,7 +10982,7 @@ static char *index_run_supervised(cbm_mcp_server_t *srv, const char *args,
         int rcp = cbm_index_spawn_worker_with_policy_log_cancel(
             args, resource_policy, /*single_thread=*/false, NULL, quarantine_path,
             srv ? srv->index_log_callback : NULL, srv ? srv->index_log_context : NULL,
-            srv ? &srv->pipeline_cancel_requested : NULL, &wrp);
+            srv ? &srv->pipeline_cancel_requested : NULL, request_started_ms, &wrp);
         cbm_mcp_supervised_result_disposition_t partial_disposition =
             cbm_mcp_supervised_result_disposition(rcp, &wrp);
         if (partial_disposition == CBM_MCP_SUPERVISED_RESULT_SUCCESS) {
