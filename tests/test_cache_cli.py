@@ -13,6 +13,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 
@@ -179,6 +180,19 @@ class CacheCLI(unittest.TestCase):
                                env=self.env, capture_output=True, timeout=30)
         self.assertEqual(start.returncode, 0, start.stderr)
         try:
+            # Daemon start is asynchronous.  On slower macOS runners the
+            # immediate prune can race initialization and pass through before
+            # the daemon has acquired its cohort lease, making the busy gate
+            # assertion flaky.  Wait until status observes the live daemon.
+            deadline = time.monotonic() + 30
+            while True:
+                status = subprocess.run([BINARY, "daemon", "status"], cwd=self.source,
+                                        env=self.env, capture_output=True, timeout=30)
+                if status.returncode == 0:
+                    break
+                if time.monotonic() >= deadline:
+                    self.fail(status.stderr.decode(errors="replace"))
+                time.sleep(0.1)
             result = self.run_cache("prune", "--missing-root", "--confirm-missing-root")
             self.assertNotEqual(result.returncode, 0, result.stdout)
             self.assertIn(b"cache is busy", result.stderr)
