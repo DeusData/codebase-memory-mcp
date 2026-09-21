@@ -38,6 +38,9 @@ struct cbm_private_file_lock {
     int fd;
     pid_t owner_pid;
     cbm_private_file_lock_mode_t mode;
+    /* Borrowed; the directory outlives every lock acquired through it. */
+    const cbm_private_lock_directory_t *directory;
+    char base_name[NAME_MAX + 1];
     struct cbm_private_file_lock *next_tracked;
     bool unlocked;
     bool test_fail_unlock_once;
@@ -345,6 +348,8 @@ cbm_private_file_lock_status_t cbm_private_file_lock_try_acquire(
     lock->fd = fd;
     lock->owner_pid = getpid();
     lock->mode = mode;
+    lock->directory = directory;
+    memcpy(lock->base_name, base_name, strlen(base_name) + 1);
 
     int operation = mode == CBM_PRIVATE_FILE_LOCK_SH ? LOCK_SH : LOCK_EX;
     if (private_flock_set(fd, operation | LOCK_NB) != 0) {
@@ -489,9 +494,11 @@ cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock
     if (!cbm_private_file_lock_fork_guard_enter()) {
         return CBM_PRIVATE_FILE_LOCK_IO;
     }
-    /* An unlinked file keeps its inode alive for this handle with st_nlink 0,
-     * which the payload validity check already rejects. */
-    bool linked = private_payload_fd_valid(lock, NULL);
+    /* Unlink leaves st_nlink 0 on the held inode, but a rename-away or a
+     * replaced directory keeps it linked elsewhere; only the path-vs-handle
+     * identity check proves the canonical path still names this lock. */
+    bool linked = private_payload_fd_valid(lock, NULL) && lock->directory &&
+                  private_file_revalidate(lock->directory, lock->base_name, lock->fd, NULL);
     bool touched = linked && futimens(lock->fd, NULL) == 0;
     cbm_private_file_lock_fork_guard_leave();
     if (!linked) {

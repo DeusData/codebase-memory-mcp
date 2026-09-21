@@ -363,23 +363,35 @@ cbm_private_file_lock_status_t cbm_version_cohort_lease_release(
     return result;
 }
 
-static bool version_cohort_lock_touch(cbm_private_file_lock_t *lock) {
-    return !lock || cbm_private_file_lock_touch(lock) == CBM_PRIVATE_FILE_LOCK_OK;
-}
-
-bool cbm_version_cohort_lease_touch(cbm_version_cohort_lease_t *lease) {
-    if (!lease) {
-        return false;
+/* Folds one lock's touch into an accumulated result: a lost file (UNSAFE)
+ * outranks a transient refresh failure (IO), which outranks OK. A lease holds
+ * only lifetime after admission, so absent locks are skipped. */
+static cbm_version_cohort_status_t version_cohort_lock_touch(cbm_private_file_lock_t *lock,
+                                                             cbm_version_cohort_status_t result) {
+    if (!lock || result == CBM_VERSION_COHORT_UNSAFE) {
+        return result;
     }
-    /* Evaluate all three so one lost file does not leave the others to age. */
-    bool lifetime = version_cohort_lock_touch(lease->lifetime);
-    bool admission = version_cohort_lock_touch(lease->admission);
-    bool maintenance = version_cohort_lock_touch(lease->maintenance);
-    return lifetime && admission && maintenance;
+    cbm_private_file_lock_status_t status = cbm_private_file_lock_touch(lock);
+    if (status == CBM_PRIVATE_FILE_LOCK_UNSAFE) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    return status == CBM_PRIVATE_FILE_LOCK_OK ? result : CBM_VERSION_COHORT_IO;
 }
 
-bool cbm_version_cohort_daemon_claim_touch(cbm_version_cohort_daemon_claim_t *claim) {
-    return claim && claim->marker && version_cohort_lock_touch(claim->marker);
+cbm_version_cohort_status_t cbm_version_cohort_lease_touch(cbm_version_cohort_lease_t *lease) {
+    if (!lease || !lease->lifetime) {
+        return CBM_VERSION_COHORT_UNSAFE;
+    }
+    cbm_version_cohort_status_t result =
+        version_cohort_lock_touch(lease->lifetime, CBM_VERSION_COHORT_OK);
+    result = version_cohort_lock_touch(lease->admission, result);
+    return version_cohort_lock_touch(lease->maintenance, result);
+}
+
+cbm_version_cohort_status_t cbm_version_cohort_daemon_claim_touch(
+    cbm_version_cohort_daemon_claim_t *claim) {
+    return claim && claim->marker ? version_cohort_lock_touch(claim->marker, CBM_VERSION_COHORT_OK)
+                                  : CBM_VERSION_COHORT_UNSAFE;
 }
 
 static cbm_version_cohort_status_t version_cohort_failed(cbm_version_cohort_lease_t *lease,

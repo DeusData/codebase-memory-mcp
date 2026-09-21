@@ -146,13 +146,15 @@ cbm_private_file_lock_status_t cbm_version_cohort_lease_release(
     cbm_version_cohort_lease_t **lease_io);
 
 /* Heartbeat for a long-lived holder: refresh every lock file the lease or
- * claim holds and report false once any held file was unlinked or replaced.
- * An age-based temp cleaner deleting a held file silently ends coordination,
- * because the next participant creates and locks a fresh inode (#2178). The
- * only safe response to false is an orderly exit; re-claiming would race
- * that participant. */
-bool cbm_version_cohort_lease_touch(cbm_version_cohort_lease_t *lease);
-bool cbm_version_cohort_daemon_claim_touch(cbm_version_cohort_daemon_claim_t *claim);
+ * claim holds. An age-based temp cleaner deleting a held file silently ends
+ * coordination, because the next participant creates and locks a fresh inode
+ * (#2178). Returns OK when all held files were refreshed, UNSAFE once any is
+ * lost (its path no longer names the held file), and IO when a still-valid
+ * file could not be refreshed. The only safe response to UNSAFE is an orderly
+ * exit; re-claiming would race that participant. IO is transient. */
+cbm_version_cohort_status_t cbm_version_cohort_lease_touch(cbm_version_cohort_lease_t *lease);
+cbm_version_cohort_status_t cbm_version_cohort_daemon_claim_touch(
+    cbm_version_cohort_daemon_claim_t *claim);
 
 /* Refuses teardown while a lease or retryable cleanup handle remains. */
 cbm_private_file_lock_status_t cbm_version_cohort_manager_free(

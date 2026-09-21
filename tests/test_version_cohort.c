@@ -330,9 +330,9 @@ TEST(version_cohort_conflict_is_retried_until_the_deadline) {
 
     /* An indefinite deadline never waits on a conflicting holder. */
     retries_before = cbm_version_cohort_conflict_retries_for_testing();
-    ASSERT_EQ(cbm_version_cohort_acquire(second, &requested, UINT64_MAX, &requested_lease,
-                                         &conflict),
-              CBM_VERSION_COHORT_CONFLICT);
+    ASSERT_EQ(
+        cbm_version_cohort_acquire(second, &requested, UINT64_MAX, &requested_lease, &conflict),
+        CBM_VERSION_COHORT_CONFLICT);
     ASSERT_NULL(requested_lease);
     ASSERT_EQ(cbm_version_cohort_conflict_retries_for_testing(), retries_before);
 
@@ -667,6 +667,53 @@ TEST(version_cohort_does_not_repurpose_daemon_startup_lock_for_lifetime) {
     version_cohort_manager_close(&manager);
     version_cohort_fixture_finish(&fixture);
     PASS();
+}
+
+/* #2178: a live daemon's lease holds only the lifetime file after admission
+ * (admission and maintenance are released), and its claim holds the marker.
+ * Touch must report both intact, then name each as lost once an age-based
+ * temp cleaner unlinks it, independently of the other. */
+TEST(version_cohort_touch_reports_each_lost_file) {
+#ifdef _WIN32
+    SKIP_PLATFORM("unlinking a held lock file is POSIX behavior");
+#else
+    version_cohort_fixture_t fixture;
+    ASSERT_TRUE(version_cohort_fixture_start(&fixture, "touch"));
+    cbm_version_cohort_manager_t *manager = cbm_version_cohort_manager_new(fixture.endpoint);
+    ASSERT_NOT_NULL(manager);
+    cbm_daemon_build_identity_t identity = version_cohort_identity("1.0.0", VERSION_COHORT_BUILD_A);
+    cbm_daemon_conflict_t conflict;
+    cbm_version_cohort_lease_t *lease = NULL;
+    cbm_version_cohort_daemon_claim_t *claim = NULL;
+    ASSERT_EQ(
+        cbm_version_cohort_acquire(manager, &identity, cbm_now_ms() + 5000, &lease, &conflict),
+        CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(cbm_version_cohort_daemon_claim_acquire(manager, &claim), CBM_VERSION_COHORT_OK);
+
+    ASSERT_EQ(cbm_version_cohort_lease_touch(lease), CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(cbm_version_cohort_daemon_claim_touch(claim), CBM_VERSION_COHORT_OK);
+
+    const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(fixture.endpoint);
+    char marker[VERSION_COHORT_TEST_PATH_CAP];
+    char lifetime[VERSION_COHORT_TEST_PATH_CAP];
+    ASSERT_TRUE(snprintf(marker, sizeof(marker), "%s/cbm-version-cohort-daemon-v1.lock",
+                         runtime_dir) < (int)sizeof(marker));
+    ASSERT_TRUE(snprintf(lifetime, sizeof(lifetime), "%s/cbm-version-cohort-lifetime-v1.lock",
+                         runtime_dir) < (int)sizeof(lifetime));
+
+    ASSERT_EQ(unlink(marker), 0);
+    ASSERT_EQ(cbm_version_cohort_daemon_claim_touch(claim), CBM_VERSION_COHORT_UNSAFE);
+    ASSERT_EQ(cbm_version_cohort_lease_touch(lease), CBM_VERSION_COHORT_OK);
+
+    ASSERT_EQ(unlink(lifetime), 0);
+    ASSERT_EQ(cbm_version_cohort_lease_touch(lease), CBM_VERSION_COHORT_UNSAFE);
+
+    ASSERT_EQ(cbm_version_cohort_daemon_claim_release(&claim), CBM_PRIVATE_FILE_LOCK_OK);
+    version_cohort_release(&lease);
+    version_cohort_manager_close(&manager);
+    version_cohort_fixture_finish(&fixture);
+    PASS();
+#endif
 }
 
 TEST(version_cohort_distinguishes_coordinated_daemon_without_connecting) {
@@ -1034,6 +1081,7 @@ SUITE(version_cohort) {
     RUN_TEST(version_cohort_mutation_waits_for_every_lifetime_participant);
     RUN_TEST(version_cohort_mutation_timeout_releases_all_guards);
     RUN_TEST(version_cohort_does_not_repurpose_daemon_startup_lock_for_lifetime);
+    RUN_TEST(version_cohort_touch_reports_each_lost_file);
     RUN_TEST(version_cohort_distinguishes_coordinated_daemon_without_connecting);
     RUN_TEST(version_cohort_transition_presence_is_authoritative_and_marker_checked);
     RUN_TEST(version_cohort_transition_shutdown_order_has_no_false_conflict);

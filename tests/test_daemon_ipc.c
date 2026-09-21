@@ -2064,22 +2064,34 @@ TEST(daemon_ipc_lifetime_reservation_survives_saturated_second_listen) {
 }
 
 /* #2178: an age-based temp cleaner unlinked the live daemon's lifetime lock
- * and identity marker. The heartbeat must report either loss, so the daemon
- * exits instead of serving under a lifetime file that coordinates nothing or
- * leaving an unremovable socket pair behind at close. */
+ * and identity marker. The heartbeat must keep every listener-owned file
+ * young, and report loss (unlink, or replacement by a fresh file at the same
+ * name) so the daemon exits instead of serving under a lifetime file that
+ * coordinates nothing or leaving an unremovable socket pair behind at close. */
 TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
 #ifdef _WIN32
     SKIP_PLATFORM("unlink-while-held of runtime files is POSIX behavior");
 #else
+    enum { TOUCH_CASES = 4 };
     static const char key[] = "2178a2178a2178a0";
-    static const char *const lost_files[] = {"lifetime.lock", "sock.identity"};
+    static const struct {
+        const char *suffix;
+        bool replace;
+    } cases[TOUCH_CASES] = {
+        {"lifetime.lock", false}, /* lifetime reservation */
+        {"lock", false},          /* listener-owned participant guard */
+        {"sock.identity", false}, /* identity marker, unlinked */
+        {"sock.identity", true},  /* identity marker, replaced by a fresh inode */
+    };
+    const time_t stale = 1000000000;
     char parent[TEST_PATH_CAP] = {0};
     char runtime_dir[TEST_PATH_CAP] = {0};
     cbm_daemon_ipc_endpoint_t *endpoint = NULL;
-    bool started[2] = {false, false};
-    bool touched_intact[2] = {false, false};
-    bool unlinked[2] = {false, false};
-    bool touched_after_loss[2] = {true, true};
+    bool started[TOUCH_CASES] = {false};
+    int touched_intact[TOUCH_CASES] = {0};
+    bool refreshed[TOUCH_CASES] = {false};
+    bool lost[TOUCH_CASES] = {false};
+    int touched_after_loss[TOUCH_CASES] = {1, 1, 1, 1};
 
     if (ipc_test_parent_new(parent, "listener-touch")) {
         endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
@@ -2087,25 +2099,36 @@ TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
     if (endpoint) {
         ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
     }
-    for (size_t i = 0; endpoint && i < 2; i++) {
+    for (size_t i = 0; endpoint && i < TOUCH_CASES; i++) {
         cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
         started[i] = listener != NULL;
-        touched_intact[i] = started[i] && cbm_daemon_ipc_listener_touch(listener);
         char path[TEST_PATH_CAP];
-        int written = snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, lost_files[i]);
-        unlinked[i] =
-            touched_intact[i] && written > 0 && written < (int)sizeof(path) && unlink(path) == 0;
-        touched_after_loss[i] = unlinked[i] && cbm_daemon_ipc_listener_touch(listener);
+        int written =
+            snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, cases[i].suffix);
+        bool path_ok = started[i] && written > 0 && written < (int)sizeof(path);
+        struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+        bool aged = path_ok && utimensat(AT_FDCWD, path, stale_times, AT_SYMLINK_NOFOLLOW) == 0;
+        touched_intact[i] = aged ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        struct stat after;
+        refreshed[i] = touched_intact[i] == 1 && stat(path, &after) == 0 &&
+                       after.st_atime > stale && after.st_mtime > stale;
+        lost[i] = refreshed[i] && unlink(path) == 0;
+        if (lost[i] && cases[i].replace) {
+            int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+            lost[i] = fd >= 0 && close(fd) == 0;
+        }
+        touched_after_loss[i] = lost[i] ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
         cbm_daemon_ipc_listener_close(listener);
     }
     cbm_daemon_ipc_endpoint_free(endpoint);
     ipc_test_remove_tree(runtime_dir, parent);
 
-    for (size_t i = 0; i < 2; i++) {
+    for (size_t i = 0; i < TOUCH_CASES; i++) {
         ASSERT_TRUE(started[i]);
-        ASSERT_TRUE(touched_intact[i]);
-        ASSERT_TRUE(unlinked[i]);
-        ASSERT_FALSE(touched_after_loss[i]);
+        ASSERT_EQ(touched_intact[i], 1);
+        ASSERT_TRUE(refreshed[i]);
+        ASSERT_TRUE(lost[i]);
+        ASSERT_EQ(touched_after_loss[i], 0);
     }
     PASS();
 #endif

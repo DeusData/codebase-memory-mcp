@@ -879,26 +879,41 @@ typedef struct {
     cbm_daemon_ipc_participant_guard_t *participant_guard;
 } host_coordination_t;
 
-/* Refresh every long-held runtime file and name the first one found lost, or
- * return NULL. A held lock whose path now names another inode coordinates
- * nothing: forked index workers read the daemon as uncoordinated and a peer
- * can start a second generation (#2178). */
-static const char *host_coordination_touch(const host_coordination_t *coordination,
-                                           cbm_daemon_runtime_service_t *service) {
-    if (!cbm_version_cohort_daemon_claim_touch(coordination->daemon_claim)) {
-        return "cohort_daemon_claim";
+typedef struct {
+    const char *lost;      /* first held file whose path no longer names it */
+    const char *transient; /* first still-valid file that could not be refreshed */
+} host_touch_result_t;
+
+static void host_touch_note(host_touch_result_t *result, const char *file, int status) {
+    if (status == 0 && !result->lost) {
+        result->lost = file;
+    } else if (status < 0 && !result->transient) {
+        result->transient = file;
     }
-    if (!cbm_version_cohort_lease_touch(coordination->cohort_lease)) {
-        return "cohort_lease";
-    }
-    if (!cbm_daemon_ipc_participant_guard_touch(coordination->endpoint,
-                                                coordination->participant_guard)) {
-        return "participant_guard";
-    }
-    if (!cbm_daemon_runtime_service_touch_listener(service)) {
-        return "listener";
-    }
-    return NULL;
+}
+
+static int host_cohort_touch_status(cbm_version_cohort_status_t status) {
+    return status == CBM_VERSION_COHORT_OK ? 1 : (status == CBM_VERSION_COHORT_IO ? -1 : 0);
+}
+
+/* Refresh every long-held runtime file. A held lock whose path now names
+ * another inode coordinates nothing: forked index workers read the daemon as
+ * uncoordinated and a peer can start a second generation (#2178). Every file
+ * is visited even after one fails so the rest keep being refreshed. */
+static host_touch_result_t host_coordination_touch(const host_coordination_t *coordination,
+                                                   cbm_daemon_runtime_service_t *service) {
+    host_touch_result_t result = {0};
+    host_touch_note(&result, "cohort_daemon_claim",
+                    host_cohort_touch_status(
+                        cbm_version_cohort_daemon_claim_touch(coordination->daemon_claim)));
+    host_touch_note(
+        &result, "cohort_lease",
+        host_cohort_touch_status(cbm_version_cohort_lease_touch(coordination->cohort_lease)));
+    host_touch_note(&result, "participant_guard",
+                    cbm_daemon_ipc_participant_guard_touch(coordination->endpoint,
+                                                           coordination->participant_guard));
+    host_touch_note(&result, "listener", cbm_daemon_runtime_service_touch_listener(service));
+    return result;
 }
 
 static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
@@ -907,6 +922,7 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
     uint64_t initial_deadline = cbm_now_ms() + HOST_INITIAL_CLIENT_TIMEOUT_MS;
     uint64_t stopping_deadline = 0;
     uint64_t next_touch = 0;
+    bool touch_degraded = false;
     for (;;) {
         cbm_daemon_runtime_service_state_t state = cbm_daemon_runtime_service_state(service);
         if (state == CBM_DAEMON_RUNTIME_SERVICE_EXITED) {
@@ -942,11 +958,22 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
          * coordinated generation, while re-claiming would race that client. */
         if (cbm_now_ms() >= next_touch) {
             next_touch = cbm_now_ms() + HOST_COORDINATION_TOUCH_MS;
-            const char *lost = host_coordination_touch(coordination, service);
-            if (lost) {
+            host_touch_result_t touched = host_coordination_touch(coordination, service);
+            if (touched.lost) {
                 cbm_log_warn("daemon.lifetime_end", "reason", "coordination_file_lost", "file",
-                             lost);
+                             touched.lost);
                 return cbm_daemon_runtime_service_stop(service, HOST_RUNTIME_SHUTDOWN_MS);
+            }
+            /* A refresh failure on a still-valid file (read-only remount,
+             * EMFILE) is not loss: keep serving, retry next tick, and log
+             * only transitions so a persistent condition cannot flood. */
+            if ((touched.transient != NULL) != touch_degraded) {
+                touch_degraded = touched.transient != NULL;
+                if (touch_degraded) {
+                    cbm_log_warn("daemon.coordination_touch_failed", "file", touched.transient);
+                } else {
+                    cbm_log_info("daemon.coordination_touch_recovered");
+                }
             }
         }
         host_http_reconcile_at(host, cbm_now_ms(), false);
