@@ -19,6 +19,17 @@ trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 # Resolve symlinks
 REPO=$(cd "$REPO" && pwd -P)
+# One pre-escaped spelling of the path for every request below, the way the
+# soak harness builds its own: a repository path may legitimately contain a
+# quote or a backslash, and hand-built JSON turns that into a parse error.
+REPO_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$REPO")
+
+# Elapsed time is read from a monotonic clock, never the wall clock: an NTP
+# step mid-run would otherwise skew — or negate — a figure whose whole purpose
+# is comparison across runs. Its reference point is fixed per boot on every
+# platform CPython supports here, so the three readings below are comparable
+# even though each comes from its own process.
+bench_now_ms() { python3 -c "import time; print(time.monotonic_ns() // 1000000)"; }
 
 OUT="$RESULTS_DIR/$LANG"
 mkdir -p "$OUT"
@@ -45,18 +56,18 @@ echo "$LOC" > "$OUT/loc.txt"
 # alone. setup-time.txt keeps the activation cost attributable and
 # total-time.txt is their sum — the figure comparable with earlier runs, which
 # paid activation inside the index timing whenever no daemon was already warm.
-SETUP_START_MS=$(python3 -c "import time; print(int(time.time()*1000))")
+SETUP_START_MS=$(bench_now_ms)
 if ! "$BINARY" daemon start >/dev/null 2>&1; then
   echo "  $LANG: private daemon did not start" >&2
   exit 1
 fi
 
 # Index via CLI and capture timing
-START_MS=$(python3 -c "import time; print(int(time.time()*1000))")
+START_MS=$(bench_now_ms)
 
-INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":\"$REPO\",\"mode\":\"full\"}" 2>/dev/null || echo '{"error":"index failed"}')
+INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":$REPO_JSON,\"mode\":\"full\"}" 2>/dev/null || echo '{"error":"index failed"}')
 
-END_MS=$(python3 -c "import time; print(int(time.time()*1000))")
+END_MS=$(bench_now_ms)
 ELAPSED=$((END_MS - START_MS))
 
 echo "$INDEX_JSON" > "$OUT/00-index.json"
