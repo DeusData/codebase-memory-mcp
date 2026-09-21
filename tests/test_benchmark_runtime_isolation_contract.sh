@@ -90,6 +90,31 @@ for metric in setup-time total-time index-time; do
         fail "benchmark-index did not record $metric.txt"
 done
 
+# The evaluation plan indexes a language and then reads that index from its own
+# MCP session (docs/EVALUATION_PLAN.md §7). Asked to keep the runtime, a
+# successful run must leave its root behind and record, sourceably, the paths
+# that reach it — and they must be the paths the product processes actually
+# used. Unasked, the root is gone (asserted above).
+KEEP_LOG="$WORKDIR/keep-environment.log"
+CBM_CACHE_DIR="$CALLER_CACHE" \
+CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+CBM_BENCH_ENV_PROBE="$KEEP_LOG" \
+CBM_BENCH_KEEP_RUNTIME=1 \
+    "$ROOT/scripts/benchmark-index.sh" "$ENV_PROBE" keep "$REPO" "$WORKDIR/results" \
+    > "$WORKDIR/keep.out" 2>&1 || true
+HANDOFF="$WORKDIR/results/keep/runtime-root.txt"
+[[ -s "$HANDOFF" ]] || fail "benchmark-index was asked to keep its runtime but recorded no handoff"
+KEPT_ROOT=$(bash -c '. "$1" && printf "%s" "${CBM_BENCH_RUNTIME_ROOT-}"' _ "$HANDOFF")
+KEPT_RUNTIME=$(bash -c '. "$1" && printf "%s" "${CBM_RUNTIME_DIR-}"' _ "$HANDOFF")
+KEPT_CACHE=$(bash -c '. "$1" && printf "%s" "${CBM_CACHE_DIR-}"' _ "$HANDOFF")
+[[ -n "$KEPT_ROOT" && -d "$KEPT_ROOT" && ! -L "$KEPT_ROOT" ]] ||
+    fail "benchmark-index did not keep its runtime root: ${KEPT_ROOT:-<none>}"
+[[ -d "$KEPT_ROOT/cache" && -d "$KEPT_ROOT/runtime" ]] ||
+    fail "the kept root $KEPT_ROOT lost its cache or runtime directory"
+grep -qF -- "${KEPT_CACHE}"$'\t'"${KEPT_RUNTIME}" "$KEEP_LOG" ||
+    fail "runtime-root.txt does not name the runtime and cache the product processes used"
+rm -rf -- "$KEPT_ROOT"
+
 SEARCH_LOG="$WORKDIR/search-environment.log"
 CBM_CACHE_DIR="$CALLER_CACHE" \
 CBM_RUNTIME_DIR="$CALLER_RUNTIME" \

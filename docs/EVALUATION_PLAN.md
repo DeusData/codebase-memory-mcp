@@ -283,8 +283,13 @@ for lang in $ALL_LANGS; do                      # ALL_LANGS = full 159-name list
 
   # --- step 2: cold index in the main channel, TIMED (key metric) ---
   t0=$(now_ms)
+  CBM_BENCH_KEEP_RUNTIME=1 \
   scripts/benchmark-index.sh ~/.local/bin/codebase-memory-mcp "$lang" /tmp/bench/"$lang" /tmp/eval-results
   index_ms=$(( $(now_ms) - t0 ))                 # clone+index wall-clock → manifest + report (§5)
+  # The harness indexes into a run-private root (#1696). CBM_BENCH_KEEP_RUNTIME leaves that
+  # root behind on success and records its paths; the graph session in steps 4-7 must be
+  # started with these CBM_RUNTIME_DIR / CBM_CACHE_DIR, and step 8 removes the root.
+  set -a; . /tmp/eval-results/"$lang"/runtime-root.txt; set +a
 
   # --- step 3: record per-type histograms (zeros back-filled) ---
   #   node-types.json, edge-types.json  (every label + all 32 edge types, zeros kept, §7 below)
@@ -293,7 +298,7 @@ for lang in $ALL_LANGS; do                      # ALL_LANGS = full 159-name list
   #               + per-language report + (deferred, blind) judge ---
 
   # --- step 8: delete THIS language's index so the next is cold, then mark done ---
-  rm -f ~/.cache/codebase-memory-mcp/*.db
+  rm -rf -- "$CBM_BENCH_RUNTIME_ROOT"
   manifest_mark_done "$lang" "$index_ms"
 done
 ```
