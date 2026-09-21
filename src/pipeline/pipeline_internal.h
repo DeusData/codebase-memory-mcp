@@ -83,6 +83,7 @@ void cbm_pkg_entries_free(cbm_pkg_entries_t *e);
 
 /* Shared context passed to each pass function.
  * Derived from cbm_pipeline_t fields during run. */
+typedef struct cbm_compile_commands cbm_compile_commands_t;
 typedef struct {
     const char *project_name; /* borrowed from pipeline */
     const char *repo_path;    /* borrowed from pipeline */
@@ -105,6 +106,7 @@ typedef struct {
      * configs are an easy follow-on). NULL when no usable configs were found.
      * Owned by pipeline.c / pipeline_incremental.c. */
     const cbm_path_alias_collection_t *path_aliases;
+    const cbm_compile_commands_t *compile_commands;
 
     /* Directory subtrees excluded during discovery. Borrowed from pipeline.c. */
     char **excluded_dirs;
@@ -398,6 +400,13 @@ typedef struct {
     int define_count;
     char standard[CBM_SZ_32];
 } cbm_compile_flags_t;
+
+/* Load one compilation database for this run. The map and its flags remain
+ * read-only while extraction workers run. NULL means no usable database. */
+cbm_compile_commands_t *cbm_compile_commands_load(const char *repo_path);
+const cbm_compile_flags_t *cbm_compile_commands_find(const cbm_compile_commands_t *commands,
+                                                     const char *relative_path);
+void cbm_compile_commands_free(cbm_compile_commands_t *commands);
 
 /* Split a shell command string into arguments (handles quoting).
  * Writes args to out[]. Returns count. Caller must free each out[i]. */

@@ -11,6 +11,7 @@
  * Depends on: worker_pool, graph_buffer (shared IDs + merge), extraction (cbm.h)
  */
 #include "foundation/constants.h"
+#include "foundation/source_encoding.h"
 
 enum {
     PP_RING = 4,
@@ -281,6 +282,19 @@ static char *read_file(const char *path, int *out_len, long *out_size,
     }
     size_t nread = fread(buf, SKIP_ONE, (size_t)size, f);
     (void)fclose(f);
+    size_t decoded_len = 0;
+    cbm_source_encoding_t encoding;
+    char *decoded = cbm_source_transcode_utf8(buf, nread, &decoded_len, &encoding);
+    if (encoding == CBM_SOURCE_INVALID) {
+        free(buf);
+        if (out_status) *out_status = CBM_READ_ENCODING;
+        return NULL;
+    }
+    if (decoded) {
+        free(buf);
+        buf = decoded;
+        nread = decoded_len;
+    }
     buf[nread] = '\0';
     *out_len = (int)nread;
     return buf;
@@ -643,6 +657,7 @@ typedef struct {
     int file_count;
     const char *project_name;
     const char *repo_path;
+    const cbm_compile_commands_t *compile_commands;
 
     extract_worker_state_t *workers;
     int max_workers;
@@ -1131,6 +1146,8 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
                                  itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                                  itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
                 }
+            } else if (rst == CBM_READ_ENCODING) {
+                pp_err_add(errs, fi->rel_path, "unsupported source encoding", "encoding");
             } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
                 pp_err_add(errs, fi->rel_path, "read failed", "read");
             }
@@ -1158,14 +1175,18 @@ static void extract_worker(int worker_id, void *ctx_ptr) {
         /* Export XML uses the same cache slot as every physical file, so its
          * generated classes are composed before entering the common registry
          * and resolution lifecycle. */
+        const cbm_compile_flags_t *flags =
+            cbm_compile_commands_find(ec->compile_commands, fi->rel_path);
         CBMFileResult *result =
             fi->language == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ec->project_name,
                                                            fi->rel_path, ec->macro_table,
                                                            ec->return_type_table)
                 : cbm_extract_file_ex(source, source_len, fi->language, ec->project_name,
-                                      fi->rel_path, CBM_EXTRACT_BUDGET, NULL, NULL, ec->macro_table,
-                                      ec->return_type_table);
+                                      fi->rel_path, CBM_EXTRACT_BUDGET,
+                                      flags ? (const char **)flags->defines : NULL,
+                                      flags ? (const char **)flags->include_paths : NULL,
+                                      ec->macro_table, ec->return_type_table);
 
         uint64_t file_elapsed_ms = (extract_now_ns() - file_t0) / PP_USEC_PER_MS;
 
@@ -1463,6 +1484,7 @@ int cbm_parallel_extract_ex(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         .retain_per_file_max_bytes = resolved_opts.retain_per_file_max_bytes,
         .macro_table = pp_macro_table,
         .return_type_table = ctx->return_type_table,
+        .compile_commands = ctx->compile_commands,
     };
     atomic_init(&ec.next_worker_id, 0);
     atomic_init(&ec.next_file_idx, 0);

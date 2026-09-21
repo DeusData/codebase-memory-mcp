@@ -8,6 +8,7 @@
 #include "../src/foundation/compat_thread.h"
 #include "../src/foundation/platform.h"
 #include "../src/foundation/platform_internal.h"
+#include "../src/foundation/source_encoding.h"
 #include "../src/foundation/system_info_internal.h"
 #include <stdatomic.h>
 #include <stdlib.h>
@@ -474,6 +475,28 @@ TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory) {
     ASSERT_NOT_NULL(strstr(file_template, "Ã©Ã¨"));
     PASS();
 }
+
+#ifdef _WIN32
+TEST(platform_mkstemp_retained_files_exceed_crt_namespace) {
+    char base[CBM_SZ_256] = "/tmp/cbm-many-temp-XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(base));
+    char paths[64][CBM_SZ_512] = {{0}};
+    int created = 0;
+    for (; created < 64; created++) {
+        int written = snprintf(paths[created], sizeof(paths[created]),
+                               "%s/.worker-log-XXXXXX", base);
+        ASSERT_TRUE(written > 0 && written < (int)sizeof(paths[created]));
+        int descriptor = cbm_mkstemp(paths[created]);
+        ASSERT_TRUE(descriptor >= 0);
+        ASSERT_EQ(_close(descriptor), 0);
+    }
+    for (int index = 0; index < created; index++) {
+        ASSERT_EQ(cbm_unlink(paths[index]), 0);
+    }
+    ASSERT_EQ(cbm_rmdir(base), 0);
+    PASS();
+}
+#endif
 
 typedef struct {
     atomic_int *ready;
@@ -1128,13 +1151,47 @@ TEST(cgroup_no_mem_files) {
 
 #endif /* __linux__ */
 
+TEST(platform_source_encoding_cp949_and_utf8) {
+    size_t length = 0;
+    cbm_source_encoding_t encoding = CBM_SOURCE_INVALID;
+    const char utf8[] = "int n; /* \xea\xb0\x80 */\n";
+    char *converted = cbm_source_transcode_utf8(utf8, sizeof(utf8) - 1, &length, &encoding);
+    ASSERT_NULL(converted);
+    ASSERT_EQ(encoding, CBM_SOURCE_UTF8);
+    ASSERT_EQ(length, sizeof(utf8) - 1);
+
+    const char cp949[] = "int n; /* \xb0\xa1 */\n";
+    converted = cbm_source_transcode_utf8(cp949, sizeof(cp949) - 1, &length, &encoding);
+    ASSERT_NOT_NULL(converted);
+    ASSERT_EQ(encoding, CBM_SOURCE_CP949);
+    ASSERT_STR_EQ(converted, utf8);
+    free(converted);
+
+    const char bom[] = "\xef\xbb\xbfint n;\n";
+    converted = cbm_source_transcode_utf8(bom, sizeof(bom) - 1, &length, &encoding);
+    ASSERT_NOT_NULL(converted);
+    ASSERT_EQ(encoding, CBM_SOURCE_UTF8_BOM);
+    ASSERT_STR_EQ(converted, "int n;\n");
+    free(converted);
+
+    const char invalid[] = {'x', (char)0xff};
+    converted = cbm_source_transcode_utf8(invalid, sizeof(invalid), &length, &encoding);
+    ASSERT_NULL(converted);
+    ASSERT_EQ(encoding, CBM_SOURCE_INVALID);
+    PASS();
+}
+
 SUITE(platform) {
+    RUN_TEST(platform_source_encoding_cp949_and_utf8);
     RUN_TEST(platform_file_apis_survive_max_path_overflow);
     RUN_TEST(platform_mkdir_p_follows_own_symlink_only_when_opted_in);
     RUN_TEST(platform_mkdir_p_symlink_trust_is_bounded_by_owner_and_mode);
     RUN_TEST(platform_mkdir_p_follow_owned_is_per_call_site);
     RUN_TEST(platform_mkdir_p_resolves_link_text_from_the_link_directory);
     RUN_TEST(platform_mkstemp_and_mkdtemp_survive_non_ascii_directory);
+#ifdef _WIN32
+    RUN_TEST(platform_mkstemp_retained_files_exceed_crt_namespace);
+#endif
     RUN_TEST(platform_mkdtemp_is_thread_safe);
     RUN_TEST(platform_counter_scaling_avoids_intermediate_overflow);
     RUN_TEST(platform_counter_scaling_preserves_monotonic_deadlines);

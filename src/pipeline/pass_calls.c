@@ -10,6 +10,7 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/source_encoding.h"
 
 enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 /* Confidence for a service-pattern HTTP/ASYNC edge emitted when registry
@@ -72,6 +73,18 @@ static char *read_file(const char *path, int *out_len) {
 
     if (nread > (size_t)size) {
         nread = (size_t)size;
+    }
+    size_t decoded_len = 0;
+    cbm_source_encoding_t encoding;
+    char *decoded = cbm_source_transcode_utf8(buf, nread, &decoded_len, &encoding);
+    if (encoding == CBM_SOURCE_INVALID) {
+        free(buf);
+        return NULL;
+    }
+    if (decoded) {
+        free(buf);
+        buf = decoded;
+        nread = decoded_len;
     }
     memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
     *out_len = (int)nread;
@@ -761,9 +774,13 @@ static CBMFileResult *calls_get_or_extract(cbm_pipeline_ctx_t *ctx, int idx,
     if (!src) {
         return NULL;
     }
-    CBMFileResult *r = cbm_extract_file_ex(src, slen, fi->language, ctx->project_name, fi->rel_path,
-                                           CBM_EXTRACT_BUDGET, NULL, NULL, ctx->macro_table,
-                                           ctx->return_type_table);
+    const cbm_compile_flags_t *flags =
+        cbm_compile_commands_find(ctx->compile_commands, fi->rel_path);
+    CBMFileResult *r = cbm_extract_file_ex(
+        src, slen, fi->language, ctx->project_name, fi->rel_path, CBM_EXTRACT_BUDGET,
+        flags ? (const char **)flags->defines : NULL,
+        flags ? (const char **)flags->include_paths : NULL, ctx->macro_table,
+        ctx->return_type_table);
     free(src);
     if (r) {
         *owned = true;

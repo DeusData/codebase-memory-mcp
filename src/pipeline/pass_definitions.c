@@ -25,6 +25,7 @@ enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/limits.h"
+#include "foundation/source_encoding.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
 #include "arena.h"
@@ -98,6 +99,19 @@ static char *read_file(const char *path, int *out_len, long *out_size,
 
     if (nread > (size_t)size) {
         nread = (size_t)size;
+    }
+    size_t decoded_len = 0;
+    cbm_source_encoding_t encoding;
+    char *decoded = cbm_source_transcode_utf8(buf, nread, &decoded_len, &encoding);
+    if (encoding == CBM_SOURCE_INVALID) {
+        free(buf);
+        if (out_status) *out_status = CBM_READ_ENCODING;
+        return NULL;
+    }
+    if (decoded) {
+        free(buf);
+        buf = decoded;
+        nread = decoded_len;
     }
     memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
     *out_len = (int)nread;
@@ -817,6 +831,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
                 cbm_log_warn("index.file_oversized", "path", rel, "size_mb",
                              itoa_log((int)(file_size / (CBM_SZ_1K * CBM_SZ_1K))), "cap_mb",
                              itoa_log((int)(cap / (CBM_SZ_1K * CBM_SZ_1K))));
+            } else if (rst == CBM_READ_ENCODING) {
+                cbm_pipeline_add_file_error(ctx->pipeline, rel, "unsupported source encoding",
+                                            "encoding");
             } else if (rst == CBM_READ_OPEN_FAIL || rst == CBM_READ_OOM) {
                 cbm_pipeline_add_file_error(ctx->pipeline, rel, "read failed", "read");
             }
@@ -826,13 +843,17 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
 
         /* Studio Export XML is transformed to one cacheable aggregate so later
          * passes see the same calls/usages/semantic carriers as native UDL. */
+        const cbm_compile_flags_t *compile_flags =
+            cbm_compile_commands_find(ctx->compile_commands, rel);
         CBMFileResult *result =
             lang == CBM_LANG_OBJECTSCRIPT_EXPORT
                 ? cbm_pipeline_extract_objectscript_export(source, source_len, ctx->project_name,
                                                            rel, ctx->macro_table, NULL)
                 : cbm_extract_file_ex(
-                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET, NULL,
-                      NULL /* no extra defines or include paths */, ctx->macro_table, NULL);
+                      source, source_len, lang, ctx->project_name, rel, CBM_EXTRACT_BUDGET,
+                      compile_flags ? (const char **)compile_flags->defines : NULL,
+                      compile_flags ? (const char **)compile_flags->include_paths : NULL,
+                      ctx->macro_table, NULL);
         free(source);
 
         if (!result) {

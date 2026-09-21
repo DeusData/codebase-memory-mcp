@@ -32,6 +32,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/sha256.h"
 
 #include <errno.h>
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -307,6 +308,48 @@ static void semantic_manifest_git_digest(const cbm_git_context_t *git_ctx,
     out[CBM_SHA256_HEX_LEN] = '\0';
 }
 
+static int semantic_manifest_add_compile_inputs(semantic_manifest_builder_t *builder,
+                                                const char *project, const char *repo_path) {
+    char setting[CBM_SZ_64] = "";
+    (void)cbm_safe_getenv("CBM_SOURCE_ENCODING", setting, sizeof(setting), NULL);
+    char digest[CBM_SHA256_HEX_LEN + 1];
+    cbm_sha256_hex(setting, strlen(setting), digest);
+    int rc = semantic_manifest_add_digest(builder, project,
+                                          CBM_SEMANTIC_INPUT_PREFIX "source-encoding-v1",
+                                          digest, 0, 0);
+    if (rc != 0) return rc;
+
+    char configured[CBM_SZ_4K] = "";
+    (void)cbm_safe_getenv("CBM_COMPILE_COMMANDS_PATH", configured, sizeof(configured), NULL);
+    char paths[4][CBM_SZ_4K];
+    if (configured[0] && configured[0] != '/' &&
+        !(isalpha((unsigned char)configured[0]) && configured[1] == ':')) {
+        snprintf(paths[0], sizeof(paths[0]), "%s/%s", repo_path, configured);
+    } else {
+        snprintf(paths[0], sizeof(paths[0]), "%s", configured);
+    }
+    snprintf(paths[1], sizeof(paths[1]), "%s/compile_commands.json", repo_path);
+    snprintf(paths[2], sizeof(paths[2]), "%s/build/compile_commands.json", repo_path);
+    snprintf(paths[3], sizeof(paths[3]), "%s/out/compile_commands.json", repo_path);
+    for (int i = 0; i < 4; i++) {
+        if (!paths[i][0] || !cbm_file_exists(paths[i])) continue;
+        char file_sha[CBM_SHA256_HEX_LEN + 1];
+        int64_t mtime_ns = 0, size = 0;
+        if (semantic_manifest_hash_file(paths[i], file_sha, &mtime_ns, &size) != 0) {
+            return CBM_NOT_FOUND;
+        }
+        char key[CBM_SZ_128];
+        char identity[CBM_SZ_4K + CBM_SHA256_HEX_LEN + 2];
+        snprintf(key, sizeof(key), CBM_SEMANTIC_INPUT_PREFIX "compile-commands-%d", i);
+        int n = snprintf(identity, sizeof(identity), "%s|%s", paths[i], file_sha);
+        if (n < 0 || n >= (int)sizeof(identity)) return CBM_NOT_FOUND;
+        cbm_sha256_hex(identity, (size_t)n, digest);
+        rc = semantic_manifest_add_digest(builder, project, key, digest, mtime_ns, size);
+        if (rc != 0) return rc;
+    }
+    return 0;
+}
+
 static bool semantic_manifest_package_control(const char *name) {
     if (!name) {
         return false;
@@ -453,6 +496,9 @@ int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_p
     if (rc == 0) {
         rc = semantic_manifest_add_digest(&builder, project, CBM_SEMANTIC_INPUT_PROJECT_CONFIG,
                                           project_config_digest, 0, 0);
+    }
+    if (rc == 0) {
+        rc = semantic_manifest_add_compile_inputs(&builder, project, repo_path);
     }
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
@@ -1750,6 +1796,10 @@ static int closure_try_plan(cbm_pipeline_t *p, cbm_store_t *store, const char *p
     }
     for (int i = 0; i < stored_count; i++) {
         if (!cbm_ht_get(fresh_by_path, stored[i].rel_path)) {
+            if (semantic_manifest_is_virtual_path(stored[i].rel_path)) {
+                decline = "semantic_input_removed";
+                goto done;
+            }
             if (!cbm_ht_get(files_by_path, stored[i].rel_path) &&
                 closure_is_alias_config(plan_aliases, stored[i].rel_path)) {
                 /* Removed alias config: its governed files resolve without

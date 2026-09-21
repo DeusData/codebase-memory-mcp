@@ -9745,6 +9745,59 @@ TEST(compile_commands_parse_json) {
     PASS();
 }
 
+TEST(compile_commands_windows_msvc_flags) {
+    const char *json =
+        "[{\"directory\":\"C:\\\\synthetic\\\\build\","
+        "\"file\":\"C:\\\\synthetic\\\\src\\\\sample.cpp\","
+        "\"arguments\":[\"cl\",\"/IC:\\\\synthetic\\\\include\","
+        "\"/DWIN_BUILD=1\",\"/std:c++20\"]}]";
+    char **paths = NULL;
+    cbm_compile_flags_t **flags = NULL;
+    int count = cbm_parse_compile_commands(json, "C:/synthetic", &paths, &flags);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(paths[0], "src/sample.cpp");
+    ASSERT_EQ(flags[0]->define_count, 1);
+    ASSERT_STR_EQ(flags[0]->defines[0], "WIN_BUILD=1");
+    ASSERT_EQ(flags[0]->include_count, 1);
+    cbm_compile_flags_free(flags[0]);
+    free(paths[0]);
+    free(paths);
+    free(flags);
+    PASS();
+}
+
+TEST(compile_commands_load_and_lookup) {
+    char repo[256] = "/tmp/cbm_compile_db_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    for (char *p = repo; *p; p++) {
+        if (*p == '\\') *p = '/';
+    }
+    char source_path[512];
+    char database_path[512];
+    snprintf(source_path, sizeof(source_path), "%s/sample.cpp", repo);
+    snprintf(database_path, sizeof(database_path), "%s/compile_commands.json", repo);
+    FILE *source = cbm_fopen(source_path, "wb");
+    ASSERT_NOT_NULL(source);
+    fputs("int sample(void) { return 1; }\n", source);
+    fclose(source);
+    FILE *database = cbm_fopen(database_path, "wb");
+    ASSERT_NOT_NULL(database);
+    fprintf(database,
+            "[{\"directory\":\"%s\",\"file\":\"%s\","
+            "\"arguments\":[\"clang++\",\"-DACTIVE=1\",\"-c\",\"sample.cpp\"]}]",
+            repo, source_path);
+    fclose(database);
+    cbm_compile_commands_t *commands = cbm_compile_commands_load(repo);
+    ASSERT_NOT_NULL(commands);
+    const cbm_compile_flags_t *flags = cbm_compile_commands_find(commands, "sample.cpp");
+    ASSERT_NOT_NULL(flags);
+    ASSERT_EQ(flags->define_count, 1);
+    ASSERT_STR_EQ(flags->defines[0], "ACTIVE=1");
+    cbm_compile_commands_free(commands);
+    rm_rf(repo);
+    PASS();
+}
+
 TEST(compile_commands_parse_empty) {
     char **paths = NULL;
     cbm_compile_flags_t **flags = NULL;
@@ -14932,6 +14985,8 @@ SUITE(pipeline) {
     RUN_TEST(compile_commands_split_command);
     RUN_TEST(compile_commands_extract_flags);
     RUN_TEST(compile_commands_parse_json);
+    RUN_TEST(compile_commands_windows_msvc_flags);
+    RUN_TEST(compile_commands_load_and_lookup);
     RUN_TEST(compile_commands_parse_empty);
     RUN_TEST(compile_commands_parse_invalid);
     /* Infrascan helpers */

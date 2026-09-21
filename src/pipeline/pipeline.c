@@ -2696,6 +2696,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     struct timespec t0;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t0);
     cbm_path_alias_collection_t *path_aliases = NULL;
+    cbm_compile_commands_t *compile_commands = NULL;
     cbm_file_hash_t *baseline_manifest = NULL;
     int baseline_count = 0;
     char **requested_excluded_dirs = NULL;
@@ -2834,6 +2835,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * when no usable configs are found — non-TS projects pay nothing. */
     path_aliases =
         cbm_load_path_aliases_excluded(p->repo_path, p->excluded_dirs, p->excluded_count);
+    compile_commands = cbm_compile_commands_load(p->repo_path);
 
     /* Build shared context for pass functions */
     cbm_pipeline_ctx_t ctx = {
@@ -2845,6 +2847,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         .pipeline = p, /* so passes can record per-file skips (Track B) */
         .mode = (int)p->mode,
         .path_aliases = path_aliases,
+        .compile_commands = compile_commands,
         .excluded_dirs = p->excluded_dirs,
         .excluded_count = p->excluded_count,
     };
@@ -2873,6 +2876,7 @@ cleanup:
     cbm_registry_free(p->registry);
     p->registry = NULL;
     cbm_path_alias_collection_free(path_aliases);
+    cbm_compile_commands_free(compile_commands);
     if (restore_requested_discovery) {
         cbm_discover_free_excluded(p->excluded_dirs, p->excluded_count);
         cbm_discover_free_ignored(p->ignored_files, p->ignored_count);

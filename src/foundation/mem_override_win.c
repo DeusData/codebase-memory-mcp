@@ -56,6 +56,7 @@ void *__real_malloc(size_t size);
 void *__real_calloc(size_t count, size_t size);
 void *__real_realloc(void *block, size_t size);
 void __real_free(void *block);
+void __real__aligned_free(void *block);
 char *__real_strdup(const char *text);
 size_t __real__msize(void *block);
 /* Wrappers must call __real_* for anything that is itself wrapped: a plain
@@ -155,8 +156,57 @@ void __wrap__aligned_free(void *block) {
         mi_free(block);
         return;
     }
-    __real_free(block);
+    /* A CRT aligned block has its own bookkeeping header. Plain free is not
+     * its matching deallocator. */
+    __real__aligned_free(block);
 }
+
+#if defined(CBM_MEM_GLOBAL_OVERRIDE) && CBM_MEM_GLOBAL_OVERRIDE
+/* LLVM-MinGW's static C++ runtime calls _aligned_malloc through the linker's
+ * wrapper but its aligned operator delete can call the CRT import pointer
+ * __imp__aligned_free directly. --wrap=_aligned_free does not rewrite that
+ * import-pointer reference. Provide the six C++ ABI delete entry points so
+ * every aligned new/delete pair reaches the same owner-aware deallocator. */
+void cbm_cxx_aligned_delete(void *block) __asm__("_ZdlPvSt11align_val_t");
+void cbm_cxx_aligned_delete(void *block) {
+    __wrap__aligned_free(block);
+}
+
+void cbm_cxx_aligned_delete_nothrow(void *block, const void *tag)
+    __asm__("_ZdlPvSt11align_val_tRKSt9nothrow_t");
+void cbm_cxx_aligned_delete_nothrow(void *block, const void *tag) {
+    (void)tag;
+    __wrap__aligned_free(block);
+}
+
+void cbm_cxx_aligned_delete_sized(void *block, size_t size, size_t alignment)
+    __asm__("_ZdlPvySt11align_val_t");
+void cbm_cxx_aligned_delete_sized(void *block, size_t size, size_t alignment) {
+    (void)size;
+    (void)alignment;
+    __wrap__aligned_free(block);
+}
+
+void cbm_cxx_aligned_array_delete(void *block) __asm__("_ZdaPvSt11align_val_t");
+void cbm_cxx_aligned_array_delete(void *block) {
+    __wrap__aligned_free(block);
+}
+
+void cbm_cxx_aligned_array_delete_nothrow(void *block, const void *tag)
+    __asm__("_ZdaPvSt11align_val_tRKSt9nothrow_t");
+void cbm_cxx_aligned_array_delete_nothrow(void *block, const void *tag) {
+    (void)tag;
+    __wrap__aligned_free(block);
+}
+
+void cbm_cxx_aligned_array_delete_sized(void *block, size_t size, size_t alignment)
+    __asm__("_ZdaPvySt11align_val_t");
+void cbm_cxx_aligned_array_delete_sized(void *block, size_t size, size_t alignment) {
+    (void)size;
+    (void)alignment;
+    __wrap__aligned_free(block);
+}
+#endif
 
 void *__wrap_realloc(void *block, size_t size) {
     if (!block) {

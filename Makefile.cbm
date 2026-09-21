@@ -329,6 +329,7 @@ FOUNDATION_SRCS = \
     src/foundation/subprocess.c \
     src/foundation/sha256.c \
     src/foundation/secure_random.c \
+    src/foundation/source_encoding.c \
     src/foundation/macos_acl.c \
     src/foundation/private_file_lock.c \
     src/foundation/lock_registry.c

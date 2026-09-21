@@ -13,6 +13,7 @@
  * Depends on: pass_definitions having populated the registry and graph buffer
  */
 #include "foundation/constants.h"
+#include "foundation/source_encoding.h"
 #include "foundation/str_util.h" // cbm_json_escape
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -78,6 +79,18 @@ static char *read_file(const char *path, int *out_len) {
     (void)fclose(f);
     if (nread > (size_t)size) {
         nread = (size_t)size;
+    }
+    size_t decoded_len = 0;
+    cbm_source_encoding_t encoding;
+    char *decoded = cbm_source_transcode_utf8(buf, nread, &decoded_len, &encoding);
+    if (encoding == CBM_SOURCE_INVALID) {
+        free(buf);
+        return NULL;
+    }
+    if (decoded) {
+        free(buf);
+        buf = decoded;
+        nread = decoded_len;
     }
     memset(buf + nread, 0, CBM_TS_LOOKAHEAD_PAD);
     *out_len = (int)nread;
@@ -352,8 +365,13 @@ int cbm_pipeline_pass_usages(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *fil
                 errors++;
                 continue;
             }
-            result = cbm_extract_file(source, source_len, files[i].language, ctx->project_name, rel,
-                                      CBM_EXTRACT_BUDGET, NULL, NULL);
+            const cbm_compile_flags_t *flags =
+                cbm_compile_commands_find(ctx->compile_commands, rel);
+            result = cbm_extract_file_ex(
+                source, source_len, files[i].language, ctx->project_name, rel,
+                CBM_EXTRACT_BUDGET, flags ? (const char **)flags->defines : NULL,
+                flags ? (const char **)flags->include_paths : NULL, ctx->macro_table,
+                ctx->return_type_table);
             free(source);
             if (!result) {
                 errors++;

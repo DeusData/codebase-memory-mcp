@@ -11,7 +11,12 @@ enum { CC_FLAG_IDX = 1, CC_FLAG_SKIP = 2 };
 #define SLEN(s) (sizeof(s) - 1)
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
+#include "foundation/compat.h"
+#include "foundation/compat_fs.h"
+#include "foundation/platform.h"
+#include "foundation/log.h"
 
+#include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -63,7 +68,8 @@ static char *resolve_path(const char *path, const char *directory) {
     }
 
     /* Absolute path */
-    if (path[0] == '/') {
+    if (path[0] == '/' ||
+        (isalpha((unsigned char)path[0]) && path[1] == ':')) {
         return strdup(path);
     }
 
@@ -81,7 +87,7 @@ static char *resolve_path(const char *path, const char *directory) {
 static bool try_include_flag(cbm_compile_flags_t *f, const char **args, int argc, int *i,
                              const char *directory) {
     const char *arg = args[*i];
-    if (arg[0] == '-' && arg[CC_FLAG_IDX] == 'I') {
+    if ((arg[0] == '-' || arg[0] == '/') && arg[CC_FLAG_IDX] == 'I') {
         const char *path = arg + CC_FLAG_SKIP;
         if (*path == '\0' && *i + SKIP_ONE < argc) {
             (*i)++;
@@ -103,7 +109,7 @@ static bool try_include_flag(cbm_compile_flags_t *f, const char **args, int argc
 /* Try to consume a -D define flag. Returns true if consumed. */
 static bool try_define_flag(cbm_compile_flags_t *f, const char **args, int argc, int *i) {
     const char *arg = args[*i];
-    if (arg[0] != '-' || arg[CC_FLAG_IDX] != 'D') {
+    if ((arg[0] != '-' && arg[0] != '/') || arg[CC_FLAG_IDX] != 'D') {
         return false;
     }
     const char *define = arg + CC_FLAG_SKIP;
@@ -122,8 +128,12 @@ cbm_compile_flags_t *cbm_extract_flags(const char **args, int argc, const char *
     if (!f) {
         return NULL;
     }
-    f->include_paths = calloc(argc, sizeof(char *));
-    f->defines = calloc(argc, sizeof(char *));
+    f->include_paths = calloc((size_t)argc + 1, sizeof(char *));
+    f->defines = calloc((size_t)argc + 1, sizeof(char *));
+    if (!f->include_paths || !f->defines) {
+        cbm_compile_flags_free(f);
+        return NULL;
+    }
 
     for (int i = 0; i < argc; i++) {
         if (try_include_flag(f, args, argc, &i, directory)) {
@@ -205,7 +215,14 @@ static int process_compile_entry(yyjson_val *entry, const char *repo_path, char 
         return 0;
     }
 
-    cbm_compile_flags_t *f = cbm_extract_flags(flag_args, flag_argc, directory);
+    char resolved_dir[CBM_SZ_4K];
+    if (directory[0] && directory[0] != '/' &&
+        !(isalpha((unsigned char)directory[0]) && directory[1] == ':')) {
+        snprintf(resolved_dir, sizeof(resolved_dir), "%s/%s", repo_path, directory);
+    } else {
+        snprintf(resolved_dir, sizeof(resolved_dir), "%s", directory);
+    }
+    cbm_compile_flags_t *f = cbm_extract_flags(flag_args, flag_argc, resolved_dir);
 
     if (cmd_val && yyjson_is_str(cmd_val)) {
         for (int j = 0; j < flag_argc; j++) {
@@ -218,14 +235,30 @@ static int process_compile_entry(yyjson_val *entry, const char *repo_path, char 
     }
 
     char abs_path[CBM_SZ_4K];
-    if (file_path[0] != '/' && directory && directory[0]) {
-        snprintf(abs_path, sizeof(abs_path), "%s/%s", directory, file_path);
+    if (file_path[0] != '/' &&
+        !(isalpha((unsigned char)file_path[0]) && file_path[1] == ':')) {
+        snprintf(abs_path, sizeof(abs_path), "%s/%s", resolved_dir[0] ? resolved_dir : repo_path,
+                 file_path);
     } else {
         snprintf(abs_path, sizeof(abs_path), "%s", file_path);
     }
-
-    size_t repo_len = strlen(repo_path);
-    if (strncmp(abs_path, repo_path, repo_len) != 0 || abs_path[repo_len] != '/') {
+    char canonical_file[CBM_SZ_4K];
+    char canonical_repo[CBM_SZ_4K];
+    if (cbm_canonical_path(abs_path, canonical_file, sizeof(canonical_file))) {
+        snprintf(abs_path, sizeof(abs_path), "%s", canonical_file);
+    }
+    if (!cbm_canonical_path(repo_path, canonical_repo, sizeof(canonical_repo))) {
+        snprintf(canonical_repo, sizeof(canonical_repo), "%s", repo_path);
+    }
+    cbm_normalize_path_sep(abs_path);
+    cbm_normalize_path_sep(canonical_repo);
+    size_t repo_len = strlen(canonical_repo);
+#ifdef _WIN32
+    int prefix_matches = _strnicmp(abs_path, canonical_repo, repo_len) == 0;
+#else
+    int prefix_matches = strncmp(abs_path, canonical_repo, repo_len) == 0;
+#endif
+    if (!prefix_matches || abs_path[repo_len] != '/') {
         cbm_compile_flags_free(f);
         return 0;
     }
@@ -262,6 +295,12 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
 
     char **paths = calloc(arr_len, sizeof(char *));
     cbm_compile_flags_t **flags = calloc(arr_len, sizeof(cbm_compile_flags_t *));
+    if (!paths || !flags) {
+        free(paths);
+        free(flags);
+        yyjson_doc_free(doc);
+        return CBM_NOT_FOUND;
+    }
     int count = 0;
 
     yyjson_val *entry;
@@ -282,4 +321,137 @@ int cbm_parse_compile_commands(const char *json_data, const char *repo_path, cha
     *out_paths = paths;
     *out_flags = flags;
     return count;
+}
+
+typedef struct {
+    char *path;
+    cbm_compile_flags_t *flags;
+} cbm_compile_command_entry_t;
+
+struct cbm_compile_commands {
+    cbm_compile_command_entry_t *entries;
+    int count;
+};
+
+static int command_path_compare(const char *a, const char *b) {
+#ifdef _WIN32
+    return _stricmp(a, b);
+#else
+    return strcmp(a, b);
+#endif
+}
+
+static int command_entry_compare(const void *a, const void *b) {
+    const cbm_compile_command_entry_t *left = a;
+    const cbm_compile_command_entry_t *right = b;
+    return command_path_compare(left->path, right->path);
+}
+
+const cbm_compile_flags_t *cbm_compile_commands_find(const cbm_compile_commands_t *commands,
+                                                     const char *relative_path) {
+    if (!commands || !relative_path) return NULL;
+    int lo = 0, hi = commands->count;
+    while (lo < hi) {
+        int mid = lo + (hi - lo) / 2;
+        int comparison = command_path_compare(commands->entries[mid].path, relative_path);
+        if (comparison < 0) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo < commands->count &&
+                   command_path_compare(commands->entries[lo].path, relative_path) == 0
+               ? commands->entries[lo].flags
+               : NULL;
+}
+
+void cbm_compile_commands_free(cbm_compile_commands_t *commands) {
+    if (!commands) return;
+    for (int i = 0; i < commands->count; i++) {
+        free(commands->entries[i].path);
+        cbm_compile_flags_free(commands->entries[i].flags);
+    }
+    free(commands->entries);
+    free(commands);
+}
+
+cbm_compile_commands_t *cbm_compile_commands_load(const char *repo_path) {
+    if (!repo_path) return NULL;
+    char configured[CBM_SZ_4K] = "";
+    (void)cbm_safe_getenv("CBM_COMPILE_COMMANDS_PATH", configured, sizeof(configured), NULL);
+    char paths[4][CBM_SZ_4K];
+    if (configured[0] && configured[0] != '/' &&
+        !(isalpha((unsigned char)configured[0]) && configured[1] == ':')) {
+        snprintf(paths[0], sizeof(paths[0]), "%s/%s", repo_path, configured);
+    } else {
+        snprintf(paths[0], sizeof(paths[0]), "%s", configured);
+    }
+    snprintf(paths[1], sizeof(paths[1]), "%s/compile_commands.json", repo_path);
+    snprintf(paths[2], sizeof(paths[2]), "%s/build/compile_commands.json", repo_path);
+    snprintf(paths[3], sizeof(paths[3]), "%s/out/compile_commands.json", repo_path);
+    for (size_t candidate = 0; candidate < 4; candidate++) {
+        if (!paths[candidate][0]) continue;
+        FILE *file = cbm_fopen(paths[candidate], "rb");
+        if (!file) continue;
+        if (fseek(file, 0, SEEK_END) != 0) {
+            fclose(file);
+            continue;
+        }
+        long size = ftell(file);
+        if (size <= 0 || size > 128L * 1024L * 1024L || fseek(file, 0, SEEK_SET) != 0) {
+            fclose(file);
+            continue;
+        }
+        char *json = malloc((size_t)size + 1);
+        if (!json) {
+            fclose(file);
+            return NULL;
+        }
+        size_t got = fread(json, 1, (size_t)size, file);
+        fclose(file);
+        json[got] = '\0';
+        if (got != (size_t)size) {
+            free(json);
+            continue;
+        }
+        char **paths_out = NULL;
+        cbm_compile_flags_t **flags_out = NULL;
+        int count = cbm_parse_compile_commands(json, repo_path, &paths_out, &flags_out);
+        free(json);
+        if (count <= 0) {
+            free(paths_out);
+            free(flags_out);
+            continue;
+        }
+        cbm_compile_commands_t *commands = calloc(1, sizeof(*commands));
+        if (!commands) {
+            for (int i = 0; i < count; i++) {
+                free(paths_out[i]);
+                cbm_compile_flags_free(flags_out[i]);
+            }
+            free(paths_out);
+            free(flags_out);
+            return NULL;
+        }
+        commands->entries = calloc((size_t)count, sizeof(*commands->entries));
+        if (!commands->entries) {
+            free(commands);
+            for (int i = 0; i < count; i++) {
+                free(paths_out[i]);
+                cbm_compile_flags_free(flags_out[i]);
+            }
+            free(paths_out);
+            free(flags_out);
+            return NULL;
+        }
+        commands->count = count;
+        for (int i = 0; i < count; i++) {
+            commands->entries[i].path = paths_out[i];
+            commands->entries[i].flags = flags_out[i];
+        }
+        free(paths_out);
+        free(flags_out);
+        qsort(commands->entries, (size_t)count, sizeof(*commands->entries), command_entry_compare);
+        cbm_log_info("index.compile_commands.loaded", "entries", "present", "path", paths[candidate]);
+        return commands;
+    }
+    return NULL;
 }
