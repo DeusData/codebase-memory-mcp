@@ -15,7 +15,28 @@ RESULTS_DIR="${4:?}"
 # shellcheck source=test-runtime.sh
 source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
 cbm_test_runtime_init
-trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+
+# The evaluation plan (docs/EVALUATION_PLAN.md §7) indexes a language here and
+# then answers graph questions against that index from its own MCP session.
+# A run-private root would be gone before that session starts, so the caller
+# may ask for it to be kept: after a SUCCESSFUL run the harness stops its
+# daemon, leaves the root in place, records the paths that reach it in
+# <results>/<lang>/runtime-root.txt (sourceable), and ownership of the root —
+# including its removal — passes to the caller. A failed run cleans up
+# regardless: there is no index worth keeping, and nothing must leak. Never on
+# by default, or an unattended run accumulates one root per language.
+bench_finish() {
+  local rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "${CBM_BENCH_KEEP_RUNTIME:-}" ] && [ -d "${OUT:-}" ]; then
+    "$BINARY" daemon stop >/dev/null 2>&1 || true
+    printf 'CBM_BENCH_RUNTIME_ROOT=%q\nCBM_RUNTIME_DIR=%q\nCBM_CACHE_DIR=%q\n' \
+      "$CBM_TEST_RUNTIME_ROOT" "$CBM_RUNTIME_DIR" "$CBM_CACHE_DIR" > "$OUT/runtime-root.txt"
+    echo "  $LANG: runtime kept at $CBM_TEST_RUNTIME_ROOT; paths in $OUT/runtime-root.txt" >&2
+    return 0
+  fi
+  cbm_test_runtime_cleanup "$BINARY"
+}
+trap bench_finish EXIT
 
 # Resolve symlinks
 REPO=$(cd "$REPO" && pwd -P)
