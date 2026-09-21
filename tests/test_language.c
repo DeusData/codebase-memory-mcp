@@ -413,6 +413,36 @@ TEST(lang_ext_svg) {
     ASSERT_EQ(cbm_language_for_extension(".svg"), CBM_LANG_XML);
     PASS();
 }
+/* Issue #2229: the XML documents that make up a .NET repository's project
+ * system were unmapped, so a solution's package references, target frameworks,
+ * localized strings and app manifests were never indexed or searchable. */
+TEST(lang_ext_msbuild_projects) {
+    ASSERT_EQ(cbm_language_for_extension(".csproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".vbproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".fsproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".props"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".targets"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".nuspec"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".slnx"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".runsettings"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_resx) {
+    ASSERT_EQ(cbm_language_for_extension(".resx"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_xaml) {
+    ASSERT_EQ(cbm_language_for_extension(".xaml"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".axaml"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_app_manifests) {
+    ASSERT_EQ(cbm_language_for_extension(".plist"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".xcprivacy"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".manifest"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".appxmanifest"), CBM_LANG_XML);
+    PASS();
+}
 TEST(lang_ext_markdown) {
     ASSERT_EQ(cbm_language_for_extension(".md"), CBM_LANG_MARKDOWN);
     PASS();
@@ -1361,6 +1391,10 @@ SUITE(language) {
     RUN_TEST(lang_ext_xsl);
     RUN_TEST(lang_ext_xsd);
     RUN_TEST(lang_ext_svg);
+    RUN_TEST(lang_ext_msbuild_projects);
+    RUN_TEST(lang_ext_resx);
+    RUN_TEST(lang_ext_xaml);
+    RUN_TEST(lang_ext_app_manifests);
     RUN_TEST(lang_ext_markdown);
     RUN_TEST(lang_ext_mdx);
     RUN_TEST(lang_ext_makefile);

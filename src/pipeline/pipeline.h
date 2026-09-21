@@ -53,6 +53,13 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -63,9 +70,16 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * need to know whether the PREVIOUS generation survived can distinguish the
  * failures by value: the run publishes by renaming a fully validated staging
  * database over the destination, so every abort before that rename leaves the
- * existing database in place. Those codes (CBM_PIPELINE_ABORT_PRESERVE_DB and
- * CBM_PIPELINE_PERSIST_FAILED) are defined in pipeline_internal.h alongside the
- * stages that raise them. */
+ * existing database in place. */
+#define CBM_PIPELINE_ABORT_PRESERVE_DB (-2) /* aborted pre-publication; previous DB intact */
+#define CBM_PIPELINE_PERSIST_FAILED (-4)    /* staging/rollback failure during publication */
+/* Resident memory stayed above the budget after back-pressure and one
+ * confirmation cycle: the run stops before publication, no partial graph is
+ * written, the previous DB is intact (#1997 #832). Distinct from the cancel
+ * sentinel so callers can name the cause instead of "pipeline failed". */
+#define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
+/* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
+#define CBM_PIPELINE_RESOURCE_LIMIT (-6)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */

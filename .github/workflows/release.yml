@@ -44,6 +44,13 @@ jobs:
   # ── Security (starts immediately, blocks only verify) ───────────
   security:
     uses: ./.github/workflows/_security.yml
+    # The called job requests security-events:read to count code-scanning
+    # alerts; a reusable workflow cannot request more than its caller grants,
+    # so withholding this here fails the whole run at startup.
+    permissions:
+      contents: read
+      security-events: read
+      actions: read
     secrets: inherit
 
   # ── 0. Preflight: refuse malformed dispatch inputs ──────────────
@@ -137,6 +144,15 @@ jobs:
       run_asan: ${{ inputs.soak_level == 'full' }}
       version: ${{ inputs.version }}
       use_release_artifacts: true
+
+  # ── Waste sanitizer, REPORT-ONLY ────────────────────────────────
+  # The same full run as the dry run, on the release commit. Not in
+  # release-draft's needs: the report is evidence for the release notes, never
+  # a publication gate.
+  memwaste:
+    uses: ./.github/workflows/_memwaste.yml
+    with:
+      mode: full
 
   # ── 6. Create DRAFT release ────────────────────────────────────
   # Requires smoke to have actually SUCCEEDED, not merely "not failed". The bare

@@ -212,14 +212,26 @@ bash "$ROOT/tests/test_ui_dev_proxy_security.sh"
 echo "=== Step 0d: daemon soak recovery contract ==="
 bash "$ROOT/tests/test_soak_daemon_recovery_contract.sh"
 
+echo "=== Step 0d2: soak harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_soak_runtime_isolation_contract.sh"
+
 echo "=== Step 0e: Windows launcher bundle contract ==="
 bash "$ROOT/tests/test_windows_bundle_contract.sh"
+
+echo "=== Step 0e2: activation refusal diagnostic contract ==="
+bash "$ROOT/tests/test_activation_diagnostic_contract.sh"
+
+echo "=== Step 0e3: security gate fail-closed contract ==="
+bash "$ROOT/tests/test_security_gate_fail_closed.sh"
 
 echo "=== Step 0f: tree-sitter runtime Makefile dependencies ==="
 bash "$ROOT/tests/test_makefile_ts_runtime_dependencies.sh"
 
 echo "=== Step 0g: security fuzz harness self-test ==="
 bash "$ROOT/tests/test_security_fuzz_harness.sh"
+
+echo "=== Step 0g2: memlab harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_memlab_runtime_isolation_contract.sh"
 
 echo "=== Step 0h: smoke release-fixture contract ==="
 bash "$ROOT/tests/test_smoke_fixture_contract.sh"
@@ -272,6 +284,14 @@ bash "$ROOT/tests/test_language_count_contract.sh"
 echo "=== Step 0x: packaging version-metadata contract ==="
 bash "$ROOT/tests/test_version_metadata_contract.sh"
 
+# Step 0y: the Windows leg must not decide its verdict from an exit status that
+# the ssh/msys2_shell chain can mangle — a channel that turns 0 into 1 can turn
+# 1 into 0, and that direction reports a RED Windows leg as green. Runs
+# everywhere (it drives synthetic logs, no VM needed) because the guard it pins
+# is what every Windows verdict rests on.
+echo "=== Step 0y: VM leg verdict contract ==="
+bash "$ROOT/tests/test_vm_verdict_contract.sh"
+
 # Verify compiler supports target arch
 verify_compiler "$CC"
 
@@ -312,6 +332,15 @@ make -j"$NPROC" -f Makefile.cbm cbm TEST_SEAMS=1 ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}
 WATCHDOG_BINARY="$ROOT/$BUILD_DIR/codebase-memory-mcp"
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_parent_watchdog.sh"
 
+# Step 5a: that watchdog is also the SMALLEST-stack thread in the image, which
+# makes it the first casualty when static TLS grows — glibc takes the TLS block
+# out of each thread's own stack allocation. Checked here, against the binary
+# Step 5 just built, because the failure it prevents surfaces nowhere near its
+# cause (PR #2233: a thread-local cache in an extraction file stopped the index
+# worker from starting, on x86-64 only).
+echo "=== Step 5a: static-TLS budget against the smallest thread stack ==="
+bash "$ROOT/tests/test_thread_stack_tls_contract.sh" "$WATCHDOG_BINARY"
+
 # Step 5b: worker-mode parent-death watchdog (#845). A supervised index worker
 # (`cli --index-worker …`) whose supervisor dies must self-exit instead of
 # indexing on as an orphan. Reuses the prod binary built in Step 5.
@@ -345,6 +374,12 @@ CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_error_response.
 # never a fixed sleep — see the header of the test for why.
 echo "=== Step 5e: watcher_enabled kill-switch regression (#335) ==="
 CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_watcher_disabled.sh"
+
+# Step 5f: a supervised worker is scoped to the request the daemon admitted,
+# never to the CBM_ALLOWED_ROOT it inherited from the daemon starter's
+# environment. Reuses the prod binary built in Step 5.
+echo "=== Step 5f: worker request-scope regression ==="
+CBM_TEST_BINARY="$WATCHDOG_BINARY" bash "$ROOT/tests/test_worker_session_scope.sh"
 
 # Step 6: security-strings URL allow-list regression. The MSYS2 CLANG64 toolchain
 # bakes its package-tracker URL into the static Windows .exe; the binary string

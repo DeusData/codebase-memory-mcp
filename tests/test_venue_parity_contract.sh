@@ -47,7 +47,11 @@ failures: list[str] = []
 
 # ── The canonical leg entries (the ONLY product-exercising calls allowed) ──
 CANONICAL = re.compile(
-    r"scripts/(test|build|lint|clean|smoke-local|soak-legs|smoke-invariants|package-release)\.sh"
+    # fuzz.sh and memwaste.sh own their legs end to end (build, corpus/binary,
+    # artifact paths, exit code), exactly as soak-legs.sh owns the soak — the
+    # venue passes shape flags and collects the report, nothing more.
+    r"scripts/(test|build|lint|clean|smoke-local|soak-legs|smoke-invariants"
+    r"|package-release|fuzz|memwaste)\.sh"
     r"|test-infrastructure/vm/vm-smoke\.sh"
     r"|scripts/ci/[a-z0-9-]+\.(sh|ps1|py)"
     r"|scripts/security-[a-z0-9-]+\.sh"
@@ -78,7 +82,7 @@ FORBIDDEN = [
 VENUE_WORKFLOWS = [
     "pr.yml", "dry-run.yml", "release.yml", "nightly-soak.yml",
     "_test.yml", "_smoke.yml", "_soak.yml", "_build.yml", "_lint.yml",
-    "smoke.yml",
+    "smoke.yml", "_memwaste.yml",
 ]
 
 # Provisioning / plumbing commands a venue may run (first word of a line).
@@ -391,6 +395,8 @@ scripts/ci/verify-shard-union.sh
 scripts/ci/generate-sbom.py
 scripts/package-release.sh
 scripts/ci/smoke-artifact.sh
+scripts/fuzz.sh
+scripts/memwaste.sh
 test-infrastructure/run.sh
 test-infrastructure/vm/vm-smoke.sh
 test-infrastructure/vm/vm-run-tests.sh
@@ -428,6 +434,8 @@ scripts/soak-legs.sh
 scripts/ci/preflight-docker.sh
 test-infrastructure/vm/vm-smoke.sh
 scripts/smoke-invariants.sh
+scripts/fuzz.sh
+scripts/memwaste.sh
 "
     for entry in $STRICT_ENTRIES; do
         out=$(cd "$ROOT" && bash "$entry" --definitely-not-a-flag 2>&1) && rc=0 || rc=$?

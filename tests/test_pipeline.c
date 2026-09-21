@@ -151,6 +151,34 @@ TEST(pipeline_run_null) {
     PASS();
 }
 
+TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing) {
+    char *repo = th_mktempdir("cbm_pipeline_discovery_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "second.py"), "second = 2\n"), 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+
+    ASSERT_EQ(cbm_pipeline_run(pipeline), CBM_PIPELINE_RESOURCE_LIMIT);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+
+    cbm_pipeline_free(pipeline);
+    th_cleanup(repo);
+    PASS();
+}
+
 /* ── Focused: file-backed store persistence ─────────────────────── */
 
 TEST(store_file_persistence) {
@@ -220,6 +248,137 @@ TEST(store_bulk_persistence) {
     cbm_store_close(s2);
 
     teardown_test_repo();
+    PASS();
+}
+
+static void write_temp_file(const char *dir, const char *name, const char *content);
+
+/* EVERY proto service gets its Routes, not the first 64 the graph buffer
+ * happened to hold.
+ *
+ * create_grpc_routes() collected services into a fixed `services[CBM_SZ_64]`
+ * and stopped there, in graph-buffer insertion order — which is parallel
+ * worker merge order. So on a repo with more than 64 services the extras were
+ * silently dropped, and WHICH ones were dropped changed between runs of the
+ * same binary: two kubernetes indexes differed by 5 Routes one way and 4 the
+ * other, plus their HANDLES edges (2026-09-18). 70 services here, so the old
+ * cap fails this test whatever order the workers produce. */
+TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_grpc_cap_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    enum { SERVICES = 70 }; /* > the 64 the fixed array used to hold */
+    for (int i = 0; i < SERVICES; i++) {
+        char name[64];
+        char body[512];
+        snprintf(name, sizeof(name), "svc%02d.proto", i);
+        snprintf(body, sizeof(body),
+                 "syntax = \"proto3\";\npackage demo%02d;\n\n"
+                 "message Req%02d { string id = 1; }\n"
+                 "message Resp%02d { string ok = 1; }\n\n"
+                 "service Svc%02d {\n"
+                 "  rpc Ping (Req%02d) returns (Resp%02d);\n}\n",
+                 i, i, i, i, i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/grpc.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count),
+              CBM_STORE_OK);
+    int grpc_routes = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name &&
+            strncmp(routes[i].qualified_name, "__grpc__", strlen("__grpc__")) == 0) {
+            grpc_routes++;
+        }
+    }
+    cbm_store_free_nodes(routes, route_count);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+
+    /* One rpc per service: every service must be represented. The old cap
+     * produced at most 64 however the workers interleaved. */
+    ASSERT_EQ(grpc_routes, SERVICES);
+    PASS();
+}
+
+/* Spilling must be invisible in the OUTPUT: the same repository indexed with
+ * results parked on disk must produce the same graph as one indexed entirely in
+ * memory. It did not. The namespace map that `use`/`using`/package imports
+ * resolve through was built from the in-memory result cache, where a PARKED
+ * result is NULL, so every spilled file contributed no namespace and its
+ * imports fell through to the looser fallback. Measured on the php corpus
+ * (2026-09-18, reproducible 3/3 each way, and present on main): 57,182 edges in
+ * memory against 59,379 while spilling — differing in BOTH directions, because
+ * a file missing from that map does not fail to resolve, it resolves
+ * differently.
+ *
+ * Why this needs its own fixture: test_parallel's spill-parity test uses the
+ * compact parity harness, which omits the production pass that builds the map,
+ * and its repo is Go+Java — neither reaches the namespace path. This one runs
+ * the REAL pipeline over >MIN_FILES_FOR_PARALLEL files so the parallel route is
+ * taken, with namespaced PHP that imports across files. */
+TEST(pipeline_spill_resolves_namespace_imports_like_memory) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_spill_ns_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    /* 60 modules: each declares a namespace and the next one imports it, so
+     * every file both contributes to the namespace map and depends on it. */
+    enum { NS_FILES = 60 };
+    for (int i = 0; i < NS_FILES; i++) {
+        char name[64];
+        char body[512];
+        snprintf(name, sizeof(name), "Mod%02d.php", i);
+        snprintf(body, sizeof(body),
+                 "<?php\nnamespace App\\Mod%02d;\n\nuse App\\Mod%02d\\Thing%02d;\n\n"
+                 "class Thing%02d {\n"
+                 "    public function run() { $t = new Thing%02d(); return $t->run(); }\n}\n",
+                 i, (i + 1) % NS_FILES, (i + 1) % NS_FILES, i, (i + 1) % NS_FILES);
+        write_temp_file(tmp, name, body);
+    }
+
+    int counts[2] = {0, 0};
+    int imports[2] = {0, 0};
+    for (int pass = 0; pass < 2; pass++) {
+        char db_path[512];
+        snprintf(db_path, sizeof(db_path), "%s/ns%d.db", tmp, pass);
+        if (pass == 1) {
+            cbm_setenv("CBM_MEM_SPILL", "1", 1); /* park every result on disk */
+        }
+        cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+        ASSERT_NOT_NULL(p);
+        int rc = cbm_pipeline_run(p);
+        if (pass == 1) {
+            cbm_unsetenv("CBM_MEM_SPILL");
+        }
+        ASSERT_EQ(rc, 0);
+        cbm_store_t *s = cbm_store_open_path(db_path);
+        ASSERT_NOT_NULL(s);
+        const char *project = cbm_pipeline_project_name(p);
+        counts[pass] = cbm_store_count_edges(s, project);
+        imports[pass] = cbm_store_count_edges_by_type(s, project, "IMPORTS");
+        cbm_store_close(s);
+        cbm_pipeline_free(p);
+    }
+    th_rmtree(tmp);
+
+    /* The imports must actually have resolved, or this compares 0 == 0. */
+    ASSERT_GT(imports[0], 0);
+    ASSERT_EQ(imports[0], imports[1]);
+    ASSERT_EQ(counts[0], counts[1]);
     PASS();
 }
 
@@ -2278,7 +2437,7 @@ TEST(pipeline_complexity_props_independent_of_worker_order) {
     ASSERT_EQ(sequential_rc, 0);
     ASSERT_NOT_NULL(sequential_sig);
     ASSERT_GTE(sequential_funcs, copied); /* at least the one function per fixture file */
-    ASSERT_TRUE(cycles_detected);        /* the cycles must reach the pass at all */
+    ASSERT_TRUE(cycles_detected);         /* the cycles must reach the pass at all */
     if (mismatch_run >= 0) {
         printf("\n    parallel run %d diverges from sequential: %s\n", mismatch_run, diff);
         FAIL("complexity props depend on worker id order");
@@ -3281,6 +3440,44 @@ static void mutate_semantic_input_before_final_manifest(void *userdata) {
     mutation->write_rc = th_write_file(mutation->path, mutation->replacement);
 }
 
+TEST(pipeline_late_source_limit_preserves_previous_generation) {
+    char *repo = th_mktempdir("cbm_pipeline_late_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    char db_path[512];
+    char late_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    snprintf(late_path, sizeof(late_path), "%s/late.py", repo);
+
+    manifest_race_mutation_t mutation = {
+        .path = late_path,
+        .replacement = "late = 2\n",
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    cbm_pipeline_free(pipeline);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    th_cleanup(repo);
+    PASS();
+}
+
 /* A graph and its exact manifest are one generation. If source bytes change
  * after extraction but before publication, the mixed generation must be
  * rejected and the previous live DB preserved. */
@@ -3413,6 +3610,527 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
     /* Not one may be unlinked, truncated, or written through. */
     ASSERT_EQ(survived, PREDICTABLE_CANARIES);
     ASSERT_EQ(intact, PREDICTABLE_CANARIES);
+    PASS();
+}
+
+static int count_substring(const char *haystack, const char *needle) {
+    int count = 0;
+    size_t needle_len = strlen(needle);
+    for (const char *at = strstr(haystack, needle); at; at = strstr(at + needle_len, needle)) {
+        count++;
+    }
+    return count;
+}
+
+static int count_nested_stage_entries(const char *dir_path, const char *db_basename) {
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        return -1;
+    }
+    size_t base_len = strlen(db_basename);
+    int count = 0;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        if (strncmp(entry->name, db_basename, base_len) == 0 &&
+            count_substring(entry->name + base_len, ".stage.") >= 2) {
+            count++;
+        }
+    }
+    cbm_closedir(dir);
+    return count;
+}
+
+/* #1839: the outer run rewrites the pipeline's db_path to its stage, so the
+ * inner publication (dump or delta clone) minted ITS stage from a stage:
+ * <db>.stage.A.stage.B, plus -wal/-shm under WAL. A generation's stage is a
+ * sibling of the live database, whichever path it is minted from; a database
+ * whose own basename merely contains ".stage." is not a stage and keeps its
+ * full name. */
+TEST(pipeline_stage_names_never_nest) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_nesting_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    char odd_db[512];
+    snprintf(odd_db, sizeof(odd_db), "%s/x.stage.y.db", tmp);
+
+    char *outer = cbm_pipeline_create_staging_path(db_path);
+    ASSERT_NOT_NULL(outer);
+    char *inner = cbm_pipeline_create_staging_path(outer);
+    ASSERT_NOT_NULL(inner);
+    char *odd_stage = cbm_pipeline_create_staging_path(odd_db);
+    ASSERT_NOT_NULL(odd_stage);
+
+    size_t db_len = strlen(db_path);
+    size_t odd_len = strlen(odd_db);
+    int outer_tokens = count_substring(outer, ".stage.");
+    int inner_tokens = count_substring(inner, ".stage.");
+    bool inner_is_sibling =
+        strncmp(inner, db_path, db_len) == 0 && strncmp(inner + db_len, ".stage.", 7) == 0;
+    bool inner_distinct = strcmp(inner, outer) != 0;
+    bool odd_keeps_basename =
+        strncmp(odd_stage, odd_db, odd_len) == 0 && strncmp(odd_stage + odd_len, ".stage.", 7) == 0;
+    int nested_entries = count_nested_stage_entries(tmp, "generation.db");
+
+    cbm_pipeline_discard_stage(inner);
+    cbm_pipeline_discard_stage(outer);
+    cbm_pipeline_discard_stage(odd_stage);
+    int leftover_entries = count_generation_stage_artifacts(tmp, "generation.db") +
+                           count_generation_stage_artifacts(tmp, "x.stage.y.db");
+    free(inner);
+    free(outer);
+    free(odd_stage);
+    th_rmtree(tmp);
+
+    ASSERT_EQ(outer_tokens, 1);
+    ASSERT_EQ(inner_tokens, 1);
+    ASSERT_TRUE(inner_is_sibling);
+    ASSERT_TRUE(inner_distinct);
+    ASSERT_TRUE(odd_keeps_basename);
+    ASSERT_EQ(nested_entries, 0);
+    ASSERT_EQ(leftover_entries, 0);
+    PASS();
+}
+
+static bool path_exists(const char *path) {
+    cbm_path_info_t info;
+    return cbm_path_info_utf8(path, &info) == CBM_PATH_INFO_OK;
+}
+
+/* #1839: a minted stage is OWNED through an exclusive kernel lock on its
+ * "<stage>.lock" sidecar for exactly as long as the stage exists. A second
+ * holder cannot take it while the writer is live; discarding the stage frees
+ * the name and removes the sidecar, so nothing stays behind. */
+TEST(pipeline_minted_stage_is_owned_until_released) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_owner_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    char *stage = cbm_pipeline_create_staging_path(db_path);
+    ASSERT_NOT_NULL(stage);
+    char lock_path[600];
+    snprintf(lock_path, sizeof(lock_path), "%s.lock", stage);
+    bool lock_present_while_live = path_exists(lock_path);
+    int hold_while_live = cbm_pipeline_stage_lock_hold(stage);
+    if (hold_while_live >= 0) {
+        cbm_pipeline_stage_lock_drop(stage, hold_while_live);
+    }
+
+    cbm_pipeline_discard_stage(stage);
+    bool stage_gone = !path_exists(stage);
+    bool lock_gone = !path_exists(lock_path);
+
+    int hold_after_discard = cbm_pipeline_stage_lock_hold(stage);
+    int second_holder = cbm_pipeline_stage_lock_hold(stage);
+    if (second_holder >= 0) {
+        cbm_pipeline_stage_lock_drop(stage, second_holder);
+    }
+    cbm_pipeline_stage_lock_drop(stage, hold_after_discard);
+    int hold_after_drop = cbm_pipeline_stage_lock_hold(stage);
+    cbm_pipeline_stage_lock_drop(stage, hold_after_drop);
+    int leftovers = count_generation_stage_artifacts(tmp, "generation.db");
+    free(stage);
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(lock_present_while_live);
+    ASSERT_EQ(hold_while_live, -1);
+    ASSERT_TRUE(stage_gone);
+    ASSERT_TRUE(lock_gone);
+    ASSERT_TRUE(hold_after_discard >= 0);
+    ASSERT_EQ(second_holder, -1);
+    ASSERT_TRUE(hold_after_drop >= 0);
+    ASSERT_EQ(leftovers, 0);
+    PASS();
+}
+
+static bool file_has_content(const char *path, const char *expected) {
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    char buf[256] = {0};
+    size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+    (void)fclose(f);
+    return n == strlen(expected) && memcmp(buf, expected, n) == 0;
+}
+
+/* #1839 / #1864: a stage a dead writer left beside a VALID database is swept
+ * by the next run and never influences its route. The 0-byte shape is what a
+ * worker killed before its backup wrote a page leaves behind; a stale -shm
+ * beside it is swept with it. */
+TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stale_stage_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    char stale_stage[600];
+    char stale_shm[600];
+    snprintf(stale_stage, sizeof(stale_stage), "%s.stage.deadbe", db_path);
+    snprintf(stale_shm, sizeof(stale_shm), "%s.stage.deadbe-shm", db_path);
+    ASSERT_EQ(th_write_file(stale_stage, ""), 0);
+    ASSERT_EQ(th_write_file(stale_shm, "stale-shm"), 0);
+
+    /* A body-only change: no added names, so the planner may repair. */
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *incr = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(incr);
+    int incr_rc = cbm_pipeline_run(incr);
+    cbm_incremental_route_t route = cbm_pipeline_incremental_test_last_route();
+    cbm_pipeline_free(incr);
+
+    bool stale_stage_gone = !path_exists(stale_stage);
+    bool stale_shm_gone = !path_exists(stale_shm);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    int stable_count = -1;
+    int absent_count = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined", &stable_count,
+                             &absent_count);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(incr_rc, 0);
+    ASSERT_TRUE(route != CBM_INCREMENTAL_ROUTE_FORCED_FULL);
+    ASSERT_TRUE(route != CBM_INCREMENTAL_ROUTE_NONE);
+    ASSERT_TRUE(stale_stage_gone);
+    ASSERT_TRUE(stale_shm_gone);
+    ASSERT_EQ(stage_count, 0);
+    ASSERT_EQ(stable_count, 1);
+    ASSERT_EQ(absent_count, 0);
+    PASS();
+}
+
+/* A killed run cleans up nothing, and until 2026-09-18 its staging database was
+ * reclaimed only when THAT project was indexed again: a kernel index killed by
+ * the OOM killer left ~15 GB parked until someone re-indexed the kernel, and
+ * indefinitely if nobody ever did. Indexing ANY project now reclaims the
+ * orphans of every project sharing that cache directory -- while the lock probe
+ * still keeps a LIVE writer's stage, whichever project owns it. */
+TEST(pipeline_sweep_reclaims_orphans_of_other_projects_and_keeps_their_live_stages) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_sweep_other_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/mine.db", tmp);
+
+    /* Two stages of a DIFFERENT project sharing the cache directory: one whose
+     * writer died (nothing holds its lock) and one whose writer is alive. */
+    char other_dead[600];
+    char other_dead_wal[600];
+    char other_live[600];
+    snprintf(other_dead, sizeof(other_dead), "%s/other.db.stage.cccccc", tmp);
+    snprintf(other_dead_wal, sizeof(other_dead_wal), "%s/other.db.stage.cccccc-wal", tmp);
+    snprintf(other_live, sizeof(other_live), "%s/other.db.stage.dddddd", tmp);
+    static const char other_live_bytes[] = "other-project-live-bytes";
+    ASSERT_EQ(th_write_file(other_dead, "other-project-dead-bytes"), 0);
+    ASSERT_EQ(th_write_file(other_dead_wal, "other-project-dead-wal"), 0);
+    ASSERT_EQ(th_write_file(other_live, other_live_bytes), 0);
+    int other_live_fd = cbm_pipeline_stage_lock_hold(other_live);
+    ASSERT_TRUE(other_live_fd >= 0);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *mine = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(mine);
+    ASSERT_EQ(cbm_pipeline_run(mine), 0);
+    cbm_pipeline_free(mine);
+
+    bool dead_gone = !path_exists(other_dead);
+    bool dead_wal_gone = !path_exists(other_dead_wal);
+    bool live_kept = file_has_content(other_live, other_live_bytes);
+    cbm_pipeline_stage_lock_drop(other_live, other_live_fd);
+
+    ASSERT_TRUE(dead_gone);     /* reclaimed even though it belongs to "other" */
+    ASSERT_TRUE(dead_wal_gone); /* sidecars go with their stage */
+    ASSERT_TRUE(live_kept);     /* another project's LIVE stage is untouched */
+    PASS();
+}
+
+/* #1839: the sweep removes exactly the stages nobody owns. A dead writer's
+ * stage (main, -wal, and the unlocked .lock sidecar its death left) goes; a
+ * stage whose writer is LIVE -- here the test, holding its lock -- is kept
+ * byte for byte, and goes only once that lock is dropped. No timing: liveness
+ * is the kernel lock, nothing else. */
+TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_sweep_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(baseline);
+    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
+    cbm_pipeline_free(baseline);
+
+    char dead_stage[600];
+    char dead_wal[600];
+    char dead_lock[600];
+    char live_stage[600];
+    char live_lock[600];
+    snprintf(dead_stage, sizeof(dead_stage), "%s.stage.aaaaaa", db_path);
+    snprintf(dead_wal, sizeof(dead_wal), "%s.stage.aaaaaa-wal", db_path);
+    snprintf(dead_lock, sizeof(dead_lock), "%s.stage.aaaaaa.lock", db_path);
+    snprintf(live_stage, sizeof(live_stage), "%s.stage.bbbbbb", db_path);
+    snprintf(live_lock, sizeof(live_lock), "%s.stage.bbbbbb.lock", db_path);
+    static const char live_bytes[] = "live-stage-bytes";
+    ASSERT_EQ(th_write_file(dead_stage, "dead-stage-bytes"), 0);
+    ASSERT_EQ(th_write_file(dead_wal, "dead-wal"), 0);
+    ASSERT_EQ(th_write_file(dead_lock, ""), 0);
+    ASSERT_EQ(th_write_file(live_stage, live_bytes), 0);
+    int live_fd = cbm_pipeline_stage_lock_hold(live_stage);
+    ASSERT_TRUE(live_fd >= 0);
+
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 2\n");
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *first = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(first);
+    int first_rc = cbm_pipeline_run(first);
+    cbm_pipeline_free(first);
+
+    bool dead_stage_gone = !path_exists(dead_stage);
+    bool dead_wal_gone = !path_exists(dead_wal);
+    bool dead_lock_gone = !path_exists(dead_lock);
+    bool live_kept = file_has_content(live_stage, live_bytes);
+    bool live_lock_kept = path_exists(live_lock);
+    int stable_after_first = -1;
+    int absent_after_first = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined",
+                             &stable_after_first, &absent_after_first);
+
+    cbm_pipeline_stage_lock_drop(live_stage, live_fd);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *second = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(second);
+    int second_rc = cbm_pipeline_run(second);
+    cbm_pipeline_free(second);
+
+    bool live_gone = !path_exists(live_stage);
+    bool live_lock_gone = !path_exists(live_lock);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    int stable_after_second = -1;
+    int absent_after_second = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined",
+                             &stable_after_second, &absent_after_second);
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(first_rc, 0);
+    ASSERT_TRUE(dead_stage_gone);
+    ASSERT_TRUE(dead_wal_gone);
+    ASSERT_TRUE(dead_lock_gone);
+    ASSERT_TRUE(live_kept);
+    ASSERT_TRUE(live_lock_kept);
+    ASSERT_EQ(stable_after_first, 1);
+    ASSERT_EQ(absent_after_first, 0);
+    ASSERT_EQ(second_rc, 0);
+    ASSERT_TRUE(live_gone);
+    ASSERT_TRUE(live_lock_gone);
+    ASSERT_EQ(stage_count, 0);
+    ASSERT_EQ(stable_after_second, 1);
+    ASSERT_EQ(absent_after_second, 0);
+    PASS();
+}
+
+/* #2111 create->register TOCTOU guard. The bug this pins: create_staging_path()
+ * used to make the stage's main file visible (via mkstemp) BEFORE taking its
+ * sidecar lock, and sweep_orphan_stages() treats an absent lock sidecar
+ * (ENOENT) as a confirmed-dead writer (kernel released the lock on death). So a
+ * second, concurrent cbm_pipeline_run() against the SAME final_path, landing
+ * its own sweep in that narrow unlocked window, removed the first run's
+ * in-flight stage out from under it: every extraction pass still completed
+ * (none touch the stage file on disk), but the publish that followed found its
+ * own stage gone. Two writers racing the same project is a real scenario this
+ * PR's own sweep exists to clean up after (auto_index; the recently-fixed
+ * stale-rendezvous-recovery retry path) -- not hypothetical, and exactly the
+ * shape of #2111's windows-guards red (every pass logged success, nothing was
+ * ever committed, "Pipeline failed" surfaced generic; on Windows the sidecar
+ * collision surfaced as EACCES/errno=13).
+ *
+ * The fix takes the sidecar lock BEFORE the main file becomes visible, so this
+ * hook -- fired the instant the main file exists -- finds the stage already
+ * lock-protected and the racing sweep keeps it. The hook fires at the same
+ * point under the old ordering, where the lock was NOT yet held, so this test
+ * goes RED if that ordering ever regresses.
+ *
+ * The racing run is cancelled immediately so it never reaches ITS OWN
+ * publish -- isolating the sweep's effect on the first run's stage from the
+ * separate question of two full runs both completing for the same project. */
+typedef struct {
+    const char *tmp_dir;
+    const char *db_path;
+    bool stage_survived;
+} racing_sweep_arg_t;
+
+static bool find_sole_stage_path(const char *dir, const char *db_basename, char *out,
+                                 size_t out_sz) {
+    cbm_dir_t *d = cbm_opendir(dir);
+    if (!d) {
+        return false;
+    }
+    char prefix[256];
+    snprintf(prefix, sizeof(prefix), "%s.stage.", db_basename);
+    size_t prefix_len = strlen(prefix);
+    bool found = false;
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(d)) != NULL) {
+        size_t name_len = strlen(entry->name);
+        enum { STAGE_SUFFIX_RANDOM_CHARS = 6 }; /* mirrors CBM_STAGE_SUFFIX_RANDOM_CHARS */
+        if (strncmp(entry->name, prefix, prefix_len) == 0 &&
+            name_len == prefix_len + STAGE_SUFFIX_RANDOM_CHARS) {
+            snprintf(out, out_sz, "%s/%s", dir, entry->name);
+            found = true;
+            break;
+        }
+    }
+    cbm_closedir(d);
+    return found;
+}
+
+static void *racing_sweep_thread(void *arg) {
+    racing_sweep_arg_t *a = (racing_sweep_arg_t *)arg;
+    cbm_pipeline_t *p = cbm_pipeline_new(a->tmp_dir, a->db_path, CBM_MODE_FULL);
+    if (p) {
+        /* Its own sweep_orphan_stages() runs at the very start, before this
+         * run mints its own stage -- exactly like the first run's. Cancel
+         * immediately: this run must reach the sweep and nothing past it. */
+        cbm_pipeline_cancel(p);
+        (void)cbm_pipeline_run(p);
+        cbm_pipeline_free(p);
+    }
+    return NULL;
+}
+
+/* Fired from inside the FIRST run's create_staging_path(), the instant its
+ * stage main file exists (under the fix, with its sidecar lock already held;
+ * under the old create-then-lock ordering, before the lock was taken): run a
+ * second, cancelled cbm_pipeline_run() for the same project synchronously on
+ * another thread, so its sweep has every chance to reach the stage before
+ * control returns to the first run. */
+static void racing_sweep_hook(void *userdata) {
+    racing_sweep_arg_t *a = (racing_sweep_arg_t *)userdata;
+    char stage_path[600] = {0};
+    bool had_stage =
+        find_sole_stage_path(a->tmp_dir, "generation.db", stage_path, sizeof(stage_path));
+    cbm_thread_t tid;
+    if (cbm_thread_create(&tid, 0, racing_sweep_thread, a) == 0) {
+        cbm_thread_join(&tid);
+    }
+    a->stage_survived = had_stage && path_exists(stage_path);
+}
+
+TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_stage_race_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    cbm_pipeline_incremental_test_reset_faults();
+    racing_sweep_arg_t race_arg = {.tmp_dir = tmp, .db_path = db_path, .stage_survived = false};
+    cbm_pipeline_incremental_test_after_stage_created_once(racing_sweep_hook, &race_arg);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    int rc = cbm_pipeline_run(p);
+    cbm_pipeline_free(p);
+
+    bool db_exists = path_exists(db_path);
+    int defined_count = -1;
+    int absent_count = -1;
+    observe_named_generation(db_path, project, "StableGeneration", "NeverDefined", &defined_count,
+                             &absent_count);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_TRUE(race_arg.stage_survived);
+    ASSERT_EQ(rc, 0);
+    ASSERT_TRUE(db_exists);
+    ASSERT_EQ(defined_count, 1);
+    ASSERT_EQ(absent_count, 0);
+    ASSERT_EQ(stage_count, 0);
+    PASS();
+}
+
+static char g_route_log_capture[8192];
+static atomic_flag g_route_log_spin = ATOMIC_FLAG_INIT;
+
+/* Keeps only the route decisions; worker threads log too, and only the
+ * appends need serialising. */
+static void capture_route_log_sink(const char *line) {
+    if (!line || !strstr(line, "pipeline.route")) {
+        return;
+    }
+    while (atomic_flag_test_and_set_explicit(&g_route_log_spin, memory_order_acquire)) {}
+    size_t used = strlen(g_route_log_capture);
+    size_t avail = sizeof(g_route_log_capture) - used;
+    if (avail > 1) {
+        int n = snprintf(g_route_log_capture + used, avail, "%s\n", line);
+        if (n < 0 || (size_t)n >= avail) {
+            g_route_log_capture[sizeof(g_route_log_capture) - 1] = '\0';
+        }
+    }
+    atomic_flag_clear_explicit(&g_route_log_spin, memory_order_release);
+}
+
+/* #1864: a first index has no previous generation. The route probe used to
+ * open the run's own EMPTY stage placeholder, fail its integrity check, and
+ * warn "reason=invalid_existing_db" on every first index of every project,
+ * which the report read as a corrupted database and a crash loop. A fresh
+ * index says what it is. */
+TEST(pipeline_fresh_index_never_reports_invalid_existing_db) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_fresh_route_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    write_temp_file(tmp, "generation.py", "def StableGeneration():\n    return 1\n");
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+
+    g_route_log_capture[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_DEBUG);
+    cbm_log_set_sink(capture_route_log_sink);
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_t *fresh = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    int fresh_rc = fresh ? cbm_pipeline_run(fresh) : -1;
+    cbm_pipeline_free(fresh);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    bool invalid_reported = strstr(g_route_log_capture, "invalid_existing_db") != NULL;
+    bool fresh_reported = strstr(g_route_log_capture, "reason=no_existing_db") != NULL;
+    bool db_present = path_exists(db_path);
+    int stage_count = count_generation_stage_artifacts(tmp, "generation.db");
+    cbm_pipeline_incremental_test_reset_faults();
+    th_rmtree(tmp);
+
+    ASSERT_EQ(fresh_rc, 0);
+    ASSERT_TRUE(!invalid_reported);
+    ASSERT_TRUE(fresh_reported);
+    ASSERT_TRUE(db_present);
+    ASSERT_EQ(stage_count, 0);
     PASS();
 }
 
@@ -7137,19 +7855,18 @@ TEST(pipeline_python_cross_module_call) {
  * unique_name (candidates==1) is #1572 and is not this claim. */
 TEST(pipeline_cross_language_same_name_does_not_share_calls_issue725) {
     const char *files[] = {"store.py", "app.py", "web/src/pages/Editor.js"};
-    const char *contents[] = {
-        "class Store:\n"
-        "    def commit(self):\n"
-        "        return True\n",
+    const char *contents[] = {"class Store:\n"
+                              "    def commit(self):\n"
+                              "        return True\n",
 
-        "from store import Store\n"
-        "\n"
-        "def save():\n"
-        "    return Store().commit()\n",
+                              "from store import Store\n"
+                              "\n"
+                              "def save():\n"
+                              "    return Store().commit()\n",
 
-        "export function commit() {\n"
-        "  return 1;\n"
-        "}\n"};
+                              "export function commit() {\n"
+                              "  return 1;\n"
+                              "}\n"};
 
     if (setup_lang_repo(files, contents, 3) != 0)
         FAIL("tmpdir");
@@ -12871,22 +13588,81 @@ TEST(pipeline_committed_counts_match_persisted) {
  * MIN_FILES_FOR_PARALLEL (50) — else the run routes sequential, the gate never
  * fires, and the test would pass vacuously (cycles==0). The engagement assert
  * below (cycles >= 1) is a hard guard against that regressing silently. */
-TEST(pipeline_backpressure_futile_nap_disengages) {
-    /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
-     * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
+/* Shared fixture for the back-pressure tests: 64 tiny Go files, above
+ * MIN_FILES_FOR_PARALLEL (50) so the parallel extract path — the only phase
+ * with a memory gate — is the one that runs. */
+static bool write_backpressure_fixture(void) {
     snprintf(g_tmpdir, sizeof(g_tmpdir), "/tmp/cbm_test_XXXXXX");
     if (!cbm_mkdtemp(g_tmpdir)) {
-        FAIL("failed to create temp dir");
+        return false;
     }
     for (int i = 0; i < 64; i++) {
         char path[512];
         snprintf(path, sizeof(path), "%s/f%02d.go", g_tmpdir, i);
         FILE *f = fopen(path, "w");
         if (!f) {
-            FAIL("failed to create fixture file");
+            return false;
         }
         fprintf(f, "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n", i, i);
         fclose(f);
+    }
+    return true;
+}
+
+/* Rewrite every fixture file with a second definition. An unchanged repo
+ * routes incremental_manifest → incremental.noop (nothing is re-extracted, so
+ * no gate can fire); changing all 64 files makes the next run re-extract them
+ * all through the parallel path. */
+static bool mutate_backpressure_fixture(void) {
+    for (int i = 0; i < 64; i++) {
+        char path[512];
+        snprintf(path, sizeof(path), "%s/f%02d.go", g_tmpdir, i);
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            return false;
+        }
+        fprintf(f,
+                "package main\n\nfunc F%02d() int {\n\treturn %d\n}\n\n"
+                "func G%02d() int {\n\treturn F%02d() + 1\n}\n",
+                i, i, i, i);
+        fclose(f);
+    }
+    return true;
+}
+
+/* Whole-file read for byte-identity assertions on a published database. */
+static unsigned char *read_file_bytes(const char *path, size_t *len_out) {
+    *len_out = 0;
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return NULL;
+    }
+    long size = fseek(f, 0, SEEK_END) == 0 ? ftell(f) : -1;
+    if (size < 0) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    unsigned char *buf = malloc((size_t)size + 1);
+    if (!buf) {
+        fclose(f);
+        return NULL;
+    }
+    size_t got = fread(buf, 1, (size_t)size, f);
+    fclose(f);
+    if (got != (size_t)size) {
+        free(buf);
+        return NULL;
+    }
+    *len_out = got;
+    return buf;
+}
+
+TEST(pipeline_backpressure_futile_nap_disengages) {
+    /* 64 tiny files: > MIN_FILES_FOR_PARALLEL (50) so the parallel path (and its
+     * back-pressure gate) actually runs; old-code cycles (~64) >> the bound. */
+    if (!write_backpressure_fixture()) {
+        FAIL("failed to create fixture");
     }
 
     /* 1 MB budget: over-budget on every pull, unreclaimable by napping.
@@ -12942,7 +13718,10 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
     teardown_test_repo();
 
     ASSERT_EQ(restore_workers_rc, 0);
-    ASSERT_EQ(rc, 0);
+    /* Decision A (#1997 #832): a budget that never drains is not a soft
+     * overshoot any more — after the latch and ONE confirmation cycle the
+     * attempt fails whole with the named code (rc==0 was the advisory era). */
+    ASSERT_EQ(rc, CBM_PIPELINE_ABORT_OVER_BUDGET);
     /* Engagement guard (anti-vacuous): the gate must have actually run — the
      * parallel path taken and the 1 MB budget exceeded on every pull. cycles==0
      * means the fixture routed sequential (or the gate was compiled out) and
@@ -12951,14 +13730,111 @@ TEST(pipeline_backpressure_futile_nap_disengages) {
         FAIL("back-pressure gate never engaged (cycles==0) — fixture routed sequential?");
     }
     /* Futile napping must disengage: at most one in-flight cycle per worker
-     * plus a small margin, never one per file (64). */
-    long bound = TEST_WORKERS + 2;
+     * plus the single confirmation cycle and a small margin, never one per
+     * file (64). */
+    long bound = TEST_WORKERS + 3;
     if (cycles > bound) {
         char msg[128];
         snprintf(msg, sizeof(msg), "nap cycles %ld > bound %ld (gate re-paid per pull)", cycles,
                  bound);
         FAIL(msg);
     }
+    PASS();
+}
+
+/* Decision A (#1997 #832): once back-pressure is futile AND one confirmation
+ * cycle still ends over budget, the attempt fails WHOLE with a named code —
+ * no partial graph is published, no stage residue remains, and the previously
+ * serving generation is byte-identical. */
+TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db) {
+    if (!write_backpressure_fixture()) {
+        FAIL("failed to create fixture");
+    }
+    enum { TEST_WORKERS = 4 };
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    if ((old_workers && !saved_workers) || cbm_setenv("CBM_WORKERS", "4", 1) != 0) {
+        free(saved_workers);
+        teardown_test_repo();
+        FAIL("failed to pin CBM_WORKERS");
+    }
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/budget.db", g_tmpdir);
+
+    /* Generation 1 at the process budget: publishes normally. */
+    cbm_pipeline_t *p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    int rc_first = p ? cbm_pipeline_run(p) : -1;
+    char *project = p ? strdup(cbm_pipeline_project_name(p)) : NULL;
+    cbm_pipeline_free(p);
+    int nodes_before = -1;
+    bool valid_before = false;
+    cbm_store_t *live = rc_first == 0 && project ? cbm_store_open_path(db_path) : NULL;
+    if (live) {
+        valid_before = cbm_store_check_integrity(live);
+        nodes_before = cbm_store_count_nodes(live, project);
+        cbm_store_close(live);
+    }
+    size_t before_len = 0;
+    unsigned char *before = read_file_bytes(db_path, &before_len);
+
+    /* Generation 2 at a 1 MiB budget over a CHANGED repo (every file gains a
+     * definition, so the run must re-extract all 64): over budget on every
+     * probe and unreclaimable by napping, so futility latches and the
+     * confirmation cycle still ends over budget. */
+    bool mutated = mutate_backpressure_fixture();
+    size_t saved_budget = cbm_mem_budget();
+    cbm_mem_set_budget_for_tests((size_t)1024 * 1024);
+    bool over_at_start = cbm_mem_over_budget();
+    cbm_pp_bp_nap_cycles_reset();
+    p = cbm_pipeline_new(g_tmpdir, db_path, CBM_MODE_FULL);
+    int rc_second = p ? cbm_pipeline_run(p) : -1;
+    long cycles = cbm_pp_bp_nap_cycles();
+    /* Restore the caller-visible budget BEFORE any assertion. */
+    cbm_mem_set_budget_for_tests(saved_budget);
+    cbm_pipeline_free(p);
+
+    size_t after_len = 0;
+    unsigned char *after = read_file_bytes(db_path, &after_len);
+    int stage_count = count_generation_stage_artifacts(g_tmpdir, "budget.db");
+    int nodes_after = -1;
+    bool valid_after = false;
+    live = cbm_store_open_path(db_path);
+    if (live) {
+        valid_after = cbm_store_check_integrity(live);
+        nodes_after = project ? cbm_store_count_nodes(live, project) : -1;
+        cbm_store_close(live);
+    }
+    bool bytes_identical =
+        before && after && before_len == after_len && memcmp(before, after, before_len) == 0;
+    free(before);
+    free(after);
+    free(project);
+    int restore_workers_rc =
+        saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    free(saved_workers);
+    teardown_test_repo();
+
+    ASSERT_EQ(restore_workers_rc, 0);
+    ASSERT_EQ(rc_first, 0);
+    ASSERT_TRUE(valid_before);
+    ASSERT_GT(nodes_before, 0);
+    ASSERT_TRUE(before_len > 0);
+    ASSERT_TRUE(mutated);
+    ASSERT_TRUE(over_at_start);
+    /* The named failure — not the cancel sentinel, not success. */
+    ASSERT_EQ(rc_second, CBM_PIPELINE_ABORT_OVER_BUDGET);
+    /* Engagement guard (anti-vacuous): fail-whole needs the latching cycle AND
+     * the confirmation cycle; fewer means the gate never decided anything. */
+    if (cycles < 2) {
+        FAIL("back-pressure gate never confirmed futility (cycles<2) — fixture routed sequential?");
+    }
+    /* The serving generation is untouched: same bytes, still valid, same
+     * graph; and the failed attempt left no stage residue behind. */
+    ASSERT_TRUE(bytes_identical);
+    ASSERT_TRUE(valid_after);
+    ASSERT_EQ(nodes_after, nodes_before);
+    ASSERT_EQ(stage_count, 0);
     PASS();
 }
 
@@ -13564,7 +14440,6 @@ TEST(pipeline_delta_patch_indexes_docstring_into_fts_body) {
     PASS();
 }
 
-
 /* End-to-end for #518/#519: source → docstring → properties JSON → nodes_fts
  * `body` → findable. Each layer has its own test; this one proves they connect.
  * It is also the guard on the size budget: build_def_props drops an oversized
@@ -13637,6 +14512,151 @@ TEST(pipeline_markdown_and_config_prose_reaches_fts_body) {
  * attribute, so the sanitizer is silent there. The label counts pin the
  * fixture to what it claims: at least one Struct and zero Function/Method,
  * i.e. the scan genuinely finds nothing to sort. */
+/* ── Semantic pass, batched == unbatched ─────────────────────────────── */
+
+/* Under memory pressure the semantic pass tokenizes, counts and vectorizes
+ * in headroom-sized batches of functions (tokenizing twice) instead of
+ * holding every function's tokens at once. The graph must not be able to
+ * tell: the same repo indexed with CBM_SEM_BATCH=5 (forced batches, 30
+ * functions -> 6 batches) yields byte-identical node vectors, token vectors
+ * and SEMANTICALLY_RELATED edges. Rows are compared by qualified name, never
+ * by node id: parallel extraction hands out ids in worker order. */
+static void write_sem_family(const char *base, const char *file, const char *subject) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/%s", base, file);
+    char body[4096];
+    snprintf(body, sizeof(body),
+             "package main\n\n"
+             "// Parse%sConfig reads the %s config file and returns the parsed %s config.\n"
+             "func Parse%sConfig(path string) (*%sConfig, error) {\n"
+             "\treturn Load%sConfig(path)\n}\n\n"
+             "// Load%sConfig loads the %s config from disk and validates it.\n"
+             "func Load%sConfig(path string) (*%sConfig, error) {\n"
+             "\tcfg := &%sConfig{}\n\tValidate%sConfig(cfg)\n\treturn cfg, nil\n}\n\n"
+             "// Validate%sConfig checks the %s config for missing fields.\n"
+             "func Validate%sConfig(cfg *%sConfig) bool {\n\treturn cfg != nil\n}\n\n"
+             "// Write%sConfig serializes the %s config back to disk.\n"
+             "func Write%sConfig(path string, cfg *%sConfig) error {\n"
+             "\tValidate%sConfig(cfg)\n\treturn nil\n}\n\n"
+             /* A near-duplicate of Load: same doc, same body, same calls -- the
+              * pair the pass must relate, in every venue. */
+             "// Load%sConfigFile loads the %s config from disk and validates it.\n"
+             "func Load%sConfigFile(path string) (*%sConfig, error) {\n"
+             "\tcfg := &%sConfig{}\n\tValidate%sConfig(cfg)\n\treturn cfg, nil\n}\n\n"
+             "type %sConfig struct{ Name string }\n",
+             subject, subject, subject, subject, subject, subject, subject, subject, subject,
+             subject, subject, subject, subject, subject, subject, subject, subject, subject,
+             subject, subject, subject, subject, subject, subject, subject, subject, subject,
+             subject);
+    th_write_file(path, body);
+}
+
+/* Step both statements in lockstep; every column of every row must match. */
+static bool sem_same_rows(sqlite3 *a, sqlite3 *b, const char *sql, int *rows) {
+    sqlite3_stmt *sa = NULL;
+    sqlite3_stmt *sb = NULL;
+    bool same = sqlite3_prepare_v2(a, sql, -1, &sa, NULL) == SQLITE_OK &&
+                sqlite3_prepare_v2(b, sql, -1, &sb, NULL) == SQLITE_OK;
+    *rows = 0;
+    while (same) {
+        int ra = sqlite3_step(sa);
+        int rb = sqlite3_step(sb);
+        if (ra != rb) {
+            same = false;
+            break;
+        }
+        if (ra != SQLITE_ROW) {
+            break;
+        }
+        int cols = sqlite3_column_count(sa);
+        for (int c = 0; c < cols && same; c++) {
+            const unsigned char *va = sqlite3_column_text(sa, c);
+            const unsigned char *vb = sqlite3_column_text(sb, c);
+            same = (va == NULL) == (vb == NULL) &&
+                   (!va || strcmp((const char *)va, (const char *)vb) == 0);
+        }
+        (*rows)++;
+    }
+    sqlite3_finalize(sa);
+    sqlite3_finalize(sb);
+    return same;
+}
+
+TEST(pipeline_semantic_batched_matches_unbatched) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_sembatch_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    static const char *const subjects[] = {"User", "Server", "Client", "Cache", "Queue", "Mail"};
+    for (size_t i = 0; i < sizeof(subjects) / sizeof(subjects[0]); i++) {
+        char file[64];
+        snprintf(file, sizeof(file), "%s_config.go", subjects[i]);
+        write_sem_family(tmp, file, subjects[i]);
+    }
+
+    char db_plain[512];
+    char db_batched[512];
+    snprintf(db_plain, sizeof(db_plain), "%s/plain.db", tmp);
+    snprintf(db_batched, sizeof(db_batched), "%s/batched.db", tmp);
+
+    /* The default threshold (0.75) admits no pair on a 30-function fixture;
+     * 0.3 admits the near-duplicates. The test is about equality, not the bar. */
+    cbm_setenv("CBM_SEMANTIC_THRESHOLD", "0.3", 1);
+    cbm_unsetenv("CBM_SEM_BATCH");
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_plain, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+
+    p = cbm_pipeline_new(tmp, db_batched, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    cbm_setenv("CBM_SEM_BATCH", "5", 1); /* read by the pass, once per run */
+    int rc = cbm_pipeline_run(p);
+    cbm_unsetenv("CBM_SEM_BATCH");
+    cbm_unsetenv("CBM_SEMANTIC_THRESHOLD");
+    cbm_pipeline_free(p);
+    ASSERT_EQ(rc, 0);
+
+    cbm_store_t *sp = cbm_store_open_path(db_plain);
+    cbm_store_t *sb = cbm_store_open_path(db_batched);
+    ASSERT_NOT_NULL(sp);
+    ASSERT_NOT_NULL(sb);
+    sqlite3 *a = cbm_store_get_db(sp);
+    sqlite3 *b = cbm_store_get_db(sb);
+
+    /* The fixture must exercise batching: more functions than the forced
+     * batch, and a semantic pass that actually stored vectors and edges. */
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(
+        sqlite3_prepare_v2(a, "SELECT COUNT(*) FROM nodes WHERE label = 'Function'", -1, &st, NULL),
+        SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int functions = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    ASSERT_GT(functions, 5);
+
+    int rows = 0;
+    ASSERT_TRUE(sem_same_rows(a, b,
+                              "SELECT n.qualified_name, hex(v.vector) FROM node_vectors v "
+                              "JOIN nodes n ON n.id = v.node_id ORDER BY n.qualified_name",
+                              &rows));
+    ASSERT_EQ(rows, functions);
+    ASSERT_TRUE(sem_same_rows(
+        a, b, "SELECT token, hex(vector), idf FROM token_vectors ORDER BY token", &rows));
+    ASSERT_GT(rows, 0);
+    ASSERT_TRUE(
+        sem_same_rows(a, b,
+                      "SELECT s.qualified_name, t.qualified_name, e.properties FROM edges e "
+                      "JOIN nodes s ON s.id = e.source_id JOIN nodes t ON t.id = e.target_id "
+                      "WHERE e.type = 'SEMANTICALLY_RELATED' ORDER BY 1, 2",
+                      &rows));
+    ASSERT_GT(rows, 0);
+
+    cbm_store_close(sp);
+    cbm_store_close(sb);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_semantic_edges_no_functions) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_nofunc_XXXXXX");
@@ -13772,14 +14792,19 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing);
+    RUN_TEST(pipeline_late_source_limit_preserves_previous_generation);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
+    RUN_TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db);
     /* Sequential cross-LSP shared registry (ms-typescript quadratic) */
     RUN_TEST(pipeline_seq_ts_cross_uses_shared_registry);
     /* File persistence */
     RUN_TEST(store_file_persistence);
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
+    RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
+    RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
@@ -14097,6 +15122,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_delta_patch_indexes_docstring_into_fts_body);
     RUN_TEST(pipeline_markdown_and_config_prose_reaches_fts_body);
     RUN_TEST(pipeline_semantic_edges_no_functions);
+    RUN_TEST(pipeline_semantic_batched_matches_unbatched);
 }
 
 /* Focused semantic-manifest and publication contracts. Kept separate from the
@@ -14120,6 +15146,13 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_git_context_change_forces_full_and_refreshes_branch);
     RUN_TEST(pipeline_global_extension_config_change_forces_full);
     RUN_TEST(pipeline_publication_never_uses_a_predictable_staging_path);
+    RUN_TEST(pipeline_stage_names_never_nest);
+    RUN_TEST(pipeline_minted_stage_is_owned_until_released);
+    RUN_TEST(pipeline_stale_zero_byte_stage_beside_valid_db_routes_incremental_and_is_swept);
+    RUN_TEST(pipeline_sweep_reclaims_orphans_of_other_projects_and_keeps_their_live_stages);
+    RUN_TEST(pipeline_sweep_removes_dead_writer_stage_keeps_locked_stage);
+    RUN_TEST(pipeline_concurrent_sweep_must_not_remove_inflight_stage);
+    RUN_TEST(pipeline_fresh_index_never_reports_invalid_existing_db);
     RUN_TEST(pipeline_source_mutation_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_source_addition_before_publication_preserves_previous_generation);
     RUN_TEST(pipeline_tsconfig_mutation_before_publication_preserves_previous_generation);

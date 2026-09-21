@@ -258,9 +258,18 @@ static char *extract_constructor_callee(CBMArena *a, TSNode node, const char *so
 }
 
 // Try common field-based callee resolution (function, name, method fields).
+static TSNode unwrap_await_callee(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "await_expression") != 0 ||
+        ts_node_named_child_count(node) == 0) {
+        return node;
+    }
+    return ts_node_named_child(node, 0);
+}
+
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    func_node = unwrap_await_callee(func_node);
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
         if (strcmp(fk, "selector_expression") == 0) {
@@ -2059,6 +2068,12 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     for (uint32_t ai = 0; ai < argc && call->arg_count < CBM_MAX_CALL_ARGS; ai++) {
         TSNode arg_node = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg_node);
+        if (!call->args) {
+            call->args = cbm_arena_calloc(ctx->arena, CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+            if (!call->args) {
+                return;
+            }
+        }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
 
@@ -3515,6 +3530,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     }
 
     selection.expr = language_specific_callee_expr(ctx->language, node);
+    selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};
         return selection;
@@ -3767,6 +3783,13 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                         if (strcmp(ack, "method_arg") != 0) {
                             continue;
+                        }
+                        if (!call.args) {
+                            call.args = cbm_arena_calloc(ctx->arena,
+                                                         CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+                            if (!call.args) {
+                                break;
+                            }
                         }
                         CBMCallArg *ca = &call.args[call.arg_count];
                         memset(ca, 0, sizeof(*ca));

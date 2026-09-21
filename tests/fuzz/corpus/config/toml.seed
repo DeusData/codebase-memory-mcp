@@ -1,0 +1,6 @@
+t[mcp_servers.other]
+command = "other"
+
+# BEGIN codebase-memory
+old = true
+# END codebase-memory

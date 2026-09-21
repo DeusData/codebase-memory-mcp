@@ -2100,13 +2100,19 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
 
 /* ── Namespace map ───────────────────────────────────────────────── */
 
-CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
-                                               CBMFileResult *const *results,
-                                               const char *const *rels, int count) {
+/* The namespace names themselves, so a caller that has parked some results on
+ * disk can still contribute their namespaces (see
+ * cbm_result_spill_namespace). A file missing from this map does not fail to
+ * resolve -- it resolves DIFFERENTLY, through the looser fallback, which is why
+ * an incomplete map changed edge counts in both directions rather than only
+ * losing edges. */
+CBMHashTable *cbm_pipeline_namespace_map_build_names(const char *project_name,
+                                                     const char *const *namespaces,
+                                                     const char *const *rels, int count) {
     CBMHashTable *map = NULL;
     for (int i = 0; i < count; i++) {
-        const CBMFileResult *r = results[i];
-        if (!r || !r->namespace_name || !r->namespace_name[0] || !rels[i]) {
+        const char *namespace_name = namespaces[i];
+        if (!namespace_name || !namespace_name[0] || !rels[i]) {
             continue;
         }
         if (!map) {
@@ -2122,7 +2128,7 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
         /* Normalize the namespace key to dot-separated form so it matches the
          * dot-normalized lookups in cbm_pipeline_resolve_import_node (PHP uses
          * '\\', some grammars '::' or '/'). */
-        char *key = strdup(r->namespace_name);
+        char *key = strdup(namespace_name);
         if (!key) {
             free(file_qn);
             continue;
@@ -2159,6 +2165,25 @@ CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
             free(file_qn); /* content copied into combined */
         }
     }
+    return map;
+}
+
+/* Convenience for callers whose results are all in memory (the sequential
+ * definitions pass). A caller that can SPILL must use the _names variant and
+ * fill the parked slots from cbm_result_spill_namespace, or its map silently
+ * loses those files. */
+CBMHashTable *cbm_pipeline_namespace_map_build(const char *project_name,
+                                               CBMFileResult *const *results,
+                                               const char *const *rels, int count) {
+    const char **names = cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)count * sizeof(char *));
+    if (!names) {
+        return NULL;
+    }
+    for (int i = 0; i < count; i++) {
+        names[i] = results[i] ? results[i]->namespace_name : NULL;
+    }
+    CBMHashTable *map = cbm_pipeline_namespace_map_build_names(project_name, names, rels, count);
+    cbm_free(CBM_MEM_CLASS_OTHER, names);
     return map;
 }
 

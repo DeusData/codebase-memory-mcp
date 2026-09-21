@@ -6,6 +6,8 @@
  */
 #include "test_framework.h"
 #include "graph_buffer/graph_buffer.h"
+#include "foundation/mem_core.h"
+#include <stdatomic.h>
 #include "store/store.h"
 #include <string.h>
 
@@ -1120,7 +1122,38 @@ TEST(gbuf_flush_skips_orphan_edges) {
 
 /* ── Suite ─────────────────────────────────────────────────────── */
 
+/* A worker buffer draws ids from the shared counter, so a dense id -> node
+ * array in it spans the whole global id space: 18 workers x (next power of
+ * two above the highest id) x 8 B, doubling in lockstep -- a 1 GB step
+ * inside one gate interval on the kernel at 8M ids (2026-09-14). A worker
+ * buffer is never asked by id before the merge, so it keeps no such array;
+ * the main buffer it merges into still answers by id. One node at id 2M
+ * would cost a 16 MB array; the index class must not grow by even 1 MB. */
+TEST(gbuf_worker_buffer_keeps_no_by_id_array) {
+    _Atomic int64_t ids;
+    atomic_init(&ids, (int64_t)1 << 21);
+    size_t before = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_INDEX);
+    cbm_gbuf_t *w = cbm_gbuf_new_worker("p", "/r", &ids);
+    ASSERT_NOT_NULL(w);
+    int64_t id = cbm_gbuf_upsert_node(w, "Function", "f", "p.f", "a.c", 1, 2, "{}");
+    ASSERT_TRUE(id >= ((int64_t)1 << 21));
+    size_t after = cbm_mem_class_live_bytes(CBM_MEM_CLASS_GBUF_INDEX);
+    size_t grown = after > before ? after - before : 0;
+    ASSERT_TRUE(grown < ((size_t)1 << 20));
+    ASSERT_TRUE(cbm_gbuf_find_by_id(w, id) == NULL);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_qn(w, "p.f"));
+
+    cbm_gbuf_t *main_gb = cbm_gbuf_new("p", "/r");
+    ASSERT_NOT_NULL(main_gb);
+    cbm_gbuf_merge(main_gb, w);
+    ASSERT_NOT_NULL(cbm_gbuf_find_by_id(main_gb, id));
+    cbm_gbuf_free(w);
+    cbm_gbuf_free(main_gb);
+    PASS();
+}
+
 SUITE(graph_buffer) {
+    RUN_TEST(gbuf_worker_buffer_keeps_no_by_id_array);
     /* Original tests */
     RUN_TEST(gbuf_create_free);
     RUN_TEST(gbuf_free_null);

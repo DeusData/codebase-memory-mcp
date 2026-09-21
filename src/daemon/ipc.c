@@ -9,6 +9,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/macos_acl.h"
+#include "foundation/platform.h"
 #include "foundation/private_file_lock_internal.h"
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
@@ -51,6 +52,60 @@ void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail) {
 
 const char *cbm_daemon_ipc_validation_detail(void) {
     return ipc_validation_detail_buffer;
+}
+
+static cbm_daemon_ipc_listen_failure_t ipc_listen_failure;
+
+/* The failure recorder and its reset are only reached from the POSIX socket
+ * listener (all callers live in the `#ifndef _WIN32` block below); the Windows
+ * named-pipe listener does its own reporting. Guarding them keeps the always-
+ * compiled struct + accessor cross-platform while avoiding -Werror,
+ * -Wunused-function on the Windows build (#1828 CI). */
+#ifndef _WIN32
+static void ipc_listen_failure_reset(void) {
+    memset(&ipc_listen_failure, 0, sizeof(ipc_listen_failure));
+}
+
+/* Record and log one listener failure. `name` is an artifact inside the
+ * endpoint's runtime directory, "" for the directory itself, or NULL when
+ * the stage has no path. The log line names the errno symbolically and the
+ * full path, so `daemon.ipc.listen_failed stage=pending_publication` alone
+ * (the whole trace #1828's reporter had) can no longer happen. */
+static void ipc_listen_failed(const char *runtime_dir, const char *stage, int errno_value,
+                              const char *name) {
+    ipc_listen_failure_reset();
+    (void)snprintf(ipc_listen_failure.stage, sizeof(ipc_listen_failure.stage), "%s",
+                   stage ? stage : "");
+    ipc_listen_failure.errno_value = errno_value;
+    if (runtime_dir && name) {
+        int written = name[0] ? snprintf(ipc_listen_failure.path, sizeof(ipc_listen_failure.path),
+                                         "%s/%s", runtime_dir, name)
+                              : snprintf(ipc_listen_failure.path, sizeof(ipc_listen_failure.path),
+                                         "%s", runtime_dir);
+        if (written <= 0 || written >= (int)sizeof(ipc_listen_failure.path)) {
+            ipc_listen_failure.path[0] = '\0';
+        }
+    }
+    const char *errno_name = errno_value != 0 ? cbm_errno_name(errno_value) : NULL;
+    if (errno_name && ipc_listen_failure.path[0]) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage, "errno", errno_name, "path",
+                      ipc_listen_failure.path);
+    } else if (errno_name) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage, "errno", errno_name);
+    } else if (ipc_listen_failure.path[0]) {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage, "path", ipc_listen_failure.path);
+    } else {
+        cbm_log_error("daemon.ipc.listen_failed", "stage", stage);
+    }
+}
+#endif /* !_WIN32 */
+
+bool cbm_daemon_ipc_listen_failure_detail(cbm_daemon_ipc_listen_failure_t *out) {
+    if (!out) {
+        return false;
+    }
+    *out = ipc_listen_failure;
+    return ipc_listen_failure.stage[0] != '\0';
 }
 
 static bool instance_key_valid(const char *key) {
@@ -120,6 +175,19 @@ void cbm_daemon_ipc_posix_publication_hook_set_for_test(
 void cbm_daemon_ipc_windows_legacy_guard_release_failures_set_for_test(unsigned int count) {
     atomic_store_explicit(&g_windows_legacy_guard_release_failures_for_test, count,
                           memory_order_release);
+}
+
+#ifndef _WIN32
+static atomic_int g_posix_record_write_failure_errno_for_test;
+#endif
+
+void cbm_daemon_ipc_posix_record_write_failure_set_for_test(int errno_value) {
+#ifndef _WIN32
+    atomic_store_explicit(&g_posix_record_write_failure_errno_for_test, errno_value,
+                          memory_order_release);
+#else
+    (void)errno_value;
+#endif
 }
 
 #ifdef _WIN32
@@ -1385,14 +1453,227 @@ static char *private_log_directory_path_copy(const char *directory_path) {
     return string_copy(directory_path);
 }
 
-static bool posix_directory_owner_trusted(uid_t owner) {
-    return owner == (uid_t)0 || owner == geteuid();
+/* #1830 — single-uid user-namespace ancestors.
+ *
+ * Inside a 1:1 user namespace (for example `podman --userns=keep-id` or
+ * `unshare -U --map-current-user`), ancestors whose real owner is unmapped —
+ * the root-owned /, /tmp and the like — appear owned by the kernel overflow
+ * uid (`/proc/sys/kernel/overflowuid`, conventionally 65534). Refusing every
+ * overflow-owned ancestor made the daemon unusable in that legitimate setup.
+ *
+ * The overflow owner is tolerated for ANCESTORS ONLY, and ONLY when
+ * /proc/self/uid_map is a single-uid map whose sole inside id is our euid. In
+ * that shape no IN-NAMESPACE principal can be the overflow owner.
+ *
+ * Be precise about what that does and does not buy, because an earlier version
+ * of this comment overstated it. The overflow uid is what EVERY unmapped host
+ * uid maps to, not only host root (user_namespaces(7)), so "overflow-owned"
+ * does NOT prove "created by root". On a shared host, a directory owned by
+ * another local user is indistinguishable from root-owned /tmp once you are
+ * inside the namespace -- and there is no in-namespace discriminator that could
+ * tell them apart, which is precisely why the tolerance is scoped the way it
+ * is rather than made smarter. The real guarantee is narrower and still
+ * sufficient: no principal REACHABLE FROM INSIDE the namespace can create or
+ * mutate such an ancestor, and the private directory itself is never tolerated
+ * as overflow (see below), so a hostile host-side owner of an ancestor is
+ * bounded to denial of service and socket-path control. It cannot reach the
+ * leaf, which stays 0700 and euid-rechecked. A multi-uid map
+ * (rootless podman with subuids) still shows host root as overflow and is
+ * refused — conservative scope, not the safety argument. There is deliberately
+ * no environment escape hatch.
+ *
+ * The private directory itself is never tolerated as overflow: it is created by
+ * us (euid-owned) and re-checked `== geteuid()` by the created/final/snapshot
+ * gates, which stay strict. A host-squatted /tmp/cbm-daemon-<uid> appears
+ * overflow-owned and is refused there. */
+#define POSIX_NO_OVERFLOW_UID ((uid_t) - 1)
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_posix_overflow_override_active;
+static uid_t g_posix_overflow_override_uid = POSIX_NO_OVERFLOW_UID;
+void cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(bool active,
+                                                             unsigned long overflow_uid) {
+    g_posix_overflow_override_active = active;
+    g_posix_overflow_override_uid = active ? (uid_t)overflow_uid : POSIX_NO_OVERFLOW_UID;
 }
+#endif
+
+#if defined(__linux__) || defined(CBM_ENABLE_TEST_SEAMS)
+/* Parse a /proc/self/uid_map image. True iff it is exactly one mapping line
+ * "<inside> <outside> <count>" with count == 1 and inside == euid. Extra lines,
+ * a count other than 1, a different inside id, or malformed input all yield
+ * false (no tolerance). */
+static bool posix_uid_map_is_single_uid(const char *uid_map, uid_t euid) {
+    if (!uid_map) {
+        return false;
+    }
+    unsigned long inside = 0;
+    unsigned long outside = 0;
+    unsigned long count = 0;
+    int consumed = 0;
+    if (sscanf(uid_map, " %lu %lu %lu %n", &inside, &outside, &count, &consumed) != 3) {
+        return false;
+    }
+    if (count != 1UL || (uid_t)inside != euid) {
+        return false;
+    }
+    (void)outside;
+    /* Reject a second mapping line: a single-uid map has exactly one. */
+    const char *rest = uid_map + consumed;
+    while (*rest == ' ' || *rest == '\t' || *rest == '\n' || *rest == '\r') {
+        rest++;
+    }
+    return *rest == '\0';
+}
+#endif
+
+#if defined(__linux__)
+static bool posix_read_small_proc_file(const char *path, char *buffer, size_t capacity) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    size_t total = 0;
+    bool ok = true;
+    while (total + 1 < capacity) {
+        ssize_t got = read(fd, buffer + total, capacity - 1 - total);
+        if (got < 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+            ok = false;
+            break;
+        }
+        if (got == 0) {
+            break;
+        }
+        total += (size_t)got;
+    }
+    (void)close(fd);
+    if (!ok) {
+        return false;
+    }
+    buffer[total] = '\0';
+    return true;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Counts real derivations. A cache here was a security hazard once (see the
+ * note above posix_ancestor_overflow_uid); the contract test asserts this
+ * climbs on EVERY call so re-introducing one fails loudly. */
+static unsigned g_posix_overflow_compute_count;
+unsigned cbm_daemon_ipc_posix_overflow_compute_count_for_test(void) {
+    return g_posix_overflow_compute_count;
+}
+#endif
+
+static uid_t posix_compute_ancestor_overflow_uid(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    g_posix_overflow_compute_count++;
+#endif
+    char map[256];
+    if (!posix_read_small_proc_file("/proc/self/uid_map", map, sizeof(map)) ||
+        !posix_uid_map_is_single_uid(map, geteuid())) {
+        return POSIX_NO_OVERFLOW_UID;
+    }
+    char overflow_text[32];
+    /* Unreadable → no tolerance; never hardcode 65534. */
+    if (!posix_read_small_proc_file("/proc/sys/kernel/overflowuid", overflow_text,
+                                    sizeof(overflow_text))) {
+        return POSIX_NO_OVERFLOW_UID;
+    }
+    unsigned long overflow = 0;
+    if (sscanf(overflow_text, " %lu", &overflow) != 1) {
+        return POSIX_NO_OVERFLOW_UID;
+    }
+    return (uid_t)overflow;
+}
+
+#endif /* __linux__ */
+
+/* The overflow uid tolerated for ancestors, or POSIX_NO_OVERFLOW_UID when none.
+ *
+ * DERIVED FRESH ON EVERY CALL, deliberately. This used to memoise via
+ * pthread_once behind a comment claiming "immutable /proc state". That claim
+ * was false in both halves: unshare(CLONE_NEWUSER) rewrites
+ * /proc/self/uid_map, and pthread_once state survives a forked child already
+ * marked done -- so a process that forked and then changed namespace kept the
+ * parent answer and refused a directory it should have accepted.
+ * (Spelled without the call syntax on purpose: scripts/security-audit.sh
+ * blocks that literal in src/, and an allow-list entry to let a COMMENT pass
+ * would weaken a real check on a real file.) It happened to be
+ * harmless because every caller today runs in a freshly exec'd process, but
+ * that made a security decision depend on an invariant nothing enforced, and
+ * the next fork-without-exec caller would have silently inherited a stale
+ * verdict.
+ *
+ * The cost of not caching is two small /proc reads per ancestor check, against
+ * an openat + fstat + fchmod + ACL check per path component in the same walk.
+ * Do not re-introduce a cache here; the contract test counts derivations. */
+static uid_t posix_ancestor_overflow_uid(void) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_posix_overflow_override_active) {
+        return g_posix_overflow_override_uid;
+    }
+#endif
+#if defined(__linux__)
+    return posix_compute_ancestor_overflow_uid();
+#else
+    return POSIX_NO_OVERFLOW_UID;
+#endif
+}
+
+/* Ancestor owner acceptance. euid and root are always trusted; the namespace
+ * overflow uid is trusted only when overflow_uid != POSIX_NO_OVERFLOW_UID. */
+static bool posix_ancestor_owner_ok(uid_t owner, uid_t euid, uid_t overflow_uid) {
+    return owner == (uid_t)0 || owner == euid ||
+           (overflow_uid != POSIX_NO_OVERFLOW_UID && owner == overflow_uid);
+}
+
+/* Pure ancestor accept/refuse over (owner, mode). Mirrors the owner + write-bit
+ * policy of posix_directory_parent_secure so the decision is unit-testable
+ * without a chown-able overflow-owned directory (unprivileged tests cannot
+ * create one). The ACL and fstat checks stay in the caller. */
+static bool posix_ancestor_stat_ok(uid_t owner, mode_t mode, uid_t euid, uid_t overflow_uid) {
+    if (!posix_ancestor_owner_ok(owner, euid, overflow_uid)) {
+        return false;
+    }
+    bool owner_is_overflow = overflow_uid != POSIX_NO_OVERFLOW_UID && owner == overflow_uid &&
+                             owner != euid && owner != (uid_t)0;
+    if ((mode & 0002) != 0) {
+        /* World-writable ancestor: only the root/overflow-owned sticky pattern
+         * (for example /tmp). A plain writable ancestor lets any local user swap
+         * a path component. */
+        return (owner == (uid_t)0 || owner_is_overflow) && (mode & S_ISVTX) != 0;
+    }
+    if ((mode & 0020) != 0 && owner_is_overflow) {
+        /* Group-writable is admitted with a warning for euid/root owners where
+         * the group is knowable (#1537); for an unmapped overflow owner the
+         * host-side group membership is unknown, so refuse. */
+        return false;
+    }
+    return true;
+}
+
+static bool posix_directory_ancestor_owner_trusted(uid_t owner) {
+    return posix_ancestor_owner_ok(owner, geteuid(), posix_ancestor_overflow_uid());
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, unsigned long euid) {
+    return posix_uid_map_is_single_uid(uid_map, (uid_t)euid);
+}
+bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
+                                                    unsigned long euid, bool overflow_active,
+                                                    unsigned long overflow_uid) {
+    return posix_ancestor_stat_ok((uid_t)owner, (mode_t)mode, (uid_t)euid,
+                                  overflow_active ? (uid_t)overflow_uid : POSIX_NO_OVERFLOW_UID);
+}
+#endif
 
 static bool posix_directory_parent_secure(int directory_fd) {
     struct stat status;
     if (directory_fd < 0 || fstat(directory_fd, &status) != 0 || !S_ISDIR(status.st_mode) ||
-        !posix_directory_owner_trusted(status.st_uid) ||
         !cbm_macos_extended_acl_fd_is_deny_only(directory_fd)) {
         return false;
     }
@@ -1403,14 +1684,18 @@ static bool posix_directory_parent_secure(int directory_fd) {
      * with a shared primary group), and refusing it here made the daemon
      * unusable with no way for the reader to see why.
      *
-     * WORLD-writable is still refused: any local user could swap a path
-     * component. Group-writable is admitted for ancestors only — the private
-     * directory itself is chmod'd to 0700 and verified after this walk, so the
-     * thing that actually holds data stays owner-private either way. */
-    if ((status.st_mode & 0002) != 0) {
-        return status.st_uid == (uid_t)0 && (status.st_mode & S_ISVTX) != 0;
+     * WORLD-writable is still refused (apart from the root/overflow-owned sticky
+     * pattern such as /tmp): any local user could swap a path component.
+     * Group-writable is admitted for ancestors only — the private directory
+     * itself is chmod'd to 0700 and verified after this walk, so the thing that
+     * actually holds data stays owner-private either way. #1830 extends the
+     * accepted owner set to the single-uid user-namespace overflow uid; see
+     * posix_ancestor_stat_ok. */
+    if (!posix_ancestor_stat_ok(status.st_uid, status.st_mode, geteuid(),
+                                posix_ancestor_overflow_uid())) {
+        return false;
     }
-    if ((status.st_mode & 0020) != 0) {
+    if ((status.st_mode & 0020) != 0 && (status.st_mode & 0002) == 0) {
         char mode_text[16];
         (void)snprintf(mode_text, sizeof(mode_text), "%04o", (unsigned)(status.st_mode & 07777));
         cbm_log_warn("daemon.private_dir_group_writable_ancestor", "mode", mode_text);
@@ -1420,17 +1705,20 @@ static bool posix_directory_parent_secure(int directory_fd) {
 
 /* Validate a path transition only through the two already-open directory
  * handles.  A group/other-writable parent is unsafe unless it is the standard
- * root-owned sticky-directory pattern (for example /tmp) and the selected
- * child is itself root/current-user owned.  Existing ancestors are observed,
- * never chmod'd or ACL-rewritten. */
+ * root/overflow-owned sticky-directory pattern (for example /tmp) and both the
+ * parent and the selected child are trusted-owned (euid/root, or the single-uid
+ * user-namespace overflow uid for #1830).  Existing ancestors are observed,
+ * never chmod'd or ACL-rewritten.  The euid-only enforcement that stops a
+ * squatted private directory lives in the created/final/snapshot checks, not
+ * here — this only walks ancestors. */
 static bool posix_directory_transition_secure(int parent_fd, int child_fd) {
     struct stat parent;
     struct stat child;
     if (parent_fd < 0 || child_fd < 0 || !posix_directory_parent_secure(parent_fd) ||
         fstat(parent_fd, &parent) != 0 || fstat(child_fd, &child) != 0 ||
         !S_ISDIR(parent.st_mode) || !S_ISDIR(child.st_mode) ||
-        !posix_directory_owner_trusted(parent.st_uid) ||
-        !posix_directory_owner_trusted(child.st_uid)) {
+        !posix_directory_ancestor_owner_trusted(parent.st_uid) ||
+        !posix_directory_ancestor_owner_trusted(child.st_uid)) {
         return false;
     }
     return true;
@@ -1815,6 +2103,29 @@ static bool posix_fd_write_all(int fd, const uint8_t *buffer, size_t length) {
     return true;
 }
 
+/* The failing step of the most recent record publication in this process:
+ * its errno (0 when a validation predicate, not a syscall, refused) and the
+ * artifact name it was operating on. Read by the listener right after a
+ * publish returns false. */
+static int posix_publish_failure_errno;
+static char posix_publish_failure_name[NAME_MAX + 1];
+
+static void posix_publish_failure_note(int errno_value, const char *name) {
+    posix_publish_failure_errno = errno_value;
+    (void)snprintf(posix_publish_failure_name, sizeof(posix_publish_failure_name), "%s",
+                   name ? name : "");
+}
+
+static bool posix_record_fd_write(int fd, const uint8_t *buffer, size_t length) {
+    int injected =
+        atomic_load_explicit(&g_posix_record_write_failure_errno_for_test, memory_order_acquire);
+    if (injected != 0) {
+        errno = injected;
+        return false;
+    }
+    return posix_fd_write_all(fd, buffer, length);
+}
+
 static bool posix_fd_pread_all(int fd, uint8_t *buffer, size_t length) {
     size_t offset = 0;
     while (offset < length) {
@@ -2169,50 +2480,75 @@ static bool posix_socket_record_publish(const cbm_daemon_ipc_endpoint_t *endpoin
         return false;
     }
     struct stat existing;
+    errno = 0;
     if (fstatat(endpoint->dir_fd, record_name, &existing, AT_SYMLINK_NOFOLLOW) == 0 ||
         errno != ENOENT) {
+        posix_publish_failure_note(errno == 0 ? EEXIST : errno, record_name);
         return false;
     }
     uint8_t record[POSIX_SOCKET_RECORD_SIZE];
     if (!posix_socket_record_encode(magic, source, record)) {
+        posix_publish_failure_note(0, record_name);
         return false;
     }
 
     char temp_name[NAME_MAX + 1];
     if (!posix_socket_record_temp_name(record_name, temp_name)) {
+        posix_publish_failure_note(ENAMETOOLONG, record_name);
         return false;
     }
     int fd = openat(endpoint->dir_fd, temp_name,
                     O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (fd < 0) {
+        posix_publish_failure_note(errno, temp_name);
         return false;
     }
 
     struct stat created = {0};
     bool temp_exists = true;
     bool stable_linked = false;
+    errno = 0;
     bool ok = fd_set_cloexec(fd) && fchmod(fd, 0600) == 0 &&
               private_regular_file_snapshot(endpoint->dir_fd, temp_name, fd, 1, &created) &&
-              posix_fd_write_all(fd, record, sizeof(record)) && fsync(fd) == 0 &&
+              posix_record_fd_write(fd, record, sizeof(record)) && fsync(fd) == 0 &&
               private_regular_file_snapshot(endpoint->dir_fd, temp_name, fd, 1, &created) &&
               created.st_size == (off_t)POSIX_SOCKET_RECORD_SIZE &&
               endpoint_runtime_still_valid(endpoint);
+    if (!ok) {
+        posix_publish_failure_note(errno, temp_name);
+    }
     if (ok) {
         posix_record_publication_stage_reached(magic, false);
+        errno = 0;
         ok =
             posix_linkat_no_follow(endpoint->dir_fd, temp_name, endpoint->dir_fd, record_name) == 0;
         stable_linked = ok;
+        if (!ok) {
+            posix_publish_failure_note(errno, record_name);
+        }
     }
     if (ok) {
         posix_record_publication_stage_reached(magic, true);
+        errno = 0;
         ok = posix_path_unlink_regular_if_matches(endpoint->dir_fd, temp_name, created.st_dev,
                                                   created.st_ino, 2);
         temp_exists = !ok;
+        if (!ok) {
+            posix_publish_failure_note(errno, temp_name);
+        }
     }
     if (ok) {
+        errno = 0;
         ok = posix_directory_sync(endpoint->dir_fd);
+        if (!ok) {
+            posix_publish_failure_note(errno, "");
+        }
     }
+    errno = 0;
     if (close(fd) != 0) {
+        if (ok) {
+            posix_publish_failure_note(errno, temp_name);
+        }
         ok = false;
     }
 
@@ -2224,6 +2560,9 @@ static bool posix_socket_record_publish(const cbm_daemon_ipc_endpoint_t *endpoin
              posix_socket_identity_equal(&published_record.identity, &source->identity) &&
              strcmp(published_record.anchor_name, source->anchor_name) == 0 &&
              published_status.st_dev == created.st_dev && published_status.st_ino == created.st_ino;
+        if (!ok) {
+            posix_publish_failure_note(0, record_name);
+        }
     }
     if (!ok) {
         if (stable_linked) {
@@ -2539,8 +2878,11 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     cbm_daemon_ipc_lifetime_reservation_t **reservation_io) {
     cbm_daemon_ipc_lifetime_reservation_t *lifetime_reservation =
         reservation_io ? *reservation_io : NULL;
+    ipc_listen_failure_reset();
+    posix_publish_failure_note(0, NULL);
+    const char *runtime_dir = endpoint ? endpoint->runtime_dir : NULL;
     if (!lifetime_reservation_matches_endpoint(endpoint, lifetime_reservation)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "reservation_validation");
+        ipc_listen_failed(runtime_dir, "reservation_validation", 0, NULL);
         return NULL;
     }
     /* Stale removal happens only under the startup lock, before a daemon host
@@ -2550,7 +2892,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     char pending_temp_name[NAME_MAX + 1];
     if (!posix_socket_record_temp_name(endpoint->socket_identity_name, identity_temp_name) ||
         !posix_socket_record_temp_name(endpoint->socket_pending_name, pending_temp_name)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "temp_names");
+        ipc_listen_failed(runtime_dir, "temp_names", ENAMETOOLONG, endpoint->socket_pending_name);
         return NULL;
     }
     struct stat existing;
@@ -2559,27 +2901,32 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         endpoint->socket_pending_name, identity_temp_name,           pending_temp_name,
     };
     bool namespace_absent = true;
+    const char *occupied_name = "";
+    int occupied_errno = 0;
     for (size_t index = 0; index < sizeof(required_absent) / sizeof(required_absent[0]); index++) {
+        errno = 0;
         if (fstatat(endpoint->dir_fd, required_absent[index], &existing, AT_SYMLINK_NOFOLLOW) ==
                 0 ||
             errno != ENOENT) {
             namespace_absent = false;
+            occupied_name = required_absent[index];
+            occupied_errno = errno == 0 ? EEXIST : errno;
             break;
         }
     }
     if (!endpoint_runtime_still_valid(endpoint) || !namespace_absent) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "namespace_validation");
+        ipc_listen_failed(runtime_dir, "namespace_validation", occupied_errno, occupied_name);
         return NULL;
     }
 
     int fd = local_socket_new();
     if (fd < 0) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "socket_creation");
+        ipc_listen_failed(runtime_dir, "socket_creation", errno, NULL);
         return NULL;
     }
     cbm_daemon_ipc_listener_t *listener = calloc(1, sizeof(*listener));
     if (!listener) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "listener_allocation");
+        ipc_listen_failed(runtime_dir, "listener_allocation", ENOMEM, NULL);
         (void)close(fd);
         return NULL;
     }
@@ -2597,7 +2944,8 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     if (listener->dir_fd < 0 || !fd_set_cloexec(listener->dir_fd) || !listener->runtime_dir ||
         !listener->address || !listener->socket_name || !listener->socket_anchor_name ||
         !listener->socket_identity_name || !listener->socket_pending_name) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "listener_initialization");
+        ipc_listen_failed(runtime_dir, "listener_initialization",
+                          listener->dir_fd < 0 ? errno : ENOMEM, NULL);
         if (listener->dir_fd >= 0) {
             (void)close(listener->dir_fd);
         }
@@ -2615,20 +2963,19 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     struct sockaddr_un address;
     socklen_t address_length;
     if (!unix_address_set(&address, endpoint->socket_anchor_address, &address_length)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "socket_address");
+        ipc_listen_failed(runtime_dir, "socket_address", ENAMETOOLONG,
+                          endpoint->socket_anchor_name);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
     if (bind(fd, (const struct sockaddr *)&address, address_length) != 0) {
-        int bind_error = errno;
-        char error_text[32];
-        (void)snprintf(error_text, sizeof(error_text), "%d", bind_error);
-        cbm_log_error("daemon.ipc.listen_failed", "bind_errno", error_text);
+        ipc_listen_failed(runtime_dir, "socket_bind", errno, endpoint->socket_anchor_name);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
 
     struct stat bound_status;
+    errno = 0;
     bool bound_path_ok = fstatat(endpoint->dir_fd, endpoint->socket_anchor_name, &bound_status,
                                  AT_SYMLINK_NOFOLLOW) == 0 &&
                          S_ISSOCK(bound_status.st_mode) && bound_status.st_uid == geteuid();
@@ -2648,11 +2995,13 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         anchor_status.st_ino != bound_status.st_ino ||
         !posix_socket_identity_from_stat(&anchor_status, &anchor_identity) ||
         !posix_directory_sync(endpoint->dir_fd)) {
+        int security_errno = errno;
         if (bound_path_ok) {
             posix_bound_socket_unlink_if_matches(endpoint->dir_fd, endpoint->socket_anchor_name,
                                                  bound_status.st_dev, bound_status.st_ino);
         }
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "socket_security");
+        ipc_listen_failed(runtime_dir, "socket_security", security_errno,
+                          endpoint->socket_anchor_name);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
@@ -2669,16 +3018,19 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         endpoint, endpoint->socket_pending_name, POSIX_SOCKET_PENDING_MAGIC, &pending,
         &pending_status.st_dev, &pending_status.st_ino);
     if (!pending_published) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "pending_publication");
+        ipc_listen_failed(runtime_dir, "pending_publication", posix_publish_failure_errno,
+                          posix_publish_failure_name);
         posix_publication_abort(endpoint, &anchor_identity, false, NULL, false, NULL);
         cbm_daemon_ipc_listener_close(listener);
         return NULL;
     }
     posix_publication_stage_reached(CBM_DAEMON_IPC_POSIX_PUBLICATION_PENDING_DURABLE);
 
+    errno = 0;
     bool stable_linked = posix_linkat_no_follow(endpoint->dir_fd, endpoint->socket_anchor_name,
                                                 endpoint->dir_fd, endpoint->socket_name) == 0 &&
                          posix_directory_sync(endpoint->dir_fd);
+    int stable_errno = stable_linked ? 0 : errno;
     posix_socket_identity_t stable_identity = {0};
     posix_socket_identity_t committed_identity = {0};
     struct stat stable_status = {0};
@@ -2693,7 +3045,7 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         posix_socket_identity_equal(&stable_identity, &committed_identity) &&
         posix_socket_inode_equal(&anchor_identity, &committed_identity);
     if (!stable_valid) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "stable_publication");
+        ipc_listen_failed(runtime_dir, "stable_publication", stable_errno, endpoint->socket_name);
         posix_publication_abort(endpoint, &anchor_identity, pending_published, &pending_status,
                                 false, NULL);
         cbm_daemon_ipc_listener_close(listener);
@@ -2712,7 +3064,8 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
         endpoint, endpoint->socket_identity_name, POSIX_SOCKET_MARKER_MAGIC, &marker,
         &marker_status.st_dev, &marker_status.st_ino);
     if (!marker_published) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "marker_publication");
+        ipc_listen_failed(runtime_dir, "marker_publication", posix_publish_failure_errno,
+                          posix_publish_failure_name);
         posix_publication_abort(endpoint, &committed_identity, pending_published, &pending_status,
                                 false, NULL);
         cbm_daemon_ipc_listener_close(listener);
@@ -2722,10 +3075,11 @@ cbm_daemon_ipc_listener_t *cbm_daemon_ipc_listen_reserved(
     listener->identity_inode = marker_status.st_ino;
     posix_publication_stage_reached(CBM_DAEMON_IPC_POSIX_PUBLICATION_MARKER_DURABLE);
 
+    errno = 0;
     if (!posix_path_unlink_regular_if_matches(endpoint->dir_fd, endpoint->socket_pending_name,
                                               pending_status.st_dev, pending_status.st_ino, 1) ||
         !posix_directory_sync(endpoint->dir_fd)) {
-        cbm_log_error("daemon.ipc.listen_failed", "stage", "pending_removal");
+        ipc_listen_failed(runtime_dir, "pending_removal", errno, endpoint->socket_pending_name);
         posix_publication_abort(endpoint, &committed_identity, true, &pending_status,
                                 marker_published, &marker_status);
         cbm_daemon_ipc_listener_close(listener);
@@ -3377,6 +3731,7 @@ bool cbm_daemon_ipc_local_transition_release(cbm_daemon_ipc_local_transition_t *
 #include <windows.h>
 #include <aclapi.h>
 #include <sddl.h>
+#include <ntsecapi.h>
 #include <fcntl.h>
 #include <io.h>
 #include <shlobj.h>
@@ -4034,16 +4389,119 @@ static bool win_sid_is_trusted_installer(const uint8_t *sid, size_t sid_length) 
     return true;
 }
 
+/* #1705: the built-in Administrator ACCOUNT of THIS machine — RID 500 under the
+ * local machine's own account-domain SID (S-1-5-21-<machine>-500) — is a
+ * legitimate owner/grantee of directories an elevated install created, even when
+ * that account has been renamed or is disabled. It is resolved by asking LSA for
+ * the local machine account-domain SID and synthesizing its RID-500 SID with
+ * CreateWellKnownSid, then compared with EqualSid.
+ *
+ * It is deliberately NOT tested with IsWellKnownSid(sid, WinAccountAdministratorSid)
+ * and NOT by matching a trailing RID of 500: BOTH of those accept ANY domain's
+ * -500 — a domain administrator, or another machine's built-in Administrator —
+ * which is exactly the cross-machine trust escalation this must never open. Only
+ * THIS machine's -500 is trusted.
+ *
+ * Resolved once per process and cached; any LSA or synthesis failure leaves the
+ * cache NULL and therefore grants NO tolerance at all (fail closed). advapi32 is
+ * reached through the already-loaded module handle in win_security_t and the
+ * function pointers are resolved dynamically, matching this file's SID-API style
+ * and adding no static import. */
+typedef NTSTATUS(NTAPI *lsa_open_policy_fn)(PLSA_UNICODE_STRING, PLSA_OBJECT_ATTRIBUTES,
+                                            ACCESS_MASK, PLSA_HANDLE);
+typedef NTSTATUS(NTAPI *lsa_query_information_policy_fn)(LSA_HANDLE, POLICY_INFORMATION_CLASS,
+                                                         PVOID *);
+typedef NTSTATUS(NTAPI *lsa_free_memory_fn)(PVOID);
+typedef NTSTATUS(NTAPI *lsa_close_fn)(LSA_HANDLE);
+typedef BOOL(WINAPI *create_well_known_sid_fn)(WELL_KNOWN_SID_TYPE, PSID, PSID, DWORD *);
+
+static INIT_ONCE g_local_admin_sid_once = INIT_ONCE_STATIC_INIT;
+static PSID g_local_admin_sid = NULL; /* process-lifetime cache; NULL => no tolerance */
+
+static BOOL CALLBACK win_resolve_local_admin_sid(PINIT_ONCE once, PVOID parameter, PVOID *context) {
+    (void)once;
+    (void)context;
+    win_security_t *security = (win_security_t *)parameter;
+    if (!security || !security->advapi) {
+        return TRUE; /* ran once; cache stays NULL (fail closed) */
+    }
+    HMODULE advapi = security->advapi;
+    lsa_open_policy_fn lsa_open =
+        (lsa_open_policy_fn)(void (*)(void))GetProcAddress(advapi, "LsaOpenPolicy");
+    lsa_query_information_policy_fn lsa_query = (lsa_query_information_policy_fn)(void (*)(
+        void))GetProcAddress(advapi, "LsaQueryInformationPolicy");
+    lsa_free_memory_fn lsa_free =
+        (lsa_free_memory_fn)(void (*)(void))GetProcAddress(advapi, "LsaFreeMemory");
+    lsa_close_fn lsa_close = (lsa_close_fn)(void (*)(void))GetProcAddress(advapi, "LsaClose");
+    create_well_known_sid_fn create_sid =
+        (create_well_known_sid_fn)(void (*)(void))GetProcAddress(advapi, "CreateWellKnownSid");
+    if (!lsa_open || !lsa_query || !lsa_free || !lsa_close || !create_sid) {
+        return TRUE;
+    }
+    LSA_OBJECT_ATTRIBUTES attributes;
+    memset(&attributes, 0, sizeof(attributes));
+    LSA_HANDLE policy = NULL;
+    /* STATUS_SUCCESS is 0; any other status (including informational positives) is
+     * treated as failure, keeping the outcome fail-closed. */
+    if (lsa_open(NULL, &attributes, POLICY_VIEW_LOCAL_INFORMATION, &policy) != 0 || !policy) {
+        return TRUE;
+    }
+    POLICY_ACCOUNT_DOMAIN_INFO *domain = NULL;
+    if (lsa_query(policy, PolicyAccountDomainInformation, (PVOID *)&domain) == 0 && domain &&
+        domain->DomainSid && security->is_valid_sid(domain->DomainSid)) {
+        DWORD needed = 0;
+        (void)create_sid(WinAccountAdministratorSid, domain->DomainSid, NULL, &needed);
+        if (needed > 0U) {
+            PSID resolved = malloc(needed);
+            if (resolved &&
+                create_sid(WinAccountAdministratorSid, domain->DomainSid, resolved, &needed) &&
+                security->is_valid_sid(resolved)) {
+                g_local_admin_sid = resolved;
+            } else {
+                free(resolved);
+            }
+        }
+    }
+    if (domain) {
+        (void)lsa_free(domain);
+    }
+    (void)lsa_close(policy);
+    return TRUE;
+}
+
+static PSID win_local_admin_sid(win_security_t *security) {
+    if (!security || !security->advapi) {
+        return NULL;
+    }
+    (void)InitOnceExecuteOnce(&g_local_admin_sid_once, win_resolve_local_admin_sid, (PVOID)security,
+                              NULL);
+    return g_local_admin_sid;
+}
+
 static bool win_sid_trusted(win_security_t *security, PSID sid) {
     if (!security || !sid || !security->is_valid_sid(sid)) {
         return false;
     }
     DWORD sid_length = security->get_length_sid(sid);
+    PSID local_admin = win_local_admin_sid(security);
     return (sid_length > 0U && security->equal_sid(sid, security->user_sid)) ||
            security->is_well_known_sid(sid, WinLocalSystemSid) ||
            security->is_well_known_sid(sid, WinBuiltinAdministratorsSid) ||
+           (local_admin && security->equal_sid(sid, local_admin)) ||
            win_sid_is_trusted_installer((const uint8_t *)sid, (size_t)sid_length);
 }
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+bool cbm_daemon_ipc_win_sid_trusted_for_testing(void *sid) {
+    win_security_t security;
+    if (!win_security_init(&security)) {
+        return false;
+    }
+    bool trusted = win_sid_trusted(&security, (PSID)sid);
+    win_security_destroy(&security);
+    return trusted;
+}
+#endif
 
 /* AppContainer identities: package SIDs (S-1-15-2-*) and capability SIDs
  * (S-1-15-3-*), under the APP_PACKAGE identifier authority (15).

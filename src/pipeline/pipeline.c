@@ -10,6 +10,8 @@
  *   6. Post-passes: tests, communities, HTTP links, git history
  *   7. Dump graph buffer to SQLite
  */
+#include "foundation/arena.h" // FIRST: internal/cbm/arena.h shares the CBM_ARENA_H guard and lacks cbm_arena_total
+
 #include "foundation/constants.h"
 
 enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
@@ -37,7 +39,11 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/compat_thread.h"
 #include "foundation/profile.h"
 #include "foundation/mem.h"
+#include "foundation/mem_core.h"
+#include "result_spill.h"
+#include "foundation/secure_random.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -72,6 +78,8 @@ static atomic_bool g_persist_test_cancel_after_destination_prepare = false;
 static atomic_bool g_persist_test_fail_adr_capture = false;
 static cbm_pipeline_test_hook_fn g_persist_test_before_final_manifest = NULL;
 static void *g_persist_test_before_final_manifest_userdata = NULL;
+static cbm_pipeline_test_hook_fn g_persist_test_after_stage_created = NULL;
+static void *g_persist_test_after_stage_created_userdata = NULL;
 
 void cbm_pipeline_incremental_test_fail_after_stage_dump_once(void) {
     atomic_store(&g_persist_test_fail_after_stage_dump, true);
@@ -105,6 +113,29 @@ void cbm_pipeline_persist_test_run_before_final_manifest(void) {
     }
 }
 
+void cbm_pipeline_incremental_test_after_stage_created_once(cbm_pipeline_test_hook_fn hook,
+                                                            void *userdata) {
+    g_persist_test_after_stage_created = hook;
+    g_persist_test_after_stage_created_userdata = userdata;
+}
+
+/* Fired by create_staging_path() right after the stage's main file is created
+ * with O_EXCL -- and, in the current lock-before-visible ordering, after its
+ * sidecar lock is already held. A test hook installed here can run a
+ * concurrent sweep (another cbm_pipeline_run() against the same final_path) at
+ * this instant to prove the just-created stage survives it. Under the OLD
+ * create-then-lock ordering this was the unlocked TOCTOU window, so the same
+ * hook binds RED if that ordering ever regresses. */
+void cbm_pipeline_persist_test_run_after_stage_created(void) {
+    cbm_pipeline_test_hook_fn hook = g_persist_test_after_stage_created;
+    void *userdata = g_persist_test_after_stage_created_userdata;
+    g_persist_test_after_stage_created = NULL;
+    g_persist_test_after_stage_created_userdata = NULL;
+    if (hook) {
+        hook(userdata);
+    }
+}
+
 bool cbm_pipeline_persist_test_take_failure_after_stage_dump(void) {
     return atomic_exchange(&g_persist_test_fail_after_stage_dump, false);
 }
@@ -124,6 +155,8 @@ void cbm_pipeline_persist_test_reset_faults(void) {
     atomic_store(&g_persist_test_fail_adr_capture, false);
     g_persist_test_before_final_manifest = NULL;
     g_persist_test_before_final_manifest_userdata = NULL;
+    g_persist_test_after_stage_created = NULL;
+    g_persist_test_after_stage_created_userdata = NULL;
 }
 #endif
 
@@ -157,6 +190,8 @@ struct cbm_pipeline {
     atomic_int cancelled_storage;
     atomic_int *cancelled;
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
+    cbm_index_resource_policy_t resource_policy;
+    cbm_index_resource_violation_t resource_violation;
 
     /* Indexing state (set during run) */
     cbm_gbuf_t *gbuf;
@@ -194,6 +229,15 @@ struct cbm_pipeline {
     /* #769: set when a stale-format index was routed through the one-time
      * full rebuild, so the MCP response can surface the migration. */
     bool format_migration;
+
+    /* Recorded by cbm_pipeline_run for the staged run beneath it: whether
+     * the destination existed, and whether it was copied into the stage so
+     * that an incremental route has a real previous generation to work
+     * from. Without a copy the stage is the run's empty placeholder, and
+     * probing THAT for integrity is what reported every first index as
+     * "invalid_existing_db" (#1864). */
+    bool final_existed;
+    bool existing_generation;
 
     /* ADR (project_summaries) captured before a full-reindex DB delete, so it
      * can be restored after the rebuild. NULL when no ADR existed. Issue #516. */
@@ -255,9 +299,27 @@ static const char *itoa_buf(int val) {
 /* Log current + peak RSS at a pipeline phase boundary (memory profiling). */
 static void log_phase_mem(const char *phase) {
     enum { PL_BYTES_PER_MB = 1024 * 1024 };
-    cbm_log_info("mem.phase", "phase", phase, "rss_mb",
-                 itoa_buf((int)(cbm_mem_rss() / PL_BYTES_PER_MB)), "peak_mb",
-                 itoa_buf((int)(cbm_mem_peak_rss() / PL_BYTES_PER_MB)));
+    /* tracked_mb is what the memory core can account for; rss_mb - tracked_mb
+     * is the part of the process no class explains yet. */
+    /* itoa_buf is a 4-slot ring: two calls per line, never more. */
+    char rss_mb[CBM_SZ_32];
+    char footprint_mb[CBM_SZ_32];
+    char commit_mb[CBM_SZ_32];
+    char tracked_mb[CBM_SZ_32];
+    char peak_mb[CBM_SZ_32];
+    char peak_charged_mb[CBM_SZ_32];
+    snprintf(rss_mb, sizeof(rss_mb), "%zu", cbm_mem_rss() / PL_BYTES_PER_MB);
+    snprintf(footprint_mb, sizeof(footprint_mb), "%zu", cbm_mem_footprint() / PL_BYTES_PER_MB);
+    snprintf(commit_mb, sizeof(commit_mb), "%zu", cbm_mem_allocator_committed() / PL_BYTES_PER_MB);
+    snprintf(tracked_mb, sizeof(tracked_mb), "%zu", cbm_mem_tracked_live_bytes() / PL_BYTES_PER_MB);
+    snprintf(peak_mb, sizeof(peak_mb), "%zu", cbm_mem_peak_rss() / PL_BYTES_PER_MB);
+    (void)cbm_mem_charged(); /* fold this mark into the high-water mark */
+    snprintf(peak_charged_mb, sizeof(peak_charged_mb), "%zu",
+             cbm_mem_peak_charged() / PL_BYTES_PER_MB);
+    cbm_log_info("mem.phase", "phase", phase, "rss_mb", rss_mb, "footprint_mb", footprint_mb,
+                 "commit_mb", commit_mb, "tracked_mb", tracked_mb, "peak_mb", peak_mb,
+                 "peak_charged_mb", peak_charged_mb);
+    cbm_mem_allocator_stats_log(phase);
 }
 
 /* ── Lifecycle ──────────────────────────────────────────────────── */
@@ -310,6 +372,20 @@ static int pipeline_refresh_git_context(cbm_pipeline_t *p) {
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled) {
     if (p) {
         p->persistence = enabled;
+    }
+}
+
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p,
+                                      const cbm_index_resource_policy_t *policy) {
+    if (p && policy) {
+        p->resource_policy = *policy;
+    }
+}
+
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation) {
+    if (violation) {
+        *violation = p ? p->resource_violation : (cbm_index_resource_violation_t){0};
     }
 }
 
@@ -420,6 +496,14 @@ const char *cbm_pipeline_project_name(const cbm_pipeline_t *p) {
 
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p) {
     return p ? p->repo_path : NULL;
+}
+
+const cbm_index_resource_policy_t *cbm_pipeline_resource_policy(const cbm_pipeline_t *p) {
+    return p && cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL;
+}
+
+cbm_index_resource_violation_t *cbm_pipeline_resource_violation(cbm_pipeline_t *p) {
+    return p ? &p->resource_violation : NULL;
 }
 
 atomic_int *cbm_pipeline_cancelled_ptr(cbm_pipeline_t *p) {
@@ -765,19 +849,32 @@ static int process_one_infra_binding(cbm_gbuf_t *gbuf, const CBMInfraBinding *ib
     return SKIP_ONE;
 }
 
-static void cbm_pipeline_process_infra_bindings(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
+static bool want_infra_bindings(const CBMFileResult *header) {
+    return header->infra_bindings.count > 0;
+}
+
+static bool want_string_refs(const CBMFileResult *header) {
+    return header->string_refs.count > 0;
+}
+
+static void cbm_pipeline_process_infra_bindings(const cbm_pipeline_ctx_t *ctx, cbm_gbuf_t *gbuf,
+                                                const cbm_file_info_t *files,
                                                 CBMFileResult **result_cache, int file_count) {
     int bindings = 0;
     for (int i = 0; i < file_count; i++) {
-        if (!result_cache[i]) {
+        bool loaded = false;
+        const CBMFileResult *r =
+            cbm_pipeline_result_acquire(ctx, result_cache, i, want_infra_bindings, &loaded);
+        if (!r) {
             continue;
         }
-        for (int bi = 0; bi < result_cache[i]->infra_bindings.count; bi++) {
-            const CBMInfraBinding *ib = &result_cache[i]->infra_bindings.items[bi];
+        for (int bi = 0; bi < r->infra_bindings.count; bi++) {
+            const CBMInfraBinding *ib = &r->infra_bindings.items[bi];
             if (ib->source_name && ib->target_url) {
                 bindings += process_one_infra_binding(gbuf, ib, files[i].rel_path);
             }
         }
+        cbm_pipeline_result_release((CBMFileResult *)r, loaded);
     }
     if (bindings > 0) {
         char buf[CBM_SZ_16];
@@ -890,7 +987,8 @@ static bool route_sr_denied(const CBMStringRef *sr) {
     return is_upstream_config_key(sr->key_path);
 }
 
-static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_info_t *files,
+static void cbm_pipeline_extract_infra_routes(const cbm_pipeline_ctx_t *ctx, cbm_gbuf_t *gbuf,
+                                              const cbm_file_info_t *files,
                                               CBMFileResult **result_cache, int file_count) {
     /* DENY-WINS-BY-VALUE: the same URL is often extracted as several string_refs
      * at different key_path granularities (full path, leaf key, flat). The Route
@@ -898,29 +996,45 @@ static void cbm_pipeline_extract_infra_routes(cbm_gbuf_t *gbuf, const cbm_file_i
      * per-ref guard — e.g. a denied full path `registries.terraform-registry.url`
      * is defeated by a sibling leaf `url`. So pass 1 collects every URL value
      * denied under ANY of its refs; pass 2 mints only values never denied. (#521) */
+    /* The table borrows nothing: a key is copied into `denied_keys`, because
+     * the result that holds sr->value is released after its file (spill
+     * mode loads it only for that moment) while the table spans both
+     * passes. A borrowed key hashed freed memory and the insert spun. */
+    CBMArena denied_keys;
+    cbm_arena_init(&denied_keys);
     CBMHashTable *denied = cbm_ht_create(16);
     for (int pass = 0; pass < 2; pass++) {
         for (int i = 0; i < file_count; i++) {
-            if (!result_cache[i] || !is_infra_file(files[i].rel_path) ||
-                is_ci_tooling_config(files[i].rel_path)) {
+            if (!is_infra_file(files[i].rel_path) || is_ci_tooling_config(files[i].rel_path)) {
                 continue;
             }
-            for (int si = 0; si < result_cache[i]->string_refs.count; si++) {
-                const CBMStringRef *sr = &result_cache[i]->string_refs.items[si];
+            bool loaded = false;
+            const CBMFileResult *r =
+                cbm_pipeline_result_acquire(ctx, result_cache, i, want_string_refs, &loaded);
+            if (!r) {
+                continue;
+            }
+            for (int si = 0; si < r->string_refs.count; si++) {
+                const CBMStringRef *sr = &r->string_refs.items[si];
                 if (sr->kind != CBM_STRREF_URL || !sr->value || !strstr(sr->value, "://")) {
                     continue;
                 }
                 if (pass == 0) {
                     if (denied && route_sr_denied(sr)) {
-                        cbm_ht_set(denied, sr->value, (void *)1);
+                        const char *key = cbm_arena_strdup(&denied_keys, sr->value);
+                        if (key && !cbm_ht_has(denied, key)) {
+                            cbm_ht_set(denied, key, (void *)1);
+                        }
                     }
                 } else if (!denied || !cbm_ht_has(denied, sr->value)) {
                     try_upsert_infra_route(gbuf, sr, files[i].rel_path);
                 }
             }
+            cbm_pipeline_result_release((CBMFileResult *)r, loaded);
         }
     }
     cbm_ht_free(denied);
+    cbm_arena_destroy(&denied_keys);
 }
 
 /* Run decorator_tags, configlink, and route matching passes. */
@@ -950,6 +1064,222 @@ static void predump_importance(cbm_pipeline_ctx_t *ctx) {
     cbm_pipeline_pass_importance(ctx);
 }
 
+/* Phase boundary for memory attribution. Two instruments, both already in
+ * foundation/, both previously wired ONLY into MCP request handling and never
+ * into the index pipeline -- which is where the memory is (a kernel index
+ * peaks at 35 GB in extraction, measured 2026-09-13 with an external sampler
+ * because nothing in-process could say which phase it was in):
+ *   - cbm_mem_phase_mark attributes the committed-bytes delta since the last
+ *     mark to the phase just ended. Off unless CBM_MEM_PHASES=1.
+ *   - cbm_mem_class_log prints the mem_core class table, so the log answers
+ *     WHICH class grew in WHICH pass. Logs nothing until a class has activity,
+ *     so it is silent on a tree that has not migrated yet.
+ * Marks must bracket the whole path with no unlabelled gaps (mem.h), hence a
+ * mark at every pass.timing site plus pipeline.begin at the top. */
+static void pipeline_phase_mark(const char *pass) {
+    cbm_mem_phase_mark(pass);
+    /* A phase boundary is where memory is genuinely idle (the results after
+     * resolve, the semantic transient): hand it back before reading the
+     * numbers. Measured 2026-09-13 with the mimalloc-backed core: the Go worker
+     * floor went 15.8 -> 1.0 GB RSS. Milliseconds per phase. */
+    cbm_mem_release_to_os();
+    log_phase_mem(pass);
+    cbm_mem_class_log(pass);
+}
+
+/* Research census (2026-09-13): what the retained per-file results are made
+ * of. Records: count x sizeof per kind, plus the capacity the growable arrays
+ * reserved (each growth leaves the previous generation dead in the arena).
+ * Strings: bytes per field family, counted once per record (a pointer that
+ * is shared between records is charged every time it appears, so a family
+ * that is really shared shows up LARGER than its arena bytes -- that is the
+ * signal that interning would win). Measurement only. */
+static size_t census_len(const char *sv) {
+    return sv ? strlen(sv) + SKIP_ONE : 0;
+}
+static size_t census_list(const char **list) {
+    size_t n = 0;
+    if (!list) {
+        return 0;
+    }
+    for (int i = 0; list[i]; i++) {
+        n += census_len(list[i]) + sizeof(char *);
+    }
+    return n + sizeof(char *);
+}
+static void log_result_census(const char *tag, CBMFileResult **cache, int file_count) {
+    enum { PL_BYTES_PER_MB = 1024 * 1024 };
+    size_t rec_defs = 0, rec_calls = 0, rec_usages = 0, rec_rw = 0, rec_typerefs = 0;
+    size_t rec_imports = 0, rec_resolved = 0, rec_other = 0;
+    size_t cap_defs = 0, cap_calls = 0, cap_usages = 0, cap_rw = 0, cap_typerefs = 0;
+    size_t cap_other = 0;
+    size_t n_defs = 0, n_calls = 0, n_usages = 0, n_rw = 0, n_typerefs = 0, n_resolved = 0;
+    size_t str_def_names = 0, str_def_sig = 0, str_def_doc = 0, str_def_tokens = 0;
+    size_t str_def_profile = 0, str_def_lists = 0, str_def_fp = 0, str_def_misc = 0;
+    size_t str_call_names = 0, str_call_enclosing = 0, str_call_args = 0;
+    size_t str_usage_names = 0, str_usage_enclosing = 0, str_rw = 0, str_typeref = 0;
+    size_t str_resolved = 0, str_source = 0, str_module = 0;
+    for (int i = 0; i < file_count; i++) {
+        const CBMFileResult *r = cache ? cache[i] : NULL;
+        if (!r) {
+            continue;
+        }
+        rec_defs += (size_t)r->defs.count * sizeof(CBMDefinition);
+        cap_defs += (size_t)r->defs.cap * sizeof(CBMDefinition);
+        rec_calls += (size_t)r->calls.count * sizeof(CBMCall);
+        cap_calls += (size_t)r->calls.cap * sizeof(CBMCall);
+        rec_usages += (size_t)r->usages.count * sizeof(CBMUsage);
+        cap_usages += (size_t)r->usages.cap * sizeof(CBMUsage);
+        rec_rw += (size_t)r->rw.count * sizeof(CBMReadWrite);
+        cap_rw += (size_t)r->rw.cap * sizeof(CBMReadWrite);
+        rec_typerefs += (size_t)r->type_refs.count * sizeof(CBMTypeRef);
+        cap_typerefs += (size_t)r->type_refs.cap * sizeof(CBMTypeRef);
+        rec_imports += (size_t)r->imports.count * sizeof(CBMImport);
+        rec_resolved += (size_t)r->resolved_calls.count * sizeof(CBMResolvedCall);
+        rec_other += (size_t)r->throws.count * sizeof(CBMThrow) +
+                     (size_t)r->env_accesses.count * sizeof(CBMEnvAccess) +
+                     (size_t)r->type_assigns.count * sizeof(CBMTypeAssign) +
+                     (size_t)r->string_refs.count * sizeof(CBMStringRef) +
+                     (size_t)r->impl_traits.count * sizeof(CBMImplTrait) +
+                     (size_t)r->infra_bindings.count * sizeof(CBMInfraBinding) +
+                     (size_t)r->channels.count * sizeof(CBMChannel);
+        cap_other += (size_t)r->imports.cap * sizeof(CBMImport) +
+                     (size_t)r->resolved_calls.cap * sizeof(CBMResolvedCall) +
+                     (size_t)r->throws.cap * sizeof(CBMThrow) +
+                     (size_t)r->env_accesses.cap * sizeof(CBMEnvAccess) +
+                     (size_t)r->type_assigns.cap * sizeof(CBMTypeAssign) +
+                     (size_t)r->string_refs.cap * sizeof(CBMStringRef) +
+                     (size_t)r->impl_traits.cap * sizeof(CBMImplTrait) +
+                     (size_t)r->infra_bindings.cap * sizeof(CBMInfraBinding) +
+                     (size_t)r->channels.cap * sizeof(CBMChannel);
+        n_defs += (size_t)r->defs.count;
+        n_calls += (size_t)r->calls.count;
+        n_usages += (size_t)r->usages.count;
+        n_rw += (size_t)r->rw.count;
+        n_typerefs += (size_t)r->type_refs.count;
+        n_resolved += (size_t)r->resolved_calls.count;
+        str_source += (size_t)(r->source ? r->source_len + 1 : 0);
+        str_module += census_len(r->module_qn) + census_len(r->namespace_name) +
+                      census_list(r->exports) + census_list(r->constants) +
+                      census_list(r->global_vars) + census_list(r->macros);
+        for (int d = 0; d < r->defs.count; d++) {
+            const CBMDefinition *def = &r->defs.items[d];
+            str_def_names += census_len(def->name) + census_len(def->qualified_name) +
+                             census_len(def->label) + census_len(def->file_path) +
+                             census_len(def->parent_class);
+            str_def_sig += census_len(def->signature) + census_len(def->return_type) +
+                           census_len(def->receiver);
+            str_def_doc += census_len(def->docstring);
+            str_def_tokens += census_len(def->body_tokens);
+            str_def_profile += census_len(def->structural_profile);
+            str_def_lists += census_list(def->decorators) + census_list(def->base_classes) +
+                             census_list(def->param_names) + census_list(def->param_types) +
+                             census_list(def->return_types);
+            for (int k = 0; k < def->signature_param_count; k++) {
+                str_def_lists += census_len(def->signature_param_types[k]) + sizeof(char *);
+            }
+            str_def_fp += def->fingerprint ? (size_t)def->fingerprint_k * sizeof(uint32_t) : 0;
+            str_def_misc += census_len(def->route_path) + census_len(def->route_method) +
+                            census_len(def->impl_trait);
+        }
+        for (int c = 0; c < r->calls.count; c++) {
+            const CBMCall *call = &r->calls.items[c];
+            str_call_names += census_len(call->callee_name) + census_len(call->first_string_arg) +
+                              census_len(call->second_arg_name);
+            str_call_enclosing += census_len(call->enclosing_func_qn);
+            for (int a = 0; a < call->arg_count && a < CBM_MAX_CALL_ARGS; a++) {
+                str_call_args += census_len(call->args[a].expr) + census_len(call->args[a].value) +
+                                 census_len(call->args[a].keyword);
+            }
+        }
+        for (int u = 0; u < r->usages.count; u++) {
+            str_usage_names += census_len(r->usages.items[u].ref_name);
+            str_usage_enclosing += census_len(r->usages.items[u].enclosing_func_qn);
+        }
+        for (int w = 0; w < r->rw.count; w++) {
+            str_rw +=
+                census_len(r->rw.items[w].var_name) + census_len(r->rw.items[w].enclosing_func_qn);
+        }
+        for (int t = 0; t < r->type_refs.count; t++) {
+            str_typeref += census_len(r->type_refs.items[t].type_name) +
+                           census_len(r->type_refs.items[t].enclosing_func_qn);
+        }
+        for (int q = 0; q < r->resolved_calls.count; q++) {
+            const CBMResolvedCall *rc = &r->resolved_calls.items[q];
+            str_resolved += census_len(rc->caller_qn) + census_len(rc->callee_qn) +
+                            census_len(rc->strategy) + census_len(rc->reason);
+        }
+    }
+    /* One snprintf per line: itoa_buf is a small TLS ring and a line with a
+     * dozen values would overwrite its own earlier fields. */
+    char line[CBM_SZ_1K];
+#define MB(x) ((unsigned long)((x) / PL_BYTES_PER_MB))
+    snprintf(line, sizeof(line), "defs=%lu calls=%lu usages=%lu rw=%lu type_refs=%lu resolved=%lu",
+             (unsigned long)n_defs, (unsigned long)n_calls, (unsigned long)n_usages,
+             (unsigned long)n_rw, (unsigned long)n_typerefs, (unsigned long)n_resolved);
+    cbm_log_info("extract.census.records", "tag", tag, "v", line);
+    snprintf(
+        line, sizeof(line),
+        "defs=%lu calls=%lu usages=%lu rw=%lu type_refs=%lu imports=%lu resolved=%lu other=%lu",
+        MB(rec_defs), MB(rec_calls), MB(rec_usages), MB(rec_rw), MB(rec_typerefs), MB(rec_imports),
+        MB(rec_resolved), MB(rec_other));
+    cbm_log_info("extract.census.record_mb", "tag", tag, "v", line);
+    snprintf(line, sizeof(line), "defs=%lu calls=%lu usages=%lu rw=%lu type_refs=%lu other=%lu",
+             MB(cap_defs), MB(cap_calls), MB(cap_usages), MB(cap_rw), MB(cap_typerefs),
+             MB(cap_other));
+    cbm_log_info("extract.census.array_cap_mb", "tag", tag, "v", line);
+    snprintf(line, sizeof(line),
+             "names=%lu signature=%lu docstring=%lu body_tokens=%lu structural_profile=%lu "
+             "lists=%lu fingerprint=%lu misc=%lu",
+             MB(str_def_names), MB(str_def_sig), MB(str_def_doc), MB(str_def_tokens),
+             MB(str_def_profile), MB(str_def_lists), MB(str_def_fp), MB(str_def_misc));
+    cbm_log_info("extract.census.def_strings_mb", "tag", tag, "v", line);
+    snprintf(line, sizeof(line),
+             "call_names=%lu call_enclosing=%lu call_args=%lu usage_names=%lu "
+             "usage_enclosing=%lu rw=%lu type_refs=%lu resolved=%lu source=%lu module=%lu",
+             MB(str_call_names), MB(str_call_enclosing), MB(str_call_args), MB(str_usage_names),
+             MB(str_usage_enclosing), MB(str_rw), MB(str_typeref), MB(str_resolved), MB(str_source),
+             MB(str_module));
+    cbm_log_info("extract.census.ref_strings_mb", "tag", tag, "v", line);
+#undef MB
+}
+
+/* The per-file result arenas are the largest retained structure of an index
+ * (Go corpus, 2026-09-13: 28.8 GB of arena capacity live at the end of
+ * extraction against 15 GB resident). Capacity is what the core charges
+ * (block sizes); used is what extraction wrote; trees counts results still
+ * holding a tree-sitter tree. The three numbers together say whether the cost
+ * is the data, the block-doubling headroom, or retained trees. */
+static void log_result_arenas(const char *tag, CBMFileResult **cache, int file_count) {
+    enum { PL_BYTES_PER_MB = 1024 * 1024 };
+    if (!cbm_mem_phases_enabled()) {
+        return; /* a walk over every result: diagnostics only (CBM_MEM_PHASES=1) */
+    }
+    size_t used = 0;
+    size_t capacity = 0;
+    int results = 0;
+    int trees = 0;
+    for (int i = 0; i < file_count; i++) {
+        const CBMFileResult *r = cache ? cache[i] : NULL;
+        if (!r) {
+            continue;
+        }
+        results++;
+        used += cbm_arena_total(&r->arena);
+        for (int b = 0; b < r->arena.nblocks; b++) {
+            capacity += r->arena.block_sizes[b];
+        }
+        if (r->cached_tree) {
+            trees++;
+        }
+    }
+    cbm_log_info("extract.arenas", "tag", tag, "results", itoa_buf(results), "used_mb",
+                 itoa_buf((int)(used / PL_BYTES_PER_MB)), "capacity_mb",
+                 itoa_buf((int)(capacity / PL_BYTES_PER_MB)), "trees", itoa_buf(trees));
+    log_result_census(tag, cache, file_count);
+}
+
+/* Results are gone after resolve; so is the store. Logs what spill did. */
 static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
     static const struct {
         predump_pass_fn fn;
@@ -986,6 +1316,7 @@ static void run_predump_passes(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx) {
         passes[i].fn(ctx);
         cbm_log_info("pass.timing", "pass", passes[i].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(t)));
+        pipeline_phase_mark(passes[i].name);
     }
 }
 
@@ -1107,6 +1438,7 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         }
         cbm_log_info("pass.timing", "pass", seq_passes[si].name, "elapsed_ms",
                      itoa_buf((int)elapsed_ms(*t)));
+        pipeline_phase_mark(seq_passes[si].name);
         if (check_cancel(p)) {
             rc = CBM_NOT_FOUND;
         }
@@ -1116,8 +1448,8 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * one. process_one_infra_binding self-creates the topic Route node when no
      * code-side dispatch created it (e.g. a standalone scheduler manifest). */
     if (seq_cache && rc == 0) {
-        cbm_pipeline_extract_infra_routes(p->gbuf, files, seq_cache, file_count);
-        cbm_pipeline_process_infra_bindings(p->gbuf, files, seq_cache, file_count);
+        cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, seq_cache, file_count);
+        cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, seq_cache, file_count);
     }
     if (seq_cache) {
         for (int i = 0; i < file_count; i++) {
@@ -1181,14 +1513,20 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         return CBM_NOT_FOUND;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
+    /* This driver is the spill owner: every consumer below reads the cache
+     * through cbm_pipeline_result_acquire() and the store is closed here. */
+    ctx->spill_allowed = true;
     int rc = cbm_parallel_extract(ctx, files, file_count, cache, &shared_ids, worker_count);
     cbm_log_info("pass.timing", "pass", "parallel_extract", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
+    pipeline_phase_mark("parallel_extract");
+    log_result_arenas("post_extract", cache, file_count);
     if (rc != 0 || check_cancel(p)) {
         for (int i = 0; i < file_count; i++) {
             cbm_free_result(cache[i]);
         }
         free(cache);
+        cbm_pipeline_spill_close(ctx);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
@@ -1204,7 +1542,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     rc = cbm_build_registry_from_cache(ctx, files, file_count, cache);
     cbm_log_info("pass.timing", "pass", "registry_build", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
-    log_phase_mem("registry_build");
+    pipeline_phase_mark("registry_build");
     if (rc != 0 || check_cancel(p)) {
         for (int i = 0; i < file_count; i++) {
             if (cache[i]) {
@@ -1212,6 +1550,7 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
             }
         }
         free(cache);
+        cbm_pipeline_spill_close(ctx);
         return rc != 0 ? rc : CBM_NOT_FOUND;
     }
     /* Registry consumers may materialize serial nodes (Channel, EnvVar, and
@@ -1249,28 +1588,36 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int def_count = 0;
     CBMLSPDef *all_defs = NULL;
     int *def_starts = NULL;
+    /* The collected defs own their strings in this arena (results may be on
+     * disk by now); the per-language cross registries share it. */
+    CBMArena cross_lsp_arena;
+    cbm_arena_init(&cross_lsp_arena);
+    CBM_PROF_START(t_collect_defs);
     if (run_cross_lsp) {
         def_modules = (char **)calloc((size_t)file_count, sizeof(char *));
         def_starts = (int *)calloc((size_t)file_count + 1, sizeof(int));
-        all_defs = def_modules
-                       ? cbm_pxc_collect_all_defs(ctx, cache, files, file_count, ctx->project_name,
-                                                  def_modules, &def_count, def_starts)
-                       : NULL;
+        all_defs = def_modules ? cbm_pxc_collect_all_defs(ctx, &cross_lsp_arena, cache, files,
+                                                          file_count, ctx->project_name,
+                                                          def_modules, &def_count, def_starts)
+                               : NULL;
     }
+    CBM_PROF_END_N("lsp_cross_prepare", "1_collect_all_defs", t_collect_defs, def_count);
     /* Serialize per-file LSP surfaces NOW — the result cache dies with this
      * pass, and the rows are what lets an incremental run detect body-only
      * edits and rehydrate cross registries without re-parsing the world.
      * Failure only degrades: no rows → the incremental route full-rebuilds. */
+    CBM_PROF_START(t_surfaces);
     if (ctx->pipeline && all_defs && def_starts) {
         cbm_lsp_surface_row_t *surface_rows = NULL;
         int surface_count = 0;
-        if (cbm_lsp_surface_build_rows(ctx->project_name, cache, files, file_count, all_defs,
+        if (cbm_lsp_surface_build_rows(ctx, ctx->project_name, cache, files, file_count, all_defs,
                                        def_starts, &surface_rows, &surface_count) == 0) {
             cbm_pipeline_set_lsp_surfaces(ctx->pipeline, surface_rows, surface_count);
         } else {
             cbm_log_warn("lsp_surface.serialize_failed", "files", itoa_buf(file_count));
         }
     }
+    CBM_PROF_END_N("lsp_cross_prepare", "2_surface_rows", t_surfaces, file_count);
     free(def_starts);
     /* Build inverted index: module_qn → defs. The fused resolve_worker
      * uses this to filter the global all_defs[] down to just the defs
@@ -1278,15 +1625,15 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
      * gopls "package summary" pattern. Drops per-file registry build
      * cost from O(all_defs) to O(relevant_defs), typically 50-100×
      * smaller per file. */
+    CBM_PROF_START(t_module_index);
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
+    CBM_PROF_END_N("lsp_cross_prepare", "3_module_def_index", t_module_index, def_count);
     /* Tier 2 full: pre-build per-language cross-LSP registries.
      * Built ONCE here; shared READ-ONLY across all files of that language
      * during resolve. Per-file work is then: parse + AST walk + O(1) lookups
      * — no registry build, no Phase 1b mutations. Languages added so far:
      * Go, Python, C/C++, C#, TS/JS, Java. Others (Kotlin, PHP) fall back to per-file. */
-    CBMArena cross_lsp_arena;
-    cbm_arena_init(&cross_lsp_arena);
     CBMCrossLspRegistries cross_registries = {0};
     if (all_defs) {
         /* Per-builder split of lsp_cross_prepare — attributes a slow prepare to
@@ -1328,13 +1675,14 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     }
     cbm_log_info("pass.timing", "pass", "lsp_cross_prepare", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
-    log_phase_mem("lsp_cross_prepare");
+    pipeline_phase_mark("lsp_cross_prepare");
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
-    log_phase_mem("parallel_resolve");
+    pipeline_phase_mark("parallel_resolve");
+    log_result_arenas("post_resolve", cache, file_count);
     cbm_pxc_free_module_def_index(module_def_index);
     cbm_arena_destroy(&cross_lsp_arena); /* releases all per-lang registries */
     free(all_defs);
@@ -1345,20 +1693,22 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
         free(def_modules);
     }
     cbm_gbuf_set_next_id(p->gbuf, atomic_load(&shared_ids));
-    cbm_pipeline_extract_infra_routes(p->gbuf, files, cache, file_count);
-    cbm_pipeline_process_infra_bindings(p->gbuf, files, cache, file_count);
+    cbm_pipeline_extract_infra_routes(ctx, p->gbuf, files, cache, file_count);
+    cbm_pipeline_process_infra_bindings(ctx, p->gbuf, files, cache, file_count);
     for (int i = 0; i < file_count; i++) {
         if (cache[i]) {
             cbm_free_result(cache[i]);
         }
     }
     free(cache);
+    cbm_pipeline_spill_close(ctx);
     if (rc != 0) {
         return rc;
     }
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     cbm_pipeline_pass_k8s(ctx, files, file_count);
     cbm_log_info("pass.timing", "pass", "k8s", "elapsed_ms", itoa_buf((int)elapsed_ms(*t)));
+    pipeline_phase_mark("k8s");
     return check_cancel(p) ? CBM_NOT_FOUND : 0;
 }
 
@@ -1402,6 +1752,16 @@ static int capture_existing_adr(cbm_pipeline_t *p, const char *db_path) {
 static int try_incremental_or_delete_db(cbm_pipeline_t *p, cbm_file_info_t *files, int file_count,
                                         const cbm_file_hash_t *baseline_manifest,
                                         int baseline_count, bool force_full_on_mismatch) {
+    if (!p->existing_generation) {
+        /* Nothing to be incremental against: a first index, or a
+         * destination that could not be copied (already reported as
+         * backup_failed_full_rebuild). The stage is an empty placeholder,
+         * not a database, so it is not probed -- "invalid_existing_db"
+         * stays reserved for a real copy that fails its integrity check. */
+        cbm_log_info("pipeline.route", "path", "full", "reason",
+                     p->final_existed ? "existing_db_backup_failed" : "no_existing_db");
+        return CBM_PIPELINE_FORCE_FULL_REINDEX;
+    }
     char *db_path = resolve_db_path(p);
     if (!db_path) {
         return CBM_PIPELINE_FORCE_FULL_REINDEX;
@@ -1530,12 +1890,148 @@ static bool promote_mode_to_existing_coverage(cbm_pipeline_t *p) {
 /* Defined below, next to the other publication helpers. */
 static char *create_staging_path(const char *final_path);
 
+/* ── Stage ownership (#1839) ─────────────────────────────────────
+ *
+ * A stage used to be recognisable only by its name: the mkstemp descriptor
+ * was closed at once and nothing marked who was writing it. A worker killed
+ * mid-run (the daemon cancels with SIGTERM then SIGKILL after one second of
+ * grace, which a gigabyte backup or clone never finishes inside) left its
+ * full-size stage behind forever, and no later run could tell a dead stage
+ * from a live one -- so none tried.
+ *
+ * Ownership is now an exclusive kernel lock on the sidecar "<stage>.lock",
+ * held from minting until the stage is discarded or renamed into place. The
+ * kernel releases it on any death, so "can I take this lock?" is exactly
+ * "is this stage dead?" -- no pid, no mtime, no grace period. The lock lives
+ * on a sidecar rather than the stage itself because on macOS an flock on a
+ * file conflicts with SQLite's fcntl byte locks on that same file.
+ *
+ * The stage path is passed around as a plain string through publish and
+ * finalize, so the descriptor is kept in this per-process registry keyed by
+ * path, and released by the same helpers that remove the file. */
+typedef struct stage_owner {
+    char *stage_path;
+    int lock_fd;
+    struct stage_owner *next;
+} stage_owner_t;
+
+static stage_owner_t *g_stage_owners = NULL;
+static atomic_flag g_stage_owners_spin = ATOMIC_FLAG_INIT;
+
+static void stage_owners_lock(void) {
+    while (atomic_flag_test_and_set_explicit(&g_stage_owners_spin, memory_order_acquire)) {}
+}
+
+static void stage_owners_unlock(void) {
+    atomic_flag_clear_explicit(&g_stage_owners_spin, memory_order_release);
+}
+
+static char *stage_lock_sidecar_path(const char *stage_path) {
+    static const char suffix[] = ".lock";
+    size_t len = strlen(stage_path);
+    if (len > SIZE_MAX - sizeof(suffix)) {
+        return NULL;
+    }
+    char *sidecar = (char *)malloc(len + sizeof(suffix));
+    if (!sidecar) {
+        return NULL;
+    }
+    memcpy(sidecar, stage_path, len);
+    memcpy(sidecar + len, suffix, sizeof(suffix));
+    return sidecar;
+}
+
+int cbm_pipeline_stage_lock_hold(const char *stage_path) {
+    if (!stage_path) {
+        return -1;
+    }
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    if (!sidecar) {
+        return -1;
+    }
+    int fd = cbm_lockfile_open(sidecar, true);
+    free(sidecar);
+    return fd;
+}
+
+void cbm_pipeline_stage_lock_drop(const char *stage_path, int lock_fd) {
+    if (!stage_path || lock_fd < 0) {
+        return;
+    }
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    /* Close before unlinking: Windows refuses to delete an open file. The
+     * sidecar exists unlocked for that instant, but by every drop the stage
+     * itself is already gone (discarded or renamed), so there is nothing a
+     * sweeper could take from us. */
+    cbm_lockfile_close(lock_fd);
+    if (sidecar) {
+        (void)cbm_unlink(sidecar);
+        free(sidecar);
+    }
+}
+
+/* Record an already-held stage lock in the per-process owner table, keyed by
+ * path so publish/finalize/discard can release it later. On success the table
+ * owns lock_fd; on failure the caller still does and must drop it.
+ *
+ * The lock must ALREADY be held: create_staging_path() takes it before the
+ * stage's main file is created (so the file is never visible on disk without
+ * its lock), then hands the descriptor here. Re-taking the lock in this helper
+ * would self-conflict -- both flock() and Windows _SH_DENYRW deny a second
+ * acquire of the same sidecar even from this same process. */
+static bool stage_owner_adopt(const char *stage_path, int lock_fd) {
+    stage_owner_t *owner = (stage_owner_t *)malloc(sizeof(*owner));
+    char *path_copy = strdup(stage_path);
+    if (!owner || !path_copy) {
+        free(owner);
+        free(path_copy);
+        return false;
+    }
+    owner->stage_path = path_copy;
+    owner->lock_fd = lock_fd;
+    stage_owners_lock();
+    owner->next = g_stage_owners;
+    g_stage_owners = owner;
+    stage_owners_unlock();
+    return true;
+}
+
+/* Release ownership of a stage that no longer exists under this name. A path
+ * this process never registered is a no-op. */
+static void stage_owner_release(const char *stage_path) {
+    if (!stage_path) {
+        return;
+    }
+    stage_owner_t *found = NULL;
+    stage_owners_lock();
+    for (stage_owner_t **link = &g_stage_owners; *link; link = &(*link)->next) {
+        if (strcmp((*link)->stage_path, stage_path) == 0) {
+            found = *link;
+            *link = found->next;
+            break;
+        }
+    }
+    stage_owners_unlock();
+    if (!found) {
+        return;
+    }
+    cbm_pipeline_stage_lock_drop(found->stage_path, found->lock_fd);
+    free(found->stage_path);
+    free(found);
+}
+
+/* Remove a stage's main file and SQLite sidecars, keeping ownership. */
+static void remove_stage_files(const char *stage_path) {
+    (void)cbm_unlink(stage_path);
+    (void)cbm_remove_db_sidecars(stage_path);
+}
+
 static void discard_generation_stage(const char *stage_path) {
     if (!stage_path) {
         return;
     }
-    cbm_unlink(stage_path);
-    cbm_remove_db_sidecars(stage_path);
+    remove_stage_files(stage_path);
+    stage_owner_release(stage_path);
 }
 
 typedef struct {
@@ -1929,6 +2425,7 @@ int cbm_pipeline_finalize_staged_generation(char *stage_path, const char *final_
         discard_generation_stage(stage_path);
         return CBM_PIPELINE_PERSIST_FAILED;
     }
+    stage_owner_release(stage_path);
     cbm_log_info("finalize.timing", "block", "rename", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t_fin)));
     return 0;
@@ -1956,7 +2453,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 #endif
     if (last_slash) {
         *last_slash = '\0';
-        cbm_mkdir_p(db_dir, CBM_DIR_PERMS);
+        cbm_mkdir_p_ex(db_dir, CBM_DIR_PERMS, CBM_MKDIR_FOLLOW_OWNED);
     }
 
     cbm_file_hash_t *manifest = NULL;
@@ -1964,15 +2461,17 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
 #if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
     cbm_pipeline_persist_test_run_before_final_manifest();
 #endif
-    if (cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
-                                                   &manifest, &manifest_count) != 0) {
+    int manifest_rc =
+        cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &manifest, &manifest_count);
+    if (manifest_rc != 0) {
         cbm_log_error("pipeline.err", "phase", "semantic_manifest");
         /* db_path and db_dir are this function's strdups; the success tail and
          * the publish-failure return release them, and these two aborts must
          * too -- LSan caught exactly these paths leaking both strings. */
         free(db_dir);
         free(db_path);
-        return CBM_PIPELINE_ABORT_PRESERVE_DB;
+        return manifest_rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                                          : CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
     if (!cbm_pipeline_semantic_manifests_equal(baseline_manifest, baseline_count, manifest,
                                                manifest_count)) {
@@ -2053,6 +2552,7 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
     }
     cbm_log_info("pass.timing", "pass", "dump_and_persist", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)), "files", itoa_buf(manifest_count));
+    pipeline_phase_mark("dump_and_persist");
     if (p->ignored_total > p->ignored_count) {
         cbm_log_warn("index.ignored_capped", "stored", itoa_buf(p->ignored_count), "total",
                      itoa_buf(p->ignored_total));
@@ -2117,6 +2617,7 @@ static int run_tests_and_history(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     int rc = cbm_pipeline_pass_tests(ctx, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_tests", t_tests, file_count);
     cbm_log_info("pass.timing", "pass", "tests", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    pipeline_phase_mark("tests");
     if (rc == 0 && !check_cancel(p)) {
         CBM_PROF_START(t_gh);
         rc = run_githistory(p, ctx);
@@ -2169,6 +2670,7 @@ static int run_extraction_phase(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     pass_structure(p, files, file_count);
     CBM_PROF_END_N("pipeline", "pass_structure", t_struct, file_count);
     cbm_log_info("pass.timing", "pass", "structure", "elapsed_ms", itoa_buf((int)elapsed_ms(t)));
+    pipeline_phase_mark("structure");
     if (check_cancel(p)) {
         return CBM_NOT_FOUND;
     }
@@ -2226,10 +2728,14 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 
     /* Phase 1: Discover files */
     CBM_PROF_START(t_discover);
+    p->resource_violation = (cbm_index_resource_violation_t){0};
     cbm_discover_opts_t opts = {
         .mode = p->requested_mode,
         .ignore_file = NULL,
         .max_file_size = 0,
+        .resource_policy =
+            cbm_index_policy_enabled(&p->resource_policy) ? &p->resource_policy : NULL,
+        .resource_violation = &p->resource_violation,
     };
     cbm_file_info_t *files = NULL;
     int file_count = 0;
@@ -2254,7 +2760,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     cbm_log_info("pipeline.discover", "files", itoa_buf(file_count), "elapsed_ms",
                  itoa_buf((int)elapsed_ms(t0)));
     if (rc != 0 || check_cancel(p)) {
-        rc = CBM_NOT_FOUND;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
         goto cleanup;
     }
 
@@ -2262,14 +2768,15 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
      * bytes drive exact no-op comparison and are checked against a fresh
      * rediscovery immediately before any replacement is published. */
     rc = mode_promoted
-             ? cbm_pipeline_build_fresh_semantic_manifest(p->project_name, p->repo_path, p->mode,
-                                                          &baseline_manifest, &baseline_count)
+             ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
+                                                          &baseline_count)
              : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
                                                     file_count, p->excluded_dirs, p->excluded_count,
                                                     &p->git_ctx, p->userconfig, &baseline_manifest,
                                                     &baseline_count);
     if (rc != 0) {
-        rc = CBM_PIPELINE_ABORT_PRESERVE_DB;
+        rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT
+                                               : CBM_PIPELINE_ABORT_PRESERVE_DB;
         goto cleanup;
     }
 
@@ -2313,7 +2820,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
         cbm_log_info("pipeline.rediscover", "requested_mode", pipeline_mode_name(p->requested_mode),
                      "effective_mode", pipeline_mode_name(p->mode), "files", itoa_buf(file_count));
         if (rc != 0 || check_cancel(p)) {
-            rc = CBM_NOT_FOUND;
+            rc = rc == CBM_DISCOVER_LIMIT_EXCEEDED ? CBM_PIPELINE_RESOURCE_LIMIT : CBM_NOT_FOUND;
             goto cleanup;
         }
     }
@@ -2386,8 +2893,8 @@ static void cleanup_staging_db(const char *path) {
     if (!path) {
         return;
     }
-    (void)cbm_unlink(path);
-    (void)cbm_remove_db_sidecars(path);
+    remove_stage_files(path);
+    stage_owner_release(path);
 }
 
 static bool ensure_db_parent(const char *path) {
@@ -2410,9 +2917,53 @@ static bool ensure_db_parent(const char *path) {
         return true;
     }
     *slash = '\0';
-    bool ok = dir[0] == '\0' || cbm_mkdir_p(dir, CBM_DIR_PERMS);
+    bool ok = dir[0] == '\0' || cbm_mkdir_p_ex(dir, CBM_DIR_PERMS, CBM_MKDIR_FOLLOW_OWNED);
     free(dir);
     return ok;
+}
+
+/* Length of the path a stage was minted for: the input itself unless its
+ * basename has exactly the minted shape "<name>.stage.<6 alphanumerics>", in
+ * which case the root is <name>. The outer run rewrites the pipeline's db_path
+ * to its stage, so the inner publication (dump and delta clone) used to mint
+ * ITS stage from that stage: <db>.stage.A.stage.B, with -wal/-shm beside it
+ * (#1839). Minting from the root keeps every generation's stage a sibling of
+ * the live database. Only the exact minted shape is recognised: a database
+ * named "x.stage.y.db" is not a stage and keeps its full name. */
+enum { CBM_STAGE_SUFFIX_RANDOM_CHARS = 6 };
+static const char cbm_stage_marker[] = ".stage.";
+
+static bool stage_suffix_at(const char *tail) {
+    if (strncmp(tail, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
+        return false;
+    }
+    const char *random = tail + sizeof(cbm_stage_marker) - 1;
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        if (!isalnum((unsigned char)random[i])) {
+            return false;
+        }
+    }
+    return random[CBM_STAGE_SUFFIX_RANDOM_CHARS] == '\0';
+}
+
+static size_t stage_root_length(const char *path) {
+    size_t len = strlen(path);
+    const size_t suffix_len = sizeof(cbm_stage_marker) - 1 + CBM_STAGE_SUFFIX_RANDOM_CHARS;
+    if (len <= suffix_len) {
+        return len;
+    }
+    size_t root_len = len - suffix_len;
+    /* The marker must sit inside the basename, never span a separator. */
+    for (size_t i = root_len; i < len; i++) {
+        if (path[i] == '/'
+#ifdef _WIN32
+            || path[i] == '\\'
+#endif
+        ) {
+            return len;
+        }
+    }
+    return stage_suffix_at(path + root_len) ? root_len : len;
 }
 
 static char *create_staging_path(const char *final_path) {
@@ -2420,7 +2971,7 @@ static char *create_staging_path(const char *final_path) {
         return NULL;
     }
     static const char suffix[] = ".stage.XXXXXX";
-    size_t final_len = strlen(final_path);
+    size_t final_len = stage_root_length(final_path);
     if (final_len > SIZE_MAX - sizeof(suffix)) {
         return NULL;
     }
@@ -2440,17 +2991,79 @@ static char *create_staging_path(const char *final_path) {
     }
     memcpy(path, final_path, final_len);
     memcpy(path + final_len, suffix, sizeof(suffix));
-    int fd = cbm_mkstemp(path);
-    if (fd < 0) {
-        free(path);
-        return NULL;
-    }
-#ifdef _WIN32
-    _close(fd);
-#else
-    close(fd);
+    /* The six random chars sit directly after the ".stage." marker; each
+     * attempt overwrites the "XXXXXX" template in place. Alphanumerics only,
+     * matching stage_suffix_at()/stage_entry_stage_length() so the sweep
+     * recognises the minted name and its sidecars. */
+    char *random_at = path + final_len + (sizeof(cbm_stage_marker) - 1);
+    static const char alphabet[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+    /* Lock BEFORE the stage becomes visible: take the sidecar lock first, then
+     * create the stage's main file with O_EXCL. The main file is therefore
+     * never present on disk without its lock already held, so a concurrent
+     * run's sweep_orphan_stages() against the same final_path can only ever
+     * find this stage lock-held -- it reaches the stage through the .lock
+     * sidecar too (stage_entry_stage_length() matches it), probes the lock,
+     * sees a live holder, and keeps it. That closes the old create->register
+     * window that let a racing sweep delete a live-but-unlocked stage (POSIX)
+     * or collide on the sidecar with EACCES (Windows) -- #2111's windows-guards
+     * red. A pre-lock-era orphan minted by an OLDER binary still carries no
+     * lock, so the sweep's ENOENT path still removes it (#1839 preserved).
+     *
+     * A minted suffix collides with an existing stage only about 1 in 62^6;
+     * retry a bounded number of times, the way mkstemp/mkdtemp do, then fail. */
+    for (int attempt = 0; attempt < 128; attempt++) {
+        unsigned char rnd[CBM_STAGE_SUFFIX_RANDOM_CHARS];
+        if (!cbm_secure_random(rnd, sizeof(rnd))) {
+            free(path);
+            errno = EIO;
+            return NULL;
+        }
+        for (size_t i = 0; i < sizeof(rnd); i++) {
+            random_at[i] = alphabet[rnd[i] % (sizeof(alphabet) - 1)];
+        }
+        errno = 0;
+        int lock_fd = cbm_pipeline_stage_lock_hold(path);
+        if (lock_fd < 0) {
+            /* A live twin already owns this exact suffix's sidecar (EAGAIN /
+             * EACCES), or the sidecar could not be created. Mint a fresh suffix
+             * and try again rather than contend for this one. */
+            continue;
+        }
+        FILE *main_file = cbm_fopen(path, "wbx");
+        if (!main_file) {
+            /* The suffix collided with a lock-less orphan's main file -- its
+             * sidecar was takeable, so it is not a live writer. Never inherit a
+             * stranger's bytes: drop the lock, remove the sidecar we just took,
+             * and mint a fresh suffix. The orphan's main file is left for a
+             * later sweep, which removes it as a pre-lock-era orphan. */
+            cbm_pipeline_stage_lock_drop(path, lock_fd);
+            continue;
+        }
+        (void)fclose(main_file);
+#if defined(CBM_INCREMENTAL_TEST_API) && CBM_INCREMENTAL_TEST_API
+        /* Main file now exists and its lock is already held. Under the OLD
+         * create-then-lock ordering this was the unlocked window; the
+         * concurrent-sweep test fires here to prove the stage now survives a
+         * racing sweep, and to bind RED if that ordering ever regresses. */
+        cbm_pipeline_persist_test_run_after_stage_created();
 #endif
-    return path;
+        if (!stage_owner_adopt(path, lock_fd)) {
+            cbm_pipeline_stage_lock_drop(path, lock_fd);
+            (void)cbm_unlink(path);
+            free(path);
+            return NULL;
+        }
+        return path;
+    }
+    /* Every attempt failed to take a lock -- keep the observability the old
+     * stage_owner_register() emitted for a lock failure. */
+    char errno_text[16];
+    (void)snprintf(errno_text, sizeof(errno_text), "%d", errno);
+    cbm_log_warn("pipeline.stage", "action", "lock_failed", "errno", errno_text, "path", path);
+    free(path);
+    errno = EEXIST;
+    return NULL;
 }
 
 /* A backup-failed destination may still have the only recoverable WAL or
@@ -2554,7 +3167,229 @@ static int export_after_publish(cbm_pipeline_t *p, const char *final_path) {
     return 0;
 }
 
+/* ── Orphan sweep (#1839) ────────────────────────────────────────
+ *
+ * Nothing on the worker-death path ever cleaned a stage up, so the sweep
+ * runs at the start of every run, before this run mints its own stage. It
+ * considers ONLY names of the exact minted shape for THIS database --
+ * "<basename>.stage.<6 alphanumerics>" plus that stage's -wal/-shm/-journal
+ * and .lock sidecars -- never the live database, a quarantined .corrupt, or
+ * another project's files. A stage is removed when its ownership lock can be
+ * taken (its writer is dead, or the stage predates ownership) and kept when
+ * a live writer holds the lock. The pre-ownership case is the one honest
+ * gap: a stage an OLDER binary is still writing against this database has
+ * no lock and is swept; that writer's final rename then fails and it
+ * discards. The live database is never named here on either path. */
+
+static const char *const cbm_stage_sidecar_tails[] = {"", "-wal", "-shm", "-journal", ".lock"};
+
+/* If `name` is "<base>.stage.<6 alphanumerics><known tail>", return the
+ * length of the stage name proper (without the tail); 0 otherwise. */
+static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len);
+
+/* The same test with the base taken from the name itself, so a sweep reclaims
+ * stages belonging to ANY project in this cache directory.
+ *
+ * Why it must not be per-project: a run killed outright (OOM killer, SIGKILL)
+ * cleans nothing up, and until 2026-09-18 its staging database was only removed
+ * when THAT project was indexed again — a kernel index killed once left 15 GB
+ * parked until someone re-indexed the kernel, and forever if nobody did. The
+ * per-stage lock probe still decides safety, so a live writer's stage is kept
+ * whichever project it belongs to. */
+static size_t stage_entry_stage_length_any_base(const char *name) {
+    const char *marker = strstr(name, cbm_stage_marker);
+    if (!marker) {
+        return 0;
+    }
+    return stage_entry_stage_length(name, name, (size_t)(marker - name));
+}
+
+static size_t stage_entry_stage_length(const char *name, const char *base, size_t base_len) {
+    if (strncmp(name, base, base_len) != 0) {
+        return 0;
+    }
+    const char *at = name + base_len;
+    if (strncmp(at, cbm_stage_marker, sizeof(cbm_stage_marker) - 1) != 0) {
+        return 0;
+    }
+    at += sizeof(cbm_stage_marker) - 1;
+    for (int i = 0; i < CBM_STAGE_SUFFIX_RANDOM_CHARS; i++) {
+        /* NUL is not alphanumeric, so a short name fails here too. */
+        if (!isalnum((unsigned char)at[i])) {
+            return 0;
+        }
+    }
+    at += CBM_STAGE_SUFFIX_RANDOM_CHARS;
+    for (size_t i = 0; i < sizeof(cbm_stage_sidecar_tails) / sizeof(cbm_stage_sidecar_tails[0]);
+         i++) {
+        if (strcmp(at, cbm_stage_sidecar_tails[i]) == 0) {
+            return (size_t)(at - name);
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    char **names;
+    int count;
+    int cap;
+} stage_name_list_t;
+
+/* Add a stage name once, however many of its files were listed. */
+static void stage_name_list_add(stage_name_list_t *list, const char *name, size_t len) {
+    for (int i = 0; i < list->count; i++) {
+        if (strlen(list->names[i]) == len && strncmp(list->names[i], name, len) == 0) {
+            return;
+        }
+    }
+    if (list->count == list->cap) {
+        int cap = list->cap ? list->cap * 2 : 8;
+        char **grown = (char **)realloc(list->names, (size_t)cap * sizeof(*grown));
+        if (!grown) {
+            return;
+        }
+        list->names = grown;
+        list->cap = cap;
+    }
+    char *copy = (char *)malloc(len + 1);
+    if (!copy) {
+        return;
+    }
+    memcpy(copy, name, len);
+    copy[len] = '\0';
+    list->names[list->count++] = copy;
+}
+
+static int64_t stage_bytes_on_disk(const char *stage_path) {
+    static const char *const files[] = {"", "-wal", "-shm", "-journal"};
+    int64_t total = 0;
+    char side[CBM_SZ_4K];
+    for (size_t i = 0; i < sizeof(files) / sizeof(files[0]); i++) {
+        int n = snprintf(side, sizeof(side), "%s%s", stage_path, files[i]);
+        if (n <= 0 || (size_t)n >= sizeof(side)) {
+            continue;
+        }
+        cbm_path_info_t info;
+        if (cbm_path_info_utf8(side, &info) == CBM_PATH_INFO_OK && info.is_regular) {
+            total += info.size;
+        }
+    }
+    return total;
+}
+
+static void sweep_one_stage(const char *stage_path) {
+    char *sidecar = stage_lock_sidecar_path(stage_path);
+    if (!sidecar) {
+        return;
+    }
+    errno = 0;
+    int lock_fd = cbm_lockfile_open(sidecar, false);
+    int probe_errno = errno;
+    free(sidecar);
+    if (lock_fd < 0 && probe_errno != ENOENT) {
+        bool live = probe_errno == EAGAIN || probe_errno == EACCES;
+#if defined(EWOULDBLOCK) && EWOULDBLOCK != EAGAIN
+        live = live || probe_errno == EWOULDBLOCK;
+#endif
+        if (live) {
+            cbm_log_info("pipeline.stage", "action", "orphan_kept", "reason", "live_writer", "path",
+                         stage_path);
+            return;
+        }
+        char errno_text[16];
+        (void)snprintf(errno_text, sizeof(errno_text), "%d", probe_errno);
+        cbm_log_warn("pipeline.stage", "action", "orphan_kept", "reason", "lock_probe_failed",
+                     "errno", errno_text, "path", stage_path);
+        return;
+    }
+    /* No owner: absent sidecar (an ENOENT probe) or a lock the kernel released
+     * with its writer. Ours now, from the lock down.
+     *
+     * The absent-sidecar (ENOENT) case is exactly a pre-lock-era orphan: a
+     * stage an OLDER binary minted with no sidecar at all (#1839 pins that
+     * these ARE swept). It is NOT an in-flight stage of a current run: since
+     * create_staging_path() now takes the sidecar lock BEFORE the stage's main
+     * file becomes visible on disk, a live stage always has its sidecar, so a
+     * concurrent sweep landing here for one would instead find the lock held
+     * above and keep it. Removing on ENOENT therefore reclaims genuine orphans
+     * without ever deleting a live stage (the create->register race behind
+     * #2111's windows-guards red is closed at the source). */
+    int64_t bytes = stage_bytes_on_disk(stage_path);
+    remove_stage_files(stage_path);
+    if (lock_fd >= 0) {
+        cbm_pipeline_stage_lock_drop(stage_path, lock_fd);
+    }
+    char bytes_text[32];
+    (void)snprintf(bytes_text, sizeof(bytes_text), "%lld", (long long)bytes);
+    cbm_log_info("pipeline.stage", "action", "orphan_removed", "bytes", bytes_text, "path",
+                 stage_path);
+}
+
+static void sweep_orphan_stages(const char *final_path) {
+    /* Directory part INCLUDING its trailing separator, so the stage paths
+     * are joined exactly as the final path was spelled. */
+    size_t prefix_len = 0;
+    for (const char *c = final_path; *c; c++) {
+        if (*c == '/'
+#ifdef _WIN32
+            || *c == '\\'
+#endif
+        ) {
+            prefix_len = (size_t)(c - final_path) + 1;
+        }
+    }
+    const char *base = final_path + prefix_len;
+    size_t base_len = strlen(base);
+    if (base_len == 0) {
+        return;
+    }
+    char *dir_path = prefix_len ? (char *)malloc(prefix_len + 1) : strdup(".");
+    if (!dir_path) {
+        return;
+    }
+    if (prefix_len) {
+        memcpy(dir_path, final_path, prefix_len);
+        dir_path[prefix_len] = '\0';
+    }
+    cbm_dir_t *dir = cbm_opendir(dir_path);
+    if (!dir) {
+        free(dir_path);
+        return;
+    }
+    stage_name_list_t list = {0};
+    cbm_dirent_t *entry;
+    while ((entry = cbm_readdir(dir)) != NULL) {
+        /* Any project's orphan, not just this one's: see
+         * stage_entry_stage_length_any_base. `base` still anchors the log line
+         * and the path rebuild below. */
+        size_t stage_len = stage_entry_stage_length_any_base(entry->name);
+        if (stage_len) {
+            stage_name_list_add(&list, entry->name, stage_len);
+        }
+    }
+    cbm_closedir(dir);
+    for (int i = 0; i < list.count; i++) {
+        size_t name_len = strlen(list.names[i]);
+        char *stage_path = (char *)malloc(prefix_len + name_len + 1);
+        if (stage_path) {
+            memcpy(stage_path, final_path, prefix_len);
+            memcpy(stage_path + prefix_len, list.names[i], name_len + 1);
+            sweep_one_stage(stage_path);
+            free(stage_path);
+        }
+        free(list.names[i]);
+    }
+    free(list.names);
+    free(dir_path);
+}
+
 int cbm_pipeline_run(cbm_pipeline_t *p) {
+    /* Per-index attribution: peaks and phase totals are about THIS index, not
+     * the process history, so they start clean here. The first mark opens
+     * the labelled path; every pass.timing site below closes a phase. */
+    cbm_mem_class_reset_peaks();
+    cbm_mem_phase_reset();
+    cbm_mem_phase_mark("pipeline.begin");
     if (!p) {
         return CBM_NOT_FOUND;
     }
@@ -2565,6 +3400,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
     }
     struct stat final_st;
     bool final_existed = stat(final_path, &final_st) == 0;
+    sweep_orphan_stages(final_path);
     char *staging_path = create_staging_path(final_path);
     if (!staging_path) {
         free(final_path);
@@ -2577,10 +3413,15 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         if (!backup_succeeded) {
             cbm_log_warn("pipeline.stage", "action", "backup_failed_full_rebuild", "path",
                          final_path);
-            cleanup_staging_db(staging_path);
+            /* The copy is gone but the NAME stays ours: the rebuilt
+             * generation is renamed over it by the inner finalize and then
+             * published from it below, so its lock is held to the end. */
+            remove_stage_files(staging_path);
         }
     }
 
+    p->final_existed = final_existed;
+    p->existing_generation = final_existed && backup_succeeded;
     char *configured_db_path = p->db_path;
     p->db_path = strdup(staging_path);
     if (!p->db_path) {
@@ -2660,6 +3501,7 @@ int cbm_pipeline_run(cbm_pipeline_t *p) {
         return CBM_PIPELINE_PERSIST_FAILED;
     }
 
+    stage_owner_release(staging_path);
     rc = export_after_publish(p, final_path);
     free(staging_path);
     free(final_path);

@@ -60,7 +60,15 @@ enum {
     MAIN_HOOK_NOTICE_INTERVAL_SECONDS = 900,
     MAIN_CLOSE_TIMEOUT_MS = 5000,
     MAIN_COORDINATION_CLEANUP_MS = 500,
-    PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
+    /* The watchdog only polls, so the STACK it needs is tiny — but on glibc the
+     * thread's static TLS block is carved out of this same allocation, and this
+     * image's TLS is ~50 KB. At the old 64 KB the request was almost entirely
+     * TLS, and when TLS grew past it the thread stopped being creatable at all:
+     * the worker then refused to index without containment and SIGKILLed its own
+     * group, reported everywhere as a bare "killed (signal 9)" (PR #2233).
+     * Sized to hold the TLS block AND a real stack; tests/
+     * test_thread_stack_tls_contract.sh keeps the two from converging again. */
+    PARENT_WATCHDOG_STACK_SIZE = 256 * CBM_SZ_1K,
 };
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
@@ -71,6 +79,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
+#include "foundation/mem_events.h"
 #include "foundation/profile.h"
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
@@ -451,10 +460,22 @@ static bool worker_prepare_process_group(void) {
  * identically — write() and _exit() rather than fprintf/exit, because this runs
  * after fork-sensitive setup and must not touch stdio locks or atexit handlers.
  */
-static void worker_containment_unavailable(void) {
-    static const char message[] =
-        "CBM index worker could not start: process-tree containment unavailable\n";
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+static void worker_containment_unavailable(const char *why) {
+    /* WHICH of the containment conditions failed, and the pids behind it. The
+     * bare sentence cost a full CI cycle and two emulated builds to attribute
+     * (PR #2233): every venue reported the same line, and the supervisor only
+     * ever sees `killed (signal 9)` because the refusal SIGKILLs its own group.
+     * snprintf into a local buffer touches no stdio lock and no atexit handler,
+     * so the fork-sensitivity contract above still holds. */
+    char message[256];
+    int n = snprintf(message, sizeof(message),
+                     "CBM index worker could not start: process-tree containment unavailable "
+                     "(%s; pid=%ld pgrp=%ld ppid=%ld)\n",
+                     why ? why : "unspecified", (long)getpid(), (long)getpgrp(), (long)getppid());
+    if (n > 0) {
+        (void)write(STDERR_FILENO, message,
+                    (size_t)n < sizeof(message) ? (size_t)n : sizeof(message) - 1);
+    }
     (void)kill(-getpid(), SIGKILL);
     _exit(EXIT_FAILURE);
 }
@@ -789,6 +810,36 @@ static bool cli_first_nonspace_is_brace(const char *s) {
 static char *main_local_cli_daemon_execute(const char *tool_name, const char *args_json,
                                            bool quiet_requested);
 
+/* A supervised worker runs in the DAEMON's environment, not the requesting
+ * client's. The daemon admitted this request under the client's session policy
+ * and re-executed us with the canonical repo_path in the args (both daemon
+ * spawn paths rewrite it), so the request itself is the worker's workspace
+ * scope: repository == session root == allowed root. Without this, a fresh
+ * server fell back to the process-wide CBM_ALLOWED_ROOT inherited from whoever
+ * started the daemon and refused every admitted session outside it. Returns
+ * NULL once scoped, otherwise the reason to fail closed: a worker never indexes
+ * under an ambient policy.
+ *
+ * A repository that cannot be canonicalized (it does not exist) can only have
+ * been admitted by a session with no declared boundary, because containment
+ * needs a real path. The worker mirrors that with an explicit unrestricted
+ * policy - still never the environment fallback - so the pipeline reports the
+ * missing repository as the tool error it always was, instead of the
+ * supervisor misreading a refused worker as a crash. */
+static const char *main_index_worker_scope_request(cbm_mcp_server_t *srv, const char *args_json) {
+    char *repo_path = cbm_mcp_get_string_arg(args_json, "repo_path");
+    if (!repo_path || !repo_path[0]) {
+        free(repo_path);
+        return "request names no repo_path";
+    }
+    char canonical[MAIN_PATH_CAP];
+    bool exists = cbm_canonical_path(repo_path, canonical, sizeof(canonical)) != 0;
+    const char *scope = exists ? canonical : repo_path;
+    bool scoped = cbm_mcp_server_set_session_context(srv, scope, exists ? scope : NULL);
+    free(repo_path);
+    return scoped ? NULL : "session context could not be installed";
+}
+
 static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_locks,
                    main_local_maintenance_context_t *maintenance_context) {
     cbm_cli_output_flags_t output_flags;
@@ -824,6 +875,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     const char *worker_marker = cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_MARKER_ARG);
     const char *worker_quarantine =
         cli_strip_flag_value(&argc, argv, CBM_INDEX_WORKER_QUARANTINE_ARG);
+    if (index_worker) {
+        /* The graph lives on this process's heaps: SQLite gets heaps of its
+         * own here, and only here (cbm_sqlite_dedicated_heap). */
+        cbm_sqlite_dedicated_heap(true);
+        cbm_memev_process_role("worker");
+    }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
                                       cbm_index_worker_memory_budget_bytes());
@@ -930,11 +987,15 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
     };
     bool maintenance_binding_failed = false;
     bool maintenance_cancelled = false;
+    const char *worker_scope_refused = NULL;
     if (!index_worker) {
         result = main_local_cli_daemon_execute(tool_name, args_json, output_flags.quiet_requested);
     } else {
         srv = cbm_mcp_server_new(NULL);
         if (srv) {
+            worker_scope_refused = main_index_worker_scope_request(srv, args_json);
+        }
+        if (srv && !worker_scope_refused) {
             /* The in-process worker is a standalone instance: it may not
              * launch MCP-session background tasks. It receives project_locks
              * from its own process-level coordination setup and therefore
@@ -947,8 +1008,8 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
                                                               main_local_cli_mutation_try_begin);
             }
         }
-        maintenance_binding_failed = srv && !maintenance_context;
-        if (srv && maintenance_context) {
+        maintenance_binding_failed = srv && !worker_scope_refused && !maintenance_context;
+        if (srv && !worker_scope_refused && maintenance_context) {
             main_local_maintenance_server_bind(maintenance_context, srv);
             result = cbm_mcp_handle_tool(srv, tool_name, args_json);
             /* Unbind under the same mutex used by cancellation before any
@@ -960,7 +1021,10 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         }
     }
     if (!result) {
-        if (maintenance_binding_failed) {
+        if (worker_scope_refused) {
+            (void)fprintf(stderr, "error: request workspace scope invalid: %s\n",
+                          worker_scope_refused);
+        } else if (maintenance_binding_failed) {
             (void)fprintf(stderr,
                           "error: local %s maintenance cancellation could not bind safely\n",
                           index_worker ? "worker" : "CLI");
@@ -982,6 +1046,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         /* Supervised worker: hand the full result string to the parent via the
          * response file before printing (parent reads it back on a clean exit). */
         const char *ro = cbm_index_worker_response_out();
+        if (cbm_index_worker_active()) {
+            /* Waste dump + execution counts BEFORE the response: the parent may
+             * end the worker as soon as the response file is complete, and the
+             * fast exit below skips every at-exit writer anyway. */
+            cbm_memev_process_exit();
+        }
         bool worker_response_written = false;
         if (ro) {
             FILE *rf = cbm_fopen(ro, "wb");
@@ -1372,7 +1442,7 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
      * only the resulting canonical path, so retargeting the original alias
      * cannot move storage after cohort admission. */
     bool cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
-    if (!cache_ready && cbm_mkdir_p(cache, 0700)) {
+    if (!cache_ready && cbm_mkdir_p_ex(cache, 0700, CBM_MKDIR_FOLLOW_OWNED)) {
         cache_ready = cbm_canonical_path(cache, canonical_cache, sizeof(canonical_cache));
     }
     if (!cache_ready || !cbm_is_dir(canonical_cache)) {
@@ -3031,17 +3101,22 @@ int main(int argc, char **argv) {
          * unconditional in the source, so with the seam compiled out cppcheck
          * correctly reported `!probe()` as always false. Guarding the STEP, not
          * stubbing the function, means release builds simply do not have it. */
-        if (!worker_prepare_process_group() || process_initial_ppid <= 1 ||
-            getppid() != process_initial_ppid) {
-            worker_containment_unavailable();
+        if (!worker_prepare_process_group()) {
+            worker_containment_unavailable("own process group not established");
+        }
+        if (process_initial_ppid <= 1) {
+            worker_containment_unavailable("no supervising parent at startup");
+        }
+        if (getppid() != process_initial_ppid) {
+            worker_containment_unavailable("parent changed since startup");
         }
 #ifdef CBM_ENABLE_TEST_SEAMS
         if (!worker_start_watchdog_test_descendant()) {
-            worker_containment_unavailable();
+            worker_containment_unavailable("watchdog test descendant refused");
         }
 #endif
         if (!worker_start_parent_watchdog(process_initial_ppid)) {
-            worker_containment_unavailable();
+            worker_containment_unavailable("parent-death watchdog would not start");
         }
 #endif
         cbm_index_supervisor_mark_host();
