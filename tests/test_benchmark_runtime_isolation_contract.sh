@@ -33,6 +33,11 @@ ENV_PROBE="$WORKDIR/environment-probe"
 cat > "$ENV_PROBE" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\t%s\n' "${CBM_CACHE_DIR-}" "${CBM_RUNTIME_DIR-}" >> "$CBM_BENCH_ENV_PROBE"
+if [[ "${1-} ${2-}" == "cli index_repository" ]]; then
+    [[ -z "${CBM_BENCH_REQUEST_LOG-}" ]] || printf '%s\n' "${3-}" >> "$CBM_BENCH_REQUEST_LOG"
+    echo "probe: index refused" >&2
+    exit 1
+fi
 [[ "${1-} ${2-}" == "daemon status" ]] && exit 1
 exit 0
 EOF
@@ -92,5 +97,49 @@ CBM_BENCH_ENV_PROBE="$SEARCH_LOG" \
     "$ROOT/scripts/benchmark-search-graph.sh" "$ENV_PROBE" "$REPO" \
     > "$WORKDIR/search.out" 2>&1 || true
 assert_isolated "benchmark-search-graph" "$SEARCH_LOG"
+
+# A refused index must name its cause. The fixture writes one line to stderr and
+# exits non-zero; discarding it leaves "did not report a project" as the only
+# thing an operator sees.
+grep -q -- '--- index/parse stderr ---' "$WORKDIR/search.out" ||
+    fail "benchmark-search-graph hid the index stderr behind its own message"
+grep -q 'probe: index refused' "$WORKDIR/search.out" ||
+    fail "benchmark-search-graph did not surface the cause of the index failure"
+
+# The request carrying the repository path has to be built as JSON. A path may
+# legitimately contain a quote or a backslash — hand-built JSON turns that into
+# a payload the server cannot parse, or one that means something else. NTFS
+# rejects both characters in a path component, so this case is POSIX-only.
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*) ;;
+*)
+    QUIRKY_REPO="$WORKDIR/re\"po\\dir"
+    mkdir -p "$QUIRKY_REPO"
+    echo 'def bench(): return 1' > "$QUIRKY_REPO/bench.py"
+    QUIRKY_RESOLVED=$(cd "$QUIRKY_REPO" && pwd -P)
+    REQUEST_LOG="$WORKDIR/requests.log"
+    CBM_CACHE_DIR="$CALLER_CACHE" \
+    CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+    CBM_BENCH_ENV_PROBE="$WORKDIR/quirky-environment.log" \
+    CBM_BENCH_REQUEST_LOG="$REQUEST_LOG" \
+        "$ROOT/scripts/benchmark-search-graph.sh" "$ENV_PROBE" "$QUIRKY_REPO" \
+        > "$WORKDIR/quirky.out" 2>&1 || true
+    python3 - "$REQUEST_LOG" "$QUIRKY_RESOLVED" <<'PY' || fail "benchmark-search-graph built an index request that is not valid JSON for a quoted path"
+import json
+import sys
+
+request_log, expected = sys.argv[1], sys.argv[2]
+try:
+    lines = [line for line in open(request_log).read().splitlines() if line.strip()]
+except OSError:
+    sys.exit("the search benchmark sent no index request")
+if not lines:
+    sys.exit("the search benchmark sent no index request")
+payload = json.loads(lines[0])
+if payload.get("repo_path") != expected:
+    sys.exit(f"repo_path is {payload.get('repo_path')!r}, expected {expected!r}")
+PY
+    ;;
+esac
 
 echo "PASS: benchmark harnesses isolate their daemon runtime and cache from the caller"

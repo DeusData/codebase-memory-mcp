@@ -22,22 +22,41 @@ REPO=$(cd "$REPO" && pwd -P)
 # shellcheck source=test-runtime.sh
 source "$(dirname "${BASH_SOURCE[0]}")/test-runtime.sh"
 cbm_test_runtime_init
-trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
+BENCH_TMP=""
+trap 'cbm_test_runtime_cleanup "$BINARY"; [ -z "$BENCH_TMP" ] || rm -rf -- "$BENCH_TMP"' EXIT
+BENCH_TMP=$(mktemp -d)
+INDEX_ERR="$BENCH_TMP/index-stderr.log"
 
 if ! "$BINARY" daemon start >/dev/null 2>&1; then
     echo "private daemon did not start" >&2
     exit 1
 fi
-INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":\"$REPO\",\"mode\":\"full\"}" 2>/dev/null || echo '{}')
+# One pre-escaped spelling of the path, the way the soak harness builds its
+# own: a repository path may legitimately contain a quote or a backslash, and
+# hand-built JSON turns that into a parse error.
+REPO_JSON=$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$REPO")
+# Index and parse keep their stderr instead of discarding it: without it the
+# failure below names only its symptom, and the cause — an unreadable
+# repository, a refused daemon, a malformed envelope — is unrecoverable.
+INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":$REPO_JSON,\"mode\":\"full\"}" \
+    2>"$INDEX_ERR" || echo '{}')
 PROJECT=$(echo "$INDEX_JSON" | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 if 'content' in d:
     d = json.loads(d['content'][0]['text'])
 print(d.get('project', ''))
-" 2>/dev/null || echo "")
+" 2>>"$INDEX_ERR" || echo "")
 if [ -z "$PROJECT" ]; then
     echo "index of $REPO did not report a project" >&2
+    if [ -s "$INDEX_ERR" ]; then
+        echo "--- index/parse stderr ---" >&2
+        cat "$INDEX_ERR" >&2
+    fi
+    if [ -n "$INDEX_JSON" ]; then
+        echo "--- index response (first 500 bytes) ---" >&2
+        printf '%.500s\n' "$INDEX_JSON" >&2
+    fi
     exit 1
 fi
 
