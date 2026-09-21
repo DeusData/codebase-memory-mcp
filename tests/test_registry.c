@@ -301,8 +301,7 @@ TEST(resolve_qualified_disambiguates_same_name) {
     ASSERT_TRUE(!nomatch.strategy || strcmp(nomatch.strategy, "qualified_suffix") != 0);
 
     /* A bare call stays ambiguous (no qualifier → no disambiguation signal). */
-    cbm_resolution_t bare =
-        cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
+    cbm_resolution_t bare = cbm_registry_resolve(r, "save", "proj.lib.App.Caller", NULL, NULL, 0);
     ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "qualified_suffix") != 0);
 
     cbm_registry_free(r);
@@ -578,6 +577,44 @@ TEST(resolve_import_reachable_prefix) {
     PASS();
 }
 
+/* The per-file reachability memo answers exactly what the uncached check
+ * answers, file after file: its key arena opens on the first memoized key and
+ * is destroyed with the file, and one key is longer than the arena's first
+ * block. The two files import different packages, so a memo leaking between
+ * files would flip an answer. */
+TEST(reach_cache_memo_matches_uncached_across_files) {
+    static char long_qn[6000];
+    memset(long_qn, 'a', sizeof(long_qn) - 1);
+    long_qn[sizeof(long_qn) - 1] = '\0';
+    memcpy(long_qn, "pkg.io.", 7);
+    long_qn[5000] = '.';
+    const char *cands[] = {"pkg.io.Reader", "pkg.net.Dial", "other.fmt.Println", long_qn};
+    enum { NCANDS = 4 };
+    const char *imports_io[] = {"pkg.io"};
+    const char *imports_net[] = {"pkg.net", "other.fmt"};
+    for (int file = 0; file < 4; file++) {
+        bool io = (file % 2) == 0;
+        const char **imports = io ? imports_io : imports_net;
+        int nimports = io ? 1 : 2;
+        bool expect[NCANDS];
+        for (int i = 0; i < NCANDS; i++) {
+            expect[i] = cbm_registry_is_import_reachable(cands[i], imports, nimports);
+        }
+        /* the uncached answers really differ between the files */
+        ASSERT_EQ(expect[0], io);
+        ASSERT_EQ(expect[1], !io);
+        ASSERT_EQ(expect[3], io);
+        cbm_registry_reach_cache_begin(8);
+        for (int pass = 0; pass < 2; pass++) { /* the second pass is served by the memo */
+            for (int i = 0; i < NCANDS; i++) {
+                ASSERT_EQ(cbm_registry_is_import_reachable(cands[i], imports, nimports), expect[i]);
+            }
+        }
+        cbm_registry_reach_cache_end();
+    }
+    PASS();
+}
+
 /* ── Negative import evidence ─────────────────────────────────── */
 
 TEST(negative_import_rejects_unimported) {
@@ -788,26 +825,26 @@ TEST(cross_language_suffix_match_drops_py_vs_js) {
      * strategy that collapses them; unique_name is #1572 and must stay. */
     ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
                                                          "suffix_match"));
-    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py",
-                                                         "suffix_match"));
-    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py",
-                                                         "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py",
-                                                          "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "unique_name"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "same_module"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "web/src/pages/Editor.js",
-                                                          "import_map"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "store.py", "suffix_match"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_BASH, "cli/main.py", "suffix_match"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, "store.py", "suffix_match"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
+        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
+        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "same_module"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON,
+                                                          "web/src/pages/Editor.js", "import_map"));
     /* JS/TS/TSX are one family. */
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "lib/util.ts",
                                                           "suffix_match"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_TYPESCRIPT, "ui/Panel.tsx",
                                                           "suffix_match"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_PYTHON, NULL, "suffix_match"));
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py",
-                                                          "suffix_match"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_COUNT, "store.py", "suffix_match"));
     PASS();
 }
 
@@ -1046,6 +1083,7 @@ SUITE(registry) {
     /* Import reachability */
     RUN_TEST(resolve_is_import_reachable);
     RUN_TEST(resolve_import_reachable_prefix);
+    RUN_TEST(reach_cache_memo_matches_uncached_across_files);
     /* Negative import evidence */
     RUN_TEST(negative_import_rejects_unimported);
     /* Fuzzy resolve */

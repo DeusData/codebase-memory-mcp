@@ -33,6 +33,7 @@
 #include "foundation/hash_table.h"
 #include "foundation/log.h"
 #include "foundation/compat_fs.h"
+#include "foundation/compat.h" /* CBM_TLS */
 
 #include <stdio.h>
 #include <stdint.h>
@@ -956,6 +957,73 @@ bool cbm_pxc_has_cross_lsp(CBMLanguage lang) {
     }
 }
 
+/* Per-thread arenas for the per-file scratch below (the walk's overlay and the
+ * append dedup keys), kept rewound between files on a resolve worker that has
+ * promised to drop them at its end (cbm_pxc_thread_scratch_begin/_end).
+ * Opened fresh per file they were 18 k 64 KB-default arenas on the Go corpus,
+ * 1.6 GB allocated and 60 % never written (waste sanitizer, 2026-09-17). An
+ * arena one big file grew past PXC_KEEP_BYTES is dropped, not held; a nested
+ * take finds the slot empty and opens its own. Everywhere else (the sequential
+ * pass) take/give are exactly init/destroy. */
+enum { PXC_SCRATCH_DISPATCH = 0, PXC_SCRATCH_KEYS = 1, PXC_SCRATCH_COUNT = 2 };
+enum { PXC_KEEP_BYTES = 4 * 1024 * 1024 };
+static CBM_TLS bool tl_pxc_keep;
+/* The parked arenas live on the HEAP behind one thread-local pointer. Inline in
+ * thread-local storage they were ~8 KB of static TLS charged to every thread in
+ * the image, and static TLS comes out of each thread's own stack allocation, so
+ * past a certain size a small-stack thread cannot be created at all — which is
+ * precisely how this branch broke the 64 KB parent-death watchdog and, with it,
+ * indexing on x86-64 Linux (PR #2233). The holder is allocated once per
+ * keeping thread, so parking still costs no allocation per file. */
+typedef struct {
+    CBMArena arena[PXC_SCRATCH_COUNT];
+    bool live[PXC_SCRATCH_COUNT];
+} pxc_scratch_t;
+static CBM_TLS pxc_scratch_t *tl_pxc;
+
+static void pxc_scratch_take(int slot, CBMArena *into) {
+    if (tl_pxc && tl_pxc->live[slot]) {
+        *into = tl_pxc->arena[slot];
+        tl_pxc->live[slot] = false;
+        cbm_arena_rewind(into);
+        return;
+    }
+    cbm_arena_init(into);
+}
+
+static void pxc_scratch_give(int slot, CBMArena *from) {
+    if (tl_pxc_keep && from->nblocks > 0 && cbm_arena_capacity(from) <= (size_t)PXC_KEEP_BYTES) {
+        if (!tl_pxc) {
+            tl_pxc = cbm_calloc(CBM_MEM_CLASS_OTHER, sizeof(pxc_scratch_t));
+        }
+        if (tl_pxc && !tl_pxc->live[slot]) {
+            tl_pxc->arena[slot] = *from;
+            tl_pxc->live[slot] = true;
+            memset(from, 0, sizeof(*from));
+            return;
+        }
+    }
+    cbm_arena_destroy(from);
+}
+
+void cbm_pxc_thread_scratch_begin(void) {
+    tl_pxc_keep = true;
+}
+
+void cbm_pxc_thread_scratch_end(void) {
+    if (tl_pxc) {
+        for (int slot = 0; slot < PXC_SCRATCH_COUNT; slot++) {
+            if (tl_pxc->live[slot]) {
+                cbm_arena_destroy(&tl_pxc->arena[slot]);
+                tl_pxc->live[slot] = false;
+            }
+        }
+        cbm_free(CBM_MEM_CLASS_OTHER, tl_pxc);
+        tl_pxc = NULL;
+    }
+    tl_pxc_keep = false;
+}
+
 /* Append cross-file results from `src_out` (allocated in a scratch arena
  * about to be destroyed) into `dst_calls` (lives in cache_entry->arena),
  * copying every string field into dst_arena. A manifest-qualified Rust
@@ -980,7 +1048,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
         return;
 
     CBMArena keys;
-    cbm_arena_init(&keys);
+    pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_out->count + 1));
 
     /* Per-file Rust resolution may already have confidently matched the tail
@@ -1073,7 +1141,7 @@ static void pxc_append_results(CBMArena *dst_arena, CBMResolvedCallArray *dst_ca
     }
 
     cbm_ht_free(seen);
-    cbm_arena_destroy(&keys);
+    pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
 }
 
 /* Merge exact synthetic call carriers produced by a cross-LSP resolver. The
@@ -1087,7 +1155,7 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
         return;
 
     CBMArena keys;
-    cbm_arena_init(&keys);
+    pxc_scratch_take(PXC_SCRATCH_KEYS, &keys);
     CBMHashTable *seen = cbm_ht_create((uint32_t)(dst_calls->count + src_calls->count + 1));
 
     for (int i = 0; i < dst_calls->count; i++) {
@@ -1146,7 +1214,7 @@ static void pxc_append_synthetic_calls(CBMArena *dst_arena, CBMCallArray *dst_ca
     }
 
     cbm_ht_free(seen);
-    cbm_arena_destroy(&keys);
+    pxc_scratch_give(PXC_SCRATCH_KEYS, &keys);
 }
 
 /* ── Rust workspace manifest (Cargo.toml) for cross-CRATE resolution ──
@@ -1214,7 +1282,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
     TSTree *tree = r->cached_tree; /* may be NULL — LSP re-parses then */
 
     CBMArena scratch;
-    cbm_arena_init(&scratch);
+    pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
     CBMCallArray synthetic_calls;
@@ -1271,7 +1339,7 @@ void cbm_pxc_run_one(CBMLanguage lang, CBMFileResult *r, const char *source, int
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
     pxc_append_synthetic_calls(&r->arena, &r->calls, &synthetic_calls);
-    cbm_arena_destroy(&scratch);
+    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
 /* Variant of cbm_pxc_run_one for TS/JS/JSX/TSX with explicit dialect
@@ -1281,7 +1349,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                         const char **imp_qns, int imp_count, bool js_mode, bool jsx_mode,
                         bool dts_mode) {
     CBMArena scratch;
-    cbm_arena_init(&scratch);
+    pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
     CBMResolvedCallArray out;
     memset(&out, 0, sizeof(out));
 
@@ -1289,7 +1357,7 @@ void cbm_pxc_run_one_ts(CBMFileResult *r, const char *source, int source_len, co
                          def_count, imp_names, imp_qns, imp_count, r->cached_tree, &out);
 
     pxc_append_results(&r->arena, &r->resolved_calls, &out);
-    cbm_arena_destroy(&scratch);
+    pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
 }
 
 /* Parse the project's root Cargo.toml (if present) into `out_m`, using
@@ -1371,7 +1439,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
          * shared registry -- a use-after-free class the moment the arena was
          * not the result arena (ASan, lsp_resolution_probe). */
         CBMArena scratch;
-        cbm_arena_init(&scratch);
+        pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
         CBMTypeRegistry overlay;
         cbm_registry_init(&overlay, &scratch);
         overlay.fallback = prebuilt;
@@ -1452,7 +1520,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
         }
-        cbm_arena_destroy(&scratch);
+        pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
     }
 
     if (used_prebuilt) {
@@ -1493,7 +1561,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
         CBMTypeRegistry *shared = rust_shared_get ? rust_shared_get(rust_shared_ctx) : NULL;
         if (shared) {
             CBMArena scratch;
-            cbm_arena_init(&scratch);
+            pxc_scratch_take(PXC_SCRATCH_DISPATCH, &scratch);
             CBMResolvedCallArray out = {0};
             CBMCallArray synthetic_calls = {0};
             cbm_run_rust_lsp_cross_with_registry(
@@ -1501,7 +1569,7 @@ void cbm_pxc_dispatch_file(CBMLanguage lang, CBMFileResult *result, const char *
                 result->cached_tree, cbm_pxc_get_rust_manifest(), &out, &synthetic_calls);
             pxc_append_results(&result->arena, &result->resolved_calls, &out);
             pxc_append_synthetic_calls(&result->arena, &result->calls, &synthetic_calls);
-            cbm_arena_destroy(&scratch);
+            pxc_scratch_give(PXC_SCRATCH_DISPATCH, &scratch);
         } else {
             cbm_pxc_run_one(lang, result, source, source_len, def_module, file_defs, file_def_count,
                             imp_keys, imp_vals, imp_count);

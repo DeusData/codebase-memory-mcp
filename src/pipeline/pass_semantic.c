@@ -307,6 +307,103 @@ static int check_go_class_implements(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_nod
     return edges;
 }
 
+/* ── Method-name index over the concrete types ────────────────────
+ *
+ * Checking every interface against every struct and named type is
+ * interfaces x types work: the scaling lane measured it at 4.00x per 2x corpus
+ * (2026-09-17). A type can only satisfy an interface if it supplies EVERY
+ * method name, so it is in the candidate list of each of those names: checking
+ * just the shortest such list, in the original order, runs exactly the checks
+ * that can succeed, in exactly the order they ran before -- the edges and their
+ * insertion order are unchanged. A type supplies a name by either lookup
+ * check_go_class_implements uses: a DEFINES_METHOD edge to a node of that name,
+ * or a node whose QN is "<TypeQN>.<name>". */
+typedef struct {
+    int *items; /* ascending type indices, no duplicates once sealed */
+    int count;
+    int cap;
+} go_type_list_t;
+
+typedef struct {
+    CBMHashTable *by_name;    /* method name (borrowed) -> go_type_list_t* */
+    CBMHashTable *type_by_qn; /* type QN (borrowed) -> (void *)(index + 1) */
+} go_method_index_t;
+
+static void go_index_add(go_method_index_t *ix, const char *name, int type_index) {
+    go_type_list_t *list = cbm_ht_get(ix->by_name, name);
+    if (!list) {
+        list = cbm_calloc(CBM_MEM_CLASS_SEMANTIC, sizeof(*list));
+        if (!list) {
+            return;
+        }
+        cbm_ht_set(ix->by_name, name, list);
+    }
+    if (list->count > 0 && list->items[list->count - 1] == type_index) {
+        return;
+    }
+    if (list->count == list->cap) {
+        int cap = list->cap ? list->cap * PAIR_LEN : CBM_SZ_4;
+        int *grown = cbm_realloc(CBM_MEM_CLASS_SEMANTIC, list->items, (size_t)cap * sizeof(int));
+        if (!grown) {
+            return;
+        }
+        list->items = grown;
+        list->cap = cap;
+    }
+    list->items[list->count++] = type_index;
+}
+
+static void go_index_visit_node(const cbm_gbuf_node_t *node, void *userdata) {
+    go_method_index_t *ix = userdata;
+    const char *qn = node->qualified_name;
+    const char *dot = qn ? strrchr(qn, '.') : NULL;
+    if (!dot || dot == qn || !dot[SKIP_ONE]) {
+        return;
+    }
+    char parent[CBM_SZ_512];
+    size_t len = (size_t)(dot - qn);
+    if (len >= sizeof(parent)) {
+        return; /* longer than the lookup buffer check_go_class_implements builds */
+    }
+    memcpy(parent, qn, len);
+    parent[len] = '\0';
+    void *slot = cbm_ht_get(ix->type_by_qn, parent);
+    if (slot) {
+        go_index_add(ix, dot + SKIP_ONE, (int)((intptr_t)slot - SKIP_ONE));
+    }
+}
+
+static int cmp_int_asc(const void *a, const void *b) {
+    int x = *(const int *)a;
+    int y = *(const int *)b;
+    return (x > y) - (x < y);
+}
+
+static void go_index_seal_list(const char *key, void *val, void *userdata) {
+    (void)key;
+    (void)userdata;
+    go_type_list_t *list = val;
+    if (list->count < PAIR_LEN) {
+        return;
+    }
+    qsort(list->items, (size_t)list->count, sizeof(int), cmp_int_asc);
+    int out = SKIP_ONE;
+    for (int i = SKIP_ONE; i < list->count; i++) {
+        if (list->items[i] != list->items[out - SKIP_ONE]) {
+            list->items[out++] = list->items[i];
+        }
+    }
+    list->count = out;
+}
+
+static void go_index_free_list(const char *key, void *val, void *userdata) {
+    (void)key;
+    (void)userdata;
+    go_type_list_t *list = val;
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, list->items);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, list);
+}
+
 int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
     int edge_count = 0;
 
@@ -328,6 +425,43 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
     cbm_gbuf_find_by_label(ctx->gbuf, "Struct", &structs, &struct_count);
     if (class_count == 0 && struct_count == 0) {
         return 0;
+    }
+
+    /* Candidate index (see go_method_index_t). Type index t is the position in
+     * the original iteration order: structs first, then classes. */
+    int type_count = struct_count + class_count;
+    const cbm_gbuf_node_t **types =
+        cbm_alloc(CBM_MEM_CLASS_SEMANTIC, (size_t)type_count * sizeof(*types));
+    go_method_index_t ix = {
+        .by_name = cbm_ht_create_in(CBM_MEM_CLASS_SEMANTIC, (uint32_t)CBM_SZ_1K),
+        .type_by_qn = cbm_ht_create_in(CBM_MEM_CLASS_SEMANTIC, (uint32_t)type_count),
+    };
+    bool indexed = types && ix.by_name && ix.type_by_qn;
+    if (indexed) {
+        for (int c = 0; c < struct_count; c++) {
+            types[c] = structs[c];
+        }
+        for (int c = 0; c < class_count; c++) {
+            types[struct_count + c] = classes[c];
+        }
+        for (int t = 0; t < type_count; t++) {
+            if (types[t]->qualified_name) {
+                cbm_ht_set(ix.type_by_qn, types[t]->qualified_name,
+                           (void *)(intptr_t)(t + SKIP_ONE));
+            }
+            const cbm_gbuf_edge_t **tdm = NULL;
+            int tdm_count = 0;
+            cbm_gbuf_find_edges_by_source_type(ctx->gbuf, types[t]->id, "DEFINES_METHOD", &tdm,
+                                               &tdm_count);
+            for (int d = 0; d < tdm_count; d++) {
+                const cbm_gbuf_node_t *cm = cbm_gbuf_find_by_id(ctx->gbuf, tdm[d]->target_id);
+                if (cm && cm->name) {
+                    go_index_add(&ix, cm->name, t);
+                }
+            }
+        }
+        cbm_gbuf_foreach_node(ctx->gbuf, go_index_visit_node, &ix);
+        cbm_ht_foreach(ix.by_name, go_index_seal_list, NULL);
     }
 
     for (int i = 0; i < iface_count; i++) {
@@ -358,15 +492,43 @@ int cbm_pipeline_implements_go(cbm_pipeline_ctx_t *ctx) {
             continue;
         }
 
-        /* Check each concrete-type node (Struct + Class) for method-set
-         * satisfaction. */
-        for (int c = 0; c < struct_count; c++) {
-            edge_count += check_go_class_implements(ctx, structs[c], iface, imethods, im_count);
+        if (!indexed) {
+            /* Index unavailable (allocation failure): the full scan. */
+            for (int c = 0; c < struct_count; c++) {
+                edge_count += check_go_class_implements(ctx, structs[c], iface, imethods, im_count);
+            }
+            for (int c = 0; c < class_count; c++) {
+                edge_count += check_go_class_implements(ctx, classes[c], iface, imethods, im_count);
+            }
+            continue;
         }
-        for (int c = 0; c < class_count; c++) {
-            edge_count += check_go_class_implements(ctx, classes[c], iface, imethods, im_count);
+        /* Only the types that supply the interface's rarest method name. */
+        const go_type_list_t *shortest = NULL;
+        bool missing = false;
+        for (int m = 0; m < im_count; m++) {
+            const go_type_list_t *list = cbm_ht_get(ix.by_name, imethods[m].name);
+            if (!list || list->count == 0) {
+                missing = true; /* no type supplies this name: none can satisfy */
+                break;
+            }
+            if (!shortest || list->count < shortest->count) {
+                shortest = list;
+            }
+        }
+        if (missing || !shortest) {
+            continue;
+        }
+        for (int k = 0; k < shortest->count; k++) {
+            edge_count += check_go_class_implements(ctx, types[shortest->items[k]], iface, imethods,
+                                                    im_count);
         }
     }
+    if (ix.by_name) {
+        cbm_ht_foreach(ix.by_name, go_index_free_list, NULL);
+        cbm_ht_free(ix.by_name);
+    }
+    cbm_ht_free(ix.type_by_qn);
+    cbm_free(CBM_MEM_CLASS_SEMANTIC, types);
     return edge_count;
 }
 

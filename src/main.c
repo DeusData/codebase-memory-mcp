@@ -60,7 +60,15 @@ enum {
     MAIN_HOOK_NOTICE_INTERVAL_SECONDS = 900,
     MAIN_CLOSE_TIMEOUT_MS = 5000,
     MAIN_COORDINATION_CLEANUP_MS = 500,
-    PARENT_WATCHDOG_STACK_SIZE = 64 * CBM_SZ_1K, /* watchdog only polls — tiny stack suffices */
+    /* The watchdog only polls, so the STACK it needs is tiny — but on glibc the
+     * thread's static TLS block is carved out of this same allocation, and this
+     * image's TLS is ~50 KB. At the old 64 KB the request was almost entirely
+     * TLS, and when TLS grew past it the thread stopped being creatable at all:
+     * the worker then refused to index without containment and SIGKILLed its own
+     * group, reported everywhere as a bare "killed (signal 9)" (PR #2233).
+     * Sized to hold the TLS block AND a real stack; tests/
+     * test_thread_stack_tls_contract.sh keeps the two from converging again. */
+    PARENT_WATCHDOG_STACK_SIZE = 256 * CBM_SZ_1K,
 };
 #define SLEN(s) (sizeof(s) - 1)
 #include "foundation/log.h"
@@ -71,6 +79,7 @@ enum {
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
 #include "foundation/mem.h"
+#include "foundation/mem_events.h"
 #include "foundation/profile.h"
 #include "foundation/sha256.h"
 #include "foundation/secure_random.h"
@@ -451,10 +460,22 @@ static bool worker_prepare_process_group(void) {
  * identically — write() and _exit() rather than fprintf/exit, because this runs
  * after fork-sensitive setup and must not touch stdio locks or atexit handlers.
  */
-static void worker_containment_unavailable(void) {
-    static const char message[] =
-        "CBM index worker could not start: process-tree containment unavailable\n";
-    (void)write(STDERR_FILENO, message, sizeof(message) - 1);
+static void worker_containment_unavailable(const char *why) {
+    /* WHICH of the containment conditions failed, and the pids behind it. The
+     * bare sentence cost a full CI cycle and two emulated builds to attribute
+     * (PR #2233): every venue reported the same line, and the supervisor only
+     * ever sees `killed (signal 9)` because the refusal SIGKILLs its own group.
+     * snprintf into a local buffer touches no stdio lock and no atexit handler,
+     * so the fork-sensitivity contract above still holds. */
+    char message[256];
+    int n = snprintf(message, sizeof(message),
+                     "CBM index worker could not start: process-tree containment unavailable "
+                     "(%s; pid=%ld pgrp=%ld ppid=%ld)\n",
+                     why ? why : "unspecified", (long)getpid(), (long)getpgrp(), (long)getppid());
+    if (n > 0) {
+        (void)write(STDERR_FILENO, message,
+                    (size_t)n < sizeof(message) ? (size_t)n : sizeof(message) - 1);
+    }
     (void)kill(-getpid(), SIGKILL);
     _exit(EXIT_FAILURE);
 }
@@ -858,6 +879,7 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         /* The graph lives on this process's heaps: SQLite gets heaps of its
          * own here, and only here (cbm_sqlite_dedicated_heap). */
         cbm_sqlite_dedicated_heap(true);
+        cbm_memev_process_role("worker");
     }
     cbm_index_set_worker_role_options(index_worker, response_out, worker_single_thread,
                                       worker_marker, worker_quarantine,
@@ -1024,6 +1046,12 @@ static int run_cli(int argc, char **argv, cbm_project_lock_manager_t *project_lo
         /* Supervised worker: hand the full result string to the parent via the
          * response file before printing (parent reads it back on a clean exit). */
         const char *ro = cbm_index_worker_response_out();
+        if (cbm_index_worker_active()) {
+            /* Waste dump + execution counts BEFORE the response: the parent may
+             * end the worker as soon as the response file is complete, and the
+             * fast exit below skips every at-exit writer anyway. */
+            cbm_memev_process_exit();
+        }
         bool worker_response_written = false;
         if (ro) {
             FILE *rf = cbm_fopen(ro, "wb");
@@ -3073,17 +3101,22 @@ int main(int argc, char **argv) {
          * unconditional in the source, so with the seam compiled out cppcheck
          * correctly reported `!probe()` as always false. Guarding the STEP, not
          * stubbing the function, means release builds simply do not have it. */
-        if (!worker_prepare_process_group() || process_initial_ppid <= 1 ||
-            getppid() != process_initial_ppid) {
-            worker_containment_unavailable();
+        if (!worker_prepare_process_group()) {
+            worker_containment_unavailable("own process group not established");
+        }
+        if (process_initial_ppid <= 1) {
+            worker_containment_unavailable("no supervising parent at startup");
+        }
+        if (getppid() != process_initial_ppid) {
+            worker_containment_unavailable("parent changed since startup");
         }
 #ifdef CBM_ENABLE_TEST_SEAMS
         if (!worker_start_watchdog_test_descendant()) {
-            worker_containment_unavailable();
+            worker_containment_unavailable("watchdog test descendant refused");
         }
 #endif
         if (!worker_start_parent_watchdog(process_initial_ppid)) {
-            worker_containment_unavailable();
+            worker_containment_unavailable("parent-death watchdog would not start");
         }
 #endif
         cbm_index_supervisor_mark_host();

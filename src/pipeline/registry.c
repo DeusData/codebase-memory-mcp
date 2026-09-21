@@ -72,8 +72,18 @@ const char *cbm_confidence_band(double score) {
 
 /* ── Internal types ──────────────────────────────────────────────── */
 
-/* Array of QN strings for byName index */
-typedef CBM_DYN_ARRAY(char *) qn_array_t;
+/* Array of QN strings for byName index, with the test/mock verdict of each
+ * name cached beside it: the scorer asked is_test_qn for every candidate of
+ * every unresolved call, and the answer depends only on the name, which never
+ * changes once registered (waste sanitizer scaling lane, 2026-09-17). Field
+ * order and names match CBM_DYN_ARRAY(char *) so cbm_da_push works on it. */
+typedef struct {
+    char **items;
+    int count;
+    int cap;
+    uint8_t *is_test; /* is_test_qn(items[i]), one byte per entry */
+    int is_test_cap;
+} qn_array_t;
 
 struct cbm_registry {
     /* Interned label strings (<=~30 distinct labels; owned here, freed in
@@ -111,64 +121,124 @@ static const char *simple_name(const char *qn) {
 
 /* Extract everything before the last dot. Returns heap-allocated string. */
 
-/* Count common dot-separated prefix segments. */
+/* Count common dot-separated prefix segments. One pass over the shared prefix:
+ * the same answer as measuring each segment of both strings with strchr and
+ * strlen and comparing them, which walked every candidate's whole name per
+ * call (the scaling lane's x3.4, waste sanitizer 2026-09-17). */
 static int common_prefix_len(const char *a, const char *b) {
     if (!a || !b) {
         return 0;
     }
     int count = 0;
-    while (*a && *b) {
-        /* Find next segment in each */
-        const char *adot = strchr(a, '.');
-        const char *bdot = strchr(b, '.');
-        size_t alen = adot ? (size_t)(adot - a) : strlen(a);
-        size_t blen = bdot ? (size_t)(bdot - b) : strlen(b);
-        if (alen != blen || memcmp(a, b, alen) != 0) {
-            break;
+    size_t i = 0;
+    while (a[i] != '\0' && b[i] != '\0') { /* a segment starts here in both */
+        while (a[i] == b[i] && a[i] != '.' && a[i] != '\0') {
+            i++;
+        }
+        bool a_ends = a[i] == '.' || a[i] == '\0';
+        bool b_ends = b[i] == '.' || b[i] == '\0';
+        if (!a_ends || !b_ends) {
+            break; /* the segments differ in content or in length */
         }
         count++;
-        a += alen + (adot ? SKIP_ONE : 0);
-        b += blen + (bdot ? SKIP_ONE : 0);
-        if (!adot || !bdot) {
-            break;
+        if (a[i] == '\0' || b[i] == '\0') {
+            break; /* one name stops here: no further segment to compare */
         }
+        i++; /* both stand on '.': step into the next segment */
     }
     return count;
 }
 
 enum { REG_TEST_PENALTY = 1000 };
 
-/* Check if a qualified name looks like a test/mock path. */
+/* Check if a qualified name looks like a test/mock path: does it contain any of
+ * Test, test, Mock, mock, Stub, stub, Fake, fake, Fixture, spec? One pass that
+ * dispatches on the first character instead of ten strstr scans of the whole
+ * name (this ran for every candidate of every unresolved call: the scaling
+ * lane's x4.0, waste sanitizer 2026-09-17). */
 static bool is_test_qn(const char *qn) {
     if (!qn) {
         return false;
     }
-    return (strstr(qn, "Test") != NULL || strstr(qn, "test") != NULL ||
-            strstr(qn, "Mock") != NULL || strstr(qn, "mock") != NULL ||
-            strstr(qn, "Stub") != NULL || strstr(qn, "stub") != NULL ||
-            strstr(qn, "Fake") != NULL || strstr(qn, "fake") != NULL ||
-            strstr(qn, "Fixture") != NULL || strstr(qn, "spec") != NULL);
+    for (const char *p = qn; *p; p++) {
+        switch (*p) {
+        case 'T':
+            if (strncmp(p, "Test", 4) == 0) {
+                return true;
+            }
+            break;
+        case 't':
+            if (strncmp(p, "test", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'M':
+            if (strncmp(p, "Mock", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'm':
+            if (strncmp(p, "mock", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'S':
+            if (strncmp(p, "Stub", 4) == 0) {
+                return true;
+            }
+            break;
+        case 's':
+            if (strncmp(p, "stub", 4) == 0 || strncmp(p, "spec", 4) == 0) {
+                return true;
+            }
+            break;
+        case 'F':
+            if (strncmp(p, "Fake", 4) == 0 || strncmp(p, "Fixture", 7) == 0) {
+                return true;
+            }
+            break;
+        case 'f':
+            if (strncmp(p, "fake", 4) == 0) {
+                return true;
+            }
+            break;
+        default:
+            break;
+        }
+    }
+    return false;
+}
+
+/* The cached test verdicts, only when they cover every entry: a failed growth
+ * leaves the cache short, and then the scorer asks per candidate as before. */
+static const uint8_t *qn_test_flags(const qn_array_t *arr) {
+    return arr->is_test && arr->is_test_cap >= arr->count ? arr->is_test : NULL;
 }
 
 /* Score a candidate for tiebreaking. Higher = better.
  * Layer 1: Non-test code preferred over test code (+1000)
- * Layer 2: Namespace proximity via common prefix length (+plen) */
-static int candidate_score(const char *candidate_qn, const char *module_qn) {
+ * Layer 2: Namespace proximity via common prefix length (+plen)
+ * `is_test` is the cached verdict when the caller has one (-1: ask). */
+static int candidate_score(const char *candidate_qn, const char *module_qn, int is_test) {
     int score = 0;
-    if (!is_test_qn(candidate_qn)) {
+    bool test = is_test >= 0 ? is_test != 0 : is_test_qn(candidate_qn);
+    if (!test) {
         score += REG_TEST_PENALTY;
     }
     score += common_prefix_len(candidate_qn, module_qn);
     return score;
 }
 
-/* Pick candidate with highest composite score (test-deprioritization + namespace proximity). */
-static const char *best_by_import_distance(const char **candidates, int count,
-                                           const char *module_qn) {
+/* Pick candidate with highest composite score (test-deprioritization + namespace
+ * proximity). `is_test_flags` is the candidates' cached test verdicts, or NULL
+ * when the caller has none (a filtered subset carries its own copy). */
+static const char *best_by_import_distance(const char **candidates, const uint8_t *is_test_flags,
+                                           int count, const char *module_qn) {
     const char *best = NULL;
     int best_score = CBM_NOT_FOUND;
     for (int i = 0; i < count; i++) {
-        int score = candidate_score(candidates[i], module_qn);
+        int score =
+            candidate_score(candidates[i], module_qn, is_test_flags ? (int)is_test_flags[i] : -1);
         if (score > best_score) {
             best_score = score;
             best = candidates[i];
@@ -190,23 +260,30 @@ static const char *best_by_import_distance(const char **candidates, int count,
  * file exit. Thread-local so each worker has its own cache without
  * contention. */
 static CBM_TLS CBMHashTable *_reach_cache = NULL;
+/* The cache's key copies live in one per-file arena, released with the cache:
+ * a strdup per memoized candidate was 12.5 M malloc + free pairs on the Go
+ * corpus (waste sanitizer, 2026-09-17). Keys are still copies -- the public
+ * cbm_registry_is_import_reachable may be handed a caller's buffer. */
+static CBM_TLS CBMArena _reach_keys;
+static CBM_TLS bool _reach_keys_live = false;
+/* The arena opens on the first memoized key, with a small first block that
+ * doubles: opened eagerly at the 64 KB default, the per-file arenas were 1.4 GB
+ * of cumulative allocation on the Go corpus, almost all of it never written
+ * (waste sanitizer, 2026-09-17). */
+enum { REACH_KEYS_FIRST_BLOCK = 4096 };
 
 /* Sentinels stored as values in the cache. NULL means "not cached".
  * We need two distinct non-NULL pointers to encode true/false. */
 #define REACH_CACHE_TRUE ((void *)(uintptr_t)1)
 #define REACH_CACHE_FALSE ((void *)(uintptr_t)2)
 
-static void reach_cache_free_key(const char *key, void *val, void *ud) {
-    (void)val;
-    (void)ud;
-    free((char *)key);
-}
-
 void cbm_registry_reach_cache_begin(int estimated_capacity) {
     if (_reach_cache) {
         /* Defensive: caller forgot to call _end. Clear and reuse. */
-        cbm_ht_foreach(_reach_cache, reach_cache_free_key, NULL);
         cbm_ht_clear(_reach_cache);
+        if (_reach_keys_live) {
+            cbm_arena_reset(&_reach_keys);
+        }
         return;
     }
     if (estimated_capacity < 16)
@@ -217,9 +294,12 @@ void cbm_registry_reach_cache_begin(int estimated_capacity) {
 void cbm_registry_reach_cache_end(void) {
     if (!_reach_cache)
         return;
-    cbm_ht_foreach(_reach_cache, reach_cache_free_key, NULL);
     cbm_ht_free(_reach_cache);
     _reach_cache = NULL;
+    if (_reach_keys_live) {
+        cbm_arena_destroy(&_reach_keys);
+        _reach_keys_live = false;
+    }
 }
 
 /* ── Per-file import-map prefix → module-QN hash ──────────────────
@@ -341,7 +421,11 @@ static bool is_import_reachable(const char *candidate_qn, const char **import_va
     }
 
     if (_reach_cache) {
-        char *kdup = strdup(candidate_qn);
+        if (!_reach_keys_live) {
+            cbm_arena_init_sized(&_reach_keys, REACH_KEYS_FIRST_BLOCK);
+            _reach_keys_live = true;
+        }
+        char *kdup = cbm_arena_strdup(&_reach_keys, candidate_qn);
         if (kdup) {
             cbm_ht_set(_reach_cache, kdup, reachable ? REACH_CACHE_TRUE : REACH_CACHE_FALSE);
         }
@@ -623,6 +707,7 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     qn_array_t *arr = value;
     if (arr) {
         /* items borrow the exact map's keys — freed there, not here */
+        cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test);
         cbm_da_free(arr);
         free(arr);
     }
@@ -689,7 +774,23 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
         cbm_ht_set(r->by_name, strdup(simple), arr);
     }
+    int before = arr->count;
     cbm_da_push(arr, (char *)owned_qn);
+    if (arr->count == before) {
+        return; /* the name could not be recorded: no verdict to cache */
+    }
+    if (arr->count > arr->is_test_cap) {
+        int want = arr->cap > 0 ? arr->cap : arr->count;
+        uint8_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test, (size_t)want * sizeof(uint8_t));
+        if (grown) {
+            arr->is_test = grown;
+            arr->is_test_cap = want;
+        }
+    }
+    if (arr->count <= arr->is_test_cap) {
+        arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
+    }
 }
 
 /* ── Lookup ──────────────────────────────────────────────────────── */
@@ -842,10 +943,16 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
 static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const char *module_qn,
                                                    const char **import_vals, int import_count) {
     const char *filtered[CBM_SZ_256];
+    uint8_t filtered_test[CBM_SZ_256];
+    const uint8_t *flags = qn_test_flags(arr);
     int fcount = 0;
     for (int i = 0; i < arr->count && fcount < CBM_SZ_256; i++) {
         if (is_import_reachable(arr->items[i], import_vals, import_count)) {
-            filtered[fcount++] = arr->items[i];
+            if (flags) {
+                filtered_test[fcount] = flags[i];
+            }
+            filtered[fcount] = arr->items[i];
+            fcount++;
         }
     }
     if (fcount == SKIP_ONE) {
@@ -853,14 +960,16 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
         return (cbm_resolution_t){filtered[0], "suffix_match", conf, arr->count};
     }
     if (fcount > SKIP_ONE) {
-        const char *best = best_by_import_distance(filtered, fcount, module_qn);
+        const char *best =
+            best_by_import_distance(filtered, flags ? filtered_test : NULL, fcount, module_qn);
         if (best) {
             double conf = candidate_count_penalty(CONF_SUFFIX_MATCH, fcount);
             return (cbm_resolution_t){best, "suffix_match", conf, fcount};
         }
     }
     /* No import-reachable — use all candidates with penalty */
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+    const char *best = best_by_import_distance((const char **)arr->items, qn_test_flags(arr),
+                                               arr->count, module_qn);
     if (best) {
         double conf = candidate_count_penalty(CONF_SUFFIX_MATCH * REG_HALF_PENALTY, arr->count);
         return (cbm_resolution_t){best, "suffix_match", conf, arr->count};
@@ -1046,7 +1155,8 @@ static cbm_resolution_t resolve_name_lookup(const cbm_registry_t *r, const char 
     if (import_vals && import_count > 0) {
         return resolve_multi_with_imports(arr, module_qn, import_vals, import_count);
     }
-    const char *best = best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+    const char *best = best_by_import_distance((const char **)arr->items, qn_test_flags(arr),
+                                               arr->count, module_qn);
     if (best) {
         if (!receiver_chain_admits(callee_name, best)) {
             return empty_result();
@@ -1226,8 +1336,8 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
 
     if (fcount == 0) {
         /* No import-reachable — use originals with penalty */
-        const char *best =
-            best_by_import_distance((const char **)arr->items, arr->count, module_qn);
+        const char *best = best_by_import_distance((const char **)arr->items, qn_test_flags(arr),
+                                                   arr->count, module_qn);
         if (!best) {
             return no_match;
         }
@@ -1241,7 +1351,8 @@ cbm_fuzzy_result_t cbm_registry_fuzzy_resolve(const cbm_registry_t *r, const cha
             {fptr[0], "fuzzy", candidate_count_penalty(CONF_FUZZY_SINGLE, arr->count), arr->count},
             true};
     }
-    const char *best = best_by_import_distance(fptr, fcount, module_qn);
+    const char *best = best_by_import_distance(
+        fptr, fptr == (const char **)arr->items ? qn_test_flags(arr) : NULL, fcount, module_qn);
     if (!best) {
         return no_match;
     }

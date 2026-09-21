@@ -119,6 +119,33 @@ static int setup_parallel_repo(void) {
                "    @Override\n    public double area() { return 0.0; }\n}\n");
     fclose(f);
 
+    /* NAMESPACE-declaring files whose import resolves through the namespace
+     * map (PHP `use`; C# `using` and Java package imports take the same path).
+     * Without these the spill-parity test compared a Go+Java fixture that never
+     * touches that map, so it passed while spilling silently changed import
+     * resolution for every namespaced repository: the map is built from the
+     * in-memory result cache, where a PARKED result is NULL, so a spilled file
+     * contributed no namespace at all and its imports fell through to the
+     * looser fallback (php corpus, 2026-09-18: 57,182 edges in memory against
+     * 59,379 while spilling, same binary, reproducible 3/3 each way). */
+    snprintf(path, sizeof(path), "%s/app", g_par_tmpdir);
+    cbm_mkdir(path);
+    snprintf(path, sizeof(path), "%s/app/Models.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Models;\n\n"
+               "class User {\n    public function name() { return \"u\"; }\n}\n");
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/app/Services.php", g_par_tmpdir);
+    f = fopen(path, "w");
+    if (!f)
+        return -1;
+    fprintf(f, "<?php\nnamespace App\\Services;\n\nuse App\\Models\\User;\n\n"
+               "class UserService {\n"
+               "    public function make() { $u = new User(); return $u->name(); }\n}\n");
+    fclose(f);
+
     return 0;
 }
 

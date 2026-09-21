@@ -13,7 +13,7 @@ internal/cbm/lsp/perl_lsp.c	21
 internal/cbm/lsp/py_lsp.c	2
 internal/cbm/macro_table.c	1
 internal/cbm/service_patterns.c	2
-internal/cbm/sqlite_writer.c	92
+internal/cbm/sqlite_writer.c	74
 src/cli/activation_transaction.c	80
 src/cli/agent_clients.c	73
 src/cli/agent_profiles.c	7
@@ -52,7 +52,7 @@ src/git/git_context.c	18
 src/main.c	32
 src/mcp/compact_out.c	39
 src/mcp/index_supervisor.c	8
-src/mcp/mcp.c	814
+src/mcp/mcp.c	785
 src/pipeline/artifact.c	38
 src/pipeline/fqn.c	23
 src/pipeline/lsp_resolve.h	4
@@ -69,7 +69,7 @@ src/pipeline/pass_envscan.c	2
 src/pipeline/pass_githistory.c	27
 src/pipeline/pass_importance.c	4
 src/pipeline/pass_infrascan.c	2
-src/pipeline/pass_k8s.c	13
+src/pipeline/pass_k8s.c	6
 src/pipeline/pass_lsp_cross.c	50
 src/pipeline/pass_parallel.c	31
 src/pipeline/pass_pkgmap.c	82
@@ -80,7 +80,7 @@ src/pipeline/path_alias.c	42
 src/pipeline/pipeline.c	134
 src/pipeline/pipeline_delta.c	19
 src/pipeline/pipeline_incremental.c	144
-src/pipeline/registry.c	19
+src/pipeline/registry.c	17
 src/pipeline/worker_pool.c	2
 src/store/store.c	358
 src/ui/config.c	12

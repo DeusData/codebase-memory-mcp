@@ -50,6 +50,14 @@ bool cbm_result_spill_peek_header(const cbm_result_spill_t *sp, int slot, CBMFil
  * relations it holds (the collector sizes its array before loading). */
 void cbm_result_spill_peek_counts(const cbm_result_spill_t *sp, int slot, int *defs, int *impls);
 
+/* The namespace/package a parked file declares, or NULL. Kept in MEMORY while
+ * the result itself is on disk, because import resolution builds its namespace
+ * map from EVERY file before any parked one is read back. Without it a spilled
+ * file contributed nothing to that map, so imports resolved differently
+ * depending on memory pressure -- php measured 57,182 edges in memory against
+ * 59,379 while spilling, the same binary, 2026-09-18. */
+const char *cbm_result_spill_namespace(const cbm_result_spill_t *sp, int slot);
+
 /* Counters for the log: results parked, bytes on disk, loads served. */
 void cbm_result_spill_stats(const cbm_result_spill_t *sp, int64_t *parked, int64_t *bytes,
                             int64_t *loads);
