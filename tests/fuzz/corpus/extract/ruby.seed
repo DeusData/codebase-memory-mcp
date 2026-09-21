@@ -1,0 +1,7 @@
+app.rb
+module App
+  class Store
+    def initialize(path) = @path = path
+    def load = File.read(@path)
+  end
+end

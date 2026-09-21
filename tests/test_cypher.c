@@ -485,6 +485,53 @@ TEST(cypher_parse_order_by_over_cap_rejected_issue1334) {
     PASS();
 }
 
+/* #1994: a non-numeric SKIP/LIMIT operand must be a loud parse error too. The old
+ * failure mode was the same one #1334 banned by a different route: expect()
+ * returned NULL, the clause was dropped, and the query still reported success
+ * with limit left at its -1 "no LIMIT" sentinel - so query_graph answered a
+ * bounded query with the entire result set. Cypher parameters ($limit) are the
+ * everyday trigger: they are what a Neo4j-shaped client writes by default. */
+TEST(cypher_parse_nonnumeric_limit_rejected_issue1994) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name LIMIT $limit", &q, &err);
+    ASSERT(rc != 0);
+    free(err);
+    PASS();
+}
+
+TEST(cypher_parse_nonnumeric_skip_rejected_issue1994) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    /* The orphaned operand also swallowed the LIMIT that followed it. */
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name SKIP $offset LIMIT 10", &q, &err);
+    ASSERT(rc != 0);
+    free(err);
+    PASS();
+}
+
+TEST(cypher_parse_word_limit_operand_rejected_issue1994) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name LIMIT abc", &q, &err);
+    ASSERT(rc != 0);
+    free(err);
+    PASS();
+}
+
+/* Control: a well-formed SKIP/LIMIT still parses and still carries its values. */
+TEST(cypher_parse_numeric_skip_limit_still_accepted) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name SKIP 2 LIMIT 10", &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(q->ret->skip, 2);
+    ASSERT_EQ(q->ret->limit, 10);
+
+    cbm_query_free(q);
+    PASS();
+}
+
 TEST(cypher_parse_return_distinct) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -1738,6 +1785,35 @@ TEST(cypher_exec_count) {
     ASSERT_EQ(rc, 0);
     /* HandleOrder→2, ValidateOrder→1 */
     ASSERT_EQ(r.row_count, 2);
+
+    cbm_cypher_result_free(&r);
+    cbm_store_close(s);
+    PASS();
+}
+
+TEST(cypher_exec_optional_bound_terminal_count_ignores_unbound) {
+    cbm_store_t *s = setup_cypher_store();
+    cbm_cypher_result_t r = {0};
+
+    int rc = cbm_cypher_execute(s,
+                                "MATCH (f:Function) OPTIONAL MATCH (t)-[:CALLS]->(f) "
+                                "RETURN f.name, COUNT(t) AS cnt",
+                                "test", 0, &r);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(r.row_count, 4);
+
+    for (int i = 0; i < r.row_count; i++) {
+        const char *name = r.rows[i][0];
+        const char *count = r.rows[i][1];
+        if (strcmp(name, "HandleOrder") == 0) {
+            ASSERT_STR_EQ(count, "0");
+        } else if (strcmp(name, "ValidateOrder") == 0 || strcmp(name, "SubmitOrder") == 0 ||
+                   strcmp(name, "LogError") == 0) {
+            ASSERT_STR_EQ(count, "1");
+        } else {
+            ASSERT_TRUE(false);
+        }
+    }
 
     cbm_cypher_result_free(&r);
     cbm_store_close(s);
@@ -4527,6 +4603,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_return_order_limit);
     RUN_TEST(cypher_parse_multikey_order_by_issue1334);
     RUN_TEST(cypher_parse_order_by_over_cap_rejected_issue1334);
+    RUN_TEST(cypher_parse_nonnumeric_limit_rejected_issue1994);
+    RUN_TEST(cypher_parse_nonnumeric_skip_rejected_issue1994);
+    RUN_TEST(cypher_parse_word_limit_operand_rejected_issue1994);
+    RUN_TEST(cypher_parse_numeric_skip_limit_still_accepted);
     RUN_TEST(cypher_parse_return_distinct);
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
@@ -4578,6 +4658,7 @@ SUITE(cypher) {
     RUN_TEST(cypher_exec_calls_with_where);
     RUN_TEST(cypher_exec_inbound);
     RUN_TEST(cypher_exec_count);
+    RUN_TEST(cypher_exec_optional_bound_terminal_count_ignores_unbound);
     RUN_TEST(cypher_exec_limit);
     RUN_TEST(cypher_exec_order_by);
     RUN_TEST(cypher_exec_variable_length);

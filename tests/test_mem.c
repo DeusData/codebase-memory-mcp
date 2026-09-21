@@ -478,6 +478,33 @@ TEST(resolve_budget_no_override_uses_fraction) {
     PASS();
 }
 
+/* A budget derived from TOTAL ram plans to use memory that may already belong
+ * to another process. Measured 2026-09-18 on a 48 GB host: the 24 GB default
+ * was sized while a 12 GiB VM ran, the kernel index took its full 24.5 GB, and
+ * the machine ran out — the same run completed once the VM was stopped. */
+TEST(clamp_to_available_leaves_headroom_for_the_rest_of_the_machine) {
+    size_t budget = 24576 * CBM_TEST_MB; /* 24 GB, the 50%-of-48 GB default */
+
+    /* Plenty free: the fraction-derived budget stands. */
+    ASSERT_EQ(cbm_mem_clamp_to_available(budget, 40960 * CBM_TEST_MB), budget);
+
+    /* Only 8 GB free: headroom is a quarter of it, so the budget becomes 6 GB
+     * instead of planning to use three times what the machine has. */
+    ASSERT_EQ(cbm_mem_clamp_to_available(budget, 8192 * CBM_TEST_MB), 6144 * CBM_TEST_MB);
+
+    /* Headroom is capped so a big machine does not behave like a small one:
+     * 64 GB free reserves 8 GB, not 16 GB, and 24 GB still fits under that. */
+    ASSERT_EQ(cbm_mem_clamp_to_available(budget, 65536 * CBM_TEST_MB), budget);
+
+    /* Nearly nothing free: clamped to the floor rather than to zero — refusing
+     * to index at all is worse than trying and spilling. */
+    ASSERT_EQ(cbm_mem_clamp_to_available(budget, 256 * CBM_TEST_MB), 512 * CBM_TEST_MB);
+
+    /* The platform could not answer: the ceiling stands, no guessing. */
+    ASSERT_EQ(cbm_mem_clamp_to_available(budget, 0), budget);
+    PASS();
+}
+
 TEST(resolve_budget_invalid_fraction_defaults) {
     /* Out-of-range fractions fall back to the 0.5 default. */
     size_t total = 8192 * CBM_TEST_MB;
@@ -1338,6 +1365,131 @@ TEST(extract_traversal_stacks_come_from_ctx_scratch_issue2010) {
     PASS();
 }
 
+static TSTree *parse_for_test(TSParser *parser, CBMLanguage lang, const char *src) {
+    ts_parser_set_language(parser, cbm_ts_language(lang));
+    return ts_parser_parse_string(parser, NULL, src, (uint32_t)strlen(src));
+}
+
+/* The field-id cache behind ts_node_child_by_field_name (cbm.h) must answer
+ * exactly what tree-sitter answers, for every node and name -- including names
+ * that are not fields, a name handed in through a REUSED buffer, and the same
+ * name in another grammar. The real function is reached with parentheses, which
+ * suppress the macro. */
+TEST(field_id_cache_answers_exactly_what_tree_sitter_answers) {
+    static const char *const names[] = {"name",   "body",     "type",  "parameters",
+                                        "result", "receiver", "value", "not_a_field"};
+    const char *go_src = "package p\n"
+                         "type T struct { A int }\n"
+                         "func (t *T) Area(x int) (int, error) { return x, nil }\n"
+                         "func F() { var v = T{}; _ = v }\n";
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    TSTree *tree = parse_for_test(parser, CBM_LANG_GO, go_src);
+    ASSERT_NOT_NULL(tree);
+
+    int compared = 0;
+    TSTreeCursor walk = ts_tree_cursor_new(ts_tree_root_node(tree));
+    bool more = true;
+    while (more) {
+        TSNode node = ts_tree_cursor_current_node(&walk);
+        for (size_t n = 0; n < sizeof(names) / sizeof(names[0]); n++) {
+            uint32_t len = (uint32_t)strlen(names[n]);
+            TSNode cached = cbm_ts_child_by_field_name(node, names[n], len);
+            TSNode real = (ts_node_child_by_field_name)(node, names[n], len);
+            ASSERT_TRUE(ts_node_eq(cached, real));
+            compared++;
+        }
+        if (ts_tree_cursor_goto_first_child(&walk)) {
+            continue;
+        }
+        while (!ts_tree_cursor_goto_next_sibling(&walk)) {
+            if (!ts_tree_cursor_goto_parent(&walk)) {
+                more = false;
+                break;
+            }
+        }
+    }
+    ts_tree_cursor_delete(&walk);
+    ASSERT_GT(compared, 100);
+
+    /* A reused buffer: same pointer, different name. */
+    TSNode root = ts_tree_root_node(tree);
+    TSNode method = ts_node_named_child(root, 2);
+    char buf[16];
+    memcpy(buf, "name", 5);
+    TSNode by_name = cbm_ts_child_by_field_name(method, buf, 4);
+    memcpy(buf, "body", 5);
+    TSNode by_body = cbm_ts_child_by_field_name(method, buf, 4);
+    ASSERT_TRUE(ts_node_eq(by_body, (ts_node_child_by_field_name)(method, "body", 4)));
+    ASSERT_FALSE(ts_node_eq(by_name, by_body));
+
+    /* The same name in another grammar resolves against that grammar. */
+    TSTree *ts_tree = parse_for_test(parser, CBM_LANG_TYPESCRIPT, "function g(a) { return a; }\n");
+    ASSERT_NOT_NULL(ts_tree);
+    TSNode fn = ts_node_named_child(ts_tree_root_node(ts_tree), 0);
+    ASSERT_TRUE(ts_node_eq(cbm_ts_child_by_field_name(fn, "name", 4),
+                           (ts_node_child_by_field_name)(fn, "name", 4)));
+    ASSERT_FALSE(ts_node_is_null(cbm_ts_child_by_field_name(fn, "name", 4)));
+
+    ts_tree_delete(ts_tree);
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
+/* Recursive walkers take one pooled cursor per depth (cbm_cursor_acquire). A
+ * depth whose slot is still held -- another walker nested on this thread --
+ * must get a private cursor, never the busy one; and a pooled cursor walks the
+ * children exactly like a fresh one. */
+TEST(cursor_pool_hands_each_depth_its_own_cursor) {
+    TSParser *parser = ts_parser_new();
+    ASSERT_NOT_NULL(parser);
+    TSTree *tree =
+        parse_for_test(parser, CBM_LANG_GO, "package p\nfunc A() {}\nfunc B() {}\nvar C = 1\n");
+    ASSERT_NOT_NULL(tree);
+    TSNode root = ts_tree_root_node(tree);
+
+    cbm_cursor_lease_t d0;
+    cbm_cursor_lease_t d1;
+    cbm_cursor_lease_t nested;
+    TSTreeCursor *c0 = cbm_cursor_acquire(&d0, 0, root);
+    TSTreeCursor *c1 = cbm_cursor_acquire(&d1, 1, ts_node_named_child(root, 0));
+    TSTreeCursor *cn = cbm_cursor_acquire(&nested, 0, root); /* depth 0 is busy */
+    ASSERT_TRUE(d0.slot == 0);
+    ASSERT_TRUE(d1.slot == 1);
+    ASSERT_TRUE(nested.slot == -1);
+    ASSERT_TRUE(c0 != c1 && cn != c0 && cn != c1);
+
+    /* The pooled cursor walks the same children as a fresh one. */
+    TSTreeCursor fresh = ts_tree_cursor_new(root);
+    bool pooled_ok = ts_tree_cursor_goto_first_child(c0);
+    bool fresh_ok = ts_tree_cursor_goto_first_child(&fresh);
+    int siblings = 0;
+    while (pooled_ok && fresh_ok) {
+        ASSERT_TRUE(
+            ts_node_eq(ts_tree_cursor_current_node(c0), ts_tree_cursor_current_node(&fresh)));
+        siblings++;
+        pooled_ok = ts_tree_cursor_goto_next_sibling(c0);
+        fresh_ok = ts_tree_cursor_goto_next_sibling(&fresh);
+    }
+    ASSERT_FALSE(pooled_ok || fresh_ok);
+    ASSERT_GT(siblings, 2);
+    ts_tree_cursor_delete(&fresh);
+
+    cbm_cursor_release(&nested);
+    cbm_cursor_release(&d1);
+    cbm_cursor_release(&d0);
+    /* Released: the same depth hands out its pooled cursor again. */
+    cbm_cursor_lease_t again;
+    ASSERT_TRUE(cbm_cursor_acquire(&again, 0, root) == c0);
+    cbm_cursor_release(&again);
+
+    cbm_destroy_thread_parser(); /* releases the pool */
+    ts_tree_delete(tree);
+    ts_parser_delete(parser);
+    PASS();
+}
+
 /* ── mem_core: the central allocation route ────────────────────────────
  *
  * Every assertion below is a DELTA, never an absolute. Other code in this
@@ -1603,6 +1755,7 @@ SUITE(mem) {
     RUN_TEST(mem_init_second_call_noop);
     /* CBM_MEM_BUDGET_MB budget override */
     RUN_TEST(resolve_budget_no_override_uses_fraction);
+    RUN_TEST(clamp_to_available_leaves_headroom_for_the_rest_of_the_machine);
     RUN_TEST(resolve_budget_invalid_fraction_defaults);
     RUN_TEST(resolve_budget_override_wins);
     RUN_TEST(resolve_budget_override_clamped_to_total);
@@ -1635,6 +1788,8 @@ SUITE(mem) {
 
     /* extraction scratch arena (#2010) */
     RUN_TEST(extract_traversal_stacks_come_from_ctx_scratch_issue2010);
+    RUN_TEST(field_id_cache_answers_exactly_what_tree_sitter_answers);
+    RUN_TEST(cursor_pool_hands_each_depth_its_own_cursor);
     RUN_TEST(mem_core_accounts_alloc_and_free);
     RUN_TEST(mem_core_classes_do_not_bleed);
     RUN_TEST(mem_core_realloc_replaces_the_old_charge);

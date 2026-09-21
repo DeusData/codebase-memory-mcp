@@ -2600,31 +2600,31 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     uint32_t depth = 0;
     uint32_t visited = 0;
 #ifdef CBM_ENABLE_TEST_SEAMS
-    /* CBM_TEST_WALK_BUDGET_NODES=<n>: the budget is "spent" after n nodes,
-     * no real timing involved. */
-    uint32_t seam_budget_nodes = 0;
+    /* CBM_TEST_WALK_BUDGET_NODES=<n>: spend the budget after n nodes. Production
+     * now counts nodes too, so this seam only shortens the budget; it no longer
+     * has to stand in for a mechanism of its own. */
+    uint32_t budget_nodes = ctx->walk_budget_nodes;
     {
         const char *seam = getenv("CBM_TEST_WALK_BUDGET_NODES");
         if (seam && seam[0]) {
-            seam_budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
+            budget_nodes = (uint32_t)strtoul(seam, NULL, 10);
         }
     }
+#else
+    const uint32_t budget_nodes = ctx->walk_budget_nodes;
 #endif
 
     for (;;) {
         TSNode node = ts_tree_cursor_current_node(&cursor);
         visited++;
-        if (ctx->walk_deadline_cpu_ns != 0 && (visited & 1023u) == 0 &&
-            cbm_thread_cpu_time_ns() > ctx->walk_deadline_cpu_ns) {
+        /* The budget is spent in nodes, so the walk of a given file always ends
+         * on the same node — on any machine, under any load. A CPU deadline
+         * here made the graph differ between two runs on one machine; see
+         * CBM_WALK_MAX_NODES_DEFAULT (cbm.c). */
+        if (budget_nodes != 0 && visited > budget_nodes) {
             ctx->walk_budget_exhausted = true;
             break;
         }
-#ifdef CBM_ENABLE_TEST_SEAMS
-        if (seam_budget_nodes != 0 && visited > seam_budget_nodes) {
-            ctx->walk_budget_exhausted = true;
-            break;
-        }
-#endif
         bool trivia = is_unified_trivia_node(node);
         if (!trivia) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred
@@ -2678,6 +2678,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
     }
 
     cbm_finalize_lexical_usages(ctx, &state);
+    ctx->walk_nodes_visited = visited;
     ts_tree_cursor_delete(&occurrence_cursor);
     ts_tree_cursor_delete(&cursor);
 }
