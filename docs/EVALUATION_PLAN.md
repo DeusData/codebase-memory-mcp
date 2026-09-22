@@ -298,6 +298,9 @@ for lang in $ALL_LANGS; do                      # ALL_LANGS = full 159-name list
   #               + per-language report + (deferred, blind) judge ---
 
   # --- step 8: delete THIS language's index so the next is cold, then mark done ---
+  # The graph session (steps 4-7) may still have a daemon running under the kept
+  # CBM_RUNTIME_DIR (exported above); stop it before its root goes away.
+  ~/.local/bin/codebase-memory-mcp daemon stop || true
   rm -rf -- "$CBM_BENCH_RUNTIME_ROOT"
   manifest_mark_done "$lang" "$index_ms"
 done
@@ -864,10 +867,13 @@ Deep-Dive section.
 # 1. Clone all 159 repos (shallow; skip existing)
 scripts/clone-bench-repos.sh /tmp/bench
 
-# 2. Cold index all 159 (LSP cohort in full mode)
-rm -f ~/.cache/codebase-memory-mcp/*.db
+# 2. Cold index all 159 (LSP cohort in full mode). Each language is indexed into a run-private
+#    runtime and cache (#1696); CBM_BENCH_KEEP_RUNTIME=1 keeps that root after a successful
+#    index and records its paths in /tmp/eval-results/<lang>/runtime-root.txt. Source it
+#    before the graph phase, then stop the daemon and remove the root, as in §7 step 8.
 mkdir -p /tmp/eval-results
 for lang in $ALL_LANGS; do
+  CBM_BENCH_KEEP_RUNTIME=1 \
   scripts/benchmark-index.sh ~/.local/bin/codebase-memory-mcp "$lang" /tmp/bench/"$lang" /tmp/eval-results
 done
 
