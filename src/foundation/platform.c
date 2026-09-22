@@ -731,11 +731,20 @@ const char *cbm_resolve_cache_dir(void) {
 }
 
 const char *cbm_resolve_memory_dir(void) {
-    static char buf[CBM_SZ_1K];
-    char tmp[CBM_SZ_256] = "";
-    cbm_safe_getenv("CBM_MEMORY_DIR", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s", tmp);
+    /* Mirrors cbm_resolve_cache_dir: TLS buffer so concurrent daemon
+     * sessions do not race on the returned pointer; 4K bound so a
+     * CBM_MEMORY_DIR that is present but too long fails closed (NULL)
+     * instead of being silently truncated to the default location. */
+    static CBM_TLS char buf[CBM_SZ_4K];
+    static const char missing[] = "\x1f"
+                                  "CBM_MEMORY_DIR_MISSING"
+                                  "\x1f";
+    const char *configured = cbm_safe_getenv("CBM_MEMORY_DIR", buf, sizeof(buf), missing);
+    if (!configured) {
+        /* Present but not representable in the product path bound. */
+        return NULL;
+    }
+    if (strcmp(configured, missing) != 0 && configured[0]) {
         cbm_normalize_path_sep(buf);
         return buf;
     }
@@ -745,26 +754,49 @@ const char *cbm_resolve_memory_dir(void) {
     if (!local) {
         return NULL;
     }
-    snprintf(buf, sizeof(buf), "%s/codebase-memory-mcp", local);
+    int written = snprintf(buf, sizeof(buf), "%s/codebase-memory-mcp", local);
+    if (written <= 0 || (size_t)written >= sizeof(buf)) {
+        buf[0] = '\0';
+        return NULL;
+    }
     return buf;
 #elif defined(__APPLE__)
     const char *home = cbm_get_home_dir();
     if (!home) {
         return NULL;
     }
-    snprintf(buf, sizeof(buf), "%s/Library/Application Support/codebase-memory-mcp", home);
+    int written = snprintf(buf, sizeof(buf),
+                          "%s/Library/Application Support/codebase-memory-mcp", home);
+    if (written <= 0 || (size_t)written >= sizeof(buf)) {
+        buf[0] = '\0';
+        return NULL;
+    }
     return buf;
 #else
-    cbm_safe_getenv("XDG_DATA_HOME", tmp, sizeof(tmp), NULL);
-    if (tmp[0]) {
-        snprintf(buf, sizeof(buf), "%s/codebase-memory-mcp", tmp);
+    static const char missing_xdg[] = "\x1f"
+                                      "XDG_DATA_HOME_MISSING"
+                                      "\x1f";
+    const char *xdg = cbm_safe_getenv("XDG_DATA_HOME", buf, sizeof(buf), missing_xdg);
+    if (xdg && strcmp(xdg, missing_xdg) != 0 && xdg[0]) {
+        /* Append after the value cbm_safe_getenv left in buf: snprintf with
+         * src == dst (buf as both target and %s argument) would overlap. */
+        size_t prefix = strlen(buf);
+        int written = snprintf(buf + prefix, sizeof(buf) - prefix, "/codebase-memory-mcp");
+        if (written <= 0 || (size_t)written >= sizeof(buf) - prefix) {
+            buf[0] = '\0';
+            return NULL;
+        }
         return buf;
     }
     const char *home = cbm_get_home_dir();
     if (!home) {
         return NULL;
     }
-    snprintf(buf, sizeof(buf), "%s/.local/share/codebase-memory-mcp", home);
+    int written = snprintf(buf, sizeof(buf), "%s/.local/share/codebase-memory-mcp", home);
+    if (written <= 0 || (size_t)written >= sizeof(buf)) {
+        buf[0] = '\0';
+        return NULL;
+    }
     return buf;
 #endif
 }

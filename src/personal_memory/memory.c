@@ -1,6 +1,7 @@
 #include "personal_memory/memory.h"
 
 #include "cli/cli.h"
+#include "foundation/compat.h" /* CBM_TLS */
 #include "foundation/compat_fs.h"
 #include "foundation/constants.h"
 #include "foundation/mem_core.h"
@@ -29,6 +30,16 @@ bool cbm_memory_enabled(struct cbm_config *cfg) {
 }
 
 const char *cbm_memory_resolve_dir(struct cbm_config *cfg) {
+    /* CBM_MEMORY_DIR wins over the stored config value, matching the
+     * config-key help text "(overridden by CBM_MEMORY_DIR)". A value present
+     * but too long to represent fails closed here (NULL) and the boundary
+     * check below rejects the fallback the same as any other dir. */
+    static CBM_TLS char env_buf[CBM_SZ_4K];
+    const char *env = cbm_safe_getenv("CBM_MEMORY_DIR", env_buf, sizeof(env_buf), NULL);
+    if (env && env[0]) {
+        cbm_normalize_path_sep(env_buf);
+        return env_buf;
+    }
     if (cfg) {
         const char *configured = cbm_config_get(cfg, CBM_CONFIG_MEMORY_DIR, "");
         if (configured && configured[0]) {
@@ -44,15 +55,13 @@ char *cbm_memory_db_path(struct cbm_config *cfg, bool create_dir) {
         return NULL;
     }
     if (create_dir) {
+        /* mkdir_p applies MEMORY_DIR_PERMS only to directories it creates;
+         * a pre-existing user-chosen directory keeps its own mode. Forcing
+         * chmod on it would silently narrow a directory the user set up for
+         * another purpose. */
         if (!cbm_mkdir_p(dir, MEMORY_DIR_PERMS)) {
             return NULL;
         }
-#ifndef _WIN32
-        /* Personal memory may contain user notes, paths, and operational context.
-         * Keep the storage directory private even when it already existed with
-         * broader permissions from an older build or user-created path. */
-        (void)chmod(dir, MEMORY_DIR_PERMS);
-#endif
     }
     int n = snprintf(NULL, 0, "%s/memory.db", dir);
     if (n < 0) {
@@ -79,6 +88,31 @@ static void memory_copy_norm(char *dst, size_t dst_sz, const char *src) {
     }
 }
 
+/* A path component equal to ".." lets the not-yet-existing tail in
+ * memory_canonicalize_maybe_missing walk back out of the resolved parent,
+ * defeating the containment check (review item: reject it up front). A
+ * leading "~" or drive-relative tail is equally not a stable location. */
+static bool memory_path_has_dotdot(const char *path) {
+    if (!path) {
+        return false;
+    }
+    const char *p = path;
+    while (*p) {
+        const char *seg = p;
+        while (*p && *p != '/') {
+            p++;
+        }
+        size_t seglen = (size_t)(p - seg);
+        if (seglen == 2 && seg[0] == '.' && seg[1] == '.') {
+            return true;
+        }
+        if (*p == '/') {
+            p++;
+        }
+    }
+    return false;
+}
+
 static bool memory_path_is_absolute(const char *path) {
     if (!path || !path[0]) {
         return false;
@@ -98,10 +132,16 @@ static bool memory_path_is_absolute(const char *path) {
  * and the memory dir (e.g. /tmp/foo/.cbm-memory) has not been created yet. */
 static bool memory_canonicalize_maybe_missing(const char *in, char *out, size_t out_sz) {
     if (cbm_canonical_path(in, out, out_sz)) {
+#ifdef _WIN32
+        /* GetFinalPathNameByHandleW yields backslashes; the containment
+         * compare below expects normalized separators, so normalize AFTER
+         * canonicalizing (same pattern as resolve_canonical_path in mcp.c). */
+        cbm_normalize_path_sep(out);
+#endif
         return true;
     }
     /* Path does not exist. Resolve the longest existing prefix. */
-    char parent[CBM_SZ_1K];
+    char parent[CBM_SZ_4K];
     snprintf(parent, sizeof(parent), "%s", in);
     for (;;) {
         char *slash = strrchr(parent, '/');
@@ -114,6 +154,9 @@ static bool memory_canonicalize_maybe_missing(const char *in, char *out, size_t 
         }
         *slash = '\0';
         if (cbm_canonical_path(parent, out, out_sz)) {
+#ifdef _WIN32
+            cbm_normalize_path_sep(out);
+#endif
             const char *tail = in + (slash - parent) + 1;
             size_t len = strlen(out);
             if (len + 1 + strlen(tail) + 1 > out_sz) {
@@ -128,10 +171,13 @@ static bool memory_canonicalize_maybe_missing(const char *in, char *out, size_t 
 }
 
 static bool memory_path_contains_dir(const char *root, const char *path) {
-    char r[CBM_SZ_1K];
-    char p[CBM_SZ_1K];
-    char cr[CBM_SZ_1K];
-    char cp[CBM_SZ_1K];
+    /* cbm_canonical_path requires out buffers >= 4096 bytes: its POSIX body
+     * is realpath(), which on Linux (PATH_MAX 4096) can resolve a short
+     * symlinked path to a much longer one. 1K buffers here overflowed. */
+    char r[CBM_SZ_4K];
+    char p[CBM_SZ_4K];
+    char cr[CBM_SZ_4K];
+    char cp[CBM_SZ_4K];
     memory_copy_norm(r, sizeof(r), root);
     memory_copy_norm(p, sizeof(p), path);
     /* Canonicalize both paths so a symlinked memory_dir pointing into the
@@ -148,7 +194,20 @@ static bool memory_path_contains_dir(const char *root, const char *path) {
     if (strcmp(rr, pp) == 0) {
         return true;
     }
-    return strncmp(pp, rr, rlen) == 0 && (rr[rlen - 1] == '/' || pp[rlen] == '/');
+#ifdef _WIN32
+    /* Windows paths are case-insensitive: an in-repo directory whose
+     * canonical form differs only in case (or drive-letter casing) must
+     * still be recognized as contained. */
+    size_t plen = strlen(pp);
+    bool prefix_equal = rlen <= plen && _strnicmp(pp, rr, rlen) == 0;
+#else
+    size_t plen = strlen(pp);
+    bool prefix_equal = rlen <= plen && strncmp(pp, rr, rlen) == 0;
+#endif
+    /* Separators are already normalized on both sides, so a '\\' boundary
+     * cannot slip through a '/'-only compare. rlen == plen covers a path
+     * equal to the root itself (on Windows possibly differing in case). */
+    return prefix_equal && (rr[rlen - 1] == '/' || rlen == plen || pp[rlen] == '/');
 }
 
 bool cbm_memory_storage_allowed(struct cbm_config *cfg, const char *root_path, char *reason,
@@ -162,6 +221,9 @@ bool cbm_memory_storage_allowed(struct cbm_config *cfg, const char *root_path, c
     } else if (!memory_path_is_absolute(dir)) {
         status = "memory_dir_must_be_absolute";
         allowed = false;
+    } else if (memory_path_has_dotdot(dir)) {
+        status = "memory_dir_must_not_traverse";
+        allowed = false;
     } else if (root_path && root_path[0] && memory_path_contains_dir(root_path, dir)) {
         status = "memory_dir_inside_repo";
         allowed = false;
@@ -172,10 +234,21 @@ bool cbm_memory_storage_allowed(struct cbm_config *cfg, const char *root_path, c
     return allowed;
 }
 
-cbm_store_t *cbm_memory_open(struct cbm_config *cfg, char **out_path) {
+cbm_store_t *cbm_memory_open(struct cbm_config *cfg, const char *root_path, char **out_path) {
     char *path = cbm_memory_db_path(cfg, true);
     if (!path) {
         return NULL;
+    }
+    /* Re-run the containment check on the now-existing directory: the
+     * pre-check ran before cbm_mkdir_p created it, and a not-yet-existing
+     * tail could only be resolved through its parent. This also closes the
+     * check-then-create window between storage_allowed and mkdir. */
+    if (root_path && root_path[0]) {
+        char reason[CBM_SZ_256];
+        if (!cbm_memory_storage_allowed(cfg, root_path, reason, sizeof(reason))) {
+            cbm_free(MEMORY_MEM_CLASS, path);
+            return NULL;
+        }
     }
     cbm_store_t *store = cbm_store_open_path(path);
     if (out_path) {
@@ -278,7 +351,7 @@ void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc, y
                                   const char *db_path, bool reveal_paths) {
     const char *cache_dir_resolved = cbm_resolve_cache_dir();
     const char *memory_dir_resolved = cbm_memory_resolve_dir(cfg);
-    char memory_dir_buf[CBM_SZ_1K];
+    char memory_dir_buf[CBM_SZ_4K];
     snprintf(memory_dir_buf, sizeof(memory_dir_buf), "%s",
              memory_dir_resolved ? memory_dir_resolved : "");
     yyjson_mut_obj_add_str(doc, root, "storage", "personal");
@@ -292,7 +365,13 @@ void cbm_memory_add_settings_json(struct cbm_config *cfg, yyjson_mut_doc *doc, y
     yyjson_mut_obj_add_bool(doc, root, "enabled", cbm_memory_enabled(cfg));
     yyjson_mut_obj_add_str(doc, root, "cache_env", "CBM_CACHE_DIR");
     yyjson_mut_obj_add_str(doc, root, "memory_env", "CBM_MEMORY_DIR");
+#ifdef _WIN32
+    /* chmod() is a POSIX call; on Windows privacy comes from the per-user
+     * profile ACLs, so claiming a 0700 mode there would be fiction. */
+    yyjson_mut_obj_add_str(doc, root, "dir_mode", "acl:per-user");
+#else
     yyjson_mut_obj_add_str(doc, root, "dir_mode", "0700");
+#endif
     yyjson_mut_obj_add_bool(doc, root, "paths_redacted", !reveal_paths);
     if (reveal_paths) {
         yyjson_mut_obj_add_str(doc, root, "cache_dir",
@@ -315,12 +394,15 @@ void cbm_memory_add_list_json(cbm_store_t *store, const char *repo_id, yyjson_mu
     if (store && repo_id) {
         sqlite3 *db = cbm_store_get_db(store);
         sqlite3_stmt *stmt = NULL;
-        const char *sql = "SELECT project, updated_at FROM project_summaries WHERE project LIKE ?1 "
-                          "ORDER BY updated_at DESC";
+        /* Prefix match with substr, not LIKE: a repo_id containing `_` or `%`
+         * must match literally. The key shape is "<repo>::branch:<b>::doc:<d>",
+         * so entries for this repo start with repo_id followed by "::". */
+        const char *sql =
+            "SELECT project, updated_at FROM project_summaries "
+            "WHERE substr(project, 1, length(?1)) = ?1 "
+            "AND substr(project, length(?1) + 1, 2) = '::' ORDER BY updated_at DESC";
         if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) == SQLITE_OK) {
-            char pattern[CBM_SZ_2K];
-            snprintf(pattern, sizeof(pattern), "%s::branch:%%::doc:%%", repo_id);
-            sqlite3_bind_text(stmt, 1, pattern, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 1, repo_id, -1, SQLITE_TRANSIENT);
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 const char *key = (const char *)sqlite3_column_text(stmt, 0);
                 const char *updated_at = (const char *)sqlite3_column_text(stmt, 1);

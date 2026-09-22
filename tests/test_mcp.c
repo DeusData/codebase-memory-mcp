@@ -19973,6 +19973,104 @@ TEST(detect_changes_default_output_is_byte_identical_golden) {
 /* ingest_traces stores for real now (the stub answered "accepted" and
  * discarded). Without a resolvable project there is nothing to store
  * against — a tool error, not a polite lie. */
+TEST(tool_manage_memory_boundary_symlink_and_dotdot) {
+#ifndef _WIN32
+    char tmp_dir[256];
+    snprintf(tmp_dir, sizeof(tmp_dir), "/tmp/cbm-memory-symlink-test-XXXXXX");
+    if (!cbm_mkdtemp(tmp_dir)) {
+        PASS();
+    }
+    char repo_dir[512];
+    snprintf(repo_dir, sizeof(repo_dir), "%s/repo", tmp_dir);
+    ASSERT_TRUE(cbm_mkdir_p(repo_dir, 0700));
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmp_dir);
+    cbm_config_t *cfg = cbm_config_open(cache_dir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_EQ(cbm_config_set(cfg, CBM_CONFIG_MEMORY_ENABLED, "true"), 0);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_config(srv, cfg);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(st);
+    cbm_store_upsert_project(st, "memory-symlink-proj", repo_dir);
+    cbm_mcp_server_set_project(srv, "memory-symlink-proj");
+
+    /* Case 1: a symlinked CBM_MEMORY_DIR that resolves INTO the repo must be
+     * rejected by canonicalization, not by the lexical prefix the old check
+     * used. The link itself lives outside the repo. */
+    char link_dir[512];
+    snprintf(link_dir, sizeof(link_dir), "%s/outside-link", tmp_dir);
+    char target_dir[512];
+    snprintf(target_dir, sizeof(target_dir), "%s/inside", repo_dir);
+    ASSERT_TRUE(cbm_mkdir_p(target_dir, 0700));
+    ASSERT_EQ(symlink(target_dir, link_dir), 0);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", link_dir, 1), 0);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2310,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{"
+             "\"project\":\"memory-symlink-proj\",\"mode\":\"update\","
+             "\"branch\":\"main\",\"content\":\"secret\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "storage_boundary_error"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_dir_inside_repo"));
+    char db_via_link[512];
+    snprintf(db_via_link, sizeof(db_via_link), "%s/memory.db", link_dir);
+    ASSERT_FALSE(cbm_file_exists(db_via_link));
+    free(resp);
+    cbm_unlink(link_dir);
+
+    /* Case 2: ".." in the memory_dir tail walks the resolved parent back into
+     * the repo; it must be rejected up front rather than trusted as a path. */
+    char dotdot_dir[512];
+    snprintf(dotdot_dir, sizeof(dotdot_dir), "%s/outside/../repo/.cbm-memory", tmp_dir);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", dotdot_dir, 1), 0);
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2311,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{"
+             "\"project\":\"memory-symlink-proj\",\"mode\":\"update\","
+             "\"branch\":\"main\",\"content\":\"secret\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "storage_boundary_error"));
+    ASSERT_NOT_NULL(strstr(resp, "memory_dir_must_not_traverse"));
+    char db_in_repo[512];
+    snprintf(db_in_repo, sizeof(db_in_repo), "%s/.cbm-memory", repo_dir);
+    ASSERT_FALSE(cbm_file_exists(db_in_repo));
+    free(resp);
+
+    /* Case 3: an unknown mode is an error, not a silent read. mode="sync" was
+     * removed; a client sending it must see invalid_mode, not memory content. */
+    char outside_dir[512];
+    snprintf(outside_dir, sizeof(outside_dir), "%s/outside", tmp_dir);
+    ASSERT_EQ(cbm_setenv("CBM_MEMORY_DIR", outside_dir, 1), 0);
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2312,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"manage_memory\",\"arguments\":{"
+             "\"project\":\"memory-symlink-proj\",\"mode\":\"sync\"}}}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "invalid_mode"));
+    free(resp);
+
+    cbm_mcp_server_free(srv);
+    cbm_config_close(cfg);
+    cbm_unsetenv("CBM_MEMORY_DIR");
+    char config_db[512];
+    snprintf(config_db, sizeof(config_db), "%s/_config.db", cache_dir);
+    cbm_unlink(config_db);
+    cbm_rmdir(cache_dir);
+    cbm_rmdir(target_dir);
+    cbm_rmdir(repo_dir);
+    cbm_rmdir(tmp_dir);
+    PASS();
+#else
+    /* Windows canonicalization (GetFinalPathNameByHandleW) and case-insensitive
+     * containment are exercised by tool_manage_memory_rejects_repo_local_storage. */
+    PASS();
+#endif
+}
+
 TEST(tool_ingest_traces_basic) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
 
@@ -26980,6 +27078,7 @@ SUITE(mcp) {
     RUN_TEST(tool_manage_memory_personal_store);
     RUN_TEST(tool_manage_memory_disabled_by_default);
     RUN_TEST(tool_manage_memory_rejects_repo_local_storage);
+    RUN_TEST(tool_manage_memory_boundary_symlink_and_dotdot);
     RUN_TEST(tool_ingest_traces_basic);
     RUN_TEST(tool_ingest_traces_empty);
 

@@ -18,7 +18,7 @@ const char *cbm_memory_resolve_dir(struct cbm_config *cfg);
 char *cbm_memory_db_path(struct cbm_config *cfg, bool create_dir);
 bool cbm_memory_storage_allowed(struct cbm_config *cfg, const char *root_path, char *reason,
                                 size_t reason_sz);
-cbm_store_t *cbm_memory_open(struct cbm_config *cfg, char **out_path);
+cbm_store_t *cbm_memory_open(struct cbm_config *cfg, const char *root_path, char **out_path);
 cbm_store_t *cbm_memory_open_existing(struct cbm_config *cfg, char **out_path);
 cbm_store_t *cbm_memory_open_query(struct cbm_config *cfg, char **out_path);
 

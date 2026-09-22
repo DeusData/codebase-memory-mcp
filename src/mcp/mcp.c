@@ -865,8 +865,7 @@ static const tool_def_t TOOLS[] = {
      "\"string\",\"enum\":[\"get\",\"update\",\"sections\",\"settings\",\"bootstrap\",\"delete\","
      "\"list\",\"promote\"]},"
      "\"doc_type\":{\"type\":\"string\",\"default\":\"adr\"},\"branch\":{\"type\":\"string\"},"
-     "\"content\":{\"type\":\"string\"},\"reveal_paths\":{\"type\":\"boolean\",\"default\":false},"
-     "\"sections\":{\"type\":\"array\",\"items\":{\"type\":\"string\"}}},"
+     "\"content\":{\"type\":\"string\"},\"reveal_paths\":{\"type\":\"boolean\",\"default\":false}},"
      "\"required\":[\"project\"]}"},
 
     {"ingest_traces",
@@ -20744,6 +20743,27 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
     if (!doc_type) {
         doc_type = heap_strdup("adr");
     }
+    /* Branch and doc_type are concatenated into the storage key; cap them so
+     * one call cannot balloon the key past sane bounds. Git branch names cap
+     * far below this in practice. */
+    if (strlen(doc_type) > CBM_SZ_256 || (branch_arg && strlen(branch_arg) > CBM_SZ_256)) {
+        safe_free(project);
+        safe_free(mode_str);
+        safe_free(content);
+        safe_free(doc_type);
+        safe_free(branch_arg);
+        return cbm_mcp_text_result("branch and doc_type must be at most 256 bytes", true);
+    }
+    /* Content is a per-branch note, not a file store; cap it so one call
+     * cannot pin arbitrary memory. 1 MiB is ~500 pages of notes. */
+    if (content && strlen(content) > 1024 * 1024) {
+        safe_free(project);
+        safe_free(mode_str);
+        safe_free(content);
+        safe_free(doc_type);
+        safe_free(branch_arg);
+        return cbm_mcp_text_result("content must be at most 1 MiB", true);
+    }
 
     if (!cbm_memory_enabled(srv->config) && strcmp(mode_str, "settings") != 0) {
         safe_free(project);
@@ -20827,7 +20847,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         cbm_free(CBM_MEM_CLASS_OTHER, db_path);
     } else if ((strcmp(mode_str, "update") == 0 || strcmp(mode_str, "store") == 0) && content) {
         char *db_path = NULL;
-        cbm_store_t *store = cbm_memory_open(srv->config, &db_path);
+        cbm_store_t *store = cbm_memory_open(srv->config, root_path, &db_path);
         if (!store) {
             yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
             is_error = true;
@@ -20848,29 +20868,49 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
         is_error = true;
     } else if (strcmp(mode_str, "promote") == 0) {
         char *db_path = NULL;
-        cbm_store_t *store = cbm_memory_open(srv->config, &db_path);
-        if (!store || strcmp(current_branch, base_branch) == 0) {
-            yyjson_mut_obj_add_str(doc, root_obj, "status", store ? "already_base" : "write_error");
-            is_error = !store;
+        /* Query first: promote only writes when a branch doc exists, so it
+         * must not create an empty memory.db just to report no_branch_memory. */
+        cbm_store_t *store = cbm_memory_open_query(srv->config, &db_path);
+        cbm_adr_t branch_doc;
+        memset(&branch_doc, 0, sizeof(branch_doc));
+        bool have_branch = store && cbm_store_adr_get(store, key, &branch_doc) == CBM_STORE_OK &&
+                           branch_doc.content;
+        if (!store) {
+            /* No readable memory DB: there is no branch doc to promote. This
+             * is the same status the flow reported before the query-first
+             * restructure, minus the empty-database side effect. */
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "no_branch_memory");
+            is_error = true;
+        } else if (strcmp(current_branch, base_branch) == 0) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "already_base");
+        } else if (!have_branch) {
+            yyjson_mut_obj_add_str(doc, root_obj, "status", "no_branch_memory");
+            is_error = true;
         } else {
-            cbm_adr_t branch_doc;
-            memset(&branch_doc, 0, sizeof(branch_doc));
-            if (cbm_store_adr_get(store, key, &branch_doc) == CBM_STORE_OK && branch_doc.content) {
-                if (cbm_store_adr_store(store, base_key, branch_doc.content) == CBM_STORE_OK) {
-                    yyjson_mut_obj_add_str(doc, root_obj, "status", "promoted");
-                    yyjson_mut_obj_add_str(doc, root_obj, "promote_semantics",
-                                           "local branch doc copy to base branch doc");
-                    yyjson_mut_obj_add_bool(doc, root_obj, "from_key_redacted", true);
-                    yyjson_mut_obj_add_bool(doc, root_obj, "to_key_redacted", true);
-                } else {
-                    yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
-                    is_error = true;
-                }
-                cbm_store_adr_free(&branch_doc);
+            /* The query store is read-only enough for the lookup, but the copy
+             * is a write: reopen without the query flag, keeping the same path. */
+            cbm_store_close(store);
+            store = NULL;
+            cbm_free(CBM_MEM_CLASS_OTHER, db_path);
+            db_path = NULL;
+            store = cbm_memory_open(srv->config, root_path, &db_path);
+            if (!store) {
+                yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
+                is_error = true;
+            } else if (cbm_store_adr_store(store, base_key, branch_doc.content) ==
+                       CBM_STORE_OK) {
+                yyjson_mut_obj_add_str(doc, root_obj, "status", "promoted");
+                yyjson_mut_obj_add_str(doc, root_obj, "promote_semantics",
+                                       "local branch doc copy to base branch doc");
+                yyjson_mut_obj_add_bool(doc, root_obj, "from_key_redacted", true);
+                yyjson_mut_obj_add_bool(doc, root_obj, "to_key_redacted", true);
             } else {
-                yyjson_mut_obj_add_str(doc, root_obj, "status", "no_branch_memory");
+                yyjson_mut_obj_add_str(doc, root_obj, "status", "write_error");
                 is_error = true;
             }
+        }
+        if (have_branch) {
+            cbm_store_adr_free(&branch_doc);
         }
         if (store) {
             cbm_store_close(store);
@@ -20910,7 +20950,7 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
             "## FEATURES\nTrack important capabilities and product behavior.\n\n"
             "## CHANGELOG\nAppend branch/pull changes that affect architecture or behavior.\n");
         yyjson_mut_obj_add_str(doc, root_obj, "status", "template");
-    } else {
+    } else if (strcmp(mode_str, "get") == 0 || strcmp(mode_str, "sections") == 0) {
         char *db_path = NULL;
         cbm_store_t *store = cbm_memory_open_query(srv->config, &db_path);
         cbm_adr_t adr;
@@ -20938,6 +20978,16 @@ static char *handle_manage_memory(cbm_mcp_server_t *srv, const char *args) {
             cbm_store_close(store);
         }
         cbm_free(CBM_MEM_CLASS_OTHER, db_path);
+    } else {
+        /* Unknown mode must error, not fall through as a read: mode="sync"
+         * used to return memory content with no error after sync was
+         * removed, which is worse than not shipping the mode at all. */
+        yyjson_mut_obj_add_str(doc, root_obj, "status", "invalid_mode");
+        yyjson_mut_obj_add_strcpy(doc, root_obj, "error", mode_str);
+        yyjson_mut_obj_add_str(
+            doc, root_obj, "error_hint",
+            "mode must be one of: get, update, sections, settings, bootstrap, delete, list, promote");
+        is_error = true;
     }
 
     char *json = yy_doc_to_str(doc);
@@ -20962,16 +21012,10 @@ static char *handle_manage_adr(cbm_mcp_server_t *srv, const char *args) {
     char *project = get_project_arg(args);
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *content = cbm_mcp_get_string_arg(args, "content");
-    char *scope = cbm_mcp_get_string_arg(args, "scope");
-
-    if (scope && strcmp(scope, "personal") == 0) {
-        safe_free(project);
-        safe_free(mode_str);
-        safe_free(content);
-        safe_free(scope);
-        return handle_manage_memory(srv, args);
-    }
-    safe_free(scope);
+    /* No scope="personal" route: manage_adr's schema does not declare `scope`
+     * (additionalProperties:false), so the route was unreachable for
+     * schema-respecting clients and silently turned a routed set_sections
+     * into a read. Personal memory is its own tool: manage_memory. */
 
     if (!mode_str) {
         mode_str = heap_strdup("outline");
