@@ -27,6 +27,7 @@ cbm_test_runtime_init
 # by default, or an unattended run accumulates one root per language.
 bench_finish() {
   local rc=$?
+  [ -z "${BENCH_TMP:-}" ] || rm -rf -- "$BENCH_TMP" || true
   if [ "$rc" -eq 0 ] && [ -n "${CBM_BENCH_KEEP_RUNTIME:-}" ] && [ -d "${OUT:-}" ]; then
     "$BINARY" daemon stop >/dev/null 2>&1 || true
     printf 'CBM_BENCH_RUNTIME_ROOT=%q\nCBM_RUNTIME_DIR=%q\nCBM_CACHE_DIR=%q\n' \
@@ -36,7 +37,13 @@ bench_finish() {
   fi
   cbm_test_runtime_cleanup "$BINARY"
 }
+BENCH_TMP=""
 trap bench_finish EXIT
+# The index call keeps its stderr, the way the search-graph twin does: for a
+# one-shot CLI that is the only channel a refusal is reported on, and without
+# it the failure below could name only its symptom.
+BENCH_TMP=$(mktemp -d)
+INDEX_ERR="$BENCH_TMP/index-stderr.log"
 
 # Resolve symlinks
 REPO=$(cd "$REPO" && pwd -P)
@@ -54,6 +61,10 @@ bench_now_ms() { python3 -c "import time; print(time.monotonic_ns() // 1000000)"
 
 OUT="$RESULTS_DIR/$LANG"
 mkdir -p "$OUT"
+# A handoff names this run's index or none: the evaluation loop reuses the
+# results directory, and a stale one would point the graph session at a root
+# step 8 has already removed.
+rm -f -- "$OUT/runtime-root.txt"
 
 echo "INDEX: $LANG ($REPO)"
 
@@ -86,7 +97,12 @@ fi
 # Index via CLI and capture timing
 START_MS=$(bench_now_ms)
 
-INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":$REPO_JSON,\"mode\":\"full\"}" 2>/dev/null || echo '{"error":"index failed"}')
+# The CLI's exit status is the index's verdict. It is recorded here and acted
+# on below, once every per-run file is written; an empty response stays valid
+# JSON in 00-index.json so the failure is legible there as well.
+INDEX_RC=0
+INDEX_JSON=$("$BINARY" cli index_repository "{\"repo_path\":$REPO_JSON,\"mode\":\"full\"}" 2>"$INDEX_ERR") ||
+  { INDEX_RC=$?; INDEX_JSON="{\"error\":\"index failed\",\"exit\":$INDEX_RC}"; }
 
 END_MS=$(bench_now_ms)
 ELAPSED=$((END_MS - START_MS))
@@ -129,6 +145,21 @@ print(inner.get('project',''))
 echo "$NODES" > "$OUT/nodes.txt"
 echo "$EDGES" > "$OUT/edges.txt"
 echo "$PROJECT" > "$OUT/project.txt"
+
+# An index that failed, or that named no project, fails the run: after the
+# timing files, so the caller keeps its figures, and through the exit status,
+# so the caller's loop notices and bench_finish never keeps a root with no
+# index in it.
+if [ "$INDEX_RC" -ne 0 ] || [ -z "$PROJECT" ]; then
+  echo "  $LANG: index failed (cli exit $INDEX_RC, project '$PROJECT'); response in $OUT/00-index.json" >&2
+  if [ -s "$INDEX_ERR" ]; then
+    echo "--- index stderr ---" >&2
+    cat "$INDEX_ERR" >&2
+  fi
+  echo "--- index response (first 500 bytes) ---" >&2
+  printf '%.500s\n' "$INDEX_JSON" >&2
+  exit 1
+fi
 
 printf "  %s: %s files, %s LOC, %sms, %s nodes, %s edges\n" \
   "$LANG" "$FILE_COUNT" "$LOC" "$ELAPSED" "$NODES" "$EDGES"
