@@ -3786,6 +3786,124 @@ TEST(tool_search_graph_bm25_reports_candidate_saturation) {
     PASS();
 }
 
+/* Shared fixture for the two BM25 findability probes (2026-09-16, measured on
+ * JetBrains/Exposed and django/django): a Class named exactly like the query,
+ * that class's own Methods, and test Methods whose long names repeat the
+ * query token — the shapes that outranked the class and hid it entirely. */
+static void bm25_findability_fixture(cbm_store_t *store, const char *project) {
+    cbm_store_upsert_project(store, project, "/tmp/bm25-findability");
+    struct {
+        const char *label, *name, *qn, *file;
+    } rows[] = {
+        {"Class", "Table", "bm25-find.core.Table.Table", "core/Table.kt"},
+        {"Method", "unquoted", "bm25-find.core.Table.Table.unquoted", "core/Table.kt"},
+        {"Method", "describe", "bm25-find.core.Table.Table.describe", "core/Table.kt"},
+        {"Method", "table references table with same name in other database",
+         "bm25-find.tests.SchemaTests.table_references_table_with_same_name", "tests/Schema.kt"},
+        {"Method", "table references table with same name in mysql",
+         "bm25-find.tests.SchemaTests.table_references_table_with_same_name_mysql",
+         "tests/Schema.kt"},
+        {"Function", "get_object_or_404", "bm25-find.shortcuts.get_object_or_404", "shortcuts.py"},
+        {"Method", "test_get_object_or_404",
+         "bm25-find.tests.GetObjectOr404Tests.test_get_object_or_404", "tests/tests.py"},
+        {"Method", "test_get_object_or_404_queryset_attribute_error",
+         "bm25-find.tests.GetObjectOr404Tests.test_get_object_or_404_queryset_attribute_error",
+         "tests/tests.py"},
+        {"Method", "test_get_object_or_404_bad_class",
+         "bm25-find.tests.GetListObjectOr404Test.test_get_object_or_404_bad_class",
+         "tests/async.py"},
+    };
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+        cbm_node_t node = {.project = project,
+                           .label = rows[i].label,
+                           .name = rows[i].name,
+                           .qualified_name = rows[i].qn,
+                           .file_path = rows[i].file,
+                           .start_line = (int)i + 1,
+                           .end_line = (int)i + 2};
+        cbm_store_upsert_node(store, &node);
+    }
+    cbm_store_exec(store, "INSERT INTO nodes_fts(nodes_fts) VALUES('delete-all');");
+    cbm_store_exec(store, "INSERT INTO nodes_fts(rowid, name, qualified_name, label, "
+                          "file_path) SELECT id, cbm_camel_split(name), qualified_name, "
+                          "label, file_path FROM nodes;");
+}
+
+/* The label filter must apply in query (BM25) mode exactly as in structural
+ * mode: `query=Table label=Class` returns the class, and no Method. */
+TEST(tool_search_graph_bm25_applies_label_filter) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-find";
+    cbm_mcp_server_set_project(srv, project);
+    bm25_findability_fixture(store, project);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":554,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"Table\",\"label\":\"Class\","
+             "\"limit\":5,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NOT_NULL(strstr(inner, "\"bm25-find.core.Table.Table\",\"Class\""));
+    ASSERT_NULL(strstr(inner, "\"Method\""));
+    /* The reported total describes the filtered rows, not the unfiltered window. */
+    ASSERT_NOT_NULL(strstr(inner, "\"total\":1"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The definition whose NAME is the query ranks first: the `Table` class above
+ * its own methods and above test methods that repeat "table" three times; the
+ * `get_object_or_404` function above the test methods that contain it. */
+TEST(tool_search_graph_bm25_ranks_exact_name_first) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "bm25-find";
+    cbm_mcp_server_set_project(srv, project);
+    bm25_findability_fixture(store, project);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":555,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"Table\",\"limit\":5,\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    const char *rows = strstr(inner, "\"rows\":[");
+    ASSERT_NOT_NULL(rows);
+    const char *first_qn = strstr(rows, "[\"");
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_EQ(strncmp(first_qn, "[\"bm25-find.core.Table.Table\"", 29), 0);
+    free(inner);
+    free(resp);
+
+    resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":556,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_graph\",\"arguments\":{"
+             "\"project\":\"bm25-find\",\"query\":\"get_object_or_404\",\"limit\":5,"
+             "\"format\":\"json\"}}}");
+    ASSERT_NOT_NULL(resp);
+    inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    rows = strstr(inner, "\"rows\":[");
+    ASSERT_NOT_NULL(rows);
+    first_qn = strstr(rows, "[\"");
+    ASSERT_NOT_NULL(first_qn);
+    ASSERT_EQ(strncmp(first_qn, "[\"bm25-find.shortcuts.get_object_or_404\"", 40), 0);
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* `query` selects the BM25 fast path, which returns before semantic_query is
  * evaluated. Accepting both therefore used to report success while silently
  * discarding one of the caller's two requested result sets. The contract is
@@ -5583,9 +5701,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The marked file: both real ranges survive, the marker is flagged, and the
      * "12" from the marker never becomes a range of its own. */
-    char *marked =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
+    char *marked = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/marked.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(marked);
     char *marked_inner = extract_text_content(marked);
     ASSERT_NOT_NULL(marked_inner);
@@ -5597,9 +5715,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
     free(marked);
 
     /* The same ranges without a marker must NOT be reported as truncated. */
-    char *plain =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
+    char *plain = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/plain.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(plain);
     char *plain_inner = extract_text_content(plain);
     ASSERT_NOT_NULL(plain_inner);
@@ -5610,9 +5728,9 @@ TEST(tool_check_index_coverage_reports_truncation_marker_issue963) {
 
     /* The reader's own limit stops the list early, so it must say so even
      * though the producer sent no marker. */
-    char *widest =
-        cbm_mcp_handle_tool(srv, "check_index_coverage",
-                            "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
+    char *widest = cbm_mcp_handle_tool(
+        srv, "check_index_coverage",
+        "{\"project\":\"coverage-marker\",\"paths\":[\"src/wide.c\"],\"format\":\"json\"}");
     ASSERT_NOT_NULL(widest);
     char *wide_inner = extract_text_content(widest);
     ASSERT_NOT_NULL(wide_inner);
@@ -20418,6 +20536,8 @@ SUITE(mcp) {
     RUN_TEST(tool_output_byte_budgets);
     RUN_TEST(tool_search_graph_query_honors_file_pattern_issue552);
     RUN_TEST(tool_search_graph_bm25_reports_candidate_saturation);
+    RUN_TEST(tool_search_graph_bm25_applies_label_filter);
+    RUN_TEST(tool_search_graph_bm25_ranks_exact_name_first);
     RUN_TEST(tool_search_graph_rejects_bm25_and_semantic_query_together);
     RUN_TEST(tool_search_graph_semantic_ceiling_never_emits_unusable_continuation);
     RUN_TEST(tool_search_graph_semantic_pagination_is_lossless_and_independent);
