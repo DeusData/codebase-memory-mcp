@@ -3229,9 +3229,29 @@ static int posix_touch_fold(int result, int next) {
     return result == 0 || next == 0 ? 0 : (result < 0 || next < 0 ? -1 : 1);
 }
 
+/* Whether base_name still names the regular file (device, inode): 1 yes,
+ * 0 proven not (absent, another inode, a symlink or other non-regular
+ * entry), -1 undetermined (any other lookup failure, e.g. EIO or ESTALE). */
+static int posix_path_names_inode(int directory_fd, const char *base_name, dev_t device,
+                                  ino_t inode) {
+    struct stat by_path;
+    if (fstatat(directory_fd, base_name, &by_path, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    return S_ISREG(by_path.st_mode) && by_path.st_dev == device && by_path.st_ino == inode ? 1 : 0;
+}
+
 static int posix_held_file_touch(int directory_fd, const char *base_name, int fd) {
-    if (!private_regular_file_snapshot(directory_fd, base_name, fd, 1, NULL)) {
-        return 0;
+    struct stat by_handle;
+    if (fstat(fd, &by_handle) != 0) {
+        return -1;
+    }
+    int identity =
+        by_handle.st_nlink == 0
+            ? 0
+            : posix_path_names_inode(directory_fd, base_name, by_handle.st_dev, by_handle.st_ino);
+    if (identity <= 0) {
+        return identity;
     }
     return futimens(fd, NULL) == 0 ? 1 : -1;
 }
@@ -3241,20 +3261,27 @@ static int posix_held_lock_touch(int directory_fd, const process_lock_entry_t *e
 }
 
 static int posix_identity_marker_touch(const cbm_daemon_ipc_listener_t *listener) {
-    /* The marker is not held open; reopen it and require the published inode.
-     * Only ENOENT proves loss: EMFILE and friends say nothing about the file. */
+    /* The marker is not held open. Classify by path first, so a symlink or
+     * other replacement is loss; only then reopen it to refresh, where a
+     * failure (EMFILE, EACCES) says nothing about the file and is transient. */
+    int identity = posix_path_names_inode(listener->dir_fd, listener->socket_identity_name,
+                                          listener->identity_device, listener->identity_inode);
+    if (identity <= 0) {
+        return identity;
+    }
     int marker_fd = openat(listener->dir_fd, listener->socket_identity_name,
                            O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
     if (marker_fd < 0) {
         return errno == ENOENT ? 0 : -1;
     }
     struct stat marker_status;
-    int result = 0;
-    if (private_regular_file_snapshot(listener->dir_fd, listener->socket_identity_name, marker_fd,
-                                      1, &marker_status) &&
-        marker_status.st_dev == listener->identity_device &&
-        marker_status.st_ino == listener->identity_inode) {
-        result = futimens(marker_fd, NULL) == 0 ? 1 : -1;
+    int result = -1;
+    if (fstat(marker_fd, &marker_status) == 0) {
+        /* Replaced between the lookup and the open. */
+        result = marker_status.st_dev != listener->identity_device ||
+                         marker_status.st_ino != listener->identity_inode
+                     ? 0
+                     : (futimens(marker_fd, NULL) == 0 ? 1 : -1);
     }
     (void)close(marker_fd);
     return result;

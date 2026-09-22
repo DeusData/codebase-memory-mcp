@@ -2072,16 +2072,18 @@ TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
 #ifdef _WIN32
     SKIP_PLATFORM("unlink-while-held of runtime files is POSIX behavior");
 #else
-    enum { TOUCH_CASES = 4 };
+    enum { TOUCH_CASES = 5 };
+    enum { LOSS_UNLINK, LOSS_REPLACE_FILE, LOSS_REPLACE_SYMLINK };
     static const char key[] = "2178a2178a2178a0";
     static const struct {
         const char *suffix;
-        bool replace;
+        int loss;
     } cases[TOUCH_CASES] = {
-        {"lifetime.lock", false}, /* lifetime reservation */
-        {"lock", false},          /* listener-owned participant guard */
-        {"sock.identity", false}, /* identity marker, unlinked */
-        {"sock.identity", true},  /* identity marker, replaced by a fresh inode */
+        {"lifetime.lock", LOSS_UNLINK},       /* lifetime reservation */
+        {"lock", LOSS_UNLINK},                /* listener-owned participant guard */
+        {"sock.identity", LOSS_UNLINK},       /* identity marker, unlinked */
+        {"sock.identity", LOSS_REPLACE_FILE}, /* ... replaced by a fresh inode */
+        {"sock.identity", LOSS_REPLACE_SYMLINK} /* ... replaced by a symlink */,
     };
     const time_t stale = 1000000000;
     char parent[TEST_PATH_CAP] = {0};
@@ -2091,13 +2093,28 @@ TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
     int touched_intact[TOUCH_CASES] = {0};
     bool refreshed[TOUCH_CASES] = {false};
     bool lost[TOUCH_CASES] = {false};
-    int touched_after_loss[TOUCH_CASES] = {1, 1, 1, 1};
+    int touched_after_loss[TOUCH_CASES] = {1, 1, 1, 1, 1};
+    int unreadable_touch = 0;
+    int readable_again_touch = 0;
 
     if (ipc_test_parent_new(parent, "listener-touch")) {
         endpoint = cbm_daemon_ipc_endpoint_new(key, parent);
     }
     if (endpoint) {
         ipc_test_copy_path(runtime_dir, cbm_daemon_ipc_endpoint_runtime_dir(endpoint));
+    }
+    /* A still-valid marker that merely cannot be reopened (EACCES) is a
+     * transient refresh failure, not loss: the daemon must keep serving. */
+    if (endpoint) {
+        cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
+        char marker[TEST_PATH_CAP];
+        int written = snprintf(marker, sizeof(marker), "%s/cbm-%s.sock.identity", runtime_dir, key);
+        if (listener && written > 0 && written < (int)sizeof(marker) && chmod(marker, 0) == 0) {
+            unreadable_touch = cbm_daemon_ipc_listener_touch(listener, NULL);
+            readable_again_touch =
+                chmod(marker, 0600) == 0 ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
+        }
+        cbm_daemon_ipc_listener_close(listener);
     }
     for (size_t i = 0; endpoint && i < TOUCH_CASES; i++) {
         cbm_daemon_ipc_listener_t *listener = cbm_daemon_ipc_listen(endpoint);
@@ -2113,16 +2130,30 @@ TEST(daemon_ipc_listener_touch_detects_lost_runtime_files) {
         refreshed[i] = touched_intact[i] == 1 && stat(path, &after) == 0 &&
                        after.st_atime > stale && after.st_mtime > stale;
         lost[i] = refreshed[i] && unlink(path) == 0;
-        if (lost[i] && cases[i].replace) {
+        if (lost[i] && cases[i].loss == LOSS_REPLACE_FILE) {
             int fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
             lost[i] = fd >= 0 && close(fd) == 0;
+        } else if (lost[i] && cases[i].loss == LOSS_REPLACE_SYMLINK) {
+            lost[i] = symlink("/dev/null", path) == 0;
         }
         touched_after_loss[i] = lost[i] ? cbm_daemon_ipc_listener_touch(listener, NULL) : -2;
         cbm_daemon_ipc_listener_close(listener);
+        /* A tampered marker makes close (correctly) keep the socket pair; clear
+         * this case's simulated leftovers so the next case can listen. */
+        static const char *const leftovers[] = {"sock.identity", "sock", "anc"};
+        for (size_t j = 0; j < sizeof(leftovers) / sizeof(leftovers[0]); j++) {
+            written = snprintf(path, sizeof(path), "%s/cbm-%s.%s", runtime_dir, key, leftovers[j]);
+            if (written > 0 && written < (int)sizeof(path)) {
+                (void)unlink(path);
+            }
+        }
     }
     cbm_daemon_ipc_endpoint_free(endpoint);
     ipc_test_remove_tree(runtime_dir, parent);
 
+    /* Root bypasses mode 0, so the reopen succeeds there and the touch is 1. */
+    ASSERT_EQ(unreadable_touch, geteuid() == 0 ? 1 : -1);
+    ASSERT_EQ(readable_again_touch, 1);
     for (size_t i = 0; i < TOUCH_CASES; i++) {
         ASSERT_TRUE(started[i]);
         ASSERT_EQ(touched_intact[i], 1);

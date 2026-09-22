@@ -22,6 +22,8 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -690,9 +692,6 @@ TEST(version_cohort_touch_reports_each_lost_file) {
         CBM_VERSION_COHORT_OK);
     ASSERT_EQ(cbm_version_cohort_daemon_claim_acquire(manager, &claim), CBM_VERSION_COHORT_OK);
 
-    ASSERT_EQ(cbm_version_cohort_lease_touch(lease), CBM_VERSION_COHORT_OK);
-    ASSERT_EQ(cbm_version_cohort_daemon_claim_touch(claim), CBM_VERSION_COHORT_OK);
-
     const char *runtime_dir = cbm_daemon_ipc_endpoint_runtime_dir(fixture.endpoint);
     char marker[VERSION_COHORT_TEST_PATH_CAP];
     char lifetime[VERSION_COHORT_TEST_PATH_CAP];
@@ -700,6 +699,20 @@ TEST(version_cohort_touch_reports_each_lost_file) {
                          runtime_dir) < (int)sizeof(marker));
     ASSERT_TRUE(snprintf(lifetime, sizeof(lifetime), "%s/cbm-version-cohort-lifetime-v1.lock",
                          runtime_dir) < (int)sizeof(lifetime));
+
+    /* Age both held files the way a cleaner would see them, then prove the
+     * touch refreshed them through the held handles. */
+    const time_t stale = 1000000000;
+    struct timespec stale_times[2] = {{.tv_sec = stale}, {.tv_sec = stale}};
+    ASSERT_EQ(utimensat(AT_FDCWD, marker, stale_times, 0), 0);
+    ASSERT_EQ(utimensat(AT_FDCWD, lifetime, stale_times, 0), 0);
+    ASSERT_EQ(cbm_version_cohort_lease_touch(lease), CBM_VERSION_COHORT_OK);
+    ASSERT_EQ(cbm_version_cohort_daemon_claim_touch(claim), CBM_VERSION_COHORT_OK);
+    struct stat refreshed;
+    ASSERT_EQ(stat(marker, &refreshed), 0);
+    ASSERT_TRUE(refreshed.st_mtime > stale && refreshed.st_atime > stale);
+    ASSERT_EQ(stat(lifetime, &refreshed), 0);
+    ASSERT_TRUE(refreshed.st_mtime > stale && refreshed.st_atime > stale);
 
     ASSERT_EQ(unlink(marker), 0);
     ASSERT_EQ(cbm_version_cohort_daemon_claim_touch(claim), CBM_VERSION_COHORT_UNSAFE);

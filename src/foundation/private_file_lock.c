@@ -487,6 +487,39 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
     return valid ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
 }
 
+/* Whether the lock's canonical path still names the held inode: 1 yes, 0 no
+ * (proven lost), -1 undetermined. Only proof counts as loss: unlink leaves
+ * st_nlink 0, a rename-away or replacement makes the path name another inode
+ * or nothing, and a replaced directory changes the directory's identity. Any
+ * other syscall failure (EIO, ESTALE, ENOMEM) says nothing about the file and
+ * is reported as undetermined so the caller retries instead of exiting. */
+static int private_held_identity(const cbm_private_file_lock_t *lock) {
+    const cbm_private_lock_directory_t *directory = lock->directory;
+    struct stat by_handle;
+    struct stat directory_by_path;
+    struct stat by_path;
+    if (fstat(lock->fd, &by_handle) != 0) {
+        return -1;
+    }
+    if (by_handle.st_nlink == 0) {
+        return 0;
+    }
+    if (lstat(directory->path, &directory_by_path) != 0) {
+        return errno == ENOENT || errno == ENOTDIR ? 0 : -1;
+    }
+    if (!S_ISDIR(directory_by_path.st_mode) || directory_by_path.st_dev != directory->device ||
+        directory_by_path.st_ino != directory->inode) {
+        return 0;
+    }
+    if (fstatat(directory->fd, lock->base_name, &by_path, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    return S_ISREG(by_path.st_mode) && by_path.st_dev == by_handle.st_dev &&
+                   by_path.st_ino == by_handle.st_ino
+               ? 1
+               : 0;
+}
+
 cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock_t *lock) {
     if (!lock) {
         return CBM_PRIVATE_FILE_LOCK_UNSAFE;
@@ -494,17 +527,17 @@ cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock
     if (!cbm_private_file_lock_fork_guard_enter()) {
         return CBM_PRIVATE_FILE_LOCK_IO;
     }
-    /* Unlink leaves st_nlink 0 on the held inode, but a rename-away or a
-     * replaced directory keeps it linked elsewhere; only the path-vs-handle
-     * identity check proves the canonical path still names this lock. */
-    bool linked = private_payload_fd_valid(lock, NULL) && lock->directory &&
-                  private_file_revalidate(lock->directory, lock->base_name, lock->fd, NULL);
-    bool touched = linked && futimens(lock->fd, NULL) == 0;
-    cbm_private_file_lock_fork_guard_leave();
-    if (!linked) {
-        return CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    cbm_private_file_lock_status_t status = CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    if (lock->fd >= 0 && !lock->unlocked && lock->owner_pid == getpid() && lock->directory &&
+        private_lock_is_tracked(lock)) {
+        int identity = private_held_identity(lock);
+        status = identity > 0   ? (futimens(lock->fd, NULL) == 0 ? CBM_PRIVATE_FILE_LOCK_OK
+                                                                 : CBM_PRIVATE_FILE_LOCK_IO)
+                 : identity < 0 ? CBM_PRIVATE_FILE_LOCK_IO
+                                : CBM_PRIVATE_FILE_LOCK_UNSAFE;
     }
-    return touched ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_IO;
+    cbm_private_file_lock_fork_guard_leave();
+    return status;
 }
 
 cbm_private_file_lock_status_t cbm_private_file_lock_release(cbm_private_file_lock_t **lock_io) {
@@ -1478,15 +1511,21 @@ cbm_private_file_lock_status_t cbm_private_file_lock_payload_write(cbm_private_f
 cbm_private_file_lock_status_t cbm_private_file_lock_touch(cbm_private_file_lock_t *lock) {
     /* Windows has no age-based cleaner of the private lock directory; only
      * confirm the held handle still names a linked file. */
-    if (!lock) {
+    if (!lock || lock->handle == INVALID_HANDLE_VALUE || lock->unlocked) {
         return CBM_PRIVATE_FILE_LOCK_UNSAFE;
     }
     if (!cbm_private_file_lock_fork_guard_enter()) {
         return CBM_PRIVATE_FILE_LOCK_IO;
     }
-    bool linked = private_win_payload_handle_valid(lock);
+    BY_HANDLE_FILE_INFORMATION information;
+    bool queried = GetFileInformationByHandle(lock->handle, &information) != 0;
     cbm_private_file_lock_fork_guard_leave();
-    return linked ? CBM_PRIVATE_FILE_LOCK_OK : CBM_PRIVATE_FILE_LOCK_UNSAFE;
+    /* A failed query says nothing about the file; only a proven unlink is loss. */
+    if (!queried) {
+        return CBM_PRIVATE_FILE_LOCK_IO;
+    }
+    return information.nNumberOfLinks == 0 ? CBM_PRIVATE_FILE_LOCK_UNSAFE
+                                           : CBM_PRIVATE_FILE_LOCK_OK;
 }
 
 static bool private_win_release_unlock(cbm_private_file_lock_t *lock) {
