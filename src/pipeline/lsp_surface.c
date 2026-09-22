@@ -206,8 +206,9 @@ int cbm_lsp_surface_build_rows(const cbm_pipeline_ctx_t *ctx, const char *projec
         .rows = rows,
     };
     atomic_init(&job.failed, false);
+    int workers = cbm_pipeline_worker_count(ctx ? ctx->pipeline : NULL);
     cbm_parallel_for(file_count, surface_row_one, &job,
-                     (cbm_parallel_for_opts_t){.max_workers = 0, .force_pthreads = false});
+                     (cbm_parallel_for_opts_t){.max_workers = workers, .force_pthreads = false});
     if (atomic_load_explicit(&job.failed, memory_order_relaxed)) {
         cbm_store_free_lsp_surfaces(rows, file_count); /* untouched rows are all NULL */
         return -1;

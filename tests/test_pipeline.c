@@ -160,32 +160,68 @@ TEST(pipeline_background_worker_policy_preserves_overrides) {
 
 TEST(pipeline_background_policy_preserves_index_results) {
     ASSERT_EQ(setup_test_repo(), 0);
+    /* 64 fillers plus setup_test_repo's three files exceed MIN_FILES_FOR_PARALLEL
+     * (50). Below that threshold both policies take the sequential path, so the
+     * comparison stays green even with the background policy removed. */
+    for (int i = 0; i < 64; i++) {
+        char name[32];
+        char body[96];
+        (void)snprintf(name, sizeof(name), "pad%02d.go", i);
+        (void)snprintf(body, sizeof(body), "package main\n\nfunc Pad%02d() int {\n\treturn %d\n}\n",
+                       i, i);
+        if (th_write_file(TH_PATH(g_tmpdir, name), body) != 0) {
+            teardown_test_repo();
+            FAIL("failed to pad fixture past MIN_FILES_FOR_PARALLEL");
+        }
+    }
+
+    /* An inherited CBM_WORKERS pin makes both runs use the same count. Drop it
+     * so this compares an all-core index against a headroom index. */
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_test_repo();
+        FAIL("failed to save worker env");
+    }
+    cbm_unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+
     char foreground_db[512];
     char background_db[512];
     (void)snprintf(foreground_db, sizeof(foreground_db), "%s/foreground.db", g_tmpdir);
     (void)snprintf(background_db, sizeof(background_db), "%s/background.db", g_tmpdir);
 
-    cbm_pipeline_t *foreground =
-        cbm_pipeline_new(g_tmpdir, foreground_db, CBM_MODE_FULL);
-    cbm_pipeline_t *background =
-        cbm_pipeline_new(g_tmpdir, background_db, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(foreground);
-    ASSERT_NOT_NULL(background);
-    cbm_pipeline_set_background(background, true);
-
-    int foreground_rc = cbm_pipeline_run(foreground);
-    int background_rc = cbm_pipeline_run(background);
+    cbm_pipeline_t *foreground = cbm_pipeline_new(g_tmpdir, foreground_db, CBM_MODE_FULL);
+    cbm_pipeline_t *background = cbm_pipeline_new(g_tmpdir, background_db, CBM_MODE_FULL);
+    int foreground_rc = -1;
+    int background_rc = -1;
     int foreground_nodes = -1;
     int foreground_edges = -1;
     int background_nodes = -1;
     int background_edges = -1;
-    cbm_pipeline_get_committed_counts(foreground, &foreground_nodes, &foreground_edges);
-    cbm_pipeline_get_committed_counts(background, &background_nodes, &background_edges);
+    bool created = foreground && background;
+    if (created) {
+        cbm_pipeline_set_background(background, true);
+        foreground_rc = cbm_pipeline_run(foreground);
+        background_rc = cbm_pipeline_run(background);
+        cbm_pipeline_get_committed_counts(foreground, &foreground_nodes, &foreground_edges);
+        cbm_pipeline_get_committed_counts(background, &background_nodes, &background_edges);
+    }
 
     cbm_pipeline_free(foreground);
     cbm_pipeline_free(background);
     teardown_test_repo();
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
 
+    ASSERT_TRUE(created);
     ASSERT_EQ(foreground_rc, 0);
     ASSERT_EQ(background_rc, 0);
     ASSERT_GT(foreground_nodes, 0);
@@ -5129,8 +5165,8 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
 
     cbm_file_hash_t *manifest = NULL;
     int manifest_count = -1;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-fail-closed", root_path, NULL, 0, NULL,
-                                                  0, NULL, NULL, &manifest, &manifest_count);
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-fail-closed", root_path, NULL, 0,
+                                                  NULL, 0, NULL, NULL, &manifest, &manifest_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
     th_rmtree(tmp);
 

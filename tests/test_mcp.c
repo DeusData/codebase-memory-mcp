@@ -19531,6 +19531,9 @@ TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
     if (cwd_ready) {
         (void)cbm_chdir(old_cwd);
     }
+    /* Capture while CBM_WORKERS is still unset. Restoring first makes the
+     * expected count follow the lane override instead of the headroom policy. */
+    int expected = cbm_default_worker_count(false);
     mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
     bool cleaned = !cache_ready || th_rmtree(cache) == 0;
 
@@ -19542,7 +19545,7 @@ TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
     ASSERT_TRUE(config_ready);
     ASSERT_TRUE(server_ready);
     ASSERT_TRUE(response_ready);
-    ASSERT_EQ(selected_workers, cbm_default_worker_count(false));
+    ASSERT_EQ(selected_workers, expected);
     ASSERT_TRUE(cleaned);
     PASS();
 }

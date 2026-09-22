@@ -413,9 +413,9 @@ static void *manifest_hash_worker(void *arg) {
 
 enum { MANIFEST_PARALLEL_MIN_FILES = 64 };
 
-int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
-                                         const cbm_file_info_t *files, int file_count,
-                                         char **excluded_dirs, int excluded_count,
+int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *project,
+                                         const char *repo_path, const cbm_file_info_t *files,
+                                         int file_count, char **excluded_dirs, int excluded_count,
                                          const cbm_git_context_t *git_ctx,
                                          const cbm_userconfig_t *userconfig, cbm_file_hash_t **out,
                                          int *out_count) {
@@ -456,7 +456,7 @@ int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_p
     }
     struct timespec t_hash;
     cbm_clock_gettime(CLOCK_MONOTONIC, &t_hash);
-    int hash_workers = cbm_default_worker_count(true);
+    int hash_workers = cbm_pipeline_worker_count(p);
     if (rc == 0 && file_count >= MANIFEST_PARALLEL_MIN_FILES && hash_workers > SKIP_ONE) {
         char (*shas)[CBM_SHA256_HEX_LEN + 1] = malloc((size_t)file_count * sizeof(*shas));
         int64_t *mtimes = calloc((size_t)file_count, sizeof(int64_t));
@@ -634,9 +634,9 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
                               &fresh_ignored_total);
     }
     if (rc == 0) {
-        rc = cbm_pipeline_build_semantic_manifest(project, repo_path, fresh_files, fresh_file_count,
-                                                  fresh_excluded, fresh_excluded_count,
-                                                  &fresh_git_ctx, fresh_userconfig, out, out_count);
+        rc = cbm_pipeline_build_semantic_manifest(
+            p, project, repo_path, fresh_files, fresh_file_count, fresh_excluded,
+            fresh_excluded_count, &fresh_git_ctx, fresh_userconfig, out, out_count);
     }
     cbm_set_user_lang_config(previous_userconfig);
     cbm_git_context_free(&fresh_git_ctx);
@@ -1594,8 +1594,12 @@ static int closure_probe_surfaces(cbm_pipeline_t *p, const char *project,
         if (def_modules && def_starts) {
             defs = cbm_pxc_collect_all_defs(NULL, &probe_arena, cache, probe_files, probe_count,
                                             project, def_modules, &def_count, def_starts);
-            rc = cbm_lsp_surface_build_rows(NULL, project, cache, probe_files, probe_count, defs,
-                                            def_starts, out_rows, out_count);
+            /* Extract left pipeline NULL so file errors are not recorded twice.
+             * Surface rows only borrow it for the background worker policy. */
+            probe_ctx.pipeline = p;
+            rc = cbm_lsp_surface_build_rows(&probe_ctx, project, cache, probe_files, probe_count,
+                                            defs, def_starts, out_rows, out_count);
+            probe_ctx.pipeline = NULL;
         } else {
             rc = -1;
         }

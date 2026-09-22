@@ -1444,7 +1444,7 @@ static int app_fake_worker_start(void *opaque, const char *args_json, size_t mem
         atomic_store(&context->args_captured[worker->attempt], true);
         context->memory_budgets[worker->attempt] = memory_budget_bytes;
         context->background_requests[worker->attempt] =
-            cbm_mcp_get_bool_arg(args_json, "_background");
+            cbm_mcp_get_bool_arg(args_json, "_cbm_background");
         if (marker_file) {
             (void)snprintf(context->marker_paths[worker->attempt], APP_TEST_PATH_CAP, "%s",
                            marker_file);

@@ -770,9 +770,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
 #define CBM_SEMANTIC_INPUT_GLOBAL_CONFIG CBM_SEMANTIC_INPUT_PREFIX "global-extension-config-v1"
 #define CBM_SEMANTIC_INPUT_PROJECT_CONFIG CBM_SEMANTIC_INPUT_PREFIX "project-extension-config-v1"
 
-int cbm_pipeline_build_semantic_manifest(const char *project, const char *repo_path,
-                                         const cbm_file_info_t *files, int file_count,
-                                         char **excluded_dirs, int excluded_count,
+int cbm_pipeline_build_semantic_manifest(const cbm_pipeline_t *p, const char *project,
+                                         const char *repo_path, const cbm_file_info_t *files,
+                                         int file_count, char **excluded_dirs, int excluded_count,
                                          const cbm_git_context_t *git_ctx,
                                          const cbm_userconfig_t *userconfig, cbm_file_hash_t **out,
                                          int *out_count);

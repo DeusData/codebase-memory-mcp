@@ -2795,7 +2795,7 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
     rc = mode_promoted
              ? cbm_pipeline_build_fresh_semantic_manifest(p, p->project_name, &baseline_manifest,
                                                           &baseline_count)
-             : cbm_pipeline_build_semantic_manifest(p->project_name, p->repo_path, files,
+             : cbm_pipeline_build_semantic_manifest(p, p->project_name, p->repo_path, files,
                                                     file_count, p->excluded_dirs, p->excluded_count,
                                                     &p->git_ctx, p->userconfig, &baseline_manifest,
                                                     &baseline_count);
