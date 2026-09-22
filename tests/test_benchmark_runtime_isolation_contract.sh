@@ -9,8 +9,9 @@ set -euo pipefail
 # operator's live store, every one-shot joined the operator's account daemon,
 # and the timings depended on whatever that daemon was doing. Drive both with
 # an environment-probe fixture and require that no product process ever
-# receives the caller's runtime or cache, and that the index benchmark records
-# the setup cost it now pays explicitly.
+# receives the caller's runtime or cache, that the index benchmark records
+# the setup cost it now pays explicitly, and that a refused index fails the
+# run, names its cause, and leaves nothing behind.
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORKDIR="$(mktemp -d)"
@@ -35,6 +36,10 @@ cat > "$ENV_PROBE" <<'EOF'
 printf '%s\t%s\n' "${CBM_CACHE_DIR-}" "${CBM_RUNTIME_DIR-}" >> "$CBM_BENCH_ENV_PROBE"
 if [[ "${1-} ${2-}" == "cli index_repository" ]]; then
     [[ -z "${CBM_BENCH_REQUEST_LOG-}" ]] || printf '%s\n' "${3-}" >> "$CBM_BENCH_REQUEST_LOG"
+    if [[ -n "${CBM_BENCH_PROBE_INDEX_OK-}" ]]; then
+        printf '%s\n' '{"project":"probe"}'
+        exit 0
+    fi
     echo "probe: index refused" >&2
     exit 1
 fi
@@ -78,30 +83,46 @@ assert_isolated() {
     [[ ! -e "$private_root" ]] || fail "$harness left its private root behind: $private_root"
 }
 
+# The fixture refuses the index. That must fail the run — after the timing
+# files are written, so the caller keeps its figures — and name its cause: the
+# fixture's one stderr line has to reach the output.
 INDEX_LOG="$WORKDIR/index-environment.log"
+index_rc=0
 CBM_CACHE_DIR="$CALLER_CACHE" \
 CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
 CBM_BENCH_ENV_PROBE="$INDEX_LOG" \
     "$ROOT/scripts/benchmark-index.sh" "$ENV_PROBE" probe "$REPO" "$WORKDIR/results" \
-    > "$WORKDIR/index.out" 2>&1 || true
+    > "$WORKDIR/index.out" 2>&1 || index_rc=$?
+[[ "$index_rc" -ne 0 ]] || fail "benchmark-index exited 0 after a refused index"
 assert_isolated "benchmark-index" "$INDEX_LOG"
 for metric in setup-time total-time index-time; do
     [[ -s "$WORKDIR/results/probe/$metric.txt" ]] ||
         fail "benchmark-index did not record $metric.txt"
 done
+grep -q -- '--- index stderr ---' "$WORKDIR/index.out" ||
+    fail "benchmark-index hid the index stderr behind its own message"
+grep -q 'probe: index refused' "$WORKDIR/index.out" ||
+    fail "benchmark-index did not surface the cause of the index failure"
 
 # The evaluation plan indexes a language and then reads that index from its own
 # MCP session (docs/EVALUATION_PLAN.md §7). Asked to keep the runtime, a
 # successful run must leave its root behind and record, sourceably, the paths
 # that reach it — and they must be the paths the product processes actually
-# used. Unasked, the root is gone (asserted above).
+# used. Unasked, the root is gone (asserted above). The fixture answers this
+# index with a minimal envelope, so what is kept is an index that succeeded.
 KEEP_LOG="$WORKDIR/keep-environment.log"
+keep_rc=0
 CBM_CACHE_DIR="$CALLER_CACHE" \
 CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
 CBM_BENCH_ENV_PROBE="$KEEP_LOG" \
+CBM_BENCH_PROBE_INDEX_OK=1 \
 CBM_BENCH_KEEP_RUNTIME=1 \
     "$ROOT/scripts/benchmark-index.sh" "$ENV_PROBE" keep "$REPO" "$WORKDIR/results" \
-    > "$WORKDIR/keep.out" 2>&1 || true
+    > "$WORKDIR/keep.out" 2>&1 || keep_rc=$?
+[[ "$keep_rc" -eq 0 ]] || fail "benchmark-index failed a run whose index succeeded (exit $keep_rc)"
+KEPT_PROJECT=$(cat "$WORKDIR/results/keep/project.txt" 2>/dev/null || true)
+[[ "${KEPT_PROJECT%$'\r'}" == "probe" ]] ||
+    fail "benchmark-index did not record the project the index reported: '${KEPT_PROJECT:-<none>}'"
 HANDOFF="$WORKDIR/results/keep/runtime-root.txt"
 [[ -s "$HANDOFF" ]] || fail "benchmark-index was asked to keep its runtime but recorded no handoff"
 KEPT_ROOT=$(bash -c '. "$1" && printf "%s" "${CBM_BENCH_RUNTIME_ROOT-}"' _ "$HANDOFF")
@@ -114,6 +135,29 @@ KEPT_CACHE=$(bash -c '. "$1" && printf "%s" "${CBM_CACHE_DIR-}"' _ "$HANDOFF")
 grep -qF -- "${KEPT_CACHE}"$'\t'"${KEPT_RUNTIME}" "$KEEP_LOG" ||
     fail "runtime-root.txt does not name the runtime and cache the product processes used"
 rm -rf -- "$KEPT_ROOT"
+
+# Asked to keep the runtime and refused the index, the harness has nothing worth
+# keeping: the run fails, no root survives, and no handoff is written — nor left
+# over from an earlier run, since the evaluation loop reuses the results
+# directory.
+REFUSED_LOG="$WORKDIR/keep-refused-environment.log"
+REFUSED_HANDOFF="$WORKDIR/results/keep-refused/runtime-root.txt"
+mkdir -p "${REFUSED_HANDOFF%/*}"
+echo 'CBM_BENCH_RUNTIME_ROOT=/stale/root/from/an/earlier/run' > "$REFUSED_HANDOFF"
+refused_rc=0
+CBM_CACHE_DIR="$CALLER_CACHE" \
+CBM_RUNTIME_DIR="$CALLER_RUNTIME" \
+CBM_BENCH_ENV_PROBE="$REFUSED_LOG" \
+CBM_BENCH_KEEP_RUNTIME=1 \
+    "$ROOT/scripts/benchmark-index.sh" "$ENV_PROBE" keep-refused "$REPO" "$WORKDIR/results" \
+    > "$WORKDIR/keep-refused.out" 2>&1 || refused_rc=$?
+[[ "$refused_rc" -ne 0 ]] || fail "benchmark-index exited 0 after a refused index it was asked to keep"
+for metric in setup-time total-time index-time; do
+    [[ -s "$WORKDIR/results/keep-refused/$metric.txt" ]] ||
+        fail "benchmark-index did not record $metric.txt for a refused index"
+done
+assert_isolated "benchmark-index (keep, refused index)" "$REFUSED_LOG"
+[[ ! -e "$REFUSED_HANDOFF" ]] || fail "benchmark-index left a handoff for an index that failed"
 
 SEARCH_LOG="$WORKDIR/search-environment.log"
 CBM_CACHE_DIR="$CALLER_CACHE" \
