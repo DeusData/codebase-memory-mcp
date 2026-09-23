@@ -761,18 +761,26 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     return true;
 }
 
+static bool lsp_strategy_is_external_builtin(const char *strategy) {
+    return strategy && (strcmp(strategy, "lsp_builtin") == 0 ||
+                        strcmp(strategy, "lsp_builtin_method") == 0 ||
+                        strcmp(strategy, "lsp_builtin_constructor") == 0);
+}
+
 bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
                                             const char *strategy) {
     if (cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, strategy)) {
         return true;
     }
-    /* py_lsp_cross module-local lookup can emit lsp_direct to the only
-     * project symbol with a bare name in another language (#1572 pipeline). */
-    if (strategy && strcmp(strategy, "lsp_direct") == 0 &&
-        cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, "unique_name")) {
-        return true;
+    /* #1572 pipeline: registry unique_name and Python-LSP bare-name binds
+     * (lsp_direct, lsp_callable_alias, …) are the same homonym class across
+     * languages. Import-aware lsp_import_alias to stdlib QNs stays same-language
+     * or off-graph; in-repo cross-language targets are still dropped. */
+    if (!strategy || strncmp(strategy, "lsp_", 4) != 0 ||
+        lsp_strategy_is_external_builtin(strategy)) {
+        return false;
     }
-    return false;
+    return cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, "unique_name");
 }
 
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {

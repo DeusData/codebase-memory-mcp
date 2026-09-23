@@ -330,9 +330,9 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
 
-/* CALLS emission guard: suffix_match / unique_name (#725/#1572) plus the
- * #1572 pipeline case where py_lsp_cross labels a cross-language homonym bind
- * lsp_direct even though the registry guard only keys on unique_name. */
+/* CALLS emission guard: suffix_match / unique_name (#725/#1572) plus in-repo
+ * LSP bare-name binds (lsp_direct, lsp_callable_alias, …) that share the
+ * #1572 homonym class with registry unique_name. */
 bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
                                             const char *strategy);
 

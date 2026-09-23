@@ -503,7 +503,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
              * project-qualified form even when fallback prefixed the project. */
             res.qualified_name = target_node->qualified_name;
             res.confidence = lsp->confidence;
-            res.strategy = lsp->strategy;
+            res.strategy = lsp->strategy ? lsp->strategy : "lsp_override";
             res.candidate_count = 1;
             if (cbm_suppress_cross_language_calls_edge(lang, target_node->file_path,
                                                        res.strategy)) {
