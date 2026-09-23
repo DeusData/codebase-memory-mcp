@@ -48,6 +48,25 @@ TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths) {
     PASS();
 }
 
+/* Document/log extensions are never HTTP routes (distilled from PR #1245):
+ * the arg-URL detector runs for every resolved call, so without the
+ * extension guard `open("/new/file.txt")` minted a Route + HTTP_CALLS.
+ * First segments deliberately avoid the filesystem-root list so ONLY the
+ * extension guard can reject them; `/api/...` marker paths stay routes. */
+TEST(infrascan_http_route_literal_guard_rejects_document_extensions) {
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/new/file.txt", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/guide.md", "read"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/data/app.log", "write"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/fake/path.pdf", "open"));
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/index.rst", "open"));
+    /* Same extensions under a query string are still files. */
+    ASSERT_FALSE(cbm_service_pattern_is_http_route_literal("/docs/guide.md?raw=1", "open"));
+    /* Positive controls: extension-less routes and the same callees. */
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/api/items", "requests.get"));
+    ASSERT_TRUE(cbm_service_pattern_is_http_route_literal("/docs/guide", "open"));
+    PASS();
+}
+
 TEST(infrascan_route_nodes_skip_bad_http_url_paths) {
     cbm_gbuf_t *gb = cbm_gbuf_new("test", "/tmp/cbm_infrascan_route_guard");
     ASSERT_NOT_NULL(gb);
@@ -128,6 +147,7 @@ TEST(infrascan_http_calls_join_matching_handler_route) {
 
 SUITE(infrascan) {
     RUN_TEST(infrascan_http_route_literal_guard_rejects_filesystem_paths);
+    RUN_TEST(infrascan_http_route_literal_guard_rejects_document_extensions);
     RUN_TEST(infrascan_route_nodes_skip_bad_http_url_paths);
     RUN_TEST(infrascan_http_calls_join_matching_handler_route);
 }

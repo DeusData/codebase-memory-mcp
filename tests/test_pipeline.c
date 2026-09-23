@@ -6696,6 +6696,100 @@ TEST(pipeline_arg_url_rejects_non_http_slash_arguments) {
     PASS();
 }
 
+/* Count HTTP_CALLS-style edges whose url_path property contains `keyword`. */
+static int count_edges_with_url_path(cbm_store_t *s, const char *project, const char *keyword) {
+    cbm_edge_t *es = NULL;
+    int n = 0;
+    cbm_store_find_edges_by_url_path(s, project, keyword, &es, &n);
+    if (es) {
+        cbm_store_free_edges(es, n);
+    }
+    return n;
+}
+
+/* Distilled from PR #1245: detect_url_in_args (parallel resolver, >= 50 files)
+ * runs for EVERY resolved call with no callee gating, so a filesystem path
+ * with a document/log extension passed to a project-defined open/read/write
+ * helper passed normalize_url_arg (second slash, no space) and the route
+ * literal guard, minting a Route node + an HTTP_CALLS edge for a file. The
+ * callees are project functions on purpose: a bare builtin `open(...)` never
+ * resolves to a target and so never reaches emit_service_edge at all. The
+ * first path segments avoid the filesystem-root list (etc/var/tmp/...) so
+ * only the extension guard can reject them. requests.get('/api/items') is
+ * the positive control that must keep its Route + HTTP_CALLS. */
+TEST(pipeline_arg_url_rejects_document_file_paths) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_arg_url_docs_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "src/files.py",
+                    "import requests\n"
+                    "def open_file(path):\n"
+                    "    return path\n"
+                    "def read_file(path):\n"
+                    "    return path\n"
+                    "def write_file(path):\n"
+                    "    return path\n"
+                    "def load_docs():\n"
+                    "    open_file('/new/file.txt')\n"
+                    "    read_file('/docs/guide.md')\n"
+                    "    write_file('/data/app.log')\n"
+                    "    read_file('/reports/summary.pdf')\n"
+                    "    open_file('/docs/index.rst')\n"
+                    "def fetch_items():\n"
+                    "    return requests.get('/api/items')\n");
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.ts", i);
+        snprintf(body, sizeof(body), "export function filler%d(): number { return %d; }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/arg_url_docs.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Positive control first: the genuine HTTP call still mints its route. */
+    ASSERT_GTE(count_nodes_named(s, project, "/api/items"), 1);
+    ASSERT_GTE(count_edges_with_url_path(s, project, "/api/items"), 1);
+    /* No Route node for any filesystem document path... */
+    ASSERT_EQ(count_nodes_named(s, project, "/new/file.txt"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/docs/guide.md"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/data/app.log"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/reports/summary.pdf"), 0);
+    ASSERT_EQ(count_nodes_named(s, project, "/docs/index.rst"), 0);
+    /* ...and no HTTP_CALLS edge carrying one as its url_path either. */
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/new/file.txt"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/docs/guide.md"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/data/app.log"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/reports/summary.pdf"), 0);
+    ASSERT_EQ(count_edges_with_url_path(s, project, "/docs/index.rst"), 0);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Native `fetch()` (#856), sequential path (< 50 files → pass_calls.c). A bare
  * unqualified call to the global fetch API has no import and no local
  * definition anywhere in this project, so registry resolution comes back
@@ -15129,6 +15223,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
+    RUN_TEST(pipeline_arg_url_rejects_document_file_paths);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
     RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);

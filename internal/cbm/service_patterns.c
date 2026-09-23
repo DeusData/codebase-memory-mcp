@@ -648,9 +648,9 @@ static bool has_filesystem_extension(const char *path) {
     ext[ext_len] = '\0';
 
     static const char *const hard_file_exts[] = {
-        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",         ".env",
-        ".ini",  ".key",    ".pem",         ".pid",  ".properties", ".service",
-        ".sock", ".socket", ".sqlite",      ".toml", NULL};
+        ".cfg",  ".conf",   ".credentials", ".crt",  ".db",  ".env",        ".ini", ".key",
+        ".log",  ".md",     ".pdf",         ".pem",  ".pid", ".properties", ".rst", ".service",
+        ".sock", ".socket", ".sqlite",      ".toml", ".txt", NULL};
     for (int i = 0; hard_file_exts[i]; i++) {
         if (path_ext_matches(ext, hard_file_exts[i])) {
             return true;
