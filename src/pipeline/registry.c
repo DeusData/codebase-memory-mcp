@@ -726,16 +726,6 @@ static const char *path_basename(const char *path) {
     return slash ? slash + 1 : path;
 }
 
-/* Build and configuration languages have no cross-language call semantics: a
- * Makefile's `$(eval ...)` or a CMake `function(...)` names nothing in a C
- * file, so a bare-name bind into another language is always a collision
- * (2026-09-16 probe: kernel Makefile targets bound to `sk_psock.eval`). */
-static bool build_config_language(CBMLanguage lang) {
-    return lang == CBM_LANG_MAKEFILE || lang == CBM_LANG_CMAKE || lang == CBM_LANG_YAML ||
-           lang == CBM_LANG_TOML || lang == CBM_LANG_JSON || lang == CBM_LANG_INI ||
-           lang == CBM_LANG_DOCKERFILE;
-}
-
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy) {
     /* Two same-named symbols in different languages: suffix_match picks one
