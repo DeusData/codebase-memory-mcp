@@ -4216,6 +4216,42 @@ TEST(extract_java_jaxrs_relative_path_templates) {
     PASS();
 }
 
+/* @Path("") is legal JAX-RS and means "the class path itself". Accepting
+ * relative templates must not turn it into an empty route path: the method
+ * has to behave exactly like one without @Path (fallback to "/", then
+ * class-level composition). The class without a class-level @Path is the
+ * binding case: an empty method path would otherwise drop the route. */
+TEST(extract_java_jaxrs_empty_path_means_class_path) {
+    CBMFileResult *r = extract("import jakarta.ws.rs.GET;\n"
+                               "import jakarta.ws.rs.Path;\n"
+                               "@Path(\"api/v1/widgets\")\n"
+                               "class WidgetResource {\n"
+                               "  @GET\n"
+                               "  @Path(\"\")\n"
+                               "  public String root() { return \"\"; }\n"
+                               "}\n"
+                               "class RootResource {\n"
+                               "  @GET\n"
+                               "  @Path(\"\")\n"
+                               "  public String index() { return \"\"; }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "Resources.java");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMDefinition *root = find_def_by_name(r, "root");
+    ASSERT_NOT_NULL(root);
+    ASSERT_NOT_NULL(root->route_path);
+    ASSERT_STR_EQ(root->route_path, "/api/v1/widgets");
+    ASSERT_STR_EQ(root->route_method, "GET");
+    const CBMDefinition *index = find_def_by_name(r, "index");
+    ASSERT_NOT_NULL(index);
+    ASSERT_NOT_NULL(index->route_path);
+    ASSERT_STR_EQ(index->route_path, "/");
+    ASSERT_STR_EQ(index->route_method, "GET");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Negative control: relative templates are accepted for JAX-RS @Path only.
  * A slash-less string on a non-JAX-RS mapping annotation must keep the
  * previous behaviour (the literal is not read as a route path), so the
@@ -8364,6 +8400,7 @@ SUITE(extraction) {
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
     RUN_TEST(extract_java_jaxrs_relative_path_templates);
+    RUN_TEST(extract_java_jaxrs_empty_path_means_class_path);
     RUN_TEST(extract_java_spring_relative_string_not_route_path);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);

@@ -1434,8 +1434,10 @@ static const char *route_path_from_string_node(CBMArena *a, TSNode node, const c
     }
     /* JAX-RS @Path values are relative URI templates; a leading slash is
      * optional and ignored by the framework. Route nodes use absolute-looking
-     * paths consistently, so normalize a non-empty relative value here. */
-    return path[0] ? cbm_arena_sprintf(a, "/%s", path) : path;
+     * paths consistently, so normalize a non-empty relative value here. An
+     * empty @Path("") means "the class path itself": leave it unset so the
+     * caller falls back exactly as it does for a method without @Path. */
+    return path[0] ? cbm_arena_sprintf(a, "/%s", path) : NULL;
 }
 
 static const char *find_route_path_literal(CBMArena *a, TSNode node, const char *source,
