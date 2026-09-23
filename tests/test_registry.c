@@ -987,6 +987,27 @@ TEST(go_bare_ref_never_binds_field) {
     PASS();
 }
 
+TEST(java_call_never_binds_data_member) {
+    /* A Java call expression never names data, so a CALLS bind that landed on
+     * a Variable or a Field is a spelling collision. The shape that produces
+     * it: a record's accessors are implicit, `p.x()` finds no declared `x()`,
+     * and the short-name registry hands back the first `x` in the tree — an
+     * unrelated class's private field. */
+    ASSERT_TRUE(cbm_java_suppress_call_to_data_member(true, "Field"));
+    ASSERT_TRUE(cbm_java_suppress_call_to_data_member(true, "Variable"));
+    /* Everything callable is kept, including the constructor's Class target. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Method"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Function"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, "Class"));
+    /* Other languages have callable data: a Kotlin property or a C function
+     * pointer is a name that is not a method and is called all the same. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Field"));
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(false, "Variable"));
+    /* Degenerate input → nothing to judge. */
+    ASSERT_FALSE(cbm_java_suppress_call_to_data_member(true, NULL));
+    PASS();
+}
+
 TEST(dynamic_suppress_drops_weak_method_matches) {
     /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
@@ -1244,6 +1265,7 @@ SUITE(registry) {
     RUN_TEST(registry_tie_break_is_independent_of_registration_order);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
+    RUN_TEST(java_call_never_binds_data_member);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
