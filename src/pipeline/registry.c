@@ -761,6 +761,20 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
     return true;
 }
 
+bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
+                                            const char *strategy) {
+    if (cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, strategy)) {
+        return true;
+    }
+    /* py_lsp_cross module-local lookup can emit lsp_direct to the only
+     * project symbol with a bare name in another language (#1572 pipeline). */
+    if (strategy && strcmp(strategy, "lsp_direct") == 0 &&
+        cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, "unique_name")) {
+        return true;
+    }
+    return false;
+}
+
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {
     /* #1928: USAGE / WRITES / READS analog of the CALLS guard above. A
      * variable or field reference resolved by the short-name registry must

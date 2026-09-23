@@ -3023,10 +3023,10 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
         atomic_fetch_add_explicit(&rc->time_ns_rc_target, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
         if (target_node && source_node->id != target_node->id &&
-            cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+            cbm_suppress_cross_language_calls_edge(lang, target_node->file_path, res.strategy)) {
             /* #725/#1572: same guard as pass_calls.c — do not emit a
              * suffix_match or unique_name CALLS edge across a language
-             * boundary. */
+             * boundary (incl. lsp_direct homonym #1572). */
             continue;
         }
         if (!target_node || source_node->id == target_node->id) {

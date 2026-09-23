@@ -505,6 +505,10 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
             res.confidence = lsp->confidence;
             res.strategy = lsp->strategy;
             res.candidate_count = 1;
+            if (cbm_suppress_cross_language_calls_edge(lang, target_node->file_path,
+                                                       res.strategy)) {
+                return SKIP_ONE;
+            }
             emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys,
                                  imp_vals, imp_count, false);
             return SKIP_ONE;
@@ -680,7 +684,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * will attach a Python Store.commit() call to a JS function named
      * commit, or a Python `with patch(...)` to a unique TSX `patch`. Drop
      * those weak cross-language edges. */
-    if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
+    if (cbm_suppress_cross_language_calls_edge(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,

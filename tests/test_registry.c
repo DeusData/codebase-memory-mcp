@@ -1016,6 +1016,17 @@ TEST(cross_language_unique_name_drops_py_vs_tsx) {
     PASS();
 }
 
+TEST(cross_language_calls_edge_treats_lsp_direct_homonym_as_unique_name) {
+    /* #1572 pipeline: py_lsp_cross can emit lsp_direct to a cross-language homonym. */
+    ASSERT_TRUE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                       "lsp_direct"));
+    ASSERT_FALSE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "backend/test_thing.py",
+                                                        "lsp_direct"));
+    ASSERT_TRUE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                       "unique_name"));
+    PASS();
+}
+
 TEST(dynamic_suppress_drops_weak_method_matches) {
     /* #592/#606/#1276: a member call whose receiver the LSP could not type, that
      * landed via a WEAK short-name strategy, is generic-resolver noise → drop.
@@ -1274,6 +1285,7 @@ SUITE(registry) {
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(cross_language_unique_name_drops_py_vs_tsx);
+    RUN_TEST(cross_language_calls_edge_treats_lsp_direct_homonym_as_unique_name);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
     RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
