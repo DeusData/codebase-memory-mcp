@@ -769,12 +769,6 @@ static bool lsp_strategy_is_external_builtin(const char *strategy) {
            strcmp(strategy, "lsp_builtin_constructor") == 0;
 }
 
-static bool cross_language_unique_name_homonym(CBMLanguage caller_lang,
-                                               const char *target_file_path) {
-    return cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path,
-                                                    "unique_name");
-}
-
 bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
                                             const char *strategy) {
     if (cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, strategy)) {
@@ -784,7 +778,8 @@ bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char 
      * homonym, every weak resolver (import_map, lsp_*, suffix_match, …) is the
      * same failure mode as registry unique_name. Keep same_module (true local
      * callee) and stdlib lsp_builtin* (usually off-graph). */
-    if (!cross_language_unique_name_homonym(caller_lang, target_file_path)) {
+    if (!cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path,
+                                                  "unique_name")) {
         return false;
     }
     if (strategy && strcmp(strategy, "same_module") == 0) {
