@@ -762,9 +762,11 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
 }
 
 static bool lsp_strategy_is_external_builtin(const char *strategy) {
-    return strategy && (strcmp(strategy, "lsp_builtin") == 0 ||
-                        strcmp(strategy, "lsp_builtin_method") == 0 ||
-                        strcmp(strategy, "lsp_builtin_constructor") == 0);
+    if (!strategy) {
+        return false;
+    }
+    return strcmp(strategy, "lsp_builtin") == 0 || strcmp(strategy, "lsp_builtin_method") == 0 ||
+           strcmp(strategy, "lsp_builtin_constructor") == 0;
 }
 
 bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
