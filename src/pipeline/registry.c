@@ -778,8 +778,7 @@ bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char 
      * homonym, every weak resolver (import_map, lsp_*, suffix_match, …) is the
      * same failure mode as registry unique_name. Keep same_module (true local
      * callee) and stdlib lsp_builtin* (usually off-graph). */
-    if (!cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path,
-                                                  "unique_name")) {
+    if (!cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, "unique_name")) {
         return false;
     }
     if (strategy && strcmp(strategy, "same_module") == 0) {
