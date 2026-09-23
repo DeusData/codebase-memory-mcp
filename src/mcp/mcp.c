@@ -8069,23 +8069,29 @@ static yyjson_doc *resolve_trace_edge_types(const char *args, const char *mode,
     return NULL;
 }
 
-/* Check if a file path looks like a test file. The substring checks below
- * only catch a tests/ directory nested under another path component
- * (".../tests/foo"); a project-root-relative path like "tests/repro/foo.c"
- * has no leading slash before "tests" and fell through undetected, leaking
- * whole test subtrees into query_graph/trace_path results with the default
- * include_tests=false (#1294). */
-static bool is_test_file(const char *path) {
-    if (!path) {
-        return false;
+/* Path rules also cover legacy nodes with missing or false is_test metadata. */
+static bool trace_node_is_test(const cbm_node_t *node) {
+    const char *base = node->file_path;
+    if (base) {
+        for (const char *end = base; *end; end++) {
+            if (*end != '/' && *end != '\\') {
+                continue;
+            }
+            size_t length = (size_t)(end - base);
+            if ((length == SLEN("test") && strncmp(base, "test", length) == 0) ||
+                (length == SLEN("tests") && strncmp(base, "tests", length) == 0) ||
+                (length == SLEN("spec") && strncmp(base, "spec", length) == 0) ||
+                (length == SLEN("__tests__") && strncmp(base, "__tests__", length) == 0)) {
+                return true;
+            }
+            base = end + SKIP_ONE;
+        }
+        if (strncmp(base, "test_", SLEN("test_")) == 0 || strstr(base, "_test.") ||
+            strstr(base, ".test.") || strstr(base, ".spec.")) {
+            return true;
+        }
     }
-    return strstr(path, "/test") != NULL || strstr(path, "test_") != NULL ||
-           strstr(path, "_test.") != NULL || strstr(path, "/tests/") != NULL ||
-           strstr(path, "/spec/") != NULL || strstr(path, ".test.") != NULL ||
-           strncmp(path, "tests/", SLEN("tests/")) == 0 ||
-           strncmp(path, "test/", SLEN("test/")) == 0 ||
-           strncmp(path, "spec/", SLEN("spec/")) == 0 ||
-           strncmp(path, "__tests__/", SLEN("__tests__/")) == 0;
+    return node->properties_json && cbm_mcp_get_bool_arg(node->properties_json, "is_test");
 }
 
 /* Filtering belongs before page-window calculation: hidden test rows must not
@@ -8094,7 +8100,7 @@ static bool is_test_file(const char *path) {
 static void trace_filter_test_rows(cbm_traverse_result_t *tr) {
     int write_index = 0;
     for (int read_index = 0; read_index < tr->visited_count; read_index++) {
-        if (is_test_file(tr->visited[read_index].node.file_path)) {
+        if (trace_node_is_test(&tr->visited[read_index].node)) {
             cbm_node_free_fields(&tr->visited[read_index].node);
             continue;
         }
@@ -8292,7 +8298,7 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
                               bool include_evidence, const trace_edge_context_t *edge_ctx) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         visible++;
@@ -8315,8 +8321,7 @@ static void bfs_to_toon_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
     }
     cbm_tree_table_header(sb, key, visible, cols, ncols);
     for (int i = 0; i < tr->visited_count; i++) {
-        const char *fp = tr->visited[i].node.file_path;
-        bool test = is_test_file(fp);
+        bool test = trace_node_is_test(&tr->visited[i].node);
         if (!include_tests && test) {
             continue;
         }
@@ -8751,7 +8756,7 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
     char *cur_group = NULL;
     bool have_group = false;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         const char *qn =
@@ -8778,7 +8783,7 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
             yyjson_mut_arr_add_str(doc, row, cbm_risk_label(cbm_hop_to_risk(tr->visited[i].hop)));
         }
         if (include_tests) {
-            yyjson_mut_arr_add_bool(doc, row, is_test_file(tr->visited[i].node.file_path));
+            yyjson_mut_arr_add_bool(doc, row, trace_node_is_test(&tr->visited[i].node));
         }
         const cbm_edge_info_t *predecessor = (data_flow || include_evidence)
                                                  ? trace_predecessor_edge(edge_ctx, &tr->visited[i])
@@ -8845,7 +8850,7 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
                               const trace_edge_context_t *edge_ctx) {
     int visible = 0;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         visible++;
@@ -8861,7 +8866,7 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
     bool ordered_owned = ordered != NULL;
     int ordered_count = 0;
     for (int i = 0; i < tr->visited_count; i++) {
-        if (!include_tests && is_test_file(tr->visited[i].node.file_path)) {
+        if (!include_tests && trace_node_is_test(&tr->visited[i].node)) {
             continue;
         }
         if (ordered) {
@@ -8895,7 +8900,7 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
         cbm_tree_cell_str(sb, plen ? qn + plen + 1 : qn, true);
         cbm_tree_cell_int(sb, ordered[i].hop, false);
         if (include_tests) {
-            cbm_tree_cell_bool(sb, is_test_file(ordered[i].node.file_path), false);
+            cbm_tree_cell_bool(sb, trace_node_is_test(&ordered[i].node), false);
         }
         const char *ev_class = NULL;
         double ev_conf = -1.0;
@@ -9383,13 +9388,13 @@ render_trace_output:;
      * the tool). Count with the same filter the emitters apply. */
     int out_total = 0;
     for (int i = 0; i < tr_out.visited_count; i++) {
-        if (include_tests || !is_test_file(tr_out.visited[i].node.file_path)) {
+        if (include_tests || !trace_node_is_test(&tr_out.visited[i].node)) {
             out_total++;
         }
     }
     int in_total = 0;
     for (int i = 0; i < tr_in.visited_count; i++) {
-        if (include_tests || !is_test_file(tr_in.visited[i].node.file_path)) {
+        if (include_tests || !trace_node_is_test(&tr_in.visited[i].node)) {
             in_total++;
         }
     }

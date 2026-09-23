@@ -2766,6 +2766,223 @@ TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294) {
     PASS();
 }
 
+TEST(tool_trace_test_classification_issue1593) {
+    static const struct {
+        const char *path;
+        const char *properties;
+        bool is_test;
+    } cases[] = {
+        {"e2e/module.spec.ts", NULL, true},
+        {"e2e/function.spec.ts", NULL, true},
+        {"e2e/method.spec.ts", NULL, true},
+        {"src/core.test.ts", NULL, true},
+        {"tests/root.ts", NULL, true},
+        {"test/root.ts", NULL, true},
+        {"spec/root.ts", NULL, true},
+        {"__tests__/root.ts", NULL, true},
+        {"app/tests/nested.ts", NULL, true},
+        {"app/test/nested.ts", NULL, true},
+        {"app/spec/nested.ts", NULL, true},
+        {"app/__tests__/nested.ts", NULL, true},
+        {"tests\\root.ts", NULL, true},
+        {"app\\__tests__\\nested.ts", NULL, true},
+        {"src/test_core.py", NULL, true},
+        {"src/core_test.c", NULL, true},
+        {"src/main.ts", NULL, false},
+        {"src/testimonials.ts", NULL, false},
+        {"src/test_helpers/main.ts", NULL, false},
+        {"src/my__tests__/main.ts", NULL, false},
+        {"src/contest.ts", NULL, false},
+        {"src/inline.rs", "{\"is_test\":true}", true},
+        {"src/inline.rs", "{ \"is_test\" : true }", true},
+        {NULL, "{\"is_test\":true}", true},
+        {"src/main.ts", "{\"is_test\":false}", false},
+        {"e2e/legacy.spec.ts", "{\"is_test\":false}", true},
+        {"src/main.ts", "{\"is_test\":\"true\"}", false},
+        {"src/main.ts", "{\"is_test\":1}", false},
+        {"src/main.ts", "{\"nested\":{\"is_test\":true}}", false},
+        {"src/main.ts", "null", false},
+        {"src/main.ts", "{broken", false},
+        {"e2e/broken.spec.ts", "{broken", true},
+        {NULL, NULL, false},
+        {"", "", false},
+    };
+    static const char *const labels[] = {"Module", "Function", "Method"};
+    static const char *const directions[] = {"outbound", "inbound", "both"};
+    static const char *const formats[] = {"json", "tree"};
+    static const struct {
+        const char *args;
+        bool risk;
+    } views[] = {{"", false},
+                 {",\"risk_labels\":true", true},
+                 {",\"mode\":\"data_flow\"", false},
+                 {",\"mode\":\"data_flow\",\"risk_labels\":true,\"include_evidence\":true", true}};
+    const size_t count = sizeof(cases) / sizeof(cases[0]);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "trace-test-kinds";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/trace-test-kinds"), CBM_STORE_OK);
+    cbm_node_t hub = {.project = project,
+                      .label = "Function",
+                      .name = "hub",
+                      .qualified_name = "trace-test-kinds.hub",
+                      .file_path = "src/hub.ts"};
+    int64_t hub_id = cbm_store_upsert_node(store, &hub);
+    ASSERT_GT(hub_id, 0);
+    size_t production_count = 0;
+    for (size_t i = 0; i < count; i++) {
+        char name[32], qn[64];
+        snprintf(name, sizeof(name), "case_%02zu", i);
+        snprintf(qn, sizeof(qn), "%s.%s", project, name);
+        cbm_node_t node = {.project = project,
+                           .label = labels[i % 3],
+                           .name = name,
+                           .qualified_name = qn,
+                           .file_path = cases[i].path,
+                           .properties_json = cases[i].properties};
+        int64_t id = cbm_store_upsert_node(store, &node);
+        ASSERT_GT(id, 0);
+        for (int inbound = 0; inbound < 2; inbound++) {
+            cbm_edge_t edge = {.project = project,
+                               .source_id = inbound ? id : hub_id,
+                               .target_id = inbound ? hub_id : id,
+                               .type = "CALLS",
+                               .properties_json =
+                                   "{\"strategy\":\"unique_name\",\"confidence\":0.75,"
+                                   "\"args\":[{\"i\":0,\"e\":\"value\"}]}"};
+            ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+        }
+        production_count += !cases[i].is_test;
+    }
+
+    bool ok = true;
+    for (size_t d = 0; d < 3; d++) {
+        for (size_t f = 0; f < 2; f++) {
+            for (size_t v = 0; v < sizeof(views) / sizeof(views[0]); v++) {
+                for (int include_tests = 0; include_tests < 2; include_tests++) {
+                    char args[512];
+                    snprintf(args, sizeof(args),
+                             "{\"project\":\"%s\",\"function_name\":\"hub\",\"direction\":\"%s\","
+                             "\"depth\":1,\"limit\":100,\"max_output_tokens\":16000,"
+                             "\"format\":\"%s\",\"include_tests\":%s%s}",
+                             project, directions[d], formats[f], include_tests ? "true" : "false",
+                             views[v].args);
+                    char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+                    char *inner = response ? extract_text_content(response) : NULL;
+                    yyjson_doc *doc = inner && f == 0 ? yyjson_read(inner, strlen(inner), 0) : NULL;
+                    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+                    bool matches = inner && (f != 0 || doc);
+                    size_t expected = include_tests ? count : production_count;
+                    for (int inbound = 0; matches && inbound < 2; inbound++) {
+                        if ((d == 0 && inbound) || (d == 1 && !inbound)) {
+                            continue;
+                        }
+                        const char *leg = inbound ? "callers" : "callees";
+                        char total[64];
+                        snprintf(total, sizeof(total), "%s_total", leg);
+                        yyjson_val *table = root ? yyjson_obj_get(root, leg) : NULL;
+                        if (f == 0) {
+                            yyjson_val *value = yyjson_obj_get(root, total);
+                            matches = yyjson_is_int(value) && yyjson_get_uint(value) == expected;
+                        } else {
+                            snprintf(total, sizeof(total), "%s_total: %zu\n", leg, expected);
+                            matches = strstr(inner, total) != NULL;
+                        }
+                        for (size_t i = 0; matches && i < count; i++) {
+                            char name[32];
+                            snprintf(name, sizeof(name), "case_%02zu", i);
+                            bool visible = include_tests || !cases[i].is_test;
+                            if (f == 0) {
+                                yyjson_val *row = trace_grouped_row_named(table, name, NULL);
+                                matches = (row != NULL) == visible;
+                                if (matches && visible && include_tests) {
+                                    yyjson_val *test = yyjson_arr_get(row, views[v].risk ? 3 : 2);
+                                    matches = yyjson_is_bool(test) &&
+                                              yyjson_get_bool(test) == cases[i].is_test;
+                                }
+                            } else {
+                                matches = (strstr(inner, name) != NULL) == visible;
+                                if (matches && visible && include_tests) {
+                                    char row[96];
+                                    snprintf(row, sizeof(row), "%s 1 %s%s", name,
+                                             views[v].risk ? "CRITICAL " : "",
+                                             cases[i].is_test ? "true" : "false");
+                                    matches = strstr(inner, row) != NULL;
+                                }
+                            }
+                        }
+                    }
+                    if (!matches && ok) {
+                        fprintf(stderr, "trace classification mismatch: %s/%s view=%zu tests=%d\n",
+                                directions[d], formats[f], v, include_tests);
+                    }
+                    ok = ok && matches;
+                    yyjson_doc_free(doc);
+                    free(inner);
+                    free(response);
+                }
+            }
+        }
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
+TEST(tool_trace_test_filter_preserves_walk_issue1593) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    const char *project = "trace-test-walk";
+    cbm_mcp_server_set_project(srv, project);
+    ASSERT_EQ(cbm_store_upsert_project(store, project, "/tmp/trace-test-walk"), CBM_STORE_OK);
+    const char *names[] = {"hub", "hidden", "visible"};
+    const char *paths[] = {"src/hub.ts", "e2e/login.spec.ts", "src/visible.ts"};
+    int64_t ids[3];
+    for (int i = 0; i < 3; i++) {
+        cbm_node_t node = {.project = project,
+                           .label = "Function",
+                           .name = names[i],
+                           .qualified_name = names[i],
+                           .file_path = paths[i]};
+        ids[i] = cbm_store_upsert_node(store, &node);
+        ASSERT_GT(ids[i], 0);
+        if (i > 0) {
+            cbm_edge_t edge = {
+                .project = project, .source_id = ids[i - 1], .target_id = ids[i], .type = "CALLS"};
+            ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+        }
+    }
+    bool ok = true;
+    for (int depth = 1; depth <= 2; depth++) {
+        char args[256];
+        snprintf(args, sizeof(args),
+                 "{\"project\":\"%s\",\"function_name\":\"hub\",\"direction\":\"outbound\","
+                 "\"depth\":%d,\"limit\":1,\"format\":\"json\"}",
+                 project, depth);
+        char *response = cbm_mcp_handle_tool(srv, "trace_path", args);
+        char *inner = response ? extract_text_content(response) : NULL;
+        yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+        yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+        yyjson_val *leg = root ? yyjson_obj_get(root, "callees") : NULL;
+        yyjson_val *row = trace_grouped_row_named(leg, "visible", NULL);
+        ok = ok && doc && yyjson_is_obj(leg) &&
+             yyjson_is_int(yyjson_obj_get(root, "callees_total")) &&
+             yyjson_get_int(yyjson_obj_get(root, "callees_total")) == depth - 1 &&
+             !yyjson_obj_get(root, "next_cursor") &&
+             !trace_grouped_row_named(leg, "hidden", NULL) &&
+             (depth == 1 ? row == NULL : row && yyjson_get_int(yyjson_arr_get(row, 1)) == 2);
+        yyjson_doc_free(doc);
+        free(inner);
+        free(response);
+    }
+    cbm_mcp_server_free(srv);
+    ASSERT_TRUE(ok);
+    PASS();
+}
+
 /* SCC condensation (get_architecture aspect "cycles"): a 3-function CALLS
  * cycle A->B->C->A must be reported as one circular dependency of size 3 with
  * all three members; a separate acyclic chain (D->E) must NOT appear. The
@@ -6484,7 +6701,7 @@ TEST(tool_trace_paging_filters_before_window_and_hashes_effective_args) {
                          .label = "Function",
                          .name = "hidden_test",
                          .qualified_name = "trace-visible-page.hidden_test",
-                         .file_path = "tests/hidden_test.c",
+                         .file_path = "e2e/hidden.spec.ts",
                          .start_line = 1,
                          .end_line = 3};
     cbm_node_t callee = {.project = project,
@@ -20524,6 +20741,8 @@ SUITE(mcp) {
     RUN_TEST(tool_search_graph_grouped_dotless_qn_round_trips);
     RUN_TEST(tool_trace_totals_respect_test_filter);
     RUN_TEST(tool_trace_totals_respect_test_filter_tests_root_subtree_issue1294);
+    RUN_TEST(tool_trace_test_classification_issue1593);
+    RUN_TEST(tool_trace_test_filter_preserves_walk_issue1593);
     RUN_TEST(tool_get_architecture_cycles_detects_scc);
     RUN_TEST(tool_get_code_snippet_clips_whole_file_node);
     RUN_TEST(tool_get_code_snippet_omits_over_budget_whole_line);
