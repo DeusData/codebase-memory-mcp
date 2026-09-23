@@ -769,20 +769,31 @@ static bool lsp_strategy_is_external_builtin(const char *strategy) {
            strcmp(strategy, "lsp_builtin_constructor") == 0;
 }
 
+static bool cross_language_unique_name_homonym(CBMLanguage caller_lang,
+                                               const char *target_file_path) {
+    return cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path,
+                                                    "unique_name");
+}
+
 bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
                                             const char *strategy) {
     if (cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, strategy)) {
         return true;
     }
-    /* #1572 pipeline: registry unique_name and Python-LSP bare-name binds
-     * (lsp_direct, lsp_callable_alias, …) are the same homonym class across
-     * languages. Import-aware lsp_import_alias to stdlib QNs stays same-language
-     * or off-graph; in-repo cross-language targets are still dropped. */
-    if (!strategy || strncmp(strategy, "lsp_", 4) != 0 ||
-        lsp_strategy_is_external_builtin(strategy)) {
+    /* #1572 / #725 pipeline: once the target is a cross-language unique_name
+     * homonym, every weak resolver (import_map, lsp_*, suffix_match, …) is the
+     * same failure mode as registry unique_name. Keep same_module (true local
+     * callee) and stdlib lsp_builtin* (usually off-graph). */
+    if (!cross_language_unique_name_homonym(caller_lang, target_file_path)) {
         return false;
     }
-    return cbm_suppress_cross_language_suffix_match(caller_lang, target_file_path, "unique_name");
+    if (strategy && strcmp(strategy, "same_module") == 0) {
+        return false;
+    }
+    if (lsp_strategy_is_external_builtin(strategy)) {
+        return false;
+    }
+    return true;
 }
 
 bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target_file_path) {

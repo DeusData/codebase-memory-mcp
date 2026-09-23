@@ -1028,8 +1028,14 @@ TEST(cross_language_calls_edge_treats_lsp_direct_homonym_as_unique_name) {
                                                        "lsp_callable_alias"));
     ASSERT_TRUE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "frontend/Panel.tsx",
                                                        "lsp_override"));
+    ASSERT_TRUE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                       "import_map"));
+    ASSERT_TRUE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "frontend/Panel.tsx",
+                                                       "import_map_suffix"));
     ASSERT_FALSE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "frontend/Panel.tsx",
                                                         "lsp_builtin"));
+    ASSERT_FALSE(cbm_suppress_cross_language_calls_edge(CBM_LANG_PYTHON, "backend/test_thing.py",
+                                                        "import_map"));
     PASS();
 }
 
