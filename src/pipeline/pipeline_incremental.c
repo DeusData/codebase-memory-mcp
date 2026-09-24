@@ -30,6 +30,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "foundation/compat_thread.h"
 #include "foundation/platform.h"
 #include "foundation/sha256.h"
+#include "result_spill.h"
 
 #include <errno.h>
 #include <stdlib.h>
@@ -1351,6 +1352,19 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         rc = cbm_parallel_resolve(ctx, changed_files, ci, cache, &shared_ids, worker_count,
                                   all_defs, all_def_count, closure ? closure->def_modules : NULL,
                                   module_def_index, registries_arg);
+        if (rc == 0) {
+            for (int i = 0; i < ci; i++) {
+                bool loaded = false;
+                CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+                if (result) {
+                    cbm_pipeline_record_unresolved_calls(ctx->pipeline, changed_files[i].rel_path,
+                                                         result);
+                } else if (ctx->spill && cbm_result_spill_has(ctx->spill, i)) {
+                    cbm_pipeline_mark_unresolved_capture_failed(ctx->pipeline);
+                }
+                cbm_pipeline_result_release(result, loaded);
+            }
+        }
         if (module_def_index) {
             cbm_pxc_free_module_def_index(module_def_index);
         }
@@ -1400,6 +1414,14 @@ static int run_extract_resolve(cbm_pipeline_ctx_t *ctx, cbm_file_info_t *changed
         }
         if (rc == 0) {
             rc = cbm_pipeline_pass_semantic(ctx, changed_files, ci);
+        }
+        if (rc == 0 && cache) {
+            for (int i = 0; i < ci; i++) {
+                if (cache[i]) {
+                    cbm_pipeline_record_unresolved_calls(ctx->pipeline, changed_files[i].rel_path,
+                                                         cache[i]);
+                }
+            }
         }
         if (rc == 0) {
             rc = cbm_pipeline_check_cancel(ctx);
@@ -2237,11 +2259,17 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
     int run_ignored_count = 0;
     int run_ignored_total = 0;
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
-    bool coverage_rows_available = cov_cap == 0;
+    cbm_coverage_row_t *run_unresolved = NULL;
+    int run_unresolved_count = 0;
+    bool unresolved_complete = false;
+    cbm_pipeline_get_unresolved_calls(p, &run_unresolved, &run_unresolved_count,
+                                      &unresolved_complete);
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count +
+                  run_unresolved_count;
+    bool coverage_rows_available = cov_cap == 0 && unresolved_complete;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
-        coverage_rows_available = cov != NULL;
+        coverage_rows_available = cov != NULL && unresolved_complete;
     }
     if (cov) {
         for (int i = 0; i < old_cov_count; i++) {
@@ -2256,6 +2284,9 @@ static int run_closure_delta(cbm_pipeline_t *p, const char *db_path, const char 
             cov[cov_n].kind = run_errs[i].phase;
             cov[cov_n].detail = run_errs[i].reason;
             cov_n++;
+        }
+        for (int i = 0; i < run_unresolved_count; i++) {
+            cov[cov_n++] = run_unresolved[i];
         }
         for (int i = 0; i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
@@ -2810,11 +2841,17 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
     cbm_pipeline_get_ignored(p, &run_ignored, &run_ignored_count, &run_ignored_total);
     cbm_coverage_row_t *cov = NULL;
     int cov_n = 0;
-    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count;
+    cbm_coverage_row_t *run_unresolved = NULL;
+    int run_unresolved_count = 0;
+    bool unresolved_complete = false;
+    cbm_pipeline_get_unresolved_calls(p, &run_unresolved, &run_unresolved_count,
+                                      &unresolved_complete);
+    int cov_cap = old_cov_count + run_err_count + run_excluded_count + run_ignored_count +
+                  run_unresolved_count;
     if (cov_cap > 0) {
         cov = (cbm_coverage_row_t *)malloc((size_t)cov_cap * sizeof(*cov));
     }
-    bool coverage_rows_available = cov_cap == 0 || cov != NULL;
+    bool coverage_rows_available = (cov_cap == 0 || cov != NULL) && unresolved_complete;
     if (cov) {
         CBMHashTable *changed_set = cbm_ht_create(ci > 0 ? (size_t)ci * PAIR_LEN : CBM_SZ_64);
         for (int i = 0; i < ci; i++) {
@@ -2833,6 +2870,9 @@ int cbm_pipeline_run_incremental(cbm_pipeline_t *p, const char *db_path, cbm_fil
             cov[cov_n].kind = run_errs[i].phase;
             cov[cov_n].detail = run_errs[i].reason;
             cov_n++;
+        }
+        for (int i = 0; i < run_unresolved_count; i++) {
+            cov[cov_n++] = run_unresolved[i];
         }
         for (int i = 0; i < run_excluded_count; i++) {
             cov[cov_n].rel_path = run_excluded[i];
