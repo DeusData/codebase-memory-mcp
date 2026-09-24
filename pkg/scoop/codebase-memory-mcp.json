@@ -1,27 +1,34 @@
 {
-  "version": "0.8.1",
-  "description": "Fast code intelligence engine — native executable with verified runtime assets",
-  "homepage": "https://github.com/DeusData/codebase-memory-mcp",
-  "license": "MIT",
-  "architecture": {
-    "64bit": {
-      "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.8.1/codebase-memory-mcp-windows-amd64.zip",
-      "hash": "a602ad090ed3f49d86c55472f73f27ad7055222806a82358f2e08513e027f00f",
-      "bin": "codebase-memory-mcp.exe"
-    }
-  },
-  "checkver": {
-    "github": "https://github.com/DeusData/codebase-memory-mcp"
-  },
-  "autoupdate": {
+    "version": "0.11.0",
+    "description": "Code intelligence knowledge graph MCP server for AI coding agents",
+    "homepage": "https://deusdata.github.io/codebase-memory-mcp/",
+    "license": "MIT",
+    "notes": "To register this MCP server with your clients, run `codebase-memory-mcp install` after install.",
     "architecture": {
-      "64bit": {
-        "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v$version/codebase-memory-mcp-windows-amd64.zip",
-        "hash": {
-          "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v$version/checksums.txt",
-          "find": "([a-f0-9]{64})\\s+codebase-memory-mcp-windows-amd64\\.zip"
+        "64bit": {
+            "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.11.0/codebase-memory-mcp-windows-amd64.zip",
+            "hash": "6eb6beaf261b19e419766e78baf93cbc3cf1c6338cff8fb7c0234859f96d1685"
+        },
+        "arm64": {
+            "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v0.11.0/codebase-memory-mcp-windows-arm64.zip",
+            "hash": "52b29881214fce47d529e098308b1de77c40f6812e20a34d588ee4c25b84fd1a"
         }
-      }
+    },
+    "bin": "codebase-memory-mcp.exe",
+    "checkver": {
+        "github": "https://github.com/DeusData/codebase-memory-mcp"
+    },
+    "autoupdate": {
+        "architecture": {
+            "64bit": {
+                "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v$version/codebase-memory-mcp-windows-amd64.zip"
+            },
+            "arm64": {
+                "url": "https://github.com/DeusData/codebase-memory-mcp/releases/download/v$version/codebase-memory-mcp-windows-arm64.zip"
+            }
+        },
+        "hash": {
+            "url": "$baseurl/checksums.txt"
+        }
     }
-  }
 }
