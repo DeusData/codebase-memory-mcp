@@ -1653,8 +1653,9 @@ static _Noreturn void cli_scope_host_child(const cli_scope_fixture_t *fixture, i
     (void)write(ready_fd, &ready, 1);
     close(ready_fd);
     bool drained = false;
-    uint64_t deadline = cbm_now_ms() + 120000U;
-    while (ready_ok && cbm_now_ms() < deadline) {
+    /* The parent owns the release pipe. If it exits, poll observes POLLHUP;
+     * a fixed lifetime can stop a healthy host during a slow binary install. */
+    while (ready_ok) {
         if (cbm_daemon_runtime_service_wait_exited(service, 50U)) {
             drained = true;
             break;
