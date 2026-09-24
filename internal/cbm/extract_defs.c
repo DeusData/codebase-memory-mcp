@@ -3490,6 +3490,159 @@ static TSNode find_function_params(TSNode func_node, CBMLanguage lang) {
     return params;
 }
 
+/* ── C-family declared return type ──────────────────────────────────
+ * The C-family grammars split a declared return type three ways: the `type`
+ * field (`char`), sibling type_qualifier nodes (`const`), and the
+ * pointer/reference declarators wrapping the function declarator (`*`). Taking
+ * only the `type` field published `const char *get_name(void)` as "char".
+ *
+ * Canonical spelling: leading cv-qualifiers in source order, the base type text
+ * verbatim, then one space and the declarator markers outermost-first with no
+ * space between them — `const char *`, `char **`, `Text &`, `Text *&`. A
+ * qualifier on a pointer level follows its `*` and is separated from the next
+ * marker by a space: `char *const *`. A qualifier written after the base type
+ * (`char const *`) is normalized to the leading position. */
+
+/* Output sink: measures when buf is NULL, writes otherwise. Rendering twice
+ * sizes the arena allocation exactly without a second copy of the logic. */
+typedef struct {
+    char *buf;
+    size_t len;
+} c_rt_out_t;
+
+static void c_rt_put(c_rt_out_t *out, const char *text, size_t n) {
+    if (out->buf) {
+        memcpy(out->buf + out->len, text, n);
+    }
+    out->len += n;
+}
+
+static void c_rt_put_str(c_rt_out_t *out, const char *text) {
+    c_rt_put(out, text, strlen(text));
+}
+
+static void c_rt_put_node(c_rt_out_t *out, TSNode node, const char *source) {
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    if (end > start) {
+        c_rt_put(out, source + start, (size_t)(end - start));
+    }
+}
+
+/* type_qualifier also covers keywords that are not part of the type
+ * (`constexpr`, `_Noreturn`, `mutable`, `__extension__`, …). Keep only the ones
+ * that are, so `constexpr int f()` still returns "int". */
+static bool is_c_return_cv_qualifier(TSNode node, const char *source) {
+    static const char *const kept[] = {"const",        "volatile", "restrict", "__restrict",
+                                       "__restrict__", "_Atomic",  NULL};
+    if (strcmp(ts_node_type(node), "type_qualifier") != 0) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = end > start ? (size_t)(end - start) : 0;
+    for (const char *const *k = kept; *k; k++) {
+        if (strlen(*k) == len && memcmp(source + start, *k, len) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool is_c_declarator_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA ||
+           lang == CBM_LANG_GLSL || lang == CBM_LANG_HLSL || lang == CBM_LANG_ISPC ||
+           lang == CBM_LANG_SLANG || lang == CBM_LANG_OBJC;
+}
+
+/* Render the canonical return type into `out`; returns how many qualifiers and
+ * markers were added around the base type (0 = the base text alone is already
+ * the whole type). The declarator walk is one strict child chain, so it is
+ * O(depth) with no recursion and needs no depth cap. It stops at the first node
+ * that is neither a pointer nor a reference declarator: for a function returning
+ * a function pointer (`int (*f(void))(int)`) that is the outer
+ * function_declarator, which leaves the base type as it was. */
+static size_t c_rt_render(c_rt_out_t *out, TSNode func_node, TSNode type_node, TSNode declarator,
+                          const char *source) {
+    size_t added = 0;
+    uint32_t decl_start = ts_node_start_byte(declarator);
+    uint32_t nc = ts_node_named_child_count(func_node);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode ch = ts_node_named_child(func_node, i);
+        if (ts_node_start_byte(ch) >= decl_start) {
+            break;
+        }
+        if (is_c_return_cv_qualifier(ch, source)) {
+            c_rt_put_node(out, ch, source);
+            c_rt_put_str(out, " ");
+            added++;
+        }
+    }
+    c_rt_put_node(out, type_node, source);
+
+    bool need_space = true;
+    TSNode decl = declarator;
+    while (!ts_node_is_null(decl)) {
+        const char *dk = ts_node_type(decl);
+        bool is_ref = strcmp(dk, "reference_declarator") == 0;
+        if (!is_ref && strcmp(dk, "pointer_declarator") != 0) {
+            break;
+        }
+        if (need_space) {
+            c_rt_put_str(out, " ");
+            need_space = false;
+        }
+        /* A reference_declarator opens with its `&` / `&&` token. */
+        TSNode marker = ts_node_child(decl, 0);
+        if (is_ref && !ts_node_is_null(marker) && !ts_node_is_named(marker)) {
+            c_rt_put_node(out, marker, source);
+        } else {
+            c_rt_put_str(out, is_ref ? "&" : "*");
+        }
+        added++;
+        uint32_t dn = ts_node_named_child_count(decl);
+        for (uint32_t i = 0; i < dn; i++) {
+            TSNode q = ts_node_named_child(decl, i);
+            if (is_c_return_cv_qualifier(q, source)) {
+                c_rt_put_node(out, q, source);
+                need_space = true;
+                added++;
+            }
+        }
+        /* tree-sitter-cpp/-cuda give a reference_declarator's inner declarator no
+         * `declarator` field (see find_c_params); it is the one named child. */
+        TSNode inner = ts_node_child_by_field_name(decl, TS_FIELD("declarator"));
+        if (ts_node_is_null(inner) && is_ref && dn > 0) {
+            inner = ts_node_named_child(decl, 0);
+        }
+        decl = inner;
+    }
+    return added;
+}
+
+/* Declared return type of a C-family function/method node whose `type` field is
+ * `type_node`. Any other language, and any type with nothing around its base
+ * type, gets the base type text exactly as before. */
+static char *c_declared_return_type(CBMExtractCtx *ctx, TSNode func_node, TSNode type_node) {
+    CBMArena *a = ctx->arena;
+    TSNode declarator = ts_node_child_by_field_name(func_node, TS_FIELD("declarator"));
+    if (!is_c_declarator_lang(ctx->language) || ts_node_is_null(declarator)) {
+        return cbm_node_text(a, type_node, ctx->source);
+    }
+    c_rt_out_t out = {NULL, 0};
+    if (c_rt_render(&out, func_node, type_node, declarator, ctx->source) == 0) {
+        return cbm_node_text(a, type_node, ctx->source);
+    }
+    out.buf = (char *)cbm_arena_alloc(a, out.len + NULL_TERM);
+    if (!out.buf) {
+        return cbm_node_text(a, type_node, ctx->source);
+    }
+    out.len = 0;
+    (void)c_rt_render(&out, func_node, type_node, declarator, ctx->source);
+    out.buf[out.len] = '\0';
+    return out.buf;
+}
+
 // C++: resolve trailing return type (auto f() -> Type) on a declarator node.
 // Updates def->return_type and def->return_types if trailing type found.
 static void resolve_cpp_trailing_return(CBMArena *a, TSNode func_node, const char *source,
@@ -3725,7 +3878,7 @@ static void extract_func_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec 
     for (const char **f = rt_fields; *f; f++) {
         TSNode rt = ts_node_child_by_field_name(func_node, *f, (uint32_t)strlen(*f));
         if (!ts_node_is_null(rt)) {
-            def.return_type = cbm_node_text(a, rt, ctx->source);
+            def.return_type = c_declared_return_type(ctx, func_node, rt);
             def.return_types = extract_return_types(a, rt, ctx->source, ctx->language);
             break;
         }
@@ -4977,7 +5130,7 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
         for (const char **f = rt_fields; *f; f++) {
             TSNode rt = ts_node_child_by_field_name(child, *f, (uint32_t)strlen(*f));
             if (!ts_node_is_null(rt)) {
-                def.return_type = cbm_node_text(a, rt, ctx->source);
+                def.return_type = c_declared_return_type(ctx, child, rt);
                 break;
             }
         }

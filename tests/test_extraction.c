@@ -977,6 +977,65 @@ TEST(c_struct) {
     PASS();
 }
 
+/* return_type of the first definition named `name`; NULL when there is no such
+ * definition or it carries no return type. */
+static const char *def_return_type(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0) {
+            return r->defs.items[i].return_type;
+        }
+    }
+    return NULL;
+}
+
+/* PR #1245: the C grammar splits a declared return type across the `type` node,
+ * sibling type_qualifier nodes and the pointer_declarator chain wrapping the
+ * function declarator. Taking only the `type` node published `const char *` as
+ * "char". Canonical spelling: qualifiers, base type, one space, then the
+ * declarator markers unspaced (`const char *`, `char **`). */
+TEST(c_function_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r = extract("static const char *text_end(const char *text) { return text; }\n"
+                               "char **table(void) { return 0; }\n"
+                               "char const *east_const(void) { return 0; }\n"
+                               "const struct Point *find_point(void) { return 0; }\n"
+                               "volatile unsigned long *reg(void) { return 0; }\n"
+                               "char *const *frozen(void) { return 0; }\n",
+                               CBM_LANG_C, "t", "returns.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "text_end"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "table"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "east_const"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "find_point"), "const struct Point *");
+    ASSERT_STR_EQ(def_return_type(r, "reg"), "volatile unsigned long *");
+    ASSERT_STR_EQ(def_return_type(r, "frozen"), "char *const *");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Guard for the fix above: a return type with no qualifier and no declarator
+ * marker is already correct and must come out byte-identical. */
+TEST(c_function_return_type_plain_unchanged) {
+    CBMFileResult *r = extract("int scalar(void) { return 0; }\n"
+                               "void nothing(void) {}\n"
+                               "unsigned long wide(void) { return 0; }\n"
+                               "struct Point make_point(void) { struct Point p; return p; }\n"
+                               "static inline size_t count(void) { return 0; }\n"
+                               "_Noreturn void die(void) { for (;;) {} }\n",
+                               CBM_LANG_C, "t", "plain.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "scalar"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "nothing"), "void");
+    ASSERT_STR_EQ(def_return_type(r, "wide"), "unsigned long");
+    ASSERT_STR_EQ(def_return_type(r, "make_point"), "struct Point");
+    ASSERT_STR_EQ(def_return_type(r, "count"), "size_t");
+    /* _Noreturn parses as a type_qualifier but is not part of the type. */
+    ASSERT_STR_EQ(def_return_type(r, "die"), "void");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C++ --- */
 TEST(cpp_class) {
     CBMFileResult *r = extract(
@@ -986,6 +1045,42 @@ TEST(cpp_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Widget"));
     ASSERT(has_def(r, "Method", "draw"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* PR #1245, C++ side: in-class methods go through a separate extraction path
+ * from free functions, and C++ adds reference markers (`&`, `&&`) whose
+ * reference_declarator carries no `declarator` field. */
+TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r = extract("class Text {\n"
+                               "public:\n"
+                               "    const char *end() { return nullptr; }\n"
+                               "    char **table() { return nullptr; }\n"
+                               "    Text &self() { return *this; }\n"
+                               "    const Text &cself() const { return *this; }\n"
+                               "    Text *&slot() { return next_; }\n"
+                               "    Text *next_;\n"
+                               "    int width() const { return 0; }\n"
+                               "    constexpr int square(int x) const { return x * x; }\n"
+                               "};\n"
+                               "const Text &shared() { static Text t; return t; }\n"
+                               "Text &&moved(Text &t) { return static_cast<Text &&>(t); }\n"
+                               "const char *Text::c_str() const { return nullptr; }\n",
+                               CBM_LANG_CPP, "t", "text.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "end"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "table"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "self"), "Text &");
+    ASSERT_STR_EQ(def_return_type(r, "cself"), "const Text &");
+    ASSERT_STR_EQ(def_return_type(r, "slot"), "Text *&");
+    ASSERT_STR_EQ(def_return_type(r, "width"), "int");
+    /* constexpr parses as a type_qualifier but is not part of the type. */
+    ASSERT_STR_EQ(def_return_type(r, "square"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "shared"), "const Text &");
+    ASSERT_STR_EQ(def_return_type(r, "moved"), "Text &&");
+    ASSERT_STR_EQ(def_return_type(r, "c_str"), "const char *");
     cbm_free_result(r);
     PASS();
 }
@@ -2941,6 +3036,106 @@ TEST(commonlisp_defmacro) {
     PASS();
 }
 
+/* 2026-09-16 probe: config extractors handed multi-line node text over as a
+ * name (8,301 elasticsearch YAML Fields, 91 kernel Makefile/.conf nodes with a
+ * line break inside), and JS/TS baselines named functions `{}` and variables
+ * `1`. The definition push is the one place every extractor goes through. */
+TEST(defs_push_cuts_multiline_names_and_rejects_js_literal_names) {
+    CBMArena a;
+    cbm_arena_init(&a);
+    CBMDefArray defs = {0};
+
+    CBMDefinition make = {0};
+    make.name = "endif\n\n$(obj)/pm_data-offsets.h";
+    make.qualified_name = "proj.arch.arm.mach-at91.Makefile.endif\n\n$(obj)/pm_data-offsets.h";
+    make.label = "Function";
+    make.file_path = "arch/arm/mach-at91/Makefile";
+    cbm_defs_push(&defs, &a, make);
+    ASSERT_EQ(defs.count, 1);
+    ASSERT_STR_EQ(defs.items[0].name, "endif");
+    ASSERT_STR_EQ(defs.items[0].qualified_name, "proj.arch.arm.mach-at91.Makefile.endif");
+
+    CBMDefinition yaml = {0};
+    yaml.name = "Test get datafeed stats given missing datafeed_id   \r\n  - do:";
+    yaml.qualified_name =
+        "proj.spec.Test get datafeed stats given missing datafeed_id   \r\n  - do:";
+    yaml.label = "Field";
+    yaml.file_path = "rest-api-spec/test/ml/get_datafeed_stats.yml";
+    cbm_defs_push(&defs, &a, yaml);
+    ASSERT_EQ(defs.count, 2);
+    ASSERT_STR_EQ(defs.items[1].name, "Test get datafeed stats given missing datafeed_id");
+
+    /* JS/TS: a literal token is not a name. */
+    CBMDefinition brace = {0};
+    brace.name = "{}";
+    brace.qualified_name = "proj.tests.baselines.x.{}";
+    brace.label = "Function";
+    brace.file_path = "tests/baselines/reference/x.js";
+    cbm_defs_push(&defs, &a, brace);
+    CBMDefinition one = {0};
+    one.name = "1";
+    one.qualified_name = "proj.tests.cases.y.1";
+    one.label = "Variable";
+    one.file_path = "tests/cases/y.ts";
+    cbm_defs_push(&defs, &a, one);
+    ASSERT_EQ(defs.count, 2);
+
+    /* Real JS names, including private members and `$`-prefixed ones, stay. */
+    CBMDefinition priv = {0};
+    priv.name = "#secret";
+    priv.qualified_name = "proj.src.a.Klass.#secret";
+    priv.label = "Method";
+    priv.file_path = "src/a.ts";
+    cbm_defs_push(&defs, &a, priv);
+    CBMDefinition dollar = {0};
+    dollar.name = "$scope";
+    dollar.qualified_name = "proj.src.b.$scope";
+    dollar.label = "Variable";
+    dollar.file_path = "src/b.js";
+    cbm_defs_push(&defs, &a, dollar);
+    ASSERT_EQ(defs.count, 4);
+
+    /* Member keys JS spells without an identifier start are names too:
+     * computed, string-literal and escaped (1,782 real definitions in the
+     * TypeScript corpus wore these spellings). */
+    const char *member_keys[] = {"[Symbol.iterator]", "\"my-key\"", "'x'", "\\u0410"};
+    for (int i = 0; i < 4; i++) {
+        CBMDefinition member = {0};
+        member.name = member_keys[i];
+        member.qualified_name = member_keys[i];
+        member.label = "Method";
+        member.file_path = "src/c.ts";
+        cbm_defs_push(&defs, &a, member);
+    }
+    ASSERT_EQ(defs.count, 8);
+
+    /* Tokens that are not names in any spelling: patterns, numeric literals,
+     * parenthesised types, rest elements. */
+    const char *tokens[] = {"{ b11 } = { b11: \"string\" }", "0x0",  "3.2e1",
+                            "(x: number) => string",         "...a", "?"};
+    for (int i = 0; i < 6; i++) {
+        CBMDefinition token = {0};
+        token.name = tokens[i];
+        token.qualified_name = tokens[i];
+        token.label = "Variable";
+        token.file_path = "tests/cases/z.js";
+        cbm_defs_push(&defs, &a, token);
+    }
+    ASSERT_EQ(defs.count, 8);
+
+    /* Other languages may legitimately name operators: untouched. */
+    CBMDefinition op = {0};
+    op.name = "<$>";
+    op.qualified_name = "proj.Data.Functor.<$>";
+    op.label = "Function";
+    op.file_path = "src/Data/Functor.hs";
+    cbm_defs_push(&defs, &a, op);
+    ASSERT_EQ(defs.count, 9);
+
+    cbm_arena_destroy(&a);
+    PASS();
+}
+
 TEST(makefile_rule_as_function) {
     CBMFileResult *r = extract("all:\n\t@echo hello\n", CBM_LANG_MAKEFILE, "test", "Makefile");
     ASSERT_NOT_NULL(r);
@@ -3111,6 +3306,25 @@ TEST(go_imports) {
     ASSERT_FALSE(r->has_error);
     ASSERT_GT(r->imports.count, 0);
     ASSERT(has_import(r, "fmt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* cgo's `import "C"` is a pseudo-package, not a real import: keeping it lets the
+ * import resolver name-match "C" onto an arbitrary project symbol called C. The
+ * real imports of the same file must survive. */
+TEST(go_cgo_pseudo_import_dropped) {
+    CBMFileResult *r = extract("package m\n\n/*\nstatic int helper(void) { return 1; }\n*/\n"
+                               "import \"C\"\n\nimport \"fmt\"\n\n"
+                               "func Run() { fmt.Println(C.helper()) }\n",
+                               CBM_LANG_GO, "t", "cgo.go");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_import(r, "fmt"));
+    for (int i = 0; i < r->imports.count; i++) {
+        ASSERT_NOT_NULL(r->imports.items[i].module_path);
+        ASSERT_TRUE(strcmp(r->imports.items[i].module_path, "C") != 0);
+    }
     cbm_free_result(r);
     PASS();
 }
@@ -4455,6 +4669,52 @@ TEST(swift_labeled_call_string_arg_issue1892) {
     ASSERT_NOT_NULL(c);
     ASSERT_NOT_NULL(c->first_string_arg);
     ASSERT_STR_EQ(c->first_string_arg, "/api/v1/widgets/1");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Swift has no URL literal, so real code builds one and force-unwraps it. The
+ * string then sits two levels below the argument list. */
+TEST(swift_nested_url_constructor_issue1892) {
+    CBMFileResult *r = extract("func fetch() { URLSession.shared.dataTask(with: URL(string: "
+                               "\"https://example.com/api/v1/widgets\")!) }\n",
+                               CBM_LANG_SWIFT, "t", "Fetch.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "URLSession.shared.dataTask");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "https://example.com/api/v1/widgets");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Without the trailing "!" the constructor is not wrapped in a
+ * postfix_expression, so this covers the other shape. */
+TEST(swift_nested_url_no_bang_issue1892) {
+    CBMFileResult *r =
+        extract("func fetch() { client.send(to: URLRequest(url: \"/api/v1/widgets/1\")) }\n",
+                CBM_LANG_SWIFT, "t", "Send.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "client.send");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/v1/widgets/1");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* A constructor that is not one of the three URL types keeps its own meaning:
+ * the outer call must not borrow the inner call's string. */
+TEST(swift_non_url_constructor_untouched_issue1892) {
+    CBMFileResult *r = extract("func f() { log.write(to: Formatter(pattern: \"%s-%d\")) }\n",
+                               CBM_LANG_SWIFT, "t", "Log.swift");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = find_call_by_callee(r, "log.write");
+    ASSERT_NOT_NULL(c);
+    ASSERT_NULL(c->first_string_arg);
     cbm_free_result(r);
     PASS();
 }
@@ -7245,6 +7505,38 @@ static int find_call_args(const CBMFileResult *r, const char *callee, const char
     return -1;
 }
 
+/* tree-sitter lists a comment inside an argument list as a named child; it is
+ * not an argument. A Java constructor call whose argument list opened with a
+ * slash-star comment handed the comment text to the Route pass as a URL
+ * (three Route nodes named by comments on elasticsearch, 2026-09-16). */
+TEST(call_args_skip_comments_between_arguments) {
+    CBMFileResult *r = extract("class A {\n"
+                               "  void f() {\n"
+                               "    app.get(/* the orders listing */ \"/orders\", handler);\n"
+                               "    new TestCase(\n"
+                               "        /*\n"
+                               "         * a multi-line note\n"
+                               "         */\n"
+                               "        \"x\", // trailing\n"
+                               "        1);\n"
+                               "  }\n"
+                               "}\n",
+                               CBM_LANG_JAVA, "t", "A.java");
+    ASSERT_NOT_NULL(r);
+    const char *arg0 = NULL;
+    const char *arg1 = NULL;
+    int argc = find_call_args(r, "get", &arg0, &arg1);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(arg0, "\"/orders\"");
+    ASSERT_STR_EQ(arg1, "handler");
+    argc = find_call_args(r, "TestCase", &arg0, &arg1);
+    ASSERT_EQ(argc, 2);
+    ASSERT_STR_EQ(arg0, "\"x\"");
+    ASSERT_STR_EQ(arg1, "1");
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(objectscript_data_flows_class_method_args) {
     CBMFileResult *r = extract("Class MyApp.Caller Extends %RegisteredObject\n"
                                "{\n"
@@ -8114,6 +8406,7 @@ SUITE(extraction) {
     RUN_TEST(objectscript_macro_constant_no_extra_call);
     RUN_TEST(objectscript_udl_method_return_type);
     RUN_TEST(objectscript_udl_scalar_return_type_not_resolved);
+    RUN_TEST(call_args_skip_comments_between_arguments);
     RUN_TEST(objectscript_data_flows_class_method_args);
     RUN_TEST(objectscript_data_flows_instance_method_args);
     RUN_TEST(iris_export_xml_simple_class);
@@ -8173,8 +8466,11 @@ SUITE(extraction) {
     RUN_TEST(go_interface);
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
+    RUN_TEST(c_function_return_type_preserves_pointer_and_qualifier);
+    RUN_TEST(c_function_return_type_plain_unchanged);
     RUN_TEST(c_struct);
     RUN_TEST(cpp_class);
+    RUN_TEST(cpp_method_return_type_preserves_pointer_and_qualifier);
 
     /* Scripting */
     RUN_TEST(python_function);
@@ -8247,6 +8543,9 @@ SUITE(extraction) {
     RUN_TEST(swift_chained_call);
     RUN_TEST(swift_force_unwrap_scanner_shift);
     RUN_TEST(swift_call_string_arg_issue1892);
+    RUN_TEST(swift_nested_url_constructor_issue1892);
+    RUN_TEST(swift_nested_url_no_bang_issue1892);
+    RUN_TEST(swift_non_url_constructor_untouched_issue1892);
     RUN_TEST(swift_labeled_call_string_arg_issue1892);
     RUN_TEST(objc_interface);
     RUN_TEST(objc_implementation);
@@ -8324,6 +8623,7 @@ SUITE(extraction) {
     RUN_TEST(commonlisp_defun);
     RUN_TEST(commonlisp_multiple_functions);
     RUN_TEST(commonlisp_defmacro);
+    RUN_TEST(defs_push_cuts_multiline_names_and_rejects_js_literal_names);
     RUN_TEST(makefile_rule_as_function);
     RUN_TEST(makefile_multiple_targets);
     RUN_TEST(makefile_variable_extraction);
@@ -8339,6 +8639,7 @@ SUITE(extraction) {
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
     RUN_TEST(go_imports);
+    RUN_TEST(go_cgo_pseudo_import_dropped);
     RUN_TEST(extract_go_struct_fields_have_nodes);
     RUN_TEST(java_imports);
     RUN_TEST(rust_imports);

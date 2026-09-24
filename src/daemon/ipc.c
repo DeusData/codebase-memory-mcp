@@ -214,6 +214,31 @@ static void ipc_startup_gate_run(void) {
 }
 #endif
 
+#ifdef _WIN32
+static cbm_daemon_ipc_win_directory_create_hook_fn g_win_directory_create_hook_for_test;
+static void *g_win_directory_create_hook_context_for_test;
+#endif
+
+void cbm_daemon_ipc_win_directory_create_hook_set_for_test(
+    cbm_daemon_ipc_win_directory_create_hook_fn hook, void *context) {
+#ifdef _WIN32
+    g_win_directory_create_hook_context_for_test = context;
+    g_win_directory_create_hook_for_test = hook;
+#else
+    (void)hook;
+    (void)context;
+#endif
+}
+
+#ifdef _WIN32
+static void ipc_win_directory_create_hook_run(const wchar_t *path) {
+    cbm_daemon_ipc_win_directory_create_hook_fn hook = g_win_directory_create_hook_for_test;
+    if (hook) {
+        hook(path, g_win_directory_create_hook_context_for_test);
+    }
+}
+#endif
+
 bool cbm_daemon_ipc_windows_legacy_names(const char *canonical_runtime_parent,
                                          const char *instance_key,
                                          char pipe_out[CBM_DAEMON_IPC_WINDOWS_NAME_CAP],
@@ -3994,6 +4019,16 @@ static char *wide_to_utf8(const wchar_t *value) {
     return utf8;
 }
 
+/* Record "<path>: <message>" as the validation detail, with the wide path
+ * rendered as UTF-8. One place owns the conversion buffer, so every refusal on
+ * the directory walk can name its component without each call site carrying
+ * its own allocation. */
+static void ipc_validation_detail_set_for_path(const wchar_t *path, const char *message) {
+    char *path_utf8 = wide_to_utf8(path);
+    ipc_validation_detail_set("%s: %s", path_utf8 ? path_utf8 : "<path>", message);
+    free(path_utf8);
+}
+
 static wchar_t *wide_copy(const wchar_t *value) {
     if (!value) {
         return NULL;
@@ -4861,13 +4896,28 @@ static bool win_runtime_directory_secure(const wchar_t *runtime_dir) {
         return false;
     }
     bool created = CreateDirectoryW(runtime_dir, &security.directory_attributes) != 0;
-    if (!created && GetLastError() != ERROR_ALREADY_EXISTS) {
+    DWORD create_error = created ? ERROR_SUCCESS : GetLastError();
+    if (!created && create_error != ERROR_ALREADY_EXISTS) {
+        char message[96];
+        (void)snprintf(message, sizeof(message),
+                       "could not create the directory (Windows error %lu)",
+                       (unsigned long)create_error);
+        ipc_validation_detail_set_for_path(runtime_dir, message);
         win_security_destroy(&security);
         return false;
     }
     DWORD attributes = GetFileAttributesW(runtime_dir);
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
         (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) {
+        /* What already exists at this path is adopted only if it is a plain
+         * directory. Say which rule refused it: the walk in front of this
+         * function tolerates losing a creation race, so this check is what
+         * stands between that tolerance and a planted file or junction. */
+        const char *rule = attributes == INVALID_FILE_ATTRIBUTES ? "cannot be inspected"
+                           : (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0
+                               ? "exists but is not a directory"
+                               : "is a reparse point (junction or symlink)";
+        ipc_validation_detail_set_for_path(runtime_dir, rule);
         win_security_destroy(&security);
         return false;
     }
@@ -5021,8 +5071,35 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
             DWORD attributes = GetFileAttributesW(path);
             if (attributes == INVALID_FILE_ATTRIBUTES) {
                 DWORD error = GetLastError();
-                ok = (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) &&
-                     CreateDirectoryW(path, &security.directory_attributes) != 0;
+                bool absent = error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+                if (absent) {
+                    ipc_win_directory_create_hook_run(path);
+                    /* Several processes first-starting together all observe
+                     * this component absent; one CreateDirectoryW wins and
+                     * the rest get ERROR_ALREADY_EXISTS. Losing that race is
+                     * not a failure -- the directory this process wanted now
+                     * exists, exactly as if it had been there all along. It
+                     * is NOT trusted for that: an ancestor still goes through
+                     * win_directory_component_secure() below, and the final
+                     * component through win_runtime_directory_secure(), which
+                     * refuses a non-directory or reparse point and enforces
+                     * owner and DACL. The POSIX walk tolerates EEXIST at the
+                     * same point for the same reason. */
+                    if (CreateDirectoryW(path, &security.directory_attributes) == 0) {
+                        error = GetLastError();
+                        absent = error == ERROR_ALREADY_EXISTS;
+                    }
+                }
+                ok = absent;
+                if (!ok) {
+                    /* Never a bare "(endpoint)": name the component and the
+                     * Windows error that refused it. */
+                    char message[96];
+                    (void)snprintf(message, sizeof(message),
+                                   "could not create or inspect the directory (Windows error %lu)",
+                                   (unsigned long)error);
+                    ipc_validation_detail_set_for_path(path, message);
+                }
             }
             /* Ancestors are observe-only and must already be secure.  The
              * final current-user directory is intentionally handled below by
@@ -5034,10 +5111,7 @@ static bool win_private_directory_tree_secure(const wchar_t *directory_path) {
                      * at this walk position; the helper set the inner rule. */
                     char inner[384];
                     (void)snprintf(inner, sizeof(inner), "%s", ipc_validation_detail_buffer);
-                    char *component_utf8 = wide_to_utf8(path);
-                    ipc_validation_detail_set(
-                        "%s: %s", component_utf8 ? component_utf8 : "<component>", inner);
-                    free(component_utf8);
+                    ipc_validation_detail_set_for_path(path, inner);
                 }
             }
         }

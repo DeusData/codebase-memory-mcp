@@ -882,6 +882,129 @@ TEST(daemon_ipc_windows_private_directory_ace_is_inheritable) {
     PASS();
 }
 
+typedef struct {
+    int calls;
+    bool plant_file; /* false: play a racer that creates the DIRECTORY first */
+    bool planted;
+} ipc_test_win_create_racer_t;
+
+/* Plays the concurrent process that wins the creation of a path component the
+ * walk has just observed absent. Runs inside the walk, at the exact point the
+ * race lives, so the interleaving is pinned by construction: no threads, no
+ * timing. */
+static void ipc_test_win_create_racer(const wchar_t *path, void *context) {
+    ipc_test_win_create_racer_t *racer = context;
+    racer->calls++;
+    if (racer->calls != 1) {
+        return;
+    }
+    if (racer->plant_file) {
+        HANDLE file =
+            CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        racer->planted = file != INVALID_HANDLE_VALUE;
+        if (racer->planted) {
+            (void)CloseHandle(file);
+        }
+    } else {
+        racer->planted = CreateDirectoryW(path, NULL) != 0;
+    }
+}
+
+/* Cold-start race (test-windows-guards section_cold_storm, 2026-09-21; the
+ * same thing a user gets when a host launches several MCP servers on its very
+ * first run): N processes first-start against a runtime directory that does
+ * not exist yet. All of them observe the final component absent, one
+ * CreateDirectoryW wins, and every other process gets ERROR_ALREADY_EXISTS.
+ * The walk treated that as a failure and recorded no detail, so the losers
+ * exited with a bare "secure CLI coordination could not be created
+ * (endpoint)". Losing the creation race is not a failure: the directory this
+ * process wanted now exists, and the owner / DACL / not-a-reparse-point checks
+ * that follow are exactly the ones a pre-existing directory gets. The POSIX
+ * walk has always tolerated EEXIST here. */
+TEST(daemon_ipc_windows_private_directory_survives_lost_creation_race) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    bool paths_ok = false;
+    bool secured = false;
+    bool owner_only = false;
+    ipc_test_win_create_racer_t racer = {0};
+
+    if (ipc_test_parent_new(parent, "win-create-race")) {
+        int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = written > 0 && written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(ipc_test_win_create_racer, &racer);
+        secured = cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(NULL, NULL);
+    }
+    if (secured) {
+        /* The racer created the directory with an inherited DACL; the winner's
+         * directory must still end up owner-only, like any adopted one. */
+        PACL dacl = NULL;
+        PSECURITY_DESCRIPTOR descriptor = NULL;
+        ACL_SIZE_INFORMATION information;
+        memset(&information, 0, sizeof(information));
+        if (GetNamedSecurityInfoA(cache, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION, NULL, NULL,
+                                  &dacl, NULL, &descriptor) == ERROR_SUCCESS &&
+            dacl &&
+            GetAclInformation(dacl, &information, sizeof(information), AclSizeInformation)) {
+            owner_only = information.AceCount == 1;
+        }
+        if (descriptor) {
+            (void)LocalFree(descriptor);
+        }
+    }
+
+    (void)RemoveDirectoryA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    /* The seam sat on the path and the racer really won: without these two the
+     * test could pass without ever exercising the race. */
+    ASSERT_EQ(racer.calls, 1);
+    ASSERT_TRUE(racer.planted);
+    ASSERT_TRUE(secured);
+    ASSERT_TRUE(owner_only);
+    PASS();
+}
+
+/* The tolerance above must not admit anything: when what appeared at the path
+ * is NOT a directory, the walk still refuses -- and it says why. A bare
+ * "(endpoint)" is what four reporters in #1533/#1574 were left with; every
+ * refusal on this path names the component and the rule. */
+TEST(daemon_ipc_windows_private_directory_refuses_and_names_a_planted_file) {
+    char parent[TEST_PATH_CAP] = {0};
+    char cache[TEST_PATH_CAP] = {0};
+    char detail[512] = {0};
+    bool paths_ok = false;
+    bool refused = false;
+    ipc_test_win_create_racer_t racer = {.plant_file = true};
+
+    if (ipc_test_parent_new(parent, "win-create-race-file")) {
+        int written = snprintf(cache, sizeof(cache), "%s/cache", parent);
+        paths_ok = written > 0 && written < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(ipc_test_win_create_racer, &racer);
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_win_directory_create_hook_set_for_test(NULL, NULL);
+        const char *why = cbm_daemon_ipc_validation_detail();
+        (void)snprintf(detail, sizeof(detail), "%s", why ? why : "");
+    }
+
+    (void)DeleteFileA(cache);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_EQ(racer.calls, 1);
+    ASSERT_TRUE(racer.planted);
+    ASSERT_TRUE(refused);
+    ASSERT_NOT_NULL(strstr(detail, "cache"));
+    ASSERT_NOT_NULL(strstr(detail, "not a directory"));
+    PASS();
+}
+
 TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor) {
     char parent[TEST_PATH_CAP] = {0};
     char add_only[TEST_PATH_CAP] = {0};
@@ -5361,6 +5484,8 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_windows_default_endpoint_ignores_temp_environment);
     RUN_TEST(daemon_ipc_windows_private_directory_rejects_untrusted_ancestor_acl);
     RUN_TEST(daemon_ipc_windows_private_directory_ace_is_inheritable);
+    RUN_TEST(daemon_ipc_windows_private_directory_survives_lost_creation_race);
+    RUN_TEST(daemon_ipc_windows_private_directory_refuses_and_names_a_planted_file);
     RUN_TEST(daemon_ipc_windows_private_directory_allows_add_subdirectory_only_ancestor);
     RUN_TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500);
     RUN_TEST(daemon_ipc_windows_legacy_bridge_covers_handoff_and_lifetime);
