@@ -82,6 +82,7 @@ typedef struct {
     TSNode prev_callee_expr;
     TSNode prev_callee_leaf;
     bool prev_inside_import;
+    bool prev_inside_anonymous_callable;
     int prev_loop_depth;
     int prev_branch_depth;
     /* #1912: py_param_stack height on entry. Pop unwinds back to it, so a
@@ -139,6 +140,7 @@ typedef struct {
     TSNode callee_expr;                 // exact active callee expression, if any
     TSNode callee_leaf;                 // exact active terminal callee, if any
     bool inside_import;                 // within an import_node_types subtree
+    bool inside_anonymous_callable;     // calls have no persistent graph caller
     int loop_depth;                     // count of enclosing loop scopes (for bottleneck metrics)
     int branch_depth;                   // count of enclosing branch scopes
 

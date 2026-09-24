@@ -3743,7 +3743,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
         CBMPrimaryCalleeSelection callee = select_primary_callee(ctx, node, state);
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.
-        if (primary_callee_name_is_allowed(ctx, &callee)) {
+        if (primary_callee_name_is_allowed(ctx, &callee) && !state->inside_anonymous_callable) {
             CBMCall call = {0};
             call.callee_name = callee.name;
             call.enclosing_func_qn = state->enclosing_func_qn;
