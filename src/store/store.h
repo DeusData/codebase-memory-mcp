@@ -639,7 +639,9 @@ int cbm_store_delete_file_hashes(cbm_store_t *s, const char *project);
 /* One best-effort coverage row: a file the indexer could not fully cover.
  * kind "parse_partial" = indexed but the parse tree had ERROR/MISSING regions
  * (detail = 1-based line ranges "12-40,88-90"); skip kinds "read"/"extract"/
- * "oversized" = not indexed at all (detail = reason). Stored in the separate
+ * "oversized" = not indexed at all (detail = reason). "unresolved_calls" is
+ * indexed source whose invocation targets were not resolved (detail = JSON
+ * array of caller, leaf, source byte span, and reason). Stored in the separate
  * index_coverage table — coverage is metadata ABOUT the graph, never mixed
  * into the graph itself. */
 typedef struct {
@@ -647,6 +649,10 @@ typedef struct {
     const char *kind;
     const char *detail;
 } cbm_coverage_row_t;
+
+/* Older generations have no unresolved-call records, so their exact trace
+ * totals cannot be trusted after this signal becomes part of coverage. */
+enum { CBM_UNRESOLVED_CALL_COVERAGE_VERSION = 4 };
 
 /* Metadata describing how completely one index run recorded the best-effort
  * coverage signal. `recording_status` is "complete", "truncated", or
@@ -690,6 +696,9 @@ int cbm_store_coverage_get_path(cbm_store_t *s, const char *project, const char 
  * ancestor that covers the scope. Prefix matching is segment-boundary safe. */
 int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char *scope,
                                  cbm_coverage_row_t **out, int *count);
+/* Fetch only unresolved invocation diagnostics for trace exactness checks. */
+int cbm_store_coverage_get_unresolved_calls(cbm_store_t *s, const char *project,
+                                            cbm_coverage_row_t **out, int *count);
 
 /* Fetch/free the metadata paired with the current coverage row set. */
 int cbm_store_coverage_meta_get(cbm_store_t *s, const char *project, cbm_coverage_meta_t *out);

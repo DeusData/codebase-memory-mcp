@@ -329,6 +329,8 @@ static int init_schema(cbm_store_t *s) {
         "  detail TEXT DEFAULT '',"
         "  PRIMARY KEY (project, rel_path, kind)"
         ");"
+        "CREATE INDEX IF NOT EXISTS idx_index_coverage_project_kind "
+        "ON index_coverage(project, kind);"
         /* One row per completed coverage persistence attempt. Kept separate
          * from projects so existing graph/artifact schema stays compatible and
          * a missing row unambiguously means coverage metadata is unavailable. */
@@ -4206,6 +4208,14 @@ int cbm_store_coverage_get_scope(cbm_store_t *s, const char *project, const char
                               "  AND substr(?2, length(rel_path) + 1, 1) = '/')) "
                               "ORDER BY rel_path, kind;";
     return coverage_query_rows(s, project, scope, sql, out, count);
+}
+
+int cbm_store_coverage_get_unresolved_calls(cbm_store_t *s, const char *project,
+                                            cbm_coverage_row_t **out, int *count) {
+    static const char sql[] = "SELECT rel_path, kind, detail FROM index_coverage "
+                              "WHERE project = ?1 AND kind = ?2 "
+                              "ORDER BY rel_path;";
+    return coverage_query_rows(s, project, "unresolved_calls", sql, out, count);
 }
 
 void cbm_store_coverage_meta_clear(cbm_coverage_meta_t *meta) {

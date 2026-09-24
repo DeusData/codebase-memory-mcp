@@ -786,7 +786,7 @@ int cbm_pipeline_build_fresh_semantic_manifest(cbm_pipeline_t *p, const char *pr
 
 /* Compatibility contract persisted in coverage metadata. Increment when a
  * graph/manifest semantic change makes prior exact-input indexes unsafe. */
-enum { CBM_SEMANTIC_INDEX_VERSION = 3 };
+enum { CBM_SEMANTIC_INDEX_VERSION = CBM_UNRESOLVED_CALL_COVERAGE_VERSION };
 
 typedef struct {
     cbm_gbuf_t *gbuf;
@@ -871,6 +871,11 @@ void cbm_pipeline_discard_stage(const char *stage_path);
  * Takes ownership; dump_and_persist_hashes writes them into the staging
  * store and cbm_pipeline_free releases them. Passing NULL/0 clears. */
 void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *rows, int count);
+void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
+                                          const CBMFileResult *result);
+void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p);
+void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
+                                       bool *complete);
 
 /* Pipeline accessors for incremental use */
 const char *cbm_pipeline_repo_path(const cbm_pipeline_t *p);
