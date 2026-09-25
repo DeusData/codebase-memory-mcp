@@ -657,6 +657,85 @@ TEST(sw_multi_page) {
     PASS();
 }
 
+/* Write n nodes of project "p" whose names are key_size bytes long, then run
+ * the #1783 coverage-shadow wipe shape: a DELETE for a project key that sorts
+ * after every written row ("p::missed" > "p"), so each (project, ...) index is
+ * searched down its rightmost path. Returns the DELETE's result code (-1 on a
+ * setup failure) and the SQLite message in err_out. */
+static int sw_write_long_names_and_wipe(int n, int key_size, char *err_out, size_t err_sz) {
+    char path[256];
+    if (make_temp_db(path, sizeof(path)) != 0) {
+        return -1;
+    }
+    CBMDumpNode *nodes = calloc((size_t)n, sizeof(*nodes));
+    char *names = calloc((size_t)n, (size_t)key_size + 1);
+    char *qns = calloc((size_t)n, (size_t)key_size + 3);
+    int rc = -1;
+    if (nodes && names && qns) {
+        for (int i = 0; i < n; i++) {
+            char *name = names + (size_t)i * ((size_t)key_size + 1);
+            char *qn = qns + (size_t)i * ((size_t)key_size + 3);
+            int prefix = snprintf(name, (size_t)key_size + 1, "n%06d_", i);
+            memset(name + prefix, 'x', (size_t)key_size - (size_t)prefix);
+            name[key_size] = '\0';
+            snprintf(qn, (size_t)key_size + 3, "p.%s", name);
+            nodes[i] = (CBMDumpNode){
+                .id = i + 1,
+                .project = "p",
+                .label = "Function",
+                .name = name,
+                .qualified_name = qn,
+                .file_path = "large.c",
+                .start_line = i + 1,
+                .end_line = i + 1,
+                .properties = "{}",
+            };
+        }
+        int wrc = cbm_write_db(path, "p", "/r", "2026-08-26T00:00:00Z", nodes, n, NULL, 0, NULL, 0,
+                               NULL, 0);
+        rc = wrc == 0 ? SQLITE_OK : -1;
+    }
+    free(nodes);
+    free(names);
+    free(qns);
+    /* INDEXED BY pins the seek to the long-key index; left alone the planner
+     * picks the short-key idx_nodes_label (one leaf page, never affected). */
+    static const char *wipe =
+        "DELETE FROM nodes INDEXED BY idx_nodes_name WHERE project = 'p::missed'";
+    sqlite3 *db = NULL;
+    if (rc == SQLITE_OK && sqlite3_open(path, &db) == SQLITE_OK) {
+        char *error = NULL;
+        rc = sqlite3_exec(db, wipe, NULL, NULL, &error);
+        snprintf(err_out, err_sz, "%s", error ? error : "none");
+        sqlite3_free(error);
+    }
+    sqlite3_close(db);
+    unlink(path);
+    return rc;
+}
+
+/* #1783: an index whose interior level spans several pages must never end that
+ * level with a page holding zero cells (only a right-child pointer). SQLite
+ * rejects such a page as SQLITE_CORRUPT the moment a cursor descends into it,
+ * and a key sorting after every row — the coverage-shadow wipe's
+ * "<project>::missed" — descends exactly there, the rightmost path. With
+ * 12000-byte keys a 64 KB page holds 5 leaf cells (4 after promotion) and 5
+ * interior cells, so 33 rows give 7 leaves = 5 cells + right child on the
+ * first interior page, leaving ONE child for the second. The sweep covers one
+ * and two interior levels; before the fix rows 31-35, 61-65 and 91-95 failed. */
+TEST(sw_interior_level_never_ends_with_empty_page) {
+    enum { KEY_SIZE = 12000, MIN_ROWS = 2, MAX_ROWS = 120 };
+    for (int rows = MIN_ROWS; rows <= MAX_ROWS; rows++) {
+        char err[256] = "";
+        int rc = sw_write_long_names_and_wipe(rows, KEY_SIZE, err, sizeof(err));
+        if (rc != SQLITE_OK) {
+            fprintf(stderr, "  rows=%d wipe rc=%d err=%s\n", rows, rc, err);
+        }
+        ASSERT_EQ(rc, SQLITE_OK);
+    }
+    PASS();
+}
+
 /* ── Oversized node: properties JSON > 65KB triggers overflow pages ─ */
 
 TEST(sw_oversized_node) {
@@ -979,6 +1058,7 @@ SUITE(sqlite_writer) {
     RUN_TEST(sw_long_index_keys_overflow);
     RUN_TEST(sw_empty);
     RUN_TEST(sw_multi_page);
+    RUN_TEST(sw_interior_level_never_ends_with_empty_page);
     RUN_TEST(sw_oversized_node);
     RUN_TEST(sw_stream_open_does_not_truncate_destination);
     RUN_TEST(sw_publish_removes_destination_sidecars);
