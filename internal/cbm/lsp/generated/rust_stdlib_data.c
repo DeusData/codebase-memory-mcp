@@ -631,7 +631,18 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
 
     /* ── std::path ─────────────────────────────────────────────── */
     ADD_TYPE("std.path.Path",       "Path",       false);
-    ADD_TYPE("std.path.PathBuf",    "PathBuf",    false);
+    {
+        /* PathBuf derefs to Path (#2053): `buf.join(..)` dispatches through
+         * rust_deref_step's DerefTarget entry to std.path.Path.join instead of
+         * leaving the receiver's method unknown. */
+        static const char *pathbuf_deref[] = {"DerefTarget:std.path.Path", NULL};
+        CBMRegisteredType _rt;
+        memset(&_rt, 0, sizeof(_rt));
+        _rt.qualified_name = "std.path.PathBuf";
+        _rt.short_name = "PathBuf";
+        _rt.embedded_types = pathbuf_deref;
+        cbm_registry_add_type(reg, _rt);
+    }
     ADD_TYPE("std.path.Component",  "Component",  false);
     ADD_TYPE("std.path.Components", "Components", false);
     ADD_TYPE("std.path.Iter",       "Iter",       false);
@@ -639,6 +650,9 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
 
     {
         const char* T = "std.path.Path";
+        /* Owned-path producers return PathBuf (#2053), so a chained call
+         * (`root.to_path_buf().join(..)`) keeps a typed receiver. */
+        const CBMType* t_pathbuf = cbm_type_named(arena, "std.path.PathBuf");
         ADD_FUNC(T, "new",             "std.path.Path.new",             cbm_type_unknown());
         ADD_FUNC(T, "exists",          "std.path.Path.exists",          t_bool);
         ADD_FUNC(T, "try_exists",      "std.path.Path.try_exists",      cbm_type_unknown());
@@ -656,16 +670,16 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
         ADD_FUNC(T, "parent",          "std.path.Path.parent",          cbm_type_unknown());
         ADD_FUNC(T, "components",      "std.path.Path.components",      cbm_type_unknown());
         ADD_FUNC(T, "iter",            "std.path.Path.iter",            cbm_type_unknown());
-        ADD_FUNC(T, "join",            "std.path.Path.join",            cbm_type_unknown());
+        ADD_FUNC(T, "join",            "std.path.Path.join",            t_pathbuf);
         ADD_FUNC(T, "display",         "std.path.Path.display",         cbm_type_unknown());
         ADD_FUNC(T, "canonicalize",    "std.path.Path.canonicalize",    cbm_type_unknown());
-        ADD_FUNC(T, "to_path_buf",     "std.path.Path.to_path_buf",     cbm_type_unknown());
+        ADD_FUNC(T, "to_path_buf",     "std.path.Path.to_path_buf",     t_pathbuf);
         ADD_FUNC(T, "to_str",          "std.path.Path.to_str",          cbm_type_unknown());
         ADD_FUNC(T, "to_string_lossy", "std.path.Path.to_string_lossy", cbm_type_unknown());
         ADD_FUNC(T, "metadata",        "std.path.Path.metadata",        cbm_type_unknown());
         ADD_FUNC(T, "read_dir",        "std.path.Path.read_dir",        cbm_type_unknown());
-        ADD_FUNC(T, "with_extension",  "std.path.Path.with_extension",  cbm_type_unknown());
-        ADD_FUNC(T, "with_file_name",  "std.path.Path.with_file_name",  cbm_type_unknown());
+        ADD_FUNC(T, "with_extension",  "std.path.Path.with_extension",  t_pathbuf);
+        ADD_FUNC(T, "with_file_name",  "std.path.Path.with_file_name",  t_pathbuf);
     }
     {
         const char* T = "std.path.PathBuf";
@@ -676,7 +690,7 @@ void cbm_rust_stdlib_register(CBMTypeRegistry* reg, CBMArena* arena) {
         ADD_FUNC(T, "pop",             "std.path.PathBuf.pop",          t_bool);
         ADD_FUNC(T, "set_file_name",   "std.path.PathBuf.set_file_name",t_unit);
         ADD_FUNC(T, "set_extension",   "std.path.PathBuf.set_extension",t_bool);
-        ADD_FUNC(T, "as_path",         "std.path.PathBuf.as_path",      cbm_type_unknown());
+        ADD_FUNC(T, "as_path",         "std.path.PathBuf.as_path",      cbm_type_named(arena, "std.path.Path"));
         ADD_FUNC(T, "into_os_string",  "std.path.PathBuf.into_os_string",cbm_type_unknown());
         ADD_FUNC(T, "clear",           "std.path.PathBuf.clear",        t_unit);
     }
