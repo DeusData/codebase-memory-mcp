@@ -14552,19 +14552,31 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     snprintf(logpath, sizeof(logpath), "%s/timeouts.log", tmpdir);
 
     int fds[2];
+    int errfds[2];
     if (pipe(fds) != 0) {
         test_rmdir_r(tmpdir);
         FAIL("pipe failed");
+    }
+    if (pipe(errfds) != 0) {
+        close(fds[0]);
+        close(fds[1]);
+        test_rmdir_r(tmpdir);
+        FAIL("stderr pipe failed");
     }
 
     fflush(NULL);
     pid_t pid = fork();
     if (pid == 0) {
         /* Child: hook-augment with a 60ms deadline and stdin that blocks
-         * forever (parent keeps the write end open, sends nothing). */
+         * forever (parent keeps the write end open, sends nothing). Its stderr
+         * is redirected so the parent can prove the deadline is also announced
+         * there, not only in the timeouts log. */
         close(fds[1]);
         dup2(fds[0], 0);
         close(fds[0]);
+        close(errfds[0]);
+        dup2(errfds[1], 2);
+        close(errfds[1]);
         setenv("CBM_HOOK_DEADLINE_MS", "60", 1);
         setenv("CBM_HOOK_TIMEOUT_LOG", logpath, 1);
         alarm(10); /* backstop: never hang the suite */
@@ -14572,6 +14584,19 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     }
     ASSERT_GT(pid, 0);
     close(fds[0]);
+    close(errfds[1]);
+
+    /* Drain the child's stderr before reaping, so a full pipe can never wedge
+     * it. EOF arrives once the child's deadline handler has run and _exit()ed. */
+    char errbuf[4096] = "";
+    size_t errlen = 0;
+    ssize_t rd;
+    while (errlen + 1 < sizeof(errbuf) &&
+           (rd = read(errfds[0], errbuf + errlen, sizeof(errbuf) - 1 - errlen)) > 0) {
+        errlen += (size_t)rd;
+    }
+    errbuf[errlen] = '\0';
+    close(errfds[0]);
 
     int status = 0;
     waitpid(pid, &status, 0);
@@ -14582,8 +14607,8 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     ASSERT_EQ(WEXITSTATUS(status), 0);
 
     /* RED before the fix: no breadcrumb existed — a fired deadline was
-     * indistinguishable from a no-match run. GREEN: the log names the
-     * deadline and the knob. */
+     * indistinguishable from a no-match run. GREEN: it is announced on BOTH
+     * the timeouts log and stderr, each naming the deadline and the knob. */
     FILE *f = fopen(logpath, "r");
     if (!f) {
         fprintf(stderr, "  [858] FAIL no timeout breadcrumb written to %s\n", logpath);
@@ -14595,6 +14620,9 @@ TEST(cli_hook_augment_deadline_breadcrumb_issue858) {
     ASSERT_NOT_NULL(got);
     ASSERT(strstr(line, "deadline_exceeded") != NULL);
     ASSERT(strstr(line, "CBM_HOOK_DEADLINE_MS") != NULL);
+
+    ASSERT(strstr(errbuf, "deadline_exceeded") != NULL);
+    ASSERT(strstr(errbuf, "CBM_HOOK_DEADLINE_MS") != NULL);
 
     cbm_unsetenv("CBM_HOOK_DEADLINE_MS");
     cbm_unsetenv("CBM_HOOK_TIMEOUT_LOG");
