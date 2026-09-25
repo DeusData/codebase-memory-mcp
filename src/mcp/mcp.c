@@ -11015,8 +11015,12 @@ static bool resolve_session_repo_path(cbm_mcp_server_t *srv, char **repo_path) {
 }
 
 /* Preserve every index option while replacing all caller-supplied repo_path
- * keys with the one canonical path that was actually authorized. */
+ * keys with the one canonical path that was actually authorized. A non-empty
+ * project_name likewise replaces any caller "name" (#2134: the project key the
+ * parent resolved for this root travels to the daemon job / worker verbatim,
+ * so lease key and written index cannot diverge). */
 static char *index_args_with_repo_path(const char *args, const char *canonical_repo_path,
+                                       const char *project_name,
                                        const cbm_index_resource_policy_t *policy) {
     if (!args || !canonical_repo_path || !policy) {
         return NULL;
@@ -11041,7 +11045,12 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
     while (yyjson_mut_obj_get(copy_root, "_cbm_index_policy")) {
         (void)yyjson_mut_obj_remove_key(copy_root, "_cbm_index_policy");
     }
-    if (!yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
+    bool has_name = project_name && project_name[0];
+    while (has_name && yyjson_mut_obj_get(copy_root, "name")) {
+        (void)yyjson_mut_obj_remove_key(copy_root, "name");
+    }
+    if ((has_name && !yyjson_mut_obj_add_strcpy(copy, copy_root, "name", project_name)) ||
+        !yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
         !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy)) {
         yyjson_mut_doc_free(copy);
         return NULL;
@@ -11092,6 +11101,117 @@ static bool project_db_is_servable(const char *project, const char *db_path) {
     cbm_project_free_fields(&stored_project);
     cbm_store_close(store);
     return servable;
+}
+
+/* #2134: an index_repository call without `name` derived the project key from
+ * the path alone, so re-indexing a root that was first indexed under an
+ * explicit name silently forked a second index (same root_path, path-derived
+ * name) and left the original stale while it kept being served. Resolve the
+ * key from the indexes already on disk instead:
+ *   - the path-derived project exists            -> keep it (unchanged path);
+ *   - exactly one other project owns this root   -> adopt its name (update it);
+ *   - several other projects own this root       -> ambiguous: fail loudly,
+ *                                                   naming them, never guess;
+ *   - none                                       -> first index, derived name.
+ * Roots compare as stored: both sides are the canonical repo path. Returns
+ * false only for the ambiguous / allocation-failure case, with *error_out set
+ * to a heap message; *owner_out is a heap name or NULL. */
+static bool index_root_owner_append(char **list, size_t *len, size_t *cap, const char *name) {
+    size_t need = *len + strlen(name) + 3;
+    if (need > *cap) {
+        size_t grown_cap = need * 2;
+        char *grown = realloc(*list, grown_cap);
+        if (!grown) {
+            return false;
+        }
+        *list = grown;
+        *cap = grown_cap;
+    }
+    *len += (size_t)snprintf(*list + *len, *cap - *len, "%s%s", *len ? ", " : "", name);
+    return true;
+}
+
+static bool index_root_owner_resolve(const char *repo_path, char **owner_out, char **error_out) {
+    *owner_out = NULL;
+    *error_out = NULL;
+    char *derived = cbm_project_name_from_path(repo_path);
+    if (!derived) {
+        return true; /* the caller reports the derivation failure itself */
+    }
+    char derived_db[CBM_SZ_1K];
+    project_db_path(derived, derived_db, sizeof(derived_db));
+    if (derived_db[0] && cbm_file_exists(derived_db)) {
+        free(derived);
+        return true; /* fast path: the path-derived project is already on disk */
+    }
+    char dir_path[CBM_SZ_1K];
+    cache_dir(dir_path, sizeof(dir_path));
+    cbm_dir_t *d = cbm_opendir(dir_path);
+    if (!d) {
+        free(derived);
+        return true;
+    }
+    char *owner = NULL;
+    char *owners = NULL;
+    size_t owners_len = 0;
+    size_t owners_cap = 0;
+    int owner_count = 0;
+    bool derived_exists = false;
+    bool ok = true;
+    cbm_dirent_t *entry;
+    while (ok && !derived_exists && (entry = cbm_readdir(d)) != NULL) {
+        size_t len = strlen(entry->name);
+        if (!is_project_db_file(entry->name, len)) {
+            continue;
+        }
+        mcp_project_record_t record = {0};
+        project_record_status_t status =
+            read_project_record_identity(dir_path, entry->name, 0, &record);
+        if (status == PROJECT_RECORD_OOM) {
+            ok = false;
+            break;
+        }
+        if (status != PROJECT_RECORD_OK) {
+            continue;
+        }
+        if (strcmp(record.name, derived) == 0) {
+            derived_exists = true;
+        } else if (strcmp(record.root_path, repo_path) == 0) {
+            owner_count++;
+            ok = index_root_owner_append(&owners, &owners_len, &owners_cap, record.name);
+            if (owner_count == 1 && ok) {
+                owner = heap_strdup(record.name);
+                ok = owner != NULL;
+            }
+        }
+        project_record_clear(&record);
+    }
+    cbm_closedir(d);
+    free(derived);
+
+    if (ok && !derived_exists && owner_count == 1) {
+        free(owners);
+        *owner_out = owner;
+        return true;
+    }
+    free(owner);
+    if (ok && (derived_exists || owner_count == 0)) {
+        free(owners);
+        return true;
+    }
+    char msg[CBM_SZ_4K];
+    if (ok) {
+        snprintf(msg, sizeof(msg),
+                 "several indexed projects share root_path %s: %s. Pass name=<project> to "
+                 "choose which one to re-index (or delete_project the stale ones).",
+                 repo_path, owners);
+    } else {
+        snprintf(msg, sizeof(msg), "out of memory while resolving the project for root_path %s",
+                 repo_path);
+    }
+    free(owners);
+    *error_out = heap_strdup(msg);
+    return false;
 }
 
 /* The three heap strings handle_index_repository owns from
@@ -11145,6 +11265,23 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result(boundary_err, true);
     }
 
+    if ((!name_override || !name_override[0]) && repo_path && repo_path[0]) {
+        char *owner = NULL;
+        char *owner_error = NULL;
+        if (!index_root_owner_resolve(repo_path, &owner, &owner_error)) {
+            index_args_free(repo_path, mode_str, name_override);
+            char *result = cbm_mcp_text_result(
+                owner_error ? owner_error : "could not resolve index project name", true);
+            free(owner_error);
+            return result;
+        }
+        if (owner) {
+            cbm_log_info("index.root_owner_reused", "root", repo_path, "project", owner);
+            free(name_override);
+            name_override = owner;
+        }
+    }
+
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
         char *result = handle_cross_repo_mode(srv, repo_path, name_override, args);
         index_args_free(repo_path, mode_str, name_override);
@@ -11161,7 +11298,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     /* A daemon session delegates the one physical write to its shared job
      * registry only after path canonicalization and workspace authorization. */
     if (srv->index_executor) {
-        char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
+        char *worker_args =
+            index_args_with_repo_path(args, repo_path, name_override, &resource_policy);
         char *coordinated =
             worker_args ? srv->index_executor(srv->index_executor_context, repo_path, worker_args)
                         : NULL;
@@ -11189,7 +11327,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * installs the same guard before running the in-process pipeline. A marked
      * host fails closed if preparation or worker startup cannot complete. */
     if (cbm_index_supervisor_should_wrap()) {
-        char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
+        char *worker_args =
+            index_args_with_repo_path(args, repo_path, name_override, &resource_policy);
         if (!worker_args) {
             free(mutation_project);
             index_args_free(repo_path, mode_str, name_override);
