@@ -327,11 +327,13 @@ static bool push_scope(WalkState *state, uint8_t kind, uint32_t depth, const cha
     f->prev_callee_expr = state->callee_expr;
     f->prev_callee_leaf = state->callee_leaf;
     f->prev_inside_import = state->inside_import;
+    f->prev_inside_anonymous_callable = state->inside_anonymous_callable;
     f->prev_loop_depth = state->loop_depth;
     f->prev_branch_depth = state->branch_depth;
     switch (kind) {
     case SCOPE_FUNC:
         state->enclosing_func_qn = qn;
+        state->inside_anonymous_callable = false;
         break;
     case SCOPE_CLASS:
     case SCOPE_NAMESPACE:
@@ -445,6 +447,7 @@ static void pop_expired_scopes(WalkState *state, uint32_t cur_depth) {
         state->callee_expr = f->prev_callee_expr;
         state->callee_leaf = f->prev_callee_leaf;
         state->inside_import = f->prev_inside_import;
+        state->inside_anonymous_callable = f->prev_inside_anonymous_callable;
         state->loop_depth = f->prev_loop_depth;
         state->branch_depth = f->prev_branch_depth;
         py_param_unwind_to(state, f->prev_py_param_stack_count);
@@ -2362,7 +2365,13 @@ static bool node_already_has_lexical_scope(const WalkState *state, TSNode node) 
 static void push_lexical_boundary(TSNode node, WalkState *state, uint32_t depth) {
     CBMLexicalScopeKind kind;
     if (!node_already_has_lexical_scope(state, node) && lexical_boundary_kind(node, &kind)) {
-        (void)push_lexical_scope(state, SCOPE_LEXICAL, depth, NULL, node, kind);
+        bool pushed = push_lexical_scope(state, SCOPE_LEXICAL, depth, NULL, node, kind);
+        if (pushed && kind == CBM_LEXICAL_SCOPE_FUNCTION) {
+            /* Anonymous callables are lexical scopes but not graph nodes. Do not
+             * manufacture CALLS edges from the enclosing named function for
+             * calls in their bodies. */
+            state->inside_anonymous_callable = true;
+        }
     }
 }
 
