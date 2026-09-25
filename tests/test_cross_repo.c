@@ -10,6 +10,7 @@
 #include "pipeline/pipeline_internal.h"
 
 #include <sqlite3/sqlite3.h>
+#include <yyjson/yyjson.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -323,6 +324,96 @@ TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133) {
     PASS();
 }
 
+/* Render the "cross_repo" status object the MCP/UI surfaces attach for
+ * `project`, read from its store the way index_status does (query open). */
+static char *cross_repo_status_json(const cross_repo_fixture_t *fixture, const char *project) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return NULL;
+    }
+    cbm_store_t *store = cbm_store_open_path_query(path);
+    if (!store) {
+        return NULL;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    yyjson_mut_val *root = yyjson_mut_obj(doc);
+    yyjson_mut_doc_set_root(doc, root);
+    char *json = NULL;
+    if (cbm_cross_repo_add_status_json(doc, root, store, project)) {
+        json = yyjson_mut_write(doc, 0, NULL);
+    }
+    yyjson_mut_doc_free(doc);
+    cbm_store_close(store);
+    return json;
+}
+
+/* #2133 follow-up: an empty CROSS_* set could mean "never linked" or "linked,
+ * nothing matched" and no surface told them apart. The source store records
+ * each run; before any run the status says so explicitly. */
+TEST(cross_repo_status_distinguishes_never_run_from_ran_without_links) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_create_project(&fixture, "status-src") &&
+                 cross_repo_create_project(&fixture, "status-api");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed status fixture");
+    }
+
+    char *before = cross_repo_status_json(&fixture, "status-src");
+    const char *targets[] = {"status-api"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("status-src", targets, 1);
+    char *after = cross_repo_status_json(&fixture, "status-src");
+    cross_repo_fixture_end(&fixture);
+
+    bool before_never = before && strstr(before, "\"cross_repo\":{\"status\":\"never_run\"}");
+    bool after_ran =
+        after && strstr(after, "\"status\":\"ran\"") && strstr(after, "\"outcome\":\"complete\"") &&
+        strstr(after, "\"targets\":[\"status-api\"]") && strstr(after, "\"projects_scanned\":1") &&
+        strstr(after, "\"total_cross_edges\":0") && strstr(after, "\"last_run_at\":\"20");
+    free(before);
+    free(after);
+    cbm_cross_repo_result_free(&result);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_TRUE(before_never);
+    ASSERT_TRUE(after_ran);
+    PASS();
+}
+
+/* #2133 follow-up: ["*"] skips a pre-#768 store (it cannot be linked until a
+ * reindex); the result must name it rather than silently covering fewer
+ * projects, and the recorded status counts it. */
+TEST(cross_repo_wildcard_reports_skipped_pre768_store) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "skip-src", "skip-api", "/orders", "s") &&
+                 cross_repo_create_pre768_project(&fixture, "aa-pre768-store");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed skipped-store fixture");
+    }
+
+    const char *targets[] = {"*"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("skip-src", targets, 1);
+    char *status = cross_repo_status_json(&fixture, "skip-src");
+    cross_repo_fixture_end(&fixture);
+
+    bool named = result.skipped_count == 1 && result.skipped_projects &&
+                 strcmp(result.skipped_projects[0].project, "aa-pre768-store") == 0 &&
+                 strcmp(result.skipped_projects[0].reason, "pre_768_schema") == 0;
+    bool status_counts =
+        status && strstr(status, "\"skipped_projects\":1") && strstr(status, "\"targets\":[\"*\"]");
+    free(status);
+    cbm_cross_repo_result_free(&result);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 1);
+    ASSERT_TRUE(named);
+    ASSERT_TRUE(status_counts);
+    PASS();
+}
+
 static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
                                          const char *source_project, const char *target_project) {
     enum { TEST_SCAN_ROWS = 4097 };
@@ -612,6 +703,8 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
     RUN_TEST(cross_repo_wildcard_skips_pre768_store_issue2133);
     RUN_TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133);
+    RUN_TEST(cross_repo_status_distinguishes_never_run_from_ran_without_links);
+    RUN_TEST(cross_repo_wildcard_reports_skipped_pre768_store);
     RUN_TEST(cross_repo_scan_bound_counts_examined_rows_not_matches);
     RUN_TEST(cross_repo_propagates_delete_failure);
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);

@@ -13,12 +13,14 @@
 #include "pipeline/pipeline_internal.h" // cbm_route_canon_path
 #include "foundation/constants.h"
 #include "foundation/log.h"
+#include "foundation/mem_core.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/str_util.h"
 
 #include <sqlite3/sqlite3.h>
+#include <yyjson/yyjson.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -153,27 +155,38 @@ static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) 
     return matches;
 }
 
-/* True when `project` is a usable cross-repo input: its store holds exactly
- * that project AND carries the schema the read-write open in
+typedef enum {
+    CR_PROJECT_USABLE = 0,
+    CR_PROJECT_MISSING, /* no store, or the store is not exactly this project */
+    CR_PROJECT_LEGACY,  /* exact project, but a pre-#768 schema (reindex required) */
+} cr_project_state_t;
+
+/* Classify `project` as a cross-repo input: usable when its store holds
+ * exactly that project AND carries the schema the read-write open in
  * cr_open_existing_project requires. Checking only the first let a pre-#768
  * store (still readable, so list_projects shows it) pass validation and the
  * ["*"] enumeration, then abort the whole run at its write open — after the
  * source's previous CROSS_* generation had already been deleted. The probe is
  * read-only, so the legacy store is left untouched for its reindex. (#2133) */
-static bool cr_project_exists(const char *project) {
+static cr_project_state_t cr_project_state(const char *project) {
     char path[CR_PATH_BUF];
     if (!cr_db_path(project, path, sizeof(path))) {
-        return false;
+        return CR_PROJECT_MISSING;
     }
     cbm_store_t *store = cbm_store_open_path_query(path);
-    bool exists = cr_store_has_exact_project(store, project);
-    if (exists && !cbm_store_edges_schema_current(store)) {
+    cr_project_state_t state =
+        cr_store_has_exact_project(store, project) ? CR_PROJECT_USABLE : CR_PROJECT_MISSING;
+    if (state == CR_PROJECT_USABLE && !cbm_store_edges_schema_current(store)) {
         cbm_log_warn("cross_repo.project_unusable", "project", project, "reason",
                      "pre_768_schema_reindex_required");
-        exists = false;
+        state = CR_PROJECT_LEGACY;
     }
     cbm_store_close(store);
-    return exists;
+    return state;
+}
+
+static bool cr_project_exists(const char *project) {
+    return cr_project_state(project) == CR_PROJECT_USABLE;
 }
 
 static cbm_store_t *cr_open_existing_project(const char *project) {
@@ -1075,8 +1088,33 @@ static cr_match_result_t match_typed_routes(cbm_store_t *src_store, const char *
 
 static void free_project_list(char **projects, int count);
 
+/* Remember a store the ["*"] enumeration skipped, so the caller can name it
+ * instead of the run silently covering fewer projects than exist. */
+static bool cr_record_skip(cbm_cross_repo_result_t *result, const char *project,
+                           const char *reason) {
+    if (!result) {
+        return true;
+    }
+    cbm_cross_repo_skip_t *grown =
+        cbm_realloc(CBM_MEM_CLASS_OTHER, result->skipped_projects,
+                    ((size_t)result->skipped_count + 1U) * sizeof(*result->skipped_projects));
+    if (!grown) {
+        return false;
+    }
+    result->skipped_projects = grown;
+    char *name = cbm_mem_strdup(CBM_MEM_CLASS_OTHER, project);
+    if (!name) {
+        return false;
+    }
+    grown[result->skipped_count].project = name;
+    grown[result->skipped_count].reason = reason;
+    result->skipped_count++;
+    return true;
+}
+
 /* When target_projects = ["*"], scan the cache directory for all .db files. */
-static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
+static int collect_all_projects(char ***out, cr_run_context_t *ctx,
+                                cbm_cross_repo_result_t *result) {
     *out = NULL;
     const char *dir = cr_cache_dir();
     cbm_dir_t *d = cbm_opendir(dir);
@@ -1126,7 +1164,15 @@ static int collect_all_projects(char ***out, cr_run_context_t *ctx) {
         }
         memcpy(project, ent->name, project_length);
         project[project_length] = '\0';
-        if (!cbm_validate_project_name(project) || !cr_project_exists(project)) {
+        if (!cbm_validate_project_name(project)) {
+            continue;
+        }
+        cr_project_state_t state = cr_project_state(project);
+        if (state == CR_PROJECT_LEGACY && !cr_record_skip(result, project, "pre_768_schema")) {
+            failed = true;
+            break;
+        }
+        if (state != CR_PROJECT_USABLE) {
             continue;
         }
         if (count >= cap) {
@@ -1211,6 +1257,106 @@ static int collect_named_projects(const char **targets, int target_count, char *
     return unique_count;
 }
 
+/* ── Last-run marker ─────────────────────────────────────────────── */
+
+static bool cr_status_key(const char *project, char *buf, size_t bufsz) {
+    int written = snprintf(buf, bufsz, "cross_repo_last_run:%s", project);
+    return written > 0 && (size_t)written < bufsz;
+}
+
+/* Record this run in the SOURCE store's store_meta, next to the CROSS_*
+ * edges it just rewrote: a reindex that rebuilds the store drops both
+ * together, so the marker can never outlive the links it describes. Written
+ * once the source's previous CROSS_* generation was cleaned, whatever the
+ * outcome, because from then on the old summary no longer matches the graph.
+ * Project names are validated ([A-Za-z0-9._-]) or "*", so no JSON escaping is
+ * needed. Best-effort: a marker failure is logged, never fails the run. */
+static void cr_record_last_run(cbm_store_t *src_store, const char *project, const char **targets,
+                               int target_count, const cbm_cross_repo_result_t *result) {
+    char key[CR_QN_BUF];
+    if (!cr_status_key(project, key, sizeof(key))) {
+        return;
+    }
+    size_t cap = CR_PROPS_BUF;
+    for (int i = 0; i < target_count; i++) {
+        cap += (targets[i] ? strlen(targets[i]) : 0) + CR_COL_4;
+    }
+    char *json = cbm_alloc(CBM_MEM_CLASS_OTHER, cap);
+    if (!json) {
+        return;
+    }
+    char when[CBM_SZ_32];
+    time_t now = time(NULL);
+    struct tm tm_now;
+    if (!cbm_gmtime_r(&now, &tm_now) ||
+        strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%SZ", &tm_now) == 0) {
+        when[0] = '\0';
+    }
+    const char *outcome = result->failed ? "failed" : result->cancelled ? "cancelled" : "complete";
+    size_t len = (size_t)snprintf(
+        json, cap, "{\"last_run_at\":\"%s\",\"outcome\":\"%s\",\"targets\":[", when, outcome);
+    for (int i = 0; i < target_count && len < cap; i++) {
+        len += (size_t)snprintf(json + len, cap - len, "%s\"%s\"", i ? "," : "",
+                                targets[i] ? targets[i] : "");
+    }
+    int total = result->http_edges + result->async_edges + result->channel_edges +
+                result->grpc_edges + result->graphql_edges + result->trpc_edges;
+    if (len < cap) {
+        len += (size_t)snprintf(json + len, cap - len,
+                                "],\"projects_scanned\":%d,\"total_cross_edges\":%d,"
+                                "\"skipped_projects\":%d}",
+                                result->projects_scanned, total, result->skipped_count);
+    }
+    if (len >= cap || cbm_store_meta_put(src_store, key, json) != CBM_STORE_OK) {
+        cbm_log_warn("cross_repo.status_unrecorded", "project", project);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, json);
+}
+
+bool cbm_cross_repo_add_status_json(struct yyjson_mut_doc *doc, struct yyjson_mut_val *parent,
+                                    cbm_store_t *store, const char *project) {
+    char key[CR_QN_BUF];
+    if (!doc || !parent || !store || !project || !cr_status_key(project, key, sizeof(key))) {
+        return false;
+    }
+    char *raw = NULL;
+    int rc = cbm_store_meta_get(store, key, &raw);
+    yyjson_doc *recorded = rc == CBM_STORE_OK ? yyjson_read(raw, strlen(raw), 0) : NULL;
+    cbm_free(CBM_MEM_CLASS_STORE, raw);
+    yyjson_val *recorded_root = recorded ? yyjson_doc_get_root(recorded) : NULL;
+    yyjson_mut_val *status = NULL;
+    if (yyjson_is_obj(recorded_root)) {
+        status = yyjson_val_mut_copy(doc, recorded_root);
+    }
+    if (!status) {
+        status = yyjson_mut_obj(doc);
+    }
+    yyjson_doc_free(recorded);
+    if (!status) {
+        return false;
+    }
+    /* "never_run" is the honest reading of an absent marker: no run with this
+     * project as the source has completed its cleanup since the store was
+     * (re)built. A target-side run still leaves its CROSS_* edges here. */
+    const char *state = rc == CBM_STORE_NOT_FOUND         ? "never_run"
+                        : yyjson_mut_obj_size(status) > 0 ? "ran"
+                                                          : "unavailable";
+    yyjson_mut_obj_add_str(doc, status, "status", state);
+    return yyjson_mut_obj_add_val(doc, parent, "cross_repo", status);
+}
+
+void cbm_cross_repo_result_free(cbm_cross_repo_result_t *result) {
+    if (!result) {
+        return;
+    }
+    for (int i = 0; i < result->skipped_count; i++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, result->skipped_projects[i].project);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, result->skipped_projects);
+    result->skipped_projects = NULL;
+    result->skipped_count = 0;
+}
+
 static cr_run_status_t add_match_count(int *total, cr_match_result_t matched) {
     *total += matched.count;
     return matched.status;
@@ -1242,7 +1388,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
     int resolved_count = 0;
 
     if (target_count == SKIP_ONE && target_projects[0] && strcmp(target_projects[0], "*") == 0) {
-        resolved_count = collect_all_projects(&resolved, &run);
+        resolved_count = collect_all_projects(&resolved, &run, &result);
     } else {
         resolved_count = collect_named_projects(target_projects, target_count, &resolved, &run);
     }
@@ -1364,6 +1510,7 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.projects_scanned++;
     }
 
+    cr_record_last_run(src_store, project, target_projects, target_count, &result);
     cbm_store_close(src_store);
 
     free_project_list(resolved, resolved_count);

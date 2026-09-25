@@ -12814,6 +12814,102 @@ TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting) {
     PASS();
 }
 
+/* A store written before the #768 edges.local_name_gen column: readable, but
+ * refused by every read-write open until a reindex. */
+static bool mcp_cross_repo_create_pre768_store(const char *cache, const char *project) {
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    sqlite3 *db = NULL;
+    if (sqlite3_open(db_path, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    char sql[CBM_SZ_1K];
+    snprintf(sql, sizeof(sql),
+             "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT NOT NULL,"
+             " root_path TEXT NOT NULL);"
+             "CREATE TABLE nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " label TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL,"
+             " file_path TEXT DEFAULT '', start_line INTEGER DEFAULT 0,"
+             " end_line INTEGER DEFAULT 0, properties TEXT DEFAULT '{}',"
+             " UNIQUE(project, qualified_name));"
+             "CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, type TEXT NOT NULL,"
+             " properties TEXT DEFAULT '{}', UNIQUE(source_id, target_id, type));"
+             "INSERT INTO projects VALUES('%s', '2026-06-01T00:00:00Z', '/pre768');",
+             project);
+    bool ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+/* #2133 follow-up, both user-visible halves: index_status tells "never run"
+ * from "ran" via a `cross_repo` object, and a ["*"] run names the legacy
+ * store it skipped (with the reindex hint) instead of silently linking fewer
+ * projects. */
+TEST(tool_cross_repo_status_and_wildcard_skipped_projects) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "%s/cbm-mcp-cross-status-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    char *source_project = cbm_project_name_from_path(cache);
+    ASSERT_NOT_NULL(source_project);
+    const char *target_project = "cross-status-target";
+    const char *legacy_project = "cross-status-pre768";
+    ASSERT_TRUE(mcp_cross_repo_seed_http_match(cache, source_project, target_project, cache));
+    ASSERT_TRUE(mcp_cross_repo_create_pre768_store(cache, legacy_project));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    ASSERT_TRUE(cbm_mcp_server_set_session_context(srv, cache, NULL));
+
+    char status_args[CBM_SZ_1K];
+    snprintf(status_args, sizeof(status_args), "{\"project\":\"%s\",\"format\":\"json\"}",
+             source_project);
+    char *before = cbm_mcp_handle_tool(srv, "index_status", status_args);
+    bool before_never =
+        response_contains_json_fragment(before, "\"cross_repo\":{\"status\":\"never_run\"}");
+
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args),
+             "{\"repo_path\":\"%s\",\"mode\":\"cross-repo-intelligence\","
+             "\"target_projects\":[\"*\"]}",
+             cache);
+    char *run = cbm_mcp_handle_tool(srv, "index_repository", args);
+    bool run_ok = run && strstr(run, "\"isError\":true") == NULL &&
+                  response_contains_json_fragment(run, "\"total_cross_edges\":1");
+    bool skipped_named = response_contains_json_fragment(
+        run, "\"skipped_projects\":[{\"name\":\"cross-status-pre768\","
+             "\"reason\":\"pre_768_schema\",\"hint\":\"reindex this project\"}]");
+
+    char *after = cbm_mcp_handle_tool(srv, "index_status", status_args);
+    bool after_ran = response_contains_json_fragment(after, "\"status\":\"ran\"") &&
+                     response_contains_json_fragment(after, "\"total_cross_edges\":1") &&
+                     response_contains_json_fragment(after, "\"skipped_projects\":1");
+
+    free(before);
+    free(run);
+    free(after);
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, source_project);
+    cleanup_project_db(cache, target_project);
+    cleanup_project_db(cache, legacy_project);
+    free(source_project);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    cbm_rmdir(cache);
+
+    ASSERT_TRUE(before_never);
+    ASSERT_TRUE(run_ok);
+    ASSERT_TRUE(skipped_named);
+    ASSERT_TRUE(after_ran);
+    PASS();
+}
+
 /* `name` is the documented index project-name override and must identify the
  * cross-repo source too. Deriving from repo_path here makes custom-named
  * projects impossible to rescan even though ordinary indexing created them. */
@@ -20786,6 +20882,7 @@ SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_cross_repo_checks_cancellation_after_acquiring_leases);
     RUN_TEST(tool_cross_repo_missing_inputs_fail_without_creating_ghost_databases);
     RUN_TEST(tool_cross_repo_dedupes_targets_before_scanning_and_counting);
+    RUN_TEST(tool_cross_repo_status_and_wildcard_skipped_projects);
     RUN_TEST(tool_cross_repo_honors_source_name_override);
     RUN_TEST(tool_corrupt_store_cleanup_guard_is_balanced_and_not_nested);
     RUN_TEST(tool_corrupt_store_cleanup_guard_denial_preserves_db_and_wal);

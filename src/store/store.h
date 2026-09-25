@@ -462,6 +462,17 @@ int cbm_store_generation_advance(cbm_store_t *s);
  * an error. */
 int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz);
 
+/* Per-store feature metadata in store_meta (key/value text). Keys are
+ * namespaced by the owning feature, e.g. "cross_repo_last_run:<project>".
+ * get: CBM_STORE_OK with *out owned by the caller (release with
+ * cbm_free(CBM_MEM_CLASS_STORE, *out)), or
+ * CBM_STORE_NOT_FOUND when the key -- or store_meta itself -- is absent.
+ * Read-only: safe on a store opened for query.
+ * put: upserts the key; seeds store_meta through the generation path when a
+ * legacy store lacks it. Atomic (savepoint); needs a read-write store. */
+int cbm_store_meta_get(cbm_store_t *s, const char *key, char **out);
+int cbm_store_meta_put(cbm_store_t *s, const char *key, const char *value);
+
 /* Seal a fully-written staging database before atomic publication.
  * Raises synchronous to FULL, requires an exclusive TRUNCATE checkpoint to
  * complete, then leaves the database in verified DELETE journal mode so the

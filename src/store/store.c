@@ -2456,6 +2456,77 @@ int cbm_store_generation(cbm_store_t *s, char *buf, size_t bufsz) {
     return CBM_STORE_OK;
 }
 
+int cbm_store_meta_get(cbm_store_t *s, const char *key, char **out) {
+    if (!out) {
+        return CBM_STORE_ERR;
+    }
+    *out = NULL;
+    if (!s || !s->db || !key) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *get = NULL;
+    /* A store that never advanced its generation has no store_meta table:
+     * that is "no value recorded", not an error. */
+    if (sqlite3_prepare_v2(s->db, "SELECT v FROM store_meta WHERE k = ?1;", CBM_NOT_FOUND, &get,
+                           NULL) != SQLITE_OK) {
+        sqlite3_finalize(get);
+        return CBM_STORE_NOT_FOUND;
+    }
+    bind_text(get, SKIP_ONE, key);
+    int rc = sqlite3_step(get);
+    if (rc == SQLITE_ROW) {
+        const char *value = (const char *)sqlite3_column_text(get, 0);
+        *out = cbm_mem_strdup(CBM_MEM_CLASS_STORE, value ? value : "");
+        sqlite3_finalize(get);
+        return *out ? CBM_STORE_OK : CBM_STORE_ERR;
+    }
+    sqlite3_finalize(get);
+    return rc == SQLITE_DONE ? CBM_STORE_NOT_FOUND : CBM_STORE_ERR;
+}
+
+int cbm_store_meta_put(cbm_store_t *s, const char *key, const char *value) {
+    static const char savepoint[] = "SAVEPOINT cbm_meta_put;";
+    static const char rollback[] = "ROLLBACK TO cbm_meta_put;";
+    static const char release[] = "RELEASE cbm_meta_put;";
+    if (!s || !s->db || !key || !value) {
+        return CBM_STORE_ERR;
+    }
+    if (exec_sql(s, savepoint) != CBM_STORE_OK) {
+        return CBM_STORE_ERR;
+    }
+    /* store_meta is only ever created by the generation seed, which writes
+     * db_uid + mutation_gen with it. Creating the table here without them
+     * would make cbm_store_generation() report malformed metadata, so an
+     * absent table is seeded through that one path. */
+    bool absent = false;
+    char uid[17] = {0};
+    char counter[21] = {0};
+    uint64_t counter_value = 0;
+    if (generation_metadata_read(s, &absent, uid, counter, &counter_value) != CBM_STORE_OK ||
+        (absent && cbm_store_generation_advance(s) != CBM_STORE_OK)) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    sqlite3_stmt *set = NULL;
+    if (sqlite3_prepare_v2(s->db, "INSERT OR REPLACE INTO store_meta (k, v) VALUES (?1, ?2);",
+                           CBM_NOT_FOUND, &set, NULL) != SQLITE_OK) {
+        store_set_error_sqlite(s, "store_meta put prepare");
+        sqlite3_finalize(set);
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    bind_text(set, SKIP_ONE, key);
+    bind_text(set, ST_COL_2, value);
+    int rc = sqlite3_step(set);
+    sqlite3_finalize(set);
+    if (rc != SQLITE_DONE) {
+        store_set_error_sqlite(s, "store_meta put");
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    if (exec_sql(s, release) != CBM_STORE_OK) {
+        return rollback_savepoint_preserving_error(s, rollback, release);
+    }
+    return CBM_STORE_OK;
+}
+
 int cbm_store_get_project(cbm_store_t *s, const char *name, cbm_project_t *out) {
     sqlite3_stmt *stmt =
         prepare_cached(s, &s->stmt_get_project,
