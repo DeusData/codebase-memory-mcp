@@ -952,6 +952,28 @@ TEST(tslsp_nocrash_circular_extends) {
     PASS();
 }
 
+/* #1743 (kilocode report): the Effect idiom `class Service extends
+ * Context.Service<Service, I>()(...)` resolved its base to the class itself,
+ * so a static call `Service.of(...)` walked a self-cycle in the extends chain
+ * with no depth bound and overflowed the resolver thread's stack. Method and
+ * member lookups over cyclic heritage must terminate. */
+TEST(tslsp_nocrash_cyclic_extends_method_call) {
+    CBMFileResult *r =
+        extract_ts("export class Loader extends Context.Service<Loader, LoaderI>()(\n"
+                   ") {}\n"
+                   "export class Service extends Context.Service<Service, I>()(\"@x/S\") {}\n"
+                   "export function fromSDK(sdk: SDK): LoaderI {\n"
+                   "  return Loader.of({\n"
+                   "  })\n"
+                   "}\n"
+                   "class A extends B {}\n"
+                   "class B extends A {}\n"
+                   "function go(a: A) { a.missing(); return a.field.other(); }\n");
+    ASSERT_NOT_NULL(r);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_nocrash_recursive_type) {
     CBMFileResult *r = extract_ts("interface List { next?: List; value: number; }\n"
                                   "function go(l: List) { l.next?.value; }\n");
@@ -4365,6 +4387,7 @@ SUITE(ts_lsp) {
 
     /* Category 26: more crash safety */
     RUN_TEST(tslsp_nocrash_circular_extends);
+    RUN_TEST(tslsp_nocrash_cyclic_extends_method_call);
     RUN_TEST(tslsp_nocrash_recursive_type);
     RUN_TEST(tslsp_nocrash_unicode_identifier);
     RUN_TEST(tslsp_nocrash_template_with_call);
