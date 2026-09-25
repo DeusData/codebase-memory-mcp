@@ -103,6 +103,27 @@ const char *cbm_nix_binding_scope_qn(CBMExtractCtx *ctx, TSNode node, const char
 // attrpath and an enclosing attrset compose into one qualified name.
 const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, const char *name);
 
+// ── Elixir def-head guards ──
+// `def f(x) when g` parses its WHOLE head as a `when` binary_operator, so the
+// `f(x)` call naming the function is the operator's left operand, and more than
+// one guard (`when a when b`) nests those operators right-associatively, so the
+// head stays the outermost operator's left operand in either shape. Four
+// walks read that same first argument — the defs walk names the function from
+// it (through cbm_elixir_def_head), the unified walk opens the function's call
+// scope from it (same helper), the calls walk tells a head apart from an
+// invocation by it, and the usages walk excludes the head's identifiers from
+// the usage set by it — so a private copy in one of them makes the rest
+// disagree about what a guarded clause is.
+// cbm_elixir_is_when_guard answers "is this node a guarded head"; the unwrap
+// returns the head under every guard, or the node unchanged when it carries
+// none; cbm_elixir_def_head_is answers whether a node is that head or one of
+// the guard operators above it, which is the question the calls walk asks.
+// All three test the operator token, so an operator definition (`def a + b`) is
+// left alone rather than mis-read as a guard.
+bool cbm_elixir_is_when_guard(TSNode node);
+TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg);
+bool cbm_elixir_def_head_is(TSNode signature, TSNode node);
+
 // Resolve a function/method definition node's NAME node across all ~130 grammars
 // (generic `name` field, arrow→declarator, C/C++ declarator chain, plus the many
 // per-language quirks: Fortran subroutine, SCSS mixin, SQL create_function, R,
@@ -229,6 +250,79 @@ char *cbm_fqn_compute_source_lang(CBMArena *a, const char *project, const char *
 
 // Folder QN: project.dir_parts
 char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir);
+
+/* --- QN discriminators (container segment + arity fence) ---------------
+ *
+ * A qualified name is a '.'-separated path whose LAST segment is the symbol
+ * name. '.' is structurally reserved as that separator across the whole
+ * codebase (simple_name, qualified_suffix_match, the LIKE '%.'||suffix store
+ * probe, ~90 strrchr(qn,'.') sites), so a second discriminator can never be a
+ * dot segment. The fence character is '#', following the precedent already set
+ * by rust_cfg_qualified_name() in extract_defs.c ("add#cfg(test)").
+ *
+ * An arity-fenced QN reads "proj.file.Module.name#N". Everything that wants the
+ * symbol's dotted identity strips the fence first. */
+
+/* "<qn>#<arity>". Returns `qn` unchanged when arity < 0. */
+char *cbm_fqn_with_arity(CBMArena *a, const char *qn, int arity);
+
+/* Copy `qn` into `out` without its '#<digits>' fence. Returns the length
+ * written (truncated to cap-1 on overflow). `out` is always NUL-terminated.
+ * A QN with no fence copies verbatim. */
+size_t cbm_qn_strip_arity(char *out, size_t cap, const char *qn);
+
+/* The container of a QN: everything before its final '.' segment, with any
+ * arity fence removed first. Writes it into `out` and returns true; returns
+ * false and leaves `out` empty when the QN has no '.'. Buffer-only, because
+ * every caller is pipeline-side and holds no arena. */
+bool cbm_qn_container_buf(char *out, size_t cap, const char *qn);
+
+/* --- Language traits (enum-keyed, NOT CBMLangSpec fields) ---------------
+ *
+ * These are predicates rather than spec rows for a build reason recorded at
+ * lang_specs.h:47: cbm_string_dispatch_suffixes was kept out of CBMLangSpec to
+ * avoid -Wmissing-field-initializers across the positional language rows, and
+ * Makefile.cbm compiles with -Wall -Wextra -Werror. */
+
+/* True when a language names its container in the SOURCE rather than deriving
+ * it from the file path — an Elixir `defmodule Fx.Store` owns its defs no
+ * matter which file holds it, so the container segment belongs in the def QN.
+ * Path-derived containers (Python module, Go package) already ride in the QN
+ * through cbm_fqn_compute and must not be doubled. */
+bool cbm_lang_container_is_source_named(CBMLanguage lang);
+
+/* True when a language distinguishes two definitions of the same name in the
+ * same container by parameter count — Elixir's fetch/1 and fetch/3 are
+ * different functions, not clauses of one. */
+bool cbm_lang_overloads_by_arity(CBMLanguage lang);
+
+/* --- Elixir def-head resolution (one implementation, two consumers) -----
+ *
+ * Elixir models every construct as a `call` node, so a def, a defmodule and an
+ * ordinary in-body call are the same kind. Both the definition extractor
+ * (extract_defs.c) and the call-scope walker (extract_unified.c) must derive
+ * the SAME name, the same arity and the same container from such a node, or
+ * the def QN and the enclosing_func_qn on its body's calls disagree and every
+ * CALLS/USAGE edge sourced inside that function silently reattributes to the
+ * file's Module node. They used to be two hand-written copies, and had already
+ * drifted: only the def side unwrapped the `when` guard binary_operator.
+ *
+ * `node` is the outer def `call`. Returns the function name and writes the
+ * arity (0 for a bare `def foo do`), or NULL when the node is not a
+ * def/defp/defmacro. A default-argument head (`def f(a, b \\ 1)`) reports its
+ * MAXIMUM arity: one node per written head, not one per reachable arity. */
+const char *cbm_elixir_def_head(CBMExtractCtx *ctx, TSNode node, int *out_arity);
+
+/* The module name written by an Elixir `defmodule Name do`, or NULL when the
+ * node is not a defmodule. The name is source text and may itself be dotted
+ * ("Fx.Store"), which is exactly what belongs in the QN. */
+const char *cbm_elixir_module_head(CBMExtractCtx *ctx, TSNode node);
+
+/* Compose an Elixir definition QN: `container` + "." + `name`, falling back to
+ * the path-derived QN when there is no container, then fenced with `arity`
+ * where the language trait admits it. Shared so the def side and the call
+ * scope side cannot drift. Pass arity < 0 for a container (defmodule) QN. */
+char *cbm_elixir_def_qn(CBMExtractCtx *ctx, const char *container_qn, const char *name, int arity);
 
 /* Flatten a JS/TS `template_string` node into plain text: string fragments are
  * kept verbatim and each ${...} substitution becomes the "{}" placeholder, so

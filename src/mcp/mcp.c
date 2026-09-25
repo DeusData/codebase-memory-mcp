@@ -8393,34 +8393,86 @@ static long node_resolution_score(const cbm_node_t *n) {
     return label_rank * (long)RES_LABEL_WEIGHT + span;
 }
 
-/* A "real" callable definition: a Function/Method node with a non-empty body
- * span (end_line > start_line). A body-less node (start_line == end_line) is an
- * ambient declaration / signature stub — e.g. a TypeScript `.d.ts` declaration
- * — which is a *fragment* of one logical symbol, not a distinct definition. The
- * distinction lets pick_resolved_node union a stub with its real implementation
- * (#546) while still treating two genuinely-different same-named functions as
- * ambiguous rather than conflating their caller sets. */
-static bool node_is_real_callable_def(const cbm_node_t *n) {
+/* Copy a QN without its '#<digits>' arity fence (internal/cbm/helpers.c).
+ * Declared extern rather than via helpers.h, which would pull the extraction
+ * layer's header into the MCP TU — the pattern used for
+ * cbm_kind_in_set_free_cache below. */
+extern size_t cbm_qn_strip_arity(char *out, size_t cap, const char *qn);
+
+/* True when `qn` ends in an all-digit '#' fence ("...fetch#3"). A fence is
+ * minted only from a definition head the extractor actually saw, which is what
+ * makes it evidence below. Rust's cfg twin ("add#cfg(test)") is not one. */
+static bool qn_has_arity_fence(const char *qn) {
+    if (!qn) {
+        return false;
+    }
+    const char *hash = strrchr(qn, '#');
+    if (!hash || !hash[SKIP_ONE]) {
+        return false;
+    }
+    for (const char *p = hash + SKIP_ONE; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Does this candidate count as a RIVAL definition of the name — a distinct
+ * implementation rather than a fragment of one logical symbol?
+ *
+ * A Function/Method node with a non-empty body span (end_line > start_line) is
+ * one. A body-less node (start_line == end_line) normally is not: it is an
+ * ambient declaration / signature stub — a TypeScript `.d.ts` declaration —
+ * which is why pick_resolved_node may union it with its real implementation
+ * (#546/#650) while still reporting two genuinely-different same-named
+ * functions as ambiguous rather than conflating their caller sets.
+ *
+ * An arity-fenced QN is the exception, and only where arities are being counted
+ * separately (fold_arity == false). The fence says the extractor saw a whole
+ * definition head, so `def size(x), do: byte_size(x)` — a complete one-line
+ * Elixir clause — is a real definition that merely occupies one line. Judging it
+ * by span would put the answer straight back where the flag took it from:
+ * decided by how many lines a body happens to take up. */
+static bool node_is_rival_def(const cbm_node_t *n, bool fold_arity) {
     if (!n->label) {
         return false;
     }
     if (strcmp(n->label, "Function") != 0 && strcmp(n->label, "Method") != 0) {
         return false;
     }
-    return (long)n->end_line - (long)n->start_line > 0;
+    if ((long)n->end_line - (long)n->start_line > 0) {
+        return true;
+    }
+    return !fold_arity && qn_has_arity_fence(n->qualified_name);
 }
 
 /* Pick the best-resolving node among name matches. Sets *ambiguous when the
  * matches can't be reduced to one logical symbol, so resolution never silently
  * traces (or conflates) the wrong same-named node:
  *   1. the top score is shared by >1 candidate (a genuine rank/span tie), or
- *   2. two or more *real* callable definitions share the name — distinct
+ *   2. two or more RIVAL definitions share the name (node_is_rival_def) — distinct
  *      implementations, not a definition plus its body-less stub(s).
  * Rule 2 completes rule 1: without it, two same-named functions whose bodies
  * differ in length score differently, dodge the tie, and get their caller sets
  * unioned by bfs_union_same_name (#546) into one confidently-conflated answer.
  * Body-less .d.ts stubs still union with their implementation (#650). */
-static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguous) {
+/* `fold_arity` says whether candidates that differ ONLY by their QN's arity
+ * fence count as one logical symbol. It gates BOTH tallies -- the top-score tie
+ * and the real-definition count -- because either one alone decides the answer,
+ * and a flag honoured by only one of them makes the outcome depend on the other:
+ * folding real definitions unconditionally left ambiguity resting on whether two
+ * clauses happened to score equally, i.e. on whether their bodies happened to
+ * have the same line count.
+ *
+ * trace_path passes true: "who calls fetch" wants the callers of every arity,
+ * and bfs_union_same_name already unions the seeds it is given. get_code_snippet
+ * passes false: it returns ONE body, and fetch/1 and fetch/3 have different
+ * bodies, so listing all three fenced QNs as suggestions is the honest answer --
+ * the answer it used to give was whichever arity's node survived the collision,
+ * with no ambiguity signal at all. */
+static int pick_resolved_node(const cbm_node_t *nodes, int count, bool fold_arity,
+                              bool *ambiguous) {
     *ambiguous = false;
     if (count <= 1) {
         return 0;
@@ -8436,11 +8488,58 @@ static int pick_resolved_node(const cbm_node_t *nodes, int count, bool *ambiguou
     }
     int top_count = 0;
     int real_def_count = 0;
+    /* With fold_arity, a tie between two arities of one function is not a tie
+     * at all: the seeds get unioned, so which one ranks first is immaterial. */
+    const char *top_stripped_of = NULL;
+    char top_stripped[CBM_SZ_512];
+    char top_probe[CBM_SZ_512];
+    /* Under fold_arity, arities of one function are ONE logical symbol. Elixir's
+     * fetch/1 and fetch/3 are distinct NODES (that is the whole point of the
+     * arity fence) but they are the same name in the same container, and a
+     * caller that unions its seeds wants all of them, so two candidates whose
+     * QNs are equal once the fence is removed are folded here, the same way a
+     * .d.ts stub folds into its implementation above. Two genuinely different
+     * same-named functions live in different containers, so their stripped QNs
+     * still differ and they are still reported ambiguous.
+     *
+     * Without fold_arity the fold does not happen at all: each arity is counted,
+     * so a bare name naming several of them is ambiguous and gets one suggestion
+     * per arity. That is the honest answer for a caller returning a single body,
+     * and it is a deliberate difference from the folding branch, not an accident
+     * of which arity happened to rank first. */
+    const char *first_stripped_of = NULL;
+    char first_stripped[CBM_SZ_512];
+    char stripped[CBM_SZ_512];
     for (int i = 0; i < count; i++) {
         if (node_resolution_score(&nodes[i]) == best_score) {
-            top_count++;
+            if (!fold_arity) {
+                top_count++;
+            } else {
+                cbm_qn_strip_arity(top_probe, sizeof(top_probe), nodes[i].qualified_name);
+                if (!top_stripped_of) {
+                    (void)snprintf(top_stripped, sizeof(top_stripped), "%s", top_probe);
+                    top_stripped_of = top_stripped;
+                    top_count++;
+                } else if (strcmp(top_stripped, top_probe) != 0) {
+                    top_count++;
+                }
+            }
         }
-        if (node_is_real_callable_def(&nodes[i])) {
+        if (!node_is_rival_def(&nodes[i], fold_arity)) {
+            continue;
+        }
+        if (!fold_arity) {
+            /* Every arity is its own definition with its own body, so a caller
+             * that returns one body must be told there is more than one. */
+            real_def_count++;
+            continue;
+        }
+        cbm_qn_strip_arity(stripped, sizeof(stripped), nodes[i].qualified_name);
+        if (!first_stripped_of) {
+            (void)snprintf(first_stripped, sizeof(first_stripped), "%s", stripped);
+            first_stripped_of = first_stripped;
+            real_def_count++;
+        } else if (strcmp(first_stripped, stripped) != 0) {
             real_def_count++;
         }
     }
@@ -9188,7 +9287,7 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
      * ambiguity (rather than silently tracing nodes[0]) on a genuine tie — e.g.
      * a C main() vs a same-named shell-script main(). */
     bool trace_ambiguous = false;
-    int sel = pick_resolved_node(nodes, node_count, &trace_ambiguous);
+    int sel = pick_resolved_node(nodes, node_count, true, &trace_ambiguous);
     if (trace_ambiguous) {
         char *result = snippet_suggestions(func_name, nodes, node_count);
         free(func_name);
@@ -12456,7 +12555,7 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
          * instead of forcing a disambiguation round trip; only a genuine tie still
          * returns suggestions. */
         bool snip_ambiguous = false;
-        int ssel = pick_resolved_node(suffix_nodes, suffix_count, &snip_ambiguous);
+        int ssel = pick_resolved_node(suffix_nodes, suffix_count, false, &snip_ambiguous);
         if (!snip_ambiguous) {
             copy_node(&suffix_nodes[ssel], &node);
             cbm_store_free_nodes(suffix_nodes, suffix_count);

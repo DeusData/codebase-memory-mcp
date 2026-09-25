@@ -1113,6 +1113,49 @@ TEST(store_find_by_qn_suffix_dot_boundary) {
     PASS();
 }
 
+/* An arity-fenced QN ("...fetch#3") must still be reachable by the DOTTED tail
+ * a caller writes. get_code_snippet resolves a short name through this probe,
+ * and the bare symbol name with no arity suffix is the calling convention
+ * agents are given — so without the fenced alternative an overloaded function
+ * would be unreachable by every name an agent knows. */
+TEST(store_find_by_qn_suffix_matches_arity_fence) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+
+    cbm_node_t n1 = {.project = "test",
+                     .label = "Function",
+                     .name = "fetch",
+                     .qualified_name = "test.lib.store.Fx.Store.fetch#1"};
+    cbm_node_t n2 = {.project = "test",
+                     .label = "Function",
+                     .name = "fetch",
+                     .qualified_name = "test.lib.store.Fx.Store.fetch#3"};
+    cbm_node_t n3 = {.project = "test",
+                     .label = "Function",
+                     .name = "prefetch",
+                     .qualified_name = "test.lib.store.Fx.Store.prefetch#1"};
+    cbm_store_upsert_node(s, &n1);
+    cbm_store_upsert_node(s, &n2);
+    cbm_store_upsert_node(s, &n3);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    int rc = cbm_store_find_nodes_by_qn_suffix(s, "test", "fetch", &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    /* Both arities, and NOT prefetch — the dot boundary still holds. */
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    /* A container-qualified tail reaches the fenced forms too. */
+    rc = cbm_store_find_nodes_by_qn_suffix(s, "test", "Fx.Store.fetch", &nodes, &count);
+    ASSERT_EQ(rc, CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Node degree ───────────────────────────────────────────────── */
 
 TEST(store_node_degree) {
@@ -2406,6 +2449,7 @@ SUITE(store_nodes) {
     RUN_TEST(store_find_by_file_overlap);
     RUN_TEST(store_find_by_qn_suffix_single);
     RUN_TEST(store_find_by_qn_suffix_no_match);
+    RUN_TEST(store_find_by_qn_suffix_matches_arity_fence);
     RUN_TEST(store_find_by_qn_suffix_multiple);
     RUN_TEST(store_find_by_qn_suffix_dot_boundary);
     RUN_TEST(store_node_degree);

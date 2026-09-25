@@ -76,7 +76,26 @@ static int qn_has_terminal_name(const char *qn, const char *name) {
         return 0;
     size_t qn_len = strlen(qn);
     size_t name_len = strlen(name);
-    if (name_len > qn_len || strcmp(qn + qn_len - name_len, name) != 0)
+    /* A QN may end in an arity fence ("...Sample.argument#1"), which is a
+     * discriminator rather than part of the symbol's dotted identity. Drop it
+     * before the terminal-name comparison: the question here is which function
+     * a call was attributed to, and two arities of one name are still that
+     * name. A fence is '#' followed by digits only, so "Foo#Bar" is untouched. */
+    if (qn_len > 0) {
+        const char *hash = strrchr(qn, '#');
+        if (hash && hash[1]) {
+            int digits = 1;
+            for (const char *p = hash + 1; *p; p++) {
+                if (*p < '0' || *p > '9') {
+                    digits = 0;
+                    break;
+                }
+            }
+            if (digits)
+                qn_len = (size_t)(hash - qn);
+        }
+    }
+    if (name_len > qn_len || strncmp(qn + qn_len - name_len, name, name_len) != 0)
         return 0;
     if (name_len == qn_len)
         return 1;

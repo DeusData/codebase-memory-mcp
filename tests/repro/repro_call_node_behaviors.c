@@ -39,11 +39,31 @@ static int terminal_name_matches(const char *raw, const char *expected) {
         return 1;
 
     size_t raw_len = strlen(raw);
+    /* A QN may end in an arity fence ("...Sample.run#1"), a discriminator
+     * rather than part of the symbol's dotted identity. Drop it before the
+     * terminal-name comparison: the question here is which routine a call or
+     * definition belongs to, and two arities of one name are still that name.
+     * Only '#' followed by digits counts, so "Foo#Bar" is untouched. */
+    const char *fence = strrchr(raw, '#');
+    if (fence && fence[1]) {
+        int digits = 1;
+        for (const char *p = fence + 1; *p; p++) {
+            if (*p < '0' || *p > '9') {
+                digits = 0;
+                break;
+            }
+        }
+        if (digits) {
+            raw_len = (size_t)(fence - raw);
+            if (raw_len == strlen(expected) && strncmp(raw, expected, raw_len) == 0)
+                return 1;
+        }
+    }
     size_t expected_len = strlen(expected);
     if (raw_len < expected_len)
         return 0;
     const char *tail = raw + raw_len - expected_len;
-    if (strcmp(tail, expected) != 0)
+    if (strncmp(tail, expected, expected_len) != 0)
         return 0;
     if (tail == raw)
         return 1;

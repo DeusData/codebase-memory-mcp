@@ -325,6 +325,209 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
     PASS();
 }
 
+/* cbm_registry_add used to discard its `name` argument and re-derive the
+ * lookup key from the QN's last dot segment. That made the QN's tail load
+ * bearing for the bare-name index every language shares: a Rust cfg twin,
+ * minted as "add#cfg(test)", was indexed under that literal string and no bare
+ * `add` callee could ever reach it. */
+TEST(registry_indexes_by_passed_name_not_qn_tail) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function");
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "add", "proj.lib.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.lib.add#cfg(test)");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The other direction of the same disagreement: a name may carry segments that
+ * the QN's tail drops, and then the QN tail is the key callers actually spell.
+ *
+ * Two shapes, both taken from what the extractors emit today. An HCL block is
+ * named "resource.aws_instance.web" by find_hcl_block_name while its QN tail
+ * is bare "web", which is how a `aws_instance.web.id` reference reaches it. A
+ * file's Module node is named with the basename INCLUDING its extension in
+ * every language, while its QN tail is the extensionless stem
+ * a bare module reference is written as.
+ *
+ * Keying the index on the passed name ALONE loses both lookups, so the index
+ * carries both keys. */
+TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web",
+                     "Class");
+    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module");
+
+    cbm_resolution_t tail = cbm_registry_resolve(r, "web", "proj.main", NULL, NULL, 0);
+    ASSERT_STR_EQ(tail.qualified_name, "proj.main.resource.aws_instance.web");
+
+    cbm_resolution_t whole =
+        cbm_registry_resolve(r, "resource.aws_instance.web", "proj.main", NULL, NULL, 0);
+    ASSERT_STR_EQ(whole.qualified_name, "proj.main.resource.aws_instance.web");
+
+    cbm_resolution_t stem = cbm_registry_resolve(r, "helper", "proj.pkg.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(stem.qualified_name, "proj.pkg.helper");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* An arity fence is a discriminator, not part of the dotted tail the callee
+ * text names. A qualified callee must therefore still find a fenced candidate,
+ * and the call site's argument count is what chooses among the arities. */
+TEST(resolve_qualified_suffix_sees_through_arity_fence) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "fetch", "proj.lib.store.Fx.Store.fetch#1", "Function");
+    cbm_registry_add(r, "fetch", "proj.lib.store.Fx.Store.fetch#3", "Function");
+    cbm_registry_add(r, "fetch", "proj.lib.other.Fx.Other.fetch#1", "Function");
+
+    cbm_resolve_ctx_t one = {.container_qn = NULL, .arity = 1};
+    cbm_resolution_t a = cbm_registry_resolve_ctx(r, "Fx.Store.fetch", "proj.lib.caller", &one,
+                                                  NULL, NULL, 0);
+    ASSERT_STR_EQ(a.qualified_name, "proj.lib.store.Fx.Store.fetch#1");
+
+    cbm_resolve_ctx_t three = {.container_qn = NULL, .arity = 3};
+    cbm_resolution_t b = cbm_registry_resolve_ctx(r, "Fx.Store.fetch", "proj.lib.caller", &three,
+                                                  NULL, NULL, 0);
+    ASSERT_STR_EQ(b.qualified_name, "proj.lib.store.Fx.Store.fetch#3");
+
+    /* An arity no candidate carries cannot pick one of the two Fx.Store
+     * arities, so the qualified strategy declines rather than guessing. */
+    cbm_resolve_ctx_t nine = {.container_qn = NULL, .arity = 9};
+    cbm_resolution_t c =
+        cbm_registry_resolve_ctx(r, "Fx.Store.fetch", "proj.lib.caller", &nine, NULL, NULL, 0);
+    ASSERT_TRUE(!c.strategy || strcmp(c.strategy, "qualified_suffix") != 0);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Where a language names its container in the source, the FILE QN is not the
+ * container, so an intra-container call cannot be found by the same-module
+ * strategy without the caller's own container. Without this it degraded to the
+ * bare-name scorer at roughly half the confidence — quietly, because the
+ * scorer often still lands on a right-looking answer. */
+TEST(resolve_same_module_uses_caller_container) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "fetch", "proj.lib.store.Fx.Store.fetch#1", "Function");
+    cbm_registry_add(r, "fetch", "proj.lib.store.Fx.Store.fetch#2", "Function");
+    cbm_registry_add(r, "fetch", "proj.lib.other.Fx.Other.fetch#1", "Function");
+
+    cbm_resolve_ctx_t rx = {.container_qn = "proj.lib.store.Fx.Store", .arity = 2};
+    cbm_resolution_t res =
+        cbm_registry_resolve_ctx(r, "fetch", "proj.lib.store", &rx, NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.lib.store.Fx.Store.fetch#2");
+    ASSERT_STR_EQ(res.strategy, "same_module");
+
+    /* Without the container the file QN alone cannot compose the candidate. */
+    cbm_resolution_t bare =
+        cbm_registry_resolve(r, "fetch", "proj.lib.store", NULL, NULL, 0);
+    ASSERT_TRUE(!bare.strategy || strcmp(bare.strategy, "same_module") != 0);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Resolution must be MONOTONE: registering an unrelated symbol may not
+ * re-point an already-resolved edge. It did, because a qualified callee
+ * arrived as a bare name — one candidate resolved by unique_name, and a second
+ * same-named candidate anywhere in the tree flipped the strategy to
+ * proximity scoring, which picked by path distance. */
+TEST(resolve_qualified_is_monotone_under_unrelated_additions) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "get", "proj.lib.probe.Fx.Probe.get#1", "Function");
+
+    cbm_resolution_t before =
+        cbm_registry_resolve(r, "Fx.Probe.get", "proj.lib.store", NULL, NULL, 0);
+    ASSERT_STR_EQ(before.qualified_name, "proj.lib.probe.Fx.Probe.get#1");
+
+    /* One unrelated file, in a module the call never names. */
+    cbm_registry_add(r, "get", "proj.lib.zz_collide.Fx.Collide.get#1", "Function");
+    cbm_registry_resolve_cache_end();
+
+    cbm_resolution_t after =
+        cbm_registry_resolve(r, "Fx.Probe.get", "proj.lib.store", NULL, NULL, 0);
+    ASSERT_STR_EQ(after.qualified_name, "proj.lib.probe.Fx.Probe.get#1");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* A qualified callee naming a container that holds no such symbol must resolve
+ * to nothing rather than to an unrelated local of the same bare name. This is
+ * the `Keyword.get(opts, :reason)` case: the receiver chain is the only
+ * evidence that the project's own get/1 is the wrong answer. */
+TEST(resolve_foreign_receiver_does_not_bind_local_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "get", "proj.lib.probe.Fx.Probe.get#1", "Function");
+    cbm_registry_add(r, "put", "proj.lib.probe.Fx.Probe.put#3", "Function");
+
+    cbm_resolution_t kw = cbm_registry_resolve(r, "Keyword.get", "proj.lib.store", NULL, NULL, 0);
+    ASSERT_TRUE(!kw.qualified_name || kw.qualified_name[0] == '\0');
+
+    cbm_resolution_t mp = cbm_registry_resolve(r, "Map.put", "proj.lib.store", NULL, NULL, 0);
+    ASSERT_TRUE(!mp.qualified_name || mp.qualified_name[0] == '\0');
+
+    /* The genuinely qualified call still resolves. */
+    cbm_resolution_t ok =
+        cbm_registry_resolve(r, "Fx.Probe.get", "proj.lib.store", NULL, NULL, 0);
+    ASSERT_STR_EQ(ok.qualified_name, "proj.lib.probe.Fx.Probe.get#1");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The same-module suffix fallback composes its candidate from the caller's
+ * module and the callee's SUFFIX, discarding the qualifier the call site wrote.
+ * Routing it through receiver_chain_admits is NOT gated on the new context
+ * argument: cbm_registry_resolve reaches it too, so every language that writes
+ * receiver chains is covered. Nothing here carries an arity fence and no
+ * context is passed, so the container and arity machinery is off by
+ * construction and the guard is the only thing under test. */
+TEST(resolve_receiver_guard_is_language_agnostic) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "parse", "proj.com.acme.Order.parse", "Method");
+    cbm_registry_add(r, "render", "proj.app.views.render", "Function");
+    cbm_registry_add(r, "max", "proj.web.cart.max", "Function");
+
+    /* Java: java.time.LocalDate.parse is not Order's own parse. */
+    cbm_resolution_t jv =
+        cbm_registry_resolve(r, "LocalDate.parse", "proj.com.acme.Order", NULL, NULL, 0);
+    ASSERT_TRUE(!jv.qualified_name || jv.qualified_name[0] == '\0');
+
+    /* Python: a Template's render is not the module's own render. */
+    cbm_resolution_t py =
+        cbm_registry_resolve(r, "Template.render", "proj.app.views", NULL, NULL, 0);
+    ASSERT_TRUE(!py.qualified_name || py.qualified_name[0] == '\0');
+
+    /* JavaScript: Math.max is not the cart's own max. */
+    cbm_resolution_t js = cbm_registry_resolve(r, "Math.max", "proj.web.cart", NULL, NULL, 0);
+    ASSERT_TRUE(!js.qualified_name || js.qualified_name[0] == '\0');
+
+    /* A chain segment naming the candidate's own ancestry still binds, so the
+     * guard withholds a foreign receiver rather than every qualified callee. */
+    cbm_resolution_t own =
+        cbm_registry_resolve(r, "Order.parse", "proj.com.acme.Order", NULL, NULL, 0);
+    ASSERT_STR_EQ(own.qualified_name, "proj.com.acme.Order.parse");
+
+    /* Carve-out: a lower-case root names a value whose type the chain does not
+     * show, so it passes through unchanged. */
+    cbm_registry_add(r, "close", "proj.io.handle.close", "Function");
+    cbm_resolution_t lc = cbm_registry_resolve(r, "file.close", "proj.io.handle", NULL, NULL, 0);
+    ASSERT_STR_EQ(lc.qualified_name, "proj.io.handle.close");
+
+    /* Carve-out: an ALL_CAPS root with an underscore is a constant holding a
+     * value, not a type. */
+    cbm_registry_add(r, "lower", "proj.iso.codes.lower", "Function");
+    cbm_resolution_t cc =
+        cbm_registry_resolve(r, "ISO_4217_URL.lower", "proj.iso.codes", NULL, NULL, 0);
+    ASSERT_STR_EQ(cc.qualified_name, "proj.iso.codes.lower");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
@@ -1201,6 +1404,13 @@ SUITE(registry) {
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(registry_indexes_by_passed_name_not_qn_tail);
+    RUN_TEST(registry_indexes_a_dotted_name_under_its_tail_too);
+    RUN_TEST(resolve_qualified_suffix_sees_through_arity_fence);
+    RUN_TEST(resolve_same_module_uses_caller_container);
+    RUN_TEST(resolve_qualified_is_monotone_under_unrelated_additions);
+    RUN_TEST(resolve_foreign_receiver_does_not_bind_local_name);
+    RUN_TEST(resolve_receiver_guard_is_language_agnostic);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);

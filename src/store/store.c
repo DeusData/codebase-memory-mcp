@@ -4383,17 +4383,27 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
     if (!s || !s->db) {
         return CBM_STORE_ERR;
     }
-    /* Match QNs ending with ".suffix" or exactly equal to suffix */
+    /* Match QNs ending with ".suffix" or exactly equal to suffix.
+     *
+     * A QN may carry an arity fence ("...Store.fetch#3"), so a third
+     * alternative matches the fenced forms of the same dotted tail. Without it
+     * get_code_snippet("fetch") -- the bare-name convention every agent is
+     * told to use -- reaches no arity of an overloaded function at all. The
+     * '#' is matched literally: it is not a LIKE metacharacter. */
     char like_pattern[CBM_SZ_512];
-    snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
+    (void)snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
+    char arity_pattern[CBM_SZ_512];
+    (void)snprintf(arity_pattern, sizeof(arity_pattern), "%%.%s#%%", suffix);
 
     const char *sql_with_project =
         "SELECT id, project, label, name, qualified_name, file_path, "
         "start_line, end_line, properties FROM nodes "
-        "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
+        "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3 "
+        "OR qualified_name LIKE ?4)";
     const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
                           "start_line, end_line, properties FROM nodes "
-                          "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2)";
+                          "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2 "
+                          "OR qualified_name LIKE ?3)";
 
     sqlite3_stmt *stmt = NULL;
     int rc =
@@ -4407,9 +4417,11 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
         bind_text(stmt, SKIP_ONE, project);
         bind_text(stmt, ST_COL_2, like_pattern);
         bind_text(stmt, ST_COL_3, suffix);
+        bind_text(stmt, ST_COL_4, arity_pattern);
     } else {
         bind_text(stmt, SKIP_ONE, like_pattern);
         bind_text(stmt, ST_COL_2, suffix);
+        bind_text(stmt, ST_COL_3, arity_pattern);
     }
 
     int cap = ST_INIT_CAP_8;

@@ -2744,6 +2744,14 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
         if (pc == 0 && d->signature) {
             pc = count_params_from_signature(d->signature);
         }
+        /* Neither source is available for a language whose def head carries the
+         * arity structurally rather than as a named parameter list (Elixir).
+         * Its extractor sets param_count directly, and this pass must not
+         * silently zero it -- the count feeds the structural-smell metric and,
+         * for such a language, is the only record of arity outside the QN. */
+        if (pc == 0) {
+            pc = d->param_count;
+        }
         d->param_count = pc;
     }
 

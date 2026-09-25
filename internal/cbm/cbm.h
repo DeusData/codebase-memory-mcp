@@ -309,8 +309,24 @@ typedef enum {
 typedef struct {
     const char *ref_name;          // referenced identifier
     const char *enclosing_func_qn; // QN of enclosing function (or module QN)
-    /* Fixed-width fields grouped so the record packs to 40 bytes (was 48; the
-     * Go corpus holds 4.68M of these). Field meanings unchanged. */
+    /* The qualifier the reference was written under, when the extractor can
+     * see one: `Keyword` in `Keyword.get(opts, :reason)`. Without it a usage
+     * arrives at the registry as the bare name "get", receiver_chain_admits
+     * returns true at its bare-name early return, and EVERY receiver-chain
+     * protection is bypassed by construction -- which is how an unrelated
+     * local get/1 became the target of a Keyword.get call, and how adding one
+     * unrelated file re-pointed an already-resolved edge. is_member_access
+     * below records only THAT a selector was there, never what it named.
+     * NULL when the reference is unqualified. */
+    const char *receiver;
+    /* Fixed-width fields grouped so the record packs with no interior padding.
+     * `receiver` above makes that 48 bytes, up from the 40 this comment used to
+     * report: three pointers, three uint32, two enums and four bools all pack
+     * exactly, so an 8-byte pointer cannot ride in existing slack and the
+     * record grows by its full width for every language. On the Go corpus this
+     * comment already cites -- 4.68M usages -- the qualifier is ~37 MB of extra
+     * peak extraction footprint, and reference_receiver() returns NULL for
+     * every language but Elixir. Field meanings unchanged. */
     uint32_t lexical_scope_id;       // extraction-local scope instance; never graph identity
     uint32_t site_start_byte;        // exact reference-token span; end > start when present
     uint32_t site_end_byte;          // exclusive byte offset in the source file

@@ -26,6 +26,7 @@ enum { PC_RING = 4, PC_RING_MASK = 3, PC_SIG_SCAN = 15, PC_REGEX_GRP = 2 };
 #include "foundation/limits.h"
 #include "foundation/str_util.h"
 #include "cbm.h"
+#include "helpers.h"
 #include "service_patterns.h"
 
 #include "foundation/compat_regex.h"
@@ -544,8 +545,26 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
-    cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
-                                                imp_keys, imp_vals, imp_count);
+    /* The caller's own container, where the language names it in the source
+     * rather than deriving it from the path. Elixir's fetch/1 lives in
+     * `proj.file.Fx.Store`, not `proj.file`, so the same-module strategy needs
+     * this to find an intra-module call at all. NULL everywhere else, which
+     * leaves resolution byte-identical for every other language. */
+    char container_buf[CBM_SZ_512];
+    const char *container_qn = NULL;
+    if (cbm_lang_container_is_source_named(lang) && call->enclosing_func_qn &&
+        (!module_qn || strcmp(call->enclosing_func_qn, module_qn) != 0) &&
+        cbm_qn_container_buf(container_buf, sizeof(container_buf), call->enclosing_func_qn)) {
+        container_qn = container_buf;
+    }
+    /* arg_count saturates at CBM_MAX_CALL_ARGS and skips splats, so it is the
+     * written arity only below the cap and with no splat present. Above it the
+     * hint is withheld rather than guessed. */
+    cbm_resolve_ctx_t rx = {.container_qn = container_qn,
+                            .arity = call->arg_count < CBM_MAX_CALL_ARGS ? call->arg_count
+                                                                         : CBM_ARITY_NONE};
+    cbm_resolution_t res = cbm_registry_resolve_ctx(ctx->registry, call->callee_name, module_qn,
+                                                    &rx, imp_keys, imp_vals, imp_count);
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,

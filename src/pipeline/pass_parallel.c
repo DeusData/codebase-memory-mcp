@@ -1596,7 +1596,20 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
         cbm_gbuf_insert_edge(ctx->gbuf, file_node_id, def_node->id, "DEFINES", "{}");
         edges++;
     }
-    if (def->parent_class && strcmp(def->label, "Method") == 0) {
+    /* Containment: a definition that names its container earns a
+     * Class -> member edge. The gate was label == "Method" alone, which is
+     * why a language whose members are labelled Function (Elixir's defs) had
+     * NO containment edge at all -- module membership existed only as a QN
+     * prefix. Relabelling those to Method would put a falsehood in the label
+     * column to satisfy an edge condition; label is read by the FTS rank
+     * boost, cbm_label_is_registry_symbol, cbm_label_is_type_like and the
+     * search label filter. Widening the gate is the smaller blast radius:
+     * every other site in extract_defs.c that sets parent_class on a callable
+     * already labels it Method, so this adds edges for Function members only.
+     * (Elixir's container is labelled Class, which is wrong -- a module is not
+     * a class -- and is out of scope here.) */
+    if (def->parent_class &&
+        (strcmp(def->label, "Method") == 0 || strcmp(def->label, "Function") == 0)) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
         if (parent && def_node) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, def_node->id, "DEFINES_METHOD", "{}");
@@ -2896,8 +2909,29 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * exact LSP target and must fail closed rather than accepting a textual
          * registry match. */
         if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution) {
-            res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
-                                       imp_vals, imp_count);
+            /* The caller's own container, where the language names it in the
+             * source rather than deriving it from the path. Elixir's fetch/1
+             * lives in `proj.file.Fx.Store`, not `proj.file`, so the
+             * same-module strategy needs this to find an intra-module call at
+             * all. NULL everywhere else, which leaves resolution
+             * byte-identical for every other language. Must mirror the
+             * sequential twin (pass_calls.c) exactly. */
+            char container_buf[CBM_SZ_512];
+            const char *container_qn = NULL;
+            if (cbm_lang_container_is_source_named(lang) && call->enclosing_func_qn &&
+                (!module_qn || strcmp(call->enclosing_func_qn, module_qn) != 0) &&
+                cbm_qn_container_buf(container_buf, sizeof(container_buf),
+                                     call->enclosing_func_qn)) {
+                container_qn = container_buf;
+            }
+            /* arg_count saturates at CBM_MAX_CALL_ARGS and skips splats, so it
+             * is the written arity only below the cap. Above it the hint is
+             * withheld rather than guessed. */
+            cbm_resolve_ctx_t rx = {.container_qn = container_qn,
+                                    .arity = call->arg_count < CBM_MAX_CALL_ARGS ? call->arg_count
+                                                                                 : CBM_ARITY_NONE};
+            res = cbm_registry_resolve_ctx(rc->registry, call->callee_name, module_qn, &rx,
+                                           imp_keys, imp_vals, imp_count);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
@@ -3114,12 +3148,39 @@ static void resolve_file_usages(resolve_ctx_t *rc, resolve_worker_state_t *ws,
              * resolves through the default variant, whose central relation
              * veto keeps same-named code identifiers out of the lineage layer.
              * Must mirror the sequential twin (pass_usages.c) exactly. */
+            /* The caller's own container, where the language names it in the
+             * source rather than deriving it from the path (Elixir
+             * defmodule). NULL for every other language. */
+            char container_buf[CBM_SZ_512];
+            const char *container_qn = NULL;
+            if (cbm_lang_container_is_source_named(lang) && usage->enclosing_func_qn &&
+                (!module_qn || strcmp(usage->enclosing_func_qn, module_qn) != 0) &&
+                cbm_qn_container_buf(container_buf, sizeof(container_buf),
+                                     usage->enclosing_func_qn)) {
+                container_qn = container_buf;
+            }
+            /* Resolve under the qualifier the reference was actually written
+             * with. A bare name reaches receiver_chain_admits' bare-name early
+             * return, so every receiver-chain protection is bypassed; the
+             * qualified form is what lets the guard reject an unrelated local
+             * of the same name and lets qualified_suffix_match find the real
+             * one. The EDGE property still reports ref_name. */
+            char qualified_ref[CBM_SZ_512];
+            const char *resolve_ref = usage->ref_name;
+            if (usage->receiver && usage->receiver[0]) {
+                (void)snprintf(qualified_ref, sizeof(qualified_ref), "%s.%s", usage->receiver,
+                               usage->ref_name);
+                resolve_ref = qualified_ref;
+            }
+            /* A usage is a reference, not an invocation: no argument list, so
+             * no arity to offer. */
+            cbm_resolve_ctx_t rx = {.container_qn = container_qn, .arity = CBM_ARITY_NONE};
             cbm_resolution_t res =
                 (lang == CBM_LANG_SQL)
-                    ? cbm_registry_resolve_lineage(rc->registry, usage->ref_name, module_qn,
-                                                   imp_keys, imp_vals, imp_count)
-                    : cbm_registry_resolve(rc->registry, usage->ref_name, module_qn, imp_keys,
-                                           imp_vals, imp_count);
+                    ? cbm_registry_resolve_lineage(rc->registry, resolve_ref, module_qn, imp_keys,
+                                                   imp_vals, imp_count)
+                    : cbm_registry_resolve_ctx(rc->registry, resolve_ref, module_qn, &rx, imp_keys,
+                                               imp_vals, imp_count);
             if (!res.qualified_name || res.qualified_name[0] == '\0') {
                 continue;
             }

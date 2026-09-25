@@ -1017,6 +1017,44 @@ static bool cross_file_edge_exists(cbm_store_t *s, const char *project, const ch
     return found;
 }
 
+/* Copy the qualified_name of the node a named CALLS edge lands on, or NULL.
+ * Caller frees. Used to compare WHICH arity an edge bound to, which
+ * cross_file_edge_exists cannot see: it matches nodes by bare name, so every
+ * arity of one function looks alike to it. */
+static char *cross_file_call_target_qn(cbm_store_t *s, const char *project, const char *src_name,
+                                       const char *tgt_name) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    char *qn = NULL;
+    for (int i = 0; i < sc && !qn; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !qn; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && tgts[k].qualified_name) {
+                    qn = strdup(tgts[k].qualified_name);
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return qn;
+}
+
 static bool cross_file_call_exists(cbm_store_t *s, const char *project, const char *src_name,
                                    const char *tgt_name) {
     return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
@@ -1113,6 +1151,60 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
 
     cbm_store_close(ns);
     cbm_pipeline_free(np);
+    teardown_test_repo();
+    PASS();
+}
+
+/* Terraform reference resolution, end to end.
+ *
+ * An HCL block names itself with its labels appended -- find_hcl_block_name
+ * mints "resource.aws_instance.web" -- while its QN's last dot segment is
+ * bare "web", and a reference written `aws_instance.web.id` reaches the
+ * by-name index through that tail. HCL is therefore a language where the
+ * definition name and the QN tail are different strings, and an index keyed on
+ * either one alone drops every cross-resource reference in the file.
+ *
+ * This has to be a pipeline test: the registry is shared by every language
+ * and nothing in the HCL extractor mentions the index key, so the two halves
+ * can disagree with every extraction-level assertion still green.
+ */
+TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char tf_path[512];
+    snprintf(tf_path, sizeof(tf_path), "%s/main.tf", g_tmpdir);
+    FILE *tf = fopen(tf_path, "w");
+    if (!tf) {
+        teardown_test_repo();
+        FAIL("failed to write terraform fixture");
+    }
+    fprintf(tf, "resource \"aws_instance\" \"web\" {\n"
+                "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
+                "  instance_type = \"t2.micro\"\n"
+                "}\n"
+                "\n"
+                "resource \"aws_eip\" \"ip\" {\n"
+                "  instance = aws_instance.web.id\n"
+                "}\n");
+    fclose(tf);
+
+    char tf_db[512];
+    snprintf(tf_db, sizeof(tf_db), "%s/test_hcl_refs.db", g_tmpdir);
+
+    cbm_pipeline_t *tp = cbm_pipeline_new(g_tmpdir, tf_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(tp);
+    ASSERT_EQ(cbm_pipeline_run(tp), 0);
+
+    cbm_store_t *ts = cbm_store_open_path(tf_db);
+    ASSERT_NOT_NULL(ts);
+    const char *tf_project = cbm_pipeline_project_name(tp);
+
+    ASSERT(cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
+
+    cbm_store_close(ts);
+    cbm_pipeline_free(tp);
     teardown_test_repo();
     PASS();
 }
@@ -15053,6 +15145,229 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 }
 #endif
 
+/* Arity is part of node identity for a language that overloads by it, so
+ * changing a function's signature RENAMES its node. The incremental pass
+ * snapshots inbound cross-file edges by the endpoint's exact qualified_name and
+ * drops any whose target QN no longer exists, so without a secondary key an
+ * ordinary edit -- add a parameter -- would silently drop every inbound edge
+ * into that function until each caller's file happened to be re-parsed. That is
+ * a full-vs-incremental divergence created by the identity change itself. */
+TEST(pipeline_incremental_preserves_edges_across_arity_change) {
+    char *repo = th_mktempdir("cbm_arity_incr");
+    ASSERT_NOT_NULL(repo);
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s", repo);
+
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "lib/target.ex"),
+                            "defmodule Fx.Target do\n"
+                            "  def landing(a), do: a\n"
+                            "end\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "lib/caller.ex"),
+                            "defmodule Fx.Caller do\n"
+                            "  def invoke(x), do: Fx.Target.landing(x)\n"
+                            "end\n"),
+              0);
+
+    char db_path[600];
+    snprintf(db_path, sizeof(db_path), "%s/arity_incr.db", tmpdir);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    const char *project1 = cbm_pipeline_project_name(p1);
+    cbm_store_t *s1 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s1);
+    ASSERT_TRUE(cross_file_edge_exists(s1, project1, "invoke", "landing", "CALLS"));
+    cbm_store_close(s1);
+    cbm_pipeline_free(p1);
+
+    /* Add a parameter: landing/1 becomes landing/2, a different node. Only the
+     * TARGET file changes, so caller.ex is never re-parsed. */
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "lib/target.ex"),
+                            "defmodule Fx.Target do\n"
+                            "  def landing(a, b), do: {a, b}\n"
+                            "end\n"),
+              0);
+
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    const char *project2 = cbm_pipeline_project_name(p2);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    ASSERT_TRUE(cross_file_edge_exists(s2, project2, "invoke", "landing", "CALLS"));
+    cbm_store_close(s2);
+    cbm_pipeline_free(p2);
+    PASS();
+}
+/* The edge-restore secondary key exists to stop an arity edit from making the
+ * incremental graph differ from the full one. This pins that equality for the
+ * case the key itself declines: landing/1 becomes landing/2 AND landing/3, so
+ * no surviving arity is the unique successor of the captured edge and the
+ * restore drops it rather than guessing. What lands in the graph is then
+ * whatever the ordinary resolve produces -- and it must be what a from-scratch
+ * full index of the same tree produces, down to which arity the edge binds.
+ *
+ * MEASURED, not assumed: an incremental run over this change and a full index
+ * of the same post-change tree both bind invoke#1 -> landing#2. Asserting the
+ * edge is ABSENT here would be wrong; the restore declining is not the same as
+ * the edge being gone.
+ *
+ * This is a guard, not a red-green: it holds on both sides of the index that
+ * replaced the per-edge full node scan in incr_restore_inbound_edges. That is
+ * why it is here -- an index that recorded only "some node has this stripped
+ * name", and not how many do, would answer "sole match", restore the edge onto
+ * whichever arity it happened to store, and diverge from the full index. */
+TEST(pipeline_incremental_ambiguous_arity_successor_matches_full_index) {
+    const char *before = "defmodule Fx.Target do\n"
+                         "  def landing(a), do: a\n"
+                         "end\n";
+    const char *after = "defmodule Fx.Target do\n"
+                        "  def landing(a, b), do: {a, b}\n"
+                        "  def landing(a, b, c), do: {a, b, c}\n"
+                        "end\n";
+    const char *caller = "defmodule Fx.Caller do\n"
+                         "  def invoke(x), do: Fx.Target.landing(x)\n"
+                         "end\n";
+
+    /* Tree A: indexed at `before`, then re-indexed after the arity change. */
+    char *repo_a = th_mktempdir("cbm_arity_incr_amb");
+    ASSERT_NOT_NULL(repo_a);
+    char dir_a[512];
+    snprintf(dir_a, sizeof(dir_a), "%s", repo_a);
+    ASSERT_EQ(th_write_file(TH_PATH(dir_a, "lib/target.ex"), before), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(dir_a, "lib/caller.ex"), caller), 0);
+    char db_a[600];
+    snprintf(db_a, sizeof(db_a), "%s/arity_incr_amb.db", dir_a);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(dir_a, db_a, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    cbm_pipeline_free(p1);
+
+    ASSERT_EQ(th_write_file(TH_PATH(dir_a, "lib/target.ex"), after), 0);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(dir_a, db_a, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    const char *project_a = cbm_pipeline_project_name(p2);
+    cbm_store_t *store_a = cbm_store_open_path(db_a);
+    ASSERT_NOT_NULL(store_a);
+    char *incremental_qn = cross_file_call_target_qn(store_a, project_a, "invoke", "landing");
+    cbm_store_close(store_a);
+    cbm_pipeline_free(p2);
+    ASSERT_NOT_NULL(incremental_qn);
+
+    /* Tree B: the same post-change sources, indexed once from scratch. */
+    char *repo_b = th_mktempdir("cbm_arity_full_amb");
+    ASSERT_NOT_NULL(repo_b);
+    char dir_b[512];
+    snprintf(dir_b, sizeof(dir_b), "%s", repo_b);
+    ASSERT_EQ(th_write_file(TH_PATH(dir_b, "lib/target.ex"), after), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(dir_b, "lib/caller.ex"), caller), 0);
+    char db_b[600];
+    snprintf(db_b, sizeof(db_b), "%s/arity_full_amb.db", dir_b);
+
+    cbm_pipeline_t *p3 = cbm_pipeline_new(dir_b, db_b, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p3);
+    ASSERT_EQ(cbm_pipeline_run(p3), 0);
+    const char *project_b = cbm_pipeline_project_name(p3);
+    cbm_store_t *store_b = cbm_store_open_path(db_b);
+    ASSERT_NOT_NULL(store_b);
+    char *full_qn = cross_file_call_target_qn(store_b, project_b, "invoke", "landing");
+    cbm_store_close(store_b);
+    cbm_pipeline_free(p3);
+    ASSERT_NOT_NULL(full_qn);
+
+    /* Same arity on both sides. Compare the fenced tail, since the project
+     * prefix differs between the two temp trees. */
+    const char *incremental_tail = strrchr(incremental_qn, '.');
+    const char *full_tail = strrchr(full_qn, '.');
+    ASSERT_NOT_NULL(incremental_tail);
+    ASSERT_NOT_NULL(full_tail);
+    ASSERT_STR_EQ(incremental_tail, full_tail);
+    ASSERT_NOT_NULL(strchr(incremental_tail, '#'));
+
+    free(incremental_qn);
+    free(full_qn);
+    PASS();
+}
+/* End-to-end identity + resolution guard for a source-named container.
+ * Everything below is a measured defect the graph used to carry:
+ *   - fetch/1, fetch/2 and fetch/3 in one module collapsed to ONE node;
+ *   - three `def message/1` in three modules in one file collapsed to one;
+ *   - no Class -> Function containment edge existed at all;
+ *   - `Keyword.get(opts, :reason)` bound to an unrelated local get/1;
+ *   - a fully qualified cross-module call produced no CALLS edge. */
+TEST(pipeline_elixir_container_and_arity_identity) {
+    char *repo = th_mktempdir("cbm_elixir_identity");
+    ASSERT_NOT_NULL(repo);
+    char tmpdir[512];
+    snprintf(tmpdir, sizeof(tmpdir), "%s", repo);
+
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "lib/probe.ex"),
+                            "defmodule Fx.Probe do\n"
+                            "  def get(n), do: n\n"
+                            "end\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "lib/store.ex"),
+                            "defmodule Fx.Store do\n"
+                            "  def fetch(a), do: a\n"
+                            "  def fetch(a, b), do: {a, b}\n"
+                            "  def fetch(a, b, c), do: {a, b, c}\n"
+                            "  def run(opts, r) do\n"
+                            "    {Keyword.get(opts, :reason), Fx.Probe.get(r), fetch(1)}\n"
+                            "  end\n"
+                            "end\n"),
+              0);
+    ASSERT_EQ(th_write_file(TH_PATH(tmpdir, "lib/errors.ex"),
+                            "defmodule Fx.ErrA do\n"
+                            "  def message(e), do: e\n"
+                            "end\n"
+                            "defmodule Fx.ErrB do\n"
+                            "  def message(e), do: e\n"
+                            "end\n"
+                            "defmodule Fx.ErrC do\n"
+                            "  def message(e), do: e\n"
+                            "end\n"),
+              0);
+
+    char db_path[600];
+    snprintf(db_path, sizeof(db_path), "%s/elixir_identity.db", tmpdir);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmpdir, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+
+    /* Three arities, three nodes. Three modules, three `message` nodes. */
+    cbm_node_t *fetches = NULL;
+    int fetch_count = 0;
+    cbm_store_find_nodes_by_name(st, project, "fetch", &fetches, &fetch_count);
+    ASSERT_EQ(fetch_count, 3);
+    cbm_store_free_nodes(fetches, fetch_count);
+
+    cbm_node_t *messages = NULL;
+    int message_count = 0;
+    cbm_store_find_nodes_by_name(st, project, "message", &messages, &message_count);
+    ASSERT_EQ(message_count, 3);
+    cbm_store_free_nodes(messages, message_count);
+
+    /* Module membership is an edge, not just a QN prefix. */
+    ASSERT_TRUE(cross_file_edge_exists(st, project, "Fx.Store", "fetch", "DEFINES_METHOD"));
+    ASSERT_TRUE(cross_file_edge_exists(st, project, "Fx.ErrB", "message", "DEFINES_METHOD"));
+
+    /* The qualified cross-module call resolves; the intra-module one does too. */
+    ASSERT_TRUE(cross_file_edge_exists(st, project, "run", "get", "CALLS"));
+    ASSERT_TRUE(cross_file_edge_exists(st, project, "run", "fetch", "CALLS"));
+
+    cbm_store_close(st);
+    cbm_pipeline_free(p);
+    PASS();
+}
+
 SUITE(pipeline) {
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
@@ -15098,7 +15413,11 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
+    RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
+    RUN_TEST(pipeline_incremental_preserves_edges_across_arity_change);
+    RUN_TEST(pipeline_incremental_ambiguous_arity_successor_matches_full_index);
+    RUN_TEST(pipeline_elixir_container_and_arity_identity);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
     RUN_TEST(pipeline_objectscript_export_aggregate_exceeds_arena_block_table);

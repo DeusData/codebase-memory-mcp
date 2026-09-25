@@ -315,6 +315,13 @@ static void cr_walk(cr_ctx_t *c, CBMFileResult *r) {
     for (int i = 0; i < r->usages.count && r->usages.items; i++) {
         cr_str(c, &r->usages.items[i].ref_name);
         cr_str(c, &r->usages.items[i].enclosing_func_qn);
+        /* Every arena-owned string a CBMUsage points at has to be relocated
+         * here. `receiver` is one: the pipeline composes "<receiver>.<ref_name>"
+         * before resolving, so a stale pointer does not crash, it resolves a
+         * qualified reference built from whatever bytes the old arena's memory
+         * now holds -- a valid-looking USAGE edge onto an arbitrary same-suffixed
+         * function, different on every run of the same input. */
+        cr_str(c, &r->usages.items[i].receiver);
     }
     cr_array(c, (void **)&r->throws.items, r->throws.count, sizeof(CBMThrow));
     for (int i = 0; i < r->throws.count && r->throws.items; i++) {

@@ -708,9 +708,73 @@ static bool elixir_call_head_in(TSNode call, const char *source, const char *con
            call_node_text_in(ts_node_child(call, 0), source, heads);
 }
 
+/* A definition's head declares a name; it is never a call to it. Deciding that
+ * takes agreement across three files, because each of them reads the SAME first
+ * argument of the def and a disagreement does not fail, it mints an edge:
+ *   - extract_defs.c names the definition from it, through cbm_elixir_def_head.
+ *     If this file disagrees, the head becomes a CALLS edge onto the function
+ *     from its own def line, which cbm.c then reads as self-recursion because
+ *     that line sits inside the function's own span.
+ *   - extract_unified.c opens the function's call scope from it, through the
+ *     same helper, so a def this file recognises and that walk does not would
+ *     source the body's calls to the FILE node instead of to the function.
+ *   - extract_usages.c (is_elixir_def_binding) treats the whole first argument
+ *     as a binding occurrence rather than a reference, which is what keeps a
+ *     head suppressed here from re-emerging as a USAGE edge. It is deliberately
+ *     WIDER than the unwrap -- it covers the guard expression too -- and that
+ *     width is load-bearing: a suppression in one extractor of the unified walk
+ *     only REMOVES a phantom if the others also decline the node.
+ * The def-macro list below and the one in is_elixir_def_binding must therefore
+ * stay the same list, and the head itself comes from the shared unwrap
+ * (cbm_elixir_def_head_is) rather than from a private copy here.
+ *
+ * A guarded head reaches this walk by two different routes and both have to be
+ * recognised. `def f(a) when g` arrives as the inner `f(a)` call, which is not
+ * the def's first argument once a guard wraps it; `def f when g` has no inner
+ * call at all, so the `when` operator itself reaches extract_callee_name and,
+ * having no callee of its own, takes that function's last resort -- the first
+ * identifier child -- minting the same phantom from the bare name. That last
+ * resort overrides a deliberate NULL for every Elixir binary_operator
+ * extract_scripting_callee declines (`=`, `<-`, `->`, `\\`, `::`, `when`), so
+ * `def g(c \\ 2)` still emits a phantom `c` and `e = target(d)` a phantom `e`.
+ * That is pre-existing behaviour for those operators and is untouched here.
+ *
+ * Measured over forge-symphony-graph/lib (970 .ex files), counting references
+ * whose recorded callee IS the name being declared and whose recorded line is
+ * that declaration's own line: a build with none of this records 2,758 of them,
+ * 1,797 on a guarded head; this build records 48, of which 1 is guarded -- and
+ * all 48 are genuine same-line delegations to another arity
+ * (`defp parse_model({p, t} = m), do: parse_model(p, t)`), not phantoms.
+ * Downstream that is the whole of the self-recursion defect: of 20,961 Function
+ * nodes, 1,308 are flagged self_recursive before and 1,202 of those have no
+ * self-call form anywhere in their span (92% of the flag false); after, 420 are
+ * flagged and 8 are false (2%), and no true positive is lost -- every
+ * (file, name) pair flagged before that does have a self-call form is still
+ * flagged. Node identity alone does not get there: with the (module, name,
+ * arity) key but without this suppression the flag reads 1,476 with 1,224 false
+ * (83%).
+ *
+ * The typespec attributes -- `@spec f(t) :: u` and the @callback / @type family
+ * -- put a declared name in a `call` node too, and are deliberately NOT
+ * suppressed here. A def head can be, because extract_usages.c already treats a
+ * def's first argument as a binding. Nothing there treats a typespec subject as
+ * one, so declining it in this walk would not remove its phantom, it would
+ * RELABEL it: handle_usages reaches the bare identifier handle_calls just
+ * declined and mints a USAGE onto the same function, which under
+ * UNIQUE(source, target, type) is a separate row that no longer collides with
+ * the real call it used to hide behind, and which pass_importance then counts.
+ * A typespec phantom has to be removed before any extractor sees it, by
+ * skipping the whole subtree in the unified walk
+ * (is_elixir_typespec_attribute, extract_unified.c). */
 static bool elixir_call_is_definition_role(TSNode node, const char *source) {
-    static const char *const structural_heads[] = {"def", "defp", "defmacro", "defmodule", NULL};
-    static const char *const function_heads[] = {"def", "defp", "defmacro", NULL};
+    /* The same four function-defining macros cbm_elixir_def_head() mints a
+     * Function for. A head this list omits is not recognised as a declaration,
+     * so it is emitted as an invocation of the very name being defined -- and
+     * because the def side DOES mint a node for it, that phantom lands inside
+     * the function's own span and cbm.c reads it as self-recursion. */
+    static const char *const structural_heads[] = {"def",       "defp",      "defmacro",
+                                                   "defmacrop", "defmodule", NULL};
+    static const char *const function_heads[] = {"def", "defp", "defmacro", "defmacrop", NULL};
     if (elixir_call_head_in(node, source, structural_heads)) {
         return true;
     }
@@ -725,7 +789,7 @@ static bool elixir_call_is_definition_role(TSNode node, const char *source) {
         TSNode signature = ts_node_named_child_count(arguments) > 0
                                ? ts_node_named_child(arguments, 0)
                                : arguments;
-        return ts_node_eq(signature, node);
+        return cbm_elixir_def_head_is(signature, node);
     }
     return false;
 }
@@ -747,7 +811,13 @@ static bool call_node_is_definition_container(CBMLanguage lang, TSNode node, con
     if (lang == CBM_LANG_AGDA && strcmp(kind, "expr") == 0) {
         return agda_expr_is_definition_role(node);
     }
-    return lang == CBM_LANG_ELIXIR && strcmp(kind, "call") == 0 &&
+    /* A guarded head is a `when` binary_operator, not a `call`, and Elixir's
+     * call node types include binary_operator -- so the head reaches this walk
+     * and must be able to answer that it is a definition. Only a `when` operator
+     * is admitted: an operator definition's own head (`def a + b`) stays an
+     * ordinary node here, as it was before guards were handled at all. */
+    return lang == CBM_LANG_ELIXIR &&
+           (strcmp(kind, "call") == 0 || cbm_elixir_is_when_guard(node)) &&
            elixir_call_is_definition_role(node, source);
 }
 

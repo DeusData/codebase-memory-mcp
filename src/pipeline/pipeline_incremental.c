@@ -25,6 +25,7 @@ enum { INCR_RING_BUF = 4, INCR_RING_MASK = 3, INCR_TS_BUF = 24 };
 #include "discover/discover.h"
 #include "foundation/log.h"
 #include "foundation/hash_table.h"
+#include "foundation/mem_core.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/compat_thread.h"
@@ -988,19 +989,153 @@ static void incr_capture_inbound_edge(const cbm_gbuf_edge_t *edge, void *userdat
     cap->count++;
 }
 
+/* Strip a QN's '#<digits>' arity fence into `out`. Local to this TU for the
+ * same reason registry.c keeps its own copy: the pipeline does not pull in the
+ * extraction header. */
+static void incr_strip_arity(char *out, size_t cap, const char *qn) {
+    size_t len = qn ? strlen(qn) : 0;
+    const char *hash = qn ? strrchr(qn, '#') : NULL;
+    if (hash && hash[SKIP_ONE]) {
+        bool digits = true;
+        for (const char *p = hash + SKIP_ONE; *p; p++) {
+            if (*p < '0' || *p > '9') {
+                digits = false;
+                break;
+            }
+        }
+        if (digits) {
+            len = (size_t)(hash - qn);
+        }
+    }
+    if (len > cap - SKIP_ONE) {
+        len = cap - SKIP_ONE;
+    }
+    if (len > 0) {
+        memcpy(out, qn, len);
+    }
+    out[len] = '\0';
+}
+
+/* Arity-stripped QN -> the fenced node(s) that strip to it. `count` is kept,
+ * not just the node, so several arities of one name still decline to guess.
+ *
+ * This is an index because the lookup it serves is a per-edge one: restoring N
+ * captured edges against a graph of M nodes scanned all M for every fenced miss,
+ * so the pass cost the product of the two largest quantities in an incremental
+ * reindex. One walk builds the table; each miss after it is a hash lookup. The
+ * walk is deferred to the first fenced miss, so a language with no arity fences
+ * -- every language but Elixir today -- builds nothing. */
+typedef struct {
+    char *key; /* heap copy; the table borrows keys, it does not own them */
+    const cbm_gbuf_node_t *node;
+    int count;
+} incr_arity_slot_t;
+
+typedef struct {
+    CBMHashTable *by_stripped;
+    bool built;
+    bool ok; /* an allocation failed mid-build: the index is partial, so it is
+              * not consulted at all -- a partial index would answer "sole
+              * match" for a name whose rival arity never got inserted. */
+} incr_arity_index_t;
+
+static void incr_arity_index_visit(const cbm_gbuf_node_t *node, void *userdata) {
+    incr_arity_index_t *idx = (incr_arity_index_t *)userdata;
+    if (!idx->ok || !node->qualified_name || !strchr(node->qualified_name, '#')) {
+        return;
+    }
+    char stripped[CBM_SZ_512];
+    incr_strip_arity(stripped, sizeof(stripped), node->qualified_name);
+    incr_arity_slot_t *slot = cbm_ht_get(idx->by_stripped, stripped);
+    if (slot) {
+        slot->count++;
+        return;
+    }
+    slot = cbm_calloc(CBM_MEM_CLASS_HASH_TABLE, sizeof(*slot));
+    char *key = cbm_mem_strdup(CBM_MEM_CLASS_HASH_TABLE, stripped);
+    if (!slot || !key) {
+        cbm_free(CBM_MEM_CLASS_HASH_TABLE, slot);
+        cbm_free(CBM_MEM_CLASS_HASH_TABLE, key);
+        idx->ok = false;
+        cbm_log_warn("incremental.arity_index_oom", "qn", node->qualified_name);
+        return;
+    }
+    slot->key = key;
+    slot->node = node;
+    slot->count = CBM_COUNT_ONE;
+    cbm_ht_set(idx->by_stripped, key, slot);
+}
+
+static void incr_arity_index_free_visitor(const char *key, void *value, void *userdata) {
+    (void)key;
+    (void)userdata;
+    incr_arity_slot_t *slot = (incr_arity_slot_t *)value;
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, slot->key);
+    cbm_free(CBM_MEM_CLASS_HASH_TABLE, slot);
+}
+
+static void incr_arity_index_build(incr_arity_index_t *idx, const cbm_gbuf_t *gbuf) {
+    idx->built = true;
+    idx->by_stripped = cbm_ht_create((uint32_t)cbm_gbuf_node_count(gbuf));
+    idx->ok = idx->by_stripped != NULL;
+    if (!idx->ok) {
+        return;
+    }
+    cbm_gbuf_foreach_node(gbuf, incr_arity_index_visit, idx);
+}
+
+static void incr_arity_index_free(incr_arity_index_t *idx) {
+    if (!idx->by_stripped) {
+        return;
+    }
+    cbm_ht_foreach(idx->by_stripped, incr_arity_index_free_visitor, NULL);
+    cbm_ht_free(idx->by_stripped);
+    idx->by_stripped = NULL;
+}
+
+/* The sole node whose QN differs from `fenced_qn` only by its arity fence, or
+ * NULL when there is none or more than one. */
+static const cbm_gbuf_node_t *incr_arity_sole_match(incr_arity_index_t *idx, const cbm_gbuf_t *gbuf,
+                                                    const char *fenced_qn) {
+    if (!idx->built) {
+        incr_arity_index_build(idx, gbuf);
+    }
+    if (!idx->ok) {
+        return NULL;
+    }
+    char want[CBM_SZ_512];
+    incr_strip_arity(want, sizeof(want), fenced_qn);
+    const incr_arity_slot_t *slot = cbm_ht_get(idx->by_stripped, want);
+    return (slot && slot->count == CBM_COUNT_ONE) ? slot->node : NULL;
+}
+
 /* Re-link snapshotted inbound edges to the freshly re-created target nodes.
- * Returns the number of edges re-linked. */
+ * Returns the number of edges re-linked.
+ *
+ * Exact QN is the primary key, as it always was. The secondary key exists
+ * because arity is now part of identity for some languages: adding or removing
+ * a parameter RENAMES the node, so a body-and-signature edit would otherwise
+ * drop every inbound cross-file edge into that function until each caller's
+ * file happened to be re-parsed -- a full-vs-incremental divergence created by
+ * the identity change itself. A unique node that differs only in its fence is
+ * the same function, so the edge follows it. Ambiguity (several arities) keeps
+ * the old behaviour and drops the edge rather than guessing. */
 static int incr_restore_inbound_edges(cbm_gbuf_t *gbuf, cbm_edge_capture_t *cap) {
     int restored = 0;
+    incr_arity_index_t idx = {NULL, false, false};
     for (int i = 0; i < cap->count; i++) {
         cbm_saved_edge_t *s = &cap->items[i];
         const cbm_gbuf_node_t *src = cbm_gbuf_find_by_qn(gbuf, s->source_qn);
         const cbm_gbuf_node_t *tgt = cbm_gbuf_find_by_qn(gbuf, s->target_qn);
+        if (src && !tgt && strchr(s->target_qn, '#')) {
+            tgt = incr_arity_sole_match(&idx, gbuf, s->target_qn);
+        }
         if (src && tgt) {
             cbm_gbuf_insert_edge(gbuf, src->id, tgt->id, s->type, s->props);
             restored++;
         }
     }
+    incr_arity_index_free(&idx);
     return restored;
 }
 

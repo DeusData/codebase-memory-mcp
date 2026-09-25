@@ -343,7 +343,20 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
         cbm_gbuf_insert_edge(ctx->gbuf, file_node->id, node_id, "DEFINES", "{}");
     }
     free(file_qn);
-    if (def->parent_class && def->label && strcmp(def->label, "Method") == 0) {
+    /* Containment: a definition that names its container earns a
+     * Class -> member edge. The gate was label == "Method" alone, which is
+     * why a language whose members are labelled Function (Elixir's defs) had
+     * NO containment edge at all -- module membership existed only as a QN
+     * prefix. Relabelling those to Method would put a falsehood in the label
+     * column to satisfy an edge condition; label is read by the FTS rank
+     * boost, cbm_label_is_registry_symbol, cbm_label_is_type_like and the
+     * search label filter. Widening the gate is the smaller blast radius:
+     * every other site in extract_defs.c that sets parent_class on a callable
+     * already labels it Method, so this adds edges for Function members only.
+     * (Elixir's container is labelled Class, which is wrong -- a module is not
+     * a class -- and is out of scope here.) */
+    if (def->parent_class && def->label &&
+        (strcmp(def->label, "Method") == 0 || strcmp(def->label, "Function") == 0)) {
         const cbm_gbuf_node_t *parent = cbm_gbuf_find_by_qn(ctx->gbuf, def->parent_class);
         if (parent && node_id > 0) {
             cbm_gbuf_insert_edge(ctx->gbuf, parent->id, node_id, "DEFINES_METHOD", "{}");

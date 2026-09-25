@@ -68,6 +68,12 @@ enum {
     CBM_INIT_DONE = 1,  /* initialization flag */
 };
 
+/* ── Arity fence ─────────────────────────────────────────────── */
+/* A qualified name may carry an arity fence ("Mod.fetch#3"). CBM_ARITY_NONE is
+ * the sentinel for a QN that carries none and for a call site that offers no
+ * usable argument count; a real arity is always >= 0. */
+enum { CBM_ARITY_NONE = -1 };
+
 /* ── Default pagination limits ───────────────────────────────── */
 /* Default page size for search_graph and the underlying store-layer search.
  * Responses land in an LLM agent's context window, so the default favors a
@@ -93,6 +99,16 @@ enum {
 
 /* Common offset constants (used across many files). */
 enum { SKIP_ONE = 1, PAIR_LEN = 2 };
+
+/* Indexing from a count, not offsetting from a pointer. SKIP_ONE above answers
+ * "how far do I advance past this element" (p + SKIP_ONE, tail[-SKIP_ONE]);
+ * these answer "which index is the last one" and "how many are there". All
+ * three are 1, so nothing misbehaves when they are swapped -- which is exactly
+ * why the name has to carry the intent. readability-magic-numbers forbids the
+ * bare literal, so the constant chosen is the only record of the question
+ * being asked: `items[n - CBM_LAST_OFFSET]` reads "the last element of n",
+ * `n == CBM_COUNT_ONE` reads "exactly one candidate". */
+enum { CBM_LAST_OFFSET = 1, CBM_COUNT_ONE = 1 };
 
 /* ── Label allowlists for SQL ────────────────────────────────────
  * SQL mirror of cbm_label_is_type_like() (internal/cbm/helpers.c). That

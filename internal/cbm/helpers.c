@@ -1140,6 +1140,93 @@ const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, c
     return scope ? cbm_arena_sprintf(a, "%s.%s", scope, name) : name;
 }
 
+/* ── Elixir def-head guards ─────────────────────────────────── */
+
+/* The guard sits on the head, not beside it: `def name(args) when guard` parses
+ * as a single `when` binary_operator whose left operand is `name(args)`. The
+ * operator field is an exact anonymous token, so the check is the token type
+ * rather than the node kind — `def a + b` is a binary_operator head too, and
+ * unwrapping it would name the function after its left parameter. */
+bool cbm_elixir_is_when_guard(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "binary_operator") != 0) {
+        return false;
+    }
+    TSNode op = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    return !ts_node_is_null(op) && strcmp(ts_node_type(op), "when") == 0;
+}
+
+/* One `when` level off a def's first argument, or the node unchanged.
+ *
+ * There is deliberately no named-child fallback for a missing `left`. An infix
+ * operator cannot reduce without a left operand, so tree-sitter-elixir never
+ * builds a `when` binary_operator that lacks one: measured over every guarded
+ * shape in the suite plus a corpus of truncated heads (`def when true`,
+ * `def f(x) when`, `def f(x) when when is_x(x)`, `def when() when when`),
+ * `left` was present on all 66 unwraps, ERROR-recovered parses included, and
+ * every one had the left operand as named child 0. Where the left operand was
+ * genuinely absent the grammar produced no `when` operator at all -- it read
+ * `when` as the head identifier -- so the unwrap is never entered. A
+ * named-child fallback would therefore be dead on a well-formed tree and, on
+ * the hypothetical malformed one, would hand back named child 0 without
+ * knowing it is the left operand rather than the guard expression: naming the
+ * function after its own guard. Returning the node unchanged degrades to the
+ * pre-guard behaviour instead, which is the safe direction. */
+static TSNode elixir_unwrap_one_guard(TSNode first_arg) {
+    if (!cbm_elixir_is_when_guard(first_arg)) {
+        return first_arg;
+    }
+    TSNode lhs = ts_node_child_by_field_name(first_arg, TS_FIELD("left"));
+    return ts_node_is_null(lhs) ? first_arg : lhs;
+}
+
+/* The head under every guard a def's first argument carries, or first_arg
+ * unchanged when it carries none. Elixir admits more than one guard on a
+ * clause -- `def f(x) when is_atom(x) when is_binary(x)` -- and
+ * tree-sitter-elixir nests those RIGHT-associatively, measured on that exact
+ * source: `when(f(x), when(is_atom(x), is_binary(x)))`. The declared head is
+ * therefore the outer operator's left operand and one peel reaches it. The
+ * peel still runs to a fixed point: the extra iteration is one token compare,
+ * and it is what makes the helper's contract "the head under EVERY guard"
+ * rather than "the head under the first one", which is the property the three
+ * walks rely on.
+ *
+ * Left wrapped, the defs walk drops the clause, the unified walk opens no
+ * function scope (so every call in a guarded body sources to the FILE node),
+ * the calls walk stops recognising the head and emits it as an invocation of
+ * the very function being defined, and the usages walk swallows every
+ * identifier in the guard as part of the binding. Four walks read this same
+ * argument, which is why the unwrap lives here rather than in any one of
+ * them. */
+TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg) {
+    for (;;) {
+        TSNode next = elixir_unwrap_one_guard(first_arg);
+        if (ts_node_eq(next, first_arg)) {
+            return first_arg;
+        }
+        first_arg = next;
+    }
+}
+
+/* True when `node` is the head a def declares, or any of the `when` guard
+ * operators wrapping it. The calls walk needs the whole chain, not just its
+ * ends: each member reaches that walk by its own route -- `def f(x) when g`
+ * arrives as the inner `f(x)` call, `def f when g` has no inner call at all and
+ * the operator itself falls through to extract_callee_name's first-identifier
+ * last resort -- and a member it fails to recognise as a declaration is emitted
+ * as an invocation of the function being defined. */
+bool cbm_elixir_def_head_is(TSNode signature, TSNode node) {
+    for (;;) {
+        if (ts_node_eq(signature, node)) {
+            return true;
+        }
+        TSNode next = elixir_unwrap_one_guard(signature);
+        if (ts_node_eq(next, signature)) {
+            return false;
+        }
+        signature = next;
+    }
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)
@@ -1184,9 +1271,56 @@ static const char *func_node_name(CBMArena *a, TSNode func_node, const char *sou
     return NULL;
 }
 
+static const char *elixir_def_head_raw(CBMArena *a, TSNode node, const char *source,
+                                       int *out_arity);
+static const char *elixir_module_head_raw(CBMArena *a, TSNode node, const char *source);
+
+/* Elixir has no class_node_types and every construct is a `call`, so the
+ * generic chain walk below cannot find the enclosing defmodule and
+ * cbm_find_enclosing_func would stop at the nearest `call` of any kind. Walk
+ * the ancestors here: the nearest def head names the function, and every
+ * defmodule above it contributes a container segment. Must agree byte for byte
+ * with extract_elixir_func_def()'s QN or the TYPE_REF/dbt edges it sources
+ * land on the file's Module node instead. */
+static const char *elixir_enclosing_func_qn(CBMArena *a, TSNode node, const char *source,
+                                            const char *project, const char *rel_path,
+                                            const char *module_qn) {
+    const char *name = NULL;
+    int arity = 0;
+    const char *container = NULL;
+    for (TSNode cur = node; !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        if (strcmp(ts_node_type(cur), "call") != 0) {
+            continue;
+        }
+        if (!name) {
+            name = elixir_def_head_raw(a, cur, source, &arity);
+            if (name) {
+                continue;
+            }
+        }
+        const char *mod = elixir_module_head_raw(a, cur, source);
+        if (mod) {
+            container = container ? cbm_arena_sprintf(a, "%s.%s", mod, container) : mod;
+        }
+    }
+    if (!name) {
+        return module_qn;
+    }
+    const char *container_qn = container ? cbm_fqn_compute(a, project, rel_path, container) : NULL;
+    char *base = container_qn ? cbm_arena_sprintf(a, "%s.%s", container_qn, name)
+                              : cbm_fqn_compute(a, project, rel_path, name);
+    if (!base) {
+        return module_qn;
+    }
+    return cbm_fqn_with_arity(a, base, arity);
+}
+
 const char *cbm_enclosing_func_qn(CBMArena *a, TSNode node, CBMLanguage lang, const char *source,
                                   const char *project, const char *rel_path,
                                   const char *module_qn) {
+    if (lang == CBM_LANG_ELIXIR) {
+        return elixir_enclosing_func_qn(a, node, source, project, rel_path, module_qn);
+    }
     TSNode func_node = cbm_find_enclosing_func(node, lang);
     if (ts_node_is_null(func_node)) {
         return module_qn;
@@ -1634,6 +1768,202 @@ char *cbm_fqn_folder(CBMArena *a, const char *project, const char *rel_dir) {
     }
     *out = '\0';
     return buf;
+}
+
+/* ── QN discriminators ──────────────────────────────────────────── */
+
+char *cbm_fqn_with_arity(CBMArena *a, const char *qn, int arity) {
+    if (!qn || arity < 0) {
+        return (char *)qn;
+    }
+    return cbm_arena_sprintf(a, "%s#%d", qn, arity);
+}
+
+/* The fence, if any, is the LAST '#' followed by one or more digits and
+ * nothing else. Returns a pointer to that '#', or NULL. */
+static const char *qn_arity_fence(const char *qn) {
+    if (!qn) {
+        return NULL;
+    }
+    const char *hash = strrchr(qn, '#');
+    if (!hash || !hash[SKIP_ONE]) {
+        return NULL;
+    }
+    for (const char *p = hash + SKIP_ONE; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            return NULL;
+        }
+    }
+    return hash;
+}
+
+size_t cbm_qn_strip_arity(char *out, size_t cap, const char *qn) {
+    if (!out || cap == 0) {
+        return 0;
+    }
+    if (!qn) {
+        out[0] = '\0';
+        return 0;
+    }
+    const char *hash = qn_arity_fence(qn);
+    size_t len = hash ? (size_t)(hash - qn) : strlen(qn);
+    if (len > cap - SKIP_ONE) {
+        len = cap - SKIP_ONE;
+    }
+    memcpy(out, qn, len);
+    out[len] = '\0';
+    return len;
+}
+
+bool cbm_qn_container_buf(char *out, size_t cap, const char *qn) {
+    if (!out || cap == 0) {
+        return false;
+    }
+    out[0] = '\0';
+    if (!qn) {
+        return false;
+    }
+    const char *hash = qn_arity_fence(qn);
+    const char *end_ptr = hash ? hash : qn + strlen(qn);
+    const char *dot = NULL;
+    for (const char *p = qn; p < end_ptr; p++) {
+        if (*p == '.') {
+            dot = p;
+        }
+    }
+    if (!dot || dot == qn) {
+        return false;
+    }
+    size_t len = (size_t)(dot - qn);
+    if (len > cap - SKIP_ONE) {
+        return false;
+    }
+    memcpy(out, qn, len);
+    out[len] = '\0';
+    return true;
+}
+
+/* ── Elixir def-head resolution ─────────────────────────────────── */
+
+/* Position of a call's `arguments` node when the grammar names no field: the
+ * head is child 0, its argument list child 1. */
+enum { ELIXIR_ARGS_CHILD_IDX = 1 };
+
+/* The `arguments` node of an Elixir `call`, by field or by position. */
+static TSNode elixir_args_of(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) && ts_node_child_count(node) > ELIXIR_ARGS_CHILD_IDX) {
+        args = ts_node_child(node, ELIXIR_ARGS_CHILD_IDX);
+    }
+    return args;
+}
+
+/* The text of a call's head (its first child), or NULL. */
+static char *elixir_call_head_text(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_child_count(node) == 0) {
+        return NULL;
+    }
+    TSNode head = ts_node_child(node, 0);
+    if (ts_node_is_null(head)) {
+        return NULL;
+    }
+    return cbm_node_text(a, head, source);
+}
+
+static const char *elixir_def_head_raw(CBMArena *a, TSNode node, const char *source,
+                                       int *out_arity) {
+    if (out_arity) {
+        *out_arity = 0;
+    }
+    char *macro = elixir_call_head_text(a, node, source);
+    if (!macro || (strcmp(macro, "def") != 0 && strcmp(macro, "defp") != 0 &&
+                   strcmp(macro, "defmacro") != 0 && strcmp(macro, "defmacrop") != 0)) {
+        return NULL;
+    }
+    TSNode args = elixir_args_of(node);
+    if (ts_node_is_null(args) || ts_node_child_count(args) == 0) {
+        return NULL;
+    }
+    TSNode first_arg = ts_node_child(args, 0);
+    if (ts_node_is_null(first_arg)) {
+        return NULL;
+    }
+    /* `def name(args) when guard` parses the whole head as a `when`
+     * binary_operator, so the name lives on its left operand. Without this
+     * unwrap every guarded clause is dropped, and a function whose clauses ALL
+     * carry guards never appears in the graph -- silently, since a missing
+     * definition is not an error. The unwrap is shared with the calls and
+     * usages walks, which read this same argument to tell a head from an
+     * invocation and to bound the head's bindings; a private copy in one of
+     * them makes the rest disagree about what a guarded clause is. It peels
+     * only `when`, so an operator definition (`def a + b`) is left alone rather
+     * than named after its left parameter. */
+    first_arg = cbm_elixir_def_head_unwrap_guard(first_arg);
+
+    const char *fk = ts_node_type(first_arg);
+    char *name = NULL;
+    if (strcmp(fk, "call") == 0 && ts_node_child_count(first_arg) > 0) {
+        name = cbm_node_text(a, ts_node_child(first_arg, 0), source);
+        if (out_arity) {
+            TSNode head_args = elixir_args_of(first_arg);
+            *out_arity = ts_node_is_null(head_args) ? 0 : (int)ts_node_named_child_count(head_args);
+        }
+    } else if (strcmp(fk, "identifier") == 0) {
+        /* `def foo do` / `def foo, do: ...` -- a bare identifier head is arity 0. */
+        name = cbm_node_text(a, first_arg, source);
+    }
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return name;
+}
+
+const char *cbm_elixir_def_head(CBMExtractCtx *ctx, TSNode node, int *out_arity) {
+    return elixir_def_head_raw(ctx->arena, node, ctx->source, out_arity);
+}
+
+static const char *elixir_module_head_raw(CBMArena *a, TSNode node, const char *source) {
+    char *macro = elixir_call_head_text(a, node, source);
+    if (!macro || strcmp(macro, "defmodule") != 0) {
+        return NULL;
+    }
+    TSNode args = elixir_args_of(node);
+    if (ts_node_is_null(args)) {
+        return NULL;
+    }
+    TSNode name_node = ts_node_child(args, 0);
+    if (ts_node_is_null(name_node)) {
+        return NULL;
+    }
+    char *name = cbm_node_text(a, name_node, source);
+    if (!name || !name[0]) {
+        return NULL;
+    }
+    return name;
+}
+
+const char *cbm_elixir_module_head(CBMExtractCtx *ctx, TSNode node) {
+    return elixir_module_head_raw(ctx->arena, node, ctx->source);
+}
+
+char *cbm_elixir_def_qn(CBMExtractCtx *ctx, const char *container_qn, const char *name, int arity) {
+    CBMArena *a = ctx->arena;
+    char *base = container_qn ? cbm_arena_sprintf(a, "%s.%s", container_qn, name)
+                              : cbm_fqn_compute(a, ctx->project, ctx->rel_path, name);
+    if (!base || arity < 0 || !cbm_lang_overloads_by_arity(ctx->language)) {
+        return base;
+    }
+    return cbm_fqn_with_arity(a, base, arity);
+}
+
+/* ── Language traits ────────────────────────────────────────────── */
+
+bool cbm_lang_container_is_source_named(CBMLanguage lang) {
+    return lang == CBM_LANG_ELIXIR;
+}
+
+bool cbm_lang_overloads_by_arity(CBMLanguage lang) {
+    return lang == CBM_LANG_ELIXIR;
 }
 
 /* ── String literal classifier ──────────────────────────────────── */

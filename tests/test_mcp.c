@@ -16312,6 +16312,178 @@ TEST(snippet_exact_qn) {
     PASS();
 }
 
+/* Reproduce-first: get_code_snippet returns exactly ONE body, so a bare name
+ * that names several arities of one function has no single honest answer -- it
+ * must be reported ambiguous, with one suggestion per arity.
+ *
+ * Before the fold_arity gate reached the real-definition tally, the arity fence
+ * was stripped there UNCONDITIONALLY, so every arity of one function folded into
+ * a single "real definition" and ambiguity could only still arrive through the
+ * top-score tie -- that is, only when two clauses happened to have the same body
+ * line count. On the real Elixir corpus that silently answered 145 of 223
+ * multi-arity bare names with whichever arity had the longest body.
+ *
+ * The three fixtures below differ ONLY in that incidental line count: `ne` has
+ * unequal spans (2 and 3), `eq` has equal spans (2 and 2), and `oneline` pairs a
+ * complete one-line Elixir clause (`def oneline(a), do: a`, span 0) with a
+ * multi-line one. RED before the fix for `ne` and for `oneline` (a plain snippet
+ * response, no status, no suggestions); `eq` was already ambiguous by accident
+ * and must stay so. Span is not identity.
+ *
+ * `oneline` is the second half of the same defect: a span-0 node is normally an
+ * ambient declaration stub that folds into its real implementation (#650), but a
+ * one-line `def` is a whole definition, and its arity fence proves the extractor
+ * saw the head. Without the fence exception in node_is_rival_def the answer is
+ * still decided by a line count -- just a different one. */
+TEST(snippet_bare_name_every_arity_is_ambiguous_whatever_the_spans) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "arity-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/arity");
+
+    /* ne/1 and ne/2: DIFFERENT body spans, so they cannot tie on score. */
+    cbm_node_t ne1 = {.project = proj,
+                      .label = "Function",
+                      .name = "ne",
+                      .qualified_name = "arity-proj.lib.tie.Fx.Tie.ne#1",
+                      .file_path = "lib/tie.ex",
+                      .start_line = 10,
+                      .end_line = 12};
+    cbm_node_t ne2 = {.project = proj,
+                      .label = "Function",
+                      .name = "ne",
+                      .qualified_name = "arity-proj.lib.tie.Fx.Tie.ne#2",
+                      .file_path = "lib/tie.ex",
+                      .start_line = 14,
+                      .end_line = 17};
+    /* eq/1 and eq/2: EQUAL body spans, the accidental tie that used to be the
+     * only way a multi-arity name reached the ambiguous answer. */
+    cbm_node_t eq1 = {.project = proj,
+                      .label = "Function",
+                      .name = "eq",
+                      .qualified_name = "arity-proj.lib.tie.Fx.Tie.eq#1",
+                      .file_path = "lib/tie.ex",
+                      .start_line = 2,
+                      .end_line = 4};
+    cbm_node_t eq2 = {.project = proj,
+                      .label = "Function",
+                      .name = "eq",
+                      .qualified_name = "arity-proj.lib.tie.Fx.Tie.eq#2",
+                      .file_path = "lib/tie.ex",
+                      .start_line = 6,
+                      .end_line = 8};
+    ASSERT_GT(cbm_store_upsert_node(st, &ne1), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &ne2), 0);
+    /* oneline/1 is a complete clause written on one line: span 0, which the
+     * body-less-stub rule would otherwise discount entirely. */
+    cbm_node_t one1 = {.project = proj,
+                       .label = "Function",
+                       .name = "oneline",
+                       .qualified_name = "arity-proj.lib.tie.Fx.Tie.oneline#1",
+                       .file_path = "lib/tie.ex",
+                       .start_line = 20,
+                       .end_line = 20};
+    cbm_node_t one2 = {.project = proj,
+                       .label = "Function",
+                       .name = "oneline",
+                       .qualified_name = "arity-proj.lib.tie.Fx.Tie.oneline#2",
+                       .file_path = "lib/tie.ex",
+                       .start_line = 22,
+                       .end_line = 26};
+    ASSERT_GT(cbm_store_upsert_node(st, &eq1), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &eq2), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &one1), 0);
+    ASSERT_GT(cbm_store_upsert_node(st, &one2), 0);
+
+    char *ne_resp = call_snippet(srv, "{\"qualified_name\":\"ne\",\"project\":\"arity-proj\"}");
+    ASSERT_NOT_NULL(ne_resp);
+    ASSERT_NOT_NULL(strstr(ne_resp, "\"status\":\"ambiguous\""));
+    ASSERT_NOT_NULL(strstr(ne_resp, "Fx.Tie.ne#1"));
+    ASSERT_NOT_NULL(strstr(ne_resp, "Fx.Tie.ne#2"));
+    /* No body was handed back in place of the ambiguity. */
+    ASSERT_NULL(strstr(ne_resp, "\"source\""));
+    free(ne_resp);
+
+    char *eq_resp = call_snippet(srv, "{\"qualified_name\":\"eq\",\"project\":\"arity-proj\"}");
+    ASSERT_NOT_NULL(eq_resp);
+    ASSERT_NOT_NULL(strstr(eq_resp, "\"status\":\"ambiguous\""));
+    ASSERT_NOT_NULL(strstr(eq_resp, "Fx.Tie.eq#1"));
+    ASSERT_NOT_NULL(strstr(eq_resp, "Fx.Tie.eq#2"));
+    ASSERT_NULL(strstr(eq_resp, "\"source\""));
+    free(eq_resp);
+
+    char *one_resp =
+        call_snippet(srv, "{\"qualified_name\":\"oneline\",\"project\":\"arity-proj\"}");
+    ASSERT_NOT_NULL(one_resp);
+    ASSERT_NOT_NULL(strstr(one_resp, "\"status\":\"ambiguous\""));
+    ASSERT_NOT_NULL(strstr(one_resp, "Fx.Tie.oneline#1"));
+    ASSERT_NOT_NULL(strstr(one_resp, "Fx.Tie.oneline#2"));
+    ASSERT_NULL(strstr(one_resp, "\"source\""));
+    free(one_resp);
+
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
+/* The other half of the same flag: trace_path asks "who calls ne", which wants
+ * the callers of EVERY arity, so there it folds and answers. Same fixture, same
+ * unequal spans, opposite verdict -- which is what makes the get_code_snippet
+ * answer above a deliberate difference rather than a tightening that leaked. */
+TEST(snippet_arity_fold_still_traces_every_arity_under_one_bare_name) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    cbm_store_t *st = cbm_mcp_server_store(srv);
+    const char *proj = "fold-proj";
+    cbm_mcp_server_set_project(srv, proj);
+    cbm_store_upsert_project(st, proj, "/tmp/fold");
+
+    cbm_node_t ne1 = {.project = proj,
+                      .label = "Function",
+                      .name = "ne",
+                      .qualified_name = "fold-proj.lib.tie.Fx.Tie.ne#1",
+                      .file_path = "lib/tie.ex",
+                      .start_line = 10,
+                      .end_line = 12};
+    cbm_node_t ne2 = {.project = proj,
+                      .label = "Function",
+                      .name = "ne",
+                      .qualified_name = "fold-proj.lib.tie.Fx.Tie.ne#2",
+                      .file_path = "lib/tie.ex",
+                      .start_line = 14,
+                      .end_line = 17};
+    cbm_node_t caller = {.project = proj,
+                         .label = "Function",
+                         .name = "invoke",
+                         .qualified_name = "fold-proj.lib.caller.Fx.Caller.invoke#1",
+                         .file_path = "lib/caller.ex",
+                         .start_line = 2,
+                         .end_line = 4};
+    int64_t id_ne1 = cbm_store_upsert_node(st, &ne1);
+    int64_t id_ne2 = cbm_store_upsert_node(st, &ne2);
+    int64_t id_caller = cbm_store_upsert_node(st, &caller);
+    ASSERT_GT(id_ne1, 0);
+    ASSERT_GT(id_ne2, 0);
+    ASSERT_GT(id_caller, 0);
+    cbm_edge_t e1 = {.project = proj, .source_id = id_caller, .target_id = id_ne1, .type = "CALLS"};
+    cbm_edge_t e2 = {.project = proj, .source_id = id_caller, .target_id = id_ne2, .type = "CALLS"};
+    cbm_store_insert_edge(st, &e1);
+    cbm_store_insert_edge(st, &e2);
+
+    char *resp = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":91,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"trace_call_path\",\"arguments\":{\"function_name\":\"ne\","
+             "\"project\":\"fold-proj\",\"direction\":\"inbound\"}}}");
+    ASSERT_NOT_NULL(resp);
+    char *inner = extract_text_content(resp);
+    ASSERT_NOT_NULL(inner);
+    ASSERT_NULL(strstr(inner, "ambiguous"));
+    ASSERT_NOT_NULL(strstr(inner, "invoke"));
+    free(inner);
+    free(resp);
+    cbm_mcp_server_free(srv);
+    PASS();
+}
+
 /* ── TestSnippet_QNSuffix ─────────────────────────────────────── */
 
 TEST(snippet_qn_suffix) {
@@ -20740,6 +20912,8 @@ SUITE(mcp) {
 
     /* Snippet resolution (port of snippet_test.go) */
     RUN_TEST(snippet_exact_qn);
+    RUN_TEST(snippet_bare_name_every_arity_is_ambiguous_whatever_the_spans);
+    RUN_TEST(snippet_arity_fold_still_traces_every_arity_under_one_bare_name);
     RUN_TEST(snippet_qn_suffix);
     RUN_TEST(snippet_unique_short_name);
     RUN_TEST(snippet_name_tier);

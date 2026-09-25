@@ -236,6 +236,30 @@ cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *calle
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
 
+/* Extra evidence a call site holds that a bare (callee, module) pair does not.
+ * Both fields are optional: `{.container_qn = NULL, .arity = CBM_ARITY_NONE}`,
+ * or a NULL pointer in place of the struct, reproduces cbm_registry_resolve
+ * exactly. A zeroed struct does not -- its arity is 0, which is a real arity
+ * (a nullary call), not the no-evidence sentinel. */
+typedef struct {
+    /* The CALLER's own container. For a language whose container is named in
+     * the source (an Elixir defmodule) the file QN is NOT the container, so
+     * the same-module strategy cannot find an intra-container call without it.
+     * NULL for every path-container language. */
+    const char *container_qn;
+    /* The number of arguments written at the call site, or CBM_ARITY_NONE when
+     * unknown or unreliable (splats, or more than CBM_MAX_CALL_ARGS). Used only
+     * to choose among candidates that differ by their QN's arity fence; never to
+     * reject a candidate that carries no fence. */
+    int arity;
+} cbm_resolve_ctx_t;
+
+/* Resolve with call-site evidence. `rx` may be NULL. */
+cbm_resolution_t cbm_registry_resolve_ctx(const cbm_registry_t *r, const char *callee_name,
+                                          const char *module_qn, const cbm_resolve_ctx_t *rx,
+                                          const char **import_map_keys,
+                                          const char **import_map_vals, int import_map_count);
+
 /* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
  * consumer allowed to bind Table/View targets. Uncached (the per-file resolve
  * cache stores the default variant's relation-vetoed answers). */
