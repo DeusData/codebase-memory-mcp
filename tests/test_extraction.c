@@ -4390,6 +4390,57 @@ TEST(extract_java_jaxrs_path_composition_issue1005) {
     PASS();
 }
 
+/* Issue #1428: NestJS routes are TypeScript decorators — the class-level
+ * @Controller('users') prefix composes with the method-level @Get(':id')
+ * verb + path. Nest paths carry no leading slash, and the decorator's call is
+ * a `call_expression` (not Python's `call`), so no Route was ever formed. */
+TEST(extract_ts_nestjs_controller_routes_issue1428) {
+    CBMFileResult *r =
+        extract("import { Controller, Get, Post, Patch, Delete, Param } from '@nestjs/common';\n"
+                "@Controller({ path: 'users', version: '1' })\n"
+                "export class UsersController {\n"
+                "  @Get() findAll() { return []; }\n"
+                "  @Get(':id') findOne(@Param('id') id: string) { return id; }\n"
+                "  @Post() create() { return 1; }\n"
+                "  @Patch(':id') update(@Param('id') id: string) { return id; }\n"
+                "  @Delete('/:id') remove(@Param('id') id: string) { return id; }\n"
+                "  helper() { return 0; }\n"
+                "}\n"
+                "@Controller('health')\n"
+                "export class HealthController {\n"
+                "  @Get() check() { return { status: 'ok' }; }\n"
+                "}\n"
+                "@Controller()\n"
+                "export class RootController {\n"
+                "  @Get('ping') ping() { return 'pong'; }\n"
+                "}\n",
+                CBM_LANG_TYPESCRIPT, "t", "src/users/users.controller.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    static const struct {
+        const char *name;
+        const char *method;
+        const char *path;
+    } want[] = {
+        {"findAll", "GET", "/users"},       {"findOne", "GET", "/users/:id"},
+        {"create", "POST", "/users"},       {"update", "PATCH", "/users/:id"},
+        {"remove", "DELETE", "/users/:id"}, {"check", "GET", "/health"},
+        {"ping", "GET", "/ping"},
+    };
+    for (size_t i = 0; i < sizeof(want) / sizeof(want[0]); i++) {
+        const CBMDefinition *d = find_def_by_name(r, want[i].name);
+        ASSERT_NOT_NULL(d);
+        ASSERT_NOT_NULL(d->route_path);
+        ASSERT_STR_EQ(d->route_path, want[i].path);
+        ASSERT_STR_EQ(d->route_method, want[i].method);
+    }
+    const CBMDefinition *helper = find_def_by_name(r, "helper");
+    ASSERT_NOT_NULL(helper);
+    ASSERT_NULL(helper->route_path);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Return the file's Module definition (extraction pushes it first), or NULL. */
 static const CBMDefinition *find_module_def(CBMFileResult *r) {
     for (int i = 0; i < r->defs.count; i++) {
@@ -8600,6 +8651,7 @@ SUITE(extraction) {
     RUN_TEST(arkts_lazy_import);
     RUN_TEST(arkts_ts_compat);
     RUN_TEST(extract_java_jaxrs_path_composition_issue1005);
+    RUN_TEST(extract_ts_nestjs_controller_routes_issue1428);
     RUN_TEST(extract_blazor_page_directive_routes_component);
     RUN_TEST(extract_blazor_component_without_page_has_no_route);
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
