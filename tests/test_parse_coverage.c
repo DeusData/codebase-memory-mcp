@@ -30,6 +30,9 @@
 
 #include "test_framework.h"
 #include "cbm.h"
+#include "sql_values.h"                 /* #1735 value-row scanner */
+#include "pipeline/pipeline_internal.h" /* CBM_EXTRACT_BUDGET */
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -983,6 +986,445 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+/* ── #1735: SQL data dumps ───────────────────────────────────────────────────
+ * A mysqldump file is a few CREATE TABLEs followed by megabytes of literal
+ * INSERT rows. Tree-sitter built a full tree for every row until the parse
+ * budget ran out, and the whole file — tables included — was skipped as
+ * "parse timeout". Literal-only rows after the first of each VALUES list are
+ * now kept out of the parse (sql_values.c). These tests pin that nothing the
+ * full parse extracted outside those rows is lost (and, for standard '' escapes
+ * the grammar reads correctly, that nothing changes at all), that a row which
+ * can reference something is still parsed, and that the parse no longer grows
+ * with the row count. */
+
+typedef struct {
+    char *s;
+    size_t len;
+    size_t cap;
+} cov_buf_t;
+
+static void cov_put(cov_buf_t *b, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    va_list ap2;
+    va_copy(ap2, ap);
+    int n = vsnprintf(NULL, 0, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        va_end(ap2);
+        return;
+    }
+    if (b->len + (size_t)n + 1 > b->cap) {
+        size_t cap = b->cap ? b->cap : 4096;
+        while (b->len + (size_t)n + 1 > cap) {
+            cap *= 2;
+        }
+        char *grown = realloc(b->s, cap);
+        if (!grown) {
+            va_end(ap2);
+            return;
+        }
+        b->s = grown;
+        b->cap = cap;
+    }
+    vsnprintf(b->s + b->len, (size_t)n + 1, fmt, ap2);
+    va_end(ap2);
+    b->len += (size_t)n;
+}
+
+static const char *const DUMP_WORDS[] = {"Kabul", "Herat",     "Amsterdam",    "O'Brien",
+                                         "Haag",  "Rotterdam", "Zuid-Holland", "Utrecht"};
+enum { DUMP_WORD_COUNT = sizeof(DUMP_WORDS) / sizeof(DUMP_WORDS[0]) };
+static const char *const DUMP_ODD[] = {"NULL", "-12.5", "0x1F",  "_binary 'ab'", "DEFAULT",
+                                       "TRUE", "1e-3",  "X'0A'", "''",           "'a''b'"};
+enum { DUMP_ODD_COUNT = sizeof(DUMP_ODD) / sizeof(DUMP_ODD[0]) };
+
+/* Deterministic mysqldump-shaped SQL: two tables and a view, then `stmts`
+ * extended INSERTs of `rows` tuples. `mysql_esc` writes a quote inside a string
+ * as \' (MySQL) instead of '' (standard). `mixed` puts one tuple holding a
+ * subquery and one holding a function call in the middle of every INSERT. The
+ * first two INSERTs separate their tuples with a newline and with a comment, the
+ * way pretty-printed dumps do. */
+static char *sql_dump(int stmts, int rows, bool mysql_esc, bool mixed) {
+    cov_buf_t b = {NULL, 0, 0};
+    cov_put(&b, "-- MySQL dump 10.13\n"
+                "/*!40101 SET NAMES utf8mb4 */;\n"
+                "CREATE TABLE `city` (\n"
+                "  `ID` int NOT NULL,\n"
+                "  `Name` char(35) NOT NULL DEFAULT '',\n"
+                "  `CountryCode` char(3),\n"
+                "  `Note` text,\n"
+                "  `Population` int\n"
+                ");\n"
+                "CREATE TABLE country (Code char(3), Name char(52));\n"
+                "CREATE VIEW big_cities AS SELECT Name FROM city WHERE Population > 1000000;\n"
+                "LOCK TABLES `city` WRITE;\n");
+    uint32_t seed = 1735;
+    int id = 1;
+    for (int s = 0; s < stmts; s++) {
+        cov_put(&b, "INSERT INTO `city` VALUES ");
+        const char *sep = s == 0 ? ",\n" : (s == 1 ? ", /* split */ " : ",");
+        for (int r = 0; r < rows; r++) {
+            if (r > 0) {
+                cov_put(&b, "%s", sep);
+            }
+            if (mixed && r == rows / 2) {
+                cov_put(&b, "((SELECT MAX(Code) FROM country),'x','AAA',NULL,1)");
+                continue;
+            }
+            if (mixed && r == rows / 2 + 1) {
+                cov_put(&b, "(%d,UPPER('y'),'BBB',NULL,2)", id++);
+                continue;
+            }
+            seed = seed * 1103515245u + 12345u;
+            const char *w = DUMP_WORDS[(seed >> 8) % DUMP_WORD_COUNT];
+            cov_put(&b, "(%d,'", id++);
+            for (const char *p = w; *p; p++) {
+                cov_put(&b, *p == '\'' ? (mysql_esc ? "\\'" : "''") : "%c", *p);
+            }
+            cov_put(&b, "','%c%c%c',%s,%u)", 'A' + (int)(seed % 26), 'A' + (int)((seed >> 5) % 26),
+                    'A' + (int)((seed >> 10) % 26), DUMP_ODD[(seed >> 12) % DUMP_ODD_COUNT],
+                    (seed >> 3) % 9000000u);
+        }
+        cov_put(&b, ";\n");
+    }
+    cov_put(&b, "UNLOCK TABLES;\n");
+    return b.s;
+}
+
+static void fp_s(cov_buf_t *b, const char *s) {
+    cov_put(b, "%s|", s ? s : "~");
+}
+
+/* Everything the graph is built from except calls and usages, in order (those
+ * two are compared site by site, sites_agree). */
+static char *result_fingerprint(const CBMFileResult *r) {
+    cov_buf_t b = {NULL, 0, 0};
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        fp_s(&b, d->label);
+        fp_s(&b, d->name);
+        fp_s(&b, d->qualified_name);
+        fp_s(&b, d->signature);
+        fp_s(&b, d->return_type);
+        fp_s(&b, d->structural_profile);
+        fp_s(&b, d->body_tokens);
+        cov_put(&b, "%u-%u c%d l%d\n", d->start_line, d->end_line, d->complexity, d->lines);
+    }
+    for (int i = 0; i < r->imports.count; i++) {
+        fp_s(&b, r->imports.items[i].local_name);
+        fp_s(&b, r->imports.items[i].module_path);
+        cov_put(&b, "imp\n");
+    }
+    for (int i = 0; i < r->rw.count; i++) {
+        fp_s(&b, r->rw.items[i].var_name);
+        cov_put(&b, "rw%d\n", (int)r->rw.items[i].is_write);
+    }
+    for (int i = 0; i < r->type_refs.count; i++) {
+        fp_s(&b, r->type_refs.items[i].type_name);
+        cov_put(&b, "tref\n");
+    }
+    for (int i = 0; i < r->env_accesses.count; i++) {
+        fp_s(&b, r->env_accesses.items[i].env_key);
+        cov_put(&b, "env\n");
+    }
+    for (int i = 0; i < r->throws.count; i++) {
+        fp_s(&b, r->throws.items[i].exception_name);
+        cov_put(&b, "throw\n");
+    }
+    for (int i = 0; i < r->string_refs.count; i++) {
+        fp_s(&b, r->string_refs.items[i].value);
+        cov_put(&b, "sref%d\n", (int)r->string_refs.items[i].kind);
+    }
+    cov_put(&b, "ta%d it%d rc%d ib%d ch%d\n", r->type_assigns.count, r->impl_traits.count,
+            r->resolved_calls.count, r->infra_bindings.count, r->channels.count);
+    return b.s;
+}
+
+static int has_usage_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->usages.count; i++) {
+        if (r->usages.items[i].ref_name && strstr(r->usages.items[i].ref_name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int has_call_named(const CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strstr(r->calls.items[i].callee_name, name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct {
+    const char *name;
+    uint32_t start;
+    uint32_t end;
+} cov_site_t;
+
+static int collect_sites(const CBMFileResult *r, bool calls, cov_site_t **out) {
+    int n = calls ? r->calls.count : r->usages.count;
+    *out = calloc((size_t)(n > 0 ? n : 1), sizeof(cov_site_t));
+    for (int i = 0; i < n && *out; i++) {
+        (*out)[i] =
+            calls ? (cov_site_t){r->calls.items[i].callee_name, r->calls.items[i].site_start_byte,
+                                 r->calls.items[i].site_end_byte}
+                  : (cov_site_t){r->usages.items[i].ref_name, r->usages.items[i].site_start_byte,
+                                 r->usages.items[i].site_end_byte};
+    }
+    return *out ? n : 0;
+}
+
+static bool site_in(cov_site_t s, const cov_site_t *arr, int n) {
+    for (int i = 0; i < n; i++) {
+        if (arr[i].start == s.start && arr[i].end == s.end && s.name && arr[i].name &&
+            strcmp(arr[i].name, s.name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Calls (calls=true) or usages, cut parse against full parse:
+ *  - nothing the full parse found outside the dropped rows may be missing;
+ *  - with `exact`, the cut parse may find nothing the full parse did not.
+ * The full parse does find things INSIDE dropped rows: the SQL grammar reads
+ * DEFAULT and a _binary introducer as identifiers, and a MySQL \' escape it
+ * does not know turns the rest of a string into one. None of those names
+ * anything. Without `exact` (MySQL escapes) the cut parse may find more: the
+ * full parse's error recovery around a misread escape swallows neighbouring
+ * rows, a subquery row among them, and the cut parse no longer misreads them. */
+static bool sites_agree(const char *src, const CBMFileResult *cut, const CBMFileResult *full,
+                        bool calls, bool exact) {
+    cov_site_t *cs = NULL;
+    cov_site_t *fs = NULL;
+    int cn = collect_sites(cut, calls, &cs);
+    int fn = collect_sites(full, calls, &fs);
+    CBMSqlKeptRanges k = {NULL, 0};
+    (void)cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k);
+    bool ok = cs && fs;
+    for (int i = 0; ok && exact && i < cn; i++) {
+        if (!site_in(cs[i], fs, fn)) {
+            fprintf(stderr, "  %s only in the cut parse\n", cs[i].name);
+            ok = false;
+        }
+    }
+    for (int i = 0; ok && i < fn; i++) {
+        if (site_in(fs[i], cs, cn)) {
+            continue;
+        }
+        for (uint32_t j = 0; j < k.count; j++) {
+            if (fs[i].start < k.items[j].end_byte && fs[i].end > k.items[j].start_byte) {
+                fprintf(stderr, "  %s lost outside the dropped rows\n", fs[i].name);
+                ok = false;
+            }
+        }
+    }
+    cbm_sql_kept_ranges_free(&k);
+    free(cs);
+    free(fs);
+    return ok;
+}
+
+static int count_calls_named(const CBMFileResult *r, const char *name) {
+    int n = 0;
+    for (int i = 0; i < r->calls.count; i++) {
+        if (r->calls.items[i].callee_name && strcmp(r->calls.items[i].callee_name, name) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+/* The same source parsed with the row exclusion and without it (test seam). */
+static CBMFileResult *extract_sql_full(const char *src, const char *path) {
+    setenv("CBM_TEST_SQL_FULL_PARSE_ON", path, 1);
+    CBMFileResult *r = do_extract(src, CBM_LANG_SQL, path);
+    unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+    return r;
+}
+
+TEST(sql_dump_literal_rows_leave_the_graph_unchanged_issue1735) {
+    for (int esc = 0; esc < 2; esc++) {
+        char *src = sql_dump(4, 60, esc == 1, true);
+        ASSERT_NOT_NULL(src);
+        CBMFileResult *cut = do_extract(src, CBM_LANG_SQL, "dump.sql");
+        CBMFileResult *full = extract_sql_full(src, "dump.sql");
+        ASSERT_NOT_NULL(cut);
+        ASSERT_NOT_NULL(full);
+        ASSERT_FALSE(cut->has_error);
+        ASSERT_TRUE(has_def(cut, "big_cities"));
+        char *fp_cut = result_fingerprint(cut);
+        char *fp_full = result_fingerprint(full);
+        ASSERT_NOT_NULL(fp_cut);
+        ASSERT_NOT_NULL(fp_full);
+        ASSERT_STR_EQ(fp_cut, fp_full);
+        ASSERT_TRUE(sites_agree(src, cut, full, true, esc == 0));
+        ASSERT_TRUE(sites_agree(src, cut, full, false, esc == 0));
+        /* Every INSERT's subquery row is parsed. */
+        ASSERT_EQ(count_calls_named(cut, "MAX"), 4);
+        /* ...and the rows really were left out: under a quarter of the file
+         * is parsed. */
+        CBMSqlKeptRanges k = {NULL, 0};
+        ASSERT_TRUE(cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k));
+        size_t kept = 0;
+        for (uint32_t j = 0; j < k.count; j++) {
+            kept += k.items[j].end_byte - k.items[j].start_byte;
+        }
+        cbm_sql_kept_ranges_free(&k);
+        ASSERT_LT(kept * 4, strlen(src));
+        free(fp_cut);
+        free(fp_full);
+        cbm_free_result(cut);
+        cbm_free_result(full);
+        free(src);
+    }
+    PASS();
+}
+
+TEST(sql_dump_tuple_with_subquery_or_call_is_still_parsed_issue1735) {
+    char *src = sql_dump(1, 20, true, true);
+    ASSERT_NOT_NULL(src);
+    CBMFileResult *r = do_extract(src, CBM_LANG_SQL, "dump.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(has_usage_named(r, "country")); /* from the subquery row */
+    ASSERT_TRUE(has_call_named(r, "UPPER"));    /* from the function-call row */
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735) {
+    /* A count, not a clock: with literal rows kept out, doubling them must not
+     * add a single tree node. */
+    char *small = sql_dump(1, 500, true, false);
+    char *big = sql_dump(1, 1000, true, false);
+    ASSERT_NOT_NULL(small);
+    ASSERT_NOT_NULL(big);
+    CBMFileResult *rs = do_extract(small, CBM_LANG_SQL, "small.sql");
+    CBMFileResult *rb = do_extract(big, CBM_LANG_SQL, "big.sql");
+    ASSERT_NOT_NULL(rs);
+    ASSERT_NOT_NULL(rb);
+    ASSERT_EQ(rs->tree_nodes, rb->tree_nodes);
+    ASSERT_EQ(rs->defs.count, rb->defs.count);
+    cbm_free_result(rs);
+    cbm_free_result(rb);
+    free(small);
+    free(big);
+    PASS();
+}
+
+TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735) {
+    /* ~26 MB with MySQL escapes, extracted under the production parse budget.
+     * The outcome is asserted — the file is indexed and its tables are in the
+     * graph — never how long it took. */
+    char *src = sql_dump(330, 2000, true, true);
+    ASSERT_NOT_NULL(src);
+    size_t len = strlen(src);
+    ASSERT_GT(len, (size_t)24 * 1024 * 1024);
+    CBMFileResult *r = cbm_extract_file(src, (int)len, CBM_LANG_SQL, "covproj", "world.sql",
+                                        CBM_EXTRACT_BUDGET, NULL, NULL);
+    ASSERT_NOT_NULL(r);
+    if (r->has_error) {
+        FAIL(r->error_msg ? r->error_msg : "extraction failed");
+    }
+    ASSERT_TRUE(has_def(r, "big_cities"));
+    ASSERT_TRUE(has_usage_named(r, "country"));
+    cbm_free_result(r);
+    free(src);
+    PASS();
+}
+
+/* The text the parser sees: every kept range, concatenated. */
+static char *kept_text(const char *src, const CBMSqlKeptRanges *k) {
+    cov_buf_t b = {NULL, 0, 0};
+    cov_put(&b, "%s", "");
+    for (uint32_t i = 0; i < k->count; i++) {
+        cov_put(&b, "%.*s", (int)(k->items[i].end_byte - k->items[i].start_byte),
+                src + k->items[i].start_byte);
+    }
+    return b.s;
+}
+
+TEST(sql_values_scanner_excludes_only_literal_rows_issue1735) {
+    /* {source, what the parser sees} — NULL means nothing is excluded. */
+    static const char *const cases[][2] = {
+        {"INSERT INTO t VALUES (1,'a'),(2,'b\\'c'),(3,NULL);", "INSERT INTO t VALUES (1,'a');"},
+        {"INSERT INTO t VALUES (1),(f(2)),(3);", "INSERT INTO t VALUES (1),(f(2));"},
+        {"insert into t values (1),(-2.5e3),(0x1F),(_binary 'x'),(DEFAULT),(true),(X'0A'),"
+         "('it''s'),(.5),();",
+         "insert into t values (1);"},
+        {"REPLACE INTO t VALUES (1), /* c */ (2), (3);", "REPLACE INTO t VALUES (1);"},
+        {"INSERT INTO t VALUES (1),(2) -- c\n,(3);", "INSERT INTO t VALUES (1) -- c\n;"},
+        {"INSERT INTO t VALUES (1),((SELECT id FROM u)),(x),(\"q\"),(`b`),(a.b);", NULL},
+        {"INSERT INTO t VALUES (1),('a\nb'),(2);", "INSERT INTO t VALUES (1),('a\nb');"},
+        {"INSERT INTO t VALUES (1),(2) ON DUPLICATE KEY UPDATE a=VALUES(a);",
+         "INSERT INTO t VALUES (1) ON DUPLICATE KEY UPDATE a=VALUES(a);"},
+        {"INSERT INTO t (a, b) VALUES (1, 2), (3, 4);", "INSERT INTO t (a, b) VALUES (1, 2);"},
+        {"SELECT 'INSERT INTO t VALUES (1),(2)';", NULL},
+        {"-- INSERT INTO t VALUES (1),(2)\nSELECT 1;", NULL},
+        {"/* INSERT INTO t VALUES (1),(2) */ SELECT 1;", NULL},
+        {"SELECT * FROM (VALUES (1),(2)) AS v(x);", NULL},
+        {"CREATE FUNCTION f() AS $$ SELECT 1; INSERT INTO t VALUES (1),(2); $$;", NULL},
+        {"INSERT INTO t VALUES (1),(2", NULL},
+        {"INSERT INTO t VALUES (1),(1abc),(2);", "INSERT INTO t VALUES (1),(1abc);"},
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        const char *src = cases[c][0];
+        CBMSqlKeptRanges k = {NULL, 0};
+        bool cut = cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k);
+        if (!cases[c][1]) {
+            if (cut) {
+                fprintf(stderr, "  case %zu excluded rows unexpectedly: %s\n", c, src);
+            }
+            ASSERT_FALSE(cut);
+            continue;
+        }
+        ASSERT_TRUE(cut);
+        char *seen = kept_text(src, &k);
+        ASSERT_NOT_NULL(seen);
+        ASSERT_STR_EQ(seen, cases[c][1]);
+        free(seen);
+        cbm_sql_kept_ranges_free(&k);
+    }
+    PASS();
+}
+
+TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735) {
+    const char *src = "INSERT INTO t VALUES\n(1),\n(2);\nCREATE TABLE u (id int);\n";
+    CBMSqlKeptRanges k = {NULL, 0};
+    ASSERT_TRUE(cbm_sql_values_kept_ranges(src, (uint32_t)strlen(src), &k));
+    ASSERT_EQ(k.count, 2u);
+    /* excluded: ",\n(2)" from byte 24 (row 1, col 3) to byte 29 (row 2, col 3) */
+    ASSERT_EQ(k.items[0].start_byte, 0u);
+    ASSERT_EQ(k.items[0].end_byte, 24u);
+    ASSERT_EQ(k.items[0].end_point.row, 1u);
+    ASSERT_EQ(k.items[0].end_point.column, 3u);
+    ASSERT_EQ(k.items[1].start_byte, 29u);
+    ASSERT_EQ(k.items[1].start_point.row, 2u);
+    ASSERT_EQ(k.items[1].start_point.column, 3u);
+    ASSERT_EQ(k.items[1].end_byte, (uint32_t)strlen(src));
+    ASSERT_EQ(k.items[1].end_point.row, 4u);
+    ASSERT_EQ(k.items[1].end_point.column, 0u);
+    cbm_sql_kept_ranges_free(&k);
+    /* The table after the cut keeps its real line. */
+    CBMFileResult *r = do_extract(src, CBM_LANG_SQL, "pos.sql");
+    ASSERT_NOT_NULL(r);
+    bool found = false;
+    for (int i = 0; i < r->defs.count; i++) {
+        if (r->defs.items[i].name && strcmp(r->defs.items[i].name, "u") == 0) {
+            ASSERT_EQ(r->defs.items[i].start_line, 4u);
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1023,4 +1465,10 @@ SUITE(parse_coverage) {
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
     RUN_TEST(coverage_range_never_covers_an_extracted_definition);
     RUN_TEST(coverage_gap_of_only_comments_is_not_a_miss);
+    RUN_TEST(sql_values_scanner_excludes_only_literal_rows_issue1735);
+    RUN_TEST(sql_values_scanner_keeps_positions_of_kept_text_issue1735);
+    RUN_TEST(sql_dump_literal_rows_leave_the_graph_unchanged_issue1735);
+    RUN_TEST(sql_dump_tuple_with_subquery_or_call_is_still_parsed_issue1735);
+    RUN_TEST(sql_dump_parse_does_not_grow_with_the_row_count_issue1735);
+    RUN_TEST(sql_dump_of_many_megabytes_is_indexed_not_timed_out_issue1735);
 }

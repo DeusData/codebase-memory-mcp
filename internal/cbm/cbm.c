@@ -21,6 +21,7 @@
 #include "lsp/kotlin_lsp.h"
 #include "lsp/rust_lsp.h"
 #include "preprocessor.h"
+#include "sql_values.h" // #1735: literal INSERT rows kept out of the SQL parse
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
@@ -2125,6 +2126,21 @@ CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage 
 enum { CBM_EXTRACT_SCRATCH_BLOCK = CBM_SZ_512 * CBM_SZ_1K };
 enum { CBM_EXTRACT_SCRATCH_KEEP_BYTES = 4 * CBM_SZ_1K * CBM_SZ_1K };
 
+/* The #1735 value-row exclusion is always on. Test builds can turn it off for
+ * one file (CBM_TEST_SQL_FULL_PARSE_ON=<rel_path substring>) so a test can
+ * compare the excluded parse against the full one on the same source. */
+static bool cbm_sql_values_exclusion_on(const char *rel_path) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    const char *full_on = getenv("CBM_TEST_SQL_FULL_PARSE_ON");
+    if (full_on && full_on[0] && rel_path && strstr(rel_path, full_on)) {
+        return false;
+    }
+#else
+    (void)rel_path;
+#endif
+    return true;
+}
+
 static CBMFileResult *extract_file_ex_body(const char *source, int source_len, CBMLanguage language,
                                            const char *project, const char *rel_path,
                                            int64_t timeout_micros, const char **extra_defines,
@@ -2233,7 +2249,19 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
 #endif
     }
 
+    /* #1735: a SQL data dump's literal-only INSERT rows carry no graph content
+     * but dominate its parse. Keep them out through included ranges; offsets
+     * and positions of everything kept are unchanged. The parser is
+     * thread-local and reused, so the ranges are cleared right after. */
+    CBMSqlKeptRanges sql_kept = {NULL, 0};
+    bool sql_ranged = language == CBM_LANG_SQL && cbm_sql_values_exclusion_on(rel_path) &&
+                      cbm_sql_values_kept_ranges(source, (uint32_t)source_len, &sql_kept) &&
+                      ts_parser_set_included_ranges(parser, sql_kept.items, sql_kept.count);
     TSTree *tree = ts_parser_parse_with_options(parser, NULL, ts_input, opts);
+    if (sql_ranged) {
+        (void)ts_parser_set_included_ranges(parser, NULL, 0);
+    }
+    cbm_sql_kept_ranges_free(&sql_kept);
     uint64_t t1 = now_ns();
 #ifdef CBM_ENABLE_TEST_SEAMS
     t1 += tl_parse_wall_seam_offset_ns; /* the stall seam inflates every wall reading */

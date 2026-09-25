@@ -344,6 +344,165 @@ TEST(pipeline_doclinks_edge_lands_in_store) {
     PASS();
 }
 
+/* #1735: every node and edge of a stored index, one sorted line each. */
+static void graph_listing_append(sqlite3 *db, const char *sql, const char *project, char **buf,
+                                 size_t *len) {
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        return;
+    }
+    sqlite3_bind_text(stmt, 1, project, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char *row = (const char *)sqlite3_column_text(stmt, 0);
+        size_t n = row ? strlen(row) : 0;
+        char *grown = realloc(*buf, *len + n + 2);
+        if (!grown) {
+            break;
+        }
+        *buf = grown;
+        memcpy(*buf + *len, row ? row : "", n);
+        (*buf)[*len + n] = '\n';
+        *len += n + 1;
+        (*buf)[*len] = '\0';
+    }
+    sqlite3_finalize(stmt);
+}
+
+static char *graph_listing(const char *db_path, const char *project) {
+    sqlite3 *db = NULL;
+    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        sqlite3_close(db);
+        return NULL;
+    }
+    char *buf = calloc(1, 1);
+    size_t len = 0;
+    graph_listing_append(db,
+                         "SELECT label||'|'||name||'|'||qualified_name||'|'||file_path||'|'||"
+                         "start_line||'|'||end_line||'|'||properties FROM nodes "
+                         "WHERE project=?1 ORDER BY 1",
+                         project, &buf, &len);
+    graph_listing_append(db,
+                         "SELECT e.type||'|'||s.qualified_name||'|'||t.qualified_name||'|'||"
+                         "e.properties FROM edges e JOIN nodes s ON s.id=e.source_id "
+                         "JOIN nodes t ON t.id=e.target_id WHERE e.project=?1 ORDER BY 1",
+                         project, &buf, &len);
+    sqlite3_close(db);
+    return buf;
+}
+
+static char *index_and_list(const char *repo, const char *db_name) {
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/%s", repo, db_name);
+    cbm_pipeline_t *p = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    if (!p) {
+        return NULL;
+    }
+    char *listing =
+        cbm_pipeline_run(p) == 0 ? graph_listing(db_path, cbm_pipeline_project_name(p)) : NULL;
+    cbm_pipeline_free(p);
+    return listing;
+}
+
+/* True if every line of `sub` is a line of `super`. */
+static bool listing_lines_within(const char *sub, const char *super) {
+    for (const char *line = sub; *line;) {
+        const char *nl = strchr(line, '\n');
+        size_t n = nl ? (size_t)(nl - line) : strlen(line);
+        bool found = false;
+        for (const char *p = super; *p && !found;) {
+            const char *pnl = strchr(p, '\n');
+            size_t pn = pnl ? (size_t)(pnl - p) : strlen(p);
+            found = pn == n && memcmp(p, line, n) == 0;
+            p = pnl ? pnl + 1 : p + pn;
+        }
+        if (!found) {
+            fprintf(stderr, "  missing from the cut index: %.*s\n", (int)n, line);
+            return false;
+        }
+        line = nl ? nl + 1 : line + n;
+    }
+    return true;
+}
+
+/* A small dump: two tables, a view, three INSERTs of 200 rows, each with one
+ * subquery row and one function-call row among literal rows. */
+static char *sql_dump_small(bool mysql_esc) {
+    size_t cap = 256 * 1024;
+    char *src = malloc(cap);
+    if (!src) {
+        return NULL;
+    }
+    const char *quoted = mysql_esc ? "(%d,'O\\'Brien',DEFAULT)" : "(%d,'O''Brien',DEFAULT)";
+    size_t len = (size_t)snprintf(src, cap,
+                                  "CREATE TABLE city (ID int, Name char(35), Population int);\n"
+                                  "CREATE TABLE country (Code char(3), Name char(52));\n"
+                                  "CREATE VIEW big_cities AS SELECT Name FROM city "
+                                  "WHERE Population > 1000000;\n");
+    for (int s = 0; s < 3; s++) {
+        len += (size_t)snprintf(src + len, cap - len, "INSERT INTO `city` VALUES ");
+        for (int r = 0; r < 200; r++) {
+            if (r) {
+                src[len++] = ',';
+            }
+            int id = s * 1000 + r;
+            if (r == 100) {
+                len += (size_t)snprintf(src + len, cap - len,
+                                        "((SELECT MAX(Code) FROM country),'x',1)");
+            } else if (r == 101) {
+                len += (size_t)snprintf(src + len, cap - len, "(%d,UPPER('y'),2)", id);
+            } else if (r % 3) {
+                len += (size_t)snprintf(src + len, cap - len, quoted, id);
+            } else {
+                len += (size_t)snprintf(src + len, cap - len, "(%d,_binary 'ab',NULL)", id);
+            }
+        }
+        len += (size_t)snprintf(src + len, cap - len, ";\n");
+    }
+    return src;
+}
+
+/* #1735: leaving a dump's literal INSERT rows out of the parse must not change
+ * the graph. The same repository is indexed twice — once as shipped and once
+ * with the full parse (test seam) — and the stored nodes and edges compared.
+ * Standard '' escapes, which the SQL grammar reads correctly: identical.
+ * MySQL \' escapes, which it misreads: the full parse's error recovery swallows
+ * neighbouring rows, so the cut index must hold everything the full one has
+ * (and may hold more — the rows the full parse lost). */
+TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735) {
+    for (int esc = 0; esc < 2; esc++) {
+        char tmp[256];
+        snprintf(tmp, sizeof(tmp), "/tmp/cbm_sql_dump_XXXXXX");
+        ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+        char *src = sql_dump_small(esc == 1);
+        ASSERT_NOT_NULL(src);
+        write_temp_file(tmp, "dump.sql", src);
+        free(src);
+
+        char *cut = index_and_list(tmp, "cut.db");
+        setenv("CBM_TEST_SQL_FULL_PARSE_ON", "dump.sql", 1);
+        char *full = index_and_list(tmp, "full.db");
+        unsetenv("CBM_TEST_SQL_FULL_PARSE_ON");
+        th_rmtree(tmp);
+        ASSERT_NOT_NULL(cut);
+        ASSERT_NOT_NULL(full);
+        /* Not vacuous: the tables, the view and its lineage are there. */
+        ASSERT_NOT_NULL(strstr(cut, "Table|city|"));
+        ASSERT_NOT_NULL(strstr(cut, "View|big_cities|"));
+        ASSERT_NOT_NULL(strstr(cut, "USAGE|"));
+        if (esc == 0 && strcmp(cut, full) != 0) {
+            fprintf(stderr, "--- cut ---\n%s--- full ---\n%s", cut, full);
+        }
+        if (esc == 0) {
+            ASSERT_STR_EQ(cut, full);
+        } else {
+            ASSERT_TRUE(listing_lines_within(full, cut));
+        }
+        free(cut);
+        free(full);
+    }
+    PASS();
+}
+
 /* Spilling must be invisible in the OUTPUT: the same repository indexed with
  * results parked on disk must produce the same graph as one indexed entirely in
  * memory. It did not. The namespace map that `use`/`using`/package imports
@@ -15110,6 +15269,7 @@ SUITE(pipeline) {
     /* Integration: structure pass */
     RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
     RUN_TEST(pipeline_doclinks_edge_lands_in_store);
+    RUN_TEST(pipeline_sql_dump_graph_matches_the_full_parse_issue1735);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
