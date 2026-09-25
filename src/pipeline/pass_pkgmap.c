@@ -1630,7 +1630,7 @@ static bool python_import_local_materialized(const cbm_gbuf_t *gbuf, const char 
     }
     char *file_qn = cbm_pipeline_fqn_compute(project_name, rel_path, "__file__");
     const cbm_gbuf_node_t *file_node = file_qn ? cbm_gbuf_find_by_qn(gbuf, file_qn) : NULL;
-    free(file_qn);
+    safe_free(file_qn);
     const cbm_gbuf_edge_t **edges = NULL;
     int edge_count = 0;
     if (!file_node || cbm_gbuf_find_edges_by_source_type(gbuf, file_node->id, "IMPORTS", &edges,
@@ -1713,7 +1713,7 @@ static bool python_import_module_in_project(const cbm_pipeline_ctx_t *ctx, const
     *dot = '\0';
     char *qn = cbm_pipeline_resolve_module(ctx, source_rel, part);
     bool found = qn && cbm_gbuf_find_by_qn(ctx->gbuf, qn) != NULL;
-    free(qn);
+    safe_free(qn);
     return found;
 }
 
