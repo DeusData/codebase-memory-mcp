@@ -301,6 +301,9 @@ static void build_ffunc_short_index(CBMTypeRegistry *reg, CBMArena *idx_arena) {
 void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
                                       CBMTypeShortIter *out) {
     out->reg = reg;
+    out->chain = false;
+    out->key = short_name;
+    out->shadow = NULL;
     out->hash = fnv1a(short_name);
     if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
         if (reg->type_short_buckets && reg->type_short_bucket_count > 0) {
@@ -319,7 +322,7 @@ void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *sh
     }
 }
 
-int cbm_type_short_iter_next(CBMTypeShortIter *it) {
+static int type_short_next_local(CBMTypeShortIter *it) {
     const CBMTypeRegistry *reg = it->reg;
     while (it->chain_idx >= 0) {
         const CBMRegistryHashEntry *e = &reg->type_short_entries[it->chain_idx];
@@ -335,9 +338,79 @@ int cbm_type_short_iter_next(CBMTypeShortIter *it) {
     return -1;
 }
 
+static const CBMRegisteredType *lookup_type_self(const CBMTypeRegistry *reg,
+                                                 const char *qualified_name);
+static const CBMRegisteredFunc *lookup_func_self(const CBMTypeRegistry *reg,
+                                                 const char *qualified_name);
+
+/* A base entry is shadowed when the head holds an entry with the same QN. */
+static bool type_shadowed(const CBMTypeRegistry *shadow, const CBMTypeRegistry *reg, int i) {
+    if (!shadow || shadow == reg || !reg->types[i].qualified_name) {
+        return false;
+    }
+    return lookup_type_self(shadow, reg->types[i].qualified_name) != NULL;
+}
+static bool func_shadowed(const CBMTypeRegistry *shadow, const CBMTypeRegistry *reg, int i) {
+    if (!shadow || shadow == reg || !reg->funcs[i].qualified_name) {
+        return false;
+    }
+    return lookup_func_self(shadow, reg->funcs[i].qualified_name) != NULL;
+}
+
+static void type_short_open_linear(const CBMTypeRegistry *reg, CBMTypeShortIter *out) {
+    out->reg = reg;
+    out->hash = 0;
+    out->chain_idx = -1;
+    out->tail_i = 0;
+    out->tail_end = reg->type_count;
+}
+
+int cbm_type_short_iter_next(CBMTypeShortIter *it) {
+    for (;;) {
+        int p = type_short_next_local(it);
+        if (p >= 0) {
+            if (it->chain && type_shadowed(it->shadow, it->reg, p)) {
+                continue;
+            }
+            return p;
+        }
+        if (!it->chain || !it->reg->fallback) {
+            return -1;
+        }
+        const CBMTypeRegistry *next = it->reg->fallback;
+        const char *key = it->key;
+        const CBMTypeRegistry *shadow = it->shadow;
+        if (key) {
+            cbm_registry_types_by_short_name(next, key, it);
+        } else {
+            type_short_open_linear(next, it);
+        }
+        it->chain = true;
+        it->key = key;
+        it->shadow = shadow;
+    }
+}
+
+void cbm_registry_types_by_short_name_chain(const CBMTypeRegistry *head, const char *short_name,
+                                            CBMTypeShortIter *out) {
+    cbm_registry_types_by_short_name(head, short_name, out);
+    out->chain = true;
+    out->shadow = head;
+}
+
+void cbm_registry_all_types_chain(const CBMTypeRegistry *head, CBMTypeShortIter *out) {
+    type_short_open_linear(head, out);
+    out->chain = true;
+    out->key = NULL;
+    out->shadow = head;
+}
+
 void cbm_registry_types_by_embedded_bare(const CBMTypeRegistry *reg, const char *bare,
                                          CBMTypeEmbedIter *out) {
     out->reg = reg;
+    out->chain = false;
+    out->key = bare;
+    out->shadow = NULL;
     out->hash = fnv1a(bare);
     out->prev_type = -1;
     if (reg->type_qn_buckets && reg->type_qn_bucket_count > 0) {
@@ -358,7 +431,7 @@ void cbm_registry_types_by_embedded_bare(const CBMTypeRegistry *reg, const char 
     }
 }
 
-int cbm_type_embed_iter_next(CBMTypeEmbedIter *it) {
+static int type_embed_next_local(CBMTypeEmbedIter *it) {
     const CBMTypeRegistry *reg = it->reg;
     while (it->chain_idx >= 0) {
         const CBMRegistryHashEntry *e = &reg->type_embed_entries[it->chain_idx];
@@ -377,9 +450,40 @@ int cbm_type_embed_iter_next(CBMTypeEmbedIter *it) {
     return -1;
 }
 
+int cbm_type_embed_iter_next(CBMTypeEmbedIter *it) {
+    for (;;) {
+        int p = type_embed_next_local(it);
+        if (p >= 0) {
+            if (it->chain && type_shadowed(it->shadow, it->reg, p)) {
+                continue;
+            }
+            return p;
+        }
+        if (!it->chain || !it->reg->fallback) {
+            return -1;
+        }
+        const CBMTypeRegistry *next = it->reg->fallback;
+        const char *key = it->key;
+        const CBMTypeRegistry *shadow = it->shadow;
+        cbm_registry_types_by_embedded_bare(next, key, it);
+        it->chain = true;
+        it->shadow = shadow;
+    }
+}
+
+void cbm_registry_types_by_embedded_bare_chain(const CBMTypeRegistry *head, const char *bare,
+                                               CBMTypeEmbedIter *out) {
+    cbm_registry_types_by_embedded_bare(head, bare, out);
+    out->chain = true;
+    out->shadow = head;
+}
+
 void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
                                            CBMFreeFuncIter *out) {
     out->reg = reg;
+    out->chain = false;
+    out->key = short_name;
+    out->shadow = NULL;
     out->hash = fnv1a(short_name);
     if (reg->func_qn_buckets && reg->func_qn_bucket_count > 0) {
         if (reg->ffunc_short_buckets && reg->ffunc_short_bucket_count > 0) {
@@ -397,7 +501,7 @@ void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const cha
     }
 }
 
-int cbm_free_func_iter_next(CBMFreeFuncIter *it) {
+static int free_func_next_local(CBMFreeFuncIter *it) {
     const CBMTypeRegistry *reg = it->reg;
     while (it->chain_idx >= 0) {
         const CBMRegistryHashEntry *e = &reg->ffunc_short_entries[it->chain_idx];
@@ -413,9 +517,57 @@ int cbm_free_func_iter_next(CBMFreeFuncIter *it) {
     return -1;
 }
 
+static void free_func_open_linear(const CBMTypeRegistry *reg, CBMFreeFuncIter *out) {
+    out->reg = reg;
+    out->hash = 0;
+    out->chain_idx = -1;
+    out->tail_i = 0;
+    out->tail_end = reg->func_count;
+}
+
+int cbm_free_func_iter_next(CBMFreeFuncIter *it) {
+    for (;;) {
+        int p = free_func_next_local(it);
+        if (p >= 0) {
+            if (it->chain && func_shadowed(it->shadow, it->reg, p)) {
+                continue;
+            }
+            return p;
+        }
+        if (!it->chain || !it->reg->fallback) {
+            return -1;
+        }
+        const CBMTypeRegistry *next = it->reg->fallback;
+        const char *key = it->key;
+        const CBMTypeRegistry *shadow = it->shadow;
+        if (key) {
+            cbm_registry_free_funcs_by_short_name(next, key, it);
+        } else {
+            free_func_open_linear(next, it);
+        }
+        it->chain = true;
+        it->key = key;
+        it->shadow = shadow;
+    }
+}
+
+void cbm_registry_free_funcs_by_short_name_chain(const CBMTypeRegistry *head,
+                                                 const char *short_name, CBMFreeFuncIter *out) {
+    cbm_registry_free_funcs_by_short_name(head, short_name, out);
+    out->chain = true;
+    out->shadow = head;
+}
+
+void cbm_registry_all_funcs_chain(const CBMTypeRegistry *head, CBMFreeFuncIter *out) {
+    free_func_open_linear(head, out);
+    out->chain = true;
+    out->key = NULL;
+    out->shadow = head;
+}
+
 void cbm_registry_methods(const CBMTypeRegistry *reg, const char *receiver_qn,
                           const char *method_name, CBMMethodIter *out) {
-    memset(out, 0, sizeof(*out));
+    memset(out, 0, sizeof(*out)); /* chain=false, shadow=NULL */
     out->reg = reg;
     out->receiver_qn = receiver_qn;
     out->method_name = method_name;
@@ -435,10 +587,7 @@ void cbm_registry_methods(const CBMTypeRegistry *reg, const char *receiver_qn,
     }
 }
 
-int cbm_method_iter_next(CBMMethodIter *it) {
-    if (!it || !it->reg || !it->receiver_qn || !it->method_name) {
-        return -1;
-    }
+static int method_next_local(CBMMethodIter *it) {
     const CBMTypeRegistry *reg = it->reg;
     while (it->chain_idx >= 0) {
         const CBMRegistryHashEntry *e = &reg->method_entries[it->chain_idx];
@@ -463,6 +612,80 @@ int cbm_method_iter_next(CBMMethodIter *it) {
         }
     }
     return -1;
+}
+
+int cbm_method_iter_next(CBMMethodIter *it) {
+    if (!it || !it->reg || !it->receiver_qn || !it->method_name) {
+        return -1;
+    }
+    for (;;) {
+        int p = method_next_local(it);
+        if (p >= 0) {
+            if (it->chain && func_shadowed(it->shadow, it->reg, p)) {
+                continue;
+            }
+            return p;
+        }
+        if (!it->chain || !it->reg->fallback) {
+            return -1;
+        }
+        const CBMTypeRegistry *next = it->reg->fallback;
+        const CBMTypeRegistry *shadow = it->shadow;
+        cbm_registry_methods(next, it->receiver_qn, it->method_name, it);
+        it->chain = true;
+        it->shadow = shadow;
+    }
+}
+
+void cbm_registry_methods_chain(const CBMTypeRegistry *head, const char *receiver_qn,
+                                const char *method_name, CBMMethodIter *out) {
+    cbm_registry_methods(head, receiver_qn, method_name, out);
+    out->chain = true;
+    out->shadow = head;
+}
+
+CBMRegisteredFunc *cbm_registry_func_for_update(CBMTypeRegistry *head, const char *qualified_name) {
+    if (!head || !qualified_name || head->read_only) {
+        return NULL;
+    }
+    const CBMRegisteredFunc *own = lookup_func_self(head, qualified_name);
+    if (own) {
+        return (CBMRegisteredFunc *)own;
+    }
+    for (const CBMTypeRegistry *r = head->fallback; r; r = r->fallback) {
+        const CBMRegisteredFunc *base = lookup_func_self(r, qualified_name);
+        if (base) {
+            int before = head->func_count;
+            cbm_registry_add_func(head, *base);
+            if (head->func_count == before + 1) {
+                return &head->funcs[before];
+            }
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+CBMRegisteredType *cbm_registry_type_for_update(CBMTypeRegistry *head, const char *qualified_name) {
+    if (!head || !qualified_name || head->read_only) {
+        return NULL;
+    }
+    const CBMRegisteredType *own = lookup_type_self(head, qualified_name);
+    if (own) {
+        return (CBMRegisteredType *)own;
+    }
+    for (const CBMTypeRegistry *r = head->fallback; r; r = r->fallback) {
+        const CBMRegisteredType *base = lookup_type_self(r, qualified_name);
+        if (base) {
+            int before = head->type_count;
+            cbm_registry_add_type(head, *base);
+            if (head->type_count == before + 1) {
+                return &head->types[before];
+            }
+            return NULL;
+        }
+    }
+    return NULL;
 }
 
 void cbm_registry_finalize_into(CBMTypeRegistry *reg, CBMArena *idx_arena) {

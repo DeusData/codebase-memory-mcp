@@ -492,10 +492,10 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
             CBMTypeShortIter ts_it;
             int i;
             if (ctx->registry) {
-                cbm_registry_types_by_short_name(ctx->registry, the_short, &ts_it);
+                cbm_registry_types_by_short_name_chain(ctx->registry, the_short, &ts_it);
             }
             while (ctx->registry && (i = cbm_type_short_iter_next(&ts_it)) >= 0) {
-                const CBMRegisteredType *cand = &ctx->registry->types[i];
+                const CBMRegisteredType *cand = &ts_it.reg->types[i];
                 if (!cand->short_name || strcmp(cand->short_name, the_short) != 0)
                     continue;
                 int score = 0;
@@ -643,12 +643,12 @@ static const CBMRegisteredFunc *cs_lookup_extension(CSLSPContext *ctx, const cha
      * registration-order tie-break exactly (bucket chains are not in funcs[]
      * order). */
     CBMFreeFuncIter ext_it;
-    cbm_registry_free_funcs_by_short_name(ctx->registry, method_name, &ext_it);
+    cbm_registry_free_funcs_by_short_name_chain(ctx->registry, method_name, &ext_it);
     const CBMRegisteredFunc *best = NULL;
     int best_idx = -1;
     int i;
     while ((i = cbm_free_func_iter_next(&ext_it)) >= 0) {
-        const CBMRegisteredFunc *cand = &ctx->registry->funcs[i];
+        const CBMRegisteredFunc *cand = &ext_it.reg->funcs[i];
         if (!cand->short_name || strcmp(cand->short_name, method_name) != 0)
             continue;
         if (cand->receiver_type)
@@ -1522,8 +1522,12 @@ static const char *cs_resolve_callable_name(CSLSPContext *ctx, const char *name)
      * generated fixtures can register receiverless callables. Only accept a
      * unique short-name match; ambiguity is intentionally not guessed. */
     const CBMRegisteredFunc *only = NULL;
-    for (int i = 0; ctx->registry && i < ctx->registry->func_count; i++) {
-        const CBMRegisteredFunc *candidate = &ctx->registry->funcs[i];
+    CBMFreeFuncIter all_funcs;
+    if (ctx->registry) {
+        cbm_registry_all_funcs_chain(ctx->registry, &all_funcs);
+    }
+    for (int i = -1; ctx->registry && (i = cbm_free_func_iter_next(&all_funcs)) >= 0;) {
+        const CBMRegisteredFunc *candidate = &all_funcs.reg->funcs[i];
         if (candidate->receiver_type || !candidate->short_name ||
             strcmp(candidate->short_name, name) != 0) {
             continue;
@@ -2142,8 +2146,12 @@ static void cs_resolve_invocation(CSLSPContext *ctx, TSNode call) {
         /* Last resort: any free function with this short name in registry. */
         const CBMRegisteredFunc *best = NULL;
         int best_score = -1;
-        for (int i = 0; ctx->registry && i < ctx->registry->func_count; i++) {
-            const CBMRegisteredFunc *cand = &ctx->registry->funcs[i];
+        CBMFreeFuncIter all_funcs;
+        if (ctx->registry) {
+            cbm_registry_all_funcs_chain(ctx->registry, &all_funcs);
+        }
+        for (int i = -1; ctx->registry && (i = cbm_free_func_iter_next(&all_funcs)) >= 0;) {
+            const CBMRegisteredFunc *cand = &all_funcs.reg->funcs[i];
             if (cand->receiver_type)
                 continue;
             if (!cand->short_name || strcmp(cand->short_name, bare) != 0)

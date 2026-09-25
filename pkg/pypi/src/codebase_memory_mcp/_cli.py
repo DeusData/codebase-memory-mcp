@@ -338,7 +338,7 @@ def _version() -> str:
         from importlib.metadata import version
         return version("codebase-memory-mcp")
     except Exception:
-        return "0.10.8"
+        return "0.11.0"
 
 
 def _os_name() -> str:

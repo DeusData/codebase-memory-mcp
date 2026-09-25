@@ -17,6 +17,7 @@
 
 /* Use the existing CBMLanguage enum from extraction layer */
 #include "cbm.h"
+#include "foundation/index_policy.h"
 
 /* ── Language detection ──────────────────────────────────────────── */
 
@@ -41,8 +42,14 @@ CBMLanguage cbm_disambiguate_m(const char *path);
 
 /* Disambiguate .cls files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_UDL if a line starts with "Class <Uppercase>",
+ * CBM_LANG_COUNT (unsupported) for a Visual Basic 6 class module (#721),
  * otherwise CBM_LANG_APEX. On read failure, defaults to CBM_LANG_APEX. */
 CBMLanguage cbm_disambiguate_cls(const char *path);
+
+/* Disambiguate .frm files by reading first 4KB of content (#721).
+ * Returns CBM_LANG_COUNT (unsupported) for a Visual Basic 6 form, otherwise
+ * CBM_LANG_FORM. On read failure, defaults to CBM_LANG_FORM. */
+CBMLanguage cbm_disambiguate_frm(const char *path);
 
 /* Disambiguate .inc files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
@@ -137,9 +144,11 @@ typedef struct {
 } cbm_file_info_t;
 
 typedef struct {
-    cbm_index_mode_t mode;   /* CBM_MODE_FULL or CBM_MODE_FAST */
-    const char *ignore_file; /* path to .cbmignore file, or NULL */
-    int64_t max_file_size;   /* 0 = no limit */
+    cbm_index_mode_t mode;                              /* discovery filtering mode */
+    const char *ignore_file;                            /* .cbmignore path, or NULL */
+    int64_t max_file_size;                              /* 0 = no per-file limit */
+    const cbm_index_resource_policy_t *resource_policy; /* NULL = no resource limits */
+    cbm_index_resource_violation_t *resource_violation; /* optional exact diagnostic */
 } cbm_discover_opts_t;
 
 typedef enum {

@@ -729,6 +729,17 @@ TEST(tslsp_nocrash_megasource) {
 
 /* ── Category 11: generics (deeper) ─────────────────────────────────────────── */
 
+TEST(tslsp_await_generic_call_issue2210) {
+    CBMFileResult *r = extract_ts("function parseJsonBody<T>(): T { return null as T; }\n"
+                                  "async function plain() { return await parseJsonBody(); }\n"
+                                  "async function generic() { return await parseJsonBody<string>(); }\n");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(find_resolved(r, "plain", "parseJsonBody") >= 0);
+    ASSERT_TRUE(find_resolved(r, "generic", "parseJsonBody") >= 0);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(tslsp_generic_identity_inference) {
     CBMFileResult *r = extract_ts("function identity<T>(x: T): T { return x; }\n"
                                   "class Box { use(): void {} }\n"
@@ -4315,6 +4326,8 @@ SUITE(ts_lsp) {
     RUN_TEST(tslsp_nocrash_eval_value);
     RUN_TEST(tslsp_nocrash_using_decl);
     RUN_TEST(tslsp_nocrash_megasource);
+
+    RUN_TEST(tslsp_await_generic_call_issue2210);
 
     /* Category 11: generics deeper */
     RUN_TEST(tslsp_generic_identity_inference);

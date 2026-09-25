@@ -44,6 +44,10 @@ typedef struct {
     const char *source;
     int source_len;
     const CBMTypeRegistry *registry;
+    /* Writable head of the registry chain (the per-file overlay, or the
+     * per-file registry on the non-cross path); refinements go here via
+     * cbm_registry_*_for_update, never into anything behind ->fallback. */
+    CBMTypeRegistry *registry_head;
     CBMScope *current_scope;
 
     // Import map: local_name -> module_qn (arena-allocated, NULL-terminated).

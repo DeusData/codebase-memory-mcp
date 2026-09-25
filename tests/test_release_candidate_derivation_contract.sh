@@ -2,6 +2,12 @@
 # Contract: release candidates are two immutable derivations of one linker
 # output. This uses the host's real compiler/strip/signing tools.
 set -euo pipefail
+# The input below is a stub compiled with the compiler's defaults, not a
+# release link: it exercises derivation (strip/codesign/hash binding), not the
+# link flags. Declare it a fixture so the composition gate reports A1d-bind-now
+# (eager binding, a -z now property of Makefile.cbm) as n/a instead of failing
+# on the fixture's own link; every other assertion still runs on it.
+export CBM_COMPOSITION_FIXTURE=1
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 FIX="$(mktemp -d "${TMPDIR:-/tmp}/cbm-candidate-derive.XXXXXX")"

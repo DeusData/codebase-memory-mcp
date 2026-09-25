@@ -15,6 +15,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include "mem_core.h" /* cbm_mem_class_t; same directory: the lsp_all unit has no -Isrc */
 #include <stdbool.h>
 
 /* Opaque — full definition lives in hash_table.c. */
@@ -23,6 +24,11 @@ typedef struct CBMHashTable CBMHashTable;
 /* Create a hash table with initial capacity hint (used to pre-reserve
  * buckets and avoid early growth; 0 = library default). */
 CBMHashTable *cbm_ht_create(uint32_t initial_capacity);
+
+/* Same, with the memory class the table's buckets and entries are charged
+ * to. cbm_ht_create charges CBM_MEM_CLASS_HASH_TABLE; an owner that wants
+ * its indexes attributed (the graph buffer: gbuf_index) names its class. */
+CBMHashTable *cbm_ht_create_in(cbm_mem_class_t cls, uint32_t initial_capacity);
 
 /* Free the hash table (does NOT free keys or values). */
 void cbm_ht_free(CBMHashTable *ht);

@@ -216,9 +216,10 @@ static int resolve_usage_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *res
             if (tgt && cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
                 continue;
             }
-            /* #1942: a bare Go reference can never denote a struct field. */
-            if (tgt &&
-                cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->ref_name, tgt->label)) {
+            /* #1942/#1962: a bare Go reference can never denote a struct
+             * field; the member half of a selector may. */
+            if (tgt && cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, usage->is_member_access,
+                                                      tgt->label)) {
                 continue;
             }
             if (usage->semantic_reference_blocked && (usage->semantic_reference_local_shadow ||
@@ -309,8 +310,9 @@ static int resolve_rw_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result
         if (cbm_suppress_cross_language_ref(lang, tgt->file_path)) {
             continue;
         }
-        /* #1942: a bare Go reference can never denote a struct field. */
-        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->var_name, tgt->label)) {
+        /* #1942/#1962: a bare Go reference can never denote a struct field;
+         * a selector-LHS write (`t.err = x`) may bind it. */
+        if (cbm_go_suppress_bare_field_ref(lang == CBM_LANG_GO, rw->is_member_access, tgt->label)) {
             continue;
         }
 

@@ -8,6 +8,8 @@
 #include "foundation/compat.h"
 #include "foundation/constants.h"
 #include "foundation/platform_internal.h"
+#include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -435,6 +437,33 @@ const char *cbm_safe_getenv(const char *name, char *buf, size_t buf_sz, const ch
     return NULL;
 }
 
+/* See platform.h. The shape here is the one src/main.c:1104 already uses for
+ * --port=: an end pointer says where the read stopped, errno catches a number
+ * too large, and *end == '\0' catches anything left over. */
+bool cbm_env_long(const char *name, long *out) {
+    if (!out) {
+        return false;
+    }
+    char raw[CBM_SZ_64] = {0};
+    if (!cbm_safe_getenv(name, raw, sizeof(raw), NULL) || !raw[0]) {
+        return false;
+    }
+    /* strtol skips leading blanks of its own accord, so " 5" would read as 5.
+     * A blank in front of a setting is a slip, not a number, so refuse it here
+     * rather than let strtol quietly step over it. */
+    if (isspace((unsigned char)raw[0])) {
+        return false;
+    }
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(raw, &end, CBM_DECIMAL_BASE);
+    if (errno != 0 || !end || end == raw || *end != '\0') {
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
 /* ── Home directory (cross-platform) ───────────────────── */
 
 const char *cbm_get_home_dir(void) {
@@ -513,6 +542,60 @@ const char *cbm_app_local_dir(void) {
 }
 
 /* ── Cache directory ────────────────────────── */
+
+const char *cbm_errno_name(int error) {
+    static const struct {
+        int value;
+        const char *name;
+    } names[] = {
+        {EACCES, "EACCES"},
+        {EAGAIN, "EAGAIN"},
+        {EBUSY, "EBUSY"},
+        {EEXIST, "EEXIST"},
+        {EFBIG, "EFBIG"},
+        {EINTR, "EINTR"},
+        {EINVAL, "EINVAL"},
+        {EIO, "EIO"},
+        {EISDIR, "EISDIR"},
+        {ELOOP, "ELOOP"},
+        {EMFILE, "EMFILE"},
+        {EMLINK, "EMLINK"},
+        {ENAMETOOLONG, "ENAMETOOLONG"},
+        {ENFILE, "ENFILE"},
+        {ENOENT, "ENOENT"},
+        {ENOMEM, "ENOMEM"},
+        {ENOSPC, "ENOSPC"},
+        {ENOTDIR, "ENOTDIR"},
+        {ENOTEMPTY, "ENOTEMPTY"},
+        {ENXIO, "ENXIO"},
+        {EPERM, "EPERM"},
+        {EROFS, "EROFS"},
+        {ETXTBSY, "ETXTBSY"},
+        {EXDEV, "EXDEV"},
+        {ETIMEDOUT, "ETIMEDOUT"},
+        {ECONNREFUSED, "ECONNREFUSED"},
+        {EADDRINUSE, "EADDRINUSE"},
+        {ENOTSOCK, "ENOTSOCK"},
+        {EPIPE, "EPIPE"},
+#ifdef EDQUOT
+        {EDQUOT, "EDQUOT"},
+#endif
+#ifdef EOVERFLOW
+        {EOVERFLOW, "EOVERFLOW"},
+#endif
+#ifdef ENOTSUP
+        {ENOTSUP, "ENOTSUP"},
+#endif
+    };
+    for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
+        if (names[i].value == error) {
+            return names[i].name;
+        }
+    }
+    static CBM_TLS char fallback[16];
+    (void)snprintf(fallback, sizeof(fallback), "%d", error);
+    return fallback;
+}
 
 const char *cbm_resolve_cache_dir(void) {
     static CBM_TLS char buf[CBM_SZ_4K];

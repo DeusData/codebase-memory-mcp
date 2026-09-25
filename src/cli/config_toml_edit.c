@@ -3,6 +3,7 @@
  */
 #include "cli/config_toml_edit.h"
 
+#include "cli/config_edit_path.h"
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 
@@ -465,13 +466,26 @@ static int toml_read_file(const char *path, char **out_data, size_t *out_len,
 #ifdef O_CLOEXEC
     flags |= O_CLOEXEC;
 #endif
-    int fd = open(path, flags);
+    /* A symlink the invoking user owns, inside an opted-in configuration
+     * root, is read through the descriptor the helper validated on the
+     * target's pinned parent directory (#1954); everything else is opened by
+     * name with O_NOFOLLOW exactly as before. */
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(path, &target) < 0) {
+        return TOML_EDIT_ERR;
+    }
+    int fd = target.fd;
+    target.fd = -1;
+    if (target.status != CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        fd = open(target.path, flags);
+    }
+    cbm_config_edit_target_close(&target);
     if (fd < 0) {
         if (errno != ENOENT) {
             return TOML_EDIT_ERR;
         }
         struct stat path_state;
-        if (lstat(path, &path_state) == 0 || errno != ENOENT) {
+        if (lstat(target.path, &path_state) == 0 || errno != ENOENT) {
             return TOML_EDIT_ERR;
         }
         char *empty = (char *)malloc(1U);
@@ -612,28 +626,65 @@ static int toml_replace_atomic(const char *temp_path, const char *path, int exis
 #endif
 }
 
-static int toml_write_atomic(const char *path, const char *old_data, size_t old_len,
-                             const char *new_data, size_t new_len,
-                             const toml_file_snapshot_t *snapshot) {
+static const char *toml_temp_name(const char *temp_path) {
+    const char *slash = strrchr(temp_path, '/');
+    return slash ? slash + 1 : temp_path;
+}
+
+/* Drop a staged temp file: through the pinned parent for a followed link,
+ * by name otherwise. */
+static void toml_discard_temp(const cbm_config_edit_target_t *target, const char *temp_path) {
+    if (target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED) {
+        (void)cbm_config_edit_target_unlink(target, toml_temp_name(temp_path));
+    } else {
+        (void)cbm_unlink(temp_path);
+    }
+}
+
+/* For a followed link (#1954) the temp file is created with openat() beside
+ * the target and published with renameat() on the pinned parent, so the link
+ * itself is never replaced; every pre-publish comparison runs against the
+ * resolved path. A direct path keeps the mkstemp + rename sequence unchanged. */
+static int toml_write_atomic_at(const cbm_config_edit_target_t *target, const char *old_data,
+                                size_t old_len, const char *new_data, size_t new_len,
+                                const toml_file_snapshot_t *snapshot) {
     if (old_len > TOML_EDIT_MAX_BYTES || new_len > TOML_EDIT_MAX_BYTES) {
         return TOML_EDIT_ERR;
     }
+    const char *path = target->path;
+    bool followed = target->status == CBM_CONFIG_EDIT_PATH_FOLLOWED;
     if (old_len == new_len && (old_len == 0 || memcmp(old_data, new_data, old_len) == 0)) {
         return TOML_EDIT_OK;
     }
     size_t path_len = strlen(path);
     static const char suffix[] = ".XXXXXX";
-    if (path_len > SIZE_MAX - sizeof(suffix)) {
+    enum { TOML_TEMP_SUFFIX_SPACE = 48, TOML_TEMP_ATTEMPTS = 64 };
+    if (path_len > SIZE_MAX - TOML_TEMP_SUFFIX_SPACE) {
         return TOML_EDIT_ERR;
     }
-    char *temp_path = (char *)malloc(path_len + sizeof(suffix));
+    size_t temp_capacity = path_len + TOML_TEMP_SUFFIX_SPACE;
+    char *temp_path = (char *)malloc(temp_capacity);
     if (!temp_path) {
         return TOML_EDIT_ERR;
     }
-    memcpy(temp_path, path, path_len);
-    memcpy(temp_path + path_len, suffix, sizeof(suffix));
 
-    int fd = cbm_mkstemp(temp_path);
+    int fd = -1;
+    if (followed) {
+        for (unsigned attempt = 0U; attempt < TOML_TEMP_ATTEMPTS && fd < 0; attempt++) {
+            int written = snprintf(temp_path, temp_capacity, "%s.cbm-toml-%u.tmp", path, attempt);
+            if (written < 0 || (size_t)written >= temp_capacity) {
+                break;
+            }
+            fd = cbm_config_edit_target_create_temp(target, toml_temp_name(temp_path), 0600U);
+            if (fd < 0 && errno != EEXIST) {
+                break;
+            }
+        }
+    } else {
+        memcpy(temp_path, path, path_len);
+        memcpy(temp_path + path_len, suffix, sizeof(suffix));
+        fd = cbm_mkstemp(temp_path);
+    }
     if (fd < 0) {
         free(temp_path);
         return TOML_EDIT_ERR;
@@ -641,7 +692,7 @@ static int toml_write_atomic(const char *path, const char *old_data, size_t old_
     FILE *file = toml_fdopen(fd, "wb");
     if (!file) {
         (void)toml_close(fd);
-        (void)cbm_unlink(temp_path);
+        toml_discard_temp(target, temp_path);
         free(temp_path);
         return TOML_EDIT_ERR;
     }
@@ -667,7 +718,7 @@ static int toml_write_atomic(const char *path, const char *old_data, size_t old_
         failed = 1;
     }
     if (failed) {
-        (void)cbm_unlink(temp_path);
+        toml_discard_temp(target, temp_path);
         free(temp_path);
         return TOML_EDIT_ERR;
     }
@@ -678,7 +729,7 @@ static int toml_write_atomic(const char *path, const char *old_data, size_t old_
         !temp_snapshot.exists || temp_len != new_len ||
         (new_len != 0U && memcmp(temp_data, new_data, new_len) != 0)) {
         free(temp_data);
-        (void)cbm_unlink(temp_path);
+        toml_discard_temp(target, temp_path);
         free(temp_path);
         return TOML_EDIT_ERR;
     }
@@ -689,7 +740,7 @@ static int toml_write_atomic(const char *path, const char *old_data, size_t old_
     }
 #endif
     if (toml_snapshot_matches_path(path, old_data, old_len, snapshot) != TOML_EDIT_OK) {
-        (void)cbm_unlink(temp_path);
+        toml_discard_temp(target, temp_path);
         free(temp_path);
         return TOML_EDIT_ERR;
     }
@@ -700,13 +751,26 @@ static int toml_write_atomic(const char *path, const char *old_data, size_t old_
 #endif
     if (toml_snapshot_matches_path(path, old_data, old_len, snapshot) != TOML_EDIT_OK ||
         toml_snapshot_matches_path(temp_path, new_data, new_len, &temp_snapshot) != TOML_EDIT_OK ||
-        toml_replace_atomic(temp_path, path, snapshot->exists) != TOML_EDIT_OK) {
-        (void)cbm_unlink(temp_path);
+        (followed ? cbm_config_edit_target_commit(target, toml_temp_name(temp_path))
+                  : toml_replace_atomic(temp_path, path, snapshot->exists)) != TOML_EDIT_OK) {
+        toml_discard_temp(target, temp_path);
         free(temp_path);
         return TOML_EDIT_ERR;
     }
     free(temp_path);
     return TOML_EDIT_OK;
+}
+
+static int toml_write_atomic(const char *requested_path, const char *old_data, size_t old_len,
+                             const char *new_data, size_t new_len,
+                             const toml_file_snapshot_t *snapshot) {
+    cbm_config_edit_target_t target;
+    if (cbm_config_edit_target_open(requested_path, &target) < 0) {
+        return TOML_EDIT_ERR;
+    }
+    int result = toml_write_atomic_at(&target, old_data, old_len, new_data, new_len, snapshot);
+    cbm_config_edit_target_close(&target);
+    return result;
 }
 
 #ifdef CBM_TOML_EDIT_ENABLE_TEST_API

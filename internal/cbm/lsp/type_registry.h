@@ -242,6 +242,16 @@ typedef struct {
     int chain_idx;
     int tail_i;
     int tail_end;
+    /* Chain mode (see cbm_registry_*_chain): when this registry is exhausted
+     * the iterator re-opens on reg->fallback; `reg` then names the registry
+     * the yielded index belongs to, so callers deref it->reg->types[i], never
+     * the registry they started from. `key` re-opens the same query on the
+     * next link; NULL = linear scan. `shadow` is the head: fallback entries
+     * whose qualified_name the head also holds are skipped (an overlay copy
+     * hides its base original). */
+    bool chain;
+    const char *key;
+    const CBMTypeRegistry *shadow;
 } CBMTypeShortIter;
 void cbm_registry_types_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
                                       CBMTypeShortIter *out);
@@ -263,6 +273,9 @@ typedef struct {
     int tail_i;    // next tail/linear type index
     int tail_end;  // reg->type_count snapshot
     int prev_type; // last yielded type index (adjacent-dedup); -1 = none
+    bool chain;
+    const char *key;
+    const CBMTypeRegistry *shadow;
 } CBMTypeEmbedIter;
 void cbm_registry_types_by_embedded_bare(const CBMTypeRegistry *reg, const char *bare,
                                          CBMTypeEmbedIter *out);
@@ -277,6 +290,9 @@ typedef struct {
     int chain_idx;
     int tail_i;
     int tail_end;
+    bool chain;
+    const char *key;
+    const CBMTypeRegistry *shadow;
 } CBMFreeFuncIter;
 
 void cbm_registry_free_funcs_by_short_name(const CBMTypeRegistry *reg, const char *short_name,
@@ -296,10 +312,40 @@ typedef struct {
     int chain_idx;
     int tail_i;
     int tail_end;
+    bool chain;
+    const CBMTypeRegistry *shadow;
 } CBMMethodIter;
 void cbm_registry_methods(const CBMTypeRegistry *reg, const char *receiver_qn,
                           const char *method_name, CBMMethodIter *out);
 int cbm_method_iter_next(CBMMethodIter *it);
+
+/* ── Chain-aware iteration and copy-on-write (per-file overlay contract) ──
+ *
+ * A resolve walk is handed a per-file OVERLAY registry chained (`fallback`) to
+ * the immutable shared base. Lookups already chain; these make the index
+ * iterators and the whole-registry scans chain too, and give a walk one way
+ * to refine an entry: copy it into the head first. Nothing behind `fallback`
+ * is ever written. Every yielded index belongs to it->reg at that moment. */
+void cbm_registry_types_by_short_name_chain(const CBMTypeRegistry *head, const char *short_name,
+                                            CBMTypeShortIter *out);
+void cbm_registry_types_by_embedded_bare_chain(const CBMTypeRegistry *head, const char *bare,
+                                               CBMTypeEmbedIter *out);
+void cbm_registry_free_funcs_by_short_name_chain(const CBMTypeRegistry *head,
+                                                 const char *short_name, CBMFreeFuncIter *out);
+void cbm_registry_methods_chain(const CBMTypeRegistry *head, const char *receiver_qn,
+                                const char *method_name, CBMMethodIter *out);
+/* Linear scans over every func / type in the chain (head first, shadowed
+ * base entries skipped). Same iterator types, same it->reg contract. */
+void cbm_registry_all_funcs_chain(const CBMTypeRegistry *head, CBMFreeFuncIter *out);
+void cbm_registry_all_types_chain(const CBMTypeRegistry *head, CBMTypeShortIter *out);
+
+/* The writable entry for qualified_name: the head's own entry if it has one,
+ * else a copy of the first fallback entry added to the head (copy-on-write),
+ * else NULL. NULL also when the head is sealed (read_only) -- a walk must never
+ * mutate a shared registry, so the caller skips the refinement, exactly as the
+ * sealed-registry no-op in cbm_registry_add_func does today. */
+CBMRegisteredFunc *cbm_registry_func_for_update(CBMTypeRegistry *head, const char *qualified_name);
+CBMRegisteredType *cbm_registry_type_for_update(CBMTypeRegistry *head, const char *qualified_name);
 
 // --- TS-specific helpers (return NULL for types without these signatures) ---
 

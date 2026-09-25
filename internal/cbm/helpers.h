@@ -122,6 +122,13 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// Find every child node matching `kind` (unlike cbm_find_child_by_kind,
+// which stops at the first match). Writes up to `max` nodes into `out`;
+// returns how many were found. Repeated sibling nodes of the same kind are
+// common in some grammars (e.g. C#/PHP stack each `[Attr]` as its own
+// attribute_list child) — see #1692.
+int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max);
+
 /* --- Lisp-family shared gates ---------------------------------------------
  * The defs, calls and unified extractors each walk the same generic `list`
  * node and must agree on what it means. The predicates below therefore live

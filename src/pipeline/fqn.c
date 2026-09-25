@@ -282,19 +282,18 @@ static char *resolve_python_relative(char *buf, size_t buf_size, const char *mod
     return strdup(buf);
 }
 
-/* Strip a trailing file extension from a segment (e.g. "helpers.ts" → "helpers").
- * Returns the new segment length. */
-static size_t strip_ext(const char *seg_start, size_t seg_len) {
-    const char *seg_end = seg_start + seg_len;
-    const char *dot = NULL;
-    for (const char *d = seg_end - FQN_SEP_LEN; d >= seg_start; d--) {
-        if (*d == '.') {
-            dot = d;
-            break;
+/* Strip an explicit JS/TS module file extension while preserving dots that are
+ * part of an extensionless basename (e.g. "featureX.engine"). */
+static size_t strip_js_module_ext(const char *seg_start, size_t seg_len) {
+    static const char *const extensions[] = {
+        ".js", ".jsx", ".mjs", ".cjs", ".ts", ".tsx", ".mts", ".cts", ".json",
+    };
+    for (size_t i = 0; i < sizeof(extensions) / sizeof(extensions[0]); i++) {
+        size_t ext_len = strlen(extensions[i]);
+        if (seg_len > ext_len &&
+            memcmp(seg_start + seg_len - ext_len, extensions[i], ext_len) == 0) {
+            return seg_len - ext_len;
         }
-    }
-    if (dot && dot > seg_start) {
-        return (size_t)(dot - seg_start);
     }
     return seg_len;
 }
@@ -322,7 +321,7 @@ static char *resolve_js_relative(char *buf, size_t buf_size, const char *module_
             continue;
         }
         if (*p == '\0') {
-            seg_len = strip_ext(seg_start, seg_len);
+            seg_len = strip_js_module_ext(seg_start, seg_len);
         }
         if (seg_len > 0 && !path_append_segment(buf, buf_size, seg_start, seg_len)) {
             return NULL;

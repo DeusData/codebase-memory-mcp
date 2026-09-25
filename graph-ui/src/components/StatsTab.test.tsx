@@ -12,7 +12,7 @@ function mockProjectsFetch(extra?: (url: string, init?: RequestInit) => Response
     if (overridden) return overridden;
     if (url === "/rpc") {
       return new Response(JSON.stringify({
-        result: { content: [{ text: JSON.stringify({ projects: [] }) }] },
+        result: { content: [{ text: JSON.stringify({ projects: [], has_more: false }) }] },
       }), { status: 200, headers: { "Content-Type": "application/json" } });
     }
     if (url.startsWith("/api/ui-config")) {
@@ -221,8 +221,11 @@ describe("StatsTab index modal", () => {
                 root_path: "/repo",
                 indexed_at: "2026-01-01T00:00:00Z",
               }],
+              has_more: false,
             }
-          : { node_labels: [], edge_types: [], total_nodes: 0, total_edges: 0 };
+          : {
+              node_labels: [], edge_types: [], total_nodes: 0, total_edges: 0, has_more: false,
+            };
         return new Response(JSON.stringify({
           result: { content: [{ text: JSON.stringify(result) }] },
         }), { status: 200, headers: { "Content-Type": "application/json" } });

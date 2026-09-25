@@ -18,6 +18,8 @@
 #define INLINE_LEXICAL_SCOPES 64
 #define INLINE_LEXICAL_BINDINGS 64
 #define INLINE_PYTHON_DIRECTIVES 16
+#define INLINE_PY_PARAM_SLOTS 64
+#define INLINE_PY_PARAM_STACK 64
 
 // ObjectScript type map: variable name → class name (for instance_method_call
 // resolution). Stack-allocated, per-method scope. Overflow is silent (no crash).
@@ -51,6 +53,15 @@ typedef struct {
     bool raw_call_emitted;
 } CBMInvocationDescriptor;
 
+/* One name bound as a function/lambda parameter by a scope currently OPEN on
+ * the walk stack. A count, not a flag: `def outer(run): def inner(run):` binds
+ * the same name twice and the inner pop must not unbind the outer. */
+typedef struct {
+    const char *name;
+    uint32_t hash;
+    int count;
+} CBMParamSlot;
+
 typedef struct {
     const char *qn;
     uint32_t depth;
@@ -73,6 +84,9 @@ typedef struct {
     bool prev_inside_import;
     int prev_loop_depth;
     int prev_branch_depth;
+    /* #1912: py_param_stack height on entry. Pop unwinds back to it, so a
+     * frame unbinds exactly the parameters it bound and nothing else. */
+    int prev_py_param_stack_count;
 } CBMWalkScope;
 
 typedef enum {
@@ -158,10 +172,42 @@ typedef struct {
     CBMPythonDirective inline_python_directives[INLINE_PYTHON_DIRECTIVES];
     int python_directive_capacity;
     int python_directive_count;
+    /* #1912 -- Python bare-call shadowing. A name bound as a parameter by ANY
+     * enclosing function or lambda shadows every project function, so a bare
+     * `run()` under `def outer(run)` cannot honestly resolve by short name.
+     *
+     * Maintained as a live name->count map pushed and popped BY THE WALK, not
+     * recomputed per call. Walking ancestors (either ts_node_parent or a
+     * cursor) and scanning the frame stack are both O(depth) per call, and
+     * since every level of f(f(f(...))) is itself a bare call that is
+     * quadratic across the file -- the same trap CBMWalkScope records above.
+     * Lookup here is O(1), so no hop cap and no fail-open cap are needed.
+     *
+     * The other binding table (CBMLexicalBinding) cannot serve this: it is
+     * qsort-ed in cbm_finalize_lexical_usages AFTER the walk and its
+     * active_end stays 0 until then, so its binary search is invalid from
+     * handle_calls, which runs mid-walk and before handle_usages. */
+    CBMParamSlot *py_param_slots;
+    CBMParamSlot inline_py_param_slots[INLINE_PY_PARAM_SLOTS];
+    int py_param_slot_capacity;
+    int py_param_slot_used;
+    const char **py_param_stack;
+    const char *inline_py_param_stack[INLINE_PY_PARAM_STACK];
+    int py_param_stack_capacity;
+    int py_param_stack_count;
+    /* Allocation failure: stop tracking and answer "not bound" forever after,
+     * which can only cost a suppression, never a true edge. */
+    bool py_param_tracking_failed;
+
     CBMLanguage language;
 
     os_type_map_t os_type_map; // ObjectScript variable → type mapping
 } WalkState;
+
+/* #1912: is `name` bound as a parameter by a Python function or lambda scope
+ * currently open on the walk stack? O(1). Answers false on any failure, so a
+ * caller can only ever lose a suppression, never a true edge. */
+bool cbm_walk_python_param_is_bound(const WalkState *state, const char *name);
 
 // Per-node handler prototypes. Each is called once per node during the
 // unified cursor walk, replacing the old recursive walk_* functions.

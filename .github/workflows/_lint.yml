@@ -68,12 +68,12 @@ jobs:
       - name: Install build deps
         run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
 
-      - name: Install LLVM 22 (pinned analyzer toolchain)
+      - name: Install LLVM 21 (pinned analyzer toolchain)
         run: |
           wget -qO- https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc
-          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-22 main" | sudo tee /etc/apt/sources.list.d/llvm-22.list
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
           sudo apt-get update
-          sudo apt-get install -y clang-tidy-22
+          sudo apt-get install -y clang-tidy-21
 
       - name: Memory-analyzer gate
-        run: scripts/ci/lint-mem.sh clang-tidy-22
+        run: scripts/ci/lint-mem.sh clang-tidy-21

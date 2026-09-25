@@ -50,6 +50,19 @@ static const ext_entry_t EXT_TABLE[] = {
 
     /* C# */
     {".cs", CBM_LANG_CSHARP},
+    /* Blazor components. The C# grammar recovers the @code block; the
+     * surrounding markup parses as ERROR regions and is reported via
+     * parse_partial, which is why this is a best-effort mapping rather
+     * than a dedicated grammar. */
+    {".razor", CBM_LANG_CSHARP},
+    /* Razor Pages / MVC views. Same Razor syntax and the same C# host as
+     * .razor, and equally unmapped before this: an ASP.NET Core app's views
+     * produced no nodes at all. The `@page` directive that defines a Razor
+     * Page lives in this file type, so the route extraction below matters
+     * more here than it does for components. Best-effort on the same terms:
+     * the C# grammar recovers the @{ } / @functions blocks, the surrounding
+     * markup lands in ERROR regions and is reported via parse_partial. */
+    {".cshtml", CBM_LANG_CSHARP},
 
     /* Clojure */
     {".clj", CBM_LANG_CLOJURE},
@@ -308,6 +321,28 @@ static const ext_entry_t EXT_TABLE[] = {
     {".xsd", CBM_LANG_XML},
     {".xsl", CBM_LANG_XML},
     {".svg", CBM_LANG_XML},
+    /* MSBuild project system. Plain XML documents, and the files that carry a
+     * .NET repository's package references, target frameworks, build hooks and
+     * project layout — none of which were reachable while these were unmapped. */
+    {".csproj", CBM_LANG_XML},
+    {".vbproj", CBM_LANG_XML},
+    {".fsproj", CBM_LANG_XML},
+    {".props", CBM_LANG_XML},
+    {".targets", CBM_LANG_XML},
+    {".nuspec", CBM_LANG_XML},
+    {".slnx", CBM_LANG_XML},
+    {".runsettings", CBM_LANG_XML},
+    /* .NET resource files: the localized strings a UI reads back by key. */
+    {".resx", CBM_LANG_XML},
+    /* XAML views: WPF, WinUI, MAUI (.xaml) and Avalonia (.axaml). */
+    {".xaml", CBM_LANG_XML},
+    {".axaml", CBM_LANG_XML},
+    /* Application manifests: Apple property lists and privacy manifests, Win32
+     * side-by-side manifests and MSIX packages. */
+    {".plist", CBM_LANG_XML},
+    {".xcprivacy", CBM_LANG_XML},
+    {".manifest", CBM_LANG_XML},
+    {".appxmanifest", CBM_LANG_XML},
 
     /* YAML */
     {".yaml", CBM_LANG_YAML},
@@ -1236,9 +1271,49 @@ CBMLanguage cbm_disambiguate_m(const char *path) {
     return CBM_LANG_MATLAB;
 }
 
-/* Disambiguate .cls files: shared by InterSystems ObjectScript UDL and
- * Salesforce Apex. ObjectScript class files begin with a line of the form
- * "Class <UppercasePackage>...". Defaults to Apex on any doubt. */
+/* Visual Basic 6 / VBA source exports are recognisable from their header (#721):
+ * every module carries `Attribute VB_Name = "..."`, class modules open with
+ * `VERSION 1.0 CLASS`, forms/controls with `VERSION 5.00` + `Begin VB.Form` /
+ * `Begin VB.UserControl`. None of these occur in Apex or ObjectScript classes
+ * or in FORM programs, whose .cls / .frm extensions VB6 happens to share. */
+static bool has_vb6_markers(const char *buf) {
+    return str_contains(buf, "Attribute VB_Name") || str_contains(buf, "VERSION 1.0 CLASS") ||
+           str_contains(buf, "Begin VB.") || str_contains(buf, "\nOption Explicit");
+}
+
+/* Disambiguate .frm files: shared by the FORM symbolic-manipulation language
+ * and Visual Basic 6 forms (#721). There is no Visual Basic language yet, so a
+ * VB6 form is reported as unsupported (CBM_LANG_COUNT) rather than handed to
+ * the FORM grammar, which yields no defs and stray junk nodes. Defaults to
+ * FORM on any doubt (preserves existing behaviour). */
+CBMLanguage cbm_disambiguate_frm(const char *path) {
+    if (!path) {
+        return CBM_LANG_FORM;
+    }
+
+    FILE *f = cbm_fopen(path, "r");
+    if (!f) {
+        return CBM_LANG_FORM;
+    }
+
+    char buf[CBM_SZ_4K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    /* VB6 form files open with "VERSION x.yy" on line 1. */
+    if (strncmp(buf, "VERSION ", SLEN("VERSION ")) == 0 &&
+        isdigit((unsigned char)buf[SLEN("VERSION ")])) {
+        return CBM_LANG_COUNT;
+    }
+    return has_vb6_markers(buf) ? CBM_LANG_COUNT : CBM_LANG_FORM;
+}
+
+/* Disambiguate .cls files: shared by InterSystems ObjectScript UDL, Salesforce
+ * Apex and Visual Basic 6 class modules (#721). ObjectScript class files begin
+ * with a line of the form "Class <UppercasePackage>..."; VB6 class modules
+ * carry the VB6 header markers and are reported as unsupported (CBM_LANG_COUNT)
+ * until a Visual Basic grammar exists. Defaults to Apex on any doubt. */
 CBMLanguage cbm_disambiguate_cls(const char *path) {
     if (!path) {
         return CBM_LANG_APEX;
@@ -1253,6 +1328,10 @@ CBMLanguage cbm_disambiguate_cls(const char *path) {
     size_t n = fread(buf, SKIP_ONE, CBM_SZ_4K, f);
     buf[n] = '\0';
     (void)fclose(f);
+
+    if (has_vb6_markers(buf)) {
+        return CBM_LANG_COUNT;
+    }
 
     const char *line = buf;
     while (*line) {

@@ -91,8 +91,52 @@ void cbm_watcher_stop(cbm_watcher_t *w);
 /* Return the number of projects in the watch list. */
 int cbm_watcher_watch_count(cbm_watcher_t *w);
 
+/* Return a watched project's consecutive hard-index-failure count, or -1 when
+ * it is not watched. Exposed so the failure state machine (increment on a
+ * hard error, reset on success) can be asserted directly rather than inferred
+ * from the poll deadline it feeds.
+ *
+ * Memory visibility: this reads under projects_lock, but poll_project WRITES
+ * the counter outside that lock — it runs against a state snapshot taken
+ * while the lock was held, which is the same discipline the other
+ * poll-mutated fields here already follow (last_head, last_dirty_sig,
+ * interval_ms, next_poll_ns, missing_root_count). It is NOT the discipline of
+ * every field: active_git is serialized by projects_lock and registered is an
+ * atomic_bool. Reading concurrently with a live poll is therefore formally a
+ * data race and may observe a stale value; it is a diagnostic and test
+ * accessor, not a synchronisation point.
+ * Single-threaded callers (the tests, and any caller between poll cycles)
+ * always see the current value. Do not build scheduling decisions on it
+ * without first giving the counter atomic accessors. */
+int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name);
+
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
+
+/* Return the delay (ms) before the next index attempt for a project with
+ * `consecutive_failures` consecutive hard index failures. Zero failures
+ * yields `interval_ms` unchanged; each further failure doubles the delay, so
+ * a permanently failing project stops re-forking a worker at the poll cadence
+ * without ever being abandoned.
+ *
+ * Doubling stops at a fixed shift cap, so the delay plateaus at
+ * `interval_ms << INDEX_FAIL_SHIFT_MAX` — which is the ceiling only when
+ * `interval_ms` is large enough to reach it (>= 4688 ms for the current cap
+ * and ceiling). Below that the plateau sits strictly under the ceiling. Every
+ * interval this watcher generates is >= POLL_BASE_MS, so in practice the
+ * ceiling is always reached; the distinction is stated because this is an
+ * exported function and a caller may pass a smaller interval.
+ *
+ * The result is clamped at BOTH ends: never above the ceiling, and never
+ * below `interval_ms`, so backing off can only ever delay the next attempt,
+ * never bring it forward. That lower clamp matters only for an `interval_ms`
+ * already above the ceiling, which the current constants cannot produce
+ * (POLL_MAX_MS < the ceiling) — it is stated because this is an exported
+ * function and the guarantee should hold for any argument a caller passes,
+ * not only for the ones today's constants generate.
+ *
+ * Negative inputs are treated as zero. */
+int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures);
 
 /* Classify a stat() errno observed on a watched project root: returns true
  * only for values that mean the root itself is gone (ENOENT, ENOTDIR) and

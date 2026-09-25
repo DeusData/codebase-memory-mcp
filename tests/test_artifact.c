@@ -8,9 +8,13 @@
 #include "foundation/compat.h"
 #include "foundation/compat_fs.h"
 #include "foundation/log.h"
+#include "foundation/platform.h"
 
 #include <sys/stat.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <unistd.h> /* symlink for the checked-in artifact-dir link */
+#endif
 #include <stdarg.h>
 #include <string.h>
 
@@ -390,6 +394,67 @@ TEST(pipeline_persistence_export_failure_returns_error) {
 
     cleanup_dir(g_tmpdir);
     PASS();
+}
+
+/* A checkout can ship `.codebase-memory` as a symlink. Git creates it owned by
+ * whoever cloned, so it is user-owned without being user-intended, and the
+ * export uses the plain walk that does not follow user-owned links: nothing
+ * may land behind the link, and the failure names the stage. With the link
+ * gone the same export succeeds, so the refusal was the link and nothing
+ * else. */
+TEST(artifact_export_refuses_symlinked_artifact_dir) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX symlink contract");
+#else
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    char outside[1024];
+    char artifact_link[1024];
+    snprintf(outside, sizeof(outside), "%s/outside", g_tmpdir);
+    snprintf(artifact_link, sizeof(artifact_link), "%s/%s", g_repo, CBM_ARTIFACT_DIR);
+    ASSERT_TRUE(cbm_mkdir_p(outside, 0755));
+    ASSERT_EQ(symlink(outside, artifact_link), 0);
+    /* Git creates the link owned by whoever cloned. A root run must model
+     * that account as non-root: root-owned links are trusted infrastructure
+     * for every walk, which is the pre-existing contract. */
+    if (geteuid() == 0) {
+        enum { CLONING_UID = 65533 };
+        ASSERT_EQ(lchown(artifact_link, CLONING_UID, CLONING_UID), 0);
+    }
+
+    int rc = cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST);
+    ASSERT_NEQ(rc, 0);
+    const char *err = cbm_artifact_export_last_error();
+    ASSERT_NOT_NULL(err);
+    ASSERT_NOT_NULL(strstr(err, "prepare_artifact_dir"));
+
+    /* Nothing landed behind the link: not the artifact, not its metadata,
+     * not the .gitattributes the export writes first, nothing at all. */
+    char leaked[1024];
+    snprintf(leaked, sizeof(leaked), "%s/%s", outside, CBM_ARTIFACT_FILENAME);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    snprintf(leaked, sizeof(leaked), "%s/%s", outside, CBM_ARTIFACT_META);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    snprintf(leaked, sizeof(leaked), "%s/.gitattributes", outside);
+    ASSERT_FALSE(cbm_file_exists(leaked));
+    cbm_dir_t *listing = cbm_opendir(outside);
+    ASSERT_NOT_NULL(listing);
+    int entries = 0;
+    for (cbm_dirent_t *entry = cbm_readdir(listing); entry; entry = cbm_readdir(listing)) {
+        if (strcmp(entry->name, ".") != 0 && strcmp(entry->name, "..") != 0) {
+            entries++;
+        }
+    }
+    cbm_closedir(listing);
+    ASSERT_EQ(entries, 0);
+
+    ASSERT_EQ(cbm_unlink(artifact_link), 0);
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+#endif
 }
 
 TEST(artifact_null_safety) {
@@ -1040,6 +1105,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_export_rename_failure_logs_specific_error);
     RUN_TEST(pipeline_persistence_export_failure_returns_error);
     RUN_TEST(artifact_import_rejects_size_mismatch);
+    RUN_TEST(artifact_export_refuses_symlinked_artifact_dir);
     RUN_TEST(artifact_null_safety);
     RUN_TEST(artifact_export_marks_clean_basis);
     RUN_TEST(artifact_reconcile_restamps_unchanged);

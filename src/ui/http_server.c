@@ -63,8 +63,16 @@
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
 #endif
+#ifdef __FreeBSD__
+#include <sys/types.h>
+#include <sys/sysctl.h>
+#endif
 
 /* ── Constants ────────────────────────────────────────────────── */
+
+#ifndef CBM_VERSION
+#define CBM_VERSION "dev"
+#endif
 
 /* Max JSON-RPC request body size (1 MB) — transport enforces the same cap. */
 #define MAX_BODY_SIZE CBM_HTTP_MAX_BODY
@@ -143,8 +151,10 @@ static void handle_ui_config(cbm_http_conn_t *c, const cbm_http_req_t *req) {
      * audit forbids hardcoded external URLs in graph-ui source (external
      * targets must come from an auditable backend response, same pattern as
      * the /api/repo-info deep-links). */
-    cbm_http_replyf(c, 200, g_cors_json, "{\"lang\":\"%s\",\"upstream_issues_url\":\"%s\"}",
-                    lang_buf, "https://github.com/DeusData/codebase-memory-mcp/issues/new");
+    cbm_http_replyf(c, 200, g_cors_json,
+                    "{\"lang\":\"%s\",\"version\":\"%s\",\"upstream_issues_url\":\"%s\"}",
+                    lang_buf, CBM_VERSION,
+                    "https://github.com/DeusData/codebase-memory-mcp/issues/new");
 }
 
 /* ── Server state ─────────────────────────────────────────────── */
@@ -1003,6 +1013,15 @@ static bool resolve_self_executable(char *out, size_t outsz) {
         return copy_path(out, outsz, buf);
     }
     return false;
+#elif defined(__FreeBSD__)
+    /* No /proc by default on FreeBSD; ask the kernel for our own path. */
+    char buf[1024];
+    int mib[4] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+    size_t cb = sizeof(buf);
+    if (sysctl(mib, 4, buf, &cb, NULL, 0) == 0 && cb > 0) {
+        return copy_path(out, outsz, buf);
+    }
+    return false;
 #else
     char buf[1024];
     ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
@@ -1756,7 +1775,8 @@ static bool rpc_is_allowed_for_ui(const char *body, size_t body_len) {
     const char *name_text = yyjson_is_str(name) ? yyjson_get_str(name) : NULL;
     bool allowed =
         method_text && strcmp(method_text, "tools/call") == 0 && name_text &&
-        (strcmp(name_text, "list_projects") == 0 || strcmp(name_text, "get_code_snippet") == 0);
+        (strcmp(name_text, "list_projects") == 0 || strcmp(name_text, "get_graph_schema") == 0 ||
+         strcmp(name_text, "get_code_snippet") == 0);
     yyjson_doc_free(document);
     return allowed;
 }

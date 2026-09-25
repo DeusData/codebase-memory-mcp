@@ -22,6 +22,11 @@ TEST(dump_verify_sparse_at_floor) {
     PASS();
 }
 
+TEST(dump_verify_sparse_zero_persisted) {
+    ASSERT_TRUE(cbm_dump_verify_is_degraded(12, 0, 0.5, CBM_DUMP_VERIFY_MIN_FLOOR));
+    PASS();
+}
+
 TEST(dump_verify_shortfall_below_ratio) {
     ASSERT_TRUE(cbm_dump_verify_is_degraded(1000, 400, 0.5, CBM_DUMP_VERIFY_MIN_FLOOR));
     PASS();
@@ -54,6 +59,7 @@ TEST(dump_verify_count_error) {
 
 TEST(dump_verify_ratio_zero_disables) {
     ASSERT_FALSE(cbm_dump_verify_is_degraded(1000, 10, 0.0, CBM_DUMP_VERIFY_MIN_FLOOR));
+    ASSERT_FALSE(cbm_dump_verify_is_degraded(12, 0, 0.0, CBM_DUMP_VERIFY_MIN_FLOOR));
     PASS();
 }
 
@@ -76,6 +82,7 @@ TEST(dump_verify_edges_shrank_nodes_ok) {
 SUITE(dump_verify) {
     RUN_TEST(dump_verify_no_baseline);
     RUN_TEST(dump_verify_sparse_at_floor);
+    RUN_TEST(dump_verify_sparse_zero_persisted);
     RUN_TEST(dump_verify_shortfall_below_ratio);
     RUN_TEST(dump_verify_just_above_ratio);
     RUN_TEST(dump_verify_just_below_ratio);

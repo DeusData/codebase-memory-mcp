@@ -13,6 +13,11 @@ typedef struct {
     const char *source;
     int source_len;
     const CBMTypeRegistry *registry;
+    /* The writable head of the registry chain: the per-file overlay the
+     * dispatcher hands in, or the per-file registry on the non-cross path.
+     * Every refinement (lazy add, min_params, template params) goes here
+     * via cbm_registry_*_for_update; nothing behind ->fallback is written. */
+    CBMTypeRegistry *registry_head;
     CBMScope *current_scope;
 
     // Include map: header_path -> namespace QN prefix
@@ -94,9 +99,9 @@ typedef struct {
                           // READ-ONLY across resolve workers — never mutate it
                           // (and never store per-worker arena pointers into it)
     bool debug;
-    int eval_depth; // recursion depth for c_eval_expr_type (crash guard)
-    int eval_steps; // total expression eval calls for current file (hang guard)
-    int walk_depth; // c_resolve_calls_in_node self-recursion (AST nesting)
+    int eval_depth;         // recursion depth for c_eval_expr_type (crash guard)
+    int eval_steps;         // total expression eval calls for current file (hang guard)
+    int walk_depth;         // c_resolve_calls_in_node self-recursion (AST nesting)
     int control_flow_depth; // if/loop/switch/catch nesting; assignments merge fail-closed
 } CLSPContext;
 

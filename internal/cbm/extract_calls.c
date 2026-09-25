@@ -21,8 +21,6 @@
 enum { LEAN_MAX_PARENT_DEPTH = 20 };
 /* Max positional args to scan for URL/string. */
 enum { MAX_POSITIONAL_SCAN = 3 };
-/* Max positional args to scan for handler ref. */
-enum { MAX_HANDLER_SCAN = 4 };
 /* Max string arg length before rejection. */
 enum { MAX_STRING_ARG_LEN = CBM_SZ_512 };
 /* Min printable ASCII (space). */
@@ -63,7 +61,8 @@ static const char *lookup_url_builder(const CBMExtractCtx *ctx, const char *name
 static int is_string_like(const char *kind) {
     return (strcmp(kind, "string") == 0 || strcmp(kind, "string_literal") == 0 ||
             strcmp(kind, "interpreted_string_literal") == 0 ||
-            strcmp(kind, "raw_string_literal") == 0 || strcmp(kind, "string_content") == 0);
+            strcmp(kind, "raw_string_literal") == 0 || strcmp(kind, "string_content") == 0 ||
+            strcmp(kind, "line_string_literal") == 0);
 }
 
 /* Strip surrounding quotes from a string, return arena-allocated copy */
@@ -259,9 +258,18 @@ static char *extract_constructor_callee(CBMArena *a, TSNode node, const char *so
 }
 
 // Try common field-based callee resolution (function, name, method fields).
+static TSNode unwrap_await_callee(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "await_expression") != 0 ||
+        ts_node_named_child_count(node) == 0) {
+        return node;
+    }
+    return ts_node_named_child(node, 0);
+}
+
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    func_node = unwrap_await_callee(func_node);
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
         if (strcmp(fk, "selector_expression") == 0) {
@@ -528,6 +536,17 @@ static char *extract_objc_callee(CBMArena *a, TSNode node, const char *source, c
     }
     TSNode selector = ts_node_child_by_field_name(node, TS_FIELD("selector"));
     return ts_node_is_null(selector) ? NULL : cbm_node_text(a, selector, source);
+}
+
+/* tree-sitter-elixir gives a call's arguments node no field name, so it is
+ * found positionally. Mirrors elixir_call_args() in extract_defs.c, which the
+ * definition side has always used for the same reason. */
+static TSNode elixir_call_arguments_fallback(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) && ts_node_child_count(node) > 1) {
+        args = ts_node_child(node, 1);
+    }
+    return args;
 }
 
 // Erlang: extract callee from call node's first child.
@@ -2049,6 +2068,20 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     for (uint32_t ai = 0; ai < argc && call->arg_count < CBM_MAX_CALL_ARGS; ai++) {
         TSNode arg_node = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg_node);
+        /* tree-sitter lists a comment inside the argument list as a named
+         * child (Java block_comment/line_comment, C-family comment). It is
+         * not an argument: taken as one, a leading block comment became
+         * args[0] and the Route pass read its text as a URL. */
+        if (strcmp(ak, "comment") == 0 || strcmp(ak, "line_comment") == 0 ||
+            strcmp(ak, "block_comment") == 0) {
+            continue;
+        }
+        if (!call->args) {
+            call->args = cbm_arena_calloc(ctx->arena, CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+            if (!call->args) {
+                return;
+            }
+        }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
 
@@ -2247,6 +2280,61 @@ static const char *extract_binary_concat_suffix(CBMExtractCtx *ctx, TSNode node)
 }
 
 // Try to extract URL/topic from a positional argument (string or constant).
+/* Swift names its call arguments, so each one is a value_argument that may lead
+ * with a value_argument_label — the `from:` in `data(from: url)`. Return the
+ * value itself, and leave any other node exactly as it came in. */
+static TSNode swift_argument_value(TSNode arg) {
+    if (strcmp(ts_node_type(arg), "value_argument") != 0 || ts_node_named_child_count(arg) == 0) {
+        return arg;
+    }
+    TSNode val = ts_node_named_child(arg, 0);
+    if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
+        ts_node_named_child_count(arg) > 1) {
+        val = ts_node_named_child(arg, 1);
+    }
+    return val;
+}
+
+/* Swift has no URL literal, so almost no real code passes a bare string to a
+ * request. It writes `URL(string: "https://…")!` instead, and the literal then
+ * sits two levels down: past the trailing `!`, which the grammar models as a
+ * postfix_expression, and inside the constructor's own argument list.
+ *
+ * Unwrap both so that literal is as reachable as a bare one. Only the three
+ * Foundation types that take a URL string are unwrapped — any other call keeps
+ * its own meaning, and a non-literal argument such as `URL(string: base + path)`
+ * falls through to the ordinary handling unchanged. */
+static TSNode swift_unwrap_url_constructor(CBMExtractCtx *ctx, TSNode arg) {
+    /* Step past a trailing "!" or "?". */
+    if (strcmp(ts_node_type(arg), "postfix_expression") == 0) {
+        TSNode target = ts_node_child_by_field_name(arg, TS_FIELD("target"));
+        if (!ts_node_is_null(target)) {
+            arg = target;
+        }
+    }
+    if (strcmp(ts_node_type(arg), "call_expression") != 0) {
+        return arg;
+    }
+    TSNode callee = ts_node_named_child(arg, 0);
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "simple_identifier") != 0) {
+        return arg;
+    }
+    const char *name = cbm_node_text(ctx->arena, callee, ctx->source);
+    if (!name || (strcmp(name, "URL") != 0 && strcmp(name, "URLComponents") != 0 &&
+                  strcmp(name, "URLRequest") != 0)) {
+        return arg;
+    }
+    TSNode suffix = cbm_find_child_by_kind(arg, "call_suffix");
+    if (ts_node_is_null(suffix)) {
+        return arg;
+    }
+    TSNode inner = cbm_find_child_by_kind(suffix, "value_arguments");
+    if (ts_node_is_null(inner) || ts_node_named_child_count(inner) == 0) {
+        return arg;
+    }
+    return swift_argument_value(ts_node_named_child(inner, 0));
+}
+
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
     /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
      * client URL joins the server route's canonical placeholder (issue #1006). */
@@ -2287,6 +2375,15 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
          * unwrap to the underlying value so the URL string is reachable. */
         if (strcmp(ts_node_type(arg), "argument") == 0 && ts_node_named_child_count(arg) > 0) {
             arg = ts_node_named_child(arg, 0);
+        }
+        /* Swift wraps each argument in a value_argument that may lead with its
+         * label, so `data(from: url)` would otherwise yield the label `from`
+         * rather than the value. */
+        arg = swift_argument_value(arg);
+        /* A Swift URL is usually built rather than written bare, and the
+         * literal then sits inside that constructor. */
+        if (ctx->language == CBM_LANG_SWIFT) {
+            arg = swift_unwrap_url_constructor(ctx, arg);
         }
         const char *ak = ts_node_type(arg);
 
@@ -2349,8 +2446,17 @@ static const char *normalize_string_handler(CBMArena *a, const char *raw) {
 }
 
 static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
+    /* The LAST eligible argument wins, and every argument is examined.
+     * Express, Fastify, gin and Laravel all put middleware between the route
+     * path and the handler, so the first function-shaped argument is usually a
+     * middleware. Taking the first one pointed the HANDLES edge at the
+     * middleware; stopping the scan early missed the handler outright when the
+     * middleware was written inline, because an arrow function matches none of
+     * the kinds below. Nothing that follows a handler matches them either — an
+     * options argument is an object node — so the last match is the handler. */
+    const char *handler = NULL;
     uint32_t nc = ts_node_named_child_count(args);
-    for (uint32_t ai = HANDLER_START_IDX; ai < nc && ai < MAX_HANDLER_SCAN; ai++) {
+    for (uint32_t ai = HANDLER_START_IDX; ai < nc; ai++) {
         TSNode arg2 = ts_node_named_child(args, ai);
         /* PHP wraps each argument in an `argument` node — unwrap to the value. */
         if (strcmp(ts_node_type(arg2), "argument") == 0 && ts_node_named_child_count(arg2) > 0) {
@@ -2362,17 +2468,18 @@ static const char *extract_handler_arg(CBMExtractCtx *ctx, TSNode args) {
         if (strcmp(ak2, "identifier") == 0 || strcmp(ak2, "member_expression") == 0 ||
             strcmp(ak2, "selector_expression") == 0 || strcmp(ak2, "attribute") == 0 ||
             strcmp(ak2, "field_expression") == 0 || strcmp(ak2, "name") == 0) {
-            return cbm_node_text(ctx->arena, arg2, ctx->source);
+            handler = cbm_node_text(ctx->arena, arg2, ctx->source);
+            continue;
         }
         if (is_string_like(ak2)) {
             const char *h =
                 normalize_string_handler(ctx->arena, cbm_node_text(ctx->arena, arg2, ctx->source));
             if (h && h[0]) {
-                return h;
+                handler = h;
             }
         }
     }
-    return NULL;
+    return handler;
 }
 
 // Extract JSX component refs (uppercase tags) as CALLS edges.
@@ -2918,6 +3025,28 @@ static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const 
  * statically-known type here, so the call must not bind by short name alone.
  * Note `self.client.send()` is NOT exempt: the receiver is `self.client`, an
  * attribute of unknown type, not `self` itself. */
+/* True when a Python attribute-call receiver is an attribute chain ROOTED at
+ * self/cls but is not self/cls itself: `self.compiler.apply_converters()` has
+ * receiver `self.compiler`, an object the class owns. The weak-member guard's
+ * unique-name exemption keys on this shape (see cbm_weak_member_unique_name_
+ * exempt): a bare parameter (`accelerator.backward()`) carries no ownership
+ * evidence and stays suppressed. Direct `self.m()` is already exempt via
+ * python_receiver_is_exempt and is deliberately NOT flagged here. */
+static bool python_receiver_rooted_at_self(CBMExtractCtx *ctx, TSNode receiver) {
+    if (ts_node_is_null(receiver) || strcmp(ts_node_type(receiver), "attribute") != 0) {
+        return false;
+    }
+    TSNode root = receiver;
+    while (!ts_node_is_null(root) && strcmp(ts_node_type(root), "attribute") == 0) {
+        root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, root, ctx->source);
+    return name && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0);
+}
+
 static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
     if (ts_node_is_null(receiver)) {
         return false;
@@ -2963,6 +3092,41 @@ static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
         }
     }
     return false;
+}
+
+/* Name bound by one Python parameter node, or NULL when the shape binds none.
+ * Covers every binding form a `parameters` / `lambda_parameters` list produces:
+ * a bare `identifier`, the `name` field of default/typed parameters, and the
+ * identifier under a `*args` / `**kwargs` splat. A shape with no identifier (the
+ * bare `*` keyword separator) yields NULL and simply matches nothing. */
+/* True when the callee of a BARE Python call `foo()` is bound as a parameter of
+ * an enclosing function or lambda -- the bare-call counterpart of
+ * python_receiver_is_exempt above.
+ *
+ * A parameter binding shadows any module-level `foo` for the whole body, so
+ * resolving such a call to a project Function/Method by short name alone
+ * fabricates the edge BY CONSTRUCTION: `def _run_with_heavy_slot(run): run()`
+ * must not bind an unrelated `SatoriLive.run`. Unlike a receiver type this is
+ * decidable from the AST outright, with no flow analysis and no list of
+ * "generic-looking" callee names -- Python forbids `global` on a parameter, and
+ * a parameter is in scope for the entire body regardless of position.
+ *
+ * The answer is CARRIED BY THE WALK rather than recomputed here. The unified
+ * walk binds a def's or lambda's parameters when it opens that scope and
+ * unwinds them when it closes it, so this is an O(1) map lookup. Deciding it
+ * by ascending the tree instead -- with ts_node_parent() or with a copied walk
+ * cursor -- costs O(depth) per call, and since every level of f(f(f(...))) is
+ * itself a bare call, that is quadratic across the file: the 30,000-deep
+ * fixture in tests/test_stack_overflow.c turned it into a hang rather than a
+ * slowdown. An O(1) lookup needs no hop cap, so unlike a capped walk this can
+ * no longer fail open on deep-but-ordinary code.
+ *
+ * It still answers false if the walk's own tracking hit an allocation failure,
+ * which costs a suppression and never a true edge. */
+static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, WalkState *state,
+                                             TSNode callee_ident) {
+    const char *callee_name = cbm_node_text(ctx->arena, callee_ident, ctx->source);
+    return cbm_walk_python_param_is_bound(state, callee_name);
 }
 
 static bool is_objectscript_language(CBMLanguage language) {
@@ -3035,6 +3199,19 @@ static TSNode objectscript_call_args(TSNode node) {
     TSNode macro_function = cbm_find_child_by_kind(node, "macro_function");
     return ts_node_is_null(macro_function) ? (TSNode){0}
                                            : cbm_find_child_by_kind(macro_function, "method_args");
+}
+
+/* Swift models a call as a target expression plus a call_suffix, and its grammar
+ * declares no "arguments" field at all, so the generic field lookup finds
+ * nothing for every Swift call. Reach the argument list through the suffix
+ * instead. A trailing closure has a call_suffix with no value_arguments, which
+ * returns a null node and leaves the call without a string argument, as before. */
+static TSNode swift_call_args(TSNode node) {
+    TSNode suffix = cbm_find_child_by_kind(node, "call_suffix");
+    if (ts_node_is_null(suffix)) {
+        return (TSNode){0};
+    }
+    return cbm_find_child_by_kind(suffix, "value_arguments");
 }
 
 static bool node_has_token(TSNode node, const char *token) {
@@ -3435,6 +3612,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     }
 
     selection.expr = language_specific_callee_expr(ctx->language, node);
+    selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};
         return selection;
@@ -3589,11 +3767,19 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             // (`accelerator.print()` must not bind MockAccelerator.print).
             // Imported receivers stay unflagged: module.function() is Python's
             // canonical cross-file call and the import map resolves it.
+            // A BARE Python call foo() whose callee is bound as a parameter of an
+            // enclosing scope cannot be the module-level foo, so short-name
+            // resolution would fabricate the edge (`def f(run): run()` must not
+            // bind SatoriLive.run). Distinct from is_method: there is no receiver
+            // here, so the weak-member guard cannot see this class at all.
             if (ctx->language == CBM_LANG_PYTHON && strcmp(ts_node_type(node), "call") == 0) {
                 TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
+                    call.receiver_is_self_attribute = python_receiver_rooted_at_self(ctx, obj);
+                } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
+                    call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, state, fn);
                 }
             }
             // TS/JS/TSX receiver-aware guard (#592/#606 direction; same intent
@@ -3621,10 +3807,29 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            /* tree-sitter-elixir attaches NO field name to a call's arguments
+             * node — its whole field set is key, left, operand, operator,
+             * quoted_start, quoted_end, right, target, value — so the lookup
+             * above is always null for Elixir and first_string_arg was never
+             * populated for ANY Elixir call. That silently disabled every
+             * downstream signal keyed off a call's string argument: Phoenix
+             * route paths, HTTP/async service URLs, and config keys.
+             * cbm_elixir_call_args is the shared second-child fallback the
+             * definition side already uses. Restricted to `call` nodes —
+             * Elixir's other call kinds (`dot`, the `|>` binary_operator) have
+             * no arguments node in that position. */
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_ELIXIR &&
+                strcmp(ts_node_type(node), "call") == 0) {
+                args = elixir_call_arguments_fallback(node);
+            }
             // ObjectScript stores args under oref_method/method_args, not the
             // generic "arguments" field; macro arguments add one wrapper.
             if (ts_node_is_null(args) && is_objectscript_language(ctx->language)) {
                 args = objectscript_call_args(node);
+            }
+            // Swift has no "arguments" field either; its args hang off call_suffix.
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_SWIFT) {
+                args = swift_call_args(node);
             }
             if (!ts_node_is_null(args)) {
                 call.first_string_arg = extract_url_or_topic_arg(ctx, args);
@@ -3661,6 +3866,13 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                         if (strcmp(ack, "method_arg") != 0) {
                             continue;
+                        }
+                        if (!call.args) {
+                            call.args = cbm_arena_calloc(ctx->arena,
+                                                         CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+                            if (!call.args) {
+                                break;
+                            }
                         }
                         CBMCallArg *ca = &call.args[call.arg_count];
                         memset(ca, 0, sizeof(*ca));
