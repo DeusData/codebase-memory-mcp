@@ -428,6 +428,13 @@ char *cbm_project_name_from_path(const char *abs_path) {
         cbm_normalize_path_sep(real);
         name_path = real;
     }
+    return cbm_project_name_sanitize(name_path);
+}
+
+char *cbm_project_name_sanitize(const char *name_path) {
+    if (!name_path || !name_path[0]) {
+        return strdup("root");
+    }
 
     /* Work on mutable copy */
     char *path = strdup(name_path);
