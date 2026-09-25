@@ -4,6 +4,7 @@
  * Polls indexed projects for git changes (HEAD movement or dirty working tree)
  * and triggers re-indexing via a callback. Uses adaptive polling intervals
  * based on project size (5s base + 1s per 500 files, capped at 60s).
+ * Non-git roots are not polled unless cbm_watcher_set_poll_non_git() opts in.
  *
  * Depends on: foundation, store (for project metadata)
  */
@@ -58,6 +59,17 @@ void cbm_watcher_set_project_mutation_guard(cbm_watcher_t *w,
                                             cbm_watcher_project_mutation_begin_fn begin,
                                             cbm_watcher_project_mutation_end_fn end,
                                             cbm_watcher_project_pruned_fn pruned, void *context);
+
+/* Opt in to polling NON-GIT project roots (#1948; default off — non-git roots
+ * are not watched). When on, a non-git root is polled on the same adaptive
+ * cadence by a tree signature: the indexer's own discovery walk (same skip
+ * lists, .gitignore and .cbmignore rules), folded over each file's (relative
+ * path, size, mtime). A changed signature triggers index_fn; the first poll
+ * after baseline reindexes once, since nothing records which tree state the
+ * index holds. Paths discovery skips — including cbm's own .codebase-memory
+ * artifact directory and cache directory — never change the signature.
+ * Read at each project's baseline, so set it before registering projects. */
+void cbm_watcher_set_poll_non_git(cbm_watcher_t *w, bool enabled);
 
 /* ── Watch list management ──────────────────────────────────────── */
 

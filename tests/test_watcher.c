@@ -2291,6 +2291,207 @@ TEST(watcher_non_git_skips) {
 }
 
 /* ══════════════════════════════════════════════════════════════════
+ *  NON-GIT TREE POLLING (#1948, opt-in)
+ * ══════════════════════════════════════════════════════════════════ */
+
+/* Bypass the adaptive interval and run one poll cycle; returns the number of
+ * reindexes that cycle performed. */
+static int nongit_poll(cbm_watcher_t *w, const char *project) {
+    cbm_watcher_touch(w, project);
+    return cbm_watcher_poll_once(w);
+}
+
+/* Control: with the opt-in OFF (the default) a non-git root is never
+ * refreshed, however its indexable files change. watcher_non_git_skips covers
+ * this with .txt files discovery ignores anyway; this uses a real source file
+ * so the ON tests below differ from it ONLY in the opt-in. */
+TEST(watcher_non_git_opt_in_off_never_polls_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_off_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_watch(w, "ng-off", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef gamma():\n    return 3\n");
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    th_write_file(TH_PATH(tmpdir, "new.py"), "def beta():\n    return 2\n");
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    ASSERT_EQ(remove(TH_PATH(tmpdir, "new.py")), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-off"), 0);
+    ASSERT_EQ(index_call_count, 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* #1948: a project indexed from a plain directory stayed frozen at its first
+ * index forever. With watch_non_git on, the watcher polls it by tree
+ * signature: the first poll after baseline catches up once (nothing records
+ * which tree state the index holds), then every edit, addition and deletion
+ * of an indexable file triggers exactly one reindex, and an untouched tree
+ * triggers none. */
+TEST(watcher_non_git_opt_in_detects_edit_add_delete_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_on_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+    th_write_file(TH_PATH(tmpdir, "pkg/util.py"), "def helper():\n    return 0\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_set_poll_non_git(w, true);
+    cbm_watcher_watch(w, "ng-on", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline: classification only */
+    ASSERT_EQ(index_call_count, 0);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1); /* at-least-once catch-up */
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0); /* untouched tree: stable */
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    /* Edit (the reporter's repro: append a function). */
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef gamma_uniquename():\n    return 2\n");
+    /* The adaptive interval still gates polling: no touch, no check. */
+    ASSERT_EQ(cbm_watcher_poll_once(w), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    /* Add, in a subdirectory. */
+    th_write_file(TH_PATH(tmpdir, "pkg/extra.py"), "def extra():\n    return 4\n");
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    /* Delete. */
+    ASSERT_EQ(remove(TH_PATH(tmpdir, "pkg/extra.py")), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-on"), 0);
+
+    ASSERT_EQ(index_call_count, 4);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* Simulates the daemon's index worker writing cbm's own output under the root
+ * on every successful reindex (the artifact re-export of #1953). */
+static int own_output_index_callback(const char *name, const char *path, void *ud) {
+    (void)name;
+    (void)ud;
+    index_call_count++;
+    th_append_file(TH_PATH(path, CBM_ARTIFACT_DIR "/graph.py"), "# rewritten by index\n");
+    return 0;
+}
+
+/* The signature must only see what the indexer would index. Paths discovery
+ * skips — cbm's own .codebase-memory output, built-in skip dirs, .cbmignore'd
+ * paths, non-source files — never trigger, and in particular a reindex that
+ * rewrites cbm's own output must not look like a new change on the next poll
+ * (the runaway-reindex history of #841/#937/#1953). */
+TEST(watcher_non_git_opt_in_ignores_skipped_paths_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_ign_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+    th_write_file(TH_PATH(tmpdir, ".cbmignore"), "ignored/\n");
+    th_write_file(TH_PATH(tmpdir, CBM_ARTIFACT_DIR "/graph.py"), "# artifact\n");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, own_output_index_callback, NULL);
+    cbm_watcher_set_poll_non_git(w, true);
+    cbm_watcher_watch(w, "ng-ign", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w);               /* baseline */
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 1); /* catch-up; rewrites own output */
+    /* The reindex's own write must not retrigger. */
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+
+    th_write_file(TH_PATH(tmpdir, "ignored/skip.py"), "def skipped():\n    return 0\n");
+    th_write_file(TH_PATH(tmpdir, "node_modules/dep/index.js"), "module.exports = 1;\n");
+    th_write_file(TH_PATH(tmpdir, "logo.png"), "not really a png\n");
+    th_append_file(TH_PATH(tmpdir, CBM_ARTIFACT_DIR "/graph.py"), "# touched\n");
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+    ASSERT_EQ(index_call_count, 1);
+
+    /* Positive control in the same tree: an indexable edit still triggers. */
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef beta():\n    return 2\n");
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-ign"), 0);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* The opt-in changes nothing for git roots: a clean repository does not get
+ * the tree strategy's catch-up reindex and still reacts to commits only. A
+ * plain folder under an unrelated dirty repository is tree-polled on its OWN
+ * files and never inherits the ancestor's dirty state. */
+TEST(watcher_non_git_opt_in_leaves_git_roots_unchanged_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_watcher_ng_git_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    if (wt_git(tmpdir, "init -q") != 0) {
+        th_rmtree(tmpdir);
+        FAIL("git init failed");
+    }
+    th_write_file(TH_PATH(tmpdir, "app.py"), "def alpha():\n    return 1\n");
+    wt_git(tmpdir, "add app.py");
+    wt_git(tmpdir, "commit -q -m init");
+
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+    cbm_watcher_set_poll_non_git(w, true);
+    cbm_watcher_watch(w, "ng-git", tmpdir);
+    index_call_count = 0;
+
+    cbm_watcher_poll_once(w); /* baseline */
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 0);
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 0);
+    th_append_file(TH_PATH(tmpdir, "app.py"), "\ndef beta():\n    return 2\n");
+    wt_git(tmpdir, "commit -q -am second");
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 1);
+    ASSERT_EQ(nongit_poll(w, "ng-git"), 0);
+
+    /* Now a scratch folder under the (permanently dirty) repository. */
+    th_write_file(TH_PATH(tmpdir, "dirty.txt"), "uncommitted\n");
+    char nested[400];
+    snprintf(nested, sizeof(nested), "%s/scratch", tmpdir);
+    th_write_file(TH_PATH(nested, "notes.py"), "def note():\n    return 0\n");
+    cbm_watcher_unwatch(w, "ng-git");
+    cbm_watcher_watch(w, "ng-nested", nested);
+    index_call_count = 0;
+    cbm_watcher_poll_once(w);                  /* baseline: nested non-git */
+    ASSERT_EQ(nongit_poll(w, "ng-nested"), 1); /* tree catch-up */
+    for (int i = 0; i < 3; i++) {
+        ASSERT_EQ(nongit_poll(w, "ng-nested"), 0); /* ancestor dirt ignored */
+    }
+    th_append_file(TH_PATH(nested, "notes.py"), "\ndef more():\n    return 1\n");
+    ASSERT_EQ(nongit_poll(w, "ng-nested"), 1);
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    th_rmtree(tmpdir);
+    PASS();
+}
+
+/* ══════════════════════════════════════════════════════════════════
  *  ADAPTIVE INTERVAL BEHAVIOR
  * ══════════════════════════════════════════════════════════════════ */
 
@@ -3625,6 +3826,10 @@ SUITE(watcher) {
 
     /* Non-git project */
     RUN_TEST(watcher_non_git_skips);
+    RUN_TEST(watcher_non_git_opt_in_off_never_polls_issue1948);
+    RUN_TEST(watcher_non_git_opt_in_detects_edit_add_delete_issue1948);
+    RUN_TEST(watcher_non_git_opt_in_ignores_skipped_paths_issue1948);
+    RUN_TEST(watcher_non_git_opt_in_leaves_git_roots_unchanged_issue1948);
 
     /* Adaptive interval behavior */
     RUN_TEST(watcher_interval_blocks_repoll);

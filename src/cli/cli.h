@@ -445,6 +445,7 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
 #define CBM_CONFIG_AUTO_WATCH "auto_watch"
 #define CBM_CONFIG_UI_LANG "ui-lang"
 #define CBM_CONFIG_WATCHER_ENABLED "watcher_enabled"
+#define CBM_CONFIG_WATCH_NON_GIT "watch_non_git"
 /* #1558: the graph UI's loopback listener. Stored in the UI config file rather
  * than the key-value store, but surfaced through `config` so it is findable. */
 #define CBM_CONFIG_UI_ENABLED "ui_enabled"
@@ -458,6 +459,11 @@ bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t
  * default (true), so a failure to open the config store never silently disables
  * the watcher. */
 bool cbm_config_watcher_enabled(cbm_config_t *cfg);
+
+/* Whether the watcher also polls NON-GIT project roots (default false, #1948).
+ * Non-git roots are otherwise never refreshed after their first index. Read
+ * once at daemon startup, like watcher_enabled. NULL-safe (NULL → false). */
+bool cbm_config_watch_non_git(cbm_config_t *cfg);
 
 /* ── Binary activation safety ─────────────────────────────────── */
 

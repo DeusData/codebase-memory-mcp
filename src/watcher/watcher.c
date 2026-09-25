@@ -2,7 +2,10 @@
  * watcher.c — Git-based file change watcher.
  *
  * Strategy: git status + HEAD tracking (the most reliable approach).
- * For non-git projects, the watcher skips polling (no fsnotify/dirmtime yet).
+ * Non-git projects are NOT polled by default. With the opt-in
+ * cbm_watcher_set_poll_non_git(w, true) (config key `watch_non_git`, #1948)
+ * they are polled with a tree signature instead: the indexer's own discovery
+ * walk (same ignore rules), folded over (relative path, size, mtime).
  *
  *
  * Per-project state tracks:
@@ -32,6 +35,7 @@
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
 #include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
+#include "discover/discover.h" /* cbm_discover: the non-git tree signature (#1948) */
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #define WIN32_LEAN_AND_MEAN
@@ -61,7 +65,8 @@ typedef struct {
     cbm_subprocess_t *active_git;
     /* Room for Git's 64-hex SHA-256 object ID plus newline/NUL while reading. */
     char last_head[CBM_SZ_128]; /* git HEAD hash (committed baseline) */
-    bool is_git;                /* false → skip polling */
+    bool is_git;                /* false → tree-polled if tree_poll, else skipped */
+    bool tree_poll;             /* non-git root polled by tree signature (#1948) */
     bool baseline_done;         /* true after first poll */
     int missing_root_count;     /* consecutive polls where root was missing (ENOENT/ENOTDIR) */
     uint64_t first_missing_ms;  /* cbm_now_ms() of the streak's first miss (0 = no streak) */
@@ -73,8 +78,14 @@ typedef struct {
      * are committed only after a SUCCESSFUL reindex (busy-skips and failed
      * runs retry); check_changes stages its observations in the pending_*
      * fields. 0 = clean tree. */
-    uint64_t last_dirty_sig;       /* committed dirty-state signature */
-    uint64_t pending_dirty_sig;    /* observed at check time */
+    uint64_t last_dirty_sig;    /* committed dirty-state signature */
+    uint64_t pending_dirty_sig; /* observed at check time */
+    /* Non-git tree signature (#1948), same commit discipline as the dirty
+     * signature. 0 = unknown: the baseline never adopts the tree as already
+     * indexed, so the first poll reindexes once (at-least-once, like a tree
+     * that is already dirty at a git baseline). Signatures are never 0. */
+    uint64_t last_tree_sig;
+    uint64_t pending_tree_sig;
     char pending_head[CBM_SZ_128]; /* HEAD observed at check time */
     /* Consecutive hard index failures (index_fn < 0). A hard error is
      * usually persistent — a poisoned coordination endpoint, an unreadable
@@ -106,6 +117,9 @@ struct cbm_watcher {
     cbm_watcher_project_pruned_fn project_pruned;
     void *mutation_context;
     atomic_int stopped;
+    /* Opt-in (#1948): poll non-git roots by tree signature. Default false —
+     * non-git roots are not watched. Read at each project's baseline. */
+    atomic_bool poll_non_git;
     /* Deferred-free list: freed after the next poll_once. */
     project_state_t **pending_free;
     int pending_free_count;
@@ -850,6 +864,46 @@ static watcher_git_status_t git_file_count(cbm_watcher_t *w, project_state_t *st
     return WATCHER_GIT_OK;
 }
 
+/* ── Non-git tree signature (#1948) ─────────────────────────────── */
+
+static int tree_entry_cmp(const void *a, const void *b) {
+    const cbm_file_info_t *fa = a;
+    const cbm_file_info_t *fb = b;
+    return strcmp(fa->rel_path, fb->rel_path);
+}
+
+/* Signature of a non-git tree: FNV-1a over every file the INDEXER would
+ * discover (cbm_discover, full mode — the same skip lists, .gitignore stack
+ * and .cbmignore), folding each (relative path, size, mtime) in path order so
+ * readdir order cannot change the value. Adding, deleting, renaming or editing
+ * an indexable file yields a new signature; touching anything discovery skips
+ * does not. That includes everything cbm writes itself: the .codebase-memory
+ * artifact directory is a built-in skip and the cache directory is pruned by
+ * absolute path, so a successful reindex can never look like a new change
+ * (the runaway history in init_baseline and #1953). Never returns 0 in
+ * *sig_out, which stays reserved for "unknown". */
+static bool tree_signature(const char *root_path, uint64_t *sig_out, int *count_out) {
+    cbm_discover_opts_t opts = {.mode = CBM_MODE_FULL};
+    cbm_file_info_t *files = NULL;
+    int count = 0;
+    if (cbm_discover(root_path, &opts, &files, &count) != 0) {
+        return false;
+    }
+    if (count > 1) {
+        qsort(files, (size_t)count, sizeof(*files), tree_entry_cmp);
+    }
+    uint64_t h = SIG_FNV_OFFSET;
+    for (int i = 0; i < count; i++) {
+        h = sig_fold(h, files[i].rel_path, strlen(files[i].rel_path) + SKIP_ONE);
+        h = sig_fold(h, &files[i].size, sizeof(files[i].size));
+        h = sig_fold(h, &files[i].mtime_ns, sizeof(files[i].mtime_ns));
+    }
+    cbm_discover_free(files, count);
+    *sig_out = h ? h : 1;
+    *count_out = count;
+    return true;
+}
+
 /* ── Project state lifecycle ────────────────────────────────────── */
 
 static void state_free(project_state_t *s);
@@ -1041,7 +1095,14 @@ cbm_watcher_t *cbm_watcher_new(cbm_store_t *store, cbm_index_fn index_fn, void *
     cbm_mutex_init(&w->projects_lock);
     cbm_mutex_init(&w->coordination_lock);
     atomic_init(&w->stopped, 0);
+    atomic_init(&w->poll_non_git, false);
     return w;
+}
+
+void cbm_watcher_set_poll_non_git(cbm_watcher_t *w, bool enabled) {
+    if (w) {
+        atomic_store_explicit(&w->poll_non_git, enabled, memory_order_release);
+    }
 }
 
 void cbm_watcher_free(cbm_watcher_t *w) {
@@ -1237,8 +1298,10 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
      * A directory is only really git-managed here if it carries its own .git,
      * or the ancestor repository actually tracks something inside it. A
      * genuine sub-package of a monorepo passes the second test; a scratch or
-     * gitignored folder sitting under a repo fails both and is polled as a
-     * plain directory instead. */
+     * gitignored folder sitting under a repo fails both and is treated as a
+     * non-git root: NOT polled by default, or polled by its own tree signature
+     * when the watch_non_git opt-in is on (#1948). Either way the ancestor's
+     * dirty state never reaches it. */
     if (s->is_git && !git_has_own_dot_git(s->root_path)) {
         bool tracked = false;
         watcher_git_status_t tracked_status = git_tracks_anything_here(w, s, &tracked);
@@ -1281,6 +1344,14 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
         s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "git", "files",
                      s->file_count > 0 ? "yes" : "0");
+    } else if (atomic_load_explicit(&w->poll_non_git, memory_order_acquire)) {
+        /* #1948 opt-in. last_tree_sig stays 0 ("unknown"): nothing records
+         * which tree state the DB holds (edits made while the daemon was down
+         * are exactly the silent-staleness case), so the first poll reindexes
+         * once and the signature gates every poll after it. The interval is
+         * sized from the file count of each signature walk. */
+        s->tree_poll = true;
+        cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "tree");
     } else {
         cbm_log_info("watcher.baseline", "project", s->project_name, "strategy", "none");
     }
@@ -1294,13 +1365,31 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
  * poll_project commits them only after a SUCCESSFUL reindex so that
  * busy-skips and failed runs retry instead of silently losing the change
  * (#937). Observations are staged in the pending_* fields. */
+/* Non-git leg of check_changes (#1948). A failed walk reports "no verdict"
+ * (false) so the committed baseline is kept and a later poll retries. */
+static bool check_tree_changes(project_state_t *s, bool *changed_out) {
+    uint64_t sig = 0;
+    int file_count = 0;
+    if (!tree_signature(s->root_path, &sig, &file_count)) {
+        cbm_log_warn("watcher.tree_walk_failed", "project", s->project_name, "path", s->root_path);
+        /* Retry at the regular cadence, not on every run-loop tick. */
+        s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+        return false;
+    }
+    s->pending_tree_sig = sig;
+    s->file_count = file_count;
+    s->interval_ms = cbm_watcher_poll_interval_ms(file_count);
+    *changed_out = sig != s->last_tree_sig;
+    return true;
+}
+
 static bool check_changes(cbm_watcher_t *w, project_state_t *s, bool *changed_out) {
     if (!changed_out) {
         return false;
     }
     *changed_out = false;
     if (!s->is_git) {
-        return true;
+        return s->tree_poll ? check_tree_changes(s, changed_out) : true;
     }
 
     bool changed = false;
@@ -1415,6 +1504,28 @@ static void prune_missing_project(cbm_watcher_t *w, project_state_t *s) {
     free(root_path);
 }
 
+/* After a SUCCESSFUL reindex, commit the baselines OBSERVED AT CHECK TIME —
+ * the state whose reindex just succeeded. A commit/edit landing during the
+ * reindex is deliberately not absorbed: the next poll sees it as a new delta
+ * (at-least-once, never lost). */
+static void commit_baselines(cbm_watcher_t *w, project_state_t *s) {
+    if (!s->is_git) {
+        /* Tree strategy (#1948): the walk already refreshed the file count. */
+        s->last_tree_sig = s->pending_tree_sig;
+        return;
+    }
+    if (s->pending_head[0] != '\0') {
+        snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
+    }
+    s->last_dirty_sig = s->pending_dirty_sig;
+    /* Refresh file count for interval */
+    int file_count = 0;
+    if (git_file_count(w, s, &file_count) == WATCHER_GIT_OK) {
+        s->file_count = file_count;
+        s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+    }
+}
+
 static void poll_project(const char *key, void *val, void *ud) {
     (void)key;
     poll_ctx_t *ctx = ud;
@@ -1467,8 +1578,9 @@ static void poll_project(const char *key, void *val, void *ud) {
         return;
     }
 
-    /* Skip non-git projects */
-    if (!s->is_git) {
+    /* Non-git projects are skipped unless the watch_non_git opt-in turned on
+     * tree polling for them at baseline (#1948). */
+    if (!s->is_git && !s->tree_poll) {
         return;
     }
 
@@ -1494,26 +1606,14 @@ static void poll_project(const char *key, void *val, void *ud) {
          * not admit an index callback after that ownership boundary. */
         return;
     }
-    cbm_log_info("watcher.changed", "project", s->project_name, "strategy", "git");
+    cbm_log_info("watcher.changed", "project", s->project_name, "strategy",
+                 s->is_git ? "git" : "tree");
     if (ctx->w->index_fn) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
             s->index_failures = 0;
-            /* Commit the baselines OBSERVED AT CHECK TIME — the state whose
-             * reindex just succeeded. A commit/edit landing during the
-             * reindex is deliberately not absorbed: the next poll sees it
-             * as a new delta (at-least-once, never lost). */
-            if (s->pending_head[0] != '\0') {
-                snprintf(s->last_head, sizeof(s->last_head), "%s", s->pending_head);
-            }
-            s->last_dirty_sig = s->pending_dirty_sig;
-            /* Refresh file count for interval */
-            int file_count = 0;
-            if (git_file_count(ctx->w, s, &file_count) == WATCHER_GIT_OK) {
-                s->file_count = file_count;
-                s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
-            }
+            commit_baselines(ctx->w, s);
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
             cbm_log_info("watcher.index.retry", "project", s->project_name);
