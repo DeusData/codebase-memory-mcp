@@ -20,6 +20,7 @@ typedef struct {
     int projects_scanned;
     double elapsed_ms;
     bool failed;          /* source/target validation, open, or allocation failed */
+    bool no_targets;      /* failed: nothing but the source project resolved (#1133) */
     bool cancelled;       /* stopped at a bounded cancellation checkpoint */
     bool partial_results; /* committed writes before cancellation were retained */
 } cbm_cross_repo_result_t;

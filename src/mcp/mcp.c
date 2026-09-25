@@ -9921,6 +9921,14 @@ static char *handle_cross_repo_mode(cbm_mcp_server_t *srv, const char *repo_path
     free(lease_keys);
     yyjson_doc_free(jdoc);
 
+    if (result.no_targets) {
+        free(project);
+        return cbm_mcp_text_result(
+            "cross-repo-intelligence resolved zero target projects: no indexed project other "
+            "than the source matched target_projects. Index the other service first (run "
+            "list_projects to see what is indexed); existing cross-repo edges were left unchanged.",
+            true);
+    }
     if (result.failed) {
         free(project);
         return cbm_mcp_text_result(
