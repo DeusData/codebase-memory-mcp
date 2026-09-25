@@ -1771,6 +1771,23 @@ TEST(mcp_get_int_arg) {
     ASSERT_EQ(val, 5);
     val = cbm_mcp_get_int_arg(args, "missing", 42);
     ASSERT_EQ(val, 42);
+    /* Out-of-int-range integers return the default instead of truncating:
+     * 2^32 + 1 used to read back as 1 through yyjson_get_int's int cast. */
+    val = cbm_mcp_get_int_arg("{\"limit\":4294967297}", "limit", 17);
+    ASSERT_EQ(val, 17);
+    val = cbm_mcp_get_int_arg("{\"limit\":-4294967297}", "limit", 19);
+    ASSERT_EQ(val, 19);
+    val = cbm_mcp_get_int_arg("{\"limit\":2147483648}", "limit", 23);
+    ASSERT_EQ(val, 23);
+    val = cbm_mcp_get_int_arg("{\"limit\":-9223372036854775808}", "limit", 29);
+    ASSERT_EQ(val, 29);
+    /* Boundary values and a negative in-range value still pass through. */
+    val = cbm_mcp_get_int_arg("{\"limit\":2147483647}", "limit", 0);
+    ASSERT_EQ(val, 2147483647);
+    val = cbm_mcp_get_int_arg("{\"limit\":-2147483648}", "limit", 0);
+    ASSERT_EQ(val, -2147483648);
+    val = cbm_mcp_get_int_arg("{\"limit\":-7}", "limit", 0);
+    ASSERT_EQ(val, -7);
     PASS();
 }
 
