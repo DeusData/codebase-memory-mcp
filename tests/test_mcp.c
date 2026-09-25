@@ -7995,6 +7995,57 @@ TEST(tool_delete_project_mutation_guard_blocks_then_releases) {
     PASS();
 }
 
+/* delete_project removes the ADR sidecar with the project, and a re-index of a
+ * same-named project afterwards starts with no ADR (round-2 review item 7c). */
+TEST(tool_delete_project_removes_adr_sidecar) {
+    char cache[256];
+    snprintf(cache, sizeof(cache), "/tmp/cbm-mcp-delete-adr-XXXXXX");
+    if (!cbm_mkdtemp(cache)) {
+        PASS();
+    }
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+
+    const char *project = "adr-delete-project";
+    char db_path[CBM_SZ_1K];
+    snprintf(db_path, sizeof(db_path), "%s/%s.db", cache, project);
+    cbm_store_t *setup = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(setup);
+    ASSERT_EQ(cbm_store_upsert_project(setup, project, "/tmp/adr-delete-project"), CBM_STORE_OK);
+    ASSERT_EQ(cbm_store_adr_store(setup, project, "# Decision\nkeep it"), CBM_STORE_OK);
+    cbm_store_close(setup);
+
+    char adr_path[CBM_SZ_1K];
+    snprintf(adr_path, sizeof(adr_path), "%s.adr.db", db_path);
+    ASSERT_TRUE(cbm_file_exists(adr_path));
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp = cbm_mcp_handle_tool(srv, "delete_project", "{\"project\":\"adr-delete-project\"}");
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "deleted"));
+    free(resp);
+
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    ASSERT_FALSE(cbm_file_exists(adr_path)); /* sidecar removed with the project */
+
+    /* A fresh store of the same name starts with no ADR. */
+    cbm_store_t *fresh = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(fresh);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(fresh, project, &adr), CBM_STORE_NOT_FOUND);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(fresh);
+
+    cbm_mcp_server_free(srv);
+    cleanup_project_db(cache, project);
+    cbm_rmdir(cache);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    PASS();
+}
+
 TEST(tool_index_repository_mutation_guard_blocks_before_local_worker) {
     char root[CBM_SZ_1K];
     (void)snprintf(root, sizeof(root), "%s/cbm-index-guard-XXXXXX", cbm_tmpdir());
@@ -20772,6 +20823,7 @@ SUITE(mcp) {
  * running the much larger MCP behavior suite. */
 SUITE(mcp_mutation_guard) {
     RUN_TEST(tool_delete_project_mutation_guard_blocks_then_releases);
+    RUN_TEST(tool_delete_project_removes_adr_sidecar);
     RUN_TEST(tool_index_repository_mutation_guard_blocks_before_local_worker);
     RUN_TEST(tool_manage_adr_mutation_guard_balances_success);
     RUN_TEST(tool_manage_adr_read_paths_skip_blocking_mutation_guard);

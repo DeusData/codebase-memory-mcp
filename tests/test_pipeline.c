@@ -540,6 +540,151 @@ TEST(pipeline_adr_survives_full_reindex) {
     PASS();
 }
 
+/* An ADR written from a test hook BETWEEN the start of a reindex and its
+ * publication survives — the write lands in the "<db>.adr.db" sidecar, which the
+ * graph-DB rebuild never touches (round-2 review item 7a, full route). */
+typedef struct {
+    char db_path[512];
+    char project[256];
+    const char *adr;
+} adr_hook_ctx_t;
+
+static void write_adr_before_final_manifest(void *userdata) {
+    adr_hook_ctx_t *c = (adr_hook_ctx_t *)userdata;
+    cbm_store_t *s = cbm_store_open_path_existing(c->db_path);
+    if (!s) {
+        s = cbm_store_open_path(c->db_path);
+    }
+    if (s) {
+        (void)cbm_store_adr_store(s, c->project, c->adr);
+        cbm_store_close(s);
+    }
+}
+
+TEST(pipeline_adr_written_during_reindex_survives) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_hook_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    adr_hook_ctx_t ctx = {.adr = "# Decision\nWritten mid-reindex."};
+    snprintf(ctx.db_path, sizeof(ctx.db_path), "%s", db_path);
+    snprintf(ctx.project, sizeof(ctx.project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* Force a full reindex, writing the ADR from the publication hook. */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_incremental_test_reset_faults();
+    cbm_pipeline_incremental_test_before_final_manifest_once(write_adr_before_final_manifest, &ctx);
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, ctx.project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, ctx.adr);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+
+    rm_rf(tmp);
+    PASS();
+}
+
+/* Upgrade order: a legacy ADR row (pre-sidecar, in the graph DB) is migrated
+ * BEFORE a forced-full reindex deletes the old generation, with NO ADR read
+ * first — the pipeline's migrate-before-rebuild step must move it (item 7b). */
+TEST(pipeline_adr_legacy_migrates_before_forced_reindex) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_upgrade_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/main.py", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    /* Seed the ADR directly into the graph DB's project_summaries (the legacy
+     * layout), bypassing the sidecar entirely. */
+    static const char adr_text[] = "# Decision\nLegacy row, migrated before rebuild.";
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    sqlite3_exec(raw,
+                 "CREATE TABLE IF NOT EXISTS project_summaries (project TEXT PRIMARY KEY,"
+                 " summary TEXT NOT NULL, source_hash TEXT NOT NULL, created_at TEXT NOT NULL,"
+                 " updated_at TEXT NOT NULL);",
+                 NULL, NULL, NULL);
+    char *sql = sqlite3_mprintf(
+        "INSERT OR REPLACE INTO project_summaries VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z',"
+        " '2020-01-01T00:00:00Z');",
+        project, adr_text);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
+
+    /* No ADR read here. Force a full reindex (which deletes the old graph DB). */
+    for (int i = 0; i < 4; i++) {
+        snprintf(path, sizeof(path), "%s/extra%d.py", tmp, i);
+        f = fopen(path, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
+
+    /* The legacy ADR was migrated to the sidecar before the delete, so it is
+     * still readable. */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -3612,7 +3757,6 @@ TEST(pipeline_publication_never_uses_a_predictable_staging_path) {
         .cancelled = NULL,
         .manifest = NULL,
         .manifest_count = 0,
-        .adr_content = NULL,
         .coverage = NULL,
         .coverage_count = 0,
     };
@@ -4992,79 +5136,148 @@ TEST(pipeline_incremental_successful_publication_preserves_adr) {
     PASS();
 }
 
-/* A forced-full rebuild must never erase an ADR merely because the old
- * generation could not be read completely. The capture is part of the
- * publication transaction: failure preserves both graph and ADR. */
-TEST(pipeline_full_adr_capture_failure_preserves_previous_generation) {
+/* An ADR written in the pre-sidecar layout (a row in the graph DB's
+ * project_summaries) is migrated into the "<db>.adr.db" sidecar the first time
+ * it is read, and then survives a full reindex — so upgrading needs no reindex
+ * and loses no decision record. */
+TEST(pipeline_adr_migrates_from_legacy_graph_row) {
     char tmp[256];
-    snprintf(tmp, sizeof(tmp), "/tmp/cbm_publish_adr_capture_XXXXXX");
-    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
-    write_temp_file(tmp, "generation.py", "def BeforeAdrCapture():\n    return 1\n");
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_migrate_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
     char db_path[512];
-    snprintf(db_path, sizeof(db_path), "%s/generation.db", tmp);
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char main_py[512];
+    snprintf(main_py, sizeof(main_py), "%s/main.py", tmp);
+    FILE *f = fopen(main_py, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
 
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *baseline = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(baseline);
-    ASSERT_EQ(cbm_pipeline_run(baseline), 0);
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
     char project[256];
-    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
-    cbm_pipeline_free(baseline);
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
 
-    static const char adr_text[] = "# Decision\nADR capture is fail-closed.";
-    cbm_store_t *adr_store = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(adr_store);
-    ASSERT_EQ(cbm_store_adr_store(adr_store, project, adr_text), CBM_STORE_OK);
-    cbm_store_close(adr_store);
+    /* Seed the ADR directly into the graph DB's project_summaries — the layout
+     * before the sidecar existed — bypassing cbm_store_adr_store (which now
+     * writes the sidecar). */
+    static const char adr_text[] = "# Decision\nLegacy row migrates to the sidecar.";
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    char *sql = sqlite3_mprintf(
+        "INSERT INTO project_summaries (project, summary, source_hash, created_at, updated_at) "
+        "VALUES (%Q, %Q, '', '2020-01-01T00:00:00Z', '2020-01-01T00:00:00Z');",
+        project, adr_text);
+    ASSERT_NOT_NULL(sql);
+    ASSERT_EQ(sqlite3_exec(raw, sql, NULL, NULL, NULL), SQLITE_OK);
+    sqlite3_free(sql);
+    sqlite3_close(raw);
 
-    write_temp_file(tmp, "generation.py", "def AfterAdrCapture():\n    return 2\n");
-    cbm_pipeline_incremental_test_fail_adr_capture_once();
-    cbm_pipeline_t *faulted = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(faulted);
-    int faulted_rc = cbm_pipeline_run(faulted);
-    cbm_pipeline_free(faulted);
+    char adr_db[600];
+    snprintf(adr_db, sizeof(adr_db), "%s.adr.db", db_path);
+    ASSERT_TRUE(!cbm_file_exists(adr_db)); /* no sidecar yet */
 
-    int faulted_before = -1;
-    int faulted_after = -1;
-    observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture",
-                             &faulted_before, &faulted_after);
-    cbm_store_t *preserved = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(preserved);
-    cbm_adr_t preserved_adr = {0};
-    int preserved_adr_rc = cbm_store_adr_get(preserved, project, &preserved_adr);
-    bool preserved_adr_matches = preserved_adr_rc == CBM_STORE_OK && preserved_adr.content &&
-                                 strcmp(preserved_adr.content, adr_text) == 0;
-    cbm_store_adr_free(&preserved_adr);
-    cbm_store_close(preserved);
+    /* A READ returns the legacy row from the graph DB and must NOT create the
+     * sidecar (a query-only cache must stay unwritten). */
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(s, project, &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s);
+    ASSERT_TRUE(!cbm_file_exists(adr_db)); /* read did not create the sidecar */
 
-    cbm_pipeline_incremental_test_reset_faults();
-    cbm_pipeline_t *retry = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
-    ASSERT_NOT_NULL(retry);
-    int retry_rc = cbm_pipeline_run(retry);
-    cbm_pipeline_free(retry);
-    int retry_before = -1;
-    int retry_after = -1;
-    observe_named_generation(db_path, project, "BeforeAdrCapture", "AfterAdrCapture", &retry_before,
-                             &retry_after);
-    cbm_store_t *published = cbm_store_open_path(db_path);
-    ASSERT_NOT_NULL(published);
-    cbm_adr_t published_adr = {0};
-    int published_adr_rc = cbm_store_adr_get(published, project, &published_adr);
-    bool published_adr_matches = published_adr_rc == CBM_STORE_OK && published_adr.content &&
-                                 strcmp(published_adr.content, adr_text) == 0;
-    cbm_store_adr_free(&published_adr);
-    cbm_store_close(published);
-    cbm_pipeline_incremental_test_reset_faults();
-    th_rmtree(tmp);
+    /* Force a full reindex; routing migrates the legacy row into the sidecar
+     * before the old generation is deleted, so the ADR survives. */
+    for (int i = 0; i < 4; i++) {
+        char extra[512];
+        snprintf(extra, sizeof(extra), "%s/extra%d.py", tmp, i);
+        f = fopen(extra, "w");
+        ASSERT_NOT_NULL(f);
+        fprintf(f, "def g%d():\n    return %d\n", i, i);
+        fclose(f);
+    }
+    cbm_pipeline_t *p2 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p2);
+    ASSERT_EQ(cbm_pipeline_run(p2), 0);
+    cbm_pipeline_free(p2);
 
-    ASSERT_EQ(faulted_rc, CBM_PIPELINE_ABORT_PRESERVE_DB);
-    ASSERT_EQ(faulted_before, 1);
-    ASSERT_EQ(faulted_after, 0);
-    ASSERT_TRUE(preserved_adr_matches);
-    ASSERT_EQ(retry_rc, 0);
-    ASSERT_EQ(retry_before, 0);
-    ASSERT_EQ(retry_after, 1);
-    ASSERT_TRUE(published_adr_matches);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_adr_t adr2 = {0};
+    ASSERT_EQ(cbm_store_adr_get(s2, project, &adr2), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr2.content);
+    ASSERT_STR_EQ(adr2.content, adr_text);
+    cbm_store_adr_free(&adr2);
+    cbm_store_close(s2);
+
+    rm_rf(tmp);
+    PASS();
+}
+
+/* ADRs live in the "<db>.adr.db" sidecar, separate from the graph DB, and
+ * removing that sidecar (what delete_project does) removes the ADR store. */
+TEST(pipeline_adr_sidecar_is_separate_and_removable) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_adr_sidecar_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("failed to create temp dir");
+    }
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    char main_py[512];
+    snprintf(main_py, sizeof(main_py), "%s/main.py", tmp);
+    FILE *f = fopen(main_py, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "def foo():\n    pass\n");
+    fclose(f);
+
+    cbm_pipeline_t *p1 = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p1);
+    ASSERT_EQ(cbm_pipeline_run(p1), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p1));
+    cbm_pipeline_free(p1);
+
+    static const char adr_text[] = "# Decision\nADRs live in the sidecar.";
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_EQ(cbm_store_adr_store(s, project, adr_text), CBM_STORE_OK);
+    cbm_store_close(s);
+
+    /* The ADR is in the sidecar, NOT in the graph DB's project_summaries. */
+    char adr_db[600];
+    snprintf(adr_db, sizeof(adr_db), "%s.adr.db", db_path);
+    ASSERT_TRUE(cbm_file_exists(adr_db));
+
+    sqlite3 *raw = NULL;
+    ASSERT_EQ(sqlite3_open(db_path, &raw), SQLITE_OK);
+    sqlite3_stmt *st = NULL;
+    ASSERT_EQ(sqlite3_prepare_v2(raw, "SELECT COUNT(*) FROM project_summaries;", -1, &st, NULL),
+              SQLITE_OK);
+    ASSERT_EQ(sqlite3_step(st), SQLITE_ROW);
+    int graph_rows = sqlite3_column_int(st, 0);
+    sqlite3_finalize(st);
+    sqlite3_close(raw);
+    ASSERT_EQ(graph_rows, 0);
+
+    /* Removing the sidecar (as delete_project does) removes the ADR store. */
+    ASSERT_EQ(cbm_unlink(adr_db), 0);
+    cbm_store_t *s2 = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s2);
+    cbm_adr_t adr = {0};
+    int rc = cbm_store_adr_get(s2, project, &adr);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(s2);
+    ASSERT_EQ(rc, CBM_STORE_NOT_FOUND);
+
+    rm_rf(tmp);
     PASS();
 }
 
@@ -15475,7 +15688,10 @@ SUITE(pipeline_semantic_manifest_repro) {
     RUN_TEST(pipeline_full_persist_failure_after_stage_dump_preserves_previous_generation);
     RUN_TEST(pipeline_incremental_persist_failure_preserves_previous_generation_and_retries);
     RUN_TEST(pipeline_incremental_successful_publication_preserves_adr);
-    RUN_TEST(pipeline_full_adr_capture_failure_preserves_previous_generation);
+    RUN_TEST(pipeline_adr_migrates_from_legacy_graph_row);
+    RUN_TEST(pipeline_adr_sidecar_is_separate_and_removable);
+    RUN_TEST(pipeline_adr_written_during_reindex_survives);
+    RUN_TEST(pipeline_adr_legacy_migrates_before_forced_reindex);
     RUN_TEST(pipeline_semantic_manifest_rejects_non_directory_root);
     RUN_TEST(pipeline_full_reindex_quarantines_corrupt_destination_without_overwrite);
     RUN_TEST(pipeline_full_reindex_replaces_legacy_schema_without_quarantine);

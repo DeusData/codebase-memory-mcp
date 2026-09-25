@@ -206,6 +206,40 @@ TEST(artifact_export_fast_roundtrip) {
     PASS();
 }
 
+/* The ADR travels with the exported artifact: it lives in the "<db>.adr.db"
+ * sidecar, and export must carry it into graph.db.zst so an import restores it
+ * into the destination's sidecar (round-2 review item 7d). */
+TEST(artifact_export_roundtrip_keeps_adr) {
+    setup_artifact_test();
+    create_test_db(g_db);
+
+    const char *adr_text = "# Decision\nThe team chose the sidecar design.";
+    cbm_store_t *src = cbm_store_open_path(g_db);
+    ASSERT_NOT_NULL(src);
+    ASSERT_EQ(cbm_store_adr_store(src, "test-proj", adr_text), CBM_STORE_OK);
+    cbm_store_close(src);
+
+    ASSERT_EQ(cbm_artifact_export(g_db, g_repo, "test-proj", CBM_ARTIFACT_FAST), 0);
+
+    char import_db[1024];
+    snprintf(import_db, sizeof(import_db), "%s/imported.db", g_tmpdir);
+    ASSERT_EQ(cbm_artifact_import(g_repo, import_db), 0);
+
+    /* The imported project starts with the team's ADR (restored into the
+     * destination sidecar by import). */
+    cbm_store_t *dst = cbm_store_open_path(import_db);
+    ASSERT_NOT_NULL(dst);
+    cbm_adr_t adr = {0};
+    ASSERT_EQ(cbm_store_adr_get(dst, "test-proj", &adr), CBM_STORE_OK);
+    ASSERT_NOT_NULL(adr.content);
+    ASSERT_STR_EQ(adr.content, adr_text);
+    cbm_store_adr_free(&adr);
+    cbm_store_close(dst);
+
+    cleanup_dir(g_tmpdir);
+    PASS();
+}
+
 TEST(artifact_export_best_roundtrip) {
     setup_artifact_test();
     create_test_db(g_db);
@@ -1096,6 +1130,7 @@ SUITE(artifact) {
     RUN_TEST(artifact_repo_path_shell_safe_rejects_injection);
     RUN_TEST(artifact_repo_path_shell_safe_rejects_cmd_metachars_on_windows);
     RUN_TEST(artifact_export_fast_roundtrip);
+    RUN_TEST(artifact_export_roundtrip_keeps_adr);
     RUN_TEST(artifact_export_best_roundtrip);
     RUN_TEST(artifact_exists_check);
     RUN_TEST(artifact_commit_hash);

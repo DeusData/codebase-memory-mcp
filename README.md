@@ -671,7 +671,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 |------|-------------|
 | `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
 | `list_projects` | List all indexed projects with node/edge counts. |
-| `delete_project` | Remove a project and all its graph data. |
+| `delete_project` | Remove a project and all its graph data, including its ADR sidecar (`<db>.adr.db`). |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
 
