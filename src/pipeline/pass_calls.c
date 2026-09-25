@@ -682,6 +682,12 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
     if (cbm_suppress_cross_language_suffix_match(lang, target_node->file_path, res.strategy)) {
         return 0;
     }
+    /* A Java call never targets data — see cbm_java_suppress_call_to_data_member.
+     * The language gate lives here, as with the guards above, and MUST match
+     * pass_parallel.c exactly or the two resolvers diverge. */
+    if (cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+        return 0;
+    }
     emit_classified_edge(ctx, call, source_node, target_node, &res, module_qn, imp_keys, imp_vals,
                          imp_count, drop_plain_call);
     return SKIP_ONE;

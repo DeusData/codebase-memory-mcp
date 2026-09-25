@@ -811,6 +811,30 @@ bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const cha
     return strcmp(target_label, "Field") == 0;
 }
 
+bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label) {
+    /* A Java call expression never names data. `p.x()` is a method invocation
+     * whatever `x` spells elsewhere in the tree, so a CALLS edge into a
+     * Variable or a Field is a spelling collision and not a call.
+     *
+     * The bind is reached when the type-aware resolver finds no method to
+     * return: a record's accessors are implicit, so `record Point(double x,
+     * double y, double z)` declares no `x()` for java_lookup_method to find,
+     * and every `p.x()` falls through to the short-name registry — which
+     * matches the first `x` anywhere in the project, typically an unrelated
+     * class's private field. Measured on a 600-file Java tree (2026-09-22):
+     * 278 of 2444 CALLS edges landed on fields that way, and the callers of
+     * one four-field class absorbed every record read in the project.
+     *
+     * Java-gated, like the Go guard above, because the veto is only sound
+     * where no callable name can be anything but a method: Kotlin properties
+     * hold function values (`val f: () -> Unit; f()`) and C has function
+     * pointers, so both legitimately call through data. */
+    if (!is_java || !target_label) {
+        return false;
+    }
+    return strcmp(target_label, "Variable") == 0 || strcmp(target_label, "Field") == 0;
+}
+
 /* ── Lifecycle ──────────────────────────────────────────────────── */
 
 cbm_registry_t *cbm_registry_new(void) {

@@ -3028,6 +3028,12 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
              * CALLS edge across a language boundary. */
             continue;
         }
+        if (target_node && source_node->id != target_node->id &&
+            cbm_java_suppress_call_to_data_member(lang == CBM_LANG_JAVA, target_node->label)) {
+            /* Same guard as pass_calls.c — a Java call never targets a
+             * Variable or a Field. */
+            continue;
+        }
         if (!target_node || source_node->id == target_node->id) {
             /* HTTP/ASYNC calls to an EXTERNAL client library (`requests.get(url)`)
              * resolve to an unindexed QN (target_node == NULL), but their edge

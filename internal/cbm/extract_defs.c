@@ -204,6 +204,7 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                                  const CBMLangSpec *spec);
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang);
 static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
+static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char *class_qn);
 static void extract_elixir_call(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec);
 
 // --- Helpers ---
@@ -4795,6 +4796,10 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
         extract_enum_members(ctx, node, class_qn);
     }
 
+    if (ctx->language == CBM_LANG_JAVA && strcmp(kind, "record_declaration") == 0) {
+        extract_record_accessors(ctx, node, class_qn);
+    }
+
     // Extract methods inside the class
     extract_class_methods(ctx, node, class_qn, spec);
 
@@ -5679,6 +5684,81 @@ static void extract_enum_members(CBMExtractCtx *ctx, TSNode node, const char *cl
         mdef.start_line = ts_node_start_point(member).row + TS_LINE_OFFSET;
         mdef.end_line = ts_node_end_point(member).row + TS_LINE_OFFSET;
         cbm_defs_push(&ctx->result->defs, a, mdef);
+    }
+}
+
+/* Whether the record body declares this accessor itself (JLS §8.10.3 lets a
+ * record override any of them), so the implicit one is not emitted twice. */
+static bool record_declares_accessor(CBMExtractCtx *ctx, TSNode node, const char *comp_name) {
+    TSNode body = find_class_body(node, ctx->language);
+    if (ts_node_is_null(body)) {
+        return false;
+    }
+    uint32_t mc = ts_node_named_child_count(body);
+    for (uint32_t mi = 0; mi < mc; mi++) {
+        TSNode member = ts_node_named_child(body, mi);
+        if (strcmp(ts_node_type(member), "method_declaration") != 0) {
+            continue;
+        }
+        TSNode mname = ts_node_child_by_field_name(member, TS_FIELD("name"));
+        if (ts_node_is_null(mname)) {
+            continue;
+        }
+        char *name = cbm_node_text(ctx->arena, mname, ctx->source);
+        if (!name || strcmp(name, comp_name) != 0) {
+            continue;
+        }
+        /* Same name, no parameters — that is the accessor. */
+        TSNode params = ts_node_child_by_field_name(member, TS_FIELD("parameters"));
+        if (ts_node_is_null(params) || ts_node_named_child_count(params) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Java records: the compiler writes one accessor per component, so `p.x()`
+ * calls a method that appears nowhere in the source. Without a definition for
+ * it the call has nothing to resolve to and falls through to the project-wide
+ * name registry, which binds it to the first `x` in the tree — typically an
+ * unrelated class's private field. Emitting the accessors makes the record's
+ * own API visible, exactly as the language defines it (JLS §8.10.3). */
+static void extract_record_accessors(CBMExtractCtx *ctx, TSNode node, const char *class_qn) {
+    CBMArena *a = ctx->arena;
+    TSNode params = ts_node_child_by_field_name(node, TS_FIELD("parameters"));
+    if (ts_node_is_null(params)) {
+        return;
+    }
+    uint32_t pc = ts_node_named_child_count(params);
+    for (uint32_t pi = 0; pi < pc; pi++) {
+        TSNode comp = ts_node_named_child(params, pi);
+        if (strcmp(ts_node_type(comp), "formal_parameter") != 0) {
+            continue;
+        }
+        TSNode cname = ts_node_child_by_field_name(comp, TS_FIELD("name"));
+        if (ts_node_is_null(cname)) {
+            continue;
+        }
+        char *comp_name = cbm_node_text(a, cname, ctx->source);
+        if (!comp_name || !comp_name[0] || record_declares_accessor(ctx, node, comp_name)) {
+            continue;
+        }
+        CBMDefinition adef;
+        memset(&adef, 0, sizeof(adef));
+        adef.name = comp_name;
+        adef.qualified_name = cbm_arena_sprintf(a, "%s.%s", class_qn, comp_name);
+        adef.label = "Method";
+        adef.file_path = ctx->rel_path;
+        adef.start_line = ts_node_start_point(comp).row + TS_LINE_OFFSET;
+        adef.end_line = ts_node_end_point(comp).row + TS_LINE_OFFSET;
+        adef.lines = 1;
+        adef.parent_class = class_qn;
+        adef.is_exported = true;
+        TSNode ctype = ts_node_child_by_field_name(comp, TS_FIELD("type"));
+        if (!ts_node_is_null(ctype)) {
+            adef.return_type = cbm_node_text(a, ctype, ctx->source);
+        }
+        cbm_defs_push(&ctx->result->defs, a, adef);
     }
 }
 

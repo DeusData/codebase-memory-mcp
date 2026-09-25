@@ -344,6 +344,13 @@ bool cbm_suppress_cross_language_ref(CBMLanguage caller_lang, const char *target
  * unit-tested in test_registry.c. */
 bool cbm_go_suppress_bare_field_ref(bool is_go, bool is_member_access, const char *target_label);
 
+/* A Java call expression never names data: `p.x()` is a method invocation
+ * whatever `x` spells elsewhere in the project. Drops a CALLS bind whose
+ * target is a Variable or Field. Java only — Kotlin properties and C function
+ * pointers are callable names that are not methods. Pure; unit-tested in
+ * test_registry.c. */
+bool cbm_java_suppress_call_to_data_member(bool is_java, const char *target_label);
+
 /* Get the label of a qualified name, or NULL if not found. */
 const char *cbm_registry_label_of(const cbm_registry_t *r, const char *qn);
 
