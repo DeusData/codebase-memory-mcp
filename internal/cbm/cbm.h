@@ -246,6 +246,10 @@ typedef struct {
      * HTTP_CALLS edge to base + path. Tail fields: zero-init stays valid. */
     const char *http_client;
     const char *http_base_url;
+    /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
+     * the global namespace and every other language). Per type, because the
+     * file-level namespace_name records only a file's first namespace. */
+    const char *decl_namespace;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
