@@ -1272,7 +1272,8 @@ typedef struct {
 
 /* When set, the fixture takes the host's coordination handles in the host's
  * order before starting the service: cohort admission refuses once a
- * generation is already serving. */
+ * generation is already serving. Unlike the host's start_reserved, the
+ * fixture's convenience start also joins a service-owned participant guard. */
 static runtime_test_coordination_t *runtime_test_fixture_coordination = NULL;
 
 static bool runtime_test_fixture_start_configured(
@@ -1452,9 +1453,9 @@ TEST(daemon_runtime_host_loop_stops_on_coordination_file_loss) {
         CBMLogLevel previous_log_level = cbm_log_get_level();
         cbm_log_set_level(CBM_LOG_INFO);
         cbm_log_set_sink(runtime_test_lifetime_log_sink);
-        loop_ok = cbm_daemon_host_wait_for_lifetime_for_test(
-            fixture.service, fixture.endpoint, coordination.lease, coordination.claim,
-            coordination.guard);
+        loop_ok = cbm_daemon_host_wait_for_lifetime_for_test(fixture.service, fixture.endpoint,
+                                                             coordination.lease, coordination.claim,
+                                                             coordination.guard);
         cbm_log_set_sink(NULL);
         cbm_log_set_level(previous_log_level);
     }
