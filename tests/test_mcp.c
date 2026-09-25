@@ -8382,6 +8382,91 @@ TEST(tool_project_arg_resolves_unique_tail_issue1025) {
     PASS();
 }
 
+/* #1827: a repo under a non-ASCII folder ("中文测试仓库") gets a project name
+ * whose non-ASCII bytes are hex-transliterated (#571), e.g.
+ * "...-e4b8ade69687e6b58be8af95e4bb93e5ba93". That stored identity stays
+ * stable (it is the cache DB file name), but the project must stay reachable
+ * by what the user actually knows: the real path (already normalized) AND the
+ * real folder name, which the #1025 tail match skipped because the raw
+ * non-ASCII name fails the project-name validator before any lookup. */
+TEST(tool_project_arg_resolves_non_ascii_folder_issue1827) {
+    char parent[CBM_SZ_256];
+    char cache[CBM_SZ_256];
+    snprintf(parent, sizeof(parent), "/tmp/cbm-i1827a-XXXXXX");
+    snprintf(cache, sizeof(cache), "/tmp/cbm-i1827c-XXXXXX");
+    if (!cbm_mkdtemp(parent) || !cbm_mkdtemp(cache)) {
+        FAIL("mkdtemp failed");
+    }
+    const char *folder = "\xe4\xb8\xad\xe6\x96\x87\xe6\xb5\x8b\xe8\xaf\x95\xe4\xbb\x93\xe5\xba\x93";
+    char repo[CBM_SZ_512];
+    snprintf(repo, sizeof(repo), "%s/%s", parent, folder);
+    ASSERT_TRUE(cbm_mkdir_p(repo, 0755));
+    char file[CBM_SZ_1K];
+    snprintf(file, sizeof(file), "%s/hello.js", repo);
+    FILE *f = cbm_fopen(file, "w");
+    ASSERT_NOT_NULL(f);
+    fprintf(f, "function greet_1827(){return 'hi';}\n");
+    fclose(f);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? cbm_strdup(saved_cache) : NULL;
+    cbm_setenv("CBM_CACHE_DIR", cache, 1);
+    cbm_setenv("CBM_INDEX_SUPERVISOR", "0", 1);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char args[CBM_SZ_2K];
+    snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"}", repo);
+    char *r = cbm_mcp_handle_tool(srv, "index_repository", args);
+    ASSERT_NOT_NULL(r);
+    free(r);
+
+    /* The stored identity keeps its existing hex form (no DB rename). */
+    char *stored = cbm_project_name_from_path(repo);
+    ASSERT_NOT_NULL(stored);
+    ASSERT_NOT_NULL(strstr(stored, "-e4b8ade69687e6b58be8af95e4bb93e5ba93"));
+    free(stored);
+
+    /* 1. The real folder name resolves (RED before: "project not found"). */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*greet_1827.*\"}",
+             folder);
+    r = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(r);
+    if (strstr(r, "project not found")) {
+        fprintf(stderr, "  [1827] FAIL folder name did not resolve: %.200s\n", r);
+    }
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "greet_1827"));
+    free(r);
+
+    /* 2. The real path keeps resolving. */
+    snprintf(args, sizeof(args), "{\"project\":\"%s\",\"name_pattern\":\".*greet_1827.*\"}", repo);
+    r = cbm_mcp_handle_tool(srv, "search_graph", args);
+    ASSERT_NOT_NULL(r);
+    ASSERT_NULL(strstr(r, "project not found"));
+    ASSERT_NOT_NULL(strstr(r, "greet_1827"));
+    free(r);
+
+    /* 3. A non-ASCII name matching nothing stays a not-found error. */
+    r = cbm_mcp_handle_tool(srv, "search_graph",
+                            "{\"project\":\"\xe4\xb8\x8d\xe5\xad\x98\xe5\x9c\xa8\","
+                            "\"name_pattern\":\".*\"}");
+    ASSERT_NOT_NULL(r);
+    ASSERT_NOT_NULL(strstr(r, "project not found"));
+    free(r);
+
+    cbm_mcp_server_free(srv);
+    if (saved_cache_copy) {
+        cbm_setenv("CBM_CACHE_DIR", saved_cache_copy, 1);
+        free(saved_cache_copy);
+    } else {
+        cbm_unsetenv("CBM_CACHE_DIR");
+    }
+    th_rmtree(parent);
+    th_rmtree(cache);
+    PASS();
+}
+
 /* Regression for #604: path scopes architecture totals and content. */
 TEST(tool_get_architecture_path_scoping) {
     cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
@@ -20597,6 +20682,7 @@ SUITE(mcp) {
     RUN_TEST(tool_get_architecture_accepts_project_name_alias_issue640);
     RUN_TEST(tool_search_graph_accepts_project_name_alias_issue640);
     RUN_TEST(tool_project_arg_resolves_unique_tail_issue1025);
+    RUN_TEST(tool_project_arg_resolves_non_ascii_folder_issue1827);
     RUN_TEST(tool_get_architecture_path_scoping);
     RUN_TEST(tool_query_graph_missing_query);
 

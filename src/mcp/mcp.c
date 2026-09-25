@@ -1481,24 +1481,50 @@ static bool repo_path_is_absolute(const char *path) {
 #endif
 }
 
+bool cbm_validate_project_name(const char *project);
+
+static bool has_non_ascii_byte(const char *s) {
+    for (; *s; s++) {
+        if ((unsigned char)*s >= 0x80) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1827: a bare non-ASCII selector, typically the real folder name of a repo
+ * under a CJK path, is encoded exactly like the path segment it came from
+ * (non-ASCII bytes -> hex, #571), so the exact/tail lookup matches the stored
+ * identity. Stored names never change; ASCII selectors keep their existing
+ * validation; a selector that collapses to the "root" fallback is left alone
+ * so it never selects the root project. */
+static bool bare_project_encoding_usable(const char *encoded) {
+    return strcmp(encoded, "root") != 0 && cbm_validate_project_name(encoded);
+}
+
 static char *normalize_project_arg(char *project) {
-    if (!project || (!strchr(project, '/') && !strchr(project, '\\'))) {
+    if (!project) {
         return project;
     }
-
-    project = canonicalize_repo_path_if_exists(project);
-    char *normalized = cbm_project_name_from_path(project);
-    if (normalized) {
-        free(project);
-        return normalized;
+    char *normalized = NULL;
+    bool bare = !strchr(project, '/') && !strchr(project, '\\');
+    if (bare) {
+        if (has_non_ascii_byte(project)) {
+            normalized = cbm_project_name_sanitize(project);
+        }
+    } else {
+        project = canonicalize_repo_path_if_exists(project);
+        normalized = cbm_project_name_from_path(project);
     }
-    return project;
+    /* Keep exactly one of the two strings and release the other. */
+    bool use_normalized = normalized && (!bare || bare_project_encoding_usable(normalized));
+    free(use_normalized ? project : normalized);
+    return use_normalized ? normalized : project;
 }
 
 /* Forward decls — defined below alongside store resolution. */
 static const char *cache_dir(char *buf, size_t bufsz);
 static bool is_project_db_file(const char *name, size_t len);
-bool cbm_validate_project_name(const char *project);
 
 /* #1025: agents naturally pass the repo FOLDER name ("codebase-memory-mcp"),
  * but indexed project names derive from the full path

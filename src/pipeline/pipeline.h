@@ -206,6 +206,13 @@ char *cbm_pipeline_resolve_relative_import(const char *source_rel, const char *m
  * Caller must free() the returned string. */
 char *cbm_project_name_from_path(const char *abs_path);
 
+/* The name-mapping half of cbm_project_name_from_path, WITHOUT path
+ * canonicalization: maps any string to the stored project-name form (unsafe
+ * ASCII -> '-', non-ASCII bytes -> two hex digits, dash/dot collapse, trim,
+ * #624 length cap). Lets a selector such as a bare non-ASCII folder name be
+ * encoded exactly like the segment it came from (#1827). Caller frees. */
+char *cbm_project_name_sanitize(const char *name_path);
+
 /* ── Function Registry ──────────────────────────────────────────── */
 
 typedef struct cbm_registry cbm_registry_t;
