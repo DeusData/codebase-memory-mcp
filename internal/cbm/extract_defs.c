@@ -1591,7 +1591,11 @@ static bool try_drf_action_decorator(CBMArena *a, TSNode dchild, const char *sou
 }
 
 // Try to extract a route from a single decorator call node.
-// Returns true if a route method was found (even with fallback path "/").
+// Returns true if a route method was found. The fallback path "/" applies only
+// to a zero-argument call (`@app.route()`): a call that HAS arguments but none
+// path-shaped is not a route -- unittest.mock's `@patch("subprocess.run")`
+// shares its name with the HTTP verb and used to mint a PATCH "/" handler for
+// every mocked test function (distilled from PR #1245).
 static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char *source,
                                           const char **out_path, const char **out_method) {
     TSNode fn = ts_node_child_by_field_name(dchild, TS_FIELD("function"));
@@ -1615,6 +1619,9 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
             *out_path = path;
             *out_method = method;
             return true;
+        }
+        if (ts_node_named_child_count(args) > 0) {
+            return false;
         }
     }
     *out_path = "/";
