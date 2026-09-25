@@ -12,16 +12,20 @@
 #include "../src/foundation/subprocess.h"
 #include "../src/foundation/compat.h"
 #include "../src/foundation/platform.h"
+#include "../src/foundation/compat_fs.h"
+#include "../src/foundation/git_env.h"
 
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/time.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #else
 #include <windows.h>
@@ -1256,6 +1260,114 @@ TEST(win_cmd_payload_rejects_short_relative_and_non_cmd_paths) {
     PASS();
 }
 
+/* ── Git child environment (#2003) ────────────────────────────────────────────
+ * strip_git_repo_env / cbm_popen_git drop every variable of
+ * `git rev-parse --local-env-vars` from the CHILD only: the parent keeps its
+ * environment, other variables pass through, and without the flag a child
+ * still inherits everything. The test sets the variables itself (a runner may
+ * clear them at startup) and restores them before asserting. */
+#ifndef _WIN32
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} gitenv_snapshot_t;
+
+static void gitenv_enter(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+        setenv(cbm_git_repo_env_vars[i], "/cbm-decoy-repo", 1);
+    }
+    setenv("CBM_GITENV_KEEP", "kept", 1);
+}
+
+static void gitenv_leave(gitenv_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+    }
+    unsetenv("CBM_GITENV_KEEP");
+}
+
+/* exit 0: no git repo-local var is set and CBM_GITENV_KEEP=kept; exit 3: a git
+ * var leaked; exit 4: the unrelated variable was lost. */
+static void gitenv_probe_script(char *buf, size_t cap) {
+    size_t n = (size_t)snprintf(buf, cap, "[ \"$CBM_GITENV_KEEP\" = kept ] || exit 4;");
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT && n < cap; i++) {
+        n += (size_t)snprintf(buf + n, cap - n, " [ -z \"${%s+x}\" ] || exit 3;",
+                              cbm_git_repo_env_vars[i]);
+    }
+    if (n < cap) {
+        (void)snprintf(buf + n, cap - n, " exit 0");
+    }
+}
+
+static int gitenv_spawn_probe(bool strip) {
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    const char *argv[] = {"/bin/sh", "-c", script, NULL};
+    cbm_proc_opts_t opts = {.bin = "/bin/sh", .argv = argv, .strip_git_repo_env = strip};
+    cbm_proc_result_t r;
+    if (cbm_subprocess_run(&opts, &r) != 0) {
+        return -1;
+    }
+    return r.exit_code;
+}
+#endif
+
+TEST(subprocess_strip_git_repo_env_is_per_child) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    int stripped = gitenv_spawn_probe(true);
+    int inherited = gitenv_spawn_probe(false);
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_EQ(stripped, 0);   /* git vars gone, CBM_GITENV_KEEP passed through */
+    ASSERT_EQ(inherited, 3);  /* without the flag the child inherits as before */
+    ASSERT_TRUE(parent_kept); /* the parent environment is never modified */
+    PASS();
+#endif
+}
+
+TEST(popen_git_strips_repo_env_and_reports_exit_status) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX /bin/sh spawn");
+#else
+    char script[2048];
+    gitenv_probe_script(script, sizeof(script));
+    char cmd[2200];
+    snprintf(cmd, sizeof(cmd), "echo probe; %s", script);
+    gitenv_snapshot_t snap;
+    gitenv_enter(&snap);
+    FILE *fp = cbm_popen_git(cmd);
+    char line[64] = {0};
+    bool got_line = fp && fgets(line, sizeof(line), fp) != NULL;
+    int status = fp ? cbm_pclose(fp) : -1;
+    FILE *fail = cbm_popen_git("exit 7");
+    int fail_status = fail ? cbm_pclose(fail) : -1;
+    const char *parent_git_dir = getenv("GIT_DIR");
+    bool parent_kept = parent_git_dir && strcmp(parent_git_dir, "/cbm-decoy-repo") == 0;
+    gitenv_leave(&snap);
+    ASSERT_TRUE(got_line);
+    ASSERT_STR_EQ(line, "probe\n");
+    ASSERT_TRUE(status >= 0 && WIFEXITED(status));
+    ASSERT_EQ(WEXITSTATUS(status), 0);
+    ASSERT_TRUE(fail_status >= 0 && WIFEXITED(fail_status));
+    ASSERT_EQ(WEXITSTATUS(fail_status), 7); /* pclose() semantics: raw wait status */
+    ASSERT_TRUE(parent_kept);
+    PASS();
+#endif
+}
+
 SUITE(subprocess) {
     RUN_TEST(subprocess_classify_clean);
     RUN_TEST(subprocess_classify_exit_nonzero);
@@ -1285,6 +1397,8 @@ SUITE(subprocess) {
     RUN_TEST(subprocess_final_log_drain_error_is_terminal_and_preserves_classification);
     RUN_TEST(subprocess_posix_child_closes_unrelated_descriptors);
     RUN_TEST(subprocess_root_exit_drains_surviving_descendant);
+    RUN_TEST(subprocess_strip_git_repo_env_is_per_child);
+    RUN_TEST(popen_git_strips_repo_env_and_reports_exit_status);
     RUN_TEST(win_cmdline_index_worker_json);
     RUN_TEST(win_cmdline_roundtrip_battery);
     RUN_TEST(win_cmdline_overflow_rejected);
