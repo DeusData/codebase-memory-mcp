@@ -221,6 +221,33 @@ be indexed and later returned. And the credential list is a denylist, so it
 raises the cost of a mistake rather than closing the class — a directory it does
 not name is permitted.
 
+### Shared / HPC filesystems
+
+On clusters and other shared machines, home directories often live on a network
+filesystem (NFS, Lustre, GPFS, SMB/CIFS), and `~/.cache` is sometimes a symlink
+into a shared tree. Three rules keep CBM working there:
+
+- **Put the cache and the rendezvous on local storage.** Set `CBM_CACHE_DIR` (indexes,
+  `_config.db`) and, if needed, `CBM_RUNTIME_DIR` (the daemon rendezvous) to a
+  local disk you own, for example `/local/scratch/$USER/cbm` or `/tmp/$USER-cbm`.
+  Set the same values in your MCP client's environment and your shell.
+- **Do not route the cache into another account's tree.** A symlinked `~/.cache` is
+  resolved and allowed, but every directory on the *resolved* path must be owned
+  by you or by root. If a parent such as `/shared/fs` belongs to another account,
+  that account can rename or replace anything below it, so CBM refuses the path
+  and names the directory and its owner:
+
+  ```text
+  ... (cache-private) - '/shared/fs' is owned by uid 1234 (alice), not by you (uid 1000) or root; ...
+  ```
+
+  This check has no override. Choose a location with a safe ancestry instead.
+- **Avoid network filesystems for the cache.** The indexes are SQLite databases in
+  WAL mode, which needs shared-memory locking that network filesystems do not
+  provide reliably. On Linux, CBM logs one `daemon.cache_root_network_fs` warning
+  at startup when the cache root is on NFS, Lustre, GPFS, CIFS or SMB2. The cache
+  still works there, but it can be slow, and a database can be corrupted.
+
 ## 5. Agent and Editor Integration Files
 
 The `install` command can also write MCP entries and instruction blocks into agent/editor config files such as Claude Code, Codex, Gemini, VS Code, Cursor, Zed, and others.

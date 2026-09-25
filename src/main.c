@@ -1451,6 +1451,8 @@ static main_build_identity_status_t main_build_identity(cbm_daemon_build_identit
     if (!cbm_daemon_ipc_private_directory_secure(canonical_cache)) {
         return MAIN_BUILD_IDENTITY_CACHE_PRIVATE;
     }
+    /* #1717: advice only -- a network-filesystem cache root is accepted. */
+    (void)cbm_daemon_ipc_warn_if_network_cache_root(canonical_cache);
     /* Every cache consumer in this process must use the exact path whose
      * fingerprint joins the account-wide cohort. Keeping an original symlink
      * spelling in the environment would let a later retarget move storage

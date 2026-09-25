@@ -92,6 +92,17 @@ bool cbm_daemon_ipc_private_directory_secure(const char *directory_path);
  * append it to their error messages; policy decisions never read it. */
 const char *cbm_daemon_ipc_validation_detail(void);
 
+/* #1717: advice, never a refusal. When cache_root lives on a network
+ * filesystem (Linux statfs: NFS, CIFS, SMB2, Lustre, GPFS), log one
+ * `daemon.cache_root_network_fs` warning per process pointing at local
+ * storage. Returns true only when this call emitted that warning. */
+bool cbm_daemon_ipc_warn_if_network_cache_root(const char *cache_root);
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* Report `magic` as the cache root's statfs f_type on every platform (active),
+ * or restore real detection; either way re-arm the once-per-process warning. */
+void cbm_daemon_ipc_set_fs_magic_for_test(bool active, unsigned long magic);
+#endif
+
 /* This process's most recent listener-publication failure: the stage that
  * refused, the errno the failing step reported (0 when the step reported
  * none), and the artifact path it was operating on ("" when no path applies).
@@ -127,6 +138,12 @@ bool cbm_daemon_ipc_win_sid_trusted_for_testing(void *sid);
  * so they can be tested without a chown-able overflow-owned directory. */
 void cbm_daemon_ipc_posix_set_ancestor_overflow_uid_for_test(bool active,
                                                              unsigned long overflow_uid);
+/* #1717 seam (POSIX): report the directory at directory_path (matched by
+ * dev/ino) as owned by foreign_uid during the ancestor walk. False when the
+ * path is not a directory. Clear restores real ownership. */
+bool cbm_daemon_ipc_posix_set_foreign_owned_dir_for_test(const char *directory_path,
+                                                         unsigned long foreign_uid);
+void cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test(void);
 bool cbm_daemon_ipc_posix_uid_map_is_single_uid_for_test(const char *uid_map, unsigned long euid);
 bool cbm_daemon_ipc_posix_ancestor_stat_ok_for_test(unsigned long owner, unsigned int mode,
                                                     unsigned long euid, bool overflow_active,
