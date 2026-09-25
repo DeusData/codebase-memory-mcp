@@ -31,11 +31,14 @@ int cbm_toml_remove_managed_block(const char *file_path, const char *begin_marke
                                   const char *end_marker);
 
 /* Remove one pre-marker codebase-memory-mcp table only when it has the known
- * historical schema: one owned command basename, optional empty args, and no
- * unknown assignments or descendant tables. Returns 1 for a syntactically
- * valid same-name foreign table and leaves it byte-identical, 0 for removed or
- * absent owned state, and -1 for malformed input or I/O failure. A supplied
- * managed-marker pair makes this a successful no-op. */
+ * historical schema: one owned command basename, optional empty args, optional
+ * env_vars naming only CBM_CACHE_DIR/CBM_RUNTIME_DIR, and no unknown
+ * assignments or descendant tables. A lone orphaned managed marker (left when
+ * a client rewrote the table and dropped its comments, #1720) is dropped in
+ * the same write. Returns 1 for a syntactically valid same-name foreign table
+ * and leaves the file byte-identical, 0 for removed or absent owned state, and
+ * -1 for malformed input or I/O failure. A supplied managed-marker pair makes
+ * this a successful no-op. */
 int cbm_toml_remove_legacy_table(const char *file_path, const char *table_name,
                                  const char *begin_marker, const char *end_marker);
 

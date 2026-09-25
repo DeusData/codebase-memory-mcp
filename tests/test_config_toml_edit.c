@@ -566,6 +566,41 @@ TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation) {
     PASS();
 }
 
+/* #1720: `env_vars` naming only the variables cbm itself forwards is part of
+ * the owned shape (#1562/#1664), so a table Codex rewrote without markers is
+ * adopted; any other forwarded name keeps the table foreign. */
+TEST(config_toml_legacy_remove_adopts_owned_env_vars_only) {
+    char dir[CTE_PATH_CAP];
+    char path[CTE_PATH_CAP];
+    char actual[CTE_FILE_CAP];
+    ASSERT_EQ(cte_fixture(dir, sizeof(dir), path, sizeof(path)), 0);
+    ASSERT_EQ(th_write_file(path, "theme = \"dark\"\n"
+                                  "[mcp_servers.codebase-memory-mcp]\n"
+                                  "command = 'C:\\cbm\\codebase-memory-mcp.exe'\n"
+                                  "env_vars = [\"CBM_CACHE_DIR\"]\n"
+                                  "\n"
+                                  "[tui]\n"
+                                  "keep = true\n"),
+              0);
+    ASSERT_EQ(
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        0);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, "theme = \"dark\"\n[tui]\nkeep = true\n");
+
+    const char *foreign = "[mcp_servers.codebase-memory-mcp]\n"
+                          "command = \"/opt/codebase-memory-mcp\"\n"
+                          "env_vars = [\"CBM_CACHE_DIR\", \"HOME\"]\n";
+    ASSERT_EQ(th_write_file(path, foreign), 0);
+    ASSERT_EQ(
+        cbm_toml_remove_legacy_table(path, "mcp_servers.codebase-memory-mcp", CTE_BEGIN, CTE_END),
+        1);
+    ASSERT_EQ(cte_read(path, actual, sizeof(actual)), 0);
+    ASSERT_STR_EQ(actual, foreign);
+    th_cleanup(dir);
+    PASS();
+}
+
 TEST(config_toml_vibe_non_array_and_dotted_conflicts_fail_closed) {
     char dir[CTE_PATH_CAP];
     char path[CTE_PATH_CAP];
@@ -1508,4 +1543,5 @@ SUITE(config_toml_edit) {
     RUN_TEST(config_toml_codex_reports_stable_failure_reasons);
     RUN_TEST(config_toml_codex_preserves_bom_crlf_and_foreign_aot);
     RUN_TEST(config_toml_legacy_remove_reports_foreign_table_without_mutation);
+    RUN_TEST(config_toml_legacy_remove_adopts_owned_env_vars_only);
 }
