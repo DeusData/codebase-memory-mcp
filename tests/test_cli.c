@@ -13331,6 +13331,57 @@ TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string) {
     PASS();
 }
 
+/* #1720: Codex rewrites its own [mcp_servers] tables whenever it edits MCP
+ * servers (`codex mcp add`, the app's MCP settings, wrappers that drive it).
+ * The rewrite drops comment decor, so our begin marker vanishes, `args = []`
+ * is omitted, and the end marker survives as an ORPHAN below the next table.
+ * The config below is byte-for-byte what codex-cli 0.153.4 produced from our
+ * managed block after `codex mcp add orca -- /bin/echo hi`. Every later
+ * install then failed `op=mcp_install` on a table cbm itself had written. */
+TEST(cli_upsert_codex_mcp_adopts_codex_rewritten_table) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-codex-rewrite-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+    char configpath[512];
+    snprintf(configpath, sizeof(configpath), "%s/config.toml", tmpdir);
+    write_test_file(configpath, "model = \"gpt-5\"\n"
+                                "\n"
+                                "[projects.\"/tmp/x\"]\n"
+                                "trust_level = \"trusted\"\n"
+                                "\n"
+                                "[mcp_servers.codebase-memory-mcp]\n"
+                                "command = \"/opt/cbm/codebase-memory-mcp\"\n"
+                                "env_vars = [\"CBM_CACHE_DIR\", \"CBM_RUNTIME_DIR\"]\n"
+                                "\n"
+                                "[mcp_servers.orca]\n"
+                                "command = \"/bin/echo\"\n"
+                                "args = [\"hi\"]\n"
+                                "# <<< codebase-memory-mcp MCP <<<\n"
+                                "\n"
+                                "[tui]\n"
+                                "theme = \"dark\"\n");
+
+    int rc = cbm_upsert_codex_mcp("/new/cbm/codebase-memory-mcp", configpath);
+    char *data = read_test_file_alloc(configpath);
+    int tables = 0;
+    for (const char *p = data; p && (p = strstr(p, "[mcp_servers.codebase-memory-mcp]")); p++) {
+        tables++;
+    }
+    bool ok = data && tables == 1 && strstr(data, "/opt/cbm/") == NULL &&
+              strstr(data, "command = \"/new/cbm/codebase-memory-mcp\"") != NULL &&
+              strstr(data, "[mcp_servers.orca]\ncommand = \"/bin/echo\"\nargs = [\"hi\"]\n") &&
+              strstr(data, "trust_level = \"trusted\"") && strstr(data, "theme = \"dark\"") &&
+              strstr(data, "# >>> codebase-memory-mcp MCP >>>\n[mcp_servers.codebase-memory-mcp]");
+    free(data);
+    test_rmdir_r(tmpdir);
+    if (rc != 0)
+        FAIL("install must adopt the owned table Codex rewrote (orphan end marker, no args)");
+    if (!ok)
+        FAIL("adoption must leave one managed cbm table and every other entry intact");
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group B: MCP Config Upsert — Zed (corrected format)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -16309,6 +16360,7 @@ SUITE(cli) {
     RUN_TEST(cli_upsert_codex_mcp_existing);
     RUN_TEST(cli_upsert_codex_mcp_replace);
     RUN_TEST(cli_codex_legacy_migration_ignores_header_text_in_multiline_string);
+    RUN_TEST(cli_upsert_codex_mcp_adopts_codex_rewritten_table);
 
     /* Zed MCP format fix (1 test — group B) */
     RUN_TEST(cli_zed_mcp_uses_args_format);
