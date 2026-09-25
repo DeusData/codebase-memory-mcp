@@ -432,12 +432,9 @@ char *cbm_project_name_from_path(const char *abs_path) {
 }
 
 char *cbm_project_name_sanitize(const char *name_path) {
-    if (!name_path || !name_path[0]) {
-        return strdup("root");
-    }
-
-    /* Work on mutable copy */
-    char *path = strdup(name_path);
+    /* Work on mutable copy. NULL and "" map to "" and fall through to the
+     * empty-after-trim "root" return below. */
+    char *path = strdup(name_path ? name_path : "");
     if (!path) {
         return NULL;
     }

@@ -1498,34 +1498,28 @@ static bool has_non_ascii_byte(const char *s) {
  * identity. Stored names never change; ASCII selectors keep their existing
  * validation; a selector that collapses to the "root" fallback is left alone
  * so it never selects the root project. */
-static char *encode_bare_project_arg(char *project) {
-    if (!has_non_ascii_byte(project)) {
-        return project;
-    }
-    char *encoded = cbm_project_name_sanitize(project);
-    if (!encoded || strcmp(encoded, "root") == 0 || !cbm_validate_project_name(encoded)) {
-        free(encoded);
-        return project;
-    }
-    free(project);
-    return encoded;
+static bool bare_project_encoding_usable(const char *encoded) {
+    return strcmp(encoded, "root") != 0 && cbm_validate_project_name(encoded);
 }
 
 static char *normalize_project_arg(char *project) {
     if (!project) {
         return project;
     }
-    if (!strchr(project, '/') && !strchr(project, '\\')) {
-        return encode_bare_project_arg(project);
+    char *normalized = NULL;
+    bool bare = !strchr(project, '/') && !strchr(project, '\\');
+    if (bare) {
+        if (has_non_ascii_byte(project)) {
+            normalized = cbm_project_name_sanitize(project);
+        }
+    } else {
+        project = canonicalize_repo_path_if_exists(project);
+        normalized = cbm_project_name_from_path(project);
     }
-
-    project = canonicalize_repo_path_if_exists(project);
-    char *normalized = cbm_project_name_from_path(project);
-    if (normalized) {
-        free(project);
-        return normalized;
-    }
-    return project;
+    /* Keep exactly one of the two strings and release the other. */
+    bool use_normalized = normalized && (!bare || bare_project_encoding_usable(normalized));
+    free(use_normalized ? project : normalized);
+    return use_normalized ? normalized : project;
 }
 
 /* Forward decls — defined below alongside store resolution. */
