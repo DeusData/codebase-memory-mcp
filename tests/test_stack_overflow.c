@@ -13,6 +13,7 @@
 #include "cbm.h"
 #include "lang_specs.h" /* cbm_ts_language — direct-parse GLR cap regression (#913) */
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -399,23 +400,31 @@ TEST(cpp_large_templated_header_no_crash_issue424) {
  * java_resolve_calls_in_node frames (bind_lambda_args), bitcoin → SIGSEGV
  * under deep c_resolve_calls_in_node frames (cbm_type_substitute via
  * c_adl_resolve), microsoft/TypeScript → SIGBUS under an unbounded
- * lookup_member_type cycle. The walks now carry depth guards; these
- * reproductions fork a child so a regression cannot kill the test runner
- * (the TS cyclic-type shape is only reachable with a real cross-file
- * registry, so that one is verified at the real-repo tier; the synthetic
- * cyclic fixture here guards the in-file path).
+ * lookup_member_type cycle. The walks now carry depth guards. On POSIX,
+ * these reproductions fork a child so a regression cannot kill the test
+ * runner; Windows runs them in-process and lacks the timeout watchdog. The
+ * TS cyclic-type shape is only reachable with a real cross-file registry,
+ * so that one is verified at the real-repo tier; the synthetic cyclic
+ * fixture here guards the in-file path.
  * ═══════════════════════════════════════════════════════════════════ */
 
 #if !defined(_WIN32)
 #include <sys/wait.h>
 #include <unistd.h>
+
+static void so_extract_alarm_exit(int sig) {
+    (void)sig;
+    _exit(124);
+}
 #endif
 
-/* Run cbm_extract_file in a forked child; true if the child died by signal.
- * Mirrors tests/test_lang_contract.c. On Windows run in-process (a genuine
- * crash there aborts the runner — hard, visible failure). */
-static bool so_extract_crashes(const char *content, CBMLanguage lang, const char *relpath) {
+/* Run cbm_extract_file in a forked child; true if the child died by signal,
+ * timed out, or exited non-zero. On Windows run in-process (a genuine crash
+ * there aborts the runner — hard, visible failure). */
+static bool so_extract_crashes_with_timeout(const char *content, CBMLanguage lang,
+                                            const char *relpath, unsigned timeout_seconds) {
 #if defined(_WIN32)
+    (void)timeout_seconds;
     CBMFileResult *r =
         cbm_extract_file(content, (int)strlen(content), lang, "so", relpath, 0, NULL, NULL);
     if (r) {
@@ -426,20 +435,39 @@ static bool so_extract_crashes(const char *content, CBMLanguage lang, const char
     fflush(NULL);
     pid_t pid = fork();
     if (pid < 0) {
-        return false;
+        return true;
     }
     if (pid == 0) {
+        if (timeout_seconds > 0) {
+            signal(SIGALRM, so_extract_alarm_exit);
+            alarm(timeout_seconds);
+        }
         CBMFileResult *r =
             cbm_extract_file(content, (int)strlen(content), lang, "so", relpath, 0, NULL, NULL);
+        alarm(0);
         if (r) {
             cbm_free_result(r);
         }
         _exit(0);
     }
     int status = 0;
-    (void)waitpid(pid, &status, 0);
-    return WIFSIGNALED(status);
+    pid_t waited;
+    do {
+        waited = waitpid(pid, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != pid) {
+        (void)kill(pid, SIGKILL);
+        do {
+            waited = waitpid(pid, &status, 0);
+        } while (waited < 0 && errno == EINTR);
+        return true;
+    }
+    return WIFSIGNALED(status) || (WIFEXITED(status) && WEXITSTATUS(status) != 0);
 #endif
+}
+
+static bool so_extract_crashes(const char *content, CBMLanguage lang, const char *relpath) {
+    return so_extract_crashes_with_timeout(content, lang, relpath, 0);
 }
 
 #if !defined(_WIN32)
@@ -670,9 +698,104 @@ TEST(lsp_ts_cyclic_types_no_crash) {
                       "interface D extends C { d: number; }\n"
                       "declare const a: A;\n"
                       "declare const c: C;\n"
+#ifdef _WIN32
+                      /* Preserve baseline property-cycle coverage where the
+                       * POSIX child watchdog is unavailable. */
                       "function useIt(p: C) { return p.missing_member; }\n"
+#else
+                      /* A missing method forces inherited-method lookup through
+                       * the cyclic interface graph instead of returning early. */
+                      "function useIt(p: C) { p.missing(); return p.missing_member; }\n"
+#endif
                       "const y = c.also_missing;\n";
+#ifdef _WIN32
     ASSERT_FALSE(so_extract_crashes(src, CBM_LANG_TYPESCRIPT, "cycle.ts"));
+#else
+    ASSERT_FALSE(so_extract_crashes_with_timeout(src, CBM_LANG_TYPESCRIPT, "cycle.ts", 30));
+#endif
+    PASS();
+}
+
+TEST(lsp_ts_branching_cycle_has_bounded_work) {
+#ifdef _WIN32
+    SKIP_PLATFORM("POSIX child watchdog required for bounded-work timing");
+#else
+    const char *src = "interface A extends B, C {}\n"
+                      "interface B extends A, C {}\n"
+                      "interface C extends A, B {}\n"
+                      "function useIt(value: A) { value.missing(); return value.missing_member; }\n";
+    ASSERT_FALSE(
+        so_extract_crashes_with_timeout(src, CBM_LANG_TYPESCRIPT, "branching-cycle.ts", 30));
+    PASS();
+#endif
+}
+
+TEST(lsp_ts_shallower_revisit_preserves_inherited_method) {
+    enum { CHAIN = 62, CAP = 16384 };
+    char *src = malloc(CAP);
+    ASSERT_NOT_NULL(src);
+    size_t used = (size_t)snprintf(src, CAP,
+                                   "interface Service { ping(): void; }\n"
+                                   "interface Target { inherited(): void; inheritedField: Service; }\n"
+                                   "interface Shared extends Target {}\n"
+                                   "interface Root extends D0, Shared {}\n");
+    for (int i = 0; i < CHAIN; i++) {
+        const char *parent = i + 1 < CHAIN ? "D" : "Shared";
+        int wrote = i + 1 < CHAIN
+                        ? snprintf(src + used, CAP - used, "interface D%d extends %s%d {}\n", i,
+                                   parent, i + 1)
+                        : snprintf(src + used, CAP - used, "interface D%d extends Shared {}\n", i);
+        ASSERT_TRUE(wrote > 0 && (size_t)wrote < CAP - used);
+        used += (size_t)wrote;
+    }
+    int wrote = snprintf(
+        src + used, CAP - used,
+        "function useIt(value: Root) { value.inherited(); value.inheritedField.ping(); }\n");
+    ASSERT_TRUE(wrote > 0 && (size_t)wrote < CAP - used);
+
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "shallower.ts");
+    free(src);
+    ASSERT_NOT_NULL(r);
+    int inherited_method_found = 0;
+    int inherited_field_method_found = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->confidence > 0 && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "useIt") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "inherited")) {
+            inherited_method_found = 1;
+        }
+        if (resolved->confidence > 0 && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "useIt") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "ping")) {
+            inherited_field_method_found = 1;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_TRUE(inherited_method_found);
+    ASSERT_TRUE(inherited_field_method_found);
+    PASS();
+}
+
+TEST(lsp_ts_inherited_method_lookup) {
+    const char *src = "interface Base { inherited(): void; }\n"
+                      "interface Child extends Base {}\n"
+                      "function useIt(c: Child) { c.inherited(); }\n";
+    CBMFileResult *r = extract(src, CBM_LANG_TYPESCRIPT, "test", "inherited.ts");
+    ASSERT_NOT_NULL(r);
+
+    int found = 0;
+    for (int i = 0; i < r->resolved_calls.count; i++) {
+        const CBMResolvedCall *resolved = &r->resolved_calls.items[i];
+        if (resolved->confidence > 0 && resolved->caller_qn &&
+            strstr(resolved->caller_qn, "useIt") && resolved->callee_qn &&
+            strstr(resolved->callee_qn, "inherited")) {
+            found = 1;
+            break;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_TRUE(found);
     PASS();
 }
 
@@ -777,9 +900,8 @@ TEST(lsp_kotlin_deep_nesting_no_crash) {
 
 /* Split into three sub-suites so parallel/sharded runs are not serialized
  * behind one ~4-minute suite (it was the wall-clock critical path: every
- * other suite finished underneath it). Pure re-registration — the 20
- * RUN_TEST entries are exactly the ones the single suite carried; the
- * before/after test-count parity is asserted in the shard runner. */
+ * other suite finished underneath it). New regressions stay in the matching
+ * shard; the shard runner asserts aggregate test-count parity. */
 SUITE(stack_overflow_a) {
     cbm_init();
 
@@ -799,6 +921,9 @@ SUITE(stack_overflow_b) {
 
     RUN_TEST(perl_glr_deep_parse_recursion_capped);
     RUN_TEST(lsp_ts_cyclic_types_no_crash);
+    RUN_TEST(lsp_ts_branching_cycle_has_bounded_work);
+    RUN_TEST(lsp_ts_shallower_revisit_preserves_inherited_method);
+    RUN_TEST(lsp_ts_inherited_method_lookup);
     RUN_TEST(lsp_python_deep_nesting_no_crash);
     RUN_TEST(lsp_go_deep_nesting_no_crash);
     RUN_TEST(lsp_php_deep_nesting_no_crash);
