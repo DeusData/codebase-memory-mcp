@@ -985,6 +985,22 @@ static bool host_wait_for_lifetime(cbm_daemon_runtime_service_t *service,
     }
 }
 
+bool cbm_daemon_host_wait_for_lifetime_for_test(cbm_daemon_runtime_service_t *service,
+                                                const cbm_daemon_ipc_endpoint_t *endpoint,
+                                                cbm_version_cohort_lease_t *cohort_lease,
+                                                cbm_version_cohort_daemon_claim_t *daemon_claim,
+                                                cbm_daemon_ipc_participant_guard_t *guard) {
+    host_state_t host = {0};
+    atomic_int stop_requested = 0;
+    host_coordination_t coordination = {
+        .endpoint = endpoint,
+        .cohort_lease = cohort_lease,
+        .daemon_claim = daemon_claim,
+        .participant_guard = guard,
+    };
+    return host_wait_for_lifetime(service, &stop_requested, &host, false, &coordination);
+}
+
 static bool host_application_shutdown(host_state_t *host) {
     if (cbm_daemon_application_shutdown(host->application, HOST_APPLICATION_SHUTDOWN_MS)) {
         return true;
