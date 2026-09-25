@@ -21,6 +21,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#endif
 
 enum {
     CBM_DAEMON_IPC_SEND_TIMEOUT_MS = 5000,
@@ -52,6 +55,76 @@ void cbm_daemon_ipc_set_validation_detail_for_testing(const char *detail) {
 
 const char *cbm_daemon_ipc_validation_detail(void) {
     return ipc_validation_detail_buffer;
+}
+
+/* #1717: a cache root on a network filesystem (a shared HPC home, an NFS or
+ * SMB mount) is ACCEPTED -- this is advice, never a refusal. SQLite's WAL mode
+ * relies on shared-memory locking that network filesystems do not provide
+ * reliably, so indexes there can be slow or corrupt. Detection is statfs
+ * f_type, Linux only; other platforms never warn. */
+static const char *ipc_network_fs_name(unsigned long magic) {
+    static const struct {
+        unsigned long magic;
+        const char *name;
+    } kinds[] = {
+        {0x6969UL, "NFS"},        {0xFF534D42UL, "CIFS"}, {0xFE534D42UL, "SMB2"},
+        {0x0BD00BD0UL, "Lustre"}, {0x47504653UL, "GPFS"},
+    };
+    for (size_t index = 0; index < sizeof(kinds) / sizeof(kinds[0]); index++) {
+        if (kinds[index].magic == magic) {
+            return kinds[index].name;
+        }
+    }
+    return NULL;
+}
+
+static atomic_bool g_ipc_network_cache_warned;
+#ifdef CBM_ENABLE_TEST_SEAMS
+static bool g_ipc_fs_magic_override_active;
+static unsigned long g_ipc_fs_magic_override;
+void cbm_daemon_ipc_set_fs_magic_for_test(bool active, unsigned long magic) {
+    g_ipc_fs_magic_override_active = active;
+    g_ipc_fs_magic_override = magic;
+    atomic_store(&g_ipc_network_cache_warned, false);
+}
+#endif
+
+static bool ipc_path_fs_magic(const char *path, unsigned long *magic_out) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_ipc_fs_magic_override_active) {
+        *magic_out = g_ipc_fs_magic_override;
+        return true;
+    }
+#endif
+#if defined(__linux__)
+    struct statfs status;
+    if (statfs(path, &status) != 0) {
+        return false;
+    }
+    /* f_type is a signed word on some ABIs; the magics are 32-bit. */
+    *magic_out = (unsigned long)status.f_type & 0xFFFFFFFFUL;
+    return true;
+#else
+    (void)path;
+    (void)magic_out;
+    return false;
+#endif
+}
+
+bool cbm_daemon_ipc_warn_if_network_cache_root(const char *cache_root) {
+    unsigned long magic = 0;
+    const char *kind = NULL;
+    if (!cache_root || !cache_root[0] || !ipc_path_fs_magic(cache_root, &magic) ||
+        !(kind = ipc_network_fs_name(magic))) {
+        return false;
+    }
+    if (atomic_exchange(&g_ipc_network_cache_warned, true)) {
+        return false; /* one warning per process */
+    }
+    cbm_log_warn("daemon.cache_root_network_fs", "path", cache_root, "fs", kind, "reason",
+                 "sqlite_wal_unreliable_on_network_fs", "hint",
+                 "set CBM_CACHE_DIR to local storage (docs/CONFIGURATION.md)");
+    return true;
 }
 
 static cbm_daemon_ipc_listen_failure_t ipc_listen_failure;
@@ -401,6 +474,9 @@ int cbm_daemon_ipc_wait_pending(const cbm_ipc_pending_ops_t *ops, uint32_t timeo
 #include <poll.h>
 #include <pthread.h>
 #include <stddef.h>
+#if !defined(__linux__)
+#include <pwd.h>
+#endif
 #include <sys/file.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -1736,14 +1812,138 @@ static bool posix_directory_parent_secure(int directory_fd) {
  * never chmod'd or ACL-rewritten.  The euid-only enforcement that stops a
  * squatted private directory lives in the created/final/snapshot checks, not
  * here — this only walks ancestors. */
-static bool posix_directory_transition_secure(int parent_fd, int child_fd) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1717 seam: report one directory (by dev/ino) as owned by a foreign uid, so
+ * the foreign-owned-ancestor refusal and its diagnostic are testable without
+ * root (an unprivileged test cannot chown a directory to another account). */
+static bool g_posix_foreign_owner_active;
+static dev_t g_posix_foreign_owner_dev;
+static ino_t g_posix_foreign_owner_ino;
+static uid_t g_posix_foreign_owner_uid;
+bool cbm_daemon_ipc_posix_set_foreign_owned_dir_for_test(const char *directory_path,
+                                                         unsigned long foreign_uid) {
+    struct stat status;
+    g_posix_foreign_owner_active = false;
+    if (!directory_path || lstat(directory_path, &status) != 0 || !S_ISDIR(status.st_mode)) {
+        return false;
+    }
+    g_posix_foreign_owner_dev = status.st_dev;
+    g_posix_foreign_owner_ino = status.st_ino;
+    g_posix_foreign_owner_uid = (uid_t)foreign_uid;
+    g_posix_foreign_owner_active = true;
+    return true;
+}
+void cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test(void) {
+    g_posix_foreign_owner_active = false;
+}
+#endif
+
+static uid_t posix_directory_observed_owner(const struct stat *status) {
+#ifdef CBM_ENABLE_TEST_SEAMS
+    if (g_posix_foreign_owner_active && status->st_dev == g_posix_foreign_owner_dev &&
+        status->st_ino == g_posix_foreign_owner_ino) {
+        return g_posix_foreign_owner_uid;
+    }
+#endif
+    return status->st_uid;
+}
+
+enum { POSIX_OWNER_NAME_CAP = 33, POSIX_PASSWD_LINE_CAP = 1024 };
+
+/* The account name for uid, or "" when it cannot be named. Diagnostic only.
+ *
+ * Linux reads /etc/passwd directly instead of calling getpwuid(): the Linux
+ * release binary is statically linked against glibc, where getpwuid() loads the
+ * HOST's NSS modules at runtime -- a version-mismatch crash hazard exactly on
+ * the sssd/LDAP hosts (#1717's shared HPC filesystems) this message serves.
+ * A directory-service account is then shown by uid only. */
+static void posix_owner_name(uid_t uid, char out[POSIX_OWNER_NAME_CAP]) {
+    out[0] = '\0';
+#if defined(__linux__)
+    FILE *passwd = cbm_fopen("/etc/passwd", "r");
+    if (!passwd) {
+        return;
+    }
+    char line[POSIX_PASSWD_LINE_CAP];
+    while (fgets(line, sizeof(line), passwd)) {
+        char *name_end = strchr(line, ':');
+        char *password_end = name_end ? strchr(name_end + 1, ':') : NULL;
+        if (!password_end || name_end == line) {
+            continue;
+        }
+        char *uid_end = NULL;
+        errno = 0;
+        unsigned long line_uid = strtoul(password_end + 1, &uid_end, 10);
+        if (errno == 0 && uid_end != password_end + 1 && *uid_end == ':' &&
+            line_uid == (unsigned long)uid) {
+            (void)snprintf(out, POSIX_OWNER_NAME_CAP, "%.*s", (int)(name_end - line), line);
+            break;
+        }
+    }
+    (void)fclose(passwd);
+#else
+    struct passwd entry;
+    struct passwd *found = NULL;
+    char storage[POSIX_PASSWD_LINE_CAP];
+    if (getpwuid_r(uid, &entry, storage, sizeof(storage), &found) == 0 && found && found->pw_name) {
+        (void)snprintf(out, POSIX_OWNER_NAME_CAP, "%s", found->pw_name);
+    }
+#endif
+}
+
+/* The foreign-owned-ancestor refusal. The remedy is the part the reader acts
+ * on, so it must survive the fixed detail buffer: the path is shortened from
+ * the LEFT ("...") to fit, which keeps the refusing component at its end. */
+static void posix_foreign_owner_detail_set(const char *child_path, uid_t owner) {
+    char name[POSIX_OWNER_NAME_CAP];
+    posix_owner_name(owner, name);
+    char owner_text[64];
+    if (name[0]) {
+        (void)snprintf(owner_text, sizeof(owner_text), "uid %ld (%s)", (long)owner, name);
+    } else {
+        (void)snprintf(owner_text, sizeof(owner_text), "uid %ld", (long)owner);
+    }
+    char tail[sizeof(ipc_validation_detail_buffer)];
+    int tail_length = snprintf(tail, sizeof(tail),
+                               "' is owned by %s, not by you (uid %ld) or root; that account "
+                               "controls this path. Use a location whose parent directories are "
+                               "yours or root's (e.g. set CBM_CACHE_DIR)",
+                               owner_text, (long)geteuid());
+    if (tail_length < 0) {
+        return;
+    }
+    size_t used = (size_t)tail_length + 1; /* the opening quote */
+    size_t room = used < sizeof(ipc_validation_detail_buffer)
+                      ? sizeof(ipc_validation_detail_buffer) - 1 - used
+                      : 0;
+    size_t path_length = strlen(child_path);
+    const char *ellipsis = "";
+    const char *shown = child_path;
+    if (path_length > room) {
+        ellipsis = "...";
+        shown = child_path + path_length - (room > 3 ? room - 3 : 0);
+    }
+    ipc_validation_detail_set("'%s%s%s", ellipsis, shown, tail);
+}
+
+static bool posix_directory_transition_secure(int parent_fd, int child_fd, const char *child_path) {
     struct stat parent;
     struct stat child;
     if (parent_fd < 0 || child_fd < 0 || !posix_directory_parent_secure(parent_fd) ||
         fstat(parent_fd, &parent) != 0 || fstat(child_fd, &child) != 0 ||
         !S_ISDIR(parent.st_mode) || !S_ISDIR(child.st_mode) ||
-        !posix_directory_ancestor_owner_trusted(parent.st_uid) ||
-        !posix_directory_ancestor_owner_trusted(child.st_uid)) {
+        !posix_directory_ancestor_owner_trusted(posix_directory_observed_owner(&parent))) {
+        return false;
+    }
+    uid_t child_owner = posix_directory_observed_owner(&child);
+    if (!posix_directory_ancestor_owner_trusted(child_owner)) {
+        /* #1717: this refusal used to set no detail, so the caller printed
+         * "ancestry component validation failed (errno 17)" -- a stale EEXIST
+         * from the mkdirat() on the existing component, naming neither the
+         * directory nor the reason. The policy is unchanged: an account that
+         * owns an ancestor can rename or replace everything below it after
+         * this walk, so it could redirect the private directory. Name it. */
+        posix_foreign_owner_detail_set(child_path, child_owner);
         return false;
     }
     return true;
@@ -1811,7 +2011,8 @@ static int private_directory_tree_open(const char *directory_path) {
                    : -1;
             struct stat status;
             ok = next_fd >= 0 && fd_set_cloexec(next_fd) && fstat(next_fd, &status) == 0 &&
-                 S_ISDIR(status.st_mode) && posix_directory_transition_secure(current_fd, next_fd);
+                 S_ISDIR(status.st_mode) &&
+                 posix_directory_transition_secure(current_fd, next_fd, path);
             if (ok && created) {
                 ok = status.st_uid == geteuid() && fchmod(next_fd, 0700) == 0 &&
                      cbm_macos_extended_acl_fd_clear(next_fd) &&

@@ -49,6 +49,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <pwd.h>
 #include <unistd.h>
 #ifdef __linux__
 #include <sched.h> /* #1830 userns real smoke: unshare(CLONE_NEWUSER). */
@@ -5193,6 +5194,147 @@ TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* #1717: an ancestor owned by ANOTHER non-root account (a shared filesystem
+ * whose parent directory belongs to a colleague) is refused -- that account can
+ * rename or replace everything below it, so the policy stays. What was wrong is
+ * the message: the refusal set no detail, and the caller printed
+ * "ancestry component validation failed (errno 17)", a stale EEXIST from
+ * mkdirat() that named neither the directory nor the reason. The reporter
+ * could not tell which directory, or why. The refusal must name the refusing
+ * directory, its owner uid, and the remedy. The seam reports one directory as
+ * foreign-owned because an unprivileged test cannot chown to another account. */
+enum { IPC_TEST_FOREIGN_MAX_DEPTH = 16 };
+
+typedef struct {
+    bool paths_ok;
+    bool seam_set;
+    bool refused;
+    bool cache_created;
+    bool secured_without_seam;
+    size_t foreign_path_length;
+    char detail[512];
+} ipc_test_foreign_result_t;
+
+/* Build <parent>/<depth x 24-char dirs>/shared-fs, mark shared-fs as owned by
+ * foreign_uid through the seam, and ask for <...>/shared-fs/cache. Deeper
+ * chains produce a path long enough that the detail must be shortened. */
+static void ipc_test_foreign_ancestor_run(const char *tag, int depth, unsigned long foreign_uid,
+                                          ipc_test_foreign_result_t *result) {
+    char parent[TEST_PATH_CAP];
+    char chain[IPC_TEST_FOREIGN_MAX_DEPTH + 1][TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    int made = 0;
+    memset(result, 0, sizeof(*result));
+    result->paths_ok = depth <= IPC_TEST_FOREIGN_MAX_DEPTH && ipc_test_parent_new(parent, tag);
+    const char *base = parent;
+    for (int level = 0; result->paths_ok && level <= depth; level++) {
+        const char *leaf = level == depth ? "shared-fs" : "level-component-24-chars";
+        int w = snprintf(chain[level], sizeof(chain[level]), "%s/%s", base, leaf);
+        result->paths_ok = w > 0 && w < (int)sizeof(chain[level]) && mkdir(chain[level], 0755) == 0;
+        made += result->paths_ok ? 1 : 0;
+        base = chain[level];
+    }
+    if (result->paths_ok) {
+        int c = snprintf(cache, sizeof(cache), "%s/cache", chain[depth]);
+        result->paths_ok = c > 0 && c < (int)sizeof(cache);
+        result->foreign_path_length = strlen(chain[depth]);
+    }
+    if (result->paths_ok) {
+        result->seam_set =
+            cbm_daemon_ipc_posix_set_foreign_owned_dir_for_test(chain[depth], foreign_uid);
+    }
+    if (result->seam_set) {
+        result->refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        const char *why = cbm_daemon_ipc_validation_detail();
+        (void)snprintf(result->detail, sizeof(result->detail), "%s", why ? why : "");
+        struct stat probe;
+        result->cache_created = lstat(cache, &probe) == 0;
+        cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test();
+        /* Control: with real ownership the same path is accepted, so the
+         * refusal above is the foreign owner and nothing else. */
+        result->secured_without_seam = cbm_daemon_ipc_private_directory_secure(cache);
+        (void)rmdir(cache);
+    }
+    cbm_daemon_ipc_posix_clear_foreign_owned_dir_for_test();
+    while (made > 0) {
+        (void)rmdir(chain[--made]);
+    }
+    if (depth <= IPC_TEST_FOREIGN_MAX_DEPTH) {
+        ipc_test_remove_flat_dir(parent);
+    }
+}
+
+TEST(daemon_ipc_posix_foreign_owned_ancestor_refusal_names_directory_issue1717) {
+    /* A uid no account resolves to: the detail names the uid alone. */
+    unsigned long foreign_uid = (unsigned long)geteuid() + 4242UL;
+    ASSERT_TRUE(getpwuid((uid_t)foreign_uid) == NULL); /* precondition */
+    ipc_test_foreign_result_t result;
+    ipc_test_foreign_ancestor_run("posix-foreign-ancestor", 0, foreign_uid, &result);
+    char owner_text[64];
+    (void)snprintf(owner_text, sizeof(owner_text), "owned by uid %lu,", foreign_uid);
+
+    ASSERT_TRUE(result.paths_ok);
+    ASSERT_TRUE(result.seam_set);
+    ASSERT_TRUE(result.refused);
+    ASSERT_TRUE(!result.cache_created); /* nothing is created below a foreign ancestor */
+    ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs'"));
+    ASSERT_NOT_NULL(strstr(result.detail, owner_text));
+    ASSERT_NOT_NULL(strstr(result.detail, "CBM_CACHE_DIR"));
+    ASSERT_TRUE(strstr(result.detail, "errno") == NULL);
+    ASSERT_TRUE(result.secured_without_seam);
+    PASS();
+}
+
+/* #1717: the owner is named when the account resolves. uid 1 is a local system
+ * account in /etc/passwd on macOS and on the Linux images we test ("daemon" on
+ * both; Alpine calls it "bin"), so the expected name is taken from the same
+ * local database rather than hardcoded. */
+TEST(daemon_ipc_posix_foreign_owned_ancestor_names_owner_account_issue1717) {
+    const unsigned long named_uid = 1;
+    struct passwd *expected = getpwuid((uid_t)named_uid);
+    if (!expected || !expected->pw_name || !expected->pw_name[0]) {
+        SKIP_PLATFORM("uid 1 has no local account name on this system");
+    }
+    char owner_text[96];
+    (void)snprintf(owner_text, sizeof(owner_text), "owned by uid %lu (%s),", named_uid,
+                   expected->pw_name);
+    ipc_test_foreign_result_t result;
+    ipc_test_foreign_ancestor_run("posix-foreign-named", 0, named_uid, &result);
+
+    ASSERT_TRUE(result.paths_ok);
+    ASSERT_TRUE(result.seam_set);
+    ASSERT_TRUE(result.refused);
+    ASSERT_NOT_NULL(strstr(result.detail, owner_text));
+    ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs'"));
+    ASSERT_TRUE(result.secured_without_seam);
+    PASS();
+}
+
+/* #1717: the detail buffer is fixed (384 bytes). A long path must not push the
+ * remedy out: the path is shortened from the left, so the refusing component
+ * and the whole remedy survive. */
+TEST(daemon_ipc_posix_foreign_owned_ancestor_long_path_keeps_remedy_issue1717) {
+    const unsigned long named_uid = 1;
+    ipc_test_foreign_result_t result;
+    ipc_test_foreign_ancestor_run("posix-foreign-long", IPC_TEST_FOREIGN_MAX_DEPTH, named_uid,
+                                  &result);
+    static const char remedy[] =
+        "Use a location whose parent directories are yours or root's (e.g. set CBM_CACHE_DIR)";
+
+    ASSERT_TRUE(result.paths_ok);
+    ASSERT_TRUE(result.foreign_path_length > 384); /* the input really overflows */
+    ASSERT_TRUE(result.refused);
+    ASSERT_TRUE(strlen(result.detail) < 384);
+    ASSERT_TRUE(strncmp(result.detail, "'...", 4) == 0);
+    ASSERT_NOT_NULL(strstr(result.detail, "/shared-fs' is owned by uid 1"));
+    size_t detail_length = strlen(result.detail);
+    ASSERT_TRUE(detail_length >= sizeof(remedy) - 1);
+    ASSERT_STR_EQ(result.detail + detail_length - (sizeof(remedy) - 1), remedy);
+    PASS();
+}
+#endif
+
+#ifdef CBM_ENABLE_TEST_SEAMS
 /* #1830: /proc/self/uid_map single-uid detection. A single-uid map is exactly
  * one line "<inside> <outside> 1" whose inside id is our euid; anything else —
  * the init map, a count other than 1, a foreign inside id, extra lines, or junk
@@ -5415,6 +5557,65 @@ static void ipc_test_log_capture_sink(const char *line) {
     ipc_test_log_capture[ipc_test_log_capture_used] = '\0';
 }
 
+#ifdef CBM_ENABLE_TEST_SEAMS
+/* #1717: a cache root on a network filesystem (shared HPC home, NFS/SMB mount)
+ * is ACCEPTED, but SQLite WAL is unreliable there, so startup logs ONE warning
+ * with the local-storage advice. The seam supplies the statfs f_type on every
+ * platform (real detection is Linux-only), so the mapping and the
+ * once-per-process rule are bound deterministically here. */
+static bool ipc_test_network_warning_emitted(unsigned long magic, const char *fs_name) {
+    ipc_test_log_capture_used = 0;
+    ipc_test_log_capture[0] = '\0';
+    cbm_daemon_ipc_set_fs_magic_for_test(true, magic);
+    cbm_log_set_sink_ex(ipc_test_log_capture_sink, CBM_LOG_SINK_REPLACE);
+    bool warned = cbm_daemon_ipc_warn_if_network_cache_root("/shared/fs/me/.cache/cbm");
+    cbm_log_set_sink(NULL);
+    char expected[32];
+    (void)snprintf(expected, sizeof(expected), "fs=%s", fs_name);
+    const char *line = strstr(ipc_test_log_capture, "daemon.cache_root_network_fs");
+    return warned && line && strstr(line, expected) && strstr(line, "CBM_CACHE_DIR") &&
+           strstr(line, "path=/shared/fs/me/.cache/cbm");
+}
+
+TEST(daemon_ipc_network_cache_root_warns_once_issue1717) {
+    CBMLogLevel saved_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_WARN);
+    bool nfs = ipc_test_network_warning_emitted(0x6969UL, "NFS");
+    bool cifs = ipc_test_network_warning_emitted(0xFF534D42UL, "CIFS");
+    bool smb2 = ipc_test_network_warning_emitted(0xFE534D42UL, "SMB2");
+    bool lustre = ipc_test_network_warning_emitted(0x0BD00BD0UL, "Lustre");
+    bool gpfs = ipc_test_network_warning_emitted(0x47504653UL, "GPFS");
+
+    /* Once per process: a second startup check stays silent. */
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0x6969UL);
+    bool first = cbm_daemon_ipc_warn_if_network_cache_root("/nfs/cache");
+    bool second = cbm_daemon_ipc_warn_if_network_cache_root("/nfs/cache");
+
+    /* Local filesystems (ext4, xfs, tmpfs) never warn. */
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0xEF53UL);
+    bool ext4 = cbm_daemon_ipc_warn_if_network_cache_root("/home/me/.cache/cbm");
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0x58465342UL);
+    bool xfs = cbm_daemon_ipc_warn_if_network_cache_root("/home/me/.cache/cbm");
+    cbm_daemon_ipc_set_fs_magic_for_test(true, 0x01021994UL);
+    bool tmpfs = cbm_daemon_ipc_warn_if_network_cache_root("/home/me/.cache/cbm");
+
+    cbm_daemon_ipc_set_fs_magic_for_test(false, 0);
+    cbm_log_set_level(saved_level);
+
+    ASSERT_TRUE(nfs);
+    ASSERT_TRUE(cifs);
+    ASSERT_TRUE(smb2);
+    ASSERT_TRUE(lustre);
+    ASSERT_TRUE(gpfs);
+    ASSERT_TRUE(first);
+    ASSERT_TRUE(!second);
+    ASSERT_TRUE(!ext4);
+    ASSERT_TRUE(!xfs);
+    ASSERT_TRUE(!tmpfs);
+    PASS();
+}
+#endif
+
 /* #1828: a full /tmp made every daemon start die at pending publication, and
  * the only durable trace was `daemon.ipc.listen_failed stage=pending_publication`
  * -- no syscall, no errno, no path. The reporter needed hours (and a wrong
@@ -5517,6 +5718,9 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
     RUN_TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537);
 #ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_posix_foreign_owned_ancestor_refusal_names_directory_issue1717);
+    RUN_TEST(daemon_ipc_posix_foreign_owned_ancestor_names_owner_account_issue1717);
+    RUN_TEST(daemon_ipc_posix_foreign_owned_ancestor_long_path_keeps_remedy_issue1717);
     RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830);
@@ -5551,6 +5755,9 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_rejects_non_socket_and_symlink_endpoints);
 #ifndef _WIN32
     RUN_TEST(daemon_ipc_listen_failure_names_errno_and_path);
+#ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_network_cache_root_warns_once_issue1717);
+#endif
 #endif
 #endif
 }
