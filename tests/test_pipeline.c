@@ -10,6 +10,7 @@
 #include "test_helpers.h"
 #include "foundation/mem.h" // cbm_mem_init/budget (back-pressure futile-nap test)
 #include "pipeline/pipeline.h"
+#include "pipeline/lsp_surface.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/artifact.h"
 #include "store/store.h"
@@ -14215,6 +14216,48 @@ TEST(pipeline_seq_ts_cross_uses_shared_registry) {
     PASS();
 }
 
+/* Object arrays are non-flat in yyjson. Exercise ordered decoding and arena
+ * ownership across a large surface, including nested string arrays. */
+TEST(pipeline_lsp_surface_large_object_array_decode) {
+    const int count = 8192;
+    const size_t capacity = (size_t)count * 192 + 64;
+    char *json = malloc(capacity);
+    ASSERT_NOT_NULL(json);
+    size_t used = (size_t)snprintf(json, capacity, "{\"v\":1,\"lsp\":[");
+    for (int i = 0; i < count; i++) {
+        int n = snprintf(json + used, capacity - used,
+                         "%s{\"qn\":\"pkg.f%d\",\"sn\":\"f%d\",\"lb\":\"Function\","
+                         "\"spt\":[\"str\",\"int\"],\"dec\":[\"first\",\"second\"]}",
+                         i ? "," : "", i, i);
+        ASSERT_TRUE(n > 0 && (size_t)n < capacity - used);
+        used += (size_t)n;
+    }
+    snprintf(json + used, capacity - used, "]}");
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    CBMLSPDef *defs = NULL;
+    int decoded = cbm_lsp_surface_defs_from_json(&arena, json, &defs);
+    free(json);
+    ASSERT_EQ(decoded, count);
+    ASSERT_NOT_NULL(defs);
+    for (int i = 0; i < count; i++) {
+        char expected[64];
+        snprintf(expected, sizeof(expected), "pkg.f%d", i);
+        ASSERT_STR_EQ(defs[i].qualified_name, expected);
+        snprintf(expected, sizeof(expected), "f%d", i);
+        ASSERT_STR_EQ(defs[i].short_name, expected);
+        ASSERT_STR_EQ(defs[i].label, "Function");
+        ASSERT_EQ(defs[i].signature_param_count, 2);
+        ASSERT_STR_EQ(defs[i].signature_param_types[0], "str");
+        ASSERT_STR_EQ(defs[i].signature_param_types[1], "int");
+        ASSERT_STR_EQ(defs[i].decorators[0], "first");
+        ASSERT_STR_EQ(defs[i].decorators[1], "second");
+        ASSERT_NULL(defs[i].decorators[2]);
+    }
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 /* The closure-repair route lives and dies by two properties of the persisted
  * per-file LSP surface: a BODY edit must leave the surface_sha unchanged (the
  * early cutoff -- no dependent recomputation owed), while a SIGNATURE edit
@@ -15084,6 +15127,7 @@ TEST(pipeline_objectscript_export_range_join_keeps_one_trailing_marker) {
 #endif
 
 SUITE(pipeline) {
+    RUN_TEST(pipeline_lsp_surface_large_object_array_decode);
     RUN_TEST(pipeline_lsp_surface_persisted_and_body_edit_invariant);
     /* Index lock */
     RUN_TEST(pipeline_lock_try_acquire);
