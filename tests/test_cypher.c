@@ -485,6 +485,53 @@ TEST(cypher_parse_order_by_over_cap_rejected_issue1334) {
     PASS();
 }
 
+/* #1994: a non-numeric SKIP/LIMIT operand must be a loud parse error too. The old
+ * failure mode was the same one #1334 banned by a different route: expect()
+ * returned NULL, the clause was dropped, and the query still reported success
+ * with limit left at its -1 "no LIMIT" sentinel - so query_graph answered a
+ * bounded query with the entire result set. Cypher parameters ($limit) are the
+ * everyday trigger: they are what a Neo4j-shaped client writes by default. */
+TEST(cypher_parse_nonnumeric_limit_rejected_issue1994) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name LIMIT $limit", &q, &err);
+    ASSERT(rc != 0);
+    free(err);
+    PASS();
+}
+
+TEST(cypher_parse_nonnumeric_skip_rejected_issue1994) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    /* The orphaned operand also swallowed the LIMIT that followed it. */
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name SKIP $offset LIMIT 10", &q, &err);
+    ASSERT(rc != 0);
+    free(err);
+    PASS();
+}
+
+TEST(cypher_parse_word_limit_operand_rejected_issue1994) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name LIMIT abc", &q, &err);
+    ASSERT(rc != 0);
+    free(err);
+    PASS();
+}
+
+/* Control: a well-formed SKIP/LIMIT still parses and still carries its values. */
+TEST(cypher_parse_numeric_skip_limit_still_accepted) {
+    cbm_query_t *q = NULL;
+    char *err = NULL;
+    int rc = cbm_cypher_parse("MATCH (f:Function) RETURN f.name SKIP 2 LIMIT 10", &q, &err);
+    ASSERT_EQ(rc, 0);
+    ASSERT_EQ(q->ret->skip, 2);
+    ASSERT_EQ(q->ret->limit, 10);
+
+    cbm_query_free(q);
+    PASS();
+}
+
 TEST(cypher_parse_return_distinct) {
     cbm_query_t *q = NULL;
     char *err = NULL;
@@ -4421,6 +4468,63 @@ TEST(cypher_exec_prop_array_with_internal_commas) {
 
 /* A string property must not end at an ESCAPED quote: the scan stopped at the
  * first '"' regardless of a preceding backslash, cutting the value short. */
+/* Planner (2026-09-16): a single-hop pattern whose FAR node carries the
+ * selective filter is walked from that end. `MATCH (a)-[:CALLS]->(b) WHERE
+ * b.name = 'X'` used to scan every node before the filter on b could act — on
+ * the 8.5 M node kernel graph it hit the execution-time limit while the
+ * anchored spelling answered in seconds. The rows must be the same in every
+ * spelling, including the inline-property and inbound-direction forms, and
+ * the caller-side variable must still bind the right nodes after the swap. */
+TEST(cypher_single_hop_seeds_from_selective_far_node) {
+    cbm_store_t *s = setup_cypher_store();
+
+    cbm_cypher_result_t where_form = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a)-[:CALLS]->(b) WHERE b.name = 'ValidateOrder' "
+                                 "RETURN a.name ORDER BY a.name",
+                                 "test", 0, &where_form),
+              0);
+    ASSERT_EQ(where_form.row_count, 1);
+    ASSERT_STR_EQ(where_form.rows[0][0], "HandleOrder");
+    cbm_cypher_result_free(&where_form);
+
+    cbm_cypher_result_t inline_form = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a)-[:CALLS]->(b {name: 'SubmitOrder'}) "
+                                 "RETURN a.name",
+                                 "test", 0, &inline_form),
+              0);
+    ASSERT_EQ(inline_form.row_count, 1);
+    ASSERT_STR_EQ(inline_form.rows[0][0], "ValidateOrder");
+    cbm_cypher_result_free(&inline_form);
+
+    /* Inbound spelling: the far node is now the CALLER; direction inverts back. */
+    cbm_cypher_result_t inbound_form = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (callee)<-[:CALLS]-(caller) WHERE caller.name = "
+                                 "'HandleOrder' RETURN callee.name ORDER BY callee.name",
+                                 "test", 0, &inbound_form),
+              0);
+    ASSERT_EQ(inbound_form.row_count, 2);
+    ASSERT_STR_EQ(inbound_form.rows[0][0], "LogError");
+    ASSERT_STR_EQ(inbound_form.rows[1][0], "ValidateOrder");
+    cbm_cypher_result_free(&inbound_form);
+
+    /* Count aggregation through the swapped seed. */
+    cbm_cypher_result_t count_form = {0};
+    ASSERT_EQ(cbm_cypher_execute(s,
+                                 "MATCH (a)-[:CALLS]->(b) WHERE b.name = 'LogError' "
+                                 "RETURN count(a) AS callers",
+                                 "test", 0, &count_form),
+              0);
+    ASSERT_EQ(count_form.row_count, 1);
+    ASSERT_STR_EQ(count_form.rows[0][0], "1");
+    cbm_cypher_result_free(&count_form);
+
+    cbm_store_close(s);
+    PASS();
+}
+
 TEST(cypher_exec_prop_string_with_escaped_quote) {
     cbm_store_t *s = cbm_store_open_memory();
     cbm_store_upsert_project(s, "test", "/tmp/test");
@@ -4556,6 +4660,10 @@ SUITE(cypher) {
     RUN_TEST(cypher_parse_return_order_limit);
     RUN_TEST(cypher_parse_multikey_order_by_issue1334);
     RUN_TEST(cypher_parse_order_by_over_cap_rejected_issue1334);
+    RUN_TEST(cypher_parse_nonnumeric_limit_rejected_issue1994);
+    RUN_TEST(cypher_parse_nonnumeric_skip_rejected_issue1994);
+    RUN_TEST(cypher_parse_word_limit_operand_rejected_issue1994);
+    RUN_TEST(cypher_parse_numeric_skip_limit_still_accepted);
     RUN_TEST(cypher_parse_return_distinct);
     RUN_TEST(cypher_parse_inline_props);
     RUN_TEST(cypher_parse_error);
@@ -4741,4 +4849,5 @@ SUITE(cypher) {
     /* Composite property projection (arrays/objects, escaped quotes) */
     RUN_TEST(cypher_exec_prop_array_with_internal_commas);
     RUN_TEST(cypher_exec_prop_string_with_escaped_quote);
+    RUN_TEST(cypher_single_hop_seeds_from_selective_far_node);
 }

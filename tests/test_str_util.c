@@ -436,6 +436,30 @@ TEST(json_escape_control_chars) {
     PASS();
 }
 
+/* A truncated escape must never end inside a multibyte UTF-8 sequence: the
+ * callee text of a CALLS edge is escaped into a fixed buffer, and a cut umlaut
+ * persisted bytes SQLite could not decode as text (2026-09-16 probe: rust,
+ * java and typescript stores). "aé" is a, 0xC3, 0xA9. */
+TEST(json_escape_never_splits_utf8) {
+    char buf[3]; /* room for two payload bytes + NUL: the lead byte would fit, its continuation not
+                  */
+    int len = cbm_json_escape(buf, sizeof(buf), "a\xC3\xA9");
+    ASSERT_STR_EQ(buf, "a");
+    ASSERT_EQ(len, 1);
+
+    char whole[4];
+    len = cbm_json_escape(whole, sizeof(whole), "a\xC3\xA9");
+    ASSERT_STR_EQ(whole, "a\xC3\xA9");
+    ASSERT_EQ(len, 3);
+
+    /* A four-byte sequence cut after two bytes is dropped whole. */
+    char emoji[3];
+    len = cbm_json_escape(emoji, sizeof(emoji), "\xF0\x9F\x98\x80z");
+    ASSERT_STR_EQ(emoji, "");
+    ASSERT_EQ(len, 0);
+    PASS();
+}
+
 /* ── SNPRINTF_APPEND tests ────────────────────────────────────── */
 
 TEST(snprintf_append_basic) {
@@ -547,6 +571,7 @@ SUITE(str_util) {
     RUN_TEST(validate_shell_arg_spaces);
     /* JSON Escaping */
     RUN_TEST(json_escape_control_chars);
+    RUN_TEST(json_escape_never_splits_utf8);
     /* SNPRINTF_APPEND */
     RUN_TEST(snprintf_append_basic);
     RUN_TEST(snprintf_append_fills_exactly);

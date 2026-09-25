@@ -820,6 +820,96 @@ TEST(perl_suppress_keeps_high_confidence_and_genuine_calls) {
     PASS();
 }
 
+/* 2026-09-16 probe on torvalds/linux: a Makefile target bound the C function
+ * `sk_psock.eval` through unique_name. Build and configuration languages have
+ * no cross-language call semantics, so for them a unique match into another
+ * language is a collision by construction; a code caller keeps #1572. */
+TEST(cross_language_config_caller_drops_unique_name_too) {
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "include/linux/skmsg.h",
+                                                         "unique_name"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_CMAKE, "src/main.c", "unique_name"));
+    ASSERT_TRUE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_YAML, "app/models.py", "unique_name"));
+    /* A code caller's unique_name into another language is still #1572. */
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(
+        CBM_LANG_PYTHON, "web/src/pages/Editor.js", "unique_name"));
+    /* Same-language config targets are untouched. */
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "lib/Makefile", "unique_name"));
+    /* Receiver-aware strategies are never this guard's business. */
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "src/main.c", "same_module"));
+    PASS();
+}
+
+/* Same-named candidates that tie on test-status and namespace proximity used
+ * to be settled by bucket position, i.e. by the order files were registered:
+ * two indexes of one kernel tree differed by 632 CALLS edges, `dev_name`
+ * landing on any of twenty same-named struct fields or on nothing at all.
+ * The tie is now a function of the candidate set: the least nested
+ * definition, then the smaller QN — whichever order the registry was built
+ * in (O9). */
+TEST(registry_tie_break_is_independent_of_registration_order) {
+    const char *cands[] = {
+        "proj.drivers.media.cec.i2c.ch7322.ch7322_conn_match.dev_name", /* struct field */
+        "proj.sound.soc.codecs.tas2783-sdw.tas2783_prv.dev_name",       /* struct field */
+        "proj.include.linux.device.dev_name",                           /* the function */
+        "proj.arch.um.drivers.pty.pty_chan.dev_name",                   /* struct field */
+    };
+    const char *labels[] = {"Field", "Field", "Function", "Field"};
+    const int n = 4;
+
+    cbm_registry_t *forward = cbm_registry_new();
+    cbm_registry_t *backward = cbm_registry_new();
+    for (int i = 0; i < n; i++) {
+        cbm_registry_add(forward, "dev_name", cands[i], labels[i]);
+        cbm_registry_add(backward, "dev_name", cands[n - 1 - i], labels[n - 1 - i]);
+    }
+
+    /* A far-away caller with no imports: every candidate scores the same. */
+    cbm_resolution_t f =
+        cbm_registry_resolve(forward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
+    cbm_resolution_t b =
+        cbm_registry_resolve(backward, "dev_name", "proj.kernel.irq.msi", NULL, NULL, 0);
+    ASSERT_NOT_NULL(f.qualified_name);
+    ASSERT_NOT_NULL(b.qualified_name);
+    ASSERT_STR_EQ(f.qualified_name, "proj.include.linux.device.dev_name");
+    ASSERT_STR_EQ(b.qualified_name, "proj.include.linux.device.dev_name");
+    ASSERT_STR_EQ(f.strategy, "suffix_match");
+    ASSERT_STR_EQ(b.strategy, "suffix_match");
+
+    /* Equal depth: the smaller QN, from either order. */
+    cbm_registry_t *lex_a = cbm_registry_new();
+    cbm_registry_t *lex_b = cbm_registry_new();
+    cbm_registry_add(lex_a, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_a, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_b, "sg_next", "proj.include.linux.scatterlist.sg_next", "Function");
+    cbm_registry_add(lex_b, "sg_next", "proj.tools.virtio.scatterlist.sg_next", "Function");
+    cbm_resolution_t la =
+        cbm_registry_resolve(lex_a, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
+    cbm_resolution_t lb =
+        cbm_registry_resolve(lex_b, "sg_next", "proj.drivers.scsi.arm_scsi", NULL, NULL, 0);
+    ASSERT_STR_EQ(la.qualified_name, "proj.include.linux.scatterlist.sg_next");
+    ASSERT_STR_EQ(lb.qualified_name, "proj.include.linux.scatterlist.sg_next");
+
+    /* Proximity still outranks depth: the sibling wins over a shallower stranger. */
+    cbm_registry_t *near = cbm_registry_new();
+    cbm_registry_add(near, "vnic_rq_free", "proj.lib.vnic_rq_free", "Function");
+    cbm_registry_add(near, "vnic_rq_free", "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free",
+                     "Function");
+    cbm_resolution_t nr = cbm_registry_resolve(near, "vnic_rq_free",
+                                               "proj.drivers.scsi.fnic.fnic_res", NULL, NULL, 0);
+    ASSERT_STR_EQ(nr.qualified_name, "proj.drivers.scsi.fnic.vnic_rq.vnic_rq_free");
+
+    cbm_registry_free(forward);
+    cbm_registry_free(backward);
+    cbm_registry_free(lex_a);
+    cbm_registry_free(lex_b);
+    cbm_registry_free(near);
+    PASS();
+}
+
 TEST(cross_language_suffix_match_drops_py_vs_js) {
     /* #725: two same-named symbols in different languages. suffix_match is the
      * strategy that collapses them; unique_name is #1572 and must stay. */
@@ -936,6 +1026,53 @@ TEST(dynamic_suppress_keeps_high_confidence_and_non_methods) {
     /* No match (NULL/empty strategy) → nothing to suppress. */
     ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, NULL));
     ASSERT_FALSE(cbm_suppress_weak_member_match(true, true, ""));
+    PASS();
+}
+
+TEST(python_builtin_member_table_matches_builtin_type_methods) {
+    /* Ends and middle of the sorted table, so a mis-sorted insert shows up. */
+    ASSERT_TRUE(cbm_python_is_builtin_member("add"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("extend"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("items"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("print"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("startswith"));
+    ASSERT_TRUE(cbm_python_is_builtin_member("zfill"));
+    /* Project-specific spellings are not builtin members. */
+    ASSERT_FALSE(cbm_python_is_builtin_member("apply_converters"));
+    ASSERT_FALSE(cbm_python_is_builtin_member("lazy_model_operation"));
+    ASSERT_FALSE(cbm_python_is_builtin_member("describe"));
+    ASSERT_FALSE(cbm_python_is_builtin_member(NULL));
+    ASSERT_FALSE(cbm_python_is_builtin_member(""));
+    PASS();
+}
+
+TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only) {
+    /* The exemption: Python, self/cls-rooted receiver, unique_name, callee not
+     * a builtin member. */
+    ASSERT_TRUE(cbm_weak_member_unique_name_exempt(true, true, "self.compiler.apply_converters",
+                                                   "unique_name"));
+    ASSERT_TRUE(cbm_weak_member_unique_name_exempt(true, true, "cls.registry.lazy_model_operation",
+                                                   "unique_name"));
+    /* A bare parameter/local receiver carries no ownership evidence: #1276's
+     * accelerator.backward() and c.describe() stay suppressed. */
+    ASSERT_FALSE(
+        cbm_weak_member_unique_name_exempt(true, false, "accelerator.backward", "unique_name"));
+    /* A builtin type's own method stays suppressed even on self. */
+    ASSERT_FALSE(
+        cbm_weak_member_unique_name_exempt(true, true, "self.parts.extend", "unique_name"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.out.print", "unique_name"));
+    /* Only unique_name carries the one-definition evidence. */
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.compiler.apply_converters",
+                                                    "suffix_match"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.compiler.apply_converters",
+                                                    "field_type_hint"));
+    /* Python only: the JS/TS family keeps its recorded trade. */
+    ASSERT_FALSE(
+        cbm_weak_member_unique_name_exempt(false, true, "this.compiler.apply", "unique_name"));
+    /* Degenerate inputs never exempt. */
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, NULL, "unique_name"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "", "unique_name"));
+    ASSERT_FALSE(cbm_weak_member_unique_name_exempt(true, true, "self.x.y", NULL));
     PASS();
 }
 
@@ -1404,10 +1541,14 @@ SUITE(registry) {
     RUN_TEST(perl_suppress_drops_weak_builtin_and_method_matches);
     RUN_TEST(perl_suppress_keeps_high_confidence_and_genuine_calls);
     RUN_TEST(cross_language_suffix_match_drops_py_vs_js);
+    RUN_TEST(cross_language_config_caller_drops_unique_name_too);
+    RUN_TEST(registry_tie_break_is_independent_of_registration_order);
     RUN_TEST(cross_language_ref_drops_go_vs_c);
     RUN_TEST(go_bare_ref_never_binds_field);
     RUN_TEST(dynamic_suppress_drops_weak_method_matches);
     RUN_TEST(dynamic_suppress_keeps_high_confidence_and_non_methods);
+    RUN_TEST(python_builtin_member_table_matches_builtin_type_methods);
+    RUN_TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only);
     RUN_TEST(local_binding_suppress_drops_weak_shadowed_bare_calls);
     RUN_TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies);
     RUN_TEST(weak_call_guards_share_one_drop_list);

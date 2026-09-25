@@ -151,6 +151,34 @@ TEST(pipeline_run_null) {
     PASS();
 }
 
+TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing) {
+    char *repo = th_mktempdir("cbm_pipeline_discovery_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "second.py"), "second = 2\n"), 0);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+
+    ASSERT_EQ(cbm_pipeline_run(pipeline), CBM_PIPELINE_RESOURCE_LIMIT);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+
+    cbm_pipeline_free(pipeline);
+    th_cleanup(repo);
+    PASS();
+}
+
 /* ── Focused: file-backed store persistence ─────────────────────── */
 
 TEST(store_file_persistence) {
@@ -3412,6 +3440,44 @@ static void mutate_semantic_input_before_final_manifest(void *userdata) {
     mutation->write_rc = th_write_file(mutation->path, mutation->replacement);
 }
 
+TEST(pipeline_late_source_limit_preserves_previous_generation) {
+    char *repo = th_mktempdir("cbm_pipeline_late_limit");
+    ASSERT_NOT_NULL(repo);
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "first.c"), "int first;\n"), 0);
+    char db_path[512];
+    char late_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/index.db", repo);
+    snprintf(late_path, sizeof(late_path), "%s/late.py", repo);
+
+    manifest_race_mutation_t mutation = {
+        .path = late_path,
+        .replacement = "late = 2\n",
+        .write_rc = -1,
+    };
+    cbm_pipeline_incremental_test_before_final_manifest_once(
+        mutate_semantic_input_before_final_manifest, &mutation);
+    cbm_pipeline_t *pipeline = cbm_pipeline_new(repo, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(pipeline);
+    cbm_index_resource_policy_t policy;
+    cbm_index_policy_init(&policy);
+    policy.max_files = (cbm_index_limit_u64_t){.enabled = true, .value = 1};
+    cbm_pipeline_set_resource_policy(pipeline, &policy);
+    int rc = cbm_pipeline_run(pipeline);
+    cbm_index_resource_violation_t violation = {0};
+    cbm_pipeline_get_resource_violation(pipeline, &violation);
+    cbm_pipeline_free(pipeline);
+    cbm_pipeline_incremental_test_reset_faults();
+
+    ASSERT_EQ(mutation.write_rc, 0);
+    ASSERT_EQ(rc, CBM_PIPELINE_RESOURCE_LIMIT);
+    ASSERT_EQ(violation.resource, CBM_INDEX_RESOURCE_FILES);
+    ASSERT_EQ(violation.observed, 2);
+    ASSERT_EQ(violation.limit, 1);
+    ASSERT_FALSE(cbm_file_exists(db_path));
+    th_cleanup(repo);
+    PASS();
+}
+
 /* A graph and its exact manifest are one generation. If source bytes change
  * after extraction but before publication, the mixed generation must be
  * rejected and the previous live DB preserved. */
@@ -5644,6 +5710,123 @@ TEST(pipeline_python_receiver_suppresses_weak_method_edge) {
     PASS();
 }
 
+/* The member guard's one exemption (2026-09-16, v0.10.8 → v0.11.0 A/B on
+ * django/django): a member call whose receiver is an attribute chain rooted at
+ * self/cls, whose callee has exactly ONE definition in the project and is not a
+ * builtin type's own method keeps its unique_name edge —
+ * `self.compiler.apply_converters()` names the only apply_converters there is.
+ * A bare parameter receiver and the builtin-member class the guard was built
+ * for (`parts.extend()` -> a project ListMixin.extend) stay suppressed.
+ * Fewer than 50 files exercises pass_calls.c. */
+TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_python_uniq_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "compiler.py",
+                    "class SQLCompiler:\n"
+                    "    def apply_converters(self, rows):\n"
+                    "        return rows\n");
+    write_temp_file(tmp, "mixin.py",
+                    "class ListMixin:\n"
+                    "    def extend(self, other):\n"
+                    "        return other\n");
+    write_temp_file(tmp, "caller.py",
+                    "class RawIterable:\n"
+                    "    def __init__(self, compiler):\n"
+                    "        self.compiler = compiler\n"
+                    "\n"
+                    "    def iterate(self):\n"
+                    "        return self.compiler.apply_converters([])\n"
+                    "\n"
+                    "\n"
+                    "def collect(parts):\n"
+                    "    parts.extend([1])\n"
+                    "    return parts\n"
+                    "\n"
+                    "\n"
+                    "def handed_in(compiler):\n"
+                    "    return compiler.apply_converters([])\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/python_uniq.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* POSITIVE: the only apply_converters in the project binds through
+     * self.compiler, an object the class owns. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "iterate", "apply_converters"));
+    /* NEGATIVE: the same unique name through a bare parameter carries no
+     * ownership evidence and stays suppressed (#1276's own shape). */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "handed_in", "apply_converters"));
+    /* NEGATIVE: list.extend on a parameter must not bind ListMixin.extend. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "collect", "extend"));
+    /* Tripwire against a vacuous run. */
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "CALLS"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* Embedded-script hosts (2026-09-16 probe on JetBrains/Exposed): a member call
+ * inside an HTML <script> body is extracted as JavaScript and carries the JS
+ * receiver flag, but the weak-member guard was gated on the FILE language, so
+ * 4,207 generated Dokka pages bound `localStorage.getItem` to a docs bundle
+ * function through unique_name. HTML (and Vue/Svelte/Astro) join the gate.
+ * POSITIVE tripwire: a bare project call in a plain .js file still resolves. */
+TEST(pipeline_html_embedded_member_call_stays_unbound) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_html_member_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    /* One directory level each: write_temp_file creates a single parent. */
+    write_temp_file(tmp, "scripts/storage.js",
+                    "function getItem(key) {\n"
+                    "    return key;\n"
+                    "}\n");
+    write_temp_file(tmp, "scripts/theme.js",
+                    "import { getItem } from './storage.js';\n"
+                    "\n"
+                    "function loadTheme() {\n"
+                    "    return getItem('theme');\n"
+                    "}\n");
+    write_temp_file(tmp, "docs/index.html",
+                    "<html><head><script>\n"
+                    "var mode = localStorage.getItem('dokka-dark-mode');\n"
+                    "</script></head><body></body></html>\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/html_member.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: localStorage's own method must not bind the docs bundle. */
+    ASSERT_FALSE(cross_file_call_exists(s, project, "index", "getItem"));
+    /* POSITIVE: the bare project call in storage.js resolves as before. */
+    ASSERT_TRUE(cross_file_call_exists(s, project, "loadTheme", "getItem"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Fixture for the #1928 cross-language reference-guard probes (sequential and
  * parallel twins). pad_files > 0 adds filler files to push the index over the
  * parallel-pipeline threshold, since USAGE/WRITES/READS have one resolver per
@@ -7042,6 +7225,55 @@ TEST(pipeline_native_fetch_classified_as_http_calls) {
  * no call arguments at all. Alamofire/URLSession were already in the service
  * pattern table; the URL simply never reached it. This is the Swift twin of
  * the TypeScript fetch case above. */
+/* The shape real Swift actually writes: the URL is built by a constructor and
+ * force-unwrapped, so the literal is two levels below the argument list. This
+ * is what issue #1892 reported from a real project. */
+TEST(pipeline_swift_nested_url_makes_route_issue1892) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_swiftnested_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "Sources/Client.swift",
+                    "import Foundation\n"
+                    "final class Client {\n"
+                    "    func listWidgets() {\n"
+                    "        URLSession.shared.dataTask(with: "
+                    "URL(string: \"/api/v1/widgets\")!)\n"
+                    "    }\n"
+                    "}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/swiftnested.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    ASSERT_GTE(cbm_store_count_edges_by_type(s, project, "HTTP_CALLS"), 1);
+
+    cbm_node_t *routes = NULL;
+    int route_count = 0;
+    cbm_store_find_nodes_by_label(s, project, "Route", &routes, &route_count);
+    int widget_routes = 0;
+    for (int i = 0; i < route_count; i++) {
+        if (routes[i].qualified_name && strstr(routes[i].qualified_name, "/api/v1/widgets")) {
+            widget_routes++;
+        }
+    }
+    cbm_store_free_nodes(routes, route_count);
+    ASSERT_GTE(widget_routes, 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 TEST(pipeline_swift_http_call_makes_route_issue1892) {
     char tmp[256];
     snprintf(tmp, sizeof(tmp), "/tmp/cbm_swifthttp_XXXXXX");
@@ -8000,6 +8232,60 @@ TEST(pipeline_python_project) {
     cbm_store_close(s);
     cbm_pipeline_free(p);
     teardown_lang_repo();
+    PASS();
+}
+
+/* `#include <linux/device.h>` from arch/x/bugs.c: two headers end with the
+ * include path (include/linux/device.h, tools/virtio/linux/device.h) and each
+ * declares `struct device`. The exact-file lookup returned the first matching
+ * node in by-name bucket order — the workers' merge order, different run to
+ * run: 5,821 kernel IMPORTS edges moved between two indexes of one tree and
+ * the CALLS resolved through their import maps moved with them. The target is
+ * the least nested File node, whichever order the nodes were registered in. */
+static void add_device_header(cbm_gbuf_t *gb, const char *rel, const char *qn_stem) {
+    char fqn[256];
+    snprintf(fqn, sizeof(fqn), "%s.h.__file__", qn_stem);
+    cbm_gbuf_upsert_node(gb, "File", "device.h", fqn, rel, 0, 0, "{}");
+    char cqn[256];
+    snprintf(cqn, sizeof(cqn), "%s.device", qn_stem);
+    cbm_gbuf_upsert_node(gb, "Class", "device", cqn, rel, 10, 40, "{}");
+}
+
+static const cbm_gbuf_node_t *resolve_device_h_from(cbm_gbuf_t *gb) {
+    atomic_int cancelled = 0;
+    cbm_pipeline_ctx_t ctx = {
+        .project_name = "p",
+        .repo_path = "/tmp/p",
+        .gbuf = gb,
+        .registry = NULL,
+        .cancelled = &cancelled,
+    };
+    CBMImport imp = {0};
+    imp.module_path = "linux/device.h";
+    imp.local_name = "h";
+    return cbm_pipeline_resolve_import_node(&ctx, "arch/x/bugs.c", "p.arch.x.bugs.c.__file__", &imp,
+                                            NULL);
+}
+
+TEST(pipeline_header_include_target_is_independent_of_registration_order) {
+    cbm_gbuf_t *a = cbm_gbuf_new("p", "/tmp/cbm_include_order_a");
+    cbm_gbuf_t *b = cbm_gbuf_new("p", "/tmp/cbm_include_order_b");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(b);
+    add_device_header(a, "include/linux/device.h", "p.include.linux.device");
+    add_device_header(a, "tools/virtio/linux/device.h", "p.tools.virtio.linux.device");
+    add_device_header(b, "tools/virtio/linux/device.h", "p.tools.virtio.linux.device");
+    add_device_header(b, "include/linux/device.h", "p.include.linux.device");
+
+    const cbm_gbuf_node_t *ta = resolve_device_h_from(a);
+    const cbm_gbuf_node_t *tb = resolve_device_h_from(b);
+    ASSERT_NOT_NULL(ta);
+    ASSERT_NOT_NULL(tb);
+    ASSERT_STR_EQ(ta->qualified_name, "p.include.linux.device.h.__file__");
+    ASSERT_STR_EQ(tb->qualified_name, "p.include.linux.device.h.__file__");
+
+    cbm_gbuf_free(a);
+    cbm_gbuf_free(b);
     PASS();
 }
 
@@ -10926,6 +11212,61 @@ TEST(registry_receiver_chain_keeps_project_extension_issue1893) {
                                               "HomeboxUI.Stats", NULL, NULL, 0);
     ASSERT_STR_EQ(r.qualified_name, "AuthDTOs.Calendar.startOfDayUTC");
     ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* A factory chain into a nested type: Settings.builder().putList names the only
+ * putList in the project, Settings.Builder.putList, and Settings — the chain's
+ * root — is in the candidate's ancestry even though the candidate's immediate
+ * parent (Builder) is not spelled in the chain. The parent-only rule refused
+ * 9,473 such unique-name calls on elastic/elasticsearch (v0.10.8 → v0.11.0 A/B,
+ * 2026-09-16). */
+TEST(registry_receiver_chain_admits_factory_chain_into_nested_type) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "putList", "org.elasticsearch.common.settings.Settings.Builder.putList",
+                     "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve(
+        reg, "Settings.builder().putList", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.settings.Settings.Builder.putList");
+    ASSERT_STR_EQ(r.strategy, "unique_name");
+
+    /* The same shape through a value in between: RequestOptions.DEFAULT
+     * .toBuilder().setWarningsHandler -> RequestOptions.Builder.setWarningsHandler. */
+    cbm_registry_add(reg, "setWarningsHandler",
+                     "org.elasticsearch.client.RequestOptions.Builder.setWarningsHandler",
+                     "Method");
+    r = cbm_registry_resolve(reg, "RequestOptions.DEFAULT.toBuilder().setWarningsHandler",
+                             "org.elasticsearch.client.Rest", NULL, NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name,
+                  "org.elasticsearch.client.RequestOptions.Builder.setWarningsHandler");
+
+    cbm_registry_free(reg);
+    PASS();
+}
+
+/* The ancestry rule must not widen the gate to foreign roots: Base64 is the
+ * JDK's, so the project's DocOffsetsCodec.getEncoder stays refused, exactly as
+ * #1893's URLSession case above. */
+TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule) {
+    cbm_registry_t *reg = cbm_registry_new();
+    cbm_registry_add(reg, "getEncoder", "org.elasticsearch.index.codec.DocOffsetsCodec.getEncoder",
+                     "Method");
+
+    cbm_resolution_t r = cbm_registry_resolve(
+        reg, "Base64.getEncoder", "org.elasticsearch.index.IndexSettings", NULL, NULL, 0);
+    ASSERT_NULL(r.qualified_name);
+
+    /* Nor may a package segment admit it: Math.toIntExact must not bind
+     * org.elasticsearch.common.Math.toIntExact through "Math" appearing as an
+     * ancestry segment ONLY IF that segment really is the type — here it is, and
+     * that is the correct outcome (the project's own Math.toIntExact). */
+    cbm_registry_add(reg, "toIntExact", "org.elasticsearch.common.Math.toIntExact", "Method");
+    r = cbm_registry_resolve(reg, "Math.toIntExact", "org.elasticsearch.index.IndexSettings", NULL,
+                             NULL, 0);
+    ASSERT_STR_EQ(r.qualified_name, "org.elasticsearch.common.Math.toIntExact");
 
     cbm_registry_free(reg);
     PASS();
@@ -15206,6 +15547,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_cancel);
     RUN_TEST(pipeline_cancel_null);
     RUN_TEST(pipeline_run_null);
+    RUN_TEST(pipeline_discovery_limit_returns_exact_violation_without_publishing);
+    RUN_TEST(pipeline_late_source_limit_preserves_previous_generation);
     /* Extraction back-pressure */
     RUN_TEST(pipeline_backpressure_futile_nap_disengages);
     RUN_TEST(pipeline_over_budget_after_futility_fails_whole_and_preserves_db);
@@ -15253,6 +15596,8 @@ SUITE(pipeline) {
 #endif
     RUN_TEST(pipeline_tsjs_receiver_suppresses_weak_method_edge);
     RUN_TEST(pipeline_python_receiver_suppresses_weak_method_edge);
+    RUN_TEST(pipeline_python_receiver_keeps_specific_unique_name_member_call);
+    RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
@@ -15269,6 +15614,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);
     RUN_TEST(pipeline_native_fetch_classified_as_http_calls);
+    RUN_TEST(pipeline_swift_nested_url_makes_route_issue1892);
     RUN_TEST(pipeline_swift_http_call_makes_route_issue1892);
     RUN_TEST(pipeline_native_fetch_parallel_classified_as_http_calls);
     RUN_TEST(pipeline_local_fetch_shadow_not_classified_as_http);
@@ -15292,6 +15638,7 @@ SUITE(pipeline) {
     RUN_TEST(usages_kotlin_no_duplicate_calls);
     /* Language integration tests */
     RUN_TEST(pipeline_python_project);
+    RUN_TEST(pipeline_header_include_target_is_independent_of_registration_order);
     RUN_TEST(pipeline_imports_multi_symbol_edges);
     RUN_TEST(pipeline_go_cross_package_call);
     RUN_TEST(pipeline_swift_cross_package_import);
@@ -15435,6 +15782,8 @@ SUITE(pipeline) {
     RUN_TEST(registry_receiver_chain_refuses_library_unique_name_issue1893);
     RUN_TEST(registry_receiver_chain_refuses_library_suffix_match_issue1893);
     RUN_TEST(registry_receiver_chain_keeps_project_extension_issue1893);
+    RUN_TEST(registry_receiver_chain_admits_factory_chain_into_nested_type);
+    RUN_TEST(registry_receiver_chain_still_refuses_foreign_root_with_ancestry_rule);
     RUN_TEST(registry_receiver_chain_ignores_lowercase_root_issue1893);
     RUN_TEST(registry_receiver_chain_ignores_bare_name_issue1893);
     RUN_TEST(registry_fuzzy_confidence_single);

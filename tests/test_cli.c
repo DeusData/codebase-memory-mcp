@@ -1837,8 +1837,7 @@ static bool cli_scope_fixture_start(cli_scope_fixture_t *fixture, const char *ta
     return fixture->client != NULL;
 }
 
-static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture,
-                                          uint32_t timeout_ms) {
+static bool cli_scope_host_serving_within(const cli_scope_fixture_t *fixture, uint32_t timeout_ms) {
     cbm_daemon_runtime_status_t status = {0};
     return fixture->endpoint &&
            cbm_daemon_runtime_request_status(fixture->endpoint, &fixture->identity, timeout_ms,
@@ -1994,8 +1993,8 @@ TEST(cli_install_into_host_namespace_still_drains_host_cohort) {
               : -1;
     /* Negative probe: see CLI_SCOPE_HOST_DRAINED_PROBE_MS. The drain itself is
      * asserted positively below via host_exit == CLI_SCOPE_HOST_DRAINED. */
-    bool host_serving = ready && cli_scope_host_serving_within(&fixture,
-                                                               CLI_SCOPE_HOST_DRAINED_PROBE_MS);
+    bool host_serving =
+        ready && cli_scope_host_serving_within(&fixture, CLI_SCOPE_HOST_DRAINED_PROBE_MS);
     const char *events = read_test_file(activation_log);
     bool drained_in_log = events && strstr(events, "cohort drained") != NULL &&
                           strstr(events, "\"daemon_active_clients\":1") != NULL;
@@ -9384,8 +9383,8 @@ TEST(cli_codex_respects_codex_home) {
     snprintf(expected_config, sizeof(expected_config), "%s/config.toml", codex_home);
     yyjson_doc *plan_doc = json ? yyjson_read(json, strlen(json), 0) : NULL;
     yyjson_val *plan_root = plan_doc ? yyjson_doc_get_root(plan_doc) : NULL;
-    bool plans_config = test_json_string_array_contains(plan_root, "config_files_planned",
-                                                        expected_config);
+    bool plans_config =
+        test_json_string_array_contains(plan_root, "config_files_planned", expected_config);
     bool plans_instructions = test_json_string_array_contains(
         plan_root, "instruction_files_planned", expected_instructions);
     bool plans_cleanup = json && strstr(json, "remove_managed_block_if_present") != NULL;
@@ -9441,8 +9440,8 @@ TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
     struct stat state;
     int fresh_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
     char *fresh_agents = read_test_file_alloc(agents_path);
-    bool fresh_pointer_installed = fresh_rc == 0 && fresh_agents &&
-                                   strcmp(fresh_agents, test_codex_activation_block) == 0;
+    bool fresh_pointer_installed =
+        fresh_rc == 0 && fresh_agents && strcmp(fresh_agents, test_codex_activation_block) == 0;
     char *config = read_test_file_alloc(config_path);
     bool other_surfaces_installed =
         fresh_rc == 0 && config && strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
@@ -9463,8 +9462,7 @@ TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
     bool unowned_preserved =
         user_pointer_written > 0 && (size_t)user_pointer_written < sizeof(expected_user_pointer) &&
         dry_rc == 0 && unowned_rc == 0 && after_dry && after_unowned &&
-        strcmp(after_dry, user_only) == 0 &&
-        strcmp(after_unowned, expected_user_pointer) == 0;
+        strcmp(after_dry, user_only) == 0 && strcmp(after_unowned, expected_user_pointer) == 0;
     free(after_dry);
     free(after_unowned);
 
@@ -9509,11 +9507,10 @@ TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
     int malformed_rc = cbm_install_agent_configs(tmpdir, binary_path, false, false);
     char *after_malformed = read_test_file_alloc(agents_path);
     config = read_test_file_alloc(config_path);
-    bool malformed_preserved = malformed_rc != 0 && after_malformed &&
-                               strcmp(after_malformed, malformed) == 0 && config &&
-                               strstr(config, "[mcp_servers.codebase-memory-mcp]") &&
-                               strstr(config, "SessionStart") && stat(skill_path, &state) == 0 &&
-                               stat(profile_path, &state) == 0;
+    bool malformed_preserved =
+        malformed_rc != 0 && after_malformed && strcmp(after_malformed, malformed) == 0 && config &&
+        strstr(config, "[mcp_servers.codebase-memory-mcp]") && strstr(config, "SessionStart") &&
+        stat(skill_path, &state) == 0 && stat(profile_path, &state) == 0;
     free(config);
     free(after_malformed);
 
@@ -9521,8 +9518,8 @@ TEST(cli_codex_install_uses_global_activation_pointer_issue1689) {
     char *uninstall_argv[] = {"uninstall", "--yes"};
     int uninstall_rc = cli_test_cmd_uninstall(2, uninstall_argv);
     char *after_uninstall = read_test_file_alloc(agents_path);
-    bool uninstall_preserved_foreign = uninstall_rc == 0 && after_uninstall &&
-                                       strcmp(after_uninstall, user_only) == 0;
+    bool uninstall_preserved_foreign =
+        uninstall_rc == 0 && after_uninstall && strcmp(after_uninstall, user_only) == 0;
     free(after_uninstall);
 
     restore_test_env("HOME", saved_home);
@@ -11803,8 +11800,7 @@ TEST(cli_codex_migrates_to_single_hook_representation) {
     restore_test_env("PATH", saved_path);
     restore_test_env("CODEX_HOME", saved_codex);
     test_rmdir_r(tmpdir);
-    if (!lifecycle_ok || !migrated || !independent_cleanup ||
-        !pointer_only_on_preflight_failure)
+    if (!lifecycle_ok || !migrated || !independent_cleanup || !pointer_only_on_preflight_failure)
         FAIL("Codex lifecycle preflight must be idempotent, preserve the activation pointer "
              "contract, and independently clean owned side files");
     PASS();
@@ -11844,8 +11840,7 @@ TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689) {
         test_rmdir_r(tmpdir);
         FAIL("failed to build expected Codex pointer migration");
     }
-    if (write_test_file(config_path, ambiguous) != 0 ||
-        write_test_file(agents_path, legacy) != 0) {
+    if (write_test_file(config_path, ambiguous) != 0 || write_test_file(agents_path, legacy) != 0) {
         test_rmdir_r(tmpdir);
         FAIL("failed to write Codex cleanup preflight fixture");
     }
@@ -11868,14 +11863,13 @@ TEST(cli_codex_pointer_migration_precedes_hook_preflight_issue1689) {
                                 strcmp(config_after_plan, ambiguous) == 0 &&
                                 strcmp(agents_after_plan, legacy) == 0;
 
-    int install_rc =
-        cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
+    int install_rc = cbm_install_agent_configs(tmpdir, "/opt/codebase-memory-mcp", false, false);
     char *config_after_install = read_test_file_alloc(config_path);
     char *agents_after_install = read_test_file_alloc(agents_path);
     struct stat state;
-    bool preflight_failed_closed =
-        install_rc != 0 && config_after_install && strcmp(config_after_install, ambiguous) == 0 &&
-        stat(skill_path, &state) != 0 && stat(profile_path, &state) != 0;
+    bool preflight_failed_closed = install_rc != 0 && config_after_install &&
+                                   strcmp(config_after_install, ambiguous) == 0 &&
+                                   stat(skill_path, &state) != 0 && stat(profile_path, &state) != 0;
     bool pointer_migrated =
         agents_after_install && strcmp(agents_after_install, legacy_migrated) == 0;
 
@@ -15206,6 +15200,34 @@ TEST(cli_build_args_json_bare_boolean_issue680) {
     PASS();
 }
 
+/* An array-typed flag given a JSON array literal — the shape the help's
+ * `<array>` invites — contributes the literal's elements, not one element
+ * holding the literal text (2026-09-16 probe: check_index_coverage reported
+ * the fake path `["lib","t"]`). Repeated plain values still accumulate. */
+TEST(cli_build_args_json_array_flag_accepts_json_literal) {
+    char *err = NULL;
+    char *argv[] = {"--project", "p", "--paths", "[\"lib\",\"t\"]"};
+    char *json = cbm_cli_build_args_json("check_index_coverage", 4, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"paths\":[\"lib\",\"t\"]") != NULL);
+    free(json);
+
+    char *argv2[] = {"--project", "p", "--paths", "lib", "--paths", "t"};
+    json = cbm_cli_build_args_json("check_index_coverage", 6, argv2, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"paths\":[\"lib\",\"t\"]") != NULL);
+    free(json);
+
+    /* A value that merely starts with '[' but is not JSON stays one element. */
+    char *argv3[] = {"--project", "p", "--paths", "[weird"};
+    json = cbm_cli_build_args_json("check_index_coverage", 4, argv3, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"paths\":[\"[weird\"]") != NULL);
+    free(json);
+    PASS();
+}
+
 /* An unknown flag for a KNOWN tool must be rejected loudly, not silently
  * typed as a string and dropped server-side (#997). GF1 eval: `trace_path
  * --max-depth 1` was accepted, the real --depth stayed at default 3, and
@@ -15311,6 +15333,21 @@ TEST(cli_print_tool_help_issue680) {
                                 "full]"));
     ASSERT_EQ(cli_tool_help_capture("nope_not_a_tool", out, sizeof(out)), -1);
     ASSERT_STR_EQ(out, "");
+    PASS();
+}
+
+/* #2102: top-level `cli --help` (CLI_USAGE) must point at tool-level
+ * `--format json` and distinguish it from outer `--json`. This is help-only:
+ * the usage synopsis still has no session-wide --format / CBM_CLI_FORMAT. */
+TEST(cli_usage_points_to_tool_format_json_issue2102) {
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--format tree|json"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "payload JSON"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "full MCP envelope"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "--json      Print the raw MCP result envelope"));
+    ASSERT_NOT_NULL(strstr(CBM_CLI_USAGE, "cli [--quiet] [--progress] [--verbose] [--json] "
+                                          "<tool_name>"));
+    ASSERT_NULL(strstr(CBM_CLI_USAGE, "[--format"));
+    ASSERT_NULL(strstr(CBM_CLI_USAGE, "CBM_CLI_FORMAT"));
     PASS();
 }
 
@@ -16347,12 +16384,14 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_string_flag_issue680);
     RUN_TEST(cli_build_args_json_integer_flag_issue680);
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
+    RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);
     RUN_TEST(cli_build_args_json_key_equals_value_issue680);
     RUN_TEST(cli_build_args_json_bad_positional_errors_issue680);
     RUN_TEST(cli_print_tool_help_issue680);
+    RUN_TEST(cli_usage_points_to_tool_format_json_issue2102);
 
     /* Stdin argument gate (#1359) */
     RUN_TEST(cli_zero_argument_tool_never_reads_stdin_issue1359);

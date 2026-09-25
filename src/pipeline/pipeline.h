@@ -54,6 +54,13 @@ cbm_pipeline_t *cbm_pipeline_new(const char *repo_path, const char *db_path, cbm
  * When enabled, the pipeline writes a compressed artifact after indexing. */
 void cbm_pipeline_set_persistence(cbm_pipeline_t *p, bool enabled);
 
+/* Apply a validated discovery resource policy. The value is copied. */
+void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resource_policy_t *policy);
+
+/* Copy the exact discovery violation from the most recent run. */
+void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
+                                         cbm_index_resource_violation_t *violation);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
@@ -72,6 +79,8 @@ void cbm_pipeline_free(cbm_pipeline_t *p);
  * written, the previous DB is intact (#1997 #832). Distinct from the cancel
  * sentinel so callers can name the cause instead of "pipeline failed". */
 #define CBM_PIPELINE_ABORT_OVER_BUDGET (-5)
+/* Opt-in discovery/resource policy breach: fail the attempt, keep serving DB. */
+#define CBM_PIPELINE_RESOURCE_LIMIT (-6)
 int cbm_pipeline_run(cbm_pipeline_t *p);
 
 /* Request cancellation of a running pipeline (thread-safe). */
@@ -285,6 +294,20 @@ bool cbm_perl_suppress_generic_match(bool is_perl, bool is_method, const char *c
  * must be identical in both, or the sequential and parallel resolvers diverge.
  * Pure; unit-tested in test_registry.c. */
 bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *strategy);
+
+/* True if `name` is a method of a Python builtin type (str/bytes/list/dict/set/
+ * file) or a builtin function seen as an attribute call. A language fact, kept
+ * as a sorted table like the Perl builtins. */
+bool cbm_python_is_builtin_member(const char *name);
+
+/* The member guard's exemption: a Python member call whose receiver is an
+ * attribute chain rooted at self/cls (an object the class owns), whose callee has
+ * exactly one project definition (strategy unique_name) and is not a builtin
+ * type's own method keeps its edge. Combine at the call sites as
+ * `suppress && !exempt`; both pass_calls.c and pass_parallel.c must do the same.
+ * Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy);
 
 /* Bare-call counterpart of the guard above. True when a resolved BARE call edge
  * binds a callee that is shadowed by an enclosing parameter, and the match came
