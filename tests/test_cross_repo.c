@@ -469,6 +469,58 @@ TEST(cross_repo_pre_cancel_preserves_existing_cross_edges) {
     PASS();
 }
 
+/* #1133: a run whose targets resolve to nothing but the source project must
+ * fail explicitly. It used to report "success" with projects_scanned:0 --
+ * indistinguishable from "these services share no routes" -- and, worse, it
+ * had already wiped the source's existing CROSS_* edges before noticing there
+ * was nothing to match against. */
+TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "self-source", "self-target", "/self-only", "self");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed self-only fixture");
+    }
+
+    const char *target = "self-target";
+    cbm_cross_repo_result_t initial = cbm_cross_repo_match("self-source", &target, 1);
+    int before = cross_repo_count_edges(&fixture, "self-source", "CROSS_HTTP_CALLS");
+    const char *self = "self-source";
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("self-source", &self, 1);
+    int after = cross_repo_count_edges(&fixture, "self-source", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(initial.failed);
+    ASSERT_TRUE(before > 0);
+    ASSERT_TRUE(result.failed);
+    ASSERT_TRUE(result.no_targets);
+    ASSERT_EQ(result.projects_scanned, 0);
+    ASSERT_EQ(after, before);
+    PASS();
+}
+
+/* #1133: ["*"] in a store that holds only the source project resolves to zero
+ * targets -- same contract as an explicit self-only list. */
+TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133) {
+    cross_repo_fixture_t fixture;
+    if (!cross_repo_fixture_begin(&fixture) ||
+        !cross_repo_create_project(&fixture, "lonely-source")) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to create isolated source project");
+    }
+
+    const char *targets[] = {"*"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("lonely-source", targets, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_TRUE(result.failed);
+    ASSERT_TRUE(result.no_targets);
+    ASSERT_EQ(result.projects_scanned, 0);
+    PASS();
+}
+
 /* Add the internal "<name>::missed" miss-graph row that indexing writes into
  * the SAME db whenever a file parses partially. */
 static bool cross_repo_add_missed_shadow(const cross_repo_fixture_t *fixture, const char *project) {
@@ -528,4 +580,6 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);
     RUN_TEST(cross_repo_cancel_mid_run_keeps_completed_target_and_stops_before_later_target);
     RUN_TEST(cross_repo_pre_cancel_preserves_existing_cross_edges);
+    RUN_TEST(cross_repo_self_only_target_fails_and_keeps_edges_issue1133);
+    RUN_TEST(cross_repo_wildcard_with_no_other_project_fails_issue1133);
 }

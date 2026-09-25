@@ -15397,6 +15397,28 @@ TEST(cli_build_args_json_array_flag_accepts_json_literal) {
     PASS();
 }
 
+/* #1133: `index_repository --target-projects '["*"]'` (the form the help
+ * documents) must reach the cross-repo matcher as a one-element array, not as
+ * a single string holding the literal text -- that shape resolved to zero
+ * targets and returned a silent "success" with projects_scanned:0. */
+TEST(cli_build_args_json_target_projects_literal_issue1133) {
+    char *err = NULL;
+    char *argv[] = {"--repo-path",       "/r",     "--mode", "cross-repo-intelligence",
+                    "--target-projects", "[\"*\"]"};
+    char *json = cbm_cli_build_args_json("index_repository", 6, argv, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT_NULL(err);
+    ASSERT(strstr(json, "\"target_projects\":[\"*\"]") != NULL);
+    free(json);
+
+    char *argv2[] = {"--repo-path", "/r", "--target-projects", "[\"svc-a\",\"svc-b\"]"};
+    json = cbm_cli_build_args_json("index_repository", 4, argv2, &err);
+    ASSERT_NOT_NULL(json);
+    ASSERT(strstr(json, "\"target_projects\":[\"svc-a\",\"svc-b\"]") != NULL);
+    free(json);
+    PASS();
+}
+
 /* An unknown flag for a KNOWN tool must be rejected loudly, not silently
  * typed as a string and dropped server-side (#997). GF1 eval: `trace_path
  * --max-depth 1` was accepted, the real --depth stayed at default 3, and
@@ -16558,6 +16580,7 @@ SUITE(cli) {
     RUN_TEST(cli_build_args_json_integer_flag_issue680);
     RUN_TEST(cli_build_args_json_bare_boolean_issue680);
     RUN_TEST(cli_build_args_json_array_flag_accepts_json_literal);
+    RUN_TEST(cli_build_args_json_target_projects_literal_issue1133);
     RUN_TEST(cli_build_args_json_unknown_flag_rejected);
     RUN_TEST(cli_build_args_json_repeated_array_issue680);
     RUN_TEST(cli_build_args_json_kebab_to_snake_issue680);

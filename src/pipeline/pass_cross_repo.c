@@ -1239,17 +1239,33 @@ cbm_cross_repo_result_t cbm_cross_repo_match_cancellable(const char *project,
         result.failed = !result.cancelled;
         return result;
     }
+    int other_targets = 0;
     for (int i = 0; i < resolved_count; i++) {
         if (cr_cancel_requested(&run)) {
             result.cancelled = true;
             free_project_list(resolved, resolved_count);
             return result;
         }
-        if (strcmp(resolved[i], project) != 0 && !cr_project_exists(resolved[i])) {
+        if (strcmp(resolved[i], project) == 0) {
+            continue;
+        }
+        if (!cr_project_exists(resolved[i])) {
             result.failed = true;
             free_project_list(resolved, resolved_count);
             return result;
         }
+        other_targets++;
+    }
+    /* Nothing but the source itself to match against (a self-only list, or
+     * ["*"] in a store holding only the source). Reporting that as success
+     * with projects_scanned:0 is indistinguishable from "these services share
+     * no routes", and the source's existing CROSS_* edges would be wiped below
+     * with nothing to rebuild them. Fail before any write. (#1133) */
+    if (other_targets == 0) {
+        result.failed = true;
+        result.no_targets = true;
+        free_project_list(resolved, resolved_count);
+        return result;
     }
 
     /* Every input is known to exist before destructive source cleanup. The
