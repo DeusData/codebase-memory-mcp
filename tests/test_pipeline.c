@@ -540,6 +540,98 @@ TEST(pipeline_adr_survives_full_reindex) {
     PASS();
 }
 
+TEST(pipeline_records_unresolved_injected_call_sites) {
+    char tmp[256] = "/tmp/cbm_unresolved_calls_XXXXXX";
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+    char db_path[512], path[512];
+    snprintf(db_path, sizeof(db_path), "%s/test.db", tmp);
+    snprintf(path, sizeof(path), "%s/cliente.js", tmp);
+    FILE *f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function crearCliente() { function buscar(id) { return id; } "
+          "return { buscar }; }\n",
+          f);
+    fclose(f);
+    snprintf(path, sizeof(path), "%s/servicio.js", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs("export function crearServicio({ cliente }) {\n"
+          "  function procesar(id) { return cliente.buscar(id); }\n"
+          "  return { procesar };\n}\n",
+          f);
+    fclose(f);
+
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    char project[256];
+    snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(p));
+    cbm_pipeline_free(p);
+    cbm_store_t *st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    cbm_coverage_row_t *rows = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    bool found = false;
+    for (int i = 0; i < count; i++) {
+        if (strcmp(rows[i].kind, "unresolved_calls") == 0 && strstr(rows[i].detail, "buscar") &&
+            strstr(rows[i].detail, "method_not_in_registry")) {
+            found = true;
+        }
+    }
+    ASSERT_TRUE(found);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+
+    /* Reindexing another file must retain this file's diagnostic. */
+    snprintf(path, sizeof(path), "%s/cliente.js", tmp);
+    f = fopen(path, "a");
+    ASSERT_NOT_NULL(f);
+    fputs("\n// unrelated edit\n", f);
+    fclose(f);
+    p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    found = false;
+    for (int i = 0; i < count; i++) {
+        found |= strcmp(rows[i].kind, "unresolved_calls") == 0;
+    }
+    ASSERT_TRUE(found);
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+
+    /* The edited file must lose its old diagnostic on the next generation. */
+    snprintf(path, sizeof(path), "%s/servicio.js", tmp);
+    f = fopen(path, "w");
+    ASSERT_NOT_NULL(f);
+    fputs(
+        "export function crearServicio({ cliente }) { return { procesar(id) { return id; } }; }\n",
+        f);
+    fclose(f);
+    p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_pipeline_free(p);
+    st = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(st);
+    rows = NULL;
+    count = 0;
+    ASSERT_EQ(cbm_store_coverage_get_path(st, project, "servicio.js", &rows, &count), CBM_STORE_OK);
+    for (int i = 0; i < count; i++) {
+        ASSERT_FALSE(strcmp(rows[i].kind, "unresolved_calls") == 0);
+    }
+    cbm_store_free_coverage(rows, count);
+    cbm_store_close(st);
+    rm_rf(tmp);
+    PASS();
+}
+
 TEST(pipeline_structure_edges) {
     if (setup_test_repo() != 0) {
         FAIL("failed to create temp dir");
@@ -15114,6 +15206,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
     RUN_TEST(pipeline_adr_survives_full_reindex);
+    RUN_TEST(pipeline_records_unresolved_injected_call_sites);
     RUN_TEST(pipeline_structure_edges);
     RUN_TEST(pipeline_branch_root_structure);
     RUN_TEST(pipeline_project_name_derived);

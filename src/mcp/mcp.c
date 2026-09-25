@@ -64,6 +64,7 @@ enum {
 #include "watcher/watcher.h"
 #include "foundation/mem.h"
 #include "foundation/mem_core.h"
+#include "foundation/hash_table.h"
 #include "foundation/diagnostics.h"
 #include "foundation/platform.h"
 #include "foundation/compat.h"
@@ -6085,11 +6086,13 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
 
     yyjson_mut_val *pp_files = yyjson_mut_arr(doc);
     yyjson_mut_val *pu_files = yyjson_mut_arr(doc);
+    yyjson_mut_val *unresolved_files = yyjson_mut_arr(doc);
     yyjson_mut_val *sk_files = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_dirs = yyjson_mut_arr(doc);
     yyjson_mut_val *ni_files = yyjson_mut_arr(doc);
     int pp_n = 0;
     int pu_n = 0;
+    int unresolved_n = 0;
     int sk_n = 0;
     int ni_dir_n = 0;
     int ni_file_n = 0;
@@ -6119,6 +6122,11 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
                 yyjson_mut_arr_add_val(pu_files, fe);
             }
             pu_n++;
+        } else if (strcmp(kind, "unresolved_calls") == 0) {
+            if (unresolved_n < sample_limit) {
+                yyjson_mut_arr_add_strcpy(doc, unresolved_files, rows[i].rel_path);
+            }
+            unresolved_n++;
         } else if (strcmp(kind, "not_indexed_dir") == 0) {
             if (ni_dir_n < sample_limit) {
                 yyjson_mut_arr_add_strcpy(doc, ni_dirs, rows[i].rel_path);
@@ -6176,6 +6184,12 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     yyjson_mut_obj_add_bool(doc, pu, "truncated", pu_n > COVERAGE_FILE_CAP);
     yyjson_mut_obj_add_val(doc, root, "parse_unusable", pu);
 
+    yyjson_mut_val *unresolved = yyjson_mut_obj(doc);
+    yyjson_mut_obj_add_val(doc, unresolved, "files", unresolved_files);
+    yyjson_mut_obj_add_int(doc, unresolved, "count", unresolved_n);
+    yyjson_mut_obj_add_bool(doc, unresolved, "truncated", unresolved_n > sample_limit);
+    yyjson_mut_obj_add_val(doc, root, "unresolved_calls", unresolved);
+
     yyjson_mut_val *sk = yyjson_mut_obj(doc);
     yyjson_mut_obj_add_val(doc, sk, "files", sk_files);
     yyjson_mut_obj_add_int(doc, sk, "count", sk_n);
@@ -6213,7 +6227,7 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
     }
     yyjson_mut_obj_add_val(doc, root, "not_indexed", ni);
 
-    if (sample_limit > 0 && (pp_n > 0 || sk_n > 0)) {
+    if (sample_limit > 0 && (pp_n > 0 || sk_n > 0 || unresolved_n > 0)) {
         yyjson_mut_obj_add_str(
             doc, root, "coverage_note",
             "Best-effort signal, not a completeness guarantee: parse_partial files WERE indexed, "
@@ -6221,7 +6235,9 @@ static void add_coverage_report(yyjson_mut_doc *doc, yyjson_mut_val *root, cbm_s
             "(tree-sitter error recovery still salvages some). skipped files were not indexed at "
             "all. Prefer text search (grep) for flagged files/ranges. Files absent from this list "
             "are NOT guaranteed to be fully indexed. (not_indexed entries are a separate, "
-            "BY-DESIGN class — deliberate ignore rules, not failures.)");
+            "BY-DESIGN class — deliberate ignore rules, not failures.) "
+            "Unresolved callsites need source verification because CALLS totals may be "
+            "incomplete.");
     }
 }
 
@@ -6462,6 +6478,9 @@ static const char *coverage_status(const cbm_coverage_row_t *rows, int count,
             if (pass == 0 && strcmp(kind, "parse_partial") == 0) {
                 return "partial";
             }
+            if (pass == 0 && strcmp(kind, "unresolved_calls") == 0) {
+                return "unresolved_calls";
+            }
             if (pass == 1 && strncmp(kind, "not_indexed", 11) == 0) {
                 return "excluded";
             }
@@ -6485,6 +6504,9 @@ static const char *coverage_recommended_action(const char *status, const char *f
     }
     if (strcmp(status, "partial") == 0) {
         return "read_ranges_and_verify_scope";
+    }
+    if (strcmp(status, "unresolved_calls") == 0) {
+        return "read_source_and_verify_calls";
     }
     if (strcmp(status, "unusable") == 0) {
         /* The ranges cover nearly the whole file, so sending a reader to them
@@ -9324,6 +9346,102 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
     bool optional_fields_omitted = false;
     char *json = NULL;
 
+    bool trace_includes_calls = false;
+    for (int i = 0; i < edge_type_count; i++) {
+        if (strcmp(edge_types[i], "CALLS") == 0) {
+            trace_includes_calls = true;
+            break;
+        }
+    }
+    bool unresolved_out = false;
+    bool unresolved_in = false;
+    if (trace_includes_calls) {
+        cbm_coverage_meta_t coverage_meta = {0};
+        int meta_rc = cbm_store_coverage_meta_get(store, project, &coverage_meta);
+        if (meta_rc == CBM_STORE_OK) {
+            if (coverage_meta.coverage_version < CBM_UNRESOLVED_CALL_COVERAGE_VERSION ||
+                !coverage_meta.recording_status ||
+                strcmp(coverage_meta.recording_status, "unavailable") == 0) {
+                unresolved_out = do_outbound;
+                unresolved_in = do_inbound;
+            }
+        } else {
+            unresolved_out = do_outbound;
+            unresolved_in = do_inbound;
+        }
+        cbm_store_coverage_meta_clear(&coverage_meta);
+        if ((do_outbound && !unresolved_out) || (do_inbound && !unresolved_in)) {
+            CBMHashTable *callers = do_outbound ? cbm_ht_create(0) : NULL;
+            CBMHashTable *leaves = do_inbound ? cbm_ht_create(0) : NULL;
+            if ((do_outbound && !callers) || (do_inbound && !leaves)) {
+                unresolved_out = do_outbound;
+                unresolved_in = do_inbound;
+            } else {
+                bool key_set_failed = false;
+                for (int i = 0; i < node_count; i++) {
+                    if (callers && nodes[i].qualified_name) {
+                        cbm_ht_set(callers, nodes[i].qualified_name, (void *)1);
+                        key_set_failed |= !cbm_ht_has(callers, nodes[i].qualified_name);
+                    }
+                    if (leaves && nodes[i].name) {
+                        cbm_ht_set(leaves, nodes[i].name, (void *)1);
+                        key_set_failed |= !cbm_ht_has(leaves, nodes[i].name);
+                    }
+                }
+                for (int i = 0; callers && i < tr_out.visited_count; i++) {
+                    const cbm_node_t *node = &tr_out.visited[i].node;
+                    if ((include_tests || !is_test_file(node->file_path)) && node->qualified_name) {
+                        cbm_ht_set(callers, node->qualified_name, (void *)1);
+                        key_set_failed |= !cbm_ht_has(callers, node->qualified_name);
+                    }
+                }
+                for (int i = 0; leaves && i < tr_in.visited_count; i++) {
+                    const cbm_node_t *node = &tr_in.visited[i].node;
+                    if ((include_tests || !is_test_file(node->file_path)) && node->name) {
+                        cbm_ht_set(leaves, node->name, (void *)1);
+                        key_set_failed |= !cbm_ht_has(leaves, node->name);
+                    }
+                }
+                cbm_coverage_row_t *rows = NULL;
+                int row_count = 0;
+                if (key_set_failed || cbm_store_coverage_get_unresolved_calls(
+                                          store, project, &rows, &row_count) != CBM_STORE_OK) {
+                    unresolved_out = do_outbound;
+                    unresolved_in = do_inbound;
+                } else {
+                    for (int i = 0; i < row_count && ((!unresolved_out && do_outbound) ||
+                                                      (!unresolved_in && do_inbound));
+                         i++) {
+                        yyjson_doc *detail = yyjson_read(rows[i].detail, strlen(rows[i].detail), 0);
+                        yyjson_val *sites = detail ? yyjson_doc_get_root(detail) : NULL;
+                        if (!yyjson_is_arr(sites)) {
+                            unresolved_out = do_outbound;
+                            unresolved_in = do_inbound;
+                        } else {
+                            size_t idx, max;
+                            yyjson_val *site;
+                            yyjson_arr_foreach(sites, idx, max, site) {
+                                const char *caller = yyjson_get_str(yyjson_obj_get(site, "caller"));
+                                const char *leaf = yyjson_get_str(yyjson_obj_get(site, "leaf"));
+                                if (callers && caller && cbm_ht_has(callers, caller))
+                                    unresolved_out = true;
+                                if (leaves && leaf && cbm_ht_has(leaves, leaf))
+                                    unresolved_in = true;
+                            }
+                        }
+                        if (detail)
+                            yyjson_doc_free(detail);
+                    }
+                }
+                cbm_store_free_coverage(rows, row_count);
+            }
+            cbm_ht_free(callers);
+            cbm_ht_free(leaves);
+        }
+    }
+    const char *out_relation = unresolved_out ? "unknown" : (tr_out.truncated ? "gte" : "eq");
+    const char *in_relation = unresolved_in ? "unknown" : (tr_in.truncated ? "gte" : "eq");
+
 render_trace_output:;
     int rows_left = row_target;
     out_len = requested_out_len < rows_left ? requested_out_len : rows_left;
@@ -9412,7 +9530,7 @@ render_trace_output:;
         bool flat_trace = render_risk || render_data_flow;
         if (do_outbound) {
             cbm_tree_scalar_int(&sb, "callees_total", out_total);
-            cbm_tree_scalar_str(&sb, "callees_total_relation", tr_out.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callees_total_relation", out_relation);
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callees", &view_out, render_risk, include_tests,
                                   render_data_flow, render_evidence, &out_edge_ctx);
@@ -9423,7 +9541,7 @@ render_trace_output:;
         }
         if (do_inbound) {
             cbm_tree_scalar_int(&sb, "callers_total", in_total);
-            cbm_tree_scalar_str(&sb, "callers_total_relation", tr_in.truncated ? "gte" : "eq");
+            cbm_tree_scalar_str(&sb, "callers_total_relation", in_relation);
             if (flat_trace) {
                 bfs_to_toon_table(&sb, "callers", &view_in, render_risk, include_tests,
                                   render_data_flow, render_evidence, &in_edge_ctx);
@@ -9489,8 +9607,7 @@ render_trace_output:;
         }
         if (do_outbound) {
             yyjson_mut_obj_add_int(doc, root, "callees_total", out_total);
-            yyjson_mut_obj_add_str(doc, root, "callees_total_relation",
-                                   tr_out.truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_str(doc, root, "callees_total_relation", out_relation);
             yyjson_mut_obj_add_val(
                 doc, root, "callees",
                 bfs_to_tree_json(doc, &view_out, risk_labels && emit_optional_fields, include_tests,
@@ -9499,8 +9616,7 @@ render_trace_output:;
         }
         if (do_inbound) {
             yyjson_mut_obj_add_int(doc, root, "callers_total", in_total);
-            yyjson_mut_obj_add_str(doc, root, "callers_total_relation",
-                                   tr_in.truncated ? "gte" : "eq");
+            yyjson_mut_obj_add_str(doc, root, "callers_total_relation", in_relation);
             yyjson_mut_obj_add_val(
                 doc, root, "callers",
                 bfs_to_tree_json(doc, &view_in, risk_labels && emit_optional_fields, include_tests,
@@ -9558,13 +9674,11 @@ render_trace_output:;
                 cbm_sb_init(&floor);
                 if (do_outbound) {
                     cbm_tree_scalar_int(&floor, "callees_total", out_total);
-                    cbm_tree_scalar_str(&floor, "callees_total_relation",
-                                        tr_out.truncated ? "gte" : "eq");
+                    cbm_tree_scalar_str(&floor, "callees_total_relation", out_relation);
                 }
                 if (do_inbound) {
                     cbm_tree_scalar_int(&floor, "callers_total", in_total);
-                    cbm_tree_scalar_str(&floor, "callers_total_relation",
-                                        tr_in.truncated ? "gte" : "eq");
+                    cbm_tree_scalar_str(&floor, "callers_total_relation", in_relation);
                 }
                 cbm_tree_scalar_bool(&floor, "has_more", floor_has_more);
                 if (floor_has_more) {
@@ -9589,12 +9703,11 @@ render_trace_output:;
                 if (do_outbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callees_total", out_total);
                     yyjson_mut_obj_add_str(floor_doc, floor, "callees_total_relation",
-                                           tr_out.truncated ? "gte" : "eq");
+                                           out_relation);
                 }
                 if (do_inbound) {
                     yyjson_mut_obj_add_int(floor_doc, floor, "callers_total", in_total);
-                    yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation",
-                                           tr_in.truncated ? "gte" : "eq");
+                    yyjson_mut_obj_add_str(floor_doc, floor, "callers_total_relation", in_relation);
                 }
                 yyjson_mut_obj_add_bool(floor_doc, floor, "has_more", floor_has_more);
                 if (floor_has_more) {

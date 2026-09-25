@@ -20,6 +20,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "pipeline/artifact.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_surface.h"
+#include "pipeline/lsp_resolve.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pass_ensemble_routing.h"
 #include "pipeline/worker_pool.h"
@@ -42,6 +43,7 @@ enum { CBM_DIR_PERMS = 0755, PL_RING = 4, PL_RING_MASK = 3, PL_SEQ_PASSES = 6 };
 #include "foundation/mem_core.h"
 #include "result_spill.h"
 #include "foundation/secure_random.h"
+#include "yyjson/yyjson.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -253,6 +255,11 @@ struct cbm_pipeline {
     cbm_lsp_surface_row_t *surface_rows;
     int surface_row_count;
 
+    /* Per-file unresolved invocation diagnostics, published as coverage rows. */
+    cbm_coverage_row_t *unresolved_rows;
+    int unresolved_count;
+    bool unresolved_capture_failed;
+
     /* Deterministic test-only seam at the final publication boundary. Kept
      * per pipeline so concurrent test/process activity cannot cross-trigger. */
     void (*before_publish_hook)(cbm_pipeline_t *, const char *, void *);
@@ -420,6 +427,96 @@ void cbm_pipeline_set_lsp_surfaces(cbm_pipeline_t *p, cbm_lsp_surface_row_t *row
     p->surface_row_count = count;
 }
 
+static void *unresolved_json_alloc(void *ctx, size_t size) {
+    (void)ctx;
+    return cbm_alloc(CBM_MEM_CLASS_DUMP, size);
+}
+
+static void *unresolved_json_realloc(void *ctx, void *ptr, size_t old_size, size_t size) {
+    (void)ctx;
+    (void)old_size;
+    return cbm_realloc(CBM_MEM_CLASS_DUMP, ptr, size);
+}
+
+static void unresolved_json_free(void *ctx, void *ptr) {
+    (void)ctx;
+    cbm_free(CBM_MEM_CLASS_DUMP, ptr);
+}
+
+void cbm_pipeline_record_unresolved_calls(cbm_pipeline_t *p, const char *rel_path,
+                                          const CBMFileResult *result) {
+    if (!p || !rel_path || !result || result->resolved_calls.count == 0 ||
+        p->unresolved_capture_failed) {
+        return;
+    }
+    yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        p->unresolved_capture_failed = true;
+        return;
+    }
+    yyjson_mut_val *sites = yyjson_mut_arr(doc);
+    yyjson_mut_doc_set_root(doc, sites);
+    int count = 0;
+    for (int i = 0; i < result->resolved_calls.count; i++) {
+        const CBMResolvedCall *rc = &result->resolved_calls.items[i];
+        if (rc->kind != CBM_RESOLVED_INVOCATION || !rc->strategy ||
+            strcmp(rc->strategy, "lsp_unresolved") != 0 || !rc->caller_qn || !rc->callee_qn) {
+            continue;
+        }
+        const char *leaf = strrchr(rc->callee_qn, '.');
+        leaf = leaf ? leaf + 1 : rc->callee_qn;
+        yyjson_mut_val *site = yyjson_mut_obj(doc);
+        yyjson_mut_obj_add_strcpy(doc, site, "caller", rc->caller_qn);
+        yyjson_mut_obj_add_strcpy(doc, site, "leaf", leaf);
+        yyjson_mut_obj_add_uint(doc, site, "start_byte", rc->site_start_byte);
+        yyjson_mut_obj_add_uint(doc, site, "end_byte", rc->site_end_byte);
+        yyjson_mut_obj_add_strcpy(doc, site, "reason", rc->reason ? rc->reason : "unresolved");
+        yyjson_mut_arr_add_val(sites, site);
+        count++;
+    }
+    if (count > 0) {
+        yyjson_alc allocator = {.malloc = unresolved_json_alloc,
+                                .realloc = unresolved_json_realloc,
+                                .free = unresolved_json_free};
+        char *detail = yyjson_mut_write_opts(doc, 0, &allocator, NULL, NULL);
+        char *path = cbm_mem_strdup(CBM_MEM_CLASS_DUMP, rel_path);
+        if (!detail || !path) {
+            p->unresolved_capture_failed = true;
+            cbm_free(CBM_MEM_CLASS_DUMP, detail);
+            cbm_free(CBM_MEM_CLASS_DUMP, path);
+        } else {
+            cbm_coverage_row_t *rows =
+                cbm_realloc(CBM_MEM_CLASS_DUMP, p->unresolved_rows,
+                            (size_t)(p->unresolved_count + 1) * sizeof(*rows));
+            if (!rows) {
+                p->unresolved_capture_failed = true;
+                cbm_free(CBM_MEM_CLASS_DUMP, detail);
+                cbm_free(CBM_MEM_CLASS_DUMP, path);
+            } else {
+                p->unresolved_rows = rows;
+                p->unresolved_rows[p->unresolved_count++] = (cbm_coverage_row_t){
+                    .rel_path = path, .kind = "unresolved_calls", .detail = detail};
+            }
+        }
+    }
+    yyjson_mut_doc_free(doc);
+}
+
+void cbm_pipeline_mark_unresolved_capture_failed(cbm_pipeline_t *p) {
+    if (p)
+        p->unresolved_capture_failed = true;
+}
+
+void cbm_pipeline_get_unresolved_calls(cbm_pipeline_t *p, cbm_coverage_row_t **rows, int *count,
+                                       bool *complete) {
+    if (rows)
+        *rows = p ? p->unresolved_rows : NULL;
+    if (count)
+        *count = p ? p->unresolved_count : 0;
+    if (complete)
+        *complete = p && !p->unresolved_capture_failed;
+}
+
 void cbm_pipeline_free(cbm_pipeline_t *p) {
     if (!p) {
         return;
@@ -450,6 +547,11 @@ void cbm_pipeline_free(cbm_pipeline_t *p) {
     cbm_store_free_lsp_surfaces(p->surface_rows, p->surface_row_count);
     p->surface_rows = NULL;
     p->surface_row_count = 0;
+    for (int i = 0; i < p->unresolved_count; i++) {
+        cbm_free(CBM_MEM_CLASS_DUMP, (char *)p->unresolved_rows[i].rel_path);
+        cbm_free(CBM_MEM_CLASS_DUMP, (char *)p->unresolved_rows[i].detail);
+    }
+    cbm_free(CBM_MEM_CLASS_DUMP, p->unresolved_rows);
     cbm_git_context_free(&p->git_ctx);
     /* gbuf, store, registry freed during/after run */
     /* Defensively free userconfig in case run() was never called or panicked */
@@ -1458,6 +1560,9 @@ static int run_sequential_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     if (seq_cache) {
         for (int i = 0; i < file_count; i++) {
             if (seq_cache[i]) {
+                if (rc == 0) {
+                    cbm_pipeline_record_unresolved_calls(p, files[i].rel_path, seq_cache[i]);
+                }
                 cbm_free_result(seq_cache[i]);
             }
         }
@@ -1683,6 +1788,18 @@ static int run_parallel_pipeline(cbm_pipeline_t *p, cbm_pipeline_ctx_t *ctx,
     cbm_clock_gettime(CLOCK_MONOTONIC, t);
     rc = cbm_parallel_resolve(ctx, files, file_count, cache, &shared_ids, worker_count, all_defs,
                               def_count, def_modules, module_def_index, &cross_registries);
+    if (rc == 0) {
+        for (int i = 0; i < file_count; i++) {
+            bool loaded = false;
+            CBMFileResult *result = cbm_pipeline_result_acquire(ctx, cache, i, NULL, &loaded);
+            if (result) {
+                cbm_pipeline_record_unresolved_calls(p, files[i].rel_path, result);
+            } else if (ctx->spill && cbm_result_spill_has(ctx->spill, i)) {
+                cbm_pipeline_mark_unresolved_capture_failed(p);
+            }
+            cbm_pipeline_result_release(result, loaded);
+        }
+    }
     cbm_log_info("pass.timing", "pass", "parallel_resolve", "elapsed_ms",
                  itoa_buf((int)elapsed_ms(*t)));
     pipeline_phase_mark("parallel_resolve");
@@ -2486,14 +2603,18 @@ static int dump_and_persist_hashes(cbm_pipeline_t *p, const cbm_file_hash_t *bas
         return CBM_PIPELINE_ABORT_PRESERVE_DB;
     }
 
-    int cov_total = p->file_errors_count + p->excluded_count + p->ignored_count;
+    int cov_total =
+        p->file_errors_count + p->excluded_count + p->ignored_count + p->unresolved_count;
     cbm_coverage_row_t *cov = NULL;
     int cov_count = 0;
-    bool coverage_rows_available = cov_total == 0;
+    bool coverage_rows_available = cov_total == 0 && !p->unresolved_capture_failed;
     if (cov_total > 0) {
         cov = malloc((size_t)cov_total * sizeof(*cov));
         if (cov) {
-            coverage_rows_available = true;
+            coverage_rows_available = !p->unresolved_capture_failed;
+            for (int i = 0; i < p->unresolved_count; i++) {
+                cov[cov_count++] = p->unresolved_rows[i];
+            }
             for (int i = 0; i < p->file_errors_count; i++) {
                 cov[cov_count++] = (cbm_coverage_row_t){.rel_path = p->file_errors[i].path,
                                                         .kind = p->file_errors[i].phase,
