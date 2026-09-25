@@ -60,6 +60,13 @@ void cbm_pipeline_set_resource_policy(cbm_pipeline_t *p, const cbm_index_resourc
 void cbm_pipeline_get_resource_violation(const cbm_pipeline_t *p,
                                          cbm_index_resource_violation_t *violation);
 
+/* Snapshot of the artifact export failure of the last cbm_pipeline_run, or ""
+ * when the run succeeded / did not reach post-publish export. Used to
+ * truthfully attribute a failed run to the persistence export (#1665) instead
+ * of the generic pipeline-error hint. Valid until the next cbm_pipeline_run or
+ * cbm_pipeline_free(). Returns "" for NULL p. */
+const char *cbm_pipeline_export_error(const cbm_pipeline_t *p);
+
 /* Free a pipeline and all its internal state. NULL-safe. */
 void cbm_pipeline_free(cbm_pipeline_t *p);
 
