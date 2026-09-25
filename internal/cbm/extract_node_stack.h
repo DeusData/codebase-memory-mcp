@@ -34,6 +34,18 @@ typedef struct {
     CBMArena *scratch;
 } TSNodeStack;
 
+/* Initialize a stack against an arena directly. The LSP passes hold a
+ * TSLSPContext, not a CBMExtractCtx, and every allocation in those files
+ * already comes from that one arena — see collect_children in ts_lsp.c. An
+ * extraction caller should still use ts_nstack_init below, whose context
+ * argument is what makes handing over the wrong arena a type error. */
+static inline void ts_nstack_init_arena(TSNodeStack *s, CBMArena *arena, int initial_cap) {
+    s->scratch = arena;
+    s->items = (TSNode *)cbm_arena_alloc(arena, (size_t)initial_cap * sizeof(TSNode));
+    s->count = 0;
+    s->cap = s->items ? initial_cap : 0;
+}
+
 /* Initialize a stack with the given initial capacity, allocated from the
  * context's traversal scratch. Taking the context rather than an arena is
  * deliberate: it makes handing over ctx->arena, or a local alias of it, a type
@@ -41,11 +53,7 @@ typedef struct {
  * scratch falls back to ctx->arena, which is the behaviour that shipped before
  * #1997, so no caller ever gets a NULL arena and silently loses nodes. */
 static inline void ts_nstack_init(TSNodeStack *s, const CBMExtractCtx *ctx, int initial_cap) {
-    CBMArena *arena = ctx->scratch ? ctx->scratch : ctx->arena;
-    s->scratch = arena;
-    s->items = (TSNode *)cbm_arena_alloc(arena, (size_t)initial_cap * sizeof(TSNode));
-    s->count = 0;
-    s->cap = s->items ? initial_cap : 0;
+    ts_nstack_init_arena(s, ctx->scratch ? ctx->scratch : ctx->arena, initial_cap);
 }
 
 /* Push a node onto the stack, growing 2x if needed. */
