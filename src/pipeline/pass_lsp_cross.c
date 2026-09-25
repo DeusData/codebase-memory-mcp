@@ -19,6 +19,7 @@
 #include "result_spill.h"
 #include "pipeline/pipeline_internal.h"
 #include "pipeline/lsp_resolve.h"
+#include "callable_sig.h"
 #include "lsp/go_lsp.h"
 #include "lsp/c_lsp.h"
 #include "lsp/py_lsp.h"
@@ -273,12 +274,20 @@ static const char *pxc_join_base_qns(CBMArena *arena, const char *const *bases,
 
 static bool pxc_is_jvm_lang(CBMLanguage lang);
 
+/* Leaf of the BASE QN: a callable identity suffix (#2061) never contains
+ * '.', so this equals the historical strrchr split for every QN. */
 static const char *pxc_last_component(const char *qn) {
     if (!qn) {
         return NULL;
     }
-    const char *dot = strrchr(qn, '.');
-    return dot ? dot + 1 : qn;
+    const char *leaf = qn;
+    size_t base_len = cbm_qn_callable_base_len(qn);
+    for (size_t i = 0; i < base_len; i++) {
+        if (qn[i] == '.') {
+            leaf = qn + i + 1;
+        }
+    }
+    return leaf;
 }
 
 /* Every return is arena-owned: the fallback spelling is a copy, never the
@@ -377,7 +386,9 @@ static const char *pxc_qn_leaf(const char *name) {
         return NULL;
     }
     const char *leaf = name;
-    for (const char *p = name; *p; p++) {
+    /* Base only: a callable identity suffix (#2061) may carry ':' labels. */
+    const char *end = name + cbm_qn_callable_base_len(name);
+    for (const char *p = name; p < end; p++) {
         if (*p == '.' || *p == ':' || *p == '/' || *p == '\\') {
             leaf = p + 1;
         }

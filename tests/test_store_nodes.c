@@ -193,6 +193,101 @@ TEST(store_project_delete) {
     PASS();
 }
 
+/* ── QN suffix / callable-base lookups (#2061) ─────────────────── */
+
+static void qn_lookup_node(cbm_store_t *s, const char *name, const char *qn) {
+    cbm_node_t n = {.project = "test",
+                    .label = "Method",
+                    .name = name,
+                    .qualified_name = qn,
+                    .file_path = "a.java",
+                    .start_line = 1,
+                    .end_line = 2};
+    cbm_store_upsert_node(s, &n);
+}
+
+/* The suffix tier matches its text literally: '_' is not a LIKE wildcard,
+ * so `my_func` must not also find `myXfunc`. */
+TEST(store_qn_suffix_is_literal) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    qn_lookup_node(s, "my_func", "test.a.my_func");
+    qn_lookup_node(s, "myXfunc", "test.a.myXfunc");
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "test", "my_func", &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, "test.a.my_func");
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A suffix longer than the old 512-byte pattern buffer is not truncated into
+ * a pattern that matches nothing. */
+TEST(store_qn_suffix_is_unbounded) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    char leaf[601];
+    memset(leaf, 'a', sizeof(leaf) - 1);
+    leaf[sizeof(leaf) - 1] = '\0';
+    char long_qn[640];
+    char long_suffix[640];
+    snprintf(long_qn, sizeof(long_qn), "test.m.%s", leaf);
+    snprintf(long_suffix, sizeof(long_suffix), "m.%s", leaf);
+    qn_lookup_node(s, leaf, long_qn);
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_suffix(s, "test", long_suffix, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    ASSERT_STR_EQ(nodes[0].qualified_name, long_qn);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
+/* A bare base QN (exact, or as a dotted suffix) finds every signature-
+ * qualified overload of it, and never an unsuffixed QN — so the tier is inert
+ * until a language mints suffixes. */
+TEST(store_qn_base_finds_overloads_only) {
+    cbm_store_t *s = cbm_store_open_memory();
+    cbm_store_upsert_project(s, "test", "/tmp/test");
+    qn_lookup_node(s, "work", "test.S.work(int)");
+    qn_lookup_node(s, "work", "test.S.work(String)");
+    qn_lookup_node(s, "work", "test.S.work");
+    qn_lookup_node(s, "workx", "test.S.workx(int)");
+    qn_lookup_node(s, "operator()", "test.S.operator()");
+    qn_lookup_node(s, "Work", "test.C.Work<T>(T)");
+
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.S.work", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "S.work", true, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 2);
+    cbm_store_free_nodes(nodes, count);
+
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.C.Work", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 1);
+    cbm_store_free_nodes(nodes, count);
+
+    /* `operator()` is a bare C++ leaf, not "operator" + "()". */
+    ASSERT_EQ(cbm_store_find_nodes_by_qn_base(s, "test", "test.S.operator", false, &nodes, &count),
+              CBM_STORE_OK);
+    ASSERT_EQ(count, 0);
+    cbm_store_free_nodes(nodes, count);
+    cbm_store_close(s);
+    PASS();
+}
+
 /* ── Node CRUD ──────────────────────────────────────────────────── */
 
 TEST(store_node_crud) {
@@ -2362,6 +2457,9 @@ TEST(store_coverage_replace_rolls_back_when_shadow_rebuild_fails) {
 }
 
 SUITE(store_nodes) {
+    RUN_TEST(store_qn_suffix_is_literal);
+    RUN_TEST(store_qn_suffix_is_unbounded);
+    RUN_TEST(store_qn_base_finds_overloads_only);
     RUN_TEST(store_coverage_roundtrip_prune_shadow);
     RUN_TEST(store_coverage_targeted_path_and_scope_lookup);
     RUN_TEST(store_coverage_meta_zero_row_truncation_and_delete);

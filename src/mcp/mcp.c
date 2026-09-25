@@ -58,6 +58,7 @@ enum {
 #include "cypher/cypher.h"
 #include "discover/discover.h"
 #include "pipeline/pipeline.h"
+#include "callable_sig.h" /* cbm_qn_callable_base_len */
 #include "pipeline/pass_cross_repo.h"
 #include "git/git_context.h"
 #include "cli/cli.h"
@@ -4441,10 +4442,18 @@ static void sg_lines_str(char *out, size_t sz, int start, int end) {
  * ablation (tree > flat/DOT for LLM comprehension), Lost-in-Distance
  * (related rows adjacent — grouping by module does exactly that). */
 
-/* qn-prefix = qualified_name minus its last '.'-segment. Returns length. */
-static size_t sg_qn_prefix_len(const char *qn) {
-    const char *last = qn ? strrchr(qn, '.') : NULL;
-    return last ? (size_t)(last - qn) : 0;
+/* qn-prefix = qualified_name minus its last '.'-segment. Returns length.
+ * The segment is found in the base QN: a callable identity suffix (#2061)
+ * stays on the row's short name, so prefix + "." + name still rebuilds it. */
+static size_t sg_qn_prefix_len(const char *qn, const char *name) {
+    size_t last = 0;
+    size_t base_len = cbm_qn_callable_base_len_named(qn, name);
+    for (size_t i = 0; i < base_len; i++) {
+        if (qn[i] == '.') {
+            last = i;
+        }
+    }
+    return last;
 }
 
 typedef struct {
@@ -4711,7 +4720,7 @@ static void emit_search_results_grouped_tree(cbm_sb_t *sb, const cbm_search_outp
         const cbm_search_result_t *sr = &out->results[i];
         const char *qn = sr->node.qualified_name ? sr->node.qualified_name : "";
         const char *file = sr->node.file_path ? sr->node.file_path : "";
-        size_t plen = sg_qn_prefix_len(qn);
+        size_t plen = sg_qn_prefix_len(qn, sr->node.name);
         bool same_group = previous_prefix && strlen(previous_prefix) == plen &&
                           memcmp(previous_prefix, qn, plen) == 0 && previous_file &&
                           strcmp(previous_file, file) == 0;
@@ -4867,7 +4876,7 @@ static void emit_search_results_tree_json(yyjson_mut_doc *doc, yyjson_mut_val *r
         const cbm_search_result_t *sr = &out->results[i];
         const char *qn = sr->node.qualified_name ? sr->node.qualified_name : "";
         const char *file = sr->node.file_path ? sr->node.file_path : "";
-        size_t plen = sg_qn_prefix_len(qn);
+        size_t plen = sg_qn_prefix_len(qn, sr->node.name);
         bool same_group = previous_prefix && strlen(previous_prefix) == plen &&
                           memcmp(previous_prefix, qn, plen) == 0 && previous_file &&
                           strcmp(previous_file, file) == 0;
@@ -8756,7 +8765,7 @@ static yyjson_mut_val *bfs_to_tree_json(yyjson_mut_doc *doc, cbm_traverse_result
         }
         const char *qn =
             tr->visited[i].node.qualified_name ? tr->visited[i].node.qualified_name : "";
-        size_t plen = sg_qn_prefix_len(qn);
+        size_t plen = sg_qn_prefix_len(qn, tr->visited[i].node.name);
         if (!have_group || strlen(cur_group) != plen || memcmp(cur_group, qn, plen) != 0) {
             char *next_group = cbm_strndup(qn, plen);
             if (!next_group) {
@@ -8880,7 +8889,7 @@ static void bfs_to_tree_table(cbm_sb_t *sb, const char *key, cbm_traverse_result
     char *cur_group = NULL;
     for (int i = 0; i < ordered_count; i++) {
         const char *qn = ordered[i].node.qualified_name ? ordered[i].node.qualified_name : "";
-        size_t plen = sg_qn_prefix_len(qn);
+        size_t plen = sg_qn_prefix_len(qn, ordered[i].node.name);
         if (!cur_group || strlen(cur_group) != plen || memcmp(cur_group, qn, plen) != 0) {
             char *next_group = cbm_strndup(qn, plen);
             if (!next_group) {
@@ -9160,6 +9169,13 @@ static char *handle_trace_call_path(cbm_mcp_server_t *srv, const char *args) {
                 free_node_contents(&qn_node);
             }
         }
+    }
+    if (node_count == 0) {
+        /* A bare base QN names every signature-qualified overload (#2061);
+         * several overloads report ambiguity below like same-named nodes. */
+        cbm_store_free_nodes(nodes, 0);
+        nodes = NULL;
+        cbm_store_find_nodes_by_qn_base(store, project, func_name, false, &nodes, &node_count);
     }
 
     if (node_count == 0) {
@@ -12395,6 +12411,34 @@ static char *handle_get_file_outline(cbm_mcp_server_t *srv, const char *args) {
     return result;
 }
 
+/* Respond from one lookup tier's candidates (always consumed), or NULL when
+ * the tier found nothing. One match answers directly; several prefer the real
+ * definition (a .c body over a .h declaration, a Function over a Module) so
+ * an unambiguous-by-preference match resolves without a disambiguation round
+ * trip; only a genuine tie returns suggestions. */
+static char *snippet_from_tier(cbm_mcp_server_t *srv, cbm_node_t *nodes, int count,
+                               const char *input, const char *match_method, bool include_neighbors,
+                               const char *args) {
+    if (count <= 0) {
+        cbm_store_free_nodes(nodes, count);
+        return NULL;
+    }
+    bool ambiguous = false;
+    int sel = count == SKIP_ONE ? 0 : pick_resolved_node(nodes, count, &ambiguous);
+    if (ambiguous) {
+        char *result = snippet_suggestions(input, nodes, count);
+        cbm_store_free_nodes(nodes, count);
+        return result;
+    }
+    cbm_node_t node = {0};
+    copy_node(&nodes[sel], &node);
+    cbm_store_free_nodes(nodes, count);
+    char *result =
+        build_snippet_response(srv, &node, match_method, include_neighbors, NULL, 0, args);
+    free_node_contents(&node);
+    return result;
+}
+
 static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
     char *qn = cbm_mcp_get_string_arg(args, "qualified_name");
     char *project = get_project_arg(args);
@@ -12436,50 +12480,38 @@ static char *handle_get_code_snippet(cbm_mcp_server_t *srv, const char *args) {
         return result;
     }
 
+    /* Tier 1b: a bare base QN names every signature-qualified overload of it
+     * (#2061). Finds nothing for QNs without a callable identity suffix. */
+    cbm_node_t *tier_nodes = NULL;
+    int tier_count = 0;
+    cbm_store_find_nodes_by_qn_base(store, effective_project, qn, false, &tier_nodes, &tier_count);
+    char *result =
+        snippet_from_tier(srv, tier_nodes, tier_count, qn, "base", include_neighbors, args);
+
     /* Tier 2: Suffix match — handles partial QNs ("main.HandleRequest")
      * and short names ("ProcessOrder") via LIKE '%.X'. */
-    cbm_node_t *suffix_nodes = NULL;
-    int suffix_count = 0;
-    cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &suffix_nodes, &suffix_count);
-
-    if (suffix_count == SKIP_ONE) {
-        copy_node(&suffix_nodes[0], &node);
-        cbm_store_free_nodes(suffix_nodes, suffix_count);
-        char *result =
-            build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0, args);
-        free_node_contents(&node);
-        free(qn);
-        free(project);
-        return result;
+    if (!result) {
+        tier_nodes = NULL;
+        tier_count = 0;
+        cbm_store_find_nodes_by_qn_suffix(store, effective_project, qn, &tier_nodes, &tier_count);
+        result =
+            snippet_from_tier(srv, tier_nodes, tier_count, qn, "suffix", include_neighbors, args);
     }
 
-    if (suffix_count > SKIP_ONE) {
-        /* Prefer the real definition (a .c body over a .h declaration, a Function
-         * over a Module) so an unambiguous-by-preference match resolves directly
-         * instead of forcing a disambiguation round trip; only a genuine tie still
-         * returns suggestions. */
-        bool snip_ambiguous = false;
-        int ssel = pick_resolved_node(suffix_nodes, suffix_count, &snip_ambiguous);
-        if (!snip_ambiguous) {
-            copy_node(&suffix_nodes[ssel], &node);
-            cbm_store_free_nodes(suffix_nodes, suffix_count);
-            char *result =
-                build_snippet_response(srv, &node, "suffix", include_neighbors, NULL, 0, args);
-            free_node_contents(&node);
-            free(qn);
-            free(project);
-            return result;
-        }
-        char *result = snippet_suggestions(qn, suffix_nodes, suffix_count);
-        cbm_store_free_nodes(suffix_nodes, suffix_count);
-        free(qn);
-        free(project);
-        return result;
+    /* Tier 2b: the partial/short form of Tier 1b ("Session.upload"). */
+    if (!result) {
+        tier_nodes = NULL;
+        tier_count = 0;
+        cbm_store_find_nodes_by_qn_base(store, effective_project, qn, true, &tier_nodes,
+                                        &tier_count);
+        result =
+            snippet_from_tier(srv, tier_nodes, tier_count, qn, "suffix", include_neighbors, args);
     }
-
-    cbm_store_free_nodes(suffix_nodes, suffix_count);
     free(qn);
     free(project);
+    if (result) {
+        return result;
+    }
 
     /* Nothing found — guide the caller toward search_graph */
     return cbm_mcp_text_result(

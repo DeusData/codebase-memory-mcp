@@ -30,6 +30,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/hash_table.h"
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
+#include "callable_sig.h" /* cbm_qn_callable_base_len_named: overloads share the name key */
 
 #include <math.h>
 #include <stdio.h>
@@ -860,7 +861,6 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
-    (void)name;
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -893,9 +893,13 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
     const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
 
-    /* Index by simple name.
+    /* Index by simple name. A signature-qualified callable (#2061) is indexed
+     * by its bare `name`, so every overload shares one bucket; any other QN
+     * keeps its historical last-segment key.
      * No array dedup needed: exact-map check above guarantees uniqueness. */
-    const char *simple = simple_name(qualified_name);
+    const char *simple = name && cbm_qn_callable_base_len_named(owned_qn, name) < strlen(owned_qn)
+                             ? name
+                             : simple_name(qualified_name);
     qn_array_t *arr = cbm_ht_get(r->by_name, simple);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));

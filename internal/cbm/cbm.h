@@ -238,6 +238,10 @@ typedef struct {
      * that declared this method.  Kept at the tail so zero-initialised
      * callers in every other language remain ABI/source compatible. */
     const char *impl_trait;
+    /* Callable identity (#2061): offset of the signature suffix inside
+     * qualified_name (base QN = the first qn_sig_off bytes); 0 = no suffix.
+     * Always 0 until a language enables its callable_identity mode. */
+    uint32_t qn_sig_off;
 } CBMDefinition;
 
 /* Argument captured from a call expression */
@@ -422,6 +426,10 @@ typedef struct {
     uint32_t site_start_byte;      // exact source occurrence; end > start when present
     uint32_t site_end_byte;        // exclusive byte offset in the source file
     CBMSourceOrigin source_origin; // raw source or C-family preprocessed buffer
+    /* Callable identity (#2061): the resolved overload's signature suffix,
+     * appended to callee_qn when the edge is written; NULL = none (always,
+     * until a language enables its callable_identity mode). */
+    const char *callee_sig;
 } CBMResolvedCall;
 
 typedef struct {

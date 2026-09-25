@@ -78,6 +78,8 @@ enum {
 #include "foundation/compat.h"
 #include "foundation/log.h"
 #include "foundation/compat_regex.h"
+#include "callable_sig.h"        /* cbm_qn_callable_base_len: base-match tier */
+#include "foundation/mem_core.h" /* cbm_alloc: pattern buffers */
 #include "foundation/str_util.h"
 
 #define XXH_INLINE_ALL
@@ -4376,47 +4378,22 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
 
 /* ── FindNodesByQNSuffix ───────────────────────────────────────── */
 
-int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
-                                      cbm_node_t **out, int *count) {
-    *out = NULL;
-    *count = 0;
-    if (!s || !s->db) {
-        return CBM_STORE_ERR;
-    }
-    /* Match QNs ending with ".suffix" or exactly equal to suffix */
-    char like_pattern[CBM_SZ_512];
-    snprintf(like_pattern, sizeof(like_pattern), "%%.%s", suffix);
+/* Row filter on the raw qualified_name + name columns (NULL keeps every row). */
+typedef bool (*store_qn_keep_fn)(const char *qn, const char *name, const void *arg);
 
-    const char *sql_with_project =
-        "SELECT id, project, label, name, qualified_name, file_path, "
-        "start_line, end_line, properties FROM nodes "
-        "WHERE project = ?1 AND (qualified_name LIKE ?2 OR qualified_name = ?3)";
-    const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
-                          "start_line, end_line, properties FROM nodes "
-                          "WHERE (qualified_name LIKE ?1 OR qualified_name = ?2)";
-
-    sqlite3_stmt *stmt = NULL;
-    int rc =
-        sqlite3_prepare_v2(s->db, project ? sql_with_project : sql_any, CBM_NOT_FOUND, &stmt, NULL);
-    if (rc != SQLITE_OK) {
-        store_set_error_sqlite(s, "qn_suffix prepare");
-        return CBM_STORE_ERR;
-    }
-
-    if (project) {
-        bind_text(stmt, SKIP_ONE, project);
-        bind_text(stmt, ST_COL_2, like_pattern);
-        bind_text(stmt, ST_COL_3, suffix);
-    } else {
-        bind_text(stmt, SKIP_ONE, like_pattern);
-        bind_text(stmt, ST_COL_2, suffix);
-    }
-
+/* Step `stmt` (columns as scan_node reads them) into a node array, keeping the
+ * rows `keep` accepts. Finalizes `stmt`. */
+static int store_collect_nodes(cbm_store_t *s, sqlite3_stmt *stmt, store_qn_keep_fn keep,
+                               const void *keep_arg, cbm_node_t **out, int *count) {
     int cap = ST_INIT_CAP_8;
     int n = 0;
     cbm_node_t *nodes = malloc(cap * sizeof(cbm_node_t));
     int scan_rc8;
     while ((scan_rc8 = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (keep && !keep((const char *)sqlite3_column_text(stmt, CBM_SZ_4),
+                          (const char *)sqlite3_column_text(stmt, CBM_SZ_3), keep_arg)) {
+            continue;
+        }
         if (n >= cap) {
             cap *= ST_GROWTH;
             nodes = safe_realloc(nodes, cap * sizeof(cbm_node_t));
@@ -4437,6 +4414,195 @@ int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const
     *out = nodes;
     *count = n;
     return CBM_STORE_OK;
+}
+
+/* "%." + text + tail with LIKE's wildcards ('%', '_') and the escape
+ * character escaped, for `LIKE ? ESCAPE '\'`. Heap-owned. The caller's text
+ * is matched literally at any length: a fixed 512-byte buffer used to
+ * truncate a long suffix into a pattern that matched nothing, and an
+ * unescaped '_' in `my_func` also matched `myXfunc`. */
+static char *store_like_dot_suffix(const char *text, const char *tail) {
+    size_t n = strlen(text);
+    size_t tail_len = strlen(tail);
+    char *pat = cbm_alloc(CBM_MEM_CLASS_STORE, (2 * n) + tail_len + ST_COL_3); /* "%." + NUL */
+    if (!pat) {
+        return NULL;
+    }
+    size_t k = 0;
+    pat[k++] = '%';
+    pat[k++] = '.';
+    for (size_t i = 0; i < n; i++) {
+        if (text[i] == '%' || text[i] == '_' || text[i] == '\\') {
+            pat[k++] = '\\';
+        }
+        pat[k++] = text[i];
+    }
+    memcpy(pat + k, tail, tail_len + SKIP_ONE);
+    return pat;
+}
+
+int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
+                                      cbm_node_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !suffix) {
+        return CBM_STORE_ERR;
+    }
+    /* Match QNs ending with ".suffix" or exactly equal to suffix */
+    char *like_pattern = store_like_dot_suffix(suffix, "");
+    if (!like_pattern) {
+        return CBM_STORE_ERR;
+    }
+
+    const char *sql_with_project =
+        "SELECT id, project, label, name, qualified_name, file_path, "
+        "start_line, end_line, properties FROM nodes "
+        "WHERE project = ?1 AND (qualified_name LIKE ?2 ESCAPE '\\' OR qualified_name = ?3)";
+    const char *sql_any = "SELECT id, project, label, name, qualified_name, file_path, "
+                          "start_line, end_line, properties FROM nodes "
+                          "WHERE (qualified_name LIKE ?1 ESCAPE '\\' OR qualified_name = ?2)";
+
+    sqlite3_stmt *stmt = NULL;
+    int rc =
+        sqlite3_prepare_v2(s->db, project ? sql_with_project : sql_any, CBM_NOT_FOUND, &stmt, NULL);
+    if (rc != SQLITE_OK) {
+        cbm_free(CBM_MEM_CLASS_STORE, like_pattern);
+        store_set_error_sqlite(s, "qn_suffix prepare");
+        return CBM_STORE_ERR;
+    }
+
+    if (project) {
+        bind_text(stmt, SKIP_ONE, project);
+        bind_text(stmt, ST_COL_2, like_pattern);
+        bind_text(stmt, ST_COL_3, suffix);
+    } else {
+        bind_text(stmt, SKIP_ONE, like_pattern);
+        bind_text(stmt, ST_COL_2, suffix);
+    }
+    rc = store_collect_nodes(s, stmt, NULL, NULL, out, count);
+    cbm_free(CBM_MEM_CLASS_STORE, like_pattern);
+    return rc;
+}
+
+/* ── FindNodesByQNBase ─────────────────────────────────────────── */
+
+typedef struct {
+    const char *base;
+    size_t len;
+    bool suffix;
+} store_qn_base_arg_t;
+
+/* ASCII case-insensitive equality: SQLite's LIKE folds exactly ASCII. */
+static bool store_ascii_ieq(const char *a, const char *b, size_t n) {
+    for (size_t i = 0; i < n; i++) {
+        unsigned char x = (unsigned char)a[i];
+        unsigned char y = (unsigned char)b[i];
+        if (x >= 'A' && x <= 'Z') {
+            x = (unsigned char)(x - 'A' + 'a');
+        }
+        if (y >= 'A' && y <= 'Z') {
+            y = (unsigned char)(y - 'A' + 'a');
+        }
+        if (x != y) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/* Keep a row whose QN carries a callable identity suffix (#2061) over `base`:
+ * its base QN equals `base` (exact) or ends with "." + `base` (suffix mode,
+ * ASCII case-insensitive like the LIKE suffix tier). An unsuffixed QN never
+ * qualifies, so this tier finds nothing until a language mints suffixes. */
+static bool store_qn_base_keep(const char *qn, const char *name, const void *argp) {
+    const store_qn_base_arg_t *arg = argp;
+    if (!qn || !name) {
+        return false;
+    }
+    size_t base_len = cbm_qn_callable_base_len_named(qn, name);
+    if (qn[base_len] == '\0') {
+        return false;
+    }
+    if (!arg->suffix) {
+        return base_len == arg->len && memcmp(qn, arg->base, arg->len) == 0;
+    }
+    return base_len > arg->len && qn[base_len - arg->len - SKIP_ONE] == '.' &&
+           store_ascii_ieq(qn + base_len - arg->len, arg->base, arg->len);
+}
+
+/* Exact mode reads the qualified_name index range [base "(", base "="): a
+ * suffix starts with '(' (0x28) or '<' (0x3C). Suffix mode needs the leading
+ * wildcard, like the suffix tier it follows. Both bounds are heap-owned. */
+static bool store_qn_base_bounds(const char *base, bool suffix_match, char **lo, char **hi) {
+    if (suffix_match) {
+        *lo = store_like_dot_suffix(base, "(%");
+        *hi = store_like_dot_suffix(base, "<%");
+    } else {
+        size_t n = strlen(base);
+        *lo = cbm_alloc(CBM_MEM_CLASS_STORE, n + ST_COL_2);
+        *hi = cbm_alloc(CBM_MEM_CLASS_STORE, n + ST_COL_2);
+        if (*lo && *hi) {
+            memcpy(*lo, base, n);
+            memcpy(*hi, base, n);
+            (*lo)[n] = '(';
+            (*hi)[n] = '=';
+            (*lo)[n + SKIP_ONE] = '\0';
+            (*hi)[n + SKIP_ONE] = '\0';
+        }
+    }
+    if (*lo && *hi) {
+        return true;
+    }
+    cbm_free(CBM_MEM_CLASS_STORE, *lo);
+    cbm_free(CBM_MEM_CLASS_STORE, *hi);
+    return false;
+}
+
+int cbm_store_find_nodes_by_qn_base(cbm_store_t *s, const char *project, const char *base,
+                                    bool suffix_match, cbm_node_t **out, int *count) {
+    *out = NULL;
+    *count = 0;
+    if (!s || !s->db || !base || !base[0]) {
+        return CBM_STORE_ERR;
+    }
+    static const char *const sql[2][2] = {
+        /* [suffix_match][has project] */
+        {"SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, "
+         "properties FROM nodes WHERE qualified_name >= ?1 AND qualified_name < ?2",
+         "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, "
+         "properties FROM nodes WHERE project = ?1 AND qualified_name >= ?2 AND "
+         "qualified_name < ?3"},
+        {"SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, "
+         "properties FROM nodes WHERE (qualified_name LIKE ?1 ESCAPE '\\' OR "
+         "qualified_name LIKE ?2 ESCAPE '\\')",
+         "SELECT id, project, label, name, qualified_name, file_path, start_line, end_line, "
+         "properties FROM nodes WHERE project = ?1 AND (qualified_name LIKE ?2 ESCAPE '\\' OR "
+         "qualified_name LIKE ?3 ESCAPE '\\')"},
+    };
+    char *lo = NULL;
+    char *hi = NULL;
+    if (!store_qn_base_bounds(base, suffix_match, &lo, &hi)) {
+        return CBM_STORE_ERR;
+    }
+    sqlite3_stmt *stmt = NULL;
+    if (sqlite3_prepare_v2(s->db, sql[suffix_match ? 1 : 0][project ? 1 : 0], CBM_NOT_FOUND, &stmt,
+                           NULL) != SQLITE_OK) {
+        cbm_free(CBM_MEM_CLASS_STORE, lo);
+        cbm_free(CBM_MEM_CLASS_STORE, hi);
+        store_set_error_sqlite(s, "qn_base prepare");
+        return CBM_STORE_ERR;
+    }
+    int col = SKIP_ONE;
+    if (project) {
+        bind_text(stmt, col++, project);
+    }
+    bind_text(stmt, col++, lo);
+    bind_text(stmt, col, hi);
+    store_qn_base_arg_t arg = {base, strlen(base), suffix_match};
+    int rc = store_collect_nodes(s, stmt, store_qn_base_keep, &arg, out, count);
+    cbm_free(CBM_MEM_CLASS_STORE, lo);
+    cbm_free(CBM_MEM_CLASS_STORE, hi);
+    return rc;
 }
 
 /* ── NodeDegree ────────────────────────────────────────────────── */

@@ -337,6 +337,7 @@ FOUNDATION_SRCS = \
 EXTRACTION_SRCS = \
     $(CBM_DIR)/cbm.c \
     $(CBM_DIR)/extract_defs.c \
+    $(CBM_DIR)/callable_sig.c \
     $(CBM_DIR)/extract_calls.c \
     $(CBM_DIR)/extract_imports.c \
     $(CBM_DIR)/extract_usages.c \
@@ -631,6 +632,7 @@ TEST_FOUNDATION_SRCS = \
 
 TEST_EXTRACTION_SRCS = \
     tests/test_extraction.c \
+    tests/test_callable_sig.c \
     tests/test_extraction_inheritance.c \
     tests/test_extraction_imports.c \
     tests/test_parse_coverage.c \

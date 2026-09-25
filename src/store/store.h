@@ -105,6 +105,13 @@ int cbm_store_find_nodes_by_file_overlap(cbm_store_t *s, const char *project, co
 int cbm_store_find_nodes_by_qn_suffix(cbm_store_t *s, const char *project, const char *suffix,
                                       cbm_node_t **out, int *count);
 
+/* Find callables whose signature-qualified QN (#2061) has `base` as its base
+ * QN (exact), or a base ending with "." + `base` (suffix_match). QNs without
+ * a callable identity suffix never match: this is the tier that lets a bare
+ * QN name every overload. */
+int cbm_store_find_nodes_by_qn_base(cbm_store_t *s, const char *project, const char *base,
+                                    bool suffix_match, cbm_node_t **out, int *count);
+
 /* Get CALLS degree of a node (inbound and outbound). */
 void cbm_store_node_degree(cbm_store_t *s, int64_t node_id, int *in_deg, int *out_deg);
 

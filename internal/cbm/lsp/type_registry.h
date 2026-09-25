@@ -40,6 +40,9 @@ typedef struct {
      * remain NULL when raw cross-file provenance is ambiguous; the Rust trait
      * flag still prevents that method from being mistaken for inherent. */
     const char *impl_trait_qn;
+    /* Callable identity (#2061): this overload's signature suffix; its graph
+     * QN is qualified_name + sig. NULL = none (always, until enabled). */
+    const char *sig;
 } CBMRegisteredFunc;
 
 // Registered type with fields and method names.
