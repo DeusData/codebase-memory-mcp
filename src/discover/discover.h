@@ -51,6 +51,12 @@ CBMLanguage cbm_disambiguate_cls(const char *path);
  * CBM_LANG_FORM. On read failure, defaults to CBM_LANG_FORM. */
 CBMLanguage cbm_disambiguate_frm(const char *path);
 
+/* Disambiguate .res files by reading first 4KB of content (#2176).
+ * Returns CBM_LANG_COUNT (not indexed) for binary content -- a Godot resource
+ * or a Windows compiled resource file, recognised by a NUL byte -- otherwise
+ * CBM_LANG_RESCRIPT. On read failure, defaults to CBM_LANG_RESCRIPT. */
+CBMLanguage cbm_disambiguate_res(const char *path);
+
 /* Disambiguate .inc files by reading first 4KB of content.
  * Returns CBM_LANG_OBJECTSCRIPT_ROUTINE if it looks like an ObjectScript
  * include (a "ROUTINE <Uppercase>" header), otherwise CBM_LANG_BITBAKE.

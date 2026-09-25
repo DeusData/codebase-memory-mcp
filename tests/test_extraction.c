@@ -6920,6 +6920,73 @@ TEST(extract_csharp_argument_values_use_the_walk_cursor) {
     }
     PASS();
 }
+
+/* #2176: a binary Godot `.res` resource (4.7 MB) never finished indexing. It
+ * parses as ReScript into an error-heavy tree whose root has ~170k children
+ * per MB, and the ReScript `let` binding check climbed from every named leaf
+ * with ts_node_parent — a descent from the root that scans the children at
+ * every level, so O(root children) per leaf and quadratic per file (1 MB spent
+ * 46 s in the unified walk). Valid ReScript with many top-level statements has
+ * the same flat root, so plain text drives it too. The walk now climbs its own
+ * cursor. The counter records every root-descending hop that check makes; the
+ * assertion is that the walk makes none, at any size. */
+static int extract_rescript_let_leaf_fallbacks(int statement_count, int *out_usages,
+                                               uint64_t *out_slow_parent_fallbacks) {
+    static const char prefix[] = "let target = 1\n";
+    static const char statement[] = "let v = target\n";
+    size_t capacity = sizeof(prefix) + (size_t)statement_count * sizeof(statement);
+    char *source = malloc(capacity);
+    if (!source) {
+        return -1;
+    }
+    size_t offset = 0;
+    memcpy(source + offset, prefix, sizeof(prefix) - 1U);
+    offset += sizeof(prefix) - 1U;
+    for (int i = 0; i < statement_count; i++) {
+        memcpy(source + offset, statement, sizeof(statement) - 1U);
+        offset += sizeof(statement) - 1U;
+    }
+    source[offset] = '\0';
+
+    cbm_usage_field_lookup_test_reset();
+    CBMFileResult *result =
+        cbm_extract_file(source, (int)offset, CBM_LANG_RESCRIPT, "proj", "Flat.res", 0, NULL, NULL);
+    free(source);
+    if (!result) {
+        return -1;
+    }
+    int usages = 0;
+    for (int i = 0; i < result->usages.count; i++) {
+        if (result->usages.items[i].ref_name &&
+            strcmp(result->usages.items[i].ref_name, "target") == 0) {
+            usages++;
+        }
+    }
+    *out_slow_parent_fallbacks = cbm_usage_slow_parent_fallback_test_count();
+    cbm_free_result(result);
+    *out_usages = usages;
+    return 0;
+}
+
+TEST(extract_rescript_let_bindings_use_the_walk_cursor) {
+    enum { SMALL = 128, BIG = 1024 };
+    int small_usages = 0;
+    int big_usages = 0;
+    uint64_t small_fallbacks = 0;
+    uint64_t big_fallbacks = 0;
+    ASSERT_EQ(extract_rescript_let_leaf_fallbacks(SMALL, &small_usages, &small_fallbacks), 0);
+    ASSERT_EQ(extract_rescript_let_leaf_fallbacks(BIG, &big_usages, &big_fallbacks), 0);
+    fprintf(stderr, "  [rescript-let-bindings] fallbacks(%d)=%llu fallbacks(%d)=%llu\n", SMALL,
+            (unsigned long long)small_fallbacks, BIG, (unsigned long long)big_fallbacks);
+    /* Anti-vacuous: every leaf really was classified (each `target` read is a
+     * usage, each `v` a binding), so zero fallbacks means "took the cursor",
+     * not "never looked". */
+    ASSERT_EQ(small_usages, SMALL);
+    ASSERT_EQ(big_usages, BIG);
+    ASSERT_EQ(small_fallbacks, 0);
+    ASSERT_EQ(big_fallbacks, 0);
+    PASS();
+}
 #endif
 
 /* ===================================================================
@@ -8266,6 +8333,7 @@ SUITE(extraction) {
 #if defined(CBM_CALL_REFERENCE_LOOKUP_TEST_API) && CBM_CALL_REFERENCE_LOOKUP_TEST_API
     RUN_TEST(extract_wide_flat_reference_fields_are_linear);
     RUN_TEST(extract_csharp_argument_values_use_the_walk_cursor);
+    RUN_TEST(extract_rescript_let_bindings_use_the_walk_cursor);
 #endif
 
     /* Perl call-graph noise (#459 follow-up) */
