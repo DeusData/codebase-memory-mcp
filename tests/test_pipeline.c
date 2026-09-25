@@ -116,6 +116,120 @@ TEST(pipeline_create_free) {
     PASS();
 }
 
+TEST(pipeline_background_worker_policy_preserves_overrides) {
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    cbm_unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+
+    cbm_pipeline_t *foreground = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    cbm_pipeline_t *background = cbm_pipeline_new("/some/path", NULL, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(foreground);
+    ASSERT_NOT_NULL(background);
+    cbm_pipeline_set_background(background, true);
+
+    int foreground_default = cbm_pipeline_worker_count(foreground);
+    int background_default = cbm_pipeline_worker_count(background);
+    bool defaults_match = foreground_default == cbm_default_worker_count(true) &&
+                          background_default == cbm_default_worker_count(false) &&
+                          foreground_default >= 1 && background_default >= 1;
+
+    cbm_setenv("CBM_WORKERS", "3", 1);
+    bool env_override = cbm_pipeline_worker_count(foreground) == 3 &&
+                        cbm_pipeline_worker_count(background) == 3;
+
+    cbm_setenv("CBM_INDEX_SINGLE_THREAD", "1", 1);
+    bool recovery_override = cbm_pipeline_worker_count(foreground) == 1 &&
+                             cbm_pipeline_worker_count(background) == 1;
+
+    cbm_pipeline_free(foreground);
+    cbm_pipeline_free(background);
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+
+    ASSERT_TRUE(defaults_match);
+    ASSERT_TRUE(env_override);
+    ASSERT_TRUE(recovery_override);
+    PASS();
+}
+
+TEST(pipeline_background_policy_preserves_index_results) {
+    ASSERT_EQ(setup_test_repo(), 0);
+    /* 64 fillers plus setup_test_repo's three files exceed MIN_FILES_FOR_PARALLEL
+     * (50). Below that threshold both policies take the sequential path, so the
+     * comparison stays green even with the background policy removed. */
+    for (int i = 0; i < 64; i++) {
+        char name[32];
+        char body[96];
+        (void)snprintf(name, sizeof(name), "pad%02d.go", i);
+        (void)snprintf(body, sizeof(body), "package main\n\nfunc Pad%02d() int {\n\treturn %d\n}\n",
+                       i, i);
+        if (th_write_file(TH_PATH(g_tmpdir, name), body) != 0) {
+            teardown_test_repo();
+            FAIL("failed to pad fixture past MIN_FILES_FOR_PARALLEL");
+        }
+    }
+
+    /* An inherited CBM_WORKERS pin makes both runs use the same count. Drop it
+     * so this compares an all-core index against a headroom index. */
+    const char *old_workers = getenv("CBM_WORKERS");
+    char *saved_workers = old_workers ? strdup(old_workers) : NULL;
+    const char *old_single = getenv("CBM_INDEX_SINGLE_THREAD");
+    char *saved_single = old_single ? strdup(old_single) : NULL;
+    if ((old_workers && !saved_workers) || (old_single && !saved_single)) {
+        free(saved_workers);
+        free(saved_single);
+        teardown_test_repo();
+        FAIL("failed to save worker env");
+    }
+    cbm_unsetenv("CBM_WORKERS");
+    cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+
+    char foreground_db[512];
+    char background_db[512];
+    (void)snprintf(foreground_db, sizeof(foreground_db), "%s/foreground.db", g_tmpdir);
+    (void)snprintf(background_db, sizeof(background_db), "%s/background.db", g_tmpdir);
+
+    cbm_pipeline_t *foreground = cbm_pipeline_new(g_tmpdir, foreground_db, CBM_MODE_FULL);
+    cbm_pipeline_t *background = cbm_pipeline_new(g_tmpdir, background_db, CBM_MODE_FULL);
+    int foreground_rc = -1;
+    int background_rc = -1;
+    int foreground_nodes = -1;
+    int foreground_edges = -1;
+    int background_nodes = -1;
+    int background_edges = -1;
+    bool created = foreground && background;
+    if (created) {
+        cbm_pipeline_set_background(background, true);
+        foreground_rc = cbm_pipeline_run(foreground);
+        background_rc = cbm_pipeline_run(background);
+        cbm_pipeline_get_committed_counts(foreground, &foreground_nodes, &foreground_edges);
+        cbm_pipeline_get_committed_counts(background, &background_nodes, &background_edges);
+    }
+
+    cbm_pipeline_free(foreground);
+    cbm_pipeline_free(background);
+    teardown_test_repo();
+    saved_workers ? cbm_setenv("CBM_WORKERS", saved_workers, 1) : cbm_unsetenv("CBM_WORKERS");
+    saved_single ? cbm_setenv("CBM_INDEX_SINGLE_THREAD", saved_single, 1)
+                 : cbm_unsetenv("CBM_INDEX_SINGLE_THREAD");
+    free(saved_workers);
+    free(saved_single);
+
+    ASSERT_TRUE(created);
+    ASSERT_EQ(foreground_rc, 0);
+    ASSERT_EQ(background_rc, 0);
+    ASSERT_GT(foreground_nodes, 0);
+    ASSERT_EQ(background_nodes, foreground_nodes);
+    ASSERT_EQ(background_edges, foreground_edges);
+    PASS();
+}
+
 TEST(pipeline_null_repo) {
     cbm_pipeline_t *p = cbm_pipeline_new(NULL, NULL, CBM_MODE_FULL);
     ASSERT_NULL(p);
@@ -5051,8 +5165,8 @@ TEST(pipeline_semantic_manifest_rejects_non_directory_root) {
 
     cbm_file_hash_t *manifest = NULL;
     int manifest_count = -1;
-    int rc = cbm_pipeline_build_semantic_manifest("manifest-fail-closed", root_path, NULL, 0, NULL,
-                                                  0, NULL, NULL, &manifest, &manifest_count);
+    int rc = cbm_pipeline_build_semantic_manifest(NULL, "manifest-fail-closed", root_path, NULL, 0,
+                                                  NULL, 0, NULL, NULL, &manifest, &manifest_count);
     cbm_pipeline_free_semantic_manifest(manifest, manifest_count > 0 ? manifest_count : 0);
     th_rmtree(tmp);
 
@@ -15062,6 +15176,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_lock_release_allows_contender);
     /* Lifecycle */
     RUN_TEST(pipeline_create_free);
+    RUN_TEST(pipeline_background_worker_policy_preserves_overrides);
+    RUN_TEST(pipeline_background_policy_preserves_index_results);
     RUN_TEST(pipeline_null_repo);
     RUN_TEST(pipeline_free_null);
     RUN_TEST(pipeline_cancel);
