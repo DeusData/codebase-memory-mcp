@@ -314,6 +314,36 @@ TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap) {
     PASS();
 }
 
+/* Pipeline-level: the doclinks pass runs as part of a real index and its
+ * REFERENCES_FILE edges land in the store, not just in a unit test that
+ * calls cbm_pipeline_pass_doclinks() directly. Registration-list gap: every
+ * doclinks unit test calls the pass function by hand, so deleting its
+ * {predump_doclinks, "doclinks", false} entry in pipeline.c would leave
+ * every one of them green. */
+TEST(pipeline_doclinks_edge_lands_in_store) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_doclinks_pipeline_XXXXXX");
+    ASSERT_NOT_NULL(cbm_mkdtemp(tmp));
+
+    write_temp_file(tmp, "README.md", "See [main](src/main.go) for the entry point.\n");
+    write_temp_file(tmp, "src/main.go", "package main\n\nfunc main() {}\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/doclinks.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+    ASSERT_GT(cbm_store_count_edges_by_type(s, project, "REFERENCES_FILE"), 0);
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Spilling must be invisible in the OUTPUT: the same repository indexed with
  * results parked on disk must produce the same graph as one indexed entirely in
  * memory. It did not. The namespace map that `use`/`using`/package imports
@@ -15079,6 +15109,7 @@ SUITE(pipeline) {
     RUN_TEST(store_bulk_persistence);
     /* Integration: structure pass */
     RUN_TEST(pipeline_grpc_routes_cover_every_service_past_the_old_cap);
+    RUN_TEST(pipeline_doclinks_edge_lands_in_store);
     RUN_TEST(pipeline_spill_resolves_namespace_imports_like_memory);
     RUN_TEST(pipeline_structure_nodes);
     RUN_TEST(pipeline_committed_counts_match_persisted);
