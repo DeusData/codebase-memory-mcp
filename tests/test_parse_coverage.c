@@ -145,6 +145,70 @@ static const char *PERL_MALFORMED = "package Broken;\n"
                                     "sub after_error { return 2; }\n";
 
 /* ── Tests ────────────────────────────────────────────────────────────────── */
+/* Valid SQLite/TSX syntax currently rejected by the vendored grammars. */
+static const char *SQLITE_VALID_MIGRATION =
+    "PRAGMA foreign_keys = ON;\n"
+    "CREATE TABLE IF NOT EXISTS registrations (\n"
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+    "  name TEXT NOT NULL\n"
+    ");\n"
+    "CREATE TRIGGER IF NOT EXISTS registrations_guard\n"
+    "BEFORE UPDATE ON registrations\n"
+    "BEGIN\n"
+    "  SELECT RAISE(ABORT, 'registrations are immutable');\n"
+    "END;\n"
+    "CREATE UNIQUE INDEX IF NOT EXISTS registrations_name ON registrations(name)\n"
+    "  WHERE name IS NOT NULL;\n";
+
+static const char *SQLITE_MALFORMED =
+    "CREATE TABLE broken ???;\n";
+
+static const char *TSX_VALID_JSX_TEXT =
+    "function Register() {\n"
+    "  return (\n"
+    "    <form>\n"
+    "      <fieldset>\n"
+    "        <legend>Identity & contact</legend>\n"
+    "      </fieldset>\n"
+    "      <fieldset>\n"
+    "        <legend>Terms & review</legend>\n"
+    "      </fieldset>\n"
+    "    </form>\n"
+    "  );\n"
+    "}\n";
+
+TEST(sqlite_valid_migration_not_flagged) {
+    CBMFileResult *r = do_extract(SQLITE_VALID_MIGRATION, CBM_LANG_SQL, "migration.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(sqlite_malformed_still_flagged) {
+    CBMFileResult *r = do_extract(SQLITE_MALFORMED, CBM_LANG_SQL, "broken.sql");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_TRUE(r->error_region_count > 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(tsx_valid_jsx_text_not_flagged) {
+    CBMFileResult *r = do_extract(TSX_VALID_JSX_TEXT, CBM_LANG_TSX, "component.tsx");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 
 TEST(c_ifdef_split_brace_sets_parse_incomplete) {
     CBMFileResult *r = do_extract(C_IFDEF_SPLIT, CBM_LANG_C, "split.c");
@@ -984,6 +1048,9 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
 }
 
 SUITE(parse_coverage) {
+    RUN_TEST(sqlite_valid_migration_not_flagged);
+    RUN_TEST(sqlite_malformed_still_flagged);
+    RUN_TEST(tsx_valid_jsx_text_not_flagged);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
     RUN_TEST(c_error_range_points_at_failed_region);
