@@ -409,6 +409,12 @@ static int pxc_build_lsp_def(CBMArena *arena, const CBMDefinition *src, const ch
     dst->label = label;
     dst->def_module_qn = module_qn;
     dst->namespace_name = namespace_name ? cbm_arena_strdup(arena, namespace_name) : NULL;
+    /* C# types carry their OWN declared namespace: the file-level one is only
+     * the file's first namespace, wrong for every later namespace (#2120). */
+    if (lang == CBM_LANG_CSHARP && cbm_label_is_type_like(src->label)) {
+        dst->namespace_name =
+            src->decl_namespace ? cbm_arena_strdup(arena, src->decl_namespace) : NULL;
+    }
     dst->is_interface = (strcmp(label, "Interface") == 0 || strcmp(label, "Protocol") == 0);
     /* Single return-type string. The per-language registrars split on '|'
      * for multi-return languages (Go); single-return languages just see one

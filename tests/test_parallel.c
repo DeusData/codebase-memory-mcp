@@ -303,6 +303,8 @@ static cbm_gbuf_t *run_sequential_with_lsp_cross(const char *project, const char
  * run_parallel_pipeline does) and records how many results the store parked. */
 static bool g_harness_spill = false;
 static int64_t g_harness_parked = -1;
+/* Opt-in: hand cbm_parallel_resolve the production Tier-2 C# registry. */
+static bool g_harness_cs_registry = false;
 
 static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     const char *project, const char *repo_path, cbm_file_info_t *files, int file_count,
@@ -374,9 +376,17 @@ static cbm_gbuf_t *run_parallel_with_extract_opts_and_mutator(
     CBMModuleDefIndex *module_def_index =
         all_defs ? cbm_pxc_build_module_def_index(all_defs, def_count) : NULL;
 
+    /* C# has no per-file cross path (cbm_pxc_run_one has no C# case): production
+     * resolves it only through the Tier-2 registry, so a harness run that opts
+     * in builds that one registry exactly as run_parallel_pipeline does. */
+    CBMCrossLspRegistries harness_registries = {0};
+    if (g_harness_cs_registry && all_defs) {
+        harness_registries.cs = cbm_cs_build_cross_registry(&cross_arena, all_defs, def_count);
+    }
     cbm_parallel_resolve(&ctx, files, file_count, result_cache, &shared_ids, worker_count, all_defs,
                          def_count, def_modules, module_def_index,
-                         NULL /* cross_registries — tests use per-file path */);
+                         g_harness_cs_registry ? &harness_registries
+                                               : NULL /* tests use per-file path */);
     cbm_gbuf_set_next_id(gbuf, atomic_load(&shared_ids));
 
     cbm_pxc_free_module_def_index(module_def_index);
@@ -2328,6 +2338,191 @@ static kotlin_implicit_probe_t probe_kotlin_implicit_site(const CBMFileResult *r
         }
     }
     return probe;
+}
+
+/* #2120: two C# projects declare a class with the same simple name in
+ * namespaces that share a root (Contoso.Platform.Identity.UserIdentityInfo vs
+ * Contoso.Platform.BackOffice.Identity.UserIdentityInfo). Graph QNs are
+ * path-derived, so the namespace-prefix lookups never hit a project type and
+ * the short-name fallback scored both variants 0 against the file namespace:
+ * registration order picked the target, ignoring the caller's `using`
+ * directive. Each caller below can see exactly ONE variant (C# binding rules),
+ * so exactly one edge per caller is correct whatever the file order: plain
+ * `using` (both directions), enclosing-namespace proximity, and a
+ * fully-qualified name. The last case is a reference-assembly shape: one file
+ * declaring several namespaces, whose file-level namespace is only the FIRST
+ * one; the decoy is registered first, so a mislabeled namespace falls back to
+ * it. `partial` pieces of one type are separate registry entries, so a member
+ * declared on another piece must still bind to that piece. */
+TEST(parallel_csharp_same_name_class_binds_by_namespace) {
+    static const char platform_src[] =
+        "namespace Contoso.Platform.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char backoffice_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity;\n"
+        "public class UserIdentityInfo {\n"
+        "    public static UserIdentityInfo ParseFromClaim(string c)\n"
+        "        => new UserIdentityInfo();\n"
+        "}\n";
+    static const char bo_handler_src[] =
+        "using Contoso.Platform.BackOffice.Identity;\n"
+        "namespace Contoso.Platform.BackOffice.CqrsHandlers;\n"
+        "public class Handler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char pf_handler_src[] =
+        "using Contoso.Platform.Identity;\n"
+        "namespace Contoso.Platform.Api;\n"
+        "public class PlatformHandler {\n"
+        "    public string Handle(string claim) {\n"
+        "        var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "        return info.ToString();\n"
+        "    }\n"
+        "}\n";
+    static const char nested_ns_src[] =
+        "namespace Contoso.Platform.BackOffice.Identity.Claims\n"
+        "{\n"
+        "    public class ClaimReader {\n"
+        "        public string Read(string claim) {\n"
+        "            var info = UserIdentityInfo.ParseFromClaim(claim);\n"
+        "            return info.ToString();\n"
+        "        }\n"
+        "    }\n"
+        "}\n";
+    static const char fq_src[] = "namespace Contoso.Platform.Reports;\n"
+                                 "public class Report {\n"
+                                 "    public string Build(string claim) {\n"
+                                 "        var info = Contoso.Platform.BackOffice.Identity"
+                                 ".UserIdentityInfo.ParseFromClaim(claim);\n"
+                                 "        return info.ToString();\n"
+                                 "    }\n"
+                                 "}\n";
+    static const char decoy_src[] = "namespace Contoso.Decoy;\n"
+                                    "public class Worker {\n"
+                                    "    public void Start() { }\n"
+                                    "    public void Beta() { }\n"
+                                    "}\n";
+    static const char multi_ns_src[] = "namespace Contoso.Win32 { public class SafeHandle { } }\n"
+                                       "namespace Contoso.Threading {\n"
+                                       "    public class Worker { public void Start() { } }\n"
+                                       "}\n";
+    static const char runner_src[] = "using Contoso.Threading;\n"
+                                     "namespace Contoso.App;\n"
+                                     "public class Runner {\n"
+                                     "    public void Run() {\n"
+                                     "        var w = new Worker();\n"
+                                     "        w.Start();\n"
+                                     "    }\n"
+                                     "}\n";
+    static const char part_a_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Alpha() { } }\n";
+    static const char part_b_src[] = "namespace Contoso.Parts;\n"
+                                     "public partial class Thing { public void Beta() { } }\n";
+    static const char part_user_src[] = "using Contoso.Parts;\n"
+                                        "namespace Contoso.App;\n"
+                                        "public class PartUser {\n"
+                                        "    public void Use() {\n"
+                                        "        var t = new Thing();\n"
+                                        "        t.Alpha();\n"
+                                        "        t.Beta();\n"
+                                        "    }\n"
+                                        "}\n";
+    const char *project = "cbm_cs_same_name";
+    static const char *rels[] = {
+        "src/Decoy/Worker.cs",
+        "src/Contoso.Platform/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/Identity/UserIdentityInfo.cs",
+        "src/Contoso.Platform.BackOffice/CqrsHandlers/Handler.cs",
+        "src/Contoso.Platform/Api/PlatformHandler.cs",
+        "src/Contoso.Platform.BackOffice/Identity/Claims/ClaimReader.cs",
+        "src/Contoso.Platform/Reports/Report.cs",
+        "src/Ref/Threading.cs",
+        "src/App/Runner.cs",
+        "src/Parts/Thing.A.cs",
+        "src/Parts/Thing.B.cs",
+        "src/App/PartUser.cs",
+    };
+    const char *srcs[] = {decoy_src,      platform_src,  backoffice_src, bo_handler_src,
+                          pf_handler_src, nested_ns_src, fq_src,         multi_ns_src,
+                          runner_src,     part_a_src,    part_b_src,     part_user_src};
+    enum { N_FILES = 12, N_CHECKS = 13 };
+
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cbm_par_cs_same_name_XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("mkdtemp failed");
+    }
+    char paths[N_FILES][512];
+    cbm_file_info_t files[N_FILES] = {0};
+    for (int i = 0; i < N_FILES; i++) {
+        snprintf(paths[i], sizeof(paths[i]), "%s/%s", tmpdir, rels[i]);
+        if (th_write_file(paths[i], srcs[i]) != 0) {
+            th_rmtree(tmpdir);
+            FAIL("failed to write C# same-name fixture");
+        }
+        files[i].path = paths[i];
+        files[i].rel_path = (char *)rels[i];
+        files[i].language = CBM_LANG_CSHARP;
+    }
+
+    cbm_gbuf_t *graphs[2] = {run_sequential_with_lsp_cross(project, tmpdir, files, N_FILES), NULL};
+    g_harness_cs_registry = true;
+    graphs[1] = run_parallel(project, tmpdir, files, N_FILES, 2);
+    g_harness_cs_registry = false;
+    ASSERT_NOT_NULL(graphs[0]);
+    ASSERT_NOT_NULL(graphs[1]);
+
+    const char *pf = "cbm_cs_same_name.src.Contoso.Platform.Identity.UserIdentityInfo."
+                     "UserIdentityInfo.ParseFromClaim";
+    const char *bo = "cbm_cs_same_name.src.Contoso.Platform.BackOffice.Identity."
+                     "UserIdentityInfo.UserIdentityInfo.ParseFromClaim";
+    const char *ref_start = "cbm_cs_same_name.src.Ref.Threading.Worker.Start";
+    const char *decoy_start = "cbm_cs_same_name.src.Decoy.Worker.Worker.Start";
+    const char *part_alpha = "cbm_cs_same_name.src.Parts.Thing.A.Thing.Alpha";
+    const char *part_beta = "cbm_cs_same_name.src.Parts.Thing.B.Thing.Beta";
+    const char *decoy_beta = "cbm_cs_same_name.src.Decoy.Worker.Worker.Beta";
+    bool ok[2][N_CHECKS];
+    bool all = true;
+    for (int g = 0; g < 2; g++) {
+        cbm_gbuf_t *gb = graphs[g];
+        ok[g][0] = has_edge_from_callable_to_qn(gb, "Handler.Handle", bo, "CALLS");
+        ok[g][1] = !has_edge_from_callable_to_qn(gb, "Handler.Handle", pf, "CALLS");
+        ok[g][2] = has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", pf, "CALLS");
+        ok[g][3] = !has_edge_from_callable_to_qn(gb, "PlatformHandler.Handle", bo, "CALLS");
+        ok[g][4] = has_edge_from_callable_to_qn(gb, "ClaimReader.Read", bo, "CALLS");
+        ok[g][5] = !has_edge_from_callable_to_qn(gb, "ClaimReader.Read", pf, "CALLS");
+        ok[g][6] = has_edge_from_callable_to_qn(gb, "Report.Build", bo, "CALLS");
+        ok[g][7] = !has_edge_from_callable_to_qn(gb, "Report.Build", pf, "CALLS");
+        ok[g][8] = has_edge_from_callable_to_qn(gb, "Runner.Run", ref_start, "CALLS");
+        ok[g][9] = !has_edge_from_callable_to_qn(gb, "Runner.Run", decoy_start, "CALLS");
+        ok[g][10] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_alpha, "CALLS");
+        ok[g][11] = has_edge_from_callable_to_qn(gb, "PartUser.Use", part_beta, "CALLS");
+        ok[g][12] = !has_edge_from_callable_to_qn(gb, "PartUser.Use", decoy_beta, "CALLS");
+        for (int k = 0; k < N_CHECKS; k++) {
+            all = all && ok[g][k];
+        }
+    }
+    if (!all) {
+        for (int g = 0; g < 2; g++) {
+            printf("  C# same-name diagnostic %s: using_bo=%d/%d using_pf=%d/%d "
+                   "enclosing_ns=%d/%d fully_qualified=%d/%d multi_ns_file=%d/%d "
+                   "partial=%d/%d/%d\n",
+                   g == 0 ? "sequential" : "parallel", ok[g][0], ok[g][1], ok[g][2], ok[g][3],
+                   ok[g][4], ok[g][5], ok[g][6], ok[g][7], ok[g][8], ok[g][9], ok[g][10], ok[g][11],
+                   ok[g][12]);
+        }
+    }
+    cbm_gbuf_free(graphs[0]);
+    cbm_gbuf_free(graphs[1]);
+    th_rmtree(tmpdir);
+    ASSERT_TRUE(all);
+    PASS();
 }
 
 /* External Kotlin protocol targets must not borrow a project method merely
@@ -4413,6 +4608,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_typescript_module_value_usage_respects_lexical_shadows);
     RUN_TEST(parallel_typescript_import_namespace_exact_parity);
     RUN_TEST(parallel_tsx_import_namespace_exact_parity);
+    RUN_TEST(parallel_csharp_same_name_class_binds_by_namespace);
     RUN_TEST(parallel_kotlin_external_protocol_does_not_use_project_class_method_tail);
     RUN_TEST(parallel_kotlin_nonbinary_operator_carriers_reach_graph);
     RUN_TEST(parallel_rust_cross_crate_worker_receives_workspace_manifest);

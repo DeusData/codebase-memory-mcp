@@ -238,6 +238,10 @@ typedef struct {
      * that declared this method.  Kept at the tail so zero-initialised
      * callers in every other language remain ABI/source compatible. */
     const char *impl_trait;
+    /* C# only: declared namespace of a TOP-LEVEL type (NULL for nested types,
+     * the global namespace and every other language). Per type, because the
+     * file-level namespace_name records only a file's first namespace. */
+    const char *decl_namespace;
 } CBMDefinition;
 
 /* Argument captured from a call expression */

@@ -273,6 +273,7 @@ static void cr_walk_def(cr_ctx_t *c, CBMDefinition *d) {
     cr_str(c, &d->structural_profile);
     cr_str(c, &d->body_tokens);
     cr_str(c, &d->impl_trait);
+    cr_str(c, &d->decl_namespace);
 }
 
 static void cr_walk_call(cr_ctx_t *c, CBMCall *call) {

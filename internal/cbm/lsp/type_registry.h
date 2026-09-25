@@ -64,6 +64,12 @@ typedef struct {
     const CBMType *index_value_type; // V or NULL
     // Generic constraints, parallel to type_param_names. NULL or shorter array means "any".
     const CBMType **type_param_constraints; // NULL-terminated, parallel to type_param_names
+
+    // --- C#-specific (NULL for every other language) ---
+    // Declared namespace of a TOP-LEVEL project type. Graph QNs are path-derived,
+    // so this is the only way to bind a short name through `using` directives and
+    // enclosing namespaces (#2120). NULL for nested types and unknown namespaces.
+    const char *namespace_qn;
 } CBMRegisteredType;
 
 // Hash-table bucket entry. Chains collisions via next-index list for overload sets.
