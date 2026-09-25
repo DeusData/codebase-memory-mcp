@@ -862,6 +862,43 @@ TEST(dart_class) {
     PASS();
 }
 
+/* --- Dart extension members (#1457) --- */
+TEST(dart_extension_members) {
+    CBMFileResult *r =
+        extract("class Holder {\n  final int value;\n  const Holder(this.value);\n}\n\n"
+                "extension HolderMath on Holder {\n  int doubled() => value + value;\n"
+                "  int tripled() => value + value + value;\n"
+                "  String describeHolder() => 'holder';\n}\n\n"
+                "int topLevelHelper(int x) => x + 1;\n",
+                CBM_LANG_DART, "t", "a.dart");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "Holder"));
+    ASSERT(has_def(r, "Function", "topLevelHelper"));
+    ASSERT(has_def(r, "Class", "HolderMath"));
+    ASSERT(has_def(r, "Method", "doubled"));
+    ASSERT(has_def(r, "Method", "tripled"));
+    ASSERT(has_def(r, "Method", "describeHolder"));
+    /* Members hang off the extension (DEFINES_METHOD source), not the file. */
+    for (int i = 0; i < r->defs.count; i++) {
+        const CBMDefinition *d = &r->defs.items[i];
+        if (d->name && strcmp(d->name, "doubled") == 0) {
+            ASSERT_NOT_NULL(d->parent_class);
+            ASSERT_STR_EQ(d->parent_class, "t.a.HolderMath");
+        }
+    }
+    cbm_free_result(r);
+
+    /* Unnamed extension: its members are still indexed. */
+    r = extract("extension on String {\n  bool isShout() => this == toUpperCase();\n}\n",
+                CBM_LANG_DART, "t", "b.dart");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def_any(r, "isShout"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Groovy --- */
 TEST(groovy_class) {
     CBMFileResult *r =
@@ -8356,6 +8393,7 @@ SUITE(extraction) {
     RUN_TEST(scala_function);
     RUN_TEST(scala_class);
     RUN_TEST(dart_class);
+    RUN_TEST(dart_extension_members);
     RUN_TEST(groovy_class);
 
     /* Systems */
