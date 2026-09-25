@@ -87,6 +87,7 @@ Current keys:
 |---|---|---|
 | `auto_index` | `false` | Automatically index new projects when an MCP session starts. |
 | `auto_index_limit` | `50000` | Maximum file count allowed for automatic indexing of a new project. |
+| `ignore_worktrees` | `false` | Skip linked git worktrees (`git worktree add`) when indexing automatically. |
 | `auto_watch` | `true` | Register the session's project with the background git watcher on connect. Set `false` to keep a session from registering its project (the watcher still runs for other projects). |
 | `watcher_enabled` | `true` | Master switch for the background watcher subsystem. Set `false` to stop the watcher from starting at all — no poll thread and no project registration. Reindex manually with `index_repository` when disabled. |
 | `index_max_files` | `off` | Optional maximum number of accepted source files in one discovery run. |
@@ -125,6 +126,35 @@ Equality is allowed; exceeding either setting fails the complete index request
 and preserves any previously serving database. See
 [Index resource limits](INDEX_RESOURCE_LIMITS.md) for counting, validation, and
 error-response details.
+
+### `ignore_worktrees`
+
+Every indexed project is registered under its own absolute root path, so each
+linked worktree becomes a separate permanent index. On machines that create many
+short-lived worktrees, the automatic paths (`auto_index`, and the session hook's
+"index this project first" guidance) turn every throwaway checkout into another
+stored index of what is largely the same repository.
+
+Enable the key to keep those checkouts out of the index:
+
+```bash
+codebase-memory-mcp config set ignore_worktrees true
+```
+
+With it enabled:
+
+- automatic indexing skips a session whose root is a linked worktree;
+- the `hook-augment` context says the worktree is unindexed on purpose instead
+  of telling the agent to run `index_repository`;
+- an explicit `index_repository` call on a linked worktree is refused, and names
+  both ways forward — pass `index_worktree=true` for that one call, or turn the
+  key back off.
+
+The main checkout of the same repository is unaffected, as are ordinary clones
+and submodules. Detection is git plumbing only: a linked worktree's `.git` is a
+file pointing at a gitdir that contains a `commondir` entry.
+
+The default is `false`, so indexing behavior is unchanged unless you opt in.
 
 ## 3. UI Settings
 
