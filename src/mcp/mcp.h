@@ -56,6 +56,22 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message);
 /* Format an MCP tool result with text content. Returns heap-allocated JSON. */
 char *cbm_mcp_text_result(const char *text, bool is_error);
 
+/* Attach a notice to a complete MCP tool result: a JSON-object payload gains a
+ * "notice" key (content text and structuredContent stay in step), a text
+ * payload gains a trailing paragraph. Takes
+ * ownership of result and returns the rewritten result, or result unchanged
+ * when it is not a tool-result object (never NULL for a non-NULL result). */
+char *cbm_mcp_tool_result_add_notice(char *result, const char *notice);
+
+/* #2144: the advice every cut-short synchronous index_repository surfaces. A
+ * long index can outlive a client's per-call deadline; the async flag lets the
+ * daemon finish it while the client polls. */
+#define CBM_MCP_INDEX_ASYNC_HINT                                                         \
+    "Long indexes can exceed an MCP client's per-call deadline: retry with "             \
+    "index_repository(repo_path=..., async: true), then poll "                           \
+    "index_repository(repo_path=..., status: true) until state is succeeded, failed or " \
+    "cancelled."
+
 /* Return true when notifications/cancelled params target the active request. */
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
                                     const char *active_id_str);
@@ -128,9 +144,17 @@ bool cbm_mcp_tool_profile_allows_http(cbm_mcp_tool_profile_t profile);
  * already authorized against this session; args_json contains that canonical
  * path plus all caller options. The callback returns a complete malloc-owned
  * MCP tool result. A NULL result is reported as an error and never degrades to
- * an uncoordinated in-process index. */
+ * an uncoordinated in-process index. async (#2144) asks the executor to start
+ * or join the project's job and return at once; the job must then outlive the
+ * request and its session. */
 typedef char *(*cbm_mcp_index_executor_fn)(void *context, const char *repo_path,
-                                           const char *args_json);
+                                           const char *args_json, bool async);
+
+/* Optional daemon-owned index job status (#2144): the state of the running or
+ * most recent index job for one project key. Returns a malloc-owned tool
+ * result. Servers without one (in-process CLI workers, embedders) refuse
+ * index_repository's async and status modes. */
+typedef char *(*cbm_mcp_index_status_fn)(void *context, const char *project);
 
 /* Daemon-owned exclusive lease for operations that mutate a published project
  * database. begin may wait, but must remain cancellable by its session owner;
@@ -179,6 +203,9 @@ void cbm_mcp_server_set_background_tasks(cbm_mcp_server_t *srv, bool enabled);
 
 void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_executor_fn executor,
                                        void *context);
+
+void cbm_mcp_server_set_index_status_provider(cbm_mcp_server_t *srv,
+                                              cbm_mcp_index_status_fn provider, void *context);
 
 /* Relay supervised worker logs to one local request (for CLI progress). The
  * callback/context are borrowed until the synchronous tool call returns. */

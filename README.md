@@ -669,11 +669,38 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 | Tool | Description |
 |------|-------------|
-| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. |
+| `index_repository` | Index a repository into the graph. Auto-sync keeps it fresh after that. Waits for the whole index by default; pass `async: true` to start it in the daemon and return at once, then poll with `status: true` (see below). |
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
 | `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
+
+**Long indexes and client call deadlines.** A synchronous `index_repository` on a large
+repository can take longer than an MCP client allows one tool call (some IDE clients give up
+after a fixed deadline). When a client cancels or disconnects, the daemon cancels an index that
+nobody else is waiting for, so retrying the same blocking call never finishes. Use the async
+mode instead:
+
+1. `index_repository(repo_path="/abs/path", async: true)` starts the index in the daemon (or
+   joins the one already running for that project) and returns immediately with
+   `state` (`queued`/`running`). The job keeps running even if the client cancels, times out or
+   disconnects; only stopping the daemon ends it.
+2. `index_repository(repo_path="/abs/path", status: true)` reports `state`
+   (`queued`, `running`, `cancelling`, `succeeded`, `failed`, `cancelled`), `started_at`,
+   `finished_at` and an `error` summary. Poll it until the state is `succeeded`, `failed` or
+   `cancelled`. Pass the same `repo_path` (and `name`, if the index call used one).
+
+`async` and `status` are exclusive; `async` does not apply to `cross-repo-intelligence`. Both
+need the daemon-backed server (the default `codebase-memory-mcp` entry point). A temporary
+daemon (started on demand rather than by `codebase-memory-mcp daemon start`) stops, and
+cancels its jobs, when its last client disconnects. A connected MCP session keeps it alive, so
+async from your editor works. A one-shot `codebase-memory-mcp cli index_repository --async`
+that is the daemon's only client is refused with a clear error, because the job would die the
+moment the command exits: run `codebase-memory-mcp daemon start` first, keep an MCP session
+open, or call without `--async`. `status` works everywhere. When a synchronous call was cut
+short, the next
+`index_repository` or `status` call for that project carries a `notice` suggesting the async
+mode. `index_status` keeps describing the published graph and its freshness.
 
 ### Querying
 
@@ -799,6 +826,7 @@ SQLite databases stored at `~/.cache/codebase-memory-mcp/`. Persists across rest
 |---------|-----|
 | `/mcp` doesn't show the server | Check `.mcp.json` path is absolute. Restart agent. Test: `echo '{}' \| /path/to/binary` should output JSON. |
 | `index_repository` fails | Pass absolute path: `index_repository(repo_path="/absolute/path")` |
+| `index_repository` times out in the client | Start it with `async: true`, then poll with `status: true` (see [Indexing](#indexing)). |
 | `trace_path` returns 0 results | Use `search_graph(name_pattern=".*PartialName.*")` first to find the exact name. |
 | Queries return wrong project results | Add `project="name"` parameter. Use `list_projects` to see names. |
 | Binary not found after install | Add to PATH: `export PATH="$HOME/.local/bin:$PATH"` |
