@@ -74,6 +74,8 @@ static char *cs_node_text_cached(CSLSPContext *ctx, TSNode node);
 static const CBMType *cs_unwrap_task(CSLSPContext *ctx, const CBMType *t);
 static const CBMType *cs_unwrap_nullable(const CBMType *t);
 static const char *cs_resolve_callable_value(CSLSPContext *ctx, TSNode node, TSNode *callable_leaf);
+static const char *cs_top_level_namespace(const char *type_qn, const char *short_name,
+                                          const char *module_qn, const char *namespace_name);
 
 /* ── small helpers ──────────────────────────────────────────────── */
 
@@ -356,6 +358,72 @@ static const char *cs_try_type_qn(CSLSPContext *ctx, const char *qn) {
     return NULL;
 }
 
+/* Namespaces through which `qualifier` (the part of a type reference before
+ * its simple name, NULL for a simple name) can reach a top-level type, in C#
+ * lookup order: each enclosing namespace innermost outward, then the global
+ * namespace (qualified references only) or the file's `using` namespaces
+ * (simple names only -- a using-namespace directive does not import nested
+ * namespaces). Returns the count written to `out` (at most `cap`). */
+static int cs_visible_namespaces(CSLSPContext *ctx, const char *qualifier, const char **out,
+                                 int cap) {
+    int n = 0;
+    const char *ns = ctx->namespace_count > 0 ? cs_namespace_qn(ctx) : NULL;
+    while (ns && *ns && n < cap) {
+        out[n++] = qualifier ? cbm_arena_sprintf(ctx->arena, "%s.%s", ns, qualifier) : ns;
+        const char *dot = strrchr(ns, '.');
+        ns = dot ? cbm_arena_strndup(ctx->arena, ns, (size_t)(dot - ns)) : NULL;
+    }
+    if (qualifier) {
+        if (n < cap)
+            out[n++] = qualifier;
+        return n;
+    }
+    for (int i = 0; i < ctx->using_count && n < cap; i++) {
+        const CBMCSUsing *u = &ctx->usings[i];
+        if (u->kind == CBM_CS_USING_NAMESPACE && u->target_qn && u->target_qn[0])
+            out[n++] = u->target_qn;
+    }
+    return n;
+}
+
+/* Bind a (possibly namespace-qualified) type reference to the project type
+ * whose DECLARED namespace the current file can see, preferring the earliest
+ * namespace in C# lookup order; equal ranks keep registration order. NULL when
+ * no top-level type with that simple name is visible (#2120). */
+static const char *cs_resolve_by_declared_namespace(CSLSPContext *ctx, const char *name) {
+    if (!ctx->registry || !name || !*name)
+        return NULL;
+    const char *simple = cs_short_name(name);
+    if (!simple || !*simple)
+        return NULL;
+    const char *qualifier =
+        simple > name ? cbm_arena_strndup(ctx->arena, name, (size_t)(simple - name - 1)) : NULL;
+    enum { CS_VISIBLE_NS_MAX = 128 };
+    const char *visible[CS_VISIBLE_NS_MAX];
+    int visible_count = cs_visible_namespaces(ctx, qualifier, visible, CS_VISIBLE_NS_MAX);
+    if (visible_count == 0)
+        return NULL;
+
+    const CBMRegisteredType *best = NULL;
+    int best_rank = visible_count;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, simple, &it);
+    int i;
+    while ((i = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType *cand = &it.reg->types[i];
+        if (!cand->namespace_qn || !cand->short_name || strcmp(cand->short_name, simple) != 0)
+            continue;
+        for (int r = 0; r < best_rank; r++) {
+            if (strcmp(cand->namespace_qn, visible[r]) == 0) {
+                best = cand;
+                best_rank = r;
+                break;
+            }
+        }
+    }
+    return best ? best->qualified_name : NULL;
+}
+
 /* Returns a fully-qualified type name resolved against:
  *   1. predefined alias (int -> System.Int32)
  *   2. type-parameter substitution map
@@ -365,7 +433,9 @@ static const char *cs_try_type_qn(CSLSPContext *ctx, const char *qn) {
  *   6. module-prefixed (file-local QN that the unified extractor produced)
  *   7. each `using namespace X` prefix
  *   8. each `using A = X` alias substitution
- *   9. fall back to bare name (registry will fail; pipeline drops the call)
+ *   8b. declared namespace of a top-level project type (enclosing namespaces,
+ *       then `using` namespaces)
+ *   9. short-name fallback, then the bare name (registry miss drops the call)
  */
 const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
     if (!raw || !*raw)
@@ -457,6 +527,11 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
                 char *target_bare = cs_strip_generic_args(ctx->arena, u->target_qn);
                 if (target_bare && cs_lookup_type_qn(ctx, target_bare))
                     return target_bare;
+                /* A project type is registered under its path-derived QN, so
+                 * `using A = Ns.Type;` binds through the declared namespace. */
+                const char *declared = cs_resolve_by_declared_namespace(ctx, target_bare);
+                if (declared)
+                    return declared;
                 return cbm_arena_strdup(ctx->arena, u->target_qn);
             }
             if (bare[alias_len] == '.') {
@@ -468,6 +543,15 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
                     return try_qn;
             }
         }
+    }
+
+    /* 8b. Declared-namespace binding for project types (#2120): their QNs are
+     * path-derived, so steps 5 and 7 cannot hit them; bind by the namespace
+     * each top-level type declares, in C# lookup order. */
+    {
+        const char *declared = cs_resolve_by_declared_namespace(ctx, bare);
+        if (declared)
+            return declared;
     }
 
     /* 9. Short-name fallback: scan the registry for any type whose
@@ -525,6 +609,28 @@ const char *cs_resolve_type_name(CSLSPContext *ctx, const char *raw) {
     return bare;
 }
 
+/* Other top-level declarations of the type `t` names: same simple name, same
+ * declared namespace, different entry. Registration order; at most `cap`. */
+static int cs_namespace_twins(CSLSPContext *ctx, const CBMRegisteredType *t,
+                              const CBMRegisteredType **out, int cap) {
+    if (!ctx->registry || !t || !t->namespace_qn || !t->short_name)
+        return 0;
+    int n = 0;
+    CBMTypeShortIter it;
+    cbm_registry_types_by_short_name_chain(ctx->registry, t->short_name, &it);
+    int i;
+    while (n < cap && (i = cbm_type_short_iter_next(&it)) >= 0) {
+        const CBMRegisteredType *c = &it.reg->types[i];
+        if (!c->namespace_qn || !c->short_name || !c->qualified_name ||
+            strcmp(c->short_name, t->short_name) != 0 ||
+            strcmp(c->namespace_qn, t->namespace_qn) != 0 ||
+            strcmp(c->qualified_name, t->qualified_name) == 0)
+            continue;
+        out[n++] = c;
+    }
+    return n;
+}
+
 /* Look up a method on a type, walking inheritance chain. */
 const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn,
                                           const char *method_name) {
@@ -535,19 +641,34 @@ const CBMRegisteredFunc *cs_lookup_method(CSLSPContext *ctx, const char *type_qn
     if (f)
         return f;
 
-    /* Walk inheritance chain (base + interfaces + transitive bases). */
     const CBMRegisteredType *t = cs_lookup_type_qn(ctx, type_qn);
     if (!t)
         return NULL;
 
+    /* The other declarations of this same type -- `partial` pieces in other
+     * files, reference-assembly copies -- are separate registry entries
+     * (path-derived QNs) but one C# type: a member declared on any of them is
+     * a member of this one, and so is a base declared on any of them. */
+    const CBMRegisteredType *twins[CS_LSP_PARENT_WALK_MAX] = {0};
+    int twin_count = cs_namespace_twins(ctx, t, twins, CS_LSP_PARENT_WALK_MAX);
+    for (int k = 0; k < twin_count; k++) {
+        f = cbm_registry_lookup_method(ctx->registry, twins[k]->qualified_name, method_name);
+        if (f)
+            return f;
+    }
+
+    /* Walk inheritance chain (base + interfaces + transitive bases). */
     const char *visited[CS_LSP_PARENT_WALK_MAX];
     int visited_count = 0;
     const char *frontier[CS_LSP_PARENT_WALK_MAX];
     int frontier_count = 0;
 
-    if (t->embedded_types) {
-        for (int i = 0; t->embedded_types[i] && frontier_count < CS_LSP_PARENT_WALK_MAX; i++) {
-            frontier[frontier_count++] = t->embedded_types[i];
+    for (int k = -1; k < twin_count; k++) {
+        const CBMRegisteredType *decl = k < 0 ? t : twins[k];
+        for (int i = 0; decl->embedded_types && decl->embedded_types[i] &&
+                        frontier_count < CS_LSP_PARENT_WALK_MAX;
+             i++) {
+            frontier[frontier_count++] = decl->embedded_types[i];
         }
     }
 
@@ -3469,6 +3590,8 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->name;
+            rt.namespace_qn =
+                cs_top_level_namespace(d->qualified_name, d->name, module_qn, d->decl_namespace);
             rt.is_interface = (strcmp(d->label, "Interface") == 0);
             if (d->base_classes) {
                 int bc = 0;
@@ -3620,6 +3743,21 @@ void cbm_run_cs_lsp(CBMArena *arena, CBMFileResult *result, const char *source, 
 
 /* ── cross-file entry ───────────────────────────────────────────── */
 
+/* The type's declared `namespace_name` when `type_qn` is a TOP-LEVEL type of
+ * the file whose module QN is `module_qn` (top-level C# type QNs are exactly
+ * module.Name; nested ones are module.Outer.Name and stay NULL, since a nested
+ * type is not reachable by its simple name through a namespace). */
+static const char *cs_top_level_namespace(const char *type_qn, const char *short_name,
+                                          const char *module_qn, const char *namespace_name) {
+    if (!type_qn || !short_name || !module_qn || !namespace_name || !namespace_name[0])
+        return NULL;
+    size_t mlen = strlen(module_qn);
+    if (strncmp(type_qn, module_qn, mlen) != 0 || type_qn[mlen] != '.' ||
+        strcmp(type_qn + mlen + 1, short_name) != 0)
+        return NULL;
+    return namespace_name;
+}
+
 /* Register one batch of CBMLSPDef[] into a registry. Shared by the
  * per-file cross-LSP path and the Tier 2 pre-built registry builder.
  * Def-driven (no per-file AST mutation) so deterministic per def set. */
@@ -3636,6 +3774,8 @@ static void cs_register_lsp_defs(CBMArena *arena, CBMTypeRegistry *reg, CBMLSPDe
             memset(&rt, 0, sizeof(rt));
             rt.qualified_name = d->qualified_name;
             rt.short_name = d->short_name;
+            rt.namespace_qn = cs_top_level_namespace(d->qualified_name, d->short_name,
+                                                     d->def_module_qn, d->namespace_name);
             rt.is_interface = d->is_interface || (strcmp(d->label, "Interface") == 0);
             if (d->embedded_types && *d->embedded_types) {
                 /* Parse "|"-separated list. */

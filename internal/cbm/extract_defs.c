@@ -4418,6 +4418,58 @@ static bool extract_sql_ddl_class_def(CBMExtractCtx *ctx, TSNode node, const cha
     return true;
 }
 
+/* Name of a C# namespace declaration node (block or file-scoped), or NULL. */
+static const char *cs_namespace_decl_name(CBMArena *a, TSNode ns, const char *source) {
+    TSNode nm = ts_node_child_by_field_name(ns, TS_FIELD("name"));
+    if (ts_node_is_null(nm)) {
+        return NULL;
+    }
+    const char *text = cbm_node_text(a, nm, source);
+    return text && text[0] ? text : NULL;
+}
+
+/* Declared namespace of a C# type declaration: every enclosing namespace
+ * block (outer to inner) under an optional file-scoped namespace, which the
+ * grammar may attach either as an ancestor or as a preceding sibling of the
+ * compilation unit's members. NULL = global namespace. The file-level
+ * namespace_name keeps only the FIRST namespace of a file, which mislabels
+ * every type of a multi-namespace file (#2120). */
+static const char *cs_type_decl_namespace(CBMArena *a, TSNode node, const char *source) {
+    const char *acc = NULL;
+    bool file_scoped = false;
+    TSNode top = node;
+    for (TSNode cur = ts_node_parent(node); !ts_node_is_null(cur); cur = ts_node_parent(cur)) {
+        const char *k = ts_node_type(cur);
+        bool is_file_scoped = strcmp(k, "file_scoped_namespace_declaration") == 0;
+        if (is_file_scoped || strcmp(k, "namespace_declaration") == 0) {
+            const char *name = cs_namespace_decl_name(a, cur, source);
+            if (name) {
+                acc = acc ? cbm_arena_sprintf(a, "%s.%s", name, acc) : name;
+            }
+            file_scoped = file_scoped || is_file_scoped;
+        }
+        top = cur;
+    }
+    if (file_scoped) {
+        return acc;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t n = ts_node_named_child_count(top);
+    for (uint32_t i = 0; i < n; i++) {
+        TSNode c = ts_node_named_child(top, i);
+        if (ts_node_start_byte(c) >= start) {
+            break;
+        }
+        if (strcmp(ts_node_type(c), "file_scoped_namespace_declaration") == 0) {
+            const char *name = cs_namespace_decl_name(a, c, source);
+            if (name) {
+                return acc ? cbm_arena_sprintf(a, "%s.%s", name, acc) : name;
+            }
+        }
+    }
+    return acc;
+}
+
 static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec *spec) {
     CBMArena *a = ctx->arena;
     const char *kind = ts_node_type(node);
@@ -4785,6 +4837,9 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
+    if (ctx->language == CBM_LANG_CSHARP && !ctx->enclosing_class_qn) {
+        def.decl_namespace = cs_type_decl_namespace(a, node, ctx->source);
+    }
     def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
