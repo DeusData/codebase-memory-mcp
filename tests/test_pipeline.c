@@ -6266,6 +6266,56 @@ TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges) {
     PASS();
 }
 
+/* FastAPI/Starlette WebSocket route registration (distilled from #1245). The
+ * route-registration suffix table knew `.add_api_websocket_route` but not the
+ * decorator forms `.websocket` / `.websocket_route`, so a WebSocket endpoint
+ * registered via `@router.websocket('/ws')` produced no Route node at all —
+ * the endpoint was invisible to the graph. `@app.get('/health')` is the
+ * positive control (already a route suffix). Fewer than 50 files exercises
+ * pass_calls.c; the same suffix table drives the parallel resolver. */
+TEST(pipeline_python_websocket_decorators_register_routes) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_py_ws_routes_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+
+    write_temp_file(tmp, "app.py",
+                    "from fastapi import APIRouter, FastAPI, WebSocket\n\n"
+                    "app = FastAPI()\n"
+                    "router = APIRouter()\n\n"
+                    "@app.get('/health')\n"
+                    "def health():\n"
+                    "    return {'ok': True}\n\n"
+                    "@router.websocket('/ws')\n"
+                    "async def ws_endpoint(websocket: WebSocket):\n"
+                    "    await websocket.accept()\n\n"
+                    "@app.websocket_route('/events')\n"
+                    "async def events_endpoint(websocket: WebSocket):\n"
+                    "    await websocket.accept()\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/py_ws.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* Positive control: the HTTP decorator mints its Route node. */
+    ASSERT_GTE(count_nodes_named(s, project, "/health"), 1);
+    /* The two WebSocket decorator forms must mint Route nodes too. */
+    ASSERT_GTE(count_nodes_named(s, project, "/ws"), 1);
+    ASSERT_GTE(count_nodes_named(s, project, "/events"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Python bare-call local-binding suppression, sequential path. The bare-call
  * counterpart of the receiver guard above: `run` is a PARAMETER, so `run()`
  * cannot be the module-level `run` and must not bind SatoriLive.run.
@@ -15154,6 +15204,7 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
+    RUN_TEST(pipeline_python_websocket_decorators_register_routes);
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);

@@ -572,6 +572,11 @@ static const method_suffix_t route_reg_suffixes[] = {
     {".add_route", "ANY"},
     {".add_api_route", "ANY"},
     {".add_api_websocket_route", "ANY"},
+    /* FastAPI/Starlette WebSocket decorators (`@router.websocket('/ws')`,
+     * `@app.websocket_route('/events')`): not an HTTP verb, so ANY — mirrors
+     * .add_api_websocket_route above (#1245). */
+    {".websocket", "ANY"},
+    {".websocket_route", "ANY"},
     {NULL, NULL},
 };
 
