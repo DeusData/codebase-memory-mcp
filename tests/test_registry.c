@@ -6,6 +6,7 @@
  */
 #include "test_framework.h"
 #include "pipeline/pipeline.h"
+#include "pipeline/pipeline_internal.h" /* cbm_python_import_binding_contradicts (#2127) */
 
 #include <stdlib.h>
 #include <string.h>
@@ -1113,6 +1114,72 @@ TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies) {
     PASS();
 }
 
+/* #2127: the import-binding guard drops only weak strategies, and only when the
+ * caller established that the file's import contradicts the target. */
+TEST(import_binding_suppress_drops_only_weak_contradicted_calls) {
+    ASSERT_TRUE(cbm_suppress_weak_import_bound_call(true, true, "unique_name"));
+    ASSERT_TRUE(cbm_suppress_weak_import_bound_call(true, true, "suffix_match"));
+    ASSERT_TRUE(cbm_suppress_weak_import_bound_call(true, true, "fuzzy"));
+    ASSERT_FALSE(cbm_suppress_weak_import_bound_call(true, false, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_import_bound_call(false, true, "unique_name"));
+    ASSERT_FALSE(cbm_suppress_weak_import_bound_call(true, true, "import_map"));
+    ASSERT_FALSE(cbm_suppress_weak_import_bound_call(true, true, "same_module"));
+    ASSERT_FALSE(cbm_suppress_weak_import_bound_call(true, true, "lsp_py_method"));
+    ASSERT_FALSE(cbm_suppress_weak_import_bound_call(true, true, NULL));
+    PASS();
+}
+
+/* #2127: when does a Python import binding contradict a resolved target? */
+TEST(python_import_binding_contradicts_only_foreign_chains) {
+    CBMImport items[] = {
+        {.local_name = "patch", .module_path = "unittest.mock.patch"},
+        {.local_name = "f", .module_path = "pkg.f"},
+        {.local_name = "app", .module_path = "app.util"},
+        {.local_name = "h", .module_path = "app.util.helper"},
+        {.local_name = "rel", .module_path = ".views.rel"},
+        {.local_name = "mock", .module_path = "unittest.mock"},
+        {.local_name = "Author", .module_path = ".models.Author"},
+        {.local_name = "copy", .module_path = "copy.copy"},
+    };
+    CBMImportArray imps = {.items = items, .count = 8, .cap = 8};
+    /* `from copy import copy` is a from-import (leaf == local), not a root
+     * package import: its chain `copy` must appear in the target. */
+    ASSERT_TRUE(cbm_python_import_binding_contradicts(
+        &imps, "copy", "proj.forms.utils.ErrorList.copy", NULL, NULL, NULL));
+    /* Member call through an external module import: foreign → dropped. */
+    ASSERT_TRUE(cbm_python_import_binding_contradicts(
+        &imps, "mock.patch", "proj.views.generic.RedirectView.patch", NULL, NULL, NULL));
+    /* Member reached THROUGH an imported class may live on any type: only the
+     * import's own chain (`models`) is compared, so the manager call stays. */
+    ASSERT_FALSE(cbm_python_import_binding_contradicts(
+        &imps, "Author.objects.create", "proj.db.models.query.QuerySet.create", NULL, NULL, NULL));
+    /* The report: external mock.patch must not be a project REST handler. */
+    ASSERT_TRUE(cbm_python_import_binding_contradicts(
+        &imps, "patch", "proj.app.views.PkgConfigView.patch", NULL, NULL, NULL));
+    /* Re-export / src layout: the chain `pkg` is present → keep. */
+    ASSERT_FALSE(
+        cbm_python_import_binding_contradicts(&imps, "f", "proj.src.pkg.core.f", NULL, NULL, NULL));
+    /* `import app.util` binds the root package; the callee spells its path. */
+    ASSERT_FALSE(cbm_python_import_binding_contradicts(&imps, "app.util.helper",
+                                                       "proj.app.util.helper", NULL, NULL, NULL));
+    /* Aliased from-import: consistent target kept, foreign target dropped. */
+    ASSERT_FALSE(cbm_python_import_binding_contradicts(&imps, "h", "proj.app.util.helper", NULL,
+                                                       NULL, NULL));
+    ASSERT_TRUE(
+        cbm_python_import_binding_contradicts(&imps, "h", "proj.other.helper", NULL, NULL, NULL));
+    /* Relative import: leading dots carry no segment; `views` must appear. */
+    ASSERT_FALSE(cbm_python_import_binding_contradicts(&imps, "rel", "proj.app.views.rel", NULL,
+                                                       NULL, NULL));
+    ASSERT_TRUE(cbm_python_import_binding_contradicts(&imps, "rel", "proj.app.models.rel", NULL,
+                                                      NULL, NULL));
+    /* Not import-bound → never a contradiction (the recall pin). */
+    ASSERT_FALSE(
+        cbm_python_import_binding_contradicts(&imps, "helper", "proj.x.helper", NULL, NULL, NULL));
+    ASSERT_FALSE(
+        cbm_python_import_binding_contradicts(NULL, "patch", "proj.x.patch", NULL, NULL, NULL));
+    PASS();
+}
+
 TEST(weak_call_guards_share_one_drop_list) {
     /* The member guard and the local-binding guard must agree on what "weak"
      * means. They share a single static predicate for exactly this reason; if
@@ -1250,5 +1317,7 @@ SUITE(registry) {
     RUN_TEST(weak_member_unique_name_exempt_is_python_self_rooted_unique_and_specific_only);
     RUN_TEST(local_binding_suppress_drops_weak_shadowed_bare_calls);
     RUN_TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies);
+    RUN_TEST(import_binding_suppress_drops_only_weak_contradicted_calls);
+    RUN_TEST(python_import_binding_contradicts_only_foreign_chains);
     RUN_TEST(weak_call_guards_share_one_drop_list);
 }

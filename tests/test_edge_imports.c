@@ -645,6 +645,113 @@ TEST(ei_go_import_never_binds_symbol) {
     PASS();
 }
 
+/* #2127 helper: inbound edges of `edge_type` onto the (single) node named
+ * `name` with label `label`; -1 when that node is missing. */
+static int ei_inbound_edges_on(cbm_store_t *store, const char *project, const char *name,
+                               const char *label, const char *edge_type) {
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, name, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int64_t id = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, label) == 0) {
+            id = nodes[i].id;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    if (id == 0) {
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_target_type(store, id, edge_type, &edges, &n) != CBM_STORE_OK) {
+        return -1;
+    }
+    cbm_store_free_edges(edges, n);
+    return n;
+}
+
+/* #2127: `from unittest.mock import patch` names an EXTERNAL module. Strategy
+ * 1 cannot resolve it, and Strategy 3's symbol-name fallback bound the import
+ * to the only project definition named `patch` — an unrelated REST view's
+ * HTTP handler — so every patch(...) call became an import_map CALLS edge at
+ * confidence 0.95 (and, once the import edge is gone, a unique_name edge; the
+ * member form `mock.patch(...)` a suffix_match edge). A Python import path
+ * names its module chain, so a symbol hit whose QN does not contain the chain
+ * of an EXTERNAL import is not the imported thing. The true project import
+ * (`from app.util import helper`) must keep both its IMPORTS and its CALLS
+ * edge. `pad` > MIN_FILES_FOR_PARALLEL(50) runs the
+ * same fixture through the parallel pipeline, so both drivers are covered. */
+static int ei_py_external_import_case(int pad) {
+    enum { EI_2127_BASE = 5, EI_2127_MAX = EI_2127_BASE + 64 };
+    static char names[EI_2127_MAX][32];
+    EILangFile f[EI_2127_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"app/views.py", "class PkgConfigView:\n"
+                                          "    def get(self, request):\n        return 1\n\n"
+                                          "    def patch(self, request):\n        return 2\n\n"
+                                          "    def copy(self):\n        return 3\n"};
+    f[n++] = (EILangFile){"app/util.py", "def helper():\n    return 1\n"};
+    /* Recall pin: a PROJECT module re-exporting a name defined elsewhere
+     * (`app.base` re-exports `app.errors.BoomError`) is an internal import;
+     * its weak resolution is never judged by the #2127 guard. */
+    f[n++] = (EILangFile){"app/errors.py", "class BoomError(Exception):\n    pass\n"};
+    f[n++] = (EILangFile){"app/base.py", "from app.errors import BoomError\n"};
+    f[n++] = (EILangFile){"tests/test_views.py", "import copy\n"
+                                                 "from unittest import mock\n"
+                                                 "from unittest.mock import patch\n"
+                                                 "from app.base import BoomError\n"
+                                                 "from app.util import helper\n\n\n"
+                                                 "def test_something():\n"
+                                                 "    mock.patch(\"app.views.other\")\n"
+                                                 "    copy.copy(helper)\n"
+                                                 "    if helper() > 1:\n"
+                                                 "        raise BoomError()\n"
+                                                 "    with patch(\"app.views.thing\"):\n"
+                                                 "        return helper()\n"};
+    for (int i = 0; i < pad && n < EI_2127_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int bad_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "patch", "Method", "IMPORTS") : -1;
+    int bad_calls = store ? ei_inbound_edges_on(store, lp.project, "patch", "Method", "CALLS") : -1;
+    /* `import copy` (a plain module import of stdlib `copy`) is no project
+     * method: neither the import nor `copy.copy(...)` may bind it. */
+    bad_imports += store ? ei_inbound_edges_on(store, lp.project, "copy", "Method", "IMPORTS") : 0;
+    bad_calls += store ? ei_inbound_edges_on(store, lp.project, "copy", "Method", "CALLS") : 0;
+    int good_imports =
+        store ? ei_inbound_edges_on(store, lp.project, "helper", "Function", "IMPORTS") : -1;
+    int good_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "helper", "Function", "CALLS") : -1;
+    int reexport_calls =
+        store ? ei_inbound_edges_on(store, lp.project, "BoomError", "Class", "CALLS") : -1;
+    int ok = bad_imports == 0 && bad_calls == 0 && good_imports >= 1 && good_calls >= 1 &&
+             reexport_calls >= 1;
+    if (!ok) {
+        fprintf(stderr,
+                "  [#2127 pad=%d] PkgConfigView.patch+copy IMPORTS=%d CALLS=%d (want 0/0); "
+                "helper IMPORTS=%d CALLS=%d (want >=1/>=1); BoomError CALLS=%d (want >=1)\n",
+                pad, bad_imports, bad_calls, good_imports, good_calls, reexport_calls);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_py_external_import_never_binds_project_symbol) {
+    /* Both legs run before asserting so a failure diagnoses both drivers. */
+    int sequential_ok = ei_py_external_import_case(0);
+    int parallel_ok = ei_py_external_import_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* C++: header include should resolve to the header file node, not the same-stem
  * source node. Also exercises angle-bracket include resolution. */
 TEST(ei_cpp_header_include_targets_header_file) {
@@ -1171,6 +1278,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_blank_import);
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
+    RUN_TEST(ei_py_external_import_never_binds_project_symbol);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */

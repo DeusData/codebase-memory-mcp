@@ -695,6 +695,22 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
     return weak_short_name_strategy(strategy);
 }
 
+/* Import-binding counterpart of the parameter guard above (#2127). An import
+ * binds the identifier for the whole module; when that import is external it
+ * never materializes, and the chain falls through to project-wide short-name
+ * strategies (`from unittest.mock import patch; patch()` -> a REST view's
+ * `PkgConfigView.patch`). The caller decides whether the binding contradicts
+ * the target (cbm_python_import_binding_contradicts: a SCOPE FACT about this
+ * file, not a spelling list); only weak strategies are dropped, so import_map /
+ * same_module / lsp_* edges are untouched. Pure; unit-tested in test_registry.c. */
+bool cbm_suppress_weak_import_bound_call(bool enabled, bool import_binding_contradicts,
+                                         const char *strategy) {
+    if (!enabled || !import_binding_contradicts) {
+        return false;
+    }
+    return weak_short_name_strategy(strategy);
+}
+
 static bool js_ts_family(CBMLanguage lang) {
     return lang == CBM_LANG_JAVASCRIPT || lang == CBM_LANG_TYPESCRIPT || lang == CBM_LANG_TSX ||
            lang == CBM_LANG_ARKTS;

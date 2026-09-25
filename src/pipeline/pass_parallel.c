@@ -2957,7 +2957,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                                  call->receiver_is_self_attribute,
                                                  call->callee_name, res.strategy)) ||
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                                 call->callee_is_locally_bound, res.strategy);
+                                                 call->callee_is_locally_bound, res.strategy) ||
+            /* Import-binding suppression (#2127) — see pass_calls.c; this gate
+             * MUST stay identical to the one there. */
+            (lang == CBM_LANG_PYTHON &&
+             cbm_suppress_weak_import_bound_call(true, true, res.strategy) &&
+             cbm_python_import_binding_contradicts(&result->imports, call->callee_name,
+                                                   res.qualified_name, rc->main_gbuf,
+                                                   rc->project_name, rel));
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve
