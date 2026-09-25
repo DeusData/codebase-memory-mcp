@@ -2895,7 +2895,15 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * semantic candidates are deliberately excluded: they require an
          * exact LSP target and must fail closed rather than accepting a textual
          * registry match. */
-        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution) {
+        /* #2053: a Rust call the LSP placed on an EXTERNAL symbol (std's
+         * Path::join, a seeded crate API) is resolved — it just has no graph
+         * node. The textual registry would bind it to a same-named project
+         * method instead, so it must not run for such a row. Mirrors
+         * pass_calls.c; the service fallbacks below still see the call. */
+        bool rust_external = lsp && cbm_pipeline_rust_external_target(
+                                        lang, lsp->strategy, lsp->callee_qn, rc->project_name);
+        if ((!res.qualified_name || !res.qualified_name[0]) && !call->requires_lsp_resolution &&
+            !rust_external) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
         }
@@ -2989,9 +2997,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                 cbm_resolution_t fake_res = {.qualified_name = call->callee_name,
                                              .confidence = PP_HALF_CONF,
                                              .strategy = "callee_suffix"};
+                /* #2053: an LSP-external Rust call (`map.get(k)` on a std
+                 * HashMap) reaches this branch only because its registry
+                 * fallback was skipped. Without a route path the plain-CALLS
+                 * fall-through would bind source -> source, a fabricated
+                 * self-call, so it keeps only the route/service edges. */
                 emit_service_edge(ws->local_edge_buf, source_node, source_node, call, &fake_res,
                                   module_qn, rc->registry, rc->main_gbuf, imp_keys, imp_vals,
-                                  imp_count, false);
+                                  imp_count, rust_external);
             } else if (cbm_service_pattern_is_global_fetch(call->callee_name)) {
                 /* Native `fetch()` (#856): only the global API once resolution
                  * has failed to find a local/imported `fetch`. Call the low-level

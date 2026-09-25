@@ -544,8 +544,18 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         }
     }
 
-    cbm_resolution_t res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn,
-                                                imp_keys, imp_vals, imp_count);
+    /* #2053: a Rust call the LSP placed on an EXTERNAL symbol (std's
+     * Path::join, a seeded crate API) is resolved — it just has no graph node.
+     * The textual registry would bind it to a same-named project method
+     * instead, so skip it and let the empty-resolution service fallbacks below
+     * classify the call. MUST match pass_parallel.c. */
+    bool rust_external = lsp && cbm_pipeline_rust_external_target(
+                                    lang, lsp->strategy, lsp->callee_qn, ctx->project_name);
+    cbm_resolution_t res = {0};
+    if (!rust_external) {
+        res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
+                                   imp_count);
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,

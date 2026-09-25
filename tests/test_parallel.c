@@ -3121,6 +3121,40 @@ TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges) {
     PASS();
 }
 
+/* #2053 contract for cbm_pipeline_rust_external_target: only a Rust row whose
+ * strategy names a registered target, and whose QN lies outside the project
+ * prefix, counts as external. The end-to-end probes live in test_pipeline.c
+ * (pipeline_rust_std_receiver_never_binds_project_method*). */
+TEST(parallel_rust_external_target_contract) {
+    const char *proj = "proj";
+    /* External: registered std / seeded-crate targets. */
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_deref_dispatch",
+                                                  "std.path.Path.join", proj));
+    ASSERT_TRUE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_constructor",
+                                                  "core.sync.atomic.AtomicUsize.new", proj));
+    /* A prefix that is not a whole segment is still outside the project. */
+    ASSERT_TRUE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "projx.helper", proj));
+    /* Project-prefixed targets keep the registry fallback. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_method_dispatch",
+                                                   "proj.src.lib.EvidenceTier.join", proj));
+    /* Synthesized / non-registered strategies are not evidence. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_prelude_trait",
+                                                   "std.path.PathBuf.clone", proj));
+    ASSERT_FALSE(
+        cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_unresolved", "root.join", proj));
+    /* Per-language: no other language is affected. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_GO, "lsp_method_dispatch",
+                                                   "std.path.Path.join", proj));
+    /* Defensive NULL/empty inputs. */
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, NULL, "std.x", proj));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "std.x", NULL));
+    ASSERT_FALSE(cbm_pipeline_rust_external_target(CBM_LANG_RUST, "lsp_direct", "", proj));
+    PASS();
+}
+
 /* Gate guard for the JVM-only unique-tail fallbacks (lsp_resolve.h).
  *
  * The tail fallbacks join LSP overrides across QN drift by unique
@@ -4426,6 +4460,7 @@ SUITE(parallel) {
     RUN_TEST(parallel_go_cross_package_field_chain_resolves);
     RUN_TEST(parallel_cross_file_reread_preserves_unretained_edges);
     RUN_TEST(parallel_java_kotlin_lsp_override_cross_file_emits_lsp_strategy_edges);
+    RUN_TEST(parallel_rust_external_target_contract);
     RUN_TEST(parallel_lsp_tail_match_fallbacks_gated_to_jvm);
     RUN_TEST(parallel_calls_parity);
     RUN_TEST(parallel_defines_parity);

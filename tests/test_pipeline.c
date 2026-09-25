@@ -5966,6 +5966,111 @@ TEST(pipeline_go_rw_usage_never_cross_into_c_parallel) {
     PASS();
 }
 
+/* Fixture for the #2053 Rust std-receiver probes (sequential and parallel
+ * twins). The Rust LSP types `root: &Path` and dispatches `root.join(..)` to
+ * std's Path::join — a symbol with no graph node. Before the fix the pipeline
+ * then fell back to the textual registry, which bound the call to the only
+ * project method named `join` (EvidenceTier::join, unique_name). The
+ * call-expression receiver (`root.to_path_buf().join(..)`) is the same class
+ * one hop later: it needs to_path_buf's return type and PathBuf's Deref to
+ * Path. POSITIVE tripwires: the typed project call keeps its LSP edge, and a
+ * closure-parameter receiver the LSP cannot type still reaches the registry,
+ * so the fix removes only calls the LSP positively placed outside the
+ * project. `m.get(k)` on a std HashMap guards the parallel route fallback,
+ * which must not turn the skipped call into a self-call. pad_files > 0
+ * crosses the parallel-pipeline threshold. */
+static void write_rust_std_receiver_fixture(const char *tmp, int pad_files) {
+    write_temp_file(tmp, "Cargo.toml",
+                    "[package]\nname = \"stdrecv\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    write_temp_file(tmp, "src/lib.rs",
+                    "use std::collections::HashMap;\n"
+                    "use std::path::{Path, PathBuf};\n"
+                    "\n"
+                    "pub struct EvidenceTier(pub u8);\n"
+                    "impl EvidenceTier {\n"
+                    "    pub fn join(&self, other: &EvidenceTier) -> EvidenceTier {\n"
+                    "        EvidenceTier(self.0.max(other.0))\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    "pub struct Gauge(pub u8);\n"
+                    "impl Gauge {\n"
+                    "    pub fn recalibrate_gauge(&self) -> u8 {\n"
+                    "        self.0\n"
+                    "    }\n"
+                    "}\n"
+                    "\n"
+                    "pub fn real_caller() -> EvidenceTier {\n"
+                    "    EvidenceTier(1).join(&EvidenceTier(2))\n"
+                    "}\n"
+                    "\n"
+                    "pub fn stdlib_receiver(root: &Path) -> PathBuf {\n"
+                    "    root.join(\"subdir\")\n"
+                    "}\n"
+                    "\n"
+                    "pub fn call_expr_receiver(root: &Path) -> PathBuf {\n"
+                    "    root.to_path_buf().join(\"nested\")\n"
+                    "}\n"
+                    "\n"
+                    "pub fn untyped_receiver(gauges: &[Gauge]) -> u8 {\n"
+                    "    gauges.iter().map(|g| g.recalibrate_gauge()).sum()\n"
+                    "}\n"
+                    "\n"
+                    "pub fn std_map_lookup(m: &HashMap<String, u8>, k: &str) -> Option<u8> {\n"
+                    "    m.get(k).copied()\n"
+                    "}\n");
+    for (int i = 0; i < pad_files; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "src/filler%d.rs", i);
+        snprintf(body, sizeof(body), "pub fn filler%d() -> i32 {\n    %d\n}\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+}
+
+static int run_rust_std_receiver_probe(int pad_files, const char *tag) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_rs_%s_XXXXXX", tag);
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_rust_std_receiver_fixture(tmp, pad_files);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/rs_std_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+
+    /* NEGATIVE: std's Path::join / PathBuf::join are not project symbols. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "stdlib_receiver", "join"), 0);
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "call_expr_receiver", "join"), 0);
+    /* NEGATIVE: a std `map.get(k)` with no route path is no self-call (the
+     * parallel empty-resolution route fallback must not bind source->source). */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "std_map_lookup", "std_map_lookup"), 0);
+    /* POSITIVE: the typed project call keeps its edge. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "real_caller", "join"), 1);
+    /* POSITIVE: an untyped receiver still reaches the registry fallback. */
+    ASSERT_EQ(named_edge_count(s, project, "CALLS", "untyped_receiver", "recalibrate_gauge"), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_rust_std_receiver_never_binds_project_method) {
+    return run_rust_std_receiver_probe(0, "seq");
+}
+
+TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel) {
+    return run_rust_std_receiver_probe(52, "par");
+}
+
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name);
 
 /* Fixture for the #1942 bare-reference-vs-Field probes: a Go struct field
@@ -15120,6 +15225,8 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_html_embedded_member_call_stays_unbound);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c);
     RUN_TEST(pipeline_go_rw_usage_never_cross_into_c_parallel);
+    RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method);
+    RUN_TEST(pipeline_rust_std_receiver_never_binds_project_method_parallel);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field);
     RUN_TEST(pipeline_go_bare_ref_never_binds_field_parallel);
     RUN_TEST(pipeline_tsjs_receiver_parallel_keeps_service_edges);
