@@ -153,6 +153,13 @@ static bool cr_store_has_exact_project(cbm_store_t *store, const char *project) 
     return matches;
 }
 
+/* True when `project` is a usable cross-repo input: its store holds exactly
+ * that project AND carries the schema the read-write open in
+ * cr_open_existing_project requires. Checking only the first let a pre-#768
+ * store (still readable, so list_projects shows it) pass validation and the
+ * ["*"] enumeration, then abort the whole run at its write open — after the
+ * source's previous CROSS_* generation had already been deleted. The probe is
+ * read-only, so the legacy store is left untouched for its reindex. (#2133) */
 static bool cr_project_exists(const char *project) {
     char path[CR_PATH_BUF];
     if (!cr_db_path(project, path, sizeof(path))) {
@@ -160,6 +167,11 @@ static bool cr_project_exists(const char *project) {
     }
     cbm_store_t *store = cbm_store_open_path_query(path);
     bool exists = cr_store_has_exact_project(store, project);
+    if (exists && !cbm_store_edges_schema_current(store)) {
+        cbm_log_warn("cross_repo.project_unusable", "project", project, "reason",
+                     "pre_768_schema_reindex_required");
+        exists = false;
+    }
     cbm_store_close(store);
     return exists;
 }

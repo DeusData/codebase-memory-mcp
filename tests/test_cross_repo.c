@@ -236,6 +236,93 @@ TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens) {
     PASS();
 }
 
+/* A project store written before the #768 edges.local_name_gen column: it
+ * still answers read-only queries (list_projects shows it), but the
+ * read-write open every cross-repo target needs refuses it until a reindex. */
+static bool cross_repo_create_pre768_project(const cross_repo_fixture_t *fixture,
+                                             const char *project) {
+    char path[512];
+    if (!cross_repo_project_path(fixture, project, path, sizeof(path))) {
+        return false;
+    }
+    sqlite3 *db = NULL;
+    if (sqlite3_open(path, &db) != SQLITE_OK) {
+        sqlite3_close(db);
+        return false;
+    }
+    char sql[1024];
+    snprintf(sql, sizeof(sql),
+             "CREATE TABLE projects(name TEXT PRIMARY KEY, indexed_at TEXT NOT NULL,"
+             " root_path TEXT NOT NULL);"
+             "CREATE TABLE nodes(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " label TEXT NOT NULL, name TEXT NOT NULL, qualified_name TEXT NOT NULL,"
+             " file_path TEXT DEFAULT '', start_line INTEGER DEFAULT 0,"
+             " end_line INTEGER DEFAULT 0, properties TEXT DEFAULT '{}',"
+             " UNIQUE(project, qualified_name));"
+             "CREATE TABLE edges(id INTEGER PRIMARY KEY AUTOINCREMENT, project TEXT NOT NULL,"
+             " source_id INTEGER NOT NULL, target_id INTEGER NOT NULL, type TEXT NOT NULL,"
+             " properties TEXT DEFAULT '{}', UNIQUE(source_id, target_id, type));"
+             "INSERT INTO projects VALUES('%s', '2026-06-01T00:00:00Z', '/pre768');",
+             project);
+    bool ok = sqlite3_exec(db, sql, NULL, NULL, NULL) == SQLITE_OK;
+    sqlite3_close(db);
+    return ok;
+}
+
+/* #2133: ["*"] enumerated every store a read-only open accepts, then aborted
+ * the whole run on the first one the matcher's read-write open refused — a
+ * single pre-#768 index anywhere in the cache made the wildcard fail with
+ * "missing, invalid, or not indexed" while naming the same live targets
+ * worked. A store the matcher cannot use is not a wildcard target. */
+TEST(cross_repo_wildcard_skips_pre768_store_issue2133) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "wild-src", "wild-api", "/orders", "w") &&
+                 cross_repo_create_pre768_project(&fixture, "aa-pre768-store");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed pre-#768 wildcard fixture");
+    }
+
+    const char *targets[] = {"*"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("wild-src", targets, 1);
+    int edges = cross_repo_count_edges(&fixture, "wild-src", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(result.failed);
+    ASSERT_EQ(result.projects_scanned, 1);
+    ASSERT_EQ(result.http_edges, 1);
+    ASSERT_EQ(edges, 1);
+    PASS();
+}
+
+/* Naming an unusable store stays an error, but it must be refused during
+ * validation, before the source's previous CROSS_* generation is deleted. */
+TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133) {
+    cross_repo_fixture_t fixture;
+    bool setup = cross_repo_fixture_begin(&fixture) &&
+                 cross_repo_seed_http_pair(&fixture, "named-src", "named-api", "/orders", "n") &&
+                 cross_repo_create_pre768_project(&fixture, "aa-pre768-store");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed pre-#768 named fixture");
+    }
+
+    const char *live[] = {"named-api"};
+    cbm_cross_repo_result_t initial = cbm_cross_repo_match("named-src", live, 1);
+    int before = cross_repo_count_edges(&fixture, "named-src", "CROSS_HTTP_CALLS");
+    const char *with_pre768[] = {"named-api", "aa-pre768-store"};
+    cbm_cross_repo_result_t result = cbm_cross_repo_match("named-src", with_pre768, 2);
+    int after = cross_repo_count_edges(&fixture, "named-src", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(initial.failed);
+    ASSERT_EQ(before, 1);
+    ASSERT_TRUE(result.failed);
+    ASSERT_EQ(after, before);
+    PASS();
+}
+
 static bool cross_repo_seed_bounded_scan(const cross_repo_fixture_t *fixture,
                                          const char *source_project, const char *target_project) {
     enum { TEST_SCAN_ROWS = 4097 };
@@ -523,6 +610,8 @@ SUITE(cross_repo) {
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
+    RUN_TEST(cross_repo_wildcard_skips_pre768_store_issue2133);
+    RUN_TEST(cross_repo_named_pre768_target_fails_before_cleanup_issue2133);
     RUN_TEST(cross_repo_scan_bound_counts_examined_rows_not_matches);
     RUN_TEST(cross_repo_propagates_delete_failure);
     RUN_TEST(cross_repo_failed_bidirectional_insert_is_not_counted);
