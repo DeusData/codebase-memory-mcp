@@ -2,7 +2,8 @@
  * discover.c — Recursive directory walk with filtering.
  *
  * Walks a repository directory tree, applying:
- *   1. Hardcoded directory skip patterns (60+ dirs like .git, node_modules)
+ *   1. Hardcoded directory skip patterns (60+ dirs like .git, node_modules,
+ *      plus path-suffix rules such as Laravel's storage/framework/views)
  *   2. Hardcoded suffix filters (.pyc, .png, .wasm, etc.)
  *   3. Fast-mode additional filters (docs, examples, lock files, etc.)
  *   4. Gitignore-style pattern matching
@@ -51,6 +52,17 @@ static const char *ALWAYS_SKIP_DIRS[] = {
     ".vercel", ".netlify", "deploy", "deployed",
     /* Misc */
     ".codebase-memory", ".qdrant_code_embeddings", ".tmp", "vendor", "vendored", NULL};
+
+/* Always-skip directories matched by relative-PATH suffix, not by basename:
+ * generated build output whose last path component alone ("views") is far too
+ * common to skip everywhere. A rule matches the whole relative path or a
+ * '/'-aligned tail of it, so "storage/framework/views" and
+ * "backend/storage/framework/views" match while "app/views",
+ * "mystorage/framework/views" and "storage/framework/views_old" do not. */
+static const char *ALWAYS_SKIP_DIR_SUFFIXES[] = {
+    /* Laravel's compiled Blade view cache (#1735): generated PHP with no source
+     * value, skipped even when Laravel's stock .gitignore there is missing. */
+    "storage/framework/views", NULL};
 
 static const char *FAST_SKIP_DIRS[] = {
     "generated", "gen",           "auto-generated", "fixtures",     "testdata",    "test_data",
@@ -333,6 +345,25 @@ static bool resolve_global_excludes_path(char *out, size_t out_sz) {
         return out[0] != '\0';
     }
 
+    return false;
+}
+
+/* True when rel_path equals a suffix rule or ends with "/" + the rule. */
+static bool rel_path_has_skip_suffix(const char *rel_path) {
+    if (!rel_path) {
+        return false;
+    }
+    size_t plen = strlen(rel_path);
+    for (int i = 0; ALWAYS_SKIP_DIR_SUFFIXES[i]; i++) {
+        const char *suffix = ALWAYS_SKIP_DIR_SUFFIXES[i];
+        size_t slen = strlen(suffix);
+        if (slen > plen || strcmp(rel_path + plen - slen, suffix) != 0) {
+            continue;
+        }
+        if (slen == plen || rel_path[plen - slen - SKIP_ONE] == '/') {
+            return true;
+        }
+    }
     return false;
 }
 
@@ -702,7 +733,8 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
                                   const gitignore_link_t *ignore_chain,
                                   const cbm_gitignore_t *global_gi,
                                   const cbm_gitignore_t *cbmignore) {
-    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL)) {
+    if (cbm_should_skip_dir(entry_name, opts ? opts->mode : CBM_MODE_FULL) ||
+        rel_path_has_skip_suffix(rel_path)) {
         /* #500: a .cbmignore negation (e.g. "!obj/") whose rule is the last
          * match for this dir un-skips a built-in skip-list dir — except the
          * non-negatable safety core. Fall through so .gitignore/global/local
