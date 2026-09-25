@@ -320,13 +320,21 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
 bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_bound,
                                           const char *strategy);
 
-/* #725: drop a suffix_match CALLS edge when the caller language and the
- * target file's language disagree. unique_name (candidates == 1) is #1572
- * and is left alone; same_module / import_map / lsp_* are kept. JS/TS/TSX
- * are one family so a .ts helper calling a .tsx function is not dropped.
- * Pure; unit-tested in test_registry.c. */
+/* #725/#1572: drop a suffix_match or unique_name CALLS edge when the caller
+ * language and the target file's language disagree. suffix_match is the
+ * import-distance winner among many same-named symbols (#725);
+ * unique_name is the candidates==1 case of the same class (#1572).
+ * same_module / import_map / lsp_* are kept. JS/TS/TSX are one family so a
+ * .ts helper calling a .tsx function is not dropped. Pure; unit-tested in
+ * test_registry.c. */
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy);
+
+/* CALLS emission guard: suffix_match / unique_name (#725/#1572) plus any other
+ * strategy that binds a cross-language unique_name homonym (import_map, lsp_*,
+ * …). */
+bool cbm_suppress_cross_language_calls_edge(CBMLanguage caller_lang, const char *target_file_path,
+                                            const char *strategy);
 
 /* #1928: USAGE/WRITES/READS analog of the CALLS guard above. Reference edges
  * resolved by the short-name registry carry no import-closure evidence, so a
