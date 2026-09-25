@@ -596,26 +596,40 @@ static const char *local_rel_path(const char *rel_path, const char *local_prefix
  * matcher borrows a pointer to the deepest link governing it, so a directory
  * without a .gitignore of its own simply shares its parent's link. Links live
  * on the heap (the frame stack is realloc'd and popped) and walk_dir owns them
- * through the `owned_next` list. `prefix` is the walk-relative directory the
- * matcher was loaded from ("" for the root). */
+ * through the `owned_next` list.
+ *
+ * Every pattern is anchored to the directory its file came from, so each link
+ * carries the offset between that directory and the walk-relative rel_path it
+ * is asked about. The two offsets are mirror images and exactly one is ever
+ * non-empty:
+ *   `prefix` — the matcher's directory is at or BELOW the walk root
+ *              ("" for the root itself): strip it from rel_path.
+ *   `base`   — the matcher's directory is ABOVE the walk root (an enclosing
+ *              repository's ignore files, when a git-less subfolder is
+ *              indexed): prepend the walk root's path relative to it.
+ * Both strings live in the flexible tail, `base` right after `prefix`. */
 typedef struct gitignore_link {
     const cbm_gitignore_t *gi;
     const struct gitignore_link *parent;
     struct gitignore_link *owned_next;
+    const char *base;
     char prefix[];
 } gitignore_link_t;
 
 static gitignore_link_t *gitignore_link_new(const cbm_gitignore_t *gi, const char *prefix,
-                                            const gitignore_link_t *parent,
+                                            const char *base, const gitignore_link_t *parent,
                                             gitignore_link_t **owned_links) {
     size_t prefix_size = strlen(prefix) + SKIP_ONE;
-    gitignore_link_t *link = malloc(sizeof(*link) + prefix_size);
+    size_t base_size = strlen(base) + SKIP_ONE;
+    gitignore_link_t *link = malloc(sizeof(*link) + prefix_size + base_size);
     if (!link) {
         return NULL;
     }
     link->gi = gi;
     link->parent = parent;
     memcpy(link->prefix, prefix, prefix_size);
+    memcpy(link->prefix + prefix_size, base, base_size);
+    link->base = link->prefix + prefix_size;
     link->owned_next = *owned_links;
     *owned_links = link;
     return link;
@@ -636,9 +650,20 @@ static void gitignore_links_free(gitignore_link_t *link) {
  * re-included by a negation, 0 when no file mentions the path. Cost is one
  * match per .gitignore on the path — O(depth), never a rescan. */
 static int gitignore_chain_result(const gitignore_link_t *link, const char *rel_path, bool is_dir) {
+    char based[CBM_SZ_4K];
     for (; link; link = link->parent) {
-        int verdict =
-            cbm_gitignore_match_result(link->gi, local_rel_path(rel_path, link->prefix), is_dir);
+        const char *probe = local_rel_path(rel_path, link->prefix);
+        if (link->base[0]) {
+            /* Matcher from a directory above the walk root: ask it about the
+             * path it would see, i.e. the one its own rooted patterns are
+             * anchored against. */
+            int written = snprintf(based, sizeof(based), "%s/%s", link->base, probe);
+            if (written < 0 || (size_t)written >= sizeof(based)) {
+                continue; /* longer than this matcher can address: no opinion */
+            }
+            probe = based;
+        }
+        int verdict = cbm_gitignore_match_result(link->gi, probe, is_dir);
         if (verdict != 0) {
             return verdict;
         }
@@ -1030,9 +1055,20 @@ static bool walk_owned_gitignore_append(cbm_gitignore_t ***owned, size_t *count,
     return true;
 }
 
+/* Release an owner array built by walk_owned_gitignore_append(). Shared by the
+ * walk and by the enclosing-repository chain, which own their matchers the
+ * same way. */
+static void walk_owned_gitignore_free(cbm_gitignore_t **owned, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        cbm_gitignore_free(owned[i]);
+    }
+    free(owned);
+}
+
 static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_discover_opts_t *opts,
-                     const cbm_gitignore_t *gitignore, const cbm_gitignore_t *global_gi,
-                     const cbm_gitignore_t *cbmignore, file_list_t *out) {
+                     const cbm_gitignore_t *gitignore, const gitignore_link_t *ancestors,
+                     const cbm_gitignore_t *global_gi, const cbm_gitignore_t *cbmignore,
+                     file_list_t *out) {
     walk_stack_t ws = {
         .frames = calloc(WALK_STACK_CAP, sizeof(walk_frame_t)), .top = 0, .cap = WALK_STACK_CAP};
     if (!ws.frames) {
@@ -1054,8 +1090,12 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
         free(ws.frames);
         return;
     }
+    /* `ancestors` is the deepest link of the enclosing repository's chain (or
+     * NULL); the walk root's own matcher sits below it so it still wins. */
+    ws.frames[0].ignore_chain = ancestors;
     if (gitignore) {
-        ws.frames[0].ignore_chain = gitignore_link_new(gitignore, rel_prefix, NULL, &owned_links);
+        ws.frames[0].ignore_chain =
+            gitignore_link_new(gitignore, rel_prefix, "", ancestors, &owned_links);
         if (!ws.frames[0].ignore_chain) {
             out->failed = true;
             free(ws.frames);
@@ -1076,7 +1116,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
             }
             /* owned_gis owns `loaded` from here on, even if the link fails. */
             const gitignore_link_t *link =
-                gitignore_link_new(loaded, frame.prefix, frame.ignore_chain, &owned_links);
+                gitignore_link_new(loaded, frame.prefix, "", frame.ignore_chain, &owned_links);
             if (!link) {
                 out->failed = true;
                 break;
@@ -1098,10 +1138,7 @@ static void walk_dir(const char *dir_path, const char *rel_prefix, const cbm_dis
         }
         cbm_closedir(d);
     }
-    for (size_t i = 0; i < owned_count; i++) {
-        cbm_gitignore_free(owned_gis[i]);
-    }
-    free(owned_gis);
+    walk_owned_gitignore_free(owned_gis, owned_count);
     gitignore_links_free(owned_links);
     free(ws.frames);
 }
@@ -1210,6 +1247,133 @@ static bool resolve_git_common_dir(const char *repo_path, char *common_dir, size
     return true;
 }
 
+/* When repo_path itself carries no .git (resolve_git_common_dir already
+ * returned false for it), walk upward looking for an enclosing repository,
+ * exactly as `git` itself would when run from a subfolder. Bounded by the
+ * filesystem/drive root: dir is truncated at each iteration, so the loop
+ * cannot run more times than repo_path is characters long. Returns true and
+ * fills ancestor_root (for the enclosing repo's own .gitignore) plus
+ * common_dir (for its info/exclude + config, via the same resolution
+ * resolve_git_common_dir already applies to an ordinary repo root). Fixes
+ * the remaining half of issue #510: only the indexed directory's own
+ * .gitignore was ever consulted, never an enclosing repo's. */
+static bool resolve_enclosing_git_root(const char *repo_path, char *ancestor_root, size_t ar_sz,
+                                       char *common_dir, size_t cd_sz) {
+    char dir[CBM_SZ_4K];
+    snprintf(dir, sizeof(dir), "%s", repo_path);
+    cbm_normalize_path_sep(dir);
+
+    for (;;) {
+        char *slash = strrchr(dir, '/');
+        /* No separator left, or only the root separator (POSIX "/") or a
+         * bare drive prefix (Windows "C:/"): nothing above this to check. */
+        if (!slash || slash == dir || (slash > dir && *(slash - 1) == ':')) {
+            return false;
+        }
+        *slash = '\0';
+        if (resolve_git_common_dir(dir, common_dir, cd_sz)) {
+            snprintf(ancestor_root, ar_sz, "%s", dir);
+            return true;
+        }
+    }
+}
+
+/* The enclosing repository's ignore files, kept OUT of the indexed directory's
+ * own matcher. Merging them in would re-anchor every rooted pattern onto the
+ * indexed subfolder: "/secret.py" at the enclosing root would start hiding
+ * <subfolder>/secret.py (silent index loss), and "pkg/scratch/" would stop
+ * hiding pkg/scratch (a directory git excludes would be walked). Each matcher
+ * instead keeps its own directory as its anchor, via the link's `base`. */
+typedef struct {
+    cbm_gitignore_t **owned;
+    size_t count;
+    size_t capacity;
+    const gitignore_link_t *chain; /* deepest ancestor link, or NULL */
+    gitignore_link_t *links;       /* owner list backing `chain` */
+} ancestor_ignores_t;
+
+static void ancestor_ignores_free(ancestor_ignores_t *anc) {
+    walk_owned_gitignore_free(anc->owned, anc->count);
+    gitignore_links_free(anc->links);
+}
+
+/* Add one ancestor directory's matcher to the chain, deepest last so that the
+ * deepest file with an opinion wins (git's shallow-to-deep rule, negations
+ * included). Takes ownership of `gi`. */
+static bool ancestor_ignores_push(ancestor_ignores_t *anc, cbm_gitignore_t *gi, const char *base) {
+    if (!walk_owned_gitignore_append(&anc->owned, &anc->count, &anc->capacity, gi)) {
+        cbm_gitignore_free(gi);
+        return false;
+    }
+    /* owned[] owns `gi` from here on, even if the link fails. */
+    const gitignore_link_t *link = gitignore_link_new(gi, "", base, anc->chain, &anc->links);
+    if (!link) {
+        return false;
+    }
+    anc->chain = link;
+    return true;
+}
+
+/* Load the .gitignore of EVERY directory from the enclosing repository root
+ * (inclusive) down to the indexed directory (exclusive) — git consults all of
+ * them, not just the root's. `root_extra` is that repository's
+ * <common>/info/exclude, which git anchors at its root like the root
+ * .gitignore; ownership is taken. `leaf` must be a canonical path under
+ * `root`, both with '/' separators. Returns false only on allocation
+ * failure. */
+static bool ancestor_ignores_build(ancestor_ignores_t *anc, const char *root, const char *leaf,
+                                   cbm_gitignore_t *root_extra) {
+    size_t root_len = strlen(root);
+    if (strncmp(leaf, root, root_len) != 0) {
+        cbm_gitignore_free(root_extra);
+        return true;
+    }
+    const char *base = leaf + root_len;
+    while (*base == '/') {
+        base++;
+    }
+
+    char dir[CBM_SZ_4K];
+    int dir_len = snprintf(dir, sizeof(dir), "%s", root);
+    if (dir_len < 0 || (size_t)dir_len >= sizeof(dir) || !*base) {
+        cbm_gitignore_free(root_extra);
+        return dir_len >= 0 && (size_t)dir_len < sizeof(dir);
+    }
+
+    for (;;) {
+        char gi_path[CBM_SZ_4K];
+        path_join(gi_path, sizeof(gi_path), dir, ".gitignore");
+        cbm_gitignore_t *gi = cbm_gitignore_load(gi_path);
+        if (root_extra) {
+            /* First iteration: `dir` is the enclosing repository root, the one
+             * directory info/exclude shares an anchor with. Merged after the
+             * .gitignore patterns so it overrides them, the same precedence
+             * the two already have for an ordinary repository root. */
+            if (!gi) {
+                gi = root_extra;
+            } else {
+                (void)cbm_gitignore_merge(gi, root_extra);
+                cbm_gitignore_free(root_extra);
+            }
+            root_extra = NULL;
+        }
+        if (gi && !ancestor_ignores_push(anc, gi, base)) {
+            return false;
+        }
+        const char *slash = strchr(base, '/');
+        if (!slash) {
+            return true; /* the next directory down IS the indexed one */
+        }
+        int written = snprintf(dir + dir_len, sizeof(dir) - (size_t)dir_len, "/%.*s",
+                               (int)(slash - base), base);
+        if (written < 0 || (size_t)written >= sizeof(dir) - (size_t)dir_len) {
+            return true; /* deeper directories are unaddressable: stop here */
+        }
+        dir_len += written;
+        base = slash + SKIP_ONE;
+    }
+}
+
 int cbm_discover(const char *repo_path, const cbm_discover_opts_t *opts, cbm_file_info_t **out,
                  int *count) {
     return cbm_discover_ex(repo_path, opts, out, count, NULL, NULL);
@@ -1266,7 +1430,12 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
      * worktree (where .git is a gitlink file) reads the shared info/exclude/config
      * just like a normal checkout. Both are folded into a single matcher so all
      * downstream call paths remain unchanged. Fixes issue #489: OOM on repos whose
-     * worktrees are excluded only via .git/info/exclude (e.g. Sandcastle). */
+     * worktrees are excluded only via .git/info/exclude (e.g. Sandcastle).
+     *
+     * An ENCLOSING repository's ignore files (indexing a git-less subfolder,
+     * issue #510) are deliberately NOT folded in here: their patterns are
+     * anchored to their own directories, so they stay separate matchers on the
+     * chain with a `base` offset. See ancestor_ignores_build(). */
     cbm_gitignore_t *gitignore = NULL;
     char gi_path[CBM_SZ_4K];
     struct stat gi_stat;
@@ -1276,6 +1445,26 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
     char git_common_dir[CBM_SZ_4K];
     bool is_git_repo = resolve_git_common_dir(repo_path, git_common_dir, sizeof(git_common_dir));
     bool has_git_config = false;
+    /* repo_path itself is not a git repo root: walk upward for an enclosing one,
+     * exactly as `git` does when run from a subfolder. Fixes the remaining half
+     * of issue #510: only the indexed directory's own .gitignore was ever
+     * consulted, never an enclosing repo's. The walk is lexical, so repo_path is
+     * canonicalized first — otherwise `cbm index pkg` and `cbm index /abs/pkg`
+     * would discover different files from the same directory. */
+    ancestor_ignores_t ancestors = {0};
+    char enclosing_root[CBM_SZ_4K];
+    char canonical_repo[CBM_SZ_4K];
+    bool has_enclosing_repo = false;
+    if (!is_git_repo) {
+        if (!cbm_canonical_path(repo_path, canonical_repo, sizeof(canonical_repo))) {
+            snprintf(canonical_repo, sizeof(canonical_repo), "%s", repo_path);
+        }
+        cbm_normalize_path_sep(canonical_repo);
+        has_enclosing_repo =
+            resolve_enclosing_git_root(canonical_repo, enclosing_root, sizeof(enclosing_root),
+                                       git_common_dir, sizeof(git_common_dir));
+        is_git_repo = has_enclosing_repo;
+    }
     /* Always honour the .gitignore at the indexed-directory root, even when the
      * directory is not a git repo root (e.g. indexing a sub-package directly).
      * Fixes issue #510: a root .gitignore was silently ignored without .git/. */
@@ -1288,7 +1477,16 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         char exc_path[CBM_SZ_4K];
         path_join(exc_path, sizeof(exc_path), git_common_dir, "info/exclude");
         cbm_gitignore_t *git_exclude = cbm_gitignore_load(exc_path);
-        if (git_exclude) {
+        if (has_enclosing_repo) {
+            /* git_common_dir belongs to the ENCLOSING repository, so its
+             * info/exclude is anchored at that repository's root, not at the
+             * indexed subfolder. Ownership passes to the ancestor chain. */
+            if (!ancestor_ignores_build(&ancestors, enclosing_root, canonical_repo, git_exclude)) {
+                ancestor_ignores_free(&ancestors);
+                cbm_gitignore_free(gitignore);
+                return CBM_DISCOVER_ERROR;
+            }
+        } else if (git_exclude) {
             if (!gitignore) {
                 gitignore = git_exclude;
             } else {
@@ -1326,9 +1524,10 @@ static cbm_discover_status_t discover_impl(const char *repo_path, const cbm_disc
         .collect_ignored = !count_only && ignored_out != NULL,
     };
     walk_cache_dir_snapshot();
-    walk_dir(repo_path, "", opts, gitignore, global_gi, cbmignore, &fl);
+    walk_dir(repo_path, "", opts, gitignore, ancestors.chain, global_gi, cbmignore, &fl);
 
     /* Cleanup */
+    ancestor_ignores_free(&ancestors);
     cbm_gitignore_free(gitignore);
     cbm_gitignore_free(global_gi);
     cbm_gitignore_free(cbmignore);
