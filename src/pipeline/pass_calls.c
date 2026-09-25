@@ -107,6 +107,16 @@ static char *extract_local_name_from_json(const char *props_json) {
     return cbm_strndup(start, end - start);
 }
 
+/* The graph node whose QN is cbm_pipeline_fqn_compute(project, rel_path, name),
+ * or NULL. The one place this pass computes a transient QN for a lookup. */
+static const cbm_gbuf_node_t *pc_find_by_computed_qn(const cbm_gbuf_t *gbuf, const char *project,
+                                                     const char *rel_path, const char *name) {
+    char *qn = cbm_pipeline_fqn_compute(project, rel_path, name);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    free(qn);
+    return n;
+}
+
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count) {
@@ -153,9 +163,8 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     }
 
     /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    free(file_qn);
+    const cbm_gbuf_node_t *file_node =
+        pc_find_by_computed_qn(ctx->gbuf, ctx->project_name, rel_path, "__file__");
     if (!file_node) {
         return 0;
     }
@@ -202,6 +211,167 @@ static void free_import_map(const char **keys, const char **vals, int count) {
     if (vals) {
         free((void *)vals);
     }
+}
+
+/* ── #1916: axios client-instance calls ─────────────────────────── */
+
+/* Copy the plain (unescaped) JSON string value of "key" in props into out.
+ * False when absent, escaped, or too long — an unreadable base is unknown. */
+static bool pc_json_str_prop(const char *props, const char *key, char *out, size_t out_sz) {
+    if (!props) {
+        return false;
+    }
+    char pat[CBM_SZ_64];
+    snprintf(pat, sizeof(pat), "\"%s\":\"", key);
+    const char *p = strstr(props, pat);
+    if (!p) {
+        return false;
+    }
+    p += strlen(pat);
+    const char *e = strchr(p, '"');
+    if (!e) {
+        return false;
+    }
+    size_t len = (size_t)(e - p);
+    if (len >= out_sz || memchr(p, '\\', len) != NULL) {
+        return false;
+    }
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return true;
+}
+
+/* A node the extractor marked as an axios instance. `base` receives the
+ * literal baseURL ("" when unknown). */
+static bool pc_node_is_http_client(const cbm_gbuf_node_t *n, char *base, size_t base_sz) {
+    char client[CBM_SZ_32];
+    if (!n || !pc_json_str_prop(n->properties_json, "http_client", client, sizeof(client))) {
+        return false;
+    }
+    if (!pc_json_str_prop(n->properties_json, "http_base_url", base, base_sz)) {
+        base[0] = '\0';
+    }
+    return true;
+}
+
+/* The module-level Variable `name` declared in file `file_rel`. */
+static const cbm_gbuf_node_t *pc_module_var(const cbm_gbuf_t *gbuf, const char *project,
+                                            const char *file_rel, const char *name) {
+    if (!file_rel) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *n = pc_find_by_computed_qn(gbuf, project, file_rel, name);
+    return (n && n->label && strcmp(n->label, "Variable") == 0) ? n : NULL;
+}
+
+/* Resolve the binding `recv` names in the calling file to a client node:
+ * a same-file declaration first, then its ES import (default import → the
+ * module's default export; named import → that module's Variable). */
+static bool pc_receiver_client_base(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                    const CBMFileResult *result, const char **imp_keys,
+                                    const char **imp_vals, int imp_count, const char *recv,
+                                    char *base, size_t base_sz) {
+    if (pc_node_is_http_client(pc_module_var(gbuf, project, rel, recv), base, base_sz)) {
+        return true;
+    }
+    const CBMImport *imp = NULL;
+    for (int i = 0; result && i < result->imports.count; i++) {
+        const CBMImport *it = &result->imports.items[i];
+        if (it->local_name && strcmp(it->local_name, recv) == 0) {
+            imp = it;
+            break;
+        }
+    }
+    if (!imp) {
+        return false;
+    }
+    for (int i = 0; i < imp_count; i++) {
+        if (!imp_keys[i] || strcmp(imp_keys[i], recv) != 0 || !imp_vals[i]) {
+            continue;
+        }
+        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_qn(gbuf, imp_vals[i]);
+        if (!t || !t->label) {
+            return false;
+        }
+        if (strcmp(t->label, "Variable") == 0) {
+            return pc_node_is_http_client(t, base, base_sz);
+        }
+        if (strcmp(t->label, "Module") != 0) {
+            return false;
+        }
+        if (imp->is_default) {
+            return pc_node_is_http_client(t, base, base_sz);
+        }
+        return pc_node_is_http_client(pc_module_var(gbuf, project, t->file_path, recv), base,
+                                      base_sz);
+    }
+    return false;
+}
+
+/* axios instance request methods (the verb after the receiver). */
+static bool pc_is_axios_verb(const char *verb) {
+    static const char *const verbs[] = {"get",   "post", "put",     "delete",
+                                        "patch", "head", "options", NULL};
+    for (int i = 0; verbs[i]; i++) {
+        if (strcmp(verb, verbs[i]) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Copy the plain-identifier receiver of `callee` (text before `dot`) into
+ * recv. False for `this.api.get`, `a().get` and other non-binding receivers. */
+static bool pc_plain_receiver(const char *callee, const char *dot, char *recv, size_t recv_sz) {
+    size_t rlen = (size_t)(dot - callee);
+    if (rlen == 0 || rlen >= recv_sz) {
+        return false;
+    }
+    for (size_t i = 0; i < rlen; i++) {
+        char c = callee[i];
+        bool ident = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                     c == '_' || c == '$';
+        if (!ident) {
+            return false;
+        }
+    }
+    memcpy(recv, callee, rlen);
+    recv[rlen] = '\0';
+    return true;
+}
+
+bool cbm_pipeline_http_client_call_url(const cbm_gbuf_t *gbuf, const char *project, const char *rel,
+                                       const CBMFileResult *result, const char **imp_keys,
+                                       const char **imp_vals, int imp_count, const CBMCall *call,
+                                       char *out, size_t out_sz) {
+    const char *callee = call ? call->callee_name : NULL;
+    const char *url = call ? call->first_string_arg : NULL;
+    if (!gbuf || !project || !callee || !url || (url[0] != '/' && !strstr(url, "://"))) {
+        return false;
+    }
+    const char *dot = strrchr(callee, '.');
+    char recv[CBM_SZ_128];
+    if (!dot || !pc_is_axios_verb(dot + SKIP_ONE) ||
+        !pc_plain_receiver(callee, dot, recv, sizeof(recv))) {
+        return false;
+    }
+    char base[CBM_SZ_256];
+    if (!pc_receiver_client_base(gbuf, project, rel, result, imp_keys, imp_vals, imp_count, recv,
+                                 base, sizeof(base))) {
+        return false;
+    }
+    /* axios combineURLs: an absolute request URL ignores baseURL; otherwise
+     * the base (trailing '/' trimmed) is joined with the '/'-leading path. */
+    if (strstr(url, "://") || base[0] == '\0') {
+        int n = snprintf(out, out_sz, "%s", url);
+        return n > 0 && (size_t)n < out_sz;
+    }
+    size_t blen = strlen(base);
+    while (blen > 0 && base[blen - SKIP_ONE] == '/') {
+        base[--blen] = '\0';
+    }
+    int n = snprintf(out, out_sz, "%s%s", base, url);
+    return n > 0 && (size_t)n < out_sz;
 }
 
 /* Handle a route registration call: create Route node + HANDLES edge. */
@@ -467,18 +637,16 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
         }
     }
     if (!src) {
-        char *fqn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-        src = cbm_gbuf_find_by_qn(ctx->gbuf, fqn);
-        free(fqn);
+        src = pc_find_by_computed_qn(ctx->gbuf, ctx->project_name, rel, "__file__");
     }
     return src;
 }
 
 /* Resolve one call and emit the appropriate edge. Returns 1 if resolved, 0 if not. */
-static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
-                               const CBMResolvedCallArray *lsp_calls, const char *rel,
-                               const char *module_qn, const char **imp_keys, const char **imp_vals,
-                               int imp_count, CBMLanguage lang) {
+static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBMFileResult *result,
+                               const char *rel, const char *module_qn, const char **imp_keys,
+                               const char **imp_vals, int imp_count, CBMLanguage lang) {
+    const CBMResolvedCallArray *lsp_calls = &result->resolved_calls;
     const cbm_gbuf_node_t *source_node = calls_find_source(ctx, rel, call->enclosing_func_qn);
     if (!source_node) {
         return 0;
@@ -527,7 +695,26 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
      * and not an HTTP pattern, so BOTH the empty-resolution and resolved-QN
      * service checks below miss it and the call is dropped. Detect it on the
      * callee_name FIRST so the HTTP_CALLS/ASYNC_CALLS edge is emitted regardless
-     * (target is a synthesized route node, not the unindexed library). (#523) */
+     * (target is a synthesized route node, not the unindexed library). (#523)
+     *
+     * First, though: `api.get('/orders')` on an axios.create() instance (#1916).
+     * The receiver's binding decides, not its spelling — without this the
+     * verb suffix made it an Express route REGISTRATION below (a CALLS edge
+     * to a phantom server route), and a receiver spelled `axiosInstance`
+     * substring-matches the #523 check and loses its baseURL. */
+    char client_url[CBM_SZ_512];
+    if (cbm_pipeline_http_client_call_url(ctx->gbuf, ctx->project_name, rel, result, imp_keys,
+                                          imp_vals, imp_count, call, client_url,
+                                          sizeof(client_url))) {
+        CBMCall routed = *call;
+        routed.first_string_arg = client_url;
+        cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                    .confidence = PC_SVC_PATTERN_CONF,
+                                    .strategy = "http_client_instance",
+                                    .candidate_count = 0};
+        emit_http_async_edge(ctx, &routed, source_node, NULL, &svc_res, CBM_SVC_HTTP, false);
+        return SKIP_ONE;
+    }
     cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
     if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
         const char *cu = call->first_string_arg;
@@ -841,8 +1028,8 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
                 continue;
             }
             total_calls++;
-            if (resolve_single_call(ctx, call, &result->resolved_calls, rel, module_qn, imp_keys,
-                                    imp_vals, imp_count, files[i].language)) {
+            if (resolve_single_call(ctx, call, result, rel, module_qn, imp_keys, imp_vals,
+                                    imp_count, files[i].language)) {
                 resolved++;
             } else {
                 unresolved++;

@@ -181,11 +181,12 @@ TEST(extract_ts_factory_object_methods_issue341) {
  *
  * The bound is derived, not tuned. Measured on this source, total_alloc was
  * 365984 before the scratch arena and is 87456 after, exactly that difference.
- * Of the 87456 that remain, 7680 is the defs item array at GROW_ARRAY's
- * starting capacity of 32 times sizeof(CBMDefinition) 240, and the other 79776
- * is everything else this file's extraction interns; none of it is traversal
- * scratch. So the bound sits above 87456 with room and a factor of four below
- * 365984.
+ * #1916 added two pointers to CBMDefinition (240 -> 256 bytes), so it now
+ * measures 87968: 8192 is the defs item array at GROW_ARRAY's starting
+ * capacity of 32 times sizeof(CBMDefinition) 256, and the other 79776 is
+ * everything else this file's extraction interns; none of it is traversal
+ * scratch. So the bound sits above 87968 with room and a factor of four below
+ * the 365984 the scratch stacks cost.
  *
  * It is a byte budget, not a proof of lifetime; that is
  * extract_traversal_stacks_come_from_ctx_scratch_issue2010 in test_mem.c. */

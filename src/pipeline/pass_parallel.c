@@ -522,6 +522,8 @@ static void build_def_props(char *buf, size_t bufsize, const CBMDefinition *def)
     append_json_str_array(buf, bufsize, &pos, "param_types", def->param_types);
     append_json_string(buf, bufsize, &pos, "route_path", def->route_path);
     append_json_string(buf, bufsize, &pos, "route_method", def->route_method);
+    append_json_string(buf, bufsize, &pos, "http_client", def->http_client);
+    append_json_string(buf, bufsize, &pos, "http_base_url", def->http_base_url);
 
     /* MinHash fingerprint — append if present and buffer has room.
      * Hex-encoded K=64 uint32 = 512 chars + key/quotes ≈ 520 chars. */
@@ -2966,7 +2968,22 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * pattern, so the resolved-QN service checks below miss it and the call
          * is dropped. Detect it on the callee_name FIRST so the HTTP_CALLS/
          * ASYNC_CALLS edge is emitted regardless (target is a synthesized route
-         * node, not the unindexed library). Mirrors pass_calls.c. (#523) */
+         * node, not the unindexed library). Mirrors pass_calls.c. (#523)
+         *
+         * First: a call on an axios.create() instance (#1916) — decided by the
+         * receiver's binding, before the #523 spelling check and the
+         * route-registration suffix fallback. MUST match pass_calls.c. */
+        char client_url[CBM_SZ_512];
+        if (cbm_pipeline_http_client_call_url(rc->main_gbuf, rc->project_name, rel, result,
+                                              imp_keys, imp_vals, imp_count, call, client_url,
+                                              sizeof(client_url))) {
+            cbm_resolution_t svc_res = {.qualified_name = call->callee_name,
+                                        .confidence = PP_HALF_CONF,
+                                        .strategy = "http_client_instance"};
+            emit_http_async_service_edge(ws->local_edge_buf, source_node, call, &svc_res,
+                                         CBM_SVC_HTTP, client_url);
+            continue;
+        }
         cbm_svc_kind_t csvc = cbm_service_pattern_match(call->callee_name);
         if (csvc == CBM_SVC_HTTP || csvc == CBM_SVC_ASYNC) {
             const char *cu = call->first_string_arg;
