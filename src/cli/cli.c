@@ -158,6 +158,81 @@ int cbm_cli_exit_status_after_maintenance(int exit_status, bool maintenance_canc
     return maintenance_cancelled && exit_status == EXIT_SUCCESS ? EXIT_FAILURE : exit_status;
 }
 
+/* One override, parsed strictly: a typo must not silently disable a gate, so
+ * anything that is not a whole number falls back to the documented default. */
+static long cli_gate_threshold(const char *name, long fallback) {
+    const char *raw = getenv(name);
+    if (!raw || !raw[0]) {
+        return fallback;
+    }
+    char *end = NULL;
+    errno = 0;
+    long value = strtol(raw, &end, 10);
+    /* Overflow clamps to LONG_MAX with the whole string consumed, which would
+     * read as a ceiling no run can exceed: the one typo that disables a gate. */
+    if (errno == ERANGE || end == raw || *end != '\0') {
+        return fallback;
+    }
+    return value;
+}
+
+/* The contract is opt-in. Unset, empty, or "0" leaves the historical 0/1
+ * status untouched, so no existing caller sees a new code until it asks. */
+static bool cli_gate_enabled(void) {
+    const char *raw = getenv("CBM_GATE");
+    return raw && raw[0] && strcmp(raw, "0") != 0;
+}
+
+int cbm_cli_index_exit_status(const char *result, int base_status) {
+    if (!result || !cli_gate_enabled()) {
+        return base_status;
+    }
+    yyjson_doc *envelope = yyjson_read(result, strlen(result), 0);
+    if (!envelope) {
+        return base_status;
+    }
+    yyjson_val *root = yyjson_doc_get_root(envelope);
+    yyjson_val *content = yyjson_is_obj(root) ? yyjson_obj_get(root, "content") : NULL;
+    yyjson_val *first = yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    const char *text = first ? yyjson_get_str(yyjson_obj_get(first, "text")) : NULL;
+
+    int status = base_status;
+    yyjson_doc *payload = text ? yyjson_read(text, strlen(text), 0) : NULL;
+    yyjson_val *proot = payload ? yyjson_doc_get_root(payload) : NULL;
+    if (yyjson_is_obj(proot)) {
+        const char *state = yyjson_get_str(yyjson_obj_get(proot, "status"));
+        const char *reason = yyjson_get_str(yyjson_obj_get(proot, "reason"));
+        if (state && strcmp(state, "error") == 0) {
+            status = (reason && strcmp(reason, "target_unavailable") == 0)
+                         ? CBM_CLI_EXIT_TARGET
+                         : (base_status != CBM_CLI_EXIT_OK ? base_status : CBM_CLI_EXIT_FAILURE);
+        } else if (base_status == CBM_CLI_EXIT_OK) {
+            long unusable = (long)yyjson_get_int(yyjson_obj_get(proot, "parse_unusable_count"));
+            long partial = (long)yyjson_get_int(yyjson_obj_get(proot, "parse_partial_count"));
+            long files = (long)yyjson_get_int(yyjson_obj_get(proot, "files_indexed"));
+            long max_unusable = cli_gate_threshold("CBM_GATE_MAX_UNUSABLE", 0);
+            long max_partial_pct = cli_gate_threshold("CBM_GATE_MAX_PARTIAL_PCT", 10);
+            /* "degraded" is the pipeline's own verdict that the graph came out
+             * far smaller than the run expected — a quality failure by any
+             * reading, so it joins the two parse thresholds. */
+            bool degraded = strcmp(state ? state : "", "degraded") == 0;
+            bool too_many_unusable = max_unusable >= 0 && unusable > max_unusable;
+            /* Integer arithmetic on purpose: a percentage compared through a
+             * double would make the threshold depend on rounding. */
+            bool too_many_partial =
+                max_partial_pct >= 0 && files > 0 && partial * 100 > max_partial_pct * files;
+            if (degraded || too_many_unusable || too_many_partial) {
+                status = CBM_CLI_EXIT_QUALITY;
+            }
+        }
+    }
+    if (payload) {
+        yyjson_doc_free(payload);
+    }
+    yyjson_doc_free(envelope);
+    return status;
+}
+
 /* #1537. Two very different failures reached this one message: the cohort was
  * BUSY (real sessions are running — the reader can close them), or the
  * reservation failed outright (lock I/O, stale coordination state, permissions
