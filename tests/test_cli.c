@@ -16134,6 +16134,60 @@ TEST(cli_update_only_names_an_installer_that_exists_issue1632) {
     PASS();
 }
 
+/* #2200: on 0.9.0, `update -y` in a non-interactive shell auto-confirmed
+ * "Delete these indexes and continue with update?", removed every project
+ * index, and THEN failed at the variant chooser -- no binary, no indexes.
+ * The release dispatch now hands off to install.sh (which keeps indexes by
+ * default, #607) and never asks a variant question. Pin that on every
+ * platform: `update -y` and `update -y --standard`, with the activation seam
+ * OFF (the exact path a release binary ships), exit 0 and leave every .db in
+ * the cache byte-for-byte intact. A generic -y must never be read as consent
+ * to delete indexes. */
+TEST(cli_update_yes_keeps_every_index_issue2200) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-update-2200-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir)) {
+        FAIL("cbm_mkdtemp failed");
+    }
+    char *old_home = NULL;
+    char *old_cache = NULL;
+    cli_activation_save_env(&old_home, &old_cache);
+    cbm_setenv("HOME", tmpdir, 1);
+    char cache_dir[512];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/cache", tmpdir);
+    cbm_setenv("CBM_CACHE_DIR", cache_dir, 1);
+    test_mkdirp(cache_dir);
+
+    static const char *const projects[] = {"alpha", "beta", "gamma"};
+    enum { PROJECT_COUNT = 3 };
+    char db_paths[PROJECT_COUNT][640];
+    for (int i = 0; i < PROJECT_COUNT; i++) {
+        snprintf(db_paths[i], sizeof(db_paths[i]), "%s/%s.db", cache_dir, projects[i]);
+        write_test_file(db_paths[i], projects[i]);
+    }
+
+    char *yes_argv[] = {"-y"};
+    char *legacy_argv[] = {"-y", "--standard"};
+    int yes_rc = cbm_cmd_update(1, yes_argv);
+    int legacy_rc = cbm_cmd_update(2, legacy_argv);
+    cbm_set_auto_answer_for_test(0);
+
+    int kept = 0;
+    for (int i = 0; i < PROJECT_COUNT; i++) {
+        const char *content = read_test_file(db_paths[i]);
+        if (content && strcmp(content, projects[i]) == 0) {
+            kept++;
+        }
+    }
+    cli_activation_restore_env(old_home, old_cache);
+    test_rmdir_r(tmpdir);
+
+    ASSERT_EQ(yes_rc, 0);
+    ASSERT_EQ(legacy_rc, 0);
+    ASSERT_EQ(kept, PROJECT_COUNT);
+    PASS();
+}
+
 SUITE(cli) {
     if (!th_secure_runtime_parent_new(g_cli_suite_runtime_parent,
                                       sizeof(g_cli_suite_runtime_parent), "cli-suite")) {
@@ -16146,6 +16200,7 @@ SUITE(cli) {
 
     RUN_TEST(cli_suite_uses_private_activation_runtime);
     RUN_TEST(cli_update_only_names_an_installer_that_exists_issue1632);
+    RUN_TEST(cli_update_yes_keeps_every_index_issue2200);
 #ifndef _WIN32
     RUN_TEST(cli_hook_deadline_ignores_an_unreadable_value);
 #endif
