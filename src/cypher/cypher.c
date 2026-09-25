@@ -2803,6 +2803,96 @@ static bool eval_where(const cbm_where_clause_t *w, binding_t *b) {
     return is_and;
 }
 
+/* Three-valued WHERE evaluation for the early (seed-row) pass in
+ * execute_single: only the first MATCH alias is bound there, so a leaf on
+ * any other alias is UNKNOWN rather than true. The two-valued evaluator
+ * returns true for an unbound alias, which NOT / XOR then invert -- pruning
+ * every seed before relationship expansion (distilled from PR #1245). The
+ * full evaluation reruns after expansion (Step 3), so the early pass only has
+ * to prune on a definite false. Allocation-free, O(expression nodes). */
+typedef enum { CYP_PARTIAL_FALSE = 0, CYP_PARTIAL_TRUE, CYP_PARTIAL_UNKNOWN } cyp_partial_t;
+
+static cyp_partial_t partial_and(cyp_partial_t l, cyp_partial_t r) {
+    if (l == CYP_PARTIAL_FALSE || r == CYP_PARTIAL_FALSE) {
+        return CYP_PARTIAL_FALSE;
+    }
+    return (l == CYP_PARTIAL_TRUE && r == CYP_PARTIAL_TRUE) ? CYP_PARTIAL_TRUE
+                                                            : CYP_PARTIAL_UNKNOWN;
+}
+
+static cyp_partial_t partial_or(cyp_partial_t l, cyp_partial_t r) {
+    if (l == CYP_PARTIAL_TRUE || r == CYP_PARTIAL_TRUE) {
+        return CYP_PARTIAL_TRUE;
+    }
+    return (l == CYP_PARTIAL_FALSE && r == CYP_PARTIAL_FALSE) ? CYP_PARTIAL_FALSE
+                                                              : CYP_PARTIAL_UNKNOWN;
+}
+
+/* A condition whose alias is not bound yet is UNKNOWN; a literal-only LHS
+ * (func condition with no variable arg) has nothing to wait for. */
+static cyp_partial_t eval_condition_partial(const cbm_condition_t *c, binding_t *b) {
+    if (c->variable && !binding_get(b, c->variable) && !binding_get_edge(b, c->variable)) {
+        return CYP_PARTIAL_UNKNOWN;
+    }
+    return eval_condition(c, b) ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+}
+
+static cyp_partial_t eval_expr_partial(const cbm_expr_t *e, // NOLINT(misc-no-recursion)
+                                       binding_t *b) {
+    if (!e) {
+        return CYP_PARTIAL_TRUE;
+    }
+    if (e->type == EXPR_CONDITION) {
+        return eval_condition_partial(&e->cond, b);
+    }
+    cyp_partial_t left = eval_expr_partial(e->left, b);
+    if (e->type == EXPR_NOT) {
+        if (left == CYP_PARTIAL_UNKNOWN) {
+            return CYP_PARTIAL_UNKNOWN;
+        }
+        return left == CYP_PARTIAL_TRUE ? CYP_PARTIAL_FALSE : CYP_PARTIAL_TRUE;
+    }
+    /* Same short-circuits as eval_expr: a definite left decides AND / OR. */
+    if (e->type == EXPR_AND && left == CYP_PARTIAL_FALSE) {
+        return CYP_PARTIAL_FALSE;
+    }
+    if (e->type == EXPR_OR && left == CYP_PARTIAL_TRUE) {
+        return CYP_PARTIAL_TRUE;
+    }
+    cyp_partial_t right = eval_expr_partial(e->right, b);
+    if (e->type == EXPR_AND) {
+        return partial_and(left, right);
+    }
+    if (e->type == EXPR_OR) {
+        return partial_or(left, right);
+    }
+    /* EXPR_XOR */
+    if (left == CYP_PARTIAL_UNKNOWN || right == CYP_PARTIAL_UNKNOWN) {
+        return CYP_PARTIAL_UNKNOWN;
+    }
+    return left != right ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+}
+
+static cyp_partial_t eval_where_partial(const cbm_where_clause_t *w, binding_t *b) {
+    if (!w) {
+        return CYP_PARTIAL_TRUE;
+    }
+    if (w->root) {
+        return eval_expr_partial(w->root, b);
+    }
+    /* Legacy flat evaluation */
+    if (w->count == 0) {
+        return CYP_PARTIAL_TRUE;
+    }
+    bool is_and = (w->op && strcmp(w->op, "AND") == 0) != 0;
+    cyp_partial_t result = is_and ? CYP_PARTIAL_TRUE : CYP_PARTIAL_FALSE;
+    for (int i = 0; i < w->count; i++) {
+        cyp_partial_t r = eval_condition_partial(&w->conditions[i], b);
+        result = is_and ? partial_and(result, r) : partial_or(result, r);
+    }
+    return result;
+}
+
 /* Check if a string value looks like a regex pattern. */
 static bool looks_like_regex(const char *s) {
     if (!s) {
@@ -5135,7 +5225,7 @@ static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *projec
         binding_t b = {0};
         b.store = store;
         binding_set(&b, var_name, &scanned[i]);
-        bool pass = !q->where || eval_where(q->where, &b);
+        bool pass = eval_where_partial(q->where, &b) != CYP_PARTIAL_FALSE;
         if (pass) {
             bindings[bind_count++] = b;
         } else {
