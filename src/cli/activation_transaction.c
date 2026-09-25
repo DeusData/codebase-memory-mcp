@@ -889,6 +889,53 @@ static bool activation_posix_acl_empty(int descriptor) {
     return cbm_macos_extended_acl_fd_is_empty(descriptor);
 }
 
+#ifdef __linux__
+/* Managed Linux hosts often keep /home a real directory and point the per-user
+ * entry elsewhere (/home/alice -> /local/home/alice). Trust that entry only
+ * when root owns it inside a /home nobody else can write, and it resolves to a
+ * directory owned by root or the current user. Returns NULL when not
+ * applicable; the O_NOFOLLOW walk then rejects the path as before. */
+static char *activation_linux_home_entry_path(const char *directory) {
+    static const char home_prefix[] = "/home/";
+    size_t prefix_length = sizeof(home_prefix) - 1U;
+    if (strncmp(directory, home_prefix, prefix_length) != 0) {
+        return NULL;
+    }
+    size_t name_length = strcspn(directory + prefix_length, "/");
+    char entry[sizeof(home_prefix) + 256U];
+    if (name_length == 0 || name_length >= 256U) {
+        return NULL;
+    }
+    memcpy(entry, directory, prefix_length + name_length);
+    entry[prefix_length + name_length] = '\0';
+
+    struct stat home_status;
+    struct stat entry_status;
+    struct stat resolved_status;
+    char resolved[4096];
+    if (lstat("/home", &home_status) != 0 || !S_ISDIR(home_status.st_mode) ||
+        home_status.st_uid != 0 || (home_status.st_mode & 0022) != 0 ||
+        lstat(entry, &entry_status) != 0 || !S_ISLNK(entry_status.st_mode) ||
+        entry_status.st_uid != 0 || !realpath(entry, resolved) ||
+        lstat(resolved, &resolved_status) != 0 || !S_ISDIR(resolved_status.st_mode) ||
+        (resolved_status.st_uid != 0 && resolved_status.st_uid != geteuid())) {
+        return NULL;
+    }
+    const char *rest = directory + prefix_length + name_length;
+    size_t needed = strlen(resolved) + strlen(rest) + 1U;
+    char *mapped = malloc(needed);
+    if (!mapped) {
+        return NULL;
+    }
+    int written = snprintf(mapped, needed, "%s%s", resolved, rest);
+    if (written <= 0 || (size_t)written >= needed) {
+        free(mapped);
+        return NULL;
+    }
+    return mapped;
+}
+#endif
+
 static char *activation_posix_walk_path(const char *directory) {
 #if defined(__APPLE__) || defined(__linux__)
     /* macOS and immutable Linux layouts can expose writable trees through
@@ -934,6 +981,12 @@ static char *activation_posix_walk_path(const char *directory) {
             return NULL;
         }
         return mapped;
+    }
+#endif
+#ifdef __linux__
+    char *home_entry = activation_linux_home_entry_path(directory);
+    if (home_entry) {
+        return home_entry;
     }
 #endif
     return activation_string_copy(directory);
