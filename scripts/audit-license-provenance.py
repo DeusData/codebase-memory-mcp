@@ -36,7 +36,11 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "cfml": "cfmleditor/tree-sitter-cfml",
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",
+    # javascript / tsx: our JSX lone-ampersand forks (#1736) of the pins we vendored
+    # before; same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "javascript": "tree-sitter/tree-sitter-javascript",
     "qml": "yuja/tree-sitter-qmljs",
+    "tsx": "tree-sitter/tree-sitter-typescript",
 }
 SPECIAL_NOTICE = {
     "assembly": "RETAINED-MIT (upstream RubixDev/tree-sitter-assembly deleted from GitHub)",

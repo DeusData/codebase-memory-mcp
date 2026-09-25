@@ -60,15 +60,22 @@ License summary:
   smart-coin language, written for this project because no usable public
   grammar exists; its source and corpus tests live in
   `tools/tree-sitter-chialisp/`.
-- Seven further grammars (`arkts`, `assembly`, `cfml`,
-  `cfscript`, `dotenv`, `pine`, `qml`) are self-maintained forks that retain
-  their original upstream authors' licenses — see the manifest for per-grammar
-  provenance. `arkts` is a first-party derivative of
+- Nine further grammars (`arkts`, `assembly`, `cfml`,
+  `cfscript`, `dotenv`, `javascript`, `pine`, `qml`, `tsx`) are self-maintained
+  forks that retain their original upstream authors' licenses — see the manifest
+  for per-grammar provenance. `arkts` is a first-party derivative of
   [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)
   (MIT, (c) 2017 Max Brunsfeld; on the
   [tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript)
   base, MIT, (c) 2014 Max Brunsfeld) with (c) 2026 DeusData ArkTS additions;
-  its grammar source lives in `tools/tree-sitter-arkts/`.
+  its grammar source lives in `tools/tree-sitter-arkts/`. `javascript`
+  ([tree-sitter/tree-sitter-javascript](https://github.com/tree-sitter/tree-sitter-javascript),
+  MIT, (c) 2014 Max Brunsfeld) and `tsx`
+  ([tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)'s
+  `tsx` dialect, MIT, (c) 2017 Max Brunsfeld, on the same javascript base) are
+  the upstream grammars with one (c) 2026 DeusData patch that lets a lone `&`
+  appear in JSX strings and text; their grammar sources live in
+  `tools/tree-sitter-javascript/` and `tools/tree-sitter-tsx/`.
 
 ### tree-sitter-plsql
 

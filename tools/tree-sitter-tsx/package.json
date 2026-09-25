@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-tsx-cbm",
+  "version": "0.23.2-cbm.1",
+  "description": "cbm fork of tree-sitter-typescript's tsx dialect @ 75b3874 (JSX lone-ampersand fix, #1736)",
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}
