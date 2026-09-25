@@ -4867,6 +4867,62 @@ TEST(extract_ts_template_string_url_issue1006) {
     PASS();
 }
 
+/* Issue #2235: a request-config object argument carries the URL in its `url`
+ * property (Orval/axios style: `http({url: `/x/${id}`, method: 'GET'})`).
+ * The property's template literal flattens to the canonical "{}" form both on
+ * the argument (read by the arg-url heuristic for local helpers) and as the
+ * call's URL (read by HTTP-client classification, e.g. `axios({url})`). Other
+ * keys never stand in for the URL, and a route registration keeps its own
+ * (object-free) handling. */
+TEST(extract_ts_config_object_url_issue2235) {
+    CBMFileResult *r =
+        extract("export const get1 = (id: string) => {\n"
+                "  return http<Customer>({url: `/api/customers/${id}`, method: 'GET'});\n"
+                "};\n"
+                "export const load = () => axios({method: 'POST', 'url': '/api/orders'});\n"
+                "export const other = () => http({path: '/api/ignored/x'});\n"
+                "export const reg = () => fastify.route({url: '/srv/x', handler: h});\n"
+                "export const u = () => axiosInstance.getUri({url: `/pets`});\n",
+                CBM_LANG_TYPESCRIPT, "t", "client.ts");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    const CBMCall *c = NULL;
+    const CBMCall *o = NULL;
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *k = &r->calls.items[i];
+        if (k->callee_name && strcmp(k->callee_name, "http") == 0 && k->arg_count > 0) {
+            if (k->args[0].expr && strstr(k->args[0].expr, "customers")) {
+                c = k;
+            } else {
+                o = k;
+            }
+        }
+    }
+    ASSERT_NOT_NULL(c);
+    ASSERT_NOT_NULL(c->args[0].value);
+    ASSERT_STR_EQ(c->args[0].value, "/api/customers/{}");
+    ASSERT_NOT_NULL(c->first_string_arg);
+    ASSERT_STR_EQ(c->first_string_arg, "/api/customers/{}");
+    const CBMCall *a = find_call_by_callee(r, "axios");
+    ASSERT_NOT_NULL(a);
+    ASSERT_NOT_NULL(a->first_string_arg);
+    ASSERT_STR_EQ(a->first_string_arg, "/api/orders");
+    ASSERT_NOT_NULL(o);
+    ASSERT_NULL(o->args[0].value);
+    ASSERT_NULL(o->first_string_arg);
+    const CBMCall *g = find_call_by_callee(r, "fastify.route");
+    ASSERT_NOT_NULL(g);
+    ASSERT_NULL(g->first_string_arg);
+    ASSERT(g->arg_count == 0 || g->args[0].value == NULL);
+    /* getUri only formats the URL; it sends no request. */
+    const CBMCall *gu = find_call_by_callee(r, "axiosInstance.getUri");
+    ASSERT_NOT_NULL(gu);
+    ASSERT_NULL(gu->first_string_arg);
+    ASSERT(gu->arg_count == 0 || gu->args[0].value == NULL);
+    cbm_free_result(r);
+    PASS();
+}
+
 /* Issue #1249: a mux route built as `configVar + "/literal"` (Go's idiomatic
  * configurable-base-path pattern) must index the literal suffix, both for a
  * route registration and for an outbound URL built the same way. A real BFF
@@ -8605,6 +8661,7 @@ SUITE(extraction) {
     RUN_TEST(extract_razor_page_directive_routes_cshtml_view);
     RUN_TEST(extract_razor_layout_without_page_has_no_route);
     RUN_TEST(extract_ts_template_string_url_issue1006);
+    RUN_TEST(extract_ts_config_object_url_issue2235);
     RUN_TEST(extract_go_binary_concat_url_issue1249);
     RUN_TEST(extract_go_binary_concat_url_no_literal_suffix_issue1249);
     RUN_TEST(extract_ts_url_builder_issue1009);
