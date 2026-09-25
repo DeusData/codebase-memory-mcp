@@ -60,7 +60,13 @@ extern "C" {
 
 /// Free any memory allocated for this array. Note that this does not free any
 /// memory allocated for the array's contents.
-#define array_delete(self) _array__delete((self), (void *)(self)->contents, sizeof(*self))
+#define array_delete(self)                           \
+  do {                                               \
+    if ((self)->contents) ts_free((self)->contents); \
+    (self)->contents = NULL;                         \
+    (self)->size = 0;                                \
+    (self)->capacity = 0;                            \
+  } while (0)
 
 /// Push a new `element` onto the end of the array.
 #define array_push(self, element)                                 \
@@ -130,12 +136,11 @@ extern "C" {
 /// Swap one array with another
 #define array_swap(self, other)                                     \
   do {                                                              \
-    struct Swap swapped_contents = _array__swap(                    \
-      (void *)(self)->contents, &(self)->size, &(self)->capacity,   \
-      (void *)(other)->contents, &(other)->size, &(other)->capacity \
-    );                                                              \
-    (self)->contents = swapped_contents.self_contents;              \
-    (other)->contents = swapped_contents.other_contents;            \
+    void *_array_swap_tmp = (void *)(self)->contents;               \
+    (self)->contents = (other)->contents;                           \
+    (other)->contents = _array_swap_tmp;                            \
+    _array__swap(&(self)->size, &(self)->capacity,                  \
+                 &(other)->size, &(other)->capacity);               \
   } while (0)
 
 /// Get the size of the array contents
@@ -188,12 +193,6 @@ extern "C" {
 // The `Array` type itself was not altered as a solution in order to avoid breakage
 // with existing consumers (in particular, parsers with external scanners).
 
-/// This is not what you're looking for, see `array_delete`.
-static inline void _array__delete(void *self, void *contents, size_t self_size) {
-  if (contents) ts_free(contents);
-  if (self) memset(self, 0, self_size);
-}
-
 /// This is not what you're looking for, see `array_erase`.
 static inline void _array__erase(void* self_contents, uint32_t *size,
                                 size_t element_size, uint32_t index) {
@@ -228,31 +227,15 @@ static inline void *_array__assign(void* self_contents, uint32_t *self_size, uin
   return new_contents;
 }
 
-struct Swap {
-  void *self_contents;
-  void *other_contents;
-};
-
 /// This is not what you're looking for, see `array_swap`.
-// static inline void _array__swap(Array *self, Array *other) {
-static inline struct Swap _array__swap(void *self_contents, uint32_t *self_size, uint32_t *self_capacity,
-                               void *other_contents, uint32_t *other_size, uint32_t *other_capacity) {
-  void *new_self_contents = other_contents;
-  uint32_t new_self_size = *other_size;
-  uint32_t new_self_capacity = *other_capacity;
-
-  void *new_other_contents = self_contents;
-  *other_size = *self_size;
-  *other_capacity = *self_capacity;
-
-  *self_size = new_self_size;
-  *self_capacity = new_self_capacity;
-
-  struct Swap out = {
-    .self_contents = new_self_contents,
-    .other_contents = new_other_contents,
-  };
-  return out;
+static inline void _array__swap(uint32_t *self_size, uint32_t *self_capacity,
+                               uint32_t *other_size, uint32_t *other_capacity) {
+  uint32_t tmp_size = *self_size;
+  uint32_t tmp_capacity = *self_capacity;
+  *self_size = *other_size;
+  *self_capacity = *other_capacity;
+  *other_size = tmp_size;
+  *other_capacity = tmp_capacity;
 }
 
 /// This is not what you're looking for, see `array_push` or `array_grow_by`.
