@@ -5193,6 +5193,59 @@ TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537) {
 }
 
 #ifdef CBM_ENABLE_TEST_SEAMS
+/* #1687: on a WSL DrvFs mount (/mnt/e, default 0777) the ancestor refusal is
+ * correct but used to leave the user guessing. The gate must still refuse, and
+ * the detail must now name the containing directory AND the WSL remedy. */
+TEST(daemon_ipc_posix_wsl_drvfs_refusal_names_remedy_issue1687) {
+    char parent[TEST_PATH_CAP];
+    char ancestor[TEST_PATH_CAP];
+    char cache[TEST_PATH_CAP];
+    char detail[512] = {0};
+    char plain_detail[512] = {0};
+    bool paths_ok = false;
+    bool ancestor_ready = false;
+    bool refused = false;
+    bool plain_refused = false;
+
+    if (ipc_test_parent_new(parent, "posix-wsl-drvfs")) {
+        int a = snprintf(ancestor, sizeof(ancestor), "%s/e", parent);
+        int c = snprintf(cache, sizeof(cache), "%s/codebase_memory_cache", ancestor);
+        paths_ok = a > 0 && a < (int)sizeof(ancestor) && c > 0 && c < (int)sizeof(cache);
+    }
+    if (paths_ok) {
+        ancestor_ready = mkdir(ancestor, 0777) == 0 && chmod(ancestor, 0777) == 0;
+    }
+    if (ancestor_ready) {
+        cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(true);
+        refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        cbm_daemon_ipc_posix_force_wsl_drvfs_for_test(false);
+        (void)snprintf(detail, sizeof(detail), "%s", cbm_daemon_ipc_validation_detail());
+        plain_refused = !cbm_daemon_ipc_private_directory_secure(cache);
+        (void)snprintf(plain_detail, sizeof(plain_detail), "%s",
+                       cbm_daemon_ipc_validation_detail());
+    }
+
+    (void)rmdir(cache);
+    (void)rmdir(ancestor);
+    ipc_test_remove_flat_dir(parent);
+
+    ASSERT_TRUE(paths_ok);
+    ASSERT_TRUE(ancestor_ready);
+    ASSERT_TRUE(refused); /* policy unchanged: still refused */
+    ASSERT_NOT_NULL(strstr(detail, "CONTAINING 'codebase_memory_cache'"));
+    ASSERT_NOT_NULL(strstr(detail, "/etc/wsl.conf"));
+    ASSERT_NOT_NULL(strstr(detail, "metadata,umask=22,fmask=11"));
+    ASSERT_NOT_NULL(strstr(detail, "wsl --shutdown"));
+    ASSERT_NOT_NULL(strstr(detail, "~/.cache"));
+    /* The remedy must fit whole, not be clipped by the detail buffer. */
+    ASSERT_NOT_NULL(strstr(detail, "(e.g. ~/.cache)"));
+    /* Off DrvFs the generic message stays and carries no WSL advice. */
+    ASSERT_TRUE(plain_refused);
+    ASSERT_NOT_NULL(strstr(plain_detail, "CONTAINING 'codebase_memory_cache'"));
+    ASSERT_NULL(strstr(plain_detail, "wsl.conf"));
+    PASS();
+}
+
 /* #1830: /proc/self/uid_map single-uid detection. A single-uid map is exactly
  * one line "<inside> <outside> 1" whose inside id is our euid; anything else —
  * the init map, a count other than 1, a foreign inside id, extra lines, or junk
@@ -5517,6 +5570,7 @@ SUITE(daemon_ipc) {
     RUN_TEST(daemon_ipc_posix_group_writable_ancestor_is_admitted_issue1537);
     RUN_TEST(daemon_ipc_posix_world_writable_ancestor_still_refused_issue1537);
 #ifdef CBM_ENABLE_TEST_SEAMS
+    RUN_TEST(daemon_ipc_posix_wsl_drvfs_refusal_names_remedy_issue1687);
     RUN_TEST(daemon_ipc_posix_uid_map_single_uid_parse_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_ancestor_tolerated_only_in_single_uid_ns_issue1830);
     RUN_TEST(daemon_ipc_posix_overflow_uid_is_never_cached_issue1830);
