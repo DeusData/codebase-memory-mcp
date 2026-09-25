@@ -26,6 +26,11 @@
 #include "test_framework.h"
 #include "test_helpers.h"
 #include "git/git_context.h"
+#include "foundation/compat.h"
+#include "foundation/git_env.h"
+#include "pipeline/pipeline_internal.h"
+
+#include <stdlib.h>
 
 #include <stdio.h>
 #include <string.h>
@@ -59,6 +64,94 @@ static int make_git_repo(const char *dir) {
     if (git_run(dir, "commit -q -m init") != 0) return -1;
     return 0;
 }
+#endif /* _WIN32 */
+
+#ifndef _WIN32
+/* ── Inherited repository-local git environment (#2003) ────────────
+ * A cbm started from a git hook (or an editor that exports GIT_DIR) inherits
+ * GIT_DIR/GIT_WORK_TREE/GIT_INDEX_FILE/..., which override `git -C <dir>`.
+ * Production must clear them for its own git children (per spawn). These
+ * tests set the hook set explicitly (the runner may clear it at startup) and
+ * restore the caller's values before asserting, so a failure never leaks the
+ * decoy environment into later tests. */
+
+typedef struct {
+    char *saved[CBM_GIT_REPO_ENV_VAR_COUNT];
+    bool present[CBM_GIT_REPO_ENV_VAR_COUNT];
+} git_env_snapshot_t;
+
+static void git_env_hook_enter(git_env_snapshot_t *snap, const char *decoy) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        const char *v = getenv(cbm_git_repo_env_vars[i]);
+        snap->present[i] = v != NULL;
+        snap->saved[i] = v ? strdup(v) : NULL;
+    }
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s/.git", decoy);
+    cbm_setenv("GIT_DIR", buf, 1);
+    cbm_setenv("GIT_COMMON_DIR", buf, 1);
+    cbm_setenv("GIT_WORK_TREE", decoy, 1);
+    snprintf(buf, sizeof(buf), "%s/.git/index", decoy);
+    cbm_setenv("GIT_INDEX_FILE", buf, 1);
+    snprintf(buf, sizeof(buf), "%s/.git/objects", decoy);
+    cbm_setenv("GIT_OBJECT_DIRECTORY", buf, 1);
+    cbm_setenv("GIT_PREFIX", "", 1);
+}
+
+static void git_env_hook_leave(git_env_snapshot_t *snap) {
+    for (int i = 0; i < CBM_GIT_REPO_ENV_VAR_COUNT; i++) {
+        if (snap->present[i]) {
+            cbm_setenv(cbm_git_repo_env_vars[i], snap->saved[i], 1);
+        } else {
+            cbm_unsetenv(cbm_git_repo_env_vars[i]);
+        }
+        free(snap->saved[i]);
+        snap->saved[i] = NULL;
+    }
+}
+
+/* First output line of `git -C dir <args>` (run with the test's clean env). */
+static void git_read_line(const char *dir, const char *args, char *out, size_t out_sz) {
+    char cmd[1024];
+    out[0] = '\0';
+    snprintf(cmd, sizeof(cmd), "git -C \"%s\" %s 2>/dev/null", dir, args);
+    FILE *fp = popen(cmd, "r");
+    if (!fp)
+        return;
+    if (fgets(out, (int)out_sz, fp)) {
+        out[strcspn(out, "\r\n")] = '\0';
+    }
+    pclose(fp);
+}
+
+/* root/decoy: a repo on branch decoy-branch with coupled a.go+b.go commits;
+ * root/fixture: a repo on branch fixture-branch; root/plain: not a repo. */
+static int make_env_isolation_tree(const char *root) {
+    char decoy[512], fixture[512], plain[512], path[600];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(fixture, sizeof(fixture), "%s/fixture", root);
+    snprintf(plain, sizeof(plain), "%s/plain", root);
+    if (make_git_repo(decoy) != 0 || make_git_repo(fixture) != 0)
+        return -1;
+    if (git_run(decoy, "checkout -q -b decoy-branch") != 0)
+        return -1;
+    if (git_run(fixture, "checkout -q -b fixture-branch") != 0)
+        return -1;
+    for (int i = 0; i < 3; i++) {
+        char content[32];
+        snprintf(content, sizeof(content), "package a // %d\n", i);
+        snprintf(path, sizeof(path), "%s/a.go", decoy);
+        th_write_file(path, content);
+        snprintf(path, sizeof(path), "%s/b.go", decoy);
+        th_write_file(path, content);
+        if (git_run(decoy, "add a.go b.go") != 0)
+            return -1;
+        if (git_run(decoy, "commit -q -m decoy") != 0)
+            return -1;
+    }
+    return th_mkdir_p(plain);
+}
+
 #endif /* _WIN32 */
 
 /* ── canonical_root: normal repo indexed from its root ──────────── */
@@ -232,10 +325,106 @@ TEST(canonical_root_linked_worktree) {
 #endif /* _WIN32 */
 }
 
+TEST(git_context_ignores_inherited_repo_env) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based env-isolation test not supported on Windows CI");
+#else
+    char root[256];
+    char *raw = th_mktempdir("cbm_gitenv");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
+    snprintf(root, sizeof(root), "%s", raw);
+    if (make_env_isolation_tree(root) != 0) {
+        th_rmtree(root);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    char decoy[512], fixture[512], plain[512];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(fixture, sizeof(fixture), "%s/fixture", root);
+    snprintf(plain, sizeof(plain), "%s/plain", root);
+
+    char decoy_head[128], decoy_branch[128], fixture_head[128];
+    git_read_line(decoy, "rev-parse HEAD", decoy_head, sizeof(decoy_head));
+    git_read_line(decoy, "rev-parse --abbrev-ref HEAD", decoy_branch, sizeof(decoy_branch));
+    git_read_line(fixture, "rev-parse HEAD", fixture_head, sizeof(fixture_head));
+
+    git_env_snapshot_t snap;
+    git_env_hook_enter(&snap, decoy);
+    cbm_git_context_t plain_ctx = {0};
+    int plain_rc = cbm_git_context_resolve(plain, &plain_ctx);
+    cbm_git_context_t fix_ctx = {0};
+    int fix_rc = cbm_git_context_resolve(fixture, &fix_ctx);
+    git_env_hook_leave(&snap);
+
+    bool plain_is_git = plain_ctx.is_git;
+    char fix_head[128], fix_branch[128];
+    snprintf(fix_head, sizeof(fix_head), "%s", fix_ctx.head_sha ? fix_ctx.head_sha : "");
+    snprintf(fix_branch, sizeof(fix_branch), "%s", fix_ctx.branch ? fix_ctx.branch : "");
+    bool fix_is_git = fix_ctx.is_git;
+    cbm_git_context_free(&plain_ctx);
+    cbm_git_context_free(&fix_ctx);
+
+    char decoy_head_after[128], decoy_branch_after[128];
+    git_read_line(decoy, "rev-parse HEAD", decoy_head_after, sizeof(decoy_head_after));
+    git_read_line(decoy, "rev-parse --abbrev-ref HEAD", decoy_branch_after,
+                  sizeof(decoy_branch_after));
+    th_rmtree(root);
+
+    ASSERT_EQ(plain_rc, 0);
+    ASSERT_FALSE(plain_is_git); /* a plain dir is not the decoy's repo */
+    ASSERT_EQ(fix_rc, 0);
+    ASSERT_TRUE(fix_is_git);
+    ASSERT_STR_EQ(fix_head, fixture_head); /* the fixture's HEAD, not the decoy's */
+    ASSERT_STR_EQ(fix_branch, "fixture-branch");
+    ASSERT_STR_EQ(decoy_head_after, decoy_head); /* the decoy is untouched */
+    ASSERT_STR_EQ(decoy_branch_after, decoy_branch);
+    PASS();
+#endif /* _WIN32 */
+}
+
+TEST(githistory_ignores_inherited_repo_env) {
+#ifdef _WIN32
+    SKIP_PLATFORM("git-based env-isolation test not supported on Windows CI");
+#else
+    char root[256];
+    char *raw = th_mktempdir("cbm_gitenv_hist");
+    if (!raw)
+        FAIL("th_mktempdir returned NULL");
+    snprintf(root, sizeof(root), "%s", raw);
+    if (make_env_isolation_tree(root) != 0) {
+        th_rmtree(root);
+        SKIP_PLATFORM("git not available to init a repo");
+    }
+    char decoy[512], plain[512];
+    snprintf(decoy, sizeof(decoy), "%s/decoy", root);
+    snprintf(plain, sizeof(plain), "%s/plain", root);
+
+    git_env_snapshot_t snap;
+    git_env_hook_enter(&snap, decoy);
+    cbm_githistory_result_t result = {0};
+    (void)cbm_pipeline_githistory_compute(plain, &result);
+    git_env_hook_leave(&snap);
+
+    int commits = result.commit_count;
+    int couplings = result.count;
+    free(result.couplings);
+    free(result.file_temporal);
+    th_rmtree(root);
+
+    /* A non-git directory has no history: the decoy's 3 coupled commits
+     * must not be attributed to it. */
+    ASSERT_EQ(commits, 0);
+    ASSERT_EQ(couplings, 0);
+    PASS();
+#endif /* _WIN32 */
+}
+
 /* ── Suite ──────────────────────────────────────────────────────── */
 
 SUITE(git_context) {
     RUN_TEST(canonical_root_repo_root);
     RUN_TEST(canonical_root_subdir);
     RUN_TEST(canonical_root_linked_worktree);
+    RUN_TEST(git_context_ignores_inherited_repo_env);
+    RUN_TEST(githistory_ignores_inherited_repo_env);
 }

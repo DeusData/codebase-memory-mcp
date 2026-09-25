@@ -393,6 +393,7 @@ static watcher_git_status_t watcher_git_run(cbm_watcher_t *w, project_state_t *s
         .quiet_timeout_ms = 0,
         .cancel_grace_ms = CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS,
         .delete_log_on_exit = false,
+        .strip_git_repo_env = true, /* #2003: an inherited GIT_DIR must not redirect -C */
     };
     cbm_subprocess_t *process = NULL;
     if (cbm_subprocess_spawn(&options, &process) != 0) {

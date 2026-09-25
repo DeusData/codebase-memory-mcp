@@ -74,6 +74,9 @@ typedef struct {
     size_t memory_limit_bytes;       /* Windows-only hard commit limit for the entire Job Object;
                                       * 0 => no OS-enforced memory limit */
     bool delete_log_on_exit;         /* unlink log_file after reaping */
+    bool strip_git_repo_env;         /* child env omits git's repository-local variables
+                                      * (foundation/git_env.h) — set for every git spawn so
+                                      * an inherited GIT_DIR never overrides `git -C` */
 } cbm_proc_opts_t;
 
 #define CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS 1000
