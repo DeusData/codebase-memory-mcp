@@ -1004,8 +1004,8 @@ TEST(daemon_ipc_windows_sid_trust_accepts_local_admin_rejects_foreign_500) {
     (void)CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, NULL, &builtin_needed);
     if (builtin_needed > 0) {
         builtin_admins = malloc(builtin_needed);
-        if (builtin_admins && !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins,
-                                                  &builtin_needed)) {
+        if (builtin_admins &&
+            !CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, builtin_admins, &builtin_needed)) {
             free(builtin_admins);
             builtin_admins = NULL;
         }
@@ -5362,7 +5362,8 @@ TEST(daemon_ipc_posix_single_uid_userns_real_smoke_issue1830) {
     if (WEXITSTATUS(status) != 0 && WEXITSTATUS(status) != 1) {
         char unexpected[128];
         (void)snprintf(unexpected, sizeof(unexpected),
-                       "userns probe exited %d -- not a security verdict", WEXITSTATUS(status));
+                       "userns probe exited %d -- not a security verdict",
+                       WEXITSTATUS(status));
         FAIL(unexpected);
     }
     ASSERT_EQ(0, WEXITSTATUS(status));

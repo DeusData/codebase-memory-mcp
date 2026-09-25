@@ -332,9 +332,9 @@ TEST(version_cohort_conflict_is_retried_until_the_deadline) {
 
     /* An indefinite deadline never waits on a conflicting holder. */
     retries_before = cbm_version_cohort_conflict_retries_for_testing();
-    ASSERT_EQ(
-        cbm_version_cohort_acquire(second, &requested, UINT64_MAX, &requested_lease, &conflict),
-        CBM_VERSION_COHORT_CONFLICT);
+    ASSERT_EQ(cbm_version_cohort_acquire(second, &requested, UINT64_MAX, &requested_lease,
+                                         &conflict),
+              CBM_VERSION_COHORT_CONFLICT);
     ASSERT_NULL(requested_lease);
     ASSERT_EQ(cbm_version_cohort_conflict_retries_for_testing(), retries_before);
 
