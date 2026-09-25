@@ -147,6 +147,7 @@ struct cbm_daemon_application_job {
     bool cancelled;
     bool cancel_requested;
     bool supervision_failed;
+    uint64_t request_started_ms;
     cbm_daemon_application_job_t *next;
 };
 
@@ -303,11 +304,21 @@ static void application_project_lock_release_fully(cbm_project_lock_lease_t **le
 static int application_worker_start_default(void *context, const char *args_json,
                                             size_t memory_budget_bytes, const char *marker_file,
                                             const char *quarantine_file,
+                                            uint64_t duration_origin_ms,
                                             cbm_daemon_application_worker_t *worker_out) {
     (void)context;
+    cbm_index_resource_policy_t resource_policy;
+    char error[CBM_SZ_256] = {0};
+    if (!cbm_mcp_index_policy_from_internal_args(args_json, &resource_policy, error,
+                                                 sizeof(error))) {
+        cbm_log_error("daemon.index.policy", "error", error);
+        *worker_out = NULL;
+        return -1;
+    }
     cbm_index_worker_handle_t *worker = NULL;
-    int result = cbm_index_worker_start(args_json, memory_budget_bytes, false, marker_file,
-                                        quarantine_file, &worker);
+    int result = cbm_index_worker_start_with_policy(args_json, memory_budget_bytes,
+                                                    &resource_policy, false, marker_file,
+                                                    quarantine_file, duration_origin_ms, &worker);
     *worker_out = worker;
     return result;
 }
@@ -1115,10 +1126,13 @@ static application_attempt_status_t application_job_run_attempt(cbm_daemon_appli
     }
 
     cbm_daemon_application_worker_t worker = NULL;
+    if (job->request_started_ms == 0) {
+        job->request_started_ms = cbm_index_worker_now_ms();
+    }
     application_tmp_lock();
-    int start_result =
-        application->worker_ops.start(application->worker_ops.context, job->args_json,
-                                      memory_budget_bytes, marker_path, quarantine_path, &worker);
+    int start_result = application->worker_ops.start(
+        application->worker_ops.context, job->args_json, memory_budget_bytes, marker_path,
+        quarantine_path, job->request_started_ms, &worker);
     application_tmp_unlock();
     if (start_result != 0 || !worker) {
         return application_job_cancel_requested(job) ? APPLICATION_ATTEMPT_CANCELLED
@@ -1283,6 +1297,12 @@ static application_attempt_decision_t application_consume_attempt(
         execution->successful = execution->response != NULL;
         application_attempt_free(attempt);
         return APPLICATION_ATTEMPT_DECISION_SUCCESS;
+    }
+    if (disposition == CBM_MCP_SUPERVISED_RESULT_RESOURCE_FAILURE) {
+        execution->response =
+            cbm_mcp_index_worker_resource_response(job->args_json, &attempt->result);
+        application_attempt_free(attempt);
+        return APPLICATION_ATTEMPT_DECISION_STOP;
     }
     if (disposition == CBM_MCP_SUPERVISED_RESULT_UNSAFE_TERMINAL) {
         execution->unsafe_terminal = true;
