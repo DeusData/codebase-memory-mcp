@@ -977,6 +977,65 @@ TEST(c_struct) {
     PASS();
 }
 
+/* return_type of the first definition named `name`; NULL when there is no such
+ * definition or it carries no return type. */
+static const char *def_return_type(CBMFileResult *r, const char *name) {
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].name, name) == 0) {
+            return r->defs.items[i].return_type;
+        }
+    }
+    return NULL;
+}
+
+/* PR #1245: the C grammar splits a declared return type across the `type` node,
+ * sibling type_qualifier nodes and the pointer_declarator chain wrapping the
+ * function declarator. Taking only the `type` node published `const char *` as
+ * "char". Canonical spelling: qualifiers, base type, one space, then the
+ * declarator markers unspaced (`const char *`, `char **`). */
+TEST(c_function_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r = extract("static const char *text_end(const char *text) { return text; }\n"
+                               "char **table(void) { return 0; }\n"
+                               "char const *east_const(void) { return 0; }\n"
+                               "const struct Point *find_point(void) { return 0; }\n"
+                               "volatile unsigned long *reg(void) { return 0; }\n"
+                               "char *const *frozen(void) { return 0; }\n",
+                               CBM_LANG_C, "t", "returns.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "text_end"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "table"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "east_const"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "find_point"), "const struct Point *");
+    ASSERT_STR_EQ(def_return_type(r, "reg"), "volatile unsigned long *");
+    ASSERT_STR_EQ(def_return_type(r, "frozen"), "char *const *");
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Guard for the fix above: a return type with no qualifier and no declarator
+ * marker is already correct and must come out byte-identical. */
+TEST(c_function_return_type_plain_unchanged) {
+    CBMFileResult *r = extract("int scalar(void) { return 0; }\n"
+                               "void nothing(void) {}\n"
+                               "unsigned long wide(void) { return 0; }\n"
+                               "struct Point make_point(void) { struct Point p; return p; }\n"
+                               "static inline size_t count(void) { return 0; }\n"
+                               "_Noreturn void die(void) { for (;;) {} }\n",
+                               CBM_LANG_C, "t", "plain.c");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "scalar"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "nothing"), "void");
+    ASSERT_STR_EQ(def_return_type(r, "wide"), "unsigned long");
+    ASSERT_STR_EQ(def_return_type(r, "make_point"), "struct Point");
+    ASSERT_STR_EQ(def_return_type(r, "count"), "size_t");
+    /* _Noreturn parses as a type_qualifier but is not part of the type. */
+    ASSERT_STR_EQ(def_return_type(r, "die"), "void");
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- C++ --- */
 TEST(cpp_class) {
     CBMFileResult *r = extract(
@@ -986,6 +1045,42 @@ TEST(cpp_class) {
     ASSERT_FALSE(r->has_error);
     ASSERT(has_def(r, "Class", "Widget"));
     ASSERT(has_def(r, "Method", "draw"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* PR #1245, C++ side: in-class methods go through a separate extraction path
+ * from free functions, and C++ adds reference markers (`&`, `&&`) whose
+ * reference_declarator carries no `declarator` field. */
+TEST(cpp_method_return_type_preserves_pointer_and_qualifier) {
+    CBMFileResult *r = extract("class Text {\n"
+                               "public:\n"
+                               "    const char *end() { return nullptr; }\n"
+                               "    char **table() { return nullptr; }\n"
+                               "    Text &self() { return *this; }\n"
+                               "    const Text &cself() const { return *this; }\n"
+                               "    Text *&slot() { return next_; }\n"
+                               "    Text *next_;\n"
+                               "    int width() const { return 0; }\n"
+                               "    constexpr int square(int x) const { return x * x; }\n"
+                               "};\n"
+                               "const Text &shared() { static Text t; return t; }\n"
+                               "Text &&moved(Text &t) { return static_cast<Text &&>(t); }\n"
+                               "const char *Text::c_str() const { return nullptr; }\n",
+                               CBM_LANG_CPP, "t", "text.cpp");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_STR_EQ(def_return_type(r, "end"), "const char *");
+    ASSERT_STR_EQ(def_return_type(r, "table"), "char **");
+    ASSERT_STR_EQ(def_return_type(r, "self"), "Text &");
+    ASSERT_STR_EQ(def_return_type(r, "cself"), "const Text &");
+    ASSERT_STR_EQ(def_return_type(r, "slot"), "Text *&");
+    ASSERT_STR_EQ(def_return_type(r, "width"), "int");
+    /* constexpr parses as a type_qualifier but is not part of the type. */
+    ASSERT_STR_EQ(def_return_type(r, "square"), "int");
+    ASSERT_STR_EQ(def_return_type(r, "shared"), "const Text &");
+    ASSERT_STR_EQ(def_return_type(r, "moved"), "Text &&");
+    ASSERT_STR_EQ(def_return_type(r, "c_str"), "const char *");
     cbm_free_result(r);
     PASS();
 }
@@ -8271,8 +8366,11 @@ SUITE(extraction) {
     RUN_TEST(go_interface);
     RUN_TEST(zig_function);
     RUN_TEST(c_function);
+    RUN_TEST(c_function_return_type_preserves_pointer_and_qualifier);
+    RUN_TEST(c_function_return_type_plain_unchanged);
     RUN_TEST(c_struct);
     RUN_TEST(cpp_class);
+    RUN_TEST(cpp_method_return_type_preserves_pointer_and_qualifier);
 
     /* Scripting */
     RUN_TEST(python_function);
