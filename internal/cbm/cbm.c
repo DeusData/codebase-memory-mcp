@@ -1427,6 +1427,26 @@ static void cbm_mark_pp_error_rows(TSNode n, uint8_t *rows, uint32_t row_count, 
     }
 }
 
+/* The ONE line counter for a source buffer (#1967). Every caller that asks
+ * "how many lines does this file have" uses it, so the coverage report never
+ * holds two answers for the same buffer.
+ *
+ * Convention: a '\n' TERMINATES a line; it does not open a new one. So the
+ * count is the number of '\n' that have at least one byte after them, plus
+ * one. "a\nb" and "a\nb\n" both have 2 lines (the trailing newline adds no
+ * phantom empty line, matching what an editor shows); "a\nb" without a final
+ * newline still counts its last line. An empty buffer counts as 1 line, because
+ * tree-sitter still reports row 0 for it and 1-based line maps index line 1. */
+uint32_t cbm_source_line_count(const char *src, int src_len) {
+    uint32_t n = 1;
+    for (int i = 0; i + 1 < src_len; i++) {
+        if (src[i] == '\n') {
+            n++;
+        }
+    }
+    return n;
+}
+
 /* Recovery subtraction (#963): tree-sitter error recovery plus the
  * ERROR-descending def walker often still extract constructs INSIDE a failed
  * region (verified: a function in an #ifdef-split ERROR region and even a
@@ -1444,12 +1464,7 @@ static void cbm_mark_pp_error_rows(TSNode n, uint8_t *rows, uint32_t row_count, 
  * Now the uncovered gaps are reported instead, and a gap holding only blank,
  * comment or preprocessor lines is not a miss at all. */
 static uint32_t *cbm_line_offsets(const char *src, int src_len, uint32_t *out_lines) {
-    uint32_t lines = 1;
-    for (int i = 0; i < src_len; i++) {
-        if (src[i] == '\n') {
-            lines++;
-        }
-    }
+    uint32_t lines = cbm_source_line_count(src, src_len);
     uint32_t *offs =
         (uint32_t *)cbm_alloc(CBM_MEM_CLASS_EXTRACT, (size_t)(lines + 1) * sizeof(uint32_t));
     if (!offs) {
@@ -2000,18 +2015,6 @@ static void cbm_refine_regions_with_pp_lines(cbm_error_regions_t *regs, const ui
  * becomes noise. 80% is well clear of anything real: the widest single range in
  * this repo covers 25.5% of its file, and the next widest 3.9%. */
 #define CBM_UNUSABLE_PCT 80
-
-/* Number of 1-based lines in `src`. A file that does not end with a newline
- * still has a last line, so the count is separators plus one. */
-static uint32_t cbm_count_lines(const char *src, int src_len) {
-    uint32_t n = 1;
-    for (int i = 0; i < src_len; i++) {
-        if (src[i] == '\n' && i + 1 < src_len) {
-            n++;
-        }
-    }
-    return n;
-}
 
 /* Serialize collected regions as "start-end,start-end,...", with a trailing
  * ",+<N>" when the cap threw N ranges away.
@@ -2659,12 +2662,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
                      * total loss (root is ERROR), because then it vouches for
                      * nothing and there is no refinement to make. */
                     if (strcmp(ts_node_type(pp_root), "ERROR") != 0) {
-                        uint32_t orig_lines = 1;
-                        for (int ci = 0; ci < source_len; ci++) {
-                            if (source[ci] == '\n') {
-                                orig_lines++;
-                            }
-                        }
+                        uint32_t orig_lines = cbm_source_line_count(source, source_len);
                         uint8_t *map = (uint8_t *)cbm_arena_alloc(a, (size_t)orig_lines + 2);
                         int exp_lines = preprocessed->expanded_line_count;
                         uint8_t *bad_rows =
@@ -2860,7 +2858,7 @@ static CBMFileResult *extract_file_ex_body(const char *source, int source_len, C
              * so the report can say "read the source" instead. See
              * parse_unusable in cbm.h for which files land here and why. */
             if (regs.count == 1 && regs.dropped == 0) {
-                uint32_t total = cbm_count_lines(source, source_len);
+                uint32_t total = cbm_source_line_count(source, source_len);
                 uint32_t span = regs.ends[0] - regs.starts[0] + 1;
                 if (total > 0 && span * 100 >= total * CBM_UNUSABLE_PCT) {
                     result->parse_unusable = true;

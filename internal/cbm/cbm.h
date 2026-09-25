@@ -857,6 +857,11 @@ uint64_t cbm_usage_field_lookup_test_work(void);
 uint64_t cbm_usage_slow_parent_fallback_test_count(void);
 #endif
 
+// Number of 1-based lines in a source buffer. The single line-count convention
+// for coverage reporting (#1967): a trailing '\n' ends the last line and opens
+// no new one; an empty buffer counts as 1 line. See the definition in cbm.c.
+uint32_t cbm_source_line_count(const char *src, int src_len);
+
 // Toggle C/C++ preprocessor Macro-node extraction (#375). The pipeline enables
 // it only for full/advanced index modes (it dominates extraction on macro-dense
 // codebases). Default ON. Set before extraction; read-only during.
