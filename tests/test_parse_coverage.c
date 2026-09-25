@@ -983,6 +983,107 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+/* ── #1748: C# 12 collection expressions in conditional branches ─────────────
+ * The vendored tree-sitter-c-sharp (pin 88366631d598) predated upstream's
+ * collection-expression support (#402, first released in v0.23.4): `[...]` was
+ * only reachable as an element_binding_expression, so an empty or a second
+ * collection literal after `?`/`:` had no valid parse and error recovery ate
+ * the surrounding statement. Every body below is valid C# 12; the method that
+ * FOLLOWS it pins that extraction resumes after the conditional. */
+#define CS_1748_WRAP(body)                         \
+    "class M\n"                                    \
+    "{\n"                                          \
+    "    async Task Go(bool c, List<int> items)\n" \
+    "    {\n" body "\n"                            \
+    "    }\n"                                      \
+    "    Task<List<int>> F() => null;\n"           \
+    "    void AfterConditional() { }\n"            \
+    "}\n"
+
+TEST(cs_collection_expression_in_conditional_is_complete_issue1748) {
+    static const char *const bodies[] = {
+        /* the reported shape: wrapped ternary, empty collection first */
+        CS_1748_WRAP("        var x = c\n            ? []\n            : await F();"),
+        CS_1748_WRAP("        var x = c ? []\n            : await F();"),
+        CS_1748_WRAP("        List<int> x = c\n            ? []\n            : [items.First()];"),
+        /* both branches collection expressions, single line */
+        CS_1748_WRAP("        List<int> x = c ? [] : [1];"),
+        /* single-line, single collection branch (also failed on the old pin) */
+        CS_1748_WRAP("        var x = c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? [] : await F();"),
+        CS_1748_WRAP("        return c ? [] : items;"),
+        CS_1748_WRAP("        if (c) return c ? [] : items;"),
+        CS_1748_WRAP("        var x = c ? items : [];"),
+        CS_1748_WRAP("        var x = c switch { true => [], _ => items };"),
+        CS_1748_WRAP("        int[] a = [1, 2, ..items];"),
+        /* control: the same wrapped shape without a collection expression */
+        CS_1748_WRAP("        var x = c\n            ? null\n            : await F();"),
+    };
+    int failures = 0;
+    for (size_t i = 0; i < sizeof(bodies) / sizeof(bodies[0]); i++) {
+        CBMFileResult *r = do_extract(bodies[i], CBM_LANG_CSHARP, "M.cs");
+        ASSERT_NOT_NULL(r);
+        bool partial = r->parse_incomplete;
+        bool has_after = has_def(r, "AfterConditional");
+        if (partial || !has_after) {
+            fprintf(stderr, "  case %zu: partial=%d ranges=%s after_def=%d\n", i, partial,
+                    r->error_ranges ? r->error_ranges : "(none)", has_after);
+            failures++;
+        }
+        cbm_free_result(r);
+    }
+    if (failures != 0) {
+        FAIL("valid C# 12 collection expressions in conditional branches must parse completely");
+    }
+    PASS();
+}
+
+/* Calls nested in a collection expression (element and spread) must still be
+ * extracted after the refresh moved them under collection_expression /
+ * expression_element / spread_element (previously element_binding_expression /
+ * argument / range_expression). */
+TEST(cs_calls_inside_collection_expression_extracted_issue1748) {
+    const char *src = "class M\n"
+                      "{\n"
+                      "    int[] Build(bool c)\n"
+                      "    {\n"
+                      "        return c ? [] : [Head(), ..Tail()];\n"
+                      "    }\n"
+                      "    int Head() => 1;\n"
+                      "    int[] Tail() => null;\n"
+                      "}\n";
+    CBMFileResult *r = do_extract(src, CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    bool partial = r->parse_incomplete;
+    bool head = false;
+    bool tail = false;
+    for (int i = 0; i < r->calls.count; i++) {
+        const char *n = r->calls.items[i].callee_name;
+        if (n && strcmp(n, "Head") == 0) {
+            head = true;
+        }
+        if (n && strcmp(n, "Tail") == 0) {
+            tail = true;
+        }
+    }
+    cbm_free_result(r);
+    ASSERT_FALSE(partial);
+    ASSERT_TRUE(head);
+    ASSERT_TRUE(tail);
+    PASS();
+}
+
+/* GUARD: the refreshed grammar must not hide genuinely broken C#. */
+TEST(cs_malformed_conditional_remains_partial_issue1748) {
+    CBMFileResult *r =
+        do_extract(CS_1748_WRAP("        var x = c ? ] : ;"), CBM_LANG_CSHARP, "M.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_NOT_NULL(r->error_ranges);
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1023,4 +1124,7 @@ SUITE(parse_coverage) {
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
     RUN_TEST(coverage_range_never_covers_an_extracted_definition);
     RUN_TEST(coverage_gap_of_only_comments_is_not_a_miss);
+    RUN_TEST(cs_collection_expression_in_conditional_is_complete_issue1748);
+    RUN_TEST(cs_calls_inside_collection_expression_extracted_issue1748);
+    RUN_TEST(cs_malformed_conditional_remains_partial_issue1748);
 }

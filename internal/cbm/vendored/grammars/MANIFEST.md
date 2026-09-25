@@ -29,6 +29,26 @@ The grammars were originally vendored as bare `parser.c`+`scanner.c` with **no r
   The table uses `UPSTREAM-RELEASE` because this refresh verified the tagged
   upstream release itself but did not independently verify a current registry
   pin; it intentionally does not claim `VERIFIED-NVIM` or `VERIFIED-BOTH`.
+- **c_sharp** (refreshed 2026-09-25, #1748): byte-for-byte generated bundle
+  (`parser.c`, `scanner.c`, `tree_sitter/{alloc,array,parser}.h`) from
+  [tree-sitter/tree-sitter-c-sharp](https://github.com/tree-sitter/tree-sitter-c-sharp)
+  tag `v0.23.5`, full commit `cac6d5fb595f5811a076336682d5d595ac1c9e85` (ABI 15,
+  unchanged), replacing `88366631d598`. The refresh picks up upstream's C# 12
+  collection-expression support (#402, first released in v0.23.4): new named
+  nodes `collection_expression`, `collection_element`, `expression_element`,
+  `spread_element` (purely additive; no node type was removed or renamed, and
+  `scanner.c` is content-identical). Before it, `[...]` literals only parsed as
+  `element_binding_expression`, so `c ? [] : x` and similar conditionals were
+  reported as parse_partial. Upstream HEAD (`9150f7d56bb4`, C# 14 support) was
+  checked and gives identical results on the #1748 cases and the dotnet/runtime
+  corpus residuals, so the release tag was taken. Upstream's generated files
+  were copied from the tag checkout; no upstream JS/build code was run. The
+  existing MIT `LICENSE` is byte-identical to upstream at the tag (SHA-256
+  `778fb7d63b8c1844da315648c02f325c4713a6f4a5d19644fd413421422776d3`).
+  Previous vendored copies differed from the pin only by stripped trailing
+  newlines; the new files keep upstream's bytes exactly. Per-file SHA-256
+  values are pinned in `scripts/vendored-checksums.txt`. Regression coverage:
+  the `cs_*_issue1748` tests in `tests/test_parse_coverage.c`.
 - **objectscript_udl / objectscript_routine** (added 2026-06-24): vendored from [intersystems/tree-sitter-objectscript](https://github.com/intersystems/tree-sitter-objectscript) @ `a7ffcdf` — MIT, the InterSystems-official grammars (a niche vendor language, hence `vendor-maintained`, not in nvim-treesitter/Helix). **Re-vendor note:** each `scanner.c`'s upstream `#include "../../common/scanner.h"` is repointed to a per-directory `objectscript_common.h` (a verbatim copy of upstream `common/scanner.h`), because this repo's shared `vendored/common/scanner.h` belongs to the cfml/fsharp grammars and differs. The generated `parser.c`/`scanner.c` are otherwise byte-for-byte upstream — on re-vendor, re-apply only that single include rename. **Local modification (2026-07-16):** in `objectscript_common.h`, two loop counters `uint8_t i` were widened to `int i` (the `reverse_marker` scan and the `html_marker_buffer` reversal) to clear CodeQL `cpp/comparison-with-wider-type` — a false positive in practice (both lengths are hard-bounded by `MARKER_BUFFER_MAX_LEN = 30`, so `uint8_t` could never wrap), fixed for cleanliness. On re-vendor, re-apply this widening too (or upstream it at intersystems/tree-sitter-objectscript).
 - **mojo** (added 2026-07-01): vendored from [lsh/tree-sitter-mojo](https://github.com/lsh/tree-sitter-mojo) @ `33193a99afe6` — MIT, ABI 15. Helix tracks `lsh/tree-sitter-mojo` as its Mojo grammar source, but the Helix-pinned commit (`3d7c53b8038f`) no longer resolves in the upstream repository after a force-push, so this vendor uses current upstream `main` rather than the stale registry SHA. Security review covered only the vendored C surface (`parser.c`, `scanner.c`, `tree_sitter/*.h`) plus upstream license/provenance metadata; no package manager hooks, workflow files, prompt/agent instruction files, or generated lockfiles were vendored.
 - **arkts** (added 2026-08-26): **first-party derivative** — a fork of [tree-sitter/tree-sitter-typescript](https://github.com/tree-sitter/tree-sitter-typescript)'s `typescript` dialect pinned @ `75b3874edb2d` (v0.23.2, the same commit our vendored typescript/tsx come from), on the tree-sitter-javascript base @ `3a837b6f3658` (v0.23.1, the version upstream's own package-lock pins), extended with ArkTS/ArkUI syntax (`@Component struct` declarations, UI-DSL trailing-closure calls with post-block attribute chains, decorated function declarations, `import lazy`, `@Extend`/`@Styles` leading-dot attribute chains, anonymous `stateStyles` style blocks). Grammar source + corpus tests live in `tools/tree-sitter-arkts/`; regenerate with `npx tree-sitter-cli@0.25.10 generate` (ABI 15). **External scanner:** `scanner.c` is a symbol-rename trampoline; `_common_scanner.h` is byte-identical (same SHA-256) to the reviewed `typescript/_common_scanner.h` already shipped. **LICENSE:** tree-sitter-typescript's MIT text **verbatim and byte-identical** (© 2017 Max Brunsfeld) — which is what MIT requires of a derivative work, and what lets the provenance audit byte-verify it against upstream rather than take a note on trust. The fork is registered in the audit's `FORKS` map. Our own copyright for the ArkTS additions, and the tree-sitter-javascript attribution (© 2014 Max Brunsfeld), live with the SOURCE in `tools/tree-sitter-arkts/grammar.js` and in `THIRD_PARTY.md`, which is what ships in the release archives.
@@ -106,7 +126,7 @@ row instead.
 | bitbake | 14 | tree-sitter-grammars/tree-sitter-bitbake | `a5d04fdb5a69` | VERIFIED-BOTH | ✅ |
 | blade | 15 | EmranMR/tree-sitter-blade | `b9436b7b9369` | VERIFIED-BOTH | ✅ |
 | c | 15 | tree-sitter/tree-sitter-c | `ae19b676b13b` | VERIFIED-BOTH | ✅ |
-| c_sharp | 15 | tree-sitter/tree-sitter-c-sharp | `88366631d598` | VERIFIED-BOTH | ✅ |
+| c_sharp | 15 | tree-sitter/tree-sitter-c-sharp | `cac6d5fb595f` | UPSTREAM-RELEASE | ✅ |
 | cairo | 14 | tree-sitter-grammars/tree-sitter-cairo | `6238f609bea2` | VERIFIED-NVIM | ✅ |
 | capnp | 14 | tree-sitter-grammars/tree-sitter-capnp | `7b0883c03e5e` | VERIFIED-BOTH | ✅ |
 | clojure | 14 | sogaiu/tree-sitter-clojure | `e43eff80d17c` | VERIFIED-BOTH | ✅ |
