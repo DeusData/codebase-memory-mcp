@@ -983,6 +983,83 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+/* ── #1736: a lone '&' in JSX is text, not a parse failure ────────────────
+ * Upstream tree-sitter-javascript (and the tsx dialect built on it) accepted
+ * '&' inside a JSX string only before a space/digit or as a complete
+ * character reference, and never inside JSX text, so `href="...?a=1&b=2"`
+ * (the reporter's Google Fonts URL) or `<p>Tom &Jerry</p>` produced an ERROR
+ * node and a parse_partial flag. Both grammars are now self-maintained forks
+ * (tools/tree-sitter-javascript, tools/tree-sitter-tsx). Each case wraps the
+ * JSX in a component and puts a second function AFTER it, so a pass also
+ * proves the definitions around the JSX are extracted. */
+static const char *const JSX_AMP_BODIES[] = {
+    /* the #1736 shape: '&' + letter in a double-quoted attribute */
+    "<link href=\"https://fonts.x/css2?family=Inter:wght@300;400&family=Syne&display=swap\" />",
+    "<link href='https://x.com/a?a=1&b=2' />", /* single-quoted attribute */
+    "<p title=\"a&\">x</p>",                   /* '&' right before the quote */
+    "<p>Tom &Jerry</p>",                       /* '&' + letter in JSX text */
+    "<p>Tom & Jerry</p>",                      /* '&' + space in JSX text */
+    "<p>x &1 y</p>",                           /* '&' + digit in JSX text */
+    /* controls: references keep parsing; '& ' / '&1' in attributes */
+    "<p title=\"x&amp;y&#38;z & w &1\">A&amp;B &#38; C</p>",
+};
+
+static const struct {
+    CBMLanguage lang;
+    const char *path;
+} JSX_AMP_LANGS[] = {
+    {CBM_LANG_JAVASCRIPT, "app/page.js"},
+    {CBM_LANG_JAVASCRIPT, "app/page.jsx"},
+    {CBM_LANG_TSX, "app/layout.tsx"},
+};
+
+enum { JSX_AMP_SRC_CAP = 512 };
+
+TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736) {
+    size_t nb = sizeof(JSX_AMP_BODIES) / sizeof(JSX_AMP_BODIES[0]);
+    size_t nl = sizeof(JSX_AMP_LANGS) / sizeof(JSX_AMP_LANGS[0]);
+    int failures = 0;
+    for (size_t l = 0; l < nl; l++) {
+        for (size_t b = 0; b < nb; b++) {
+            char src[JSX_AMP_SRC_CAP];
+            snprintf(src, sizeof(src),
+                     "export default function Page() {\n  return (\n    %s\n  );\n}\n"
+                     "export function After() {\n  return 1;\n}\n",
+                     JSX_AMP_BODIES[b]);
+            CBMFileResult *r = do_extract(src, JSX_AMP_LANGS[l].lang, JSX_AMP_LANGS[l].path);
+            ASSERT_NOT_NULL(r);
+            bool bad = r->parse_incomplete || !has_def(r, "Page") || !has_def(r, "After");
+            if (bad) {
+                fprintf(stderr, "  %s flagged=%d ranges=%s body=%s\n", JSX_AMP_LANGS[l].path,
+                        (int)r->parse_incomplete, r->error_ranges ? r->error_ranges : "(none)",
+                        JSX_AMP_BODIES[b]);
+                failures++;
+            }
+            cbm_free_result(r);
+        }
+    }
+    ASSERT_EQ(failures, 0);
+    PASS();
+}
+
+/* GUARD against an inert test: the same wrapper with genuinely broken JSX is
+ * still flagged in every one of the three languages, so the green above is the
+ * grammar accepting '&', not the signal being switched off. */
+TEST(jsx_broken_markup_still_parse_partial_issue1736) {
+    size_t nl = sizeof(JSX_AMP_LANGS) / sizeof(JSX_AMP_LANGS[0]);
+    for (size_t l = 0; l < nl; l++) {
+        const char *src = "export default function Page() {\n  return (\n"
+                          "    <p title=\"a\" =>x</p>\n  );\n}\n"
+                          "export function After() {\n  return 1;\n}\n";
+        CBMFileResult *r = do_extract(src, JSX_AMP_LANGS[l].lang, JSX_AMP_LANGS[l].path);
+        ASSERT_NOT_NULL(r);
+        bool flagged = r->parse_incomplete;
+        cbm_free_result(r);
+        ASSERT_TRUE(flagged);
+    }
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1023,4 +1100,6 @@ SUITE(parse_coverage) {
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
     RUN_TEST(coverage_range_never_covers_an_extracted_definition);
     RUN_TEST(coverage_gap_of_only_comments_is_not_a_miss);
+    RUN_TEST(jsx_lone_ampersand_is_not_parse_partial_issue1736);
+    RUN_TEST(jsx_broken_markup_still_parse_partial_issue1736);
 }
