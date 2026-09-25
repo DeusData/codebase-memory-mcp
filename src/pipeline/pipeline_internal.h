@@ -282,6 +282,23 @@ static inline int cbm_pipeline_check_cancel(const cbm_pipeline_ctx_t *ctx) {
  * ei_go_import_never_binds_symbol. */
 bool cbm_import_symbol_fallback_allowed(CBMLanguage lang);
 
+/* #2127: true when the module segments preceding `name` in a Python import
+ * path (`unittest.mock.patch` -> unittest, mock) occur, in order, among the
+ * enclosing segments of `hit_qn`. Leading relative dots and ` as alias` are
+ * ignored; a path with no module chain before `name` always matches. Gates
+ * the import resolver's symbol-name fallback for Python. */
+bool cbm_python_import_path_matches_qn(const char *module_path, const char *name,
+                                       const char *hit_qn);
+
+/* #2127: true when the callee's root identifier is bound by the file's Python
+ * imports and every such binding is EXTERNAL (no IMPORTS edge from `rel_path`
+ * in `gbuf` carries its local name; NULL gbuf = none) with a module chain that
+ * contradicts `resolved_qn`. Feeds cbm_suppress_weak_import_bound_call at both
+ * resolver call sites. */
+bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const char *callee_name,
+                                           const char *resolved_qn, const cbm_gbuf_t *gbuf,
+                                           const char *project_name, const char *rel_path);
+
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
 
