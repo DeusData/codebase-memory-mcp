@@ -23,7 +23,10 @@
 
 /* ── Shared pipeline constants ─────────────────────────────────── */
 
-/* Maximum byte budget for tree-sitter extraction per file */
+/* Per-file tree-sitter parse budget, in MICROSECONDS of this thread's CPU time
+ * (5 s). Passed as cbm_extract_file*()'s timeout_micros; a generous wall-clock
+ * ceiling (CBM_PARSE_WALL_CEILING_FACTOR x, ~60 s) backstops a stuck parse.
+ * It is a time budget, not a byte budget. */
 #define CBM_EXTRACT_BUDGET 5000000
 
 /* Route node QN buffer size (must fit __route__METHOD__/full/url/path) */

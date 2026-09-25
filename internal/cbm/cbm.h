@@ -729,9 +729,6 @@ const char *cbm_index_quarantine_phase(const char *rel_path);
 void cbm_index_mark_start(const char *rel_path);
 void cbm_index_mark_done(const char *rel_path);
 
-// Extract all data from one file. Caller must call cbm_free_result().
-// source must remain valid for the duration of the call.
-// timeout_micros: per-file parse timeout in microseconds (0 = no timeout).
 /* Compact a finished result: copy everything reachable from it -- every
  * record array at exact count, every string once (interned by content within
  * the file), the retained source -- into one exact-size arena, and destroy the
@@ -767,6 +764,11 @@ void cbm_work_arena_keep_begin(void);
 /* Free the compaction scratch this thread kept (cbm_work_arena_release calls it). */
 void cbm_result_compact_release_thread(void);
 
+// Extract all data from one file. Caller must call cbm_free_result().
+// source must remain valid for the duration of the call.
+// timeout_micros: per-file tree-sitter parse budget in microseconds of the
+// calling thread's CPU time, with a wall-clock backstop of
+// CBM_PARSE_WALL_CEILING_FACTOR x the budget (0 = no budget).
 CBMFileResult *cbm_extract_file(const char *source, int source_len, CBMLanguage language,
                                 const char *project, const char *rel_path, int64_t timeout_micros,
                                 const char **extra_defines, // NULL-terminated, or NULL
