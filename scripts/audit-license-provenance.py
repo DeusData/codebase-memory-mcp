@@ -36,6 +36,9 @@ FORKS = {  # self-maintained forks: vendored LICENSE must match the original ups
     "cfml": "cfmleditor/tree-sitter-cfml",
     "cfscript": "cfmleditor/tree-sitter-cfml",
     "dotenv": "pnx/tree-sitter-dotenv",
+    # pascal: our Unicode-identifier fork (#2211) of the pin we vendored before;
+    # same routing rule as arkts -- upstream's MIT verbatim, byte-verified.
+    "pascal": "Isopod/tree-sitter-pascal",
     "qml": "yuja/tree-sitter-qmljs",
 }
 SPECIAL_NOTICE = {
