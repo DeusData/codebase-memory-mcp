@@ -773,6 +773,43 @@ TEST(csharp_interface) {
     PASS();
 }
 
+/* Issue #2071: a C# 14 extension block parses as a constructor_declaration
+ * named `extension` whose body holds the members, and has_error stays 0, so the
+ * members were dropped without any signal. They belong to the enclosing type. */
+TEST(csharp_extension_block_members) {
+    CBMFileResult *r = extract("namespace App;\n"
+                               "public static class NumberExtensions\n"
+                               "{\n"
+                               "    extension(IEnumerable<int> numbers)\n"
+                               "    {\n"
+                               "        public int SumPositive() => 0;\n"
+                               "        public static int Zero() => 0;\n"
+                               "    }\n"
+                               "}\n",
+                               CBM_LANG_CSHARP, "t", "NumberExtensions.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Class", "NumberExtensions"));
+    ASSERT(has_def(r, "Method", "SumPositive"));
+    ASSERT(has_def(r, "Method", "Zero"));
+    ASSERT_FALSE(has_def_any(r, "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
+/* The same shape is a genuine constructor inside a type actually called
+ * `extension`, and must still be emitted (#2071). */
+TEST(csharp_constructor_of_type_named_extension) {
+    CBMFileResult *r =
+        extract("namespace App { public class extension { public extension() { } } }",
+                CBM_LANG_CSHARP, "t", "extension.cs");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Method", "extension"));
+    cbm_free_result(r);
+    PASS();
+}
+
 /* --- Swift --- */
 TEST(swift_class) {
     CBMFileResult *r = extract("class Vehicle {\n    var speed: Int = 0\n    func accelerate() { "
@@ -8349,6 +8386,8 @@ SUITE(extraction) {
     RUN_TEST(ruby_module);
     RUN_TEST(csharp_class);
     RUN_TEST(csharp_interface);
+    RUN_TEST(csharp_extension_block_members);
+    RUN_TEST(csharp_constructor_of_type_named_extension);
     RUN_TEST(swift_class);
     RUN_TEST(swift_protocol);
     RUN_TEST(kotlin_function);
