@@ -31,6 +31,7 @@
 #include "foundation/platform.h"
 #include "foundation/str_util.h"
 #include "foundation/subprocess.h"
+#include "pipeline/artifact.h" /* CBM_ARTIFACT_DIR: the indexer's own output directory */
 #ifdef _WIN32
 #include "foundation/win_utf8.h"
 #define WIN32_LEAN_AND_MEAN
@@ -75,6 +76,14 @@ typedef struct {
     uint64_t last_dirty_sig;       /* committed dirty-state signature */
     uint64_t pending_dirty_sig;    /* observed at check time */
     char pending_head[CBM_SZ_128]; /* HEAD observed at check time */
+    /* Consecutive hard index failures (index_fn < 0). A hard error is
+     * usually persistent — a poisoned coordination endpoint, an unreadable
+     * DB — so retrying it at the plain poll interval re-forks a worker that
+     * fails identically, for as long as the daemon lives. #937 deliberately
+     * leaves the baseline uncommitted so the change is never lost; this
+     * decays the retry cadence so "never lost" does not also mean "retried
+     * forever". Reset to 0 by any successful reindex. */
+    int index_failures;
     /* Hop from root_path up to the repository root ("" when they are the same),
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
@@ -114,6 +123,16 @@ struct cbm_watcher {
 #define POLL_FILE_STEP 500 /* add 1s per this many files */
 #define POLL_MAX_MS 60000
 
+/* Hard index-failure backoff. Doubling per consecutive failure, capped, so a
+ * persistently failing project costs ~12 attempts/hour instead of ~480 while
+ * still recovering on its own within the ceiling once the cause clears. The
+ * shift cap keeps the intermediate value well inside int64 for any interval. */
+#define INDEX_FAIL_SHIFT_MAX 6
+#define INDEX_FAIL_CEILING_MS 300000 /* 5 min */
+/* Log a distinct line once the failures are clearly not transient, so the
+ * daemon log names the stuck project instead of only repeating the warning. */
+#define INDEX_FAIL_SUSTAINED 10
+
 /* Stale-root pruning (#286): a watched project whose root directory stays
  * missing is pruned — its cached DB is deleted and the watch entry removed.
  * Deletion is destructive (the DB can hold user-authored data such as the
@@ -142,6 +161,27 @@ static int64_t now_ns(void) {
 }
 
 /* ── Adaptive interval ──────────────────────────────────────────── */
+
+int cbm_watcher_index_backoff_ms(int interval_ms, int consecutive_failures) {
+    if (interval_ms < 0) {
+        interval_ms = 0;
+    }
+    if (consecutive_failures <= 0) {
+        return interval_ms;
+    }
+    int shift =
+        consecutive_failures < INDEX_FAIL_SHIFT_MAX ? consecutive_failures : INDEX_FAIL_SHIFT_MAX;
+    int64_t delay = (int64_t)interval_ms << shift;
+    if (delay > INDEX_FAIL_CEILING_MS) {
+        delay = INDEX_FAIL_CEILING_MS;
+    }
+    /* Backing off must never schedule SOONER than the project's own cadence.
+     * Unreachable today (POLL_MAX_MS < the ceiling), but clamping here keeps
+     * the function monotonic for every input rather than only for the inputs
+     * the current constants can produce — the caller's contract is "a delay
+     * that never shrinks as failures accumulate". */
+    return (int)(delay < interval_ms ? interval_ms : delay);
+}
 
 int cbm_watcher_poll_interval_ms(int file_count) {
     int ms = POLL_BASE_MS + ((file_count / POLL_FILE_STEP) * CBM_MSEC_PER_SEC);
@@ -631,12 +671,31 @@ static watcher_git_status_t git_dirty_signature(cbm_watcher_t *w, project_state_
      * watched at a sub-package of a monorepo reindexes whenever any SIBLING
      * package changes, because git reports the whole repository's dirty state
      * regardless of -C. Paths stay repository-relative either way, which is
-     * what repo_cdup is for. */
-    const char *status_argv[] = {"git",    "--no-optional-locks",
-                                 "-C",     state->root_path,
-                                 "status", "--porcelain",
-                                 "-uall",  "-z",
-                                 "--",     ".",
+     * what repo_cdup is for.
+     *
+     * `:(exclude).codebase-memory` drops the indexer's OWN output. After every
+     * publish the pipeline re-exports <root>/.codebase-memory/ whenever an
+     * artifact already lives there (once persisted, or committed by the team
+     * and checked out into every worktree). Folding that write into the
+     * signature made each successful reindex look like a NEW dirty state on
+     * the next poll, and the daemon re-triggered itself forever (#1953: reap
+     * clean -> watcher.changed, 100+ times in 15 minutes, index workers
+     * pinned). Nothing under that directory is ever an index input (discovery
+     * skips it), so a change there can never require a reindex. The pathspec
+     * is CWD-relative, so a project watched at a monorepo sub-package excludes
+     * its own artifact directory; it is the same pathspec the exporter's
+     * clean-tree probe uses, for the same reason. */
+    const char *status_argv[] = {"git",
+                                 "--no-optional-locks",
+                                 "-C",
+                                 state->root_path,
+                                 "status",
+                                 "--porcelain",
+                                 "-uall",
+                                 "-z",
+                                 "--",
+                                 ".",
+                                 ":(exclude)" CBM_ARTIFACT_DIR,
                                  NULL};
     watcher_git_output_t output;
     watcher_git_status_t status =
@@ -1130,6 +1189,17 @@ void cbm_watcher_touch(cbm_watcher_t *w, const char *project_name) {
     cbm_mutex_unlock(&w->projects_lock);
 }
 
+int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) {
+    if (!w || !project_name) {
+        return -1;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    int failures = s ? s->index_failures : -1;
+    cbm_mutex_unlock(&w->projects_lock);
+    return failures;
+}
+
 int cbm_watcher_watch_count(cbm_watcher_t *w) {
     if (!w) {
         return 0;
@@ -1429,6 +1499,7 @@ static void poll_project(const char *key, void *val, void *ud) {
         int rc = ctx->w->index_fn(s->project_name, s->root_path, ctx->w->user_data);
         if (rc == 0) {
             ctx->reindexed++;
+            s->index_failures = 0;
             /* Commit the baselines OBSERVED AT CHECK TIME — the state whose
              * reindex just succeeded. A commit/edit landing during the
              * reindex is deliberately not absorbed: the next poll sees it
@@ -1447,11 +1518,28 @@ static void poll_project(const char *key, void *val, void *ud) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
             cbm_log_info("watcher.index.retry", "project", s->project_name);
         } else {
-            cbm_log_warn("watcher.index.err", "project", s->project_name);
+            /* itoa_buf returns one shared per-thread buffer, so two of them
+             * in one call would print the same value twice. */
+            char rc_text[CBM_SZ_32];
+            char streak_text[CBM_SZ_32];
+            if (s->index_failures < INT_MAX) {
+                s->index_failures++;
+            }
+            snprintf(rc_text, sizeof(rc_text), "%d", rc);
+            snprintf(streak_text, sizeof(streak_text), "%d", s->index_failures);
+            cbm_log_warn("watcher.index.err", "project", s->project_name, "rc", rc_text,
+                         "consecutive", streak_text);
+            if (s->index_failures == INDEX_FAIL_SUSTAINED) {
+                cbm_log_warn("watcher.index.sustained_failure", "project", s->project_name,
+                             "consecutive", streak_text);
+            }
         }
     }
 
-    s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
+    /* Failures back off; success and busy-skip keep the adaptive cadence. */
+    s->next_poll_ns =
+        ctx->now +
+        ((int64_t)cbm_watcher_index_backoff_ms(s->interval_ms, s->index_failures) * US_PER_MS);
 }
 
 /* Callback to snapshot project state pointers into an array. */

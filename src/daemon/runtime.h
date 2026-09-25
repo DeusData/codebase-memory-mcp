@@ -329,6 +329,13 @@ uint64_t cbm_daemon_runtime_service_clients_admitted_total(cbm_daemon_runtime_se
 /* Includes accepted connections still waiting for HELLO. Never exceeds the
  * configured max_clients; over-cap peers receive REJECTED before close. */
 size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_t *service);
+
+/* Re-evaluate an ephemeral generation that is lingering after its last committed
+ * client disconnected (the bounded cold-storm debounce). Retires it once the
+ * linger window elapses with no new client committing; the bound also rules out
+ * an unbounded idle hang. The host lifetime loop calls this every tick; it is a
+ * no-op unless a last-committed-client linger is armed. */
+void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service);
 size_t cbm_daemon_runtime_service_job_subscribers(cbm_daemon_runtime_service_t *service,
                                                   const char *project_key);
 uint64_t cbm_daemon_runtime_service_client_process_id(cbm_daemon_runtime_service_t *service,
@@ -441,6 +448,12 @@ typedef void (*cbm_daemon_runtime_containment_hook_t)(const char *component);
 void cbm_daemon_runtime_set_abandoned_request_join_timeout_for_testing(uint32_t timeout_ms);
 void cbm_daemon_runtime_set_containment_hook_for_testing(
     cbm_daemon_runtime_containment_hook_t hook);
+/* Cold-storm ephemeral-linger seam (2026-09). Overrides the bounded linger
+ * window the last-committed-client retirement grants while cohort participants
+ * are mid-bootstrap, so a test drives both the linger and its expiry backstop
+ * in test time. UINT32_MAX restores the production constant; any other value
+ * (0 = expire immediately) overrides. Process-global; reset it after use. */
+void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms);
 #endif
 
 #endif /* CBM_DAEMON_RUNTIME_H */

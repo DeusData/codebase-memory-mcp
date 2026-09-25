@@ -332,9 +332,9 @@ def section_crash_recovery(binary, work):
                   "(`daemon status` kept reporting it)" % daemon_pid)
             return False
         cold = run_cli(binary, cache, ["cli", "list_projects", "{}"], timeout=90)
-        if cold.returncode != 0 or "daemon start" not in out_text(cold):
-            print("RED: a cold one-shot after the daemon crash should succeed with the "
-                  "startup-tax hint:\n%s" % excerpt(out_text(cold)))
+        if cold.returncode != 0 or "daemon start" in out_text(cold):
+            print("RED: a cold one-shot after the daemon crash should succeed without "
+                  "default startup chatter:\n%s" % excerpt(out_text(cold)))
             return False
         restart = run_cli(binary, cache, ["daemon", "start"], timeout=60)
         second_pid = pid_from(out_text(restart))

@@ -258,9 +258,18 @@ static char *extract_constructor_callee(CBMArena *a, TSNode node, const char *so
 }
 
 // Try common field-based callee resolution (function, name, method fields).
+static TSNode unwrap_await_callee(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "await_expression") != 0 ||
+        ts_node_named_child_count(node) == 0) {
+        return node;
+    }
+    return ts_node_named_child(node, 0);
+}
+
 static char *extract_callee_from_fields(CBMArena *a, TSNode node, const char *source) {
     // Try "function" field
     TSNode func_node = ts_node_child_by_field_name(node, TS_FIELD("function"));
+    func_node = unwrap_await_callee(func_node);
     if (!ts_node_is_null(func_node)) {
         const char *fk = ts_node_type(func_node);
         if (strcmp(fk, "selector_expression") == 0) {
@@ -527,6 +536,17 @@ static char *extract_objc_callee(CBMArena *a, TSNode node, const char *source, c
     }
     TSNode selector = ts_node_child_by_field_name(node, TS_FIELD("selector"));
     return ts_node_is_null(selector) ? NULL : cbm_node_text(a, selector, source);
+}
+
+/* tree-sitter-elixir gives a call's arguments node no field name, so it is
+ * found positionally. Mirrors elixir_call_args() in extract_defs.c, which the
+ * definition side has always used for the same reason. */
+static TSNode elixir_call_arguments_fallback(TSNode node) {
+    TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+    if (ts_node_is_null(args) && ts_node_child_count(node) > 1) {
+        args = ts_node_child(node, 1);
+    }
+    return args;
 }
 
 // Erlang: extract callee from call node's first child.
@@ -2048,6 +2068,20 @@ static void extract_call_args(CBMExtractCtx *ctx, TSNode args, CBMCall *call) {
     for (uint32_t ai = 0; ai < argc && call->arg_count < CBM_MAX_CALL_ARGS; ai++) {
         TSNode arg_node = ts_node_named_child(args, ai);
         const char *ak = ts_node_type(arg_node);
+        /* tree-sitter lists a comment inside the argument list as a named
+         * child (Java block_comment/line_comment, C-family comment). It is
+         * not an argument: taken as one, a leading block comment became
+         * args[0] and the Route pass read its text as a URL. */
+        if (strcmp(ak, "comment") == 0 || strcmp(ak, "line_comment") == 0 ||
+            strcmp(ak, "block_comment") == 0) {
+            continue;
+        }
+        if (!call->args) {
+            call->args = cbm_arena_calloc(ctx->arena, CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+            if (!call->args) {
+                return;
+            }
+        }
         CBMCallArg *ca = &call->args[call->arg_count];
         memset(ca, 0, sizeof(*ca));
 
@@ -2246,6 +2280,61 @@ static const char *extract_binary_concat_suffix(CBMExtractCtx *ctx, TSNode node)
 }
 
 // Try to extract URL/topic from a positional argument (string or constant).
+/* Swift names its call arguments, so each one is a value_argument that may lead
+ * with a value_argument_label — the `from:` in `data(from: url)`. Return the
+ * value itself, and leave any other node exactly as it came in. */
+static TSNode swift_argument_value(TSNode arg) {
+    if (strcmp(ts_node_type(arg), "value_argument") != 0 || ts_node_named_child_count(arg) == 0) {
+        return arg;
+    }
+    TSNode val = ts_node_named_child(arg, 0);
+    if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
+        ts_node_named_child_count(arg) > 1) {
+        val = ts_node_named_child(arg, 1);
+    }
+    return val;
+}
+
+/* Swift has no URL literal, so almost no real code passes a bare string to a
+ * request. It writes `URL(string: "https://…")!` instead, and the literal then
+ * sits two levels down: past the trailing `!`, which the grammar models as a
+ * postfix_expression, and inside the constructor's own argument list.
+ *
+ * Unwrap both so that literal is as reachable as a bare one. Only the three
+ * Foundation types that take a URL string are unwrapped — any other call keeps
+ * its own meaning, and a non-literal argument such as `URL(string: base + path)`
+ * falls through to the ordinary handling unchanged. */
+static TSNode swift_unwrap_url_constructor(CBMExtractCtx *ctx, TSNode arg) {
+    /* Step past a trailing "!" or "?". */
+    if (strcmp(ts_node_type(arg), "postfix_expression") == 0) {
+        TSNode target = ts_node_child_by_field_name(arg, TS_FIELD("target"));
+        if (!ts_node_is_null(target)) {
+            arg = target;
+        }
+    }
+    if (strcmp(ts_node_type(arg), "call_expression") != 0) {
+        return arg;
+    }
+    TSNode callee = ts_node_named_child(arg, 0);
+    if (ts_node_is_null(callee) || strcmp(ts_node_type(callee), "simple_identifier") != 0) {
+        return arg;
+    }
+    const char *name = cbm_node_text(ctx->arena, callee, ctx->source);
+    if (!name || (strcmp(name, "URL") != 0 && strcmp(name, "URLComponents") != 0 &&
+                  strcmp(name, "URLRequest") != 0)) {
+        return arg;
+    }
+    TSNode suffix = cbm_find_child_by_kind(arg, "call_suffix");
+    if (ts_node_is_null(suffix)) {
+        return arg;
+    }
+    TSNode inner = cbm_find_child_by_kind(suffix, "value_arguments");
+    if (ts_node_is_null(inner) || ts_node_named_child_count(inner) == 0) {
+        return arg;
+    }
+    return swift_argument_value(ts_node_named_child(inner, 0));
+}
+
 static const char *extract_positional_url(CBMExtractCtx *ctx, TSNode arg, const char *ak) {
     /* JS/TS template literals: `/things/${id}` normalizes to "/things/{}" so the
      * client URL joins the server route's canonical placeholder (issue #1006). */
@@ -2289,15 +2378,12 @@ static const char *extract_url_or_topic_arg(CBMExtractCtx *ctx, TSNode args) {
         }
         /* Swift wraps each argument in a value_argument that may lead with its
          * label, so `data(from: url)` would otherwise yield the label `from`
-         * rather than the value. Step past a leading value_argument_label. */
-        if (strcmp(ts_node_type(arg), "value_argument") == 0 &&
-            ts_node_named_child_count(arg) > 0) {
-            TSNode val = ts_node_named_child(arg, 0);
-            if (strcmp(ts_node_type(val), "value_argument_label") == 0 &&
-                ts_node_named_child_count(arg) > 1) {
-                val = ts_node_named_child(arg, 1);
-            }
-            arg = val;
+         * rather than the value. */
+        arg = swift_argument_value(arg);
+        /* A Swift URL is usually built rather than written bare, and the
+         * literal then sits inside that constructor. */
+        if (ctx->language == CBM_LANG_SWIFT) {
+            arg = swift_unwrap_url_constructor(ctx, arg);
         }
         const char *ak = ts_node_type(arg);
 
@@ -2939,6 +3025,28 @@ static char *resolve_objectscript_instance_call(CBMArena *a, TSNode node, const 
  * statically-known type here, so the call must not bind by short name alone.
  * Note `self.client.send()` is NOT exempt: the receiver is `self.client`, an
  * attribute of unknown type, not `self` itself. */
+/* True when a Python attribute-call receiver is an attribute chain ROOTED at
+ * self/cls but is not self/cls itself: `self.compiler.apply_converters()` has
+ * receiver `self.compiler`, an object the class owns. The weak-member guard's
+ * unique-name exemption keys on this shape (see cbm_weak_member_unique_name_
+ * exempt): a bare parameter (`accelerator.backward()`) carries no ownership
+ * evidence and stays suppressed. Direct `self.m()` is already exempt via
+ * python_receiver_is_exempt and is deliberately NOT flagged here. */
+static bool python_receiver_rooted_at_self(CBMExtractCtx *ctx, TSNode receiver) {
+    if (ts_node_is_null(receiver) || strcmp(ts_node_type(receiver), "attribute") != 0) {
+        return false;
+    }
+    TSNode root = receiver;
+    while (!ts_node_is_null(root) && strcmp(ts_node_type(root), "attribute") == 0) {
+        root = ts_node_child_by_field_name(root, TS_FIELD("object"));
+    }
+    if (ts_node_is_null(root) || strcmp(ts_node_type(root), "identifier") != 0) {
+        return false;
+    }
+    char *name = cbm_node_text(ctx->arena, root, ctx->source);
+    return name && (strcmp(name, "self") == 0 || strcmp(name, "cls") == 0);
+}
+
 static bool python_receiver_is_exempt(CBMExtractCtx *ctx, TSNode receiver) {
     if (ts_node_is_null(receiver)) {
         return false;
@@ -3504,6 +3612,7 @@ static CBMPrimaryCalleeSelection select_primary_callee(CBMExtractCtx *ctx, TSNod
     }
 
     selection.expr = language_specific_callee_expr(ctx->language, node);
+    selection.expr = unwrap_await_callee(selection.expr);
     if (is_dynamic_callee_expr(ctx, selection.expr)) {
         selection.expr = (TSNode){0};
         return selection;
@@ -3668,6 +3777,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                 if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "attribute") == 0) {
                     TSNode obj = ts_node_child_by_field_name(fn, TS_FIELD("object"));
                     call.is_method = !python_receiver_is_exempt(ctx, obj);
+                    call.receiver_is_self_attribute = python_receiver_rooted_at_self(ctx, obj);
                 } else if (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "identifier") == 0) {
                     call.callee_is_locally_bound = python_callee_is_bound_parameter(ctx, state, fn);
                 }
@@ -3697,6 +3807,21 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
+            /* tree-sitter-elixir attaches NO field name to a call's arguments
+             * node — its whole field set is key, left, operand, operator,
+             * quoted_start, quoted_end, right, target, value — so the lookup
+             * above is always null for Elixir and first_string_arg was never
+             * populated for ANY Elixir call. That silently disabled every
+             * downstream signal keyed off a call's string argument: Phoenix
+             * route paths, HTTP/async service URLs, and config keys.
+             * cbm_elixir_call_args is the shared second-child fallback the
+             * definition side already uses. Restricted to `call` nodes —
+             * Elixir's other call kinds (`dot`, the `|>` binary_operator) have
+             * no arguments node in that position. */
+            if (ts_node_is_null(args) && ctx->language == CBM_LANG_ELIXIR &&
+                strcmp(ts_node_type(node), "call") == 0) {
+                args = elixir_call_arguments_fallback(node);
+            }
             // ObjectScript stores args under oref_method/method_args, not the
             // generic "arguments" field; macro arguments add one wrapper.
             if (ts_node_is_null(args) && is_objectscript_language(ctx->language)) {
@@ -3741,6 +3866,13 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                         if (strcmp(ack, "method_arg") != 0) {
                             continue;
+                        }
+                        if (!call.args) {
+                            call.args = cbm_arena_calloc(ctx->arena,
+                                                         CBM_MAX_CALL_ARGS * sizeof(CBMCallArg));
+                            if (!call.args) {
+                                break;
+                            }
                         }
                         CBMCallArg *ca = &call.args[call.arg_count];
                         memset(ca, 0, sizeof(*ca));

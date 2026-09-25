@@ -18,6 +18,7 @@ enum { PD_RING = 4, PD_RING_MASK = 3, PD_JSON_MARGIN = 10, PD_ESC_MARGIN = 3, PD
 enum { PD_JSON_FIELD_OVERHEAD = 6 };
 #include "pipeline/pipeline.h"
 #include <stdint.h>
+#include <ctype.h>
 #include "pipeline/pipeline_internal.h"
 #include "graph_buffer/graph_buffer.h"
 #include "foundation/log.h"
@@ -544,26 +545,92 @@ static bool objectscript_export_append_secondary_arrays(CBMFileResult *aggregate
 /* Preserve every generated class's parse diagnostics. The generated UDL
  * snippets all map back to one physical Studio Export file, so their compact
  * range lists can be concatenated using the ordinary comma separator. */
+/* Read the trailing ",+<N>" truncation marker off a range string. Returns the
+ * number of dropped ranges the marker reports, or 0 when there is no marker,
+ * and writes the length of the part before the marker to `body_len`. */
+static int objectscript_export_split_range_marker(const char *ranges, size_t *body_len) {
+    size_t len = ranges ? strlen(ranges) : 0;
+    *body_len = len;
+    if (len == 0) {
+        return 0;
+    }
+    size_t i = len;
+    while (i > 0 && isdigit((unsigned char)ranges[i - 1])) {
+        i--;
+    }
+    if (i == len || i == 0 || ranges[i - 1] != '+') {
+        return 0;
+    }
+    size_t marker = i - 1; /* index of '+' */
+    if (marker > 0 && ranges[marker - 1] == ',') {
+        marker--; /* drop the separator too */
+    }
+    *body_len = marker;
+    return atoi(ranges + i);
+}
+
+/* Join one Studio Export part's ranges onto the aggregate.
+ *
+ * One export file can hold several <Class> elements, each parsed separately,
+ * so their range strings get concatenated. A ",+<N>" truncation marker must
+ * end up ONCE, at the very end: every reader stops at the first token that is
+ * not a range, so a marker left in the middle would silently hide every range
+ * after it. Strip the marker off both sides, join the plain ranges, then add
+ * one marker back carrying the summed count. */
 static bool objectscript_export_append_error_ranges(CBMFileResult *aggregate,
                                                     const CBMFileResult *part) {
     aggregate->parse_incomplete = aggregate->parse_incomplete || part->parse_incomplete;
+    aggregate->parse_unusable = aggregate->parse_unusable || part->parse_unusable;
     aggregate->error_region_count += part->error_region_count;
     if (!part->error_ranges || !part->error_ranges[0]) {
         return true;
     }
-    const char *combined = NULL;
-    if (aggregate->error_ranges && aggregate->error_ranges[0]) {
-        combined = cbm_arena_sprintf(&aggregate->arena, "%s,%s", aggregate->error_ranges,
-                                     part->error_ranges);
+
+    size_t agg_len = 0;
+    size_t part_len = 0;
+    int dropped = 0;
+    const char *agg_body = aggregate->error_ranges;
+    if (agg_body && agg_body[0]) {
+        dropped += objectscript_export_split_range_marker(agg_body, &agg_len);
     } else {
-        combined = cbm_arena_strdup(&aggregate->arena, part->error_ranges);
+        agg_body = NULL;
+    }
+    dropped += objectscript_export_split_range_marker(part->error_ranges, &part_len);
+
+    const char *combined = NULL;
+    if (agg_body && agg_len > 0 && part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s,%.*s", (int)agg_len, agg_body,
+                                     (int)part_len, part->error_ranges);
+    } else if (agg_body && agg_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)agg_len, agg_body);
+    } else if (part_len > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%.*s", (int)part_len, part->error_ranges);
+    } else {
+        combined = cbm_arena_strdup(&aggregate->arena, "");
     }
     if (!combined) {
         return false;
     }
+    if (dropped > 0) {
+        combined = cbm_arena_sprintf(&aggregate->arena, "%s%s+%d", combined, combined[0] ? "," : "",
+                                     dropped);
+        if (!combined) {
+            return false;
+        }
+    }
     aggregate->error_ranges = combined;
     return true;
 }
+
+#if defined(CBM_COVERAGE_MARKER_TEST_API) && CBM_COVERAGE_MARKER_TEST_API
+/* Test seam. This join only fires for a Studio Export file holding several
+ * <Class> elements where a class overruns the 256-region cap — hard to reach
+ * through the pipeline, easy to get wrong, and a wrong result hides ranges
+ * without saying so. Expose the join so the marker rules can be pinned. */
+bool cbm_pipeline_coverage_marker_test_join(CBMFileResult *aggregate, const CBMFileResult *part) {
+    return objectscript_export_append_error_ranges(aggregate, part);
+}
+#endif
 
 /* Studio Export files may contain multiple <Class> elements, while the
  * pipeline cache has one slot per physical file. Extract each generated UDL
@@ -785,9 +852,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         } else if (result->parse_incomplete) {
             /* Best-effort parse-coverage signal (#963): indexed, but with
              * ERROR/MISSING regions — see pass_parallel.c (keep in sync). */
-            cbm_pipeline_add_file_error(ctx->pipeline, rel,
-                                        result->error_ranges ? result->error_ranges : "unknown",
-                                        "parse_partial");
+            cbm_pipeline_add_file_error(
+                ctx->pipeline, rel, result->error_ranges ? result->error_ranges : "unknown",
+                result->parse_unusable ? "parse_unusable" : "parse_partial");
         }
 
         /* Create nodes for each definition */

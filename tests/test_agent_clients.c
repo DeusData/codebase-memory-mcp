@@ -1174,8 +1174,13 @@ TEST(client_adapter_pi_emits_parameters_and_execute) {
     ASSERT_NOT_NULL(strstr(js, "result.content"));
     ASSERT_NULL(strstr(js, "run: (args, ctx)"));
     ASSERT_NOT_NULL(strstr(js, "parameters:"));
-    /* The registry input_schema is embedded as a JSON object literal. */
-    ASSERT_NOT_NULL(strstr(js, "\"type\":\"object\""));
+    /* TypeBox parameters schema is embedded with Type.Object syntax. */
+    ASSERT_NOT_NULL(strstr(js, "Type.Object("));
+    ASSERT_NOT_NULL(strstr(js, "Type.String("));
+    /* A numeric registry property must remain numeric in the generated schema. */
+    ASSERT_NOT_NULL(strstr(js, "depth: Type.Optional(Type.Integer("));
+    /* TypeBox import should be present. */
+    ASSERT_NOT_NULL(strstr(js, "import { Type } from 'typebox';"));
     /* Raw JSON output is required so the bridge can parse the MCP result; the
      * human-readable path would leave `call` with nothing to JSON.parse. */
     ASSERT_NOT_NULL(strstr(js, "'cli', '--json'"));
@@ -1283,6 +1288,9 @@ TEST(client_adapter_opencode_sends_the_required_hook_event) {
     ASSERT_NOT_NULL(js);
     ASSERT_NOT_NULL(strstr(js, "hook_event_name: 'PreToolUse'"));
     ASSERT_NOT_NULL(strstr(js, "tool.execute.after"));
+    ASSERT_NOT_NULL(strstr(js, "const args = input?.args ?? {};"));
+    ASSERT_NOT_NULL(strstr(js, "tool_input: args"));
+    ASSERT_NULL(strstr(js, "output?.args"));
     /* OpenCode reaches the tools over MCP already; this adapter must not
      * register any, or we reintroduce the second tool surface. */
     ASSERT_NULL(strstr(js, "registerTool"));

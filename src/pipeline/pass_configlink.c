@@ -17,9 +17,12 @@
 
 #include <stdint.h>
 #include <stdio.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include "foundation/platform.h" /* cbm_default_worker_count */
+#include "pipeline/worker_pool.h"
 #include "foundation/compat_regex.h"
 
 /* ── Config link confidence scores ───────────────────────────────── */
@@ -223,6 +226,83 @@ static int collect_code_entries(cbm_gbuf_t *gb, code_entry_t *out, int max_out) 
     return n;
 }
 
+/* The key x symbol comparison of strategy 1, per config key: every pair's
+ * verdict depends only on its two strings, so rows run in parallel and the
+ * edges are inserted afterwards in the original (config, code) order. One
+ * thread compared up to 4,096 x 8,192 pairs -- configlink's 0.93 s on the Go
+ * corpus (profile, 2026-09-17). A pair whose lengths rule both verdicts out
+ * skips the string calls: an exact match needs equal lengths, a substring one
+ * no longer than the code key. */
+typedef struct {
+    int co;
+    double confidence;
+} key_match_t;
+
+typedef struct {
+    key_match_t *items;
+    int count;
+    int cap;
+} key_match_list_t;
+
+typedef struct {
+    const config_entry_t *config;
+    const size_t *config_len;
+    int config_count;
+    const code_entry_t *code;
+    const size_t *code_len;
+    int code_count;
+    key_match_list_t *lists;
+    _Atomic int next;
+    _Atomic bool failed;
+} key_match_job_t;
+
+static double key_pair_confidence(const char *config_norm, size_t config_len, const char *code_norm,
+                                  size_t code_len) {
+    if (config_len > code_len) {
+        return 0.0;
+    }
+    if (config_len == code_len && memcmp(config_norm, code_norm, code_len) == 0) {
+        return CONF_KEY_EXACT; /* Exact match */
+    }
+    if (strstr(code_norm, config_norm) != NULL) {
+        return CONF_KEY_SUBSTRING; /* Substring match */
+    }
+    return 0.0;
+}
+
+static void key_match_worker(int worker_id, void *arg) {
+    (void)worker_id;
+    key_match_job_t *job = (key_match_job_t *)arg;
+    while (!atomic_load_explicit(&job->failed, memory_order_relaxed)) {
+        int ci = atomic_fetch_add_explicit(&job->next, SKIP_ONE, memory_order_relaxed);
+        if (ci >= job->config_count) {
+            break;
+        }
+        key_match_list_t *list = &job->lists[ci];
+        for (int co = 0; co < job->code_count; co++) {
+            double confidence = key_pair_confidence(job->config[ci].normalized, job->config_len[ci],
+                                                    job->code[co].normalized, job->code_len[co]);
+            if (confidence <= 0.0) {
+                continue;
+            }
+            if (list->count == list->cap) {
+                int cap = list->cap ? list->cap * PAIR_LEN : CBM_SZ_16;
+                key_match_t *grown =
+                    cbm_realloc(CBM_MEM_CLASS_OTHER, list->items, (size_t)cap * sizeof(*grown));
+                if (!grown) {
+                    atomic_store_explicit(&job->failed, true, memory_order_relaxed);
+                    return;
+                }
+                list->items = grown;
+                list->cap = cap;
+            }
+            list->items[list->count].co = co;
+            list->items[list->count].confidence = confidence;
+            list->count++;
+        }
+    }
+}
+
 static int strategy_key_symbols(cbm_gbuf_t *gb) {
     /* Get all Variable nodes */
     const cbm_gbuf_node_t **vars = NULL;
@@ -243,6 +323,62 @@ static int strategy_key_symbols(cbm_gbuf_t *gb) {
 
     int edge_count = 0;
 
+    size_t *config_len = cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)config_count * sizeof(size_t));
+    size_t *code_len =
+        cbm_alloc(CBM_MEM_CLASS_OTHER, (size_t)(code_count > 0 ? code_count : 1) * sizeof(size_t));
+    key_match_list_t *lists =
+        cbm_calloc(CBM_MEM_CLASS_OTHER, (size_t)config_count * sizeof(key_match_list_t));
+    bool parallel_ok = config_len && code_len && lists;
+    if (parallel_ok) {
+        for (int ci = 0; ci < config_count; ci++) {
+            config_len[ci] = strlen(config_entries[ci].normalized);
+        }
+        for (int co = 0; co < code_count; co++) {
+            code_len[co] = strlen(code_entries[co].normalized);
+        }
+        key_match_job_t job = {
+            .config = config_entries,
+            .config_len = config_len,
+            .config_count = config_count,
+            .code = code_entries,
+            .code_len = code_len,
+            .code_count = code_count,
+            .lists = lists,
+        };
+        atomic_init(&job.next, 0);
+        atomic_init(&job.failed, false);
+        int workers = cbm_default_worker_count(false);
+        cbm_parallel_for(
+            workers, key_match_worker, &job,
+            (cbm_parallel_for_opts_t){.max_workers = workers, .force_pthreads = false});
+        parallel_ok = !atomic_load_explicit(&job.failed, memory_order_relaxed);
+    }
+    if (parallel_ok) {
+        for (int ci = 0; ci < config_count; ci++) {
+            for (int m = 0; m < lists[ci].count; m++) {
+                const key_match_t *km = &lists[ci].items[m];
+                char props[CBM_SZ_512];
+                snprintf(props, sizeof(props),
+                         "{\"strategy\":\"key_symbol\",\"confidence\":%.2f,\"config_key\":\"%s\"}",
+                         km->confidence, config_entries[ci].name);
+
+                cbm_gbuf_insert_edge(gb, code_entries[km->co].node_id, config_entries[ci].node_id,
+                                     "CONFIGURES", props);
+                edge_count++;
+            }
+        }
+    }
+    for (int ci = 0; lists && ci < config_count; ci++) {
+        cbm_free(CBM_MEM_CLASS_OTHER, lists[ci].items);
+    }
+    cbm_free(CBM_MEM_CLASS_OTHER, lists);
+    cbm_free(CBM_MEM_CLASS_OTHER, config_len);
+    cbm_free(CBM_MEM_CLASS_OTHER, code_len);
+    if (parallel_ok) {
+        return edge_count;
+    }
+
+    /* Allocation failed: the one-thread comparison, as before. */
     for (int ci = 0; ci < config_count; ci++) {
         for (int co = 0; co < code_count; co++) {
             double confidence = 0.0;
@@ -350,23 +486,88 @@ static void lowercase_into(char *buf, size_t bufsize, const char *src) {
     buf[len < bufsize ? len : bufsize - SKIP_ONE] = '\0';
 }
 
-/* Match a dep name (lowercased) against an import target node.
- * Returns confidence > 0 on match, 0 on no match. */
-static double match_dep_to_import(const cbm_gbuf_node_t *target, const char *dep_lower) {
-    char target_lower[CBM_SZ_256];
-    lowercase_into(target_lower, sizeof(target_lower), target->name);
+/* One IMPORTS edge prepared for matching: its endpoints resolved and its
+ * target's name and qualified name lowercased ONCE (same truncation as before:
+ * 255 and 511 bytes). Resolving both nodes and lowercasing both strings inside
+ * the dep x import loop was the whole cost of configlink -- 0.9 s on the Go
+ * corpus, and cbm_gbuf_find_by_id's x3.1 super-linear scaling (waste
+ * sanitizer, 2026-09-17). */
+typedef struct {
+    int64_t source_id;
+    const char *target_lower; /* into one shared block */
+    const char *qn_lower;     /* NULL when the target has no qualified name */
+} dep_import_t;
 
-    if (strcmp(target_lower, dep_lower) == 0) {
+/* Match a dep name (lowercased) against a prepared import target.
+ * Returns confidence > 0 on match, 0 on no match. */
+static double match_dep_to_import(const dep_import_t *imp, const char *dep_lower) {
+    if (strcmp(imp->target_lower, dep_lower) == 0) {
         return CONF_DEP_EXACT;
     }
-    if (target->qualified_name) {
-        char qn_lower[CBM_SZ_512];
-        lowercase_into(qn_lower, sizeof(qn_lower), target->qualified_name);
-        if (strstr(qn_lower, dep_lower) != NULL) {
-            return CONF_DEP_QN_SUBSTR;
-        }
+    if (imp->qn_lower && strstr(imp->qn_lower, dep_lower) != NULL) {
+        return CONF_DEP_QN_SUBSTR;
     }
     return 0.0;
+}
+
+/* Resolve and lowercase every IMPORTS edge whose endpoints both exist, in edge
+ * order. Returns the count (0 with *out NULL on allocation failure). */
+static int prepare_dep_imports(cbm_gbuf_t *gb, const cbm_gbuf_edge_t *const *imports,
+                               int import_count, dep_import_t **out, char **block_out) {
+    *out = NULL;
+    *block_out = NULL;
+    enum { NAME_CAP = CBM_SZ_256, QN_CAP = CBM_SZ_512 };
+    size_t bytes = 0;
+    for (int ii = 0; ii < import_count; ii++) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, imports[ii]->target_id);
+        const cbm_gbuf_node_t *source =
+            target ? cbm_gbuf_find_by_id(gb, imports[ii]->source_id) : NULL;
+        if (!target || !source) {
+            continue;
+        }
+        size_t nlen = target->name ? strlen(target->name) : 0;
+        bytes += (nlen < NAME_CAP ? nlen : NAME_CAP - SKIP_ONE) + SKIP_ONE;
+        if (target->qualified_name) {
+            size_t qlen = strlen(target->qualified_name);
+            bytes += (qlen < QN_CAP ? qlen : QN_CAP - SKIP_ONE) + SKIP_ONE;
+        }
+    }
+    dep_import_t *items = cbm_alloc(
+        CBM_MEM_CLASS_OTHER, (size_t)(import_count > 0 ? import_count : 1) * sizeof(dep_import_t));
+    char *block = cbm_alloc(CBM_MEM_CLASS_OTHER, bytes > 0 ? bytes : 1);
+    if (!items || !block) {
+        cbm_free(CBM_MEM_CLASS_OTHER, items);
+        cbm_free(CBM_MEM_CLASS_OTHER, block);
+        return 0;
+    }
+    int n = 0;
+    char *w = block;
+    for (int ii = 0; ii < import_count; ii++) {
+        const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, imports[ii]->target_id);
+        const cbm_gbuf_node_t *source =
+            target ? cbm_gbuf_find_by_id(gb, imports[ii]->source_id) : NULL;
+        if (!target || !source) {
+            continue;
+        }
+        size_t nlen = target->name ? strlen(target->name) : 0;
+        size_t ncap = (nlen < NAME_CAP ? nlen : NAME_CAP - SKIP_ONE) + SKIP_ONE;
+        lowercase_into(w, ncap, target->name);
+        items[n].target_lower = w;
+        w += ncap;
+        items[n].qn_lower = NULL;
+        if (target->qualified_name) {
+            size_t qlen = strlen(target->qualified_name);
+            size_t qcap = (qlen < QN_CAP ? qlen : QN_CAP - SKIP_ONE) + SKIP_ONE;
+            lowercase_into(w, qcap, target->qualified_name);
+            items[n].qn_lower = w;
+            w += qcap;
+        }
+        items[n].source_id = source->id;
+        n++;
+    }
+    *out = items;
+    *block_out = block;
+    return n;
 }
 
 static int strategy_dep_imports(cbm_gbuf_t *gb) {
@@ -391,23 +592,16 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
     }
 
     int edge_count = 0;
+    dep_import_t *prepared = NULL;
+    char *prepared_block = NULL;
+    int prepared_count = prepare_dep_imports(gb, imports, import_count, &prepared, &prepared_block);
 
-    for (int di = 0; di < dep_count; di++) {
+    for (int di = 0; di < dep_count && prepared; di++) {
         char dep_lower[CBM_SZ_256];
         lowercase_into(dep_lower, sizeof(dep_lower), deps[di].name);
 
-        for (int ii = 0; ii < import_count; ii++) {
-            const cbm_gbuf_node_t *target = cbm_gbuf_find_by_id(gb, imports[ii]->target_id);
-            if (!target) {
-                continue;
-            }
-
-            const cbm_gbuf_node_t *source = cbm_gbuf_find_by_id(gb, imports[ii]->source_id);
-            if (!source) {
-                continue;
-            }
-
-            double confidence = match_dep_to_import(target, dep_lower);
+        for (int ii = 0; ii < prepared_count; ii++) {
+            double confidence = match_dep_to_import(&prepared[ii], dep_lower);
             if (confidence > 0.0) {
                 char props[CBM_SZ_512];
                 snprintf(
@@ -415,13 +609,16 @@ static int strategy_dep_imports(cbm_gbuf_t *gb) {
                     "{\"strategy\":\"dependency_import\",\"confidence\":%.2f,\"dep_name\":\"%s\"}",
                     confidence, deps[di].name);
 
-                cbm_gbuf_insert_edge(gb, source->id, deps[di].node_id, "CONFIGURES", props);
+                cbm_gbuf_insert_edge(gb, prepared[ii].source_id, deps[di].node_id, "CONFIGURES",
+                                     props);
                 edge_count++;
             }
         }
     }
 
-    /* gbuf data is borrowed — no free */
+    /* gbuf data is borrowed; only the prepared copies are owned */
+    cbm_free(CBM_MEM_CLASS_OTHER, prepared);
+    cbm_free(CBM_MEM_CLASS_OTHER, prepared_block);
     return edge_count;
 }
 

@@ -21,6 +21,7 @@
 #include "foundation/compat_thread.h"
 #include "foundation/log.h"
 #include "foundation/platform.h"
+#include "foundation/sanitized.h"
 #include "pipeline/pipeline.h"
 #include "store/store.h"
 
@@ -2079,6 +2080,8 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
     bool second_interrupted = false;
     bool exited = false;
     atomic_store_explicit(&runtime_activation_shutdown_log_seen, false, memory_order_release);
+    CBMLogLevel previous_log_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
     cbm_log_set_sink(runtime_test_activation_shutdown_sink);
 
     if (started) {
@@ -2095,6 +2098,7 @@ TEST(daemon_runtime_activation_ack_snapshots_then_interrupts_all_clients) {
         second_interrupted = !cbm_daemon_runtime_client_heartbeat(second, RUNTIME_TEST_TIMEOUT_MS);
     }
     cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_log_level);
     if (first) {
         (void)cbm_daemon_runtime_client_close(first, RUNTIME_TEST_TIMEOUT_MS);
         first = NULL;
@@ -2613,6 +2617,126 @@ TEST(daemon_runtime_final_disconnect_automatically_exits_within_bound) {
     ASSERT_TRUE(exited);
     PASS();
 }
+
+/* Cold-storm ephemeral-retirement gate (2026-09). A one-shot client sharing an
+ * ephemeral generation and racing connect() must not be stranded when another
+ * one-shot's connection just left. The generation lingers while a peer is still
+ * accepted (mid-HELLO) at the moment the last committed client disconnects; the
+ * accept loop retires it once the peer drains or a bounded window elapses. A raw
+ * connection (accepted, no HELLO sent) is exactly that racing peer. */
+#if defined(CBM_ENABLE_TEST_SEAMS)
+/* Direction 1 (the fix): with a peer accepted mid-HELLO, closing the last
+ * committed client leaves the generation RUNNING (lingering), not STOPPING, so
+ * the peer is not stranded. Reverting the active_connections gate flips
+ * `lingered` RED. A window far longer than the test keeps expiry from deciding
+ * the verdict. */
+TEST(daemon_runtime_ephemeral_lingers_while_peer_mid_hello) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(600000);
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "storm-peer", &identity);
+    cbm_daemon_runtime_client_t *client = NULL;
+    cbm_daemon_ipc_connection_t *peer = NULL;
+    cbm_daemon_runtime_connect_result_t result = {0};
+    bool peer_accepted = false;
+    bool lingered = false;
+    bool held_through_reconcile = false;
+
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &result);
+    }
+    if (client) {
+        /* A racing peer: accepted (active_connections++), still mid-HELLO (no
+         * HELLO frame), so not a committed client. */
+        peer = cbm_daemon_ipc_connect(fixture.endpoint, RUNTIME_TEST_TIMEOUT_MS);
+        for (int i = 0; i < 1000 && !peer_accepted; i++) {
+            if (cbm_daemon_runtime_service_active_connections(fixture.service) >= 2) {
+                peer_accepted = true;
+                break;
+            }
+            cbm_usleep(2000);
+        }
+    }
+    if (peer_accepted) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        client = NULL;
+        lingered =
+            cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+        cbm_daemon_runtime_service_reconcile_lifetime(fixture.service);
+        held_through_reconcile =
+            cbm_daemon_runtime_service_state(fixture.service) == CBM_DAEMON_RUNTIME_SERVICE_RUNNING;
+    }
+    if (peer) {
+        cbm_daemon_ipc_connection_close(peer);
+    }
+    if (client) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(UINT32_MAX);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(peer_accepted);
+    ASSERT_TRUE(lingered);
+    ASSERT_TRUE(held_through_reconcile);
+    PASS();
+}
+
+/* Direction 2 (bounded, no hang): a peer that never commits must not wedge the
+ * lingering generation forever (the host_serving 900s hang). With the window
+ * collapsed to zero the accept loop reconcile reaches the backstop and retires
+ * even while the peer is still accepted. Removing the window backstop hangs
+ * this test. */
+TEST(daemon_runtime_ephemeral_linger_retires_within_bound) {
+    cbm_daemon_build_identity_t identity =
+        runtime_test_identity("2.4.0", runtime_test_self_build());
+    cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(0);
+    runtime_test_fixture_t fixture;
+    bool started = runtime_test_fixture_start(&fixture, "storm-bound", &identity);
+    cbm_daemon_runtime_client_t *client = NULL;
+    cbm_daemon_ipc_connection_t *peer = NULL;
+    cbm_daemon_runtime_connect_result_t result = {0};
+    bool peer_accepted = false;
+    bool exited = false;
+
+    if (started) {
+        client = cbm_daemon_runtime_client_connect(fixture.endpoint, &identity,
+                                                   RUNTIME_TEST_TIMEOUT_MS, &result);
+    }
+    if (client) {
+        peer = cbm_daemon_ipc_connect(fixture.endpoint, RUNTIME_TEST_TIMEOUT_MS);
+        for (int i = 0; i < 1000 && !peer_accepted; i++) {
+            if (cbm_daemon_runtime_service_active_connections(fixture.service) >= 2) {
+                peer_accepted = true;
+                break;
+            }
+            cbm_usleep(2000);
+        }
+    }
+    if (peer_accepted) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+        client = NULL;
+        /* Peer never commits + window already elapsed -> the bounded backstop in
+         * the accept loop reconcile must retire the generation, not hang. */
+        exited = cbm_daemon_runtime_service_wait_exited(fixture.service, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    if (peer) {
+        cbm_daemon_ipc_connection_close(peer);
+    }
+    if (client) {
+        (void)cbm_daemon_runtime_client_close(client, RUNTIME_TEST_TIMEOUT_MS);
+    }
+    cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(UINT32_MAX);
+    runtime_test_fixture_finish(&fixture);
+
+    ASSERT_TRUE(started);
+    ASSERT_TRUE(peer_accepted);
+    ASSERT_TRUE(exited);
+    PASS();
+}
+#endif
 
 TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval) {
     cbm_daemon_build_identity_t identity =
@@ -3553,10 +3677,18 @@ TEST(daemon_runtime_disconnect_cancels_blocked_non_index_child_and_preserves_oth
     SKIP_PLATFORM("requires a queryable copied process image");
 #else
     enum {
+#if CBM_SANITIZED
+        /* This readiness wait is a liveness backstop, not the behavior under
+         * test. The copied instrumented runner can take several seconds to
+         * reach main on macOS, especially while the parallel gate is busy. */
+        CHILD_READY_BOUND_MS = 60000,
+        REQUEST_TIMEOUT_MS = 90000,
+#else
         CHILD_READY_BOUND_MS = 5000,
+        REQUEST_TIMEOUT_MS = 15000,
+#endif
         CHILD_CANCEL_BOUND_MS = 3000,
         CHILD_CLEANUP_BOUND_MS = 5000,
-        REQUEST_TIMEOUT_MS = 15000,
     };
     const char *old_cache = getenv("CBM_CACHE_DIR");
     const char *old_path = getenv("PATH");
@@ -4999,6 +5131,10 @@ SUITE(daemon_runtime) {
     RUN_TEST(daemon_runtime_conflict_log_failure_uses_operation_log_fallback);
     RUN_TEST(daemon_runtime_disconnect_releases_only_connection_subscriptions);
     RUN_TEST(daemon_runtime_final_disconnect_automatically_exits_within_bound);
+#if defined(CBM_ENABLE_TEST_SEAMS)
+    RUN_TEST(daemon_runtime_ephemeral_lingers_while_peer_mid_hello);
+    RUN_TEST(daemon_runtime_ephemeral_linger_retires_within_bound);
+#endif
     RUN_TEST(daemon_runtime_authenticated_idle_connection_outlives_lease_interval);
     RUN_TEST(daemon_runtime_connection_cap_covers_slow_hello_and_stopping_is_terminal);
     RUN_TEST(daemon_runtime_rejects_forged_identity_extension);

@@ -413,6 +413,36 @@ TEST(lang_ext_svg) {
     ASSERT_EQ(cbm_language_for_extension(".svg"), CBM_LANG_XML);
     PASS();
 }
+/* Issue #2229: the XML documents that make up a .NET repository's project
+ * system were unmapped, so a solution's package references, target frameworks,
+ * localized strings and app manifests were never indexed or searchable. */
+TEST(lang_ext_msbuild_projects) {
+    ASSERT_EQ(cbm_language_for_extension(".csproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".vbproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".fsproj"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".props"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".targets"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".nuspec"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".slnx"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".runsettings"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_resx) {
+    ASSERT_EQ(cbm_language_for_extension(".resx"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_xaml) {
+    ASSERT_EQ(cbm_language_for_extension(".xaml"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".axaml"), CBM_LANG_XML);
+    PASS();
+}
+TEST(lang_ext_app_manifests) {
+    ASSERT_EQ(cbm_language_for_extension(".plist"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".xcprivacy"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".manifest"), CBM_LANG_XML);
+    ASSERT_EQ(cbm_language_for_extension(".appxmanifest"), CBM_LANG_XML);
+    PASS();
+}
 TEST(lang_ext_markdown) {
     ASSERT_EQ(cbm_language_for_extension(".md"), CBM_LANG_MARKDOWN);
     PASS();
@@ -638,6 +668,72 @@ static CBMLanguage disambiguate_cfc_content(const char *name, const char *conten
     CBMLanguage lang = cbm_disambiguate_cfc(path);
     remove(path);
     return lang;
+}
+
+/* ── .cls / .frm: VB6 vs Apex / ObjectScript / FORM (#721) ────────── */
+
+static bool write_probe_file(const char *path, const char *content) {
+    FILE *f = fopen(path, "w");
+    if (!f) {
+        return false;
+    }
+    fputs(content, f);
+    fclose(f);
+    return true;
+}
+
+TEST(lang_cls_vb6_class_module_unsupported) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_vb6.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "VERSION 1.0 CLASS\r\nBEGIN\r\n  MultiUse = -1  'True\r\n"
+                                       "END\r\nAttribute VB_Name = \"Widget\"\r\n"
+                                       "Option Explicit\r\n\r\nPublic Sub Go()\r\nEnd Sub\r\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_cls_apex_stays_apex) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_apex.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "public with sharing class Widget {\n"
+                                       "  public void go() {}\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_APEX);
+    remove(path);
+    /* Unreadable file keeps the pre-existing owner. */
+    ASSERT_EQ(cbm_disambiguate_cls("/tmp/nonexistent_file_12345.cls"), CBM_LANG_APEX);
+    PASS();
+}
+
+TEST(lang_cls_objectscript_stays_objectscript) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_udl.cls", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "Class MyPkg.Widget Extends %RegisteredObject\n{\n\n"
+                                       "Method Go()\n{\n}\n\n}\n"));
+    ASSERT_EQ(cbm_disambiguate_cls(path), CBM_LANG_OBJECTSCRIPT_UDL);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_frm_vb6_form_unsupported) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_vb6.frm", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "VERSION 5.00\r\nBegin VB.Form Form1 \r\n"
+                                       "   Caption         =   \"Hi\"\r\nEnd\r\n"
+                                       "Attribute VB_Name = \"Form1\"\r\nOption Explicit\r\n"));
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_COUNT);
+    remove(path);
+    PASS();
+}
+
+TEST(lang_frm_form_stays_form) {
+    char path[256];
+    snprintf(path, sizeof(path), "%s/test_lang_form.frm", cbm_tmpdir());
+    ASSERT_TRUE(write_probe_file(path, "Symbols x, y;\nLocal F = x + y;\nPrint;\n.end\n"));
+    ASSERT_EQ(cbm_disambiguate_frm(path), CBM_LANG_FORM);
+    remove(path);
+    ASSERT_EQ(cbm_disambiguate_frm("/tmp/nonexistent_file_12345.frm"), CBM_LANG_FORM);
+    PASS();
 }
 
 TEST(lang_cfc_tag_component) {
@@ -1295,6 +1391,10 @@ SUITE(language) {
     RUN_TEST(lang_ext_xsl);
     RUN_TEST(lang_ext_xsd);
     RUN_TEST(lang_ext_svg);
+    RUN_TEST(lang_ext_msbuild_projects);
+    RUN_TEST(lang_ext_resx);
+    RUN_TEST(lang_ext_xaml);
+    RUN_TEST(lang_ext_app_manifests);
     RUN_TEST(lang_ext_markdown);
     RUN_TEST(lang_ext_mdx);
     RUN_TEST(lang_ext_makefile);
@@ -1351,6 +1451,11 @@ SUITE(language) {
     RUN_TEST(lang_cfc_tag_after_license_comment);
     RUN_TEST(lang_cfc_script_after_license_comment);
     RUN_TEST(lang_cfc_default_on_read_fail);
+    RUN_TEST(lang_cls_vb6_class_module_unsupported);
+    RUN_TEST(lang_cls_apex_stays_apex);
+    RUN_TEST(lang_cls_objectscript_stays_objectscript);
+    RUN_TEST(lang_frm_vb6_form_unsupported);
+    RUN_TEST(lang_frm_form_stays_form);
 
     /* Go test ports */
     /* New languages */

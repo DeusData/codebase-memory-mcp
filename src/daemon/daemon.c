@@ -47,6 +47,11 @@ struct cbm_daemon_coordinator {
     size_t client_count;
     /* See cbm_daemon_coordinator_set_permanent. */
     bool permanent;
+    /* See cbm_daemon_coordinator_set_linger. Distinct from `permanent`: a
+     * transient, runtime-driven hold that keeps an ephemeral coordinator
+     * admitting while cohort participants are still mid-bootstrap (cold-storm
+     * race, 2026-09). Clearing it while idle retires the coordinator at once. */
+    bool linger;
     size_t job_count;
     size_t watch_count;
     size_t callback_count;
@@ -291,7 +296,7 @@ static void release_client_locked(cbm_daemon_coordinator_t *coordinator,
     release_client_resources_locked(coordinator, client->id, batch);
     free(client);
     coordinator->client_count--;
-    if (coordinator->client_count == 0 && !coordinator->permanent) {
+    if (coordinator->client_count == 0 && !coordinator->permanent && !coordinator->linger) {
         coordinator->state = CBM_DAEMON_COORDINATOR_STOPPING;
     }
 }
@@ -326,6 +331,23 @@ void cbm_daemon_coordinator_set_permanent(cbm_daemon_coordinator_t *coordinator,
     }
     cbm_mutex_lock(&coordinator->mutex);
     coordinator->permanent = permanent;
+    cbm_mutex_unlock(&coordinator->mutex);
+}
+
+void cbm_daemon_coordinator_set_linger(cbm_daemon_coordinator_t *coordinator, bool linger) {
+    if (!coordinator) {
+        return;
+    }
+    cbm_mutex_lock(&coordinator->mutex);
+    coordinator->linger = linger;
+    /* Clearing the hold while the coordinator is already idle is the retirement
+     * signal: an ephemeral generation whose cohort participants have all
+     * connected and left (or whose linger window elapsed) transitions to
+     * STOPPING now, exactly as the last-client disconnect would have. */
+    if (!linger && !coordinator->permanent && coordinator->client_count == 0 &&
+        coordinator->state == CBM_DAEMON_COORDINATOR_RUNNING) {
+        coordinator->state = CBM_DAEMON_COORDINATOR_STOPPING;
+    }
     cbm_mutex_unlock(&coordinator->mutex);
 }
 

@@ -3,7 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/DeusData/codebase-memory-mcp?style=flat&color=blue)](https://github.com/DeusData/codebase-memory-mcp/releases/latest)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![CI](https://img.shields.io/github/actions/workflow/status/DeusData/codebase-memory-mcp/dry-run.yml?label=CI)](https://github.com/DeusData/codebase-memory-mcp/actions/workflows/dry-run.yml)
-[![Tests](https://img.shields.io/badge/tests-6768_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
+[![Tests](https://img.shields.io/badge/tests-8050_passing-brightgreen)](https://github.com/DeusData/codebase-memory-mcp)
 [![Languages](https://img.shields.io/badge/languages-162-orange)](https://github.com/DeusData/codebase-memory-mcp)
 [![Hybrid LSP](https://img.shields.io/badge/Hybrid_LSP-10_languages-blue)](#hybrid-lsp)
 [![Agents](https://img.shields.io/badge/agent_surfaces-45-purple)](https://github.com/DeusData/codebase-memory-mcp)
@@ -16,7 +16,7 @@
 
 **The fastest and most efficient code intelligence engine for AI coding agents.** Full-indexes an average repository in milliseconds, the Linux kernel (28M LOC, 75K files) in 3 minutes. Answers structural queries in under 1ms. Ships as a native executable with a small verified runtime-asset set for macOS, Linux, and Windows — download, run `install`, done.
 
-High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 162 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 15 MCP tools. No language runtime, hosted service, or API key. Plug and play across 45 supported automatic/conditional client surfaces.
+High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-sitter/) AST analysis across all 162 languages, enhanced with [**Hybrid LSP** semantic type resolution](#hybrid-lsp) for Python, TypeScript / JavaScript / JSX / TSX, PHP, C#, Go, C, C++, Java, Kotlin, Rust, and Perl — producing a persistent knowledge graph of functions, classes, call chains, HTTP routes, and cross-service links. 17 MCP tools. No language runtime, hosted service, or API key. Plug and play across 45 supported automatic/conditional client surfaces.
 
 > **Research** — The design and benchmarks behind this project are described in the preprint [*Codebase-Memory: Tree-Sitter-Based Knowledge Graphs for LLM Code Exploration via MCP*](https://arxiv.org/abs/2603.27277) (arXiv:2603.27277). Evaluated across 31 real-world repositories: 83% answer quality, 10× fewer tokens, 2.1× fewer tool calls vs. file-by-file exploration.
 
@@ -37,7 +37,7 @@ High-quality parsing through [tree-sitter](https://tree-sitter.github.io/tree-si
 - **45 supported automatic/conditional client surfaces** — `install` configures detected clients and safely activates conditional clients only when their documented platform, marker, or explicit existing config path is present. See [Multi-Agent Support](#multi-agent-support) for the complete matrix and manual/UI-only boundaries.
 - **Built-in graph visualization** — 3D interactive UI at `localhost:9749`, served from the binary itself.
 - **Infrastructure-as-code indexing** — Dockerfiles, Kubernetes manifests, and Kustomize overlays indexed as graph nodes with cross-references. `Resource` nodes for K8s kinds, `Module` nodes for Kustomize overlays with `IMPORTS` edges to referenced resources.
-- **15 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
+- **17 MCP tools** — search, trace, architecture, impact analysis, targeted index-coverage checks, Cypher queries, dead code detection, cross-service HTTP linking, ADR management, and more.
 
 ## Quick Start
 
@@ -425,7 +425,7 @@ scripts/build.sh                    # without the UI (development only)
 
 Every platform ships **one self-contained executable**: the graph UI and the agent integration templates are linked into the binary, so an extracted archive is immediately complete.
 
-Run the test suite (6,768 tests across 120 suites):
+Run the test suite (8,060 tests across 141 suites):
 
 ```bash
 scripts/test.sh                     # full: clean sanitizer build + all suites + guards
@@ -461,7 +461,7 @@ Add to `~/.claude.json` (user scope) or project `.mcp.json`:
 }
 ```
 
-Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 15 tools.
+Restart your agent. Verify with `/mcp` — you should see `codebase-memory-mcp` with 17 tools.
 
 </details>
 
@@ -491,7 +491,7 @@ overwrite user-modified agents.
 | Agent | Activation | MCP config | Durable context / augmentation |
 |-------|------------|------------|--------------------------------|
 | Claude Code | Detected | `~/.claude.json` | Skill + three exact-tool graph agents; `SessionStart`, `SubagentStart`, non-blocking `PreToolUse` for `Grep`/`Glob`/`Bash`, and post-`Read` coverage |
-| Codex CLI | Detected | `$CODEX_HOME/config.toml` | `AGENTS.md`, skill, three read-only agents; `SessionStart` + `SubagentStart` |
+| Codex CLI | Detected | `$CODEX_HOME/config.toml` | Managed `AGENTS.md` activation pointer, skill, three read-only agents; `SessionStart` + `SubagentStart` |
 | Gemini CLI | Detected | `.gemini/settings.json` | `GEMINI.md`, three explicit read/graph-tool subagents; `BeforeTool`, `AfterTool` `read_file` coverage, and `SessionStart` |
 | Zed | Detected | platform `settings.json` (JSONC) | `AGENTS.md` + shared skill |
 | OpenCode | Detected | `$OPENCODE_CONFIG` or resolved global config | `AGENTS.md`, skill, three deny-by-default read-only agents; plugin adds grep/glob graph lookup, post-`read` coverage, first-tool-result session context, and post-compaction reinjection |
@@ -535,6 +535,11 @@ overwrite user-modified agents.
 | IBM Bob IDE | Conditional | Existing `~/.bob/mcp.json` | Shared rule + IDE skill; no invented hook or agent |
 | Oh My Pi (omp) | Detected | Effective agent directory (`OMP_PROFILE` / `PI_CODING_AGENT_DIR`; default `~/.omp/agent/mcp.json`) | Skill and three direct-MCP graph-tool subagents (Scout/Verify/Auditor); preserves user `AGENTS.md` |
 | Sourcegraph Cody | Explicit opt-in | Existing `$CBM_CODY_CONFIG_PATH` | MCP only |
+
+For Codex, install keeps only a tiny managed activation pointer in global
+`$CODEX_HOME/AGENTS.md`; all detailed behavior lives in the installed `codebase-memory` skill.
+Fresh installs create the pointer, upgrades replace the legacy full managed block while preserving
+all user-owned bytes, and uninstall removes only the managed pointer.
 
 ### Sessions, compaction, and subagents
 
@@ -629,7 +634,13 @@ Every MCP tool can be invoked as a local, one-shot command. CLI tools neither st
 
 Commands that mutate graph data use shared OS-backed, per-project locks. This serializes conflicting work from CLI and MCP sessions on the same project while allowing unrelated projects to proceed independently.
 
-When stderr is an interactive terminal, the CLI automatically shows lifecycle and indexing progress. Pass `--progress` to force the same feedback when stderr is redirected or the command is run non-interactively. Progress is written only to stderr; stdout remains reserved for the command result, so pipes and scripts stay machine-safe. Pass `--json` when the full MCP result envelope is needed.
+When stderr is an interactive terminal, the CLI automatically shows lifecycle and indexing progress. Pass `--progress` to force the same feedback when stderr is redirected or the command is run non-interactively. Pass `--quiet` to disable automatic terminal progress and ordinary diagnostics while retaining errors; it cannot be combined with `--progress` or outer `cli --verbose`. Routine informational logs are quiet by default; pass outer `cli --verbose` to include them. Progress and logs use stderr while stdout remains reserved for the command result. Read tools return a compact tree by default; pass a tool's `--format json` for machine-readable payload JSON, or outer `--json` for the full MCP envelope.
+
+Large compact-tree tables may start with a response-local `<section>_refs` directory and an explicit `<section>_ref_rule`. A cell such as `@0+handler.go` reconstructs to ref `0`'s prefix plus `handler.go`. References are local to that sibling `<section>` table and expansion is non-recursive: entries inside `<section>_refs` are always literal prefixes. This is limited to declared path and qualified-name columns and activates only when the exact rendered table is at least 15% and 64 bytes smaller and a conservative model-neutral token-shape proxy also improves by at least 1%. Search and trace likewise render direct and prefix-grouped tree shapes and keep the smaller complete representation, so singleton or scattered answers do not pay directory overhead. Keys are declared once per table but never cryptically abbreviated, and `--format json` keeps stable literal strings for machine consumers. Both gates are deterministic; exact token counts still depend on the caller's tokenizer.
+
+Lean responses truncate semantically, never by cutting arbitrary bytes from code or identifiers. Ranked graph rows are retained ahead of raw grep rows and diagnostic summaries; omitted rows/sections report totals, `has_more`, and a strictly advancing continuation offset or cursor. If even the first whole row cannot fit, CBM asks for a higher budget and emits no self-looping cursor. `max_output_tokens` is model-neutral sizing guidance: CBM enforces a deterministic ceiling of four UTF-8 bytes per requested token, so it is not a tokenizer-exact count. Detail flags such as `diagnostics`, `source_mode`, and `detail` opt into heavier fields. `search_code` pages ranked rows with `result_limit`/`result_offset` (`limit` remains a compatibility alias), raw rows with `raw_limit`/`raw_offset`, and directory summaries with `directory_limit`/`directory_offset`. Raw lines default to a UTF-8-safe match-centered preview; each row reports `content_start_byte`, returned/total byte counts, match byte bounds when known, and a content continuation offset. Pass `raw_content_offset` to page the original line without moving the raw-row cursor. `match_limit` and `source_max_lines` bound per-result details, with exact omission metadata. `detect_changes` pages changed files, impacted symbols, and module summaries independently; prefer its snapshot-bound `*_cursor` continuations, which reject changed commits, worktree bytes, graph generation, or semantic arguments instead of silently skipping or duplicating rows.
+
+Every response is standard UTF-8. Identifiers, paths, and raw search previews preserve POSIX byte-string identities: a preserved value containing malformed UTF-8 is emitted reversibly as `@bytes:<lowercase hex of every original byte>`. A valid preserved value that literally begins with the reserved `@bytes:` or `@utf8:` prefix is emitted as `@utf8:<original value>`, so decoding is unambiguous: strip one `@utf8:` prefix for literal UTF-8, or hex-decode one `@bytes:` prefix for original bytes. Ordinary valid UTF-8 is unchanged and pays no output-token overhead. To keep code readable, source bodies replace malformed UTF-8 with U+FFFD; use the pageable raw search preview when byte-exact source inspection is required.
 
 Use `cli <tool> --help` to see the flags generated from that tool's input schema:
 
@@ -644,7 +655,10 @@ codebase-memory-mcp cli query_graph --project my-project --query 'MATCH (f:Funct
 
 # Force human-readable progress without contaminating stdout.
 codebase-memory-mcp cli --progress index_repository --repo-path /path/to/repo
-codebase-memory-mcp cli search_graph --project my-project --label Function | jq '.results[].name'
+# Suppress automatic terminal progress and non-error diagnostics.
+codebase-memory-mcp cli --quiet list_projects --format json
+codebase-memory-mcp cli search_graph --project my-project --label Function --format json
+codebase-memory-mcp cli list_projects --format json --detail stats | jq '.projects[].name'
 ```
 
 JSON arguments can also be piped on stdin, for tools that take arguments. A tool whose input schema declares none — `list_projects` — never reads stdin, so it stays responsive when it inherits a pipe the caller never closes (the default for `child_process.spawn` and similar wrappers). Inline JSON remains accepted for backward compatibility but is deprecated in favor of flags, `--args-file`, or stdin.
@@ -659,17 +673,20 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 | `list_projects` | List all indexed projects with node/edge counts. |
 | `delete_project` | Remove a project and all its graph data. |
 | `index_status` | Check indexing status of a project. |
+| `check_index_coverage` | Check whether exact paths or a scope are indexed and fresh. A clean result means no recorded gap, not proof of completeness. |
 
 ### Querying
 
 | Tool | Description |
 |------|-------------|
-| `search_graph` | Structured search by label, name pattern, file pattern, degree filters. Pagination via limit/offset. |
+| `search_graph` | Structural, BM25, and semantic search. Page structural rows with `offset`/`limit` and ranked semantic rows independently with `semantic_offset`/`semantic_limit`. |
 | `trace_path` | BFS traversal — who calls a function and what it calls (alias: `trace_call_path`). Depth 1-5. |
 | `detect_changes` | Map git diff to affected symbols + blast radius with risk classification. |
 | `query_graph` | Execute Cypher-like graph queries (read-only). |
 | `get_graph_schema` | Node/edge counts, relationship patterns, property definitions per label. Run this first. |
+| `compare_graphs` | Compare two indexed snapshots: node/edge additions and removals between a base and a target. |
 | `get_code_snippet` | Read source code for a function by qualified name. |
+| `get_file_outline` | Declaration outline of one repository-relative file in source order, with optional label filter and paging. |
 | `get_architecture` | Codebase overview: languages, packages, routes, hotspots, clusters, ADR. |
 | `search_code` | Grep-like text search within indexed project files. |
 | `manage_adr` | CRUD for Architecture Decision Records (`get` reads, `update` replaces the whole document, `set_sections` rewrites only the named sections and leaves every other byte untouched, `sections` lists headings). Query modes do not wait behind a same-project reindex; writes remain serialized. |
@@ -687,7 +704,7 @@ JSON arguments can also be piped on stdin, for tools that take arguments. A tool
 
 ### Edge Types
 
-`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
+`CONTAINS_PACKAGE`, `CONTAINS_FOLDER`, `CONTAINS_FILE`, `DEFINES`, `DEFINES_METHOD`, `IMPORTS`, `CALLS`, `CALL_REFERENCE`, `HTTP_CALLS`, `ASYNC_CALLS`, `IMPLEMENTS`, `HANDLES`, `USAGE`, `CONFIGURES`, `REFERENCES_FILE`, `WRITES`, `MEMBER_OF`, `TESTS`, `USES_TYPE`, `FILE_CHANGES_WITH`
 
 ### Qualified Names
 
@@ -719,8 +736,14 @@ codebase-memory-mcp config set auto_index true           # auto-index on session
 codebase-memory-mcp config set auto_index_limit 50000    # max files for auto-index
 codebase-memory-mcp config set auto_watch false          # don't register background git watcher (default: true)
 codebase-memory-mcp config set watcher_enabled false     # stop the watcher thread entirely (default: true)
+codebase-memory-mcp config set index_max_files 250000    # optional per-index source-file limit
+codebase-memory-mcp config set index_max_source_mb 16384 # optional per-index source-size limit
 codebase-memory-mcp config reset auto_index              # reset to default
 ```
+
+The two `index_max_*` settings default to `off`. Exceeding one fails the complete
+index attempt rather than publishing a partial graph; an existing serving index
+is preserved. See [Index resource limits](docs/INDEX_RESOURCE_LIMITS.md).
 
 ### Environment Variables
 
@@ -730,7 +753,7 @@ codebase-memory-mcp config reset auto_index              # reset to default
 | `CBM_CACHE_DIR` | `~/.cache/codebase-memory-mcp` | Override the database storage directory. All project indexes and config are stored here. One account can use only one canonical cache root at a time; close active CBM sessions/commands before switching it. |
 | `CBM_DIAGNOSTICS` | `false` | Set to `1` or `true` to enable the shared daemon's periodic `snapshot.json` and retained `trajectory.ndjson` below a fresh owner-private directory in the system temp directory. Exact paths are logged by `diagnostics.start`. |
 | `CBM_DOWNLOAD_URL` | *(GitHub releases)* | Override the download URL for updates. Used for testing or self-hosted deployments. |
-| `CBM_LOG_LEVEL` | `info` | Set the minimum log level. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4` matching the internal enum. Thin-frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
+| `CBM_LOG_LEVEL` | role-aware | Set the minimum log level. Thin MCP/CLI/hook frontends default to `warn`; the detached daemon and its supervised index workers default to `info` so lifecycle and liveness records remain available. Accepted values (case-insensitive): `debug`, `info`, `warn`, `error`, `none` — or their numeric equivalents `0`–`4`. A physical worker retains INFO liveness records even under a stricter override because its private log drives the supervisor's no-progress timeout. Frontend messages go to that session's stderr; detached daemon events go to `${CBM_CACHE_DIR}/logs/cbm-daemon.log`. Stdout is reserved for MCP JSON-RPC. |
 | `CBM_WORKERS` | *(detected)* | Override the parallel-indexing worker count returned by `cbm_default_worker_count`. Useful inside containers where `sysconf(_SC_NPROCESSORS_ONLN)` reports host CPUs rather than the cgroup's effective quota. Range 1–256; invalid values are ignored with a warning. |
 | `CBM_MEM_BUDGET_MB` | *(detected)* | Override the in-memory graph budget with an explicit cap in MiB, taking precedence over the `ram_fraction × total_RAM` default. Useful on bare-metal hosts without a cgroup limit, or to pin a budget *below* the cgroup limit so headroom is left for sibling processes. Must be a positive integer; it is clamped to detected total RAM (logged as `mem.budget.clamped`), and non-numeric or non-positive values are ignored with a warning (`mem.budget.env.invalid`). |
 | `CBM_DUMP_VERIFY_MIN_RATIO` | `0.5` | After indexing, compare persisted SQLite node count to the in-memory dump count. When persisted nodes fall below this fraction of committed nodes (and committed > 50), `index_repository` returns `status:"degraded"` instead of silent `indexed`. Range 0–1; set `0` to disable. Invalid values are ignored with a warning. |
@@ -829,7 +852,7 @@ Also supported (not yet benchmarked): Ada, Agda, Apex, Assembly (NASM), Astro, A
 src/
   main.c              Entry point (MCP stdio server + CLI + install/update/config)
   daemon/             Per-account session coordination, IPC, lifecycle, shared jobs/watchers
-  mcp/                MCP server (15 tools, JSON-RPC 2.0, session detection, auto-index)
+  mcp/                MCP server (17 tools, JSON-RPC 2.0, session detection, auto-index)
   cli/                Install/uninstall/update/config (45 client surfaces, hooks, instructions)
   store/              SQLite graph storage (nodes, edges, traversal, search, Louvain)
   pipeline/           Multi-pass indexing (structure → definitions → calls → HTTP links → config → tests)

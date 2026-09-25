@@ -68,6 +68,12 @@ describe("NodeDetailPanel code preview + deep-link", () => {
     /* …but was NOT parsed into a real <script> element, and did not execute. */
     expect(container.querySelector("script")).toBeNull();
     expect((window as unknown as { __pwned?: boolean }).__pwned).toBeUndefined();
+    expect(callToolMock).toHaveBeenCalledWith("get_code_snippet", {
+      qualified_name: "app::render",
+      project: "demo",
+      format: "json",
+      source_mode: "full",
+    });
   });
 
   it("builds an https GitHub deep-link with URL-encoded path segments", () => {

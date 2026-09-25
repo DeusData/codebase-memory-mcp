@@ -35,6 +35,27 @@ permissions:
   contents: read
 
 jobs:
+  # Fuzz exploration: new inputs are the point here, so it runs for a time
+  # budget instead of a fixed count. NON-GATING like the soak; a crash uploads
+  # its reproducer, which becomes a fixed-seed regression input once fixed.
+  fuzz:
+    if: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev clang llvm libclang-rt-dev
+      - name: Fuzz exploration (30 min per target)
+        run: scripts/fuzz.sh all --max-total-time 1800 --seed 0
+      - name: Upload reproducers
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts-nightly
+          path: build/fuzz/artifacts-*/
+          if-no-files-found: ignore
+
   soak:
     uses: ./.github/workflows/_soak.yml
     with:

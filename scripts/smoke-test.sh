@@ -22,6 +22,8 @@ they stage the release fixture, start the fixture server, and sandbox
 HOME/TEMP/agent-config destinations. Called bare, the download/checksum/
 install-script phases (12-13) SKIP for lack of a fixture server, and the run
 mutates the REAL profile — the venue-parity contract forbids that in any venue.
+The daemon runtime and cache are private to the run either way: every product
+process is started under a CBM_RUNTIME_DIR/CBM_CACHE_DIR this harness owns.
 
 Arguments:
   <binary-path>         product binary to smoke
@@ -40,6 +42,20 @@ if [ -n "$SMOKE_MODE" ] && [ "$SMOKE_MODE" != "--agent-config-only" ]; then
   exit 2
 fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
+
+# Every product process below — the phases, the install/update E2E and the
+# daemon retirements — must reach a daemon rendezvous this run owns. Only
+# CBM_RUNTIME_DIR moves that rendezvous; the wrappers' HOME/TMPDIR/CBM_CACHE_DIR
+# sandbox does not, so without this the retirements land on the operator's live
+# account daemon (#1691, #1696).
+# shellcheck source=test-runtime.sh
+source "$REPO_ROOT/scripts/test-runtime.sh"
+cbm_test_runtime_init
+# Armed here rather than only with the fixture trap below: the fixture mktemp
+# and its cygpath conversion sit between the two, and under `set -e` a failure
+# there would otherwise leave the private root behind. The fixture trap
+# replaces this one and keeps the same cleanup as its first step.
+trap 'cbm_test_runtime_cleanup "$BINARY"' EXIT
 
 smoke_mktemp_file() {
   if [ -n "${SMOKE_TEMP_ROOT:-}" ]; then
@@ -100,8 +116,8 @@ copy_smoke_binary() {
   cp "$BINARY" "$destination"
 }
 
-# Retire the shared account daemon (if one is running) and wait until it
-# reports not-running. Install/uninstall flows leave an ephemeral daemon
+# Retire this run's private account daemon (if one is running) and wait until
+# it reports not-running. Install/uninstall flows leave an ephemeral daemon
 # draining asynchronously whose mapped generation backing and open logs
 # block rm on Windows (POSIX rm doesn't care) — so every cleanup of a
 # fixture HOME that received an install, and the final cache removal, must
@@ -144,11 +160,16 @@ run_no_crash() {
 
 TMPDIR=$(smoke_mktemp_dir)
 DRYRUN_HOME=""
+CODEX_LIFECYCLE_HOME=""
 # On MSYS2/Windows, convert POSIX path to native Windows path for the binary
 if command -v cygpath &>/dev/null; then
     TMPDIR=$(cygpath -m "$TMPDIR")
 fi
-trap 'smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}"' EXIT
+# Runtime cleanup first, so no earlier cleanup step stands between the exit
+# and the private daemon's retirement; on Windows that retirement is also what
+# unblocks the fixture rm (mapped binary, open logs). smoke_rmtree never fails,
+# so the fixture removal still runs after it.
+trap 'cbm_test_runtime_cleanup "$BINARY"; smoke_rmtree "$TMPDIR" "${DRYRUN_HOME:-}" "${CODEX_LIFECYCLE_HOME:-}"' EXIT
 
 CLI_STDERR=$(smoke_mktemp_file)
 # 10 of the cli call sites assign directly (VAR=$(cli ...)). Under
@@ -171,6 +192,29 @@ cli() {
     } >&2
   fi
   return "$rc"
+}
+
+# A worker failure says "inspect log: <path>" — and in CI that path dies with the
+# job's sandbox, so the one artifact naming the cause is the one nobody can open.
+# A worker killed by a signal writes no summary of its own either, which is
+# exactly the case that most needs the log (PR #2233: "index worker ended with
+# killed (exit=-1, signal=9)" on ubuntu-latest, unreproducible on every local
+# venue). Print it while it still exists.
+smoke_dump_worker_log() {
+  local log
+  log=$(sed -n 's/.*inspect log: \([^ ]*\).*/\1/p' "$CLI_STDERR" 2>/dev/null | tail -1)
+  if [ -z "$log" ] || [ ! -f "$log" ]; then
+    # The path is only printed for some failures; fall back to the newest log
+    # the run produced.
+    log=$(ls -t "${CBM_CACHE_DIR:-$HOME/.cache/codebase-memory-mcp}"/logs/.worker-log-* 2>/dev/null | head -1)
+  fi
+  if [ -n "$log" ] && [ -f "$log" ]; then
+    echo "--- worker log: $log ---"
+    tail -80 "$log"
+    echo "--- end worker log ---"
+  else
+    echo "--- no worker log found (cache ${CBM_CACHE_DIR:-unset}) ---"
+  fi
 }
 
 echo "=== Phase 1: version ==="
@@ -333,6 +377,7 @@ GENEOF
 if ! RESULT=$(cli index_repository --repo-path "$TMPDIR"); then
   echo "FAIL: index_repository (flag form) exited non-zero"
   cat "$CLI_STDERR"
+  smoke_dump_worker_log
   exit 1
 fi
 echo "$RESULT"
@@ -407,7 +452,7 @@ DUP_CHECKED=0
 for TOOL_ARGS in "search_graph --project $PROJECT --name-pattern compute" \
                  "search_code --project $PROJECT --query compute" \
                  "get_architecture --project $PROJECT" \
-                 "index_status --project $PROJECT"; do
+                 "index_status --project $PROJECT --format json"; do
   # shellcheck disable=SC2086
   ENVELOPE=$("$BINARY" cli $TOOL_ARGS --json 2>/dev/null || true)
   [ -z "$ENVELOPE" ] && continue
@@ -575,7 +620,7 @@ fi
 echo "OK: trace_path found $CALLERS caller(s) for 'compute'"
 
 # 3c: get_graph_schema — verify labels exist
-if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT"); then
+if ! SCHEMA=$(cli get_graph_schema --project "$PROJECT" --format json --limit 500); then
   echo "FAIL: get_graph_schema (flag form) exited non-zero"; cat "$CLI_STDERR"; exit 1
 fi
 LABELS=$(echo "$SCHEMA" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); print(len(d.get('node_labels',[])))" 2>/dev/null || echo "0")
@@ -647,8 +692,10 @@ cyp_first_cell() {
   # $1 = query; echoes rows[0][0] (or empty). Flag form passes the query as ONE
   # argv token, so string-literal args (e.g. replace(f.name,"a","A")) and Cypher
   # metacharacters {}|=~<>" need no JSON escaping.
-  cli query_graph --project "$PROJECT" --query "$1" |
-    sed -n '/^rows: /{n;p;}' | sed 's/^  //' | sed 's/^"//;s/"$//;s/\\"/"/g'
+  cli query_graph --project "$PROJECT" --query "$1" --format json |
+    python3 -c 'import json,sys
+d=json.load(sys.stdin); rows=d.get("rows", [])
+print(rows[0][0] if rows and rows[0] else "")'
 }
 
 # labels(n) → JSON list like ["Function"]
@@ -840,7 +887,7 @@ fi
 
 # B4: STDIN + --json is the generated-client transport. It must return the
 # complete MCP result envelope and must NOT emit a deprecation warning.
-IM_STDIN=$(printf '%s' "{\"project\":\"$PROJECT\"}" | "$BINARY" cli --json get_graph_schema 2>"$CLI_STDERR")
+IM_STDIN=$(printf '%s' "{\"project\":\"$PROJECT\",\"format\":\"json\"}" | "$BINARY" cli --json get_graph_schema 2>"$CLI_STDERR")
 if ! printf '%s' "$IM_STDIN" | python3 -c "import json,sys; d=json.loads(sys.stdin.read()); c=d.get('content'); p=json.loads(c[0].get('text','')) if isinstance(c,list) and c and c[0].get('type') == 'text' else None; sys.exit(0 if d.get('isError') is not True and isinstance(p,dict) and isinstance(p.get('node_labels'),list) else 1)" 2>/dev/null; then
   echo "FAIL B4: compact stdin + --json did not return a successful get_graph_schema MCP payload"; echo "$IM_STDIN" | head -c 300; cat "$CLI_STDERR"; exit 1
 fi
@@ -851,7 +898,7 @@ echo "OK B4: compact STDIN + --json returns a successful schema MCP envelope, no
 
 # B5: --args-file — JSON read from a file resolves; must NOT warn deprecated.
 IM_ARGS_FILE=$(smoke_mktemp_file)
-echo "{\"project\":\"$PROJECT\"}" > "$IM_ARGS_FILE"
+echo "{\"project\":\"$PROJECT\",\"format\":\"json\",\"limit\":500}" > "$IM_ARGS_FILE"
 if ! IM_AF=$(cli get_graph_schema --args-file "$IM_ARGS_FILE"); then
   echo "FAIL B5: get_graph_schema --args-file exited non-zero"; cat "$CLI_STDERR"; rm -f "$IM_ARGS_FILE"; exit 1
 fi
@@ -1430,6 +1477,7 @@ echo '# Personal Rovo guidance' > "$ROVO_INSTRUCTIONS"
 PHASE8_INSTALL_RC=0
 PHASE8_INSTALL_LOG=$(smoke_mktemp_file)
 HOME="$FAKE_HOME" \
+  CODEX_HOME="$FAKE_HOME/.codex" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
@@ -1702,12 +1750,139 @@ if ! grep -q 'existing_section' "$FAKE_HOME/.codex/config.toml"; then
 fi
 echo "OK 8f-h: Codex TOML (MCP + preserved existing)"
 
-# 8i: Codex instructions
-if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] || ! grep -q 'codebase-memory-mcp' "$FAKE_HOME/.codex/AGENTS.md"; then
-  echo "FAIL 8i: Codex AGENTS.md missing"
+# 8i: Codex keeps only a tiny global activation pointer; the installed skill
+# owns all detailed behavior. Exercise the complete lifecycle in a second HOME
+# so Codex-only reinstalls cannot perturb the all-agent fixture below.
+CODEX_POINTER_EXPECTED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' > "$CODEX_POINTER_EXPECTED"
+if [ ! -f "$FAKE_HOME/.codex/AGENTS.md" ] ||
+   [ "$(smoke_file_sha256 "$FAKE_HOME/.codex/AGENTS.md")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ]; then
+  echo "FAIL 8i: fresh Codex install did not create the exact activation pointer"
   exit 1
 fi
-echo "OK 8i: Codex instructions"
+
+CODEX_LIFECYCLE_HOME=$(smoke_mktemp_dir)
+CODEX_LIFECYCLE_ROOT="$CODEX_LIFECYCLE_HOME/.codex"
+CODEX_INSTRUCTIONS="$CODEX_LIFECYCLE_ROOT/AGENTS.md"
+mkdir -p "$CODEX_LIFECYCLE_ROOT"
+
+CODEX_FRESH_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_FRESH_LOG" 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_POINTER_EXPECTED")" ] ||
+   ! grep -q '\[mcp_servers.codebase-memory-mcp\]' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'search_graph' "$CODEX_LIFECYCLE_ROOT/skills/codebase-memory/SKILL.md" ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-scout.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory.toml" ] ||
+   [ ! -s "$CODEX_LIFECYCLE_ROOT/agents/codebase-memory-auditor.toml" ] ||
+   ! grep -q 'SessionStart' "$CODEX_LIFECYCLE_ROOT/config.toml" ||
+   ! grep -q 'SubagentStart' "$CODEX_LIFECYCLE_ROOT/config.toml"; then
+  echo "FAIL 8i: isolated fresh Codex install lost the pointer or another surface"
+  exit 1
+fi
+
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'legacy managed guidance' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_INSTRUCTIONS"
+CODEX_EXPECTED_MIGRATED=$(smoke_mktemp_file)
+printf '%s\n' \
+  '# Personal Codex guidance' \
+  '<!-- codebase-memory-mcp:start -->' \
+  'For structural codebase exploration, use the installed `codebase-memory` skill.' \
+  '<!-- codebase-memory-mcp:end -->' \
+  '# Keep this line' > "$CODEX_EXPECTED_MIGRATED"
+CODEX_EXPECTED_USER=$(smoke_mktemp_file)
+printf '%s\n' '# Personal Codex guidance' '# Keep this line' > "$CODEX_EXPECTED_USER"
+CODEX_LEGACY_SHA=$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")
+
+CODEX_PLAN=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --plan --skip-binary --clients=codex > "$CODEX_PLAN"
+CODEX_INSTRUCTION_PATH=$(json_get "$CODEX_PLAN" \
+  "next((str(x) for x in d.get('instruction_files_planned', []) if str(x).replace('\\\\','/').endswith('/.codex/AGENTS.md')), '')")
+CODEX_CLEANUP_COUNT=$(json_get "$CODEX_PLAN" "len(d.get('cleanup_actions_planned', []))")
+if ! exact_path_match "$CODEX_INSTRUCTION_PATH" "$CODEX_INSTRUCTIONS" ||
+   [ "$CODEX_CLEANUP_COUNT" != "0" ] ||
+   [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
+  echo "FAIL 8i: Codex plan did not describe a non-mutating pointer upsert"
+  exit 1
+fi
+
+CODEX_DRY_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --dry-run --skip-binary --clients=codex -y > "$CODEX_DRY_LOG" 2>&1
+if ! grep -q 'managed activation pointer' "$CODEX_DRY_LOG" ||
+   [ "$CODEX_LEGACY_SHA" != "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" ]; then
+  echo "FAIL 8i: Codex dry-run did not preview a byte-identical pointer migration"
+  exit 1
+fi
+
+CODEX_MIGRATE_LOG=$(smoke_mktemp_file)
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > "$CODEX_MIGRATE_LOG" 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ]; then
+  echo "FAIL 8i: Codex migration did not replace only the legacy managed block"
+  exit 1
+fi
+
+HOME="$CODEX_LIFECYCLE_HOME" \
+  CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+  XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+  APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+  LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+  "$BINARY" install --skip-binary --clients=codex -y > /dev/null 2>&1
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_MIGRATED")" ] ||
+   [ "$(grep -c '<!-- codebase-memory-mcp:start -->' "$CODEX_INSTRUCTIONS")" -ne 1 ]; then
+  echo "FAIL 8i: Codex reinstall changed or duplicated the activation pointer"
+  exit 1
+fi
+CODEX_UNINSTALL_LOG=$(smoke_mktemp_file)
+if ! HOME="$CODEX_LIFECYCLE_HOME" \
+     CODEX_HOME="$CODEX_LIFECYCLE_ROOT" \
+     XDG_CONFIG_HOME="$CODEX_LIFECYCLE_HOME/.config" \
+     APPDATA="$CODEX_LIFECYCLE_HOME/AppData/Roaming" \
+     LOCALAPPDATA="$CODEX_LIFECYCLE_HOME/AppData/Local" \
+     "$BINARY" uninstall -y -n > "$CODEX_UNINSTALL_LOG" 2>&1; then
+  echo "FAIL 8i: Codex uninstall returned nonzero"
+  cat "$CODEX_UNINSTALL_LOG"
+  exit 1
+fi
+if [ ! -f "$CODEX_INSTRUCTIONS" ] ||
+   [ "$(smoke_file_sha256 "$CODEX_INSTRUCTIONS")" != \
+     "$(smoke_file_sha256 "$CODEX_EXPECTED_USER")" ]; then
+  echo "FAIL 8i: Codex uninstall did not remove only the activation pointer"
+  exit 1
+fi
+echo "OK 8i: isolated Codex activation-pointer lifecycle"
 
 # 8j-l: Gemini MCP + hooks + merge
 CMD=$(json_get "$FAKE_HOME/.gemini/settings.json" "d['mcpServers']['codebase-memory-mcp']['command']")
@@ -2550,7 +2725,19 @@ ok = ok and owned_total == 2
 sys.exit(0 if ok else 1)
 " 2>/dev/null ||
    ! grep -q 'SessionStart' "$FAKE_HOME/.claude/settings.json" 2>/dev/null ||
-   ! grep -q 'cbm-code-discovery-gate' "$FAKE_HOME/.claude/settings.json" 2>/dev/null; then
+   ! cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | SELF_PATH="$SELF_PATH" python3 -c "
+# Claude's gate is registered shell-free (#1733): the binary itself as the
+# command with 'hook-augment' as its argument, so no shim name can be grepped.
+import json, os, sys
+d = json.load(sys.stdin)
+self_path = os.environ['SELF_PATH']
+hooks = [h for entry in d.get('hooks', {}).get('PreToolUse', []) for h in entry.get('hooks', [])]
+ok = any(h.get('args') == ['hook-augment'] and
+         (h.get('command') == self_path or
+          os.path.basename(str(h.get('command', ''))) == os.path.basename(self_path))
+         for h in hooks)
+sys.exit(0 if ok else 1)
+" 2>/dev/null; then
   echo "FAIL 8aq: Devin hooks are not deduplicated against Claude SessionStart"
   exit 1
 else
@@ -2714,6 +2901,7 @@ if [[ "$BINARY" == *.exe ]]; then
   UNINSTALL_BINARY="$SELF_PATH"
 fi
 HOME="$FAKE_HOME" \
+  CODEX_HOME="$FAKE_HOME/.codex" \
   XDG_CONFIG_HOME="$FAKE_HOME/.config" \
   APPDATA="$FAKE_HOME/AppData/Roaming" \
   LOCALAPPDATA="$FAKE_HOME/AppData/Local" \
@@ -2755,9 +2943,14 @@ if cat "$FAKE_HOME/.claude/settings.json" 2>/dev/null | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 hooks = d.get('hooks', {})
+# Shim names cover legacy shell registrations; the exec form (#1733) carries
+# no shim name, so its 'hook-augment' argument is the owned marker there.
 found = any('cbm-code-discovery-gate' in str(h) or
             'cbm-session-reminder' in str(h) or
-            'cbm-subagent-reminder' in str(h)
+            'cbm-subagent-reminder' in str(h) or
+            any('hook-augment' in str(x.get('args', [])) or
+                'hook-augment' in str(x.get('command', ''))
+                for x in h.get('hooks', []))
             for entries in hooks.values() for h in entries)
 sys.exit(1 if found else 0)
 " 2>/dev/null; then

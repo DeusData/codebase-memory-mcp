@@ -42,6 +42,9 @@ typedef struct {
     bool forced; /* force was needed after grace expiry or to reap descendants after root exit */
     bool tree_quiesced;      /* the owned process tree has no surviving processes */
     bool supervision_failed; /* the bounded containment deadline expired; tree_quiesced is false */
+    size_t job_memory_limit_bytes; /* Windows Job Object commit cap; zero on POSIX or uncapped */
+    size_t peak_job_memory_bytes;  /* Windows peak commit, not RSS or proof of a limit hit */
+    bool job_memory_available;     /* terminal Job Object memory query succeeded */
 } cbm_proc_result_t;
 
 /* Called synchronously for each newly-completed log chunk while the child runs.
@@ -68,6 +71,8 @@ typedef struct {
                                       * ms with no new completed log line */
     int cancel_grace_ms;             /* graceful tree-termination window; <= 0 uses the finite
                                       * CBM_SUBPROCESS_DEFAULT_CANCEL_GRACE_MS */
+    size_t memory_limit_bytes;       /* Windows-only hard commit limit for the entire Job Object;
+                                      * 0 => no OS-enforced memory limit */
     bool delete_log_on_exit;         /* unlink log_file after reaping */
 } cbm_proc_opts_t;
 

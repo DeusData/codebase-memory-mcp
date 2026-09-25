@@ -2800,8 +2800,17 @@ static void resolve_value_references_at(TSLSPContext *ctx, TSNode call_node) {
     }
 }
 
+static TSNode unwrap_await_callee(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "await_expression") != 0 ||
+        ts_node_named_child_count(node) == 0) {
+        return node;
+    }
+    return ts_node_named_child(node, 0);
+}
+
 static void resolve_call_at(TSLSPContext *ctx, TSNode call_node) {
     TSNode fn = ts_node_child_by_field_name(call_node, "function", TS_LSP_FIELD_LEN("function"));
+    fn = unwrap_await_callee(fn);
     if (ts_node_is_null(fn))
         return;
 

@@ -258,6 +258,7 @@ static const char *ES_ALL_EDGE_TYPES[] = {"CALLS",
                                           "INHERITS",
                                           "INFRA_MAPS",
                                           "OVERRIDE",
+                                          "REFERENCES_FILE",
                                           "SEMANTICALLY_RELATED",
                                           "SIMILAR_TO",
                                           "TESTS_FILE",
@@ -415,6 +416,19 @@ TEST(es_calls_vue_embedded_issue1410) {
          "function callee(): number { return 42; }\n"
          "function caller(): number { return callee(); }\n"
          "</script>\n"},
+    };
+    ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
+    PASS();
+}
+
+TEST(es_calls_svelte_embedded_issue1807) {
+    static const ES_LangFile f[] = {
+        {"Toggle.svelte",
+         "<script lang=\"ts\">\n"
+         "function callee(): number { return 42; }\n"
+         "function caller(): number { return callee(); }\n"
+         "</script>\n"
+         "<button on:click={caller}>Toggle</button>\n"},
     };
     ASSERT_EQ(es_exact_edge_by_name(f, 1, "CALLS", "caller", "callee"), 1);
     PASS();
@@ -927,6 +941,7 @@ SUITE(edge_structural) {
     RUN_TEST(es_calls_crossfile_kotlin);
     RUN_TEST(es_calls_crossfile_csharp);
     RUN_TEST(es_calls_vue_embedded_issue1410);
+    RUN_TEST(es_calls_svelte_embedded_issue1807);
 
     /* ── FAMILY 2: INHERITS cross-file ────────────────────────── */
     /* GREEN: Java, C#, C++ (extraction confirmed correct). */

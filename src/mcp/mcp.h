@@ -75,7 +75,6 @@ const char *cbm_mcp_tool_name(int index);
 /* Tool metadata by name (static; do not free; NULL when unknown). Used by the
  * generated client adapters so they can emit descriptions and parameter
  * schemas without drifting from tools/list. */
-const char *cbm_mcp_tool_title(const char *tool_name);
 const char *cbm_mcp_tool_description(const char *tool_name);
 
 /* Render the top-level --help "Tools:" block from the registry so the help
