@@ -69,6 +69,9 @@ typedef struct {
     // recursive unions/wrappers across registered types) otherwise recurse
     // without bound — stack overflow on real repos.
     int member_depth;
+    // Same guard for lookup_method: its extends/implements walk recursed
+    // without bound on a cyclic heritage chain (#1743).
+    int method_depth;
 } TSLSPContext;
 
 #ifdef CBM_ENABLE_TEST_SEAMS
