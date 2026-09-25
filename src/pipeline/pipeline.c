@@ -204,7 +204,7 @@ struct cbm_pipeline {
     bool persistence; /* write .codebase-memory/graph.db.zst after indexing */
     cbm_index_resource_policy_t resource_policy;
     cbm_index_resource_violation_t resource_violation;
-    bool background;  /* reserve CPU headroom when no user is waiting */
+    bool background; /* reserve CPU headroom when no user is waiting */
 
     /* Snapshot of the artifact export failure of THIS run (set only by
      * export_after_publish failure, zeroed at run start, cleared on success).
