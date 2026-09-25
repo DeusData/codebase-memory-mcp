@@ -983,7 +983,25 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+/* #1967: every line counter over one source buffer answers the same
+ * question the same way. A trailing newline ends the last line; it does not
+ * open a new one. */
+TEST(source_line_count_one_convention) {
+    ASSERT_EQ(cbm_source_line_count("", 0), 1u);
+    ASSERT_EQ(cbm_source_line_count("a", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\n", 2), 1u);
+    ASSERT_EQ(cbm_source_line_count("\n", 1), 1u);
+    ASSERT_EQ(cbm_source_line_count("a\nb", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\nb\n", 4), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\n\n", 3), 2u);
+    ASSERT_EQ(cbm_source_line_count("a\r\nb\r\n", 6), 2u);
+    /* src_len bounds the count, not a NUL terminator. */
+    ASSERT_EQ(cbm_source_line_count("a\nb\nc", 2), 1u);
+    PASS();
+}
+
 SUITE(parse_coverage) {
+    RUN_TEST(source_line_count_one_convention);
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
     RUN_TEST(c_error_range_points_at_failed_region);
