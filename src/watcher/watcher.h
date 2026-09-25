@@ -110,6 +110,25 @@ int cbm_watcher_watch_count(cbm_watcher_t *w);
  * without first giving the counter atomic accessors. */
 int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name);
 
+/* Per-project watch status, for index_status (#2167). */
+typedef enum {
+    CBM_WATCHER_STRATEGY_PENDING = 0, /* registered; first poll not done yet */
+    CBM_WATCHER_STRATEGY_GIT = 1,     /* git HEAD + dirty-state polling */
+    CBM_WATCHER_STRATEGY_NONE = 2,    /* not a git project: never polled */
+} cbm_watcher_strategy_t;
+
+typedef struct {
+    cbm_watcher_strategy_t strategy;
+    int poll_interval_ms;     /* current adaptive cadence */
+    int64_t last_scan_unix_s; /* wall clock of the last completed scan; 0 = none */
+} cbm_watcher_project_info_t;
+
+/* Return true when project_name is physically watched and fill *out with its
+ * published status; false (and *out zeroed) otherwise. Safe to call while the
+ * poll loop runs: the fields are published atomically by the poll path. */
+bool cbm_watcher_project_info(cbm_watcher_t *w, const char *project_name,
+                              cbm_watcher_project_info_t *out);
+
 /* Return the adaptive poll interval (ms) for a given file count. */
 int cbm_watcher_poll_interval_ms(int file_count);
 

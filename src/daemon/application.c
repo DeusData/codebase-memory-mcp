@@ -536,6 +536,55 @@ static void application_refresh_watch_locked(cbm_daemon_application_session_t *s
     session->watch = watch;
 }
 
+static const char *application_watch_strategy_name(cbm_watcher_strategy_t strategy) {
+    switch (strategy) {
+    case CBM_WATCHER_STRATEGY_GIT:
+        return "git";
+    case CBM_WATCHER_STRATEGY_NONE:
+        return "none";
+    default:
+        return "pending";
+    }
+}
+
+/* index_status watch visibility (#2167). The physical watcher is the truth for
+ * "watched"; the reasons explain the documented scope: only an MCP session's
+ * own project is watched, and only while that session is open. Takes the
+ * application mutex and the watcher lock one after the other, never nested. */
+static void application_watch_status(void *context, const char *project,
+                                     cbm_mcp_watch_status_t *out) {
+    cbm_daemon_application_session_t *session = context;
+    cbm_daemon_application_t *application = session ? session->application : NULL;
+    if (!application || !application->watcher) {
+        out->reason = "watcher_disabled";
+        return;
+    }
+    cbm_watcher_project_info_t info;
+    if (cbm_watcher_project_info(application->watcher, project, &info)) {
+        out->watched = true;
+        out->strategy = application_watch_strategy_name(info.strategy);
+        out->poll_interval_ms = info.poll_interval_ms;
+        out->last_scan_unix_s = info.last_scan_unix_s;
+        return;
+    }
+    const char *session_project = cbm_mcp_server_session_project(session->mcp);
+    if (!session_project || strcmp(session_project, project) != 0) {
+        out->reason = "not_session_project";
+        return;
+    }
+    if (application->config &&
+        !cbm_config_get_bool(application->config, CBM_CONFIG_AUTO_WATCH, true)) {
+        out->reason = "auto_watch_off";
+        return;
+    }
+    /* Only MCP sessions run background initialization; a one-shot CLI command
+     * never holds a watch across calls. */
+    cbm_mutex_lock(&application->mutex);
+    bool mcp_session = session->background_eligible;
+    cbm_mutex_unlock(&application->mutex);
+    out->reason = mcp_session ? "not_registered" : "cli_session";
+}
+
 static void application_refresh_watch(cbm_daemon_application_session_t *session) {
     if (!session || !session->application) {
         return;
@@ -2385,6 +2434,7 @@ static cbm_daemon_runtime_application_session_t *application_session_open(
     }
     cbm_mcp_server_set_background_tasks(session->mcp, false);
     cbm_mcp_server_set_config(session->mcp, application->config);
+    cbm_mcp_server_set_watch_status_provider(session->mcp, application_watch_status, session);
     cbm_mcp_server_set_index_executor(session->mcp, application_index_execute, session);
     cbm_mcp_server_set_project_mutation_guard(session->mcp, application_session_mutation_begin,
                                               application_session_mutation_end, session);
