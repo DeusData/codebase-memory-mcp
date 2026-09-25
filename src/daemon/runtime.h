@@ -439,6 +439,12 @@ void cbm_daemon_runtime_force_peer_image_unverified_for_testing(bool force);
  * i.e. the tamper case that must still be rejected after unverifiable images
  * became admissible. */
 void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force);
+/* #1955 test seam: make the peer look like a different file with identical
+ * bytes (second install path, package-manager copy) so the fingerprint
+ * fallback runs; the counter reports how many full-image fingerprints the
+ * HELLO path has computed in this process. */
+void cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(bool force);
+uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void);
 /* Abandoned-request containment seams (2026-08-29 zombie incident). The
  * timeout override shrinks the join ceiling to test scale; zero restores the
  * production constant. The hook replaces the terminal containment stop with a
