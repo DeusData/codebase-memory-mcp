@@ -222,4 +222,37 @@ static inline void th_cleanup(const char *path) {
     }
 }
 
+/* ── Inherited git repository environment (#2003) ─────────────── */
+
+/* Git exports repository-local variables into hooks (GIT_DIR, GIT_INDEX_FILE,
+ * ...), and they take precedence over `git -C <dir>`. A test runner started
+ * from a pre-commit hook (or any shell with GIT_DIR set) would otherwise point
+ * every fixture's git command at the caller's real repository: branches and
+ * worktrees get created there and fixture assertions fail. This is the list
+ * `git rev-parse --local-env-vars` prints; runners clear it once at startup so
+ * every spawned git (and every re-exec'd child) scopes to its fixture. */
+static const char *const th_git_repo_env_vars[] = {
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+};
+
+static inline void th_clear_git_repo_env(void) {
+    for (size_t i = 0U; i < sizeof(th_git_repo_env_vars) / sizeof(th_git_repo_env_vars[0]); i++) {
+        (void)cbm_unsetenv(th_git_repo_env_vars[i]);
+    }
+}
+
 #endif /* TEST_HELPERS_H */

@@ -310,6 +310,12 @@ else
     make -f Makefile.cbm test-par ${MAKE_ARGS[@]+"${MAKE_ARGS[@]}"}
 fi
 
+# Step 3a: the runner must ignore an inherited git repository environment
+# (#2003: the pre-commit hook exports GIT_DIR, which overrides `git -C` and
+# pointed fixture git commands at the committer's real repository).
+echo "=== Step 3a: inherited git environment isolation (#2003) ==="
+bash "$ROOT/tests/test_git_env_isolation_contract.sh" "$ROOT/$BUILD_DIR/test-runner"
+
 # Step 4: C++ large-TU index-hang regression guard (#410). Runs the PROD binary
 # in a subprocess with a wall-clock timeout — a hang must fail, not block the run.
 # Opt-in via CBM_RUN_HANG_TEST=1 (it needs the prod binary, which the ASan unit
