@@ -107,6 +107,16 @@ static char *extract_local_name_from_json(const char *props_json) {
     return cbm_strndup(start, end - start);
 }
 
+/* The graph node whose QN is cbm_pipeline_fqn_compute(project, rel_path, name),
+ * or NULL. The one place this pass computes a transient QN for a lookup. */
+static const cbm_gbuf_node_t *pc_find_by_computed_qn(const cbm_gbuf_t *gbuf, const char *project,
+                                                     const char *rel_path, const char *name) {
+    char *qn = cbm_pipeline_fqn_compute(project, rel_path, name);
+    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
+    free(qn);
+    return n;
+}
+
 static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count) {
@@ -153,9 +163,8 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
     }
 
     /* Slow path: scan graph buffer IMPORTS edges + parse JSON properties */
-    char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel_path, "__file__");
-    const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
-    free(file_qn);
+    const cbm_gbuf_node_t *file_node =
+        pc_find_by_computed_qn(ctx->gbuf, ctx->project_name, rel_path, "__file__");
     if (!file_node) {
         return 0;
     }
@@ -251,9 +260,7 @@ static const cbm_gbuf_node_t *pc_module_var(const cbm_gbuf_t *gbuf, const char *
     if (!file_rel) {
         return NULL;
     }
-    char *qn = cbm_pipeline_fqn_compute(project, file_rel, name);
-    const cbm_gbuf_node_t *n = qn ? cbm_gbuf_find_by_qn(gbuf, qn) : NULL;
-    free(qn);
+    const cbm_gbuf_node_t *n = pc_find_by_computed_qn(gbuf, project, file_rel, name);
     return (n && n->label && strcmp(n->label, "Variable") == 0) ? n : NULL;
 }
 
@@ -630,9 +637,7 @@ static const cbm_gbuf_node_t *calls_find_source(cbm_pipeline_ctx_t *ctx, const c
         }
     }
     if (!src) {
-        char *fqn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
-        src = cbm_gbuf_find_by_qn(ctx->gbuf, fqn);
-        free(fqn);
+        src = pc_find_by_computed_qn(ctx->gbuf, ctx->project_name, rel, "__file__");
     }
     return src;
 }
