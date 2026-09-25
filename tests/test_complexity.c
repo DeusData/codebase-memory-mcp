@@ -49,6 +49,8 @@
 #include "../src/foundation/profile.h"
 #include "cbm.h"
 #include "discover/discover.h"
+#include "lang_specs.h"
+#include "tree_sitter/api.h"
 #include "pipeline/pass_lsp_cross.h"
 #include "pipeline/pipeline.h"
 #include "pipeline/pipeline_internal.h"
@@ -760,7 +762,82 @@ TEST(complexity_importance_scoring_is_linear) {
     PASS();
 }
 
+/* ── Lexer work in error recovery (#2176) ──────────────────────────────
+ * tree-sitter lexes an unparseable stretch by retrying at every byte with
+ * every external token marked valid. The ReScript scanner then ran its
+ * template-string loop from each byte to the next '`', '$', '\\' or NUL — to
+ * the end of the file when there is none — and threw the result away. That
+ * is O(stretch) per byte, O(n^2) per file, all inside lexing where the parse
+ * budget's progress callback never runs; a binary Godot `.res` of high bytes
+ * (or plain text such as a run of '~') was dropped by the clock instead of
+ * parsed. Work is counted as the bytes the lexer pulls through a chunked
+ * TSInput: a pure function of (grammar, input), independent of speed. */
+enum { CX_LEX_CHUNK = 64, CX_LEX_BASE_BYTES = 4096 };
+
+typedef struct {
+    const char *src;
+    uint32_t len;
+    uint64_t bytes_pulled;
+} CxLexInput;
+
+static const char *cx_lex_read(void *payload, uint32_t byte_index, TSPoint position,
+                               uint32_t *bytes_read) {
+    (void)position;
+    CxLexInput *in = (CxLexInput *)payload;
+    if (byte_index >= in->len) {
+        *bytes_read = 0;
+        return "";
+    }
+    uint32_t n = in->len - byte_index;
+    if (n > CX_LEX_CHUNK) {
+        n = CX_LEX_CHUNK;
+    }
+    in->bytes_pulled += n;
+    *bytes_read = n;
+    return in->src + byte_index;
+}
+
+/* Bytes pulled while parsing `len` copies of `fill` as ReScript; 0 on failure. */
+static uint64_t cx_rescript_lex_work(unsigned char fill, uint32_t len) {
+    char *src = malloc(len);
+    TSParser *parser = ts_parser_new();
+    uint64_t work = 0;
+    if (src && parser && ts_parser_set_language(parser, cbm_ts_language(CBM_LANG_RESCRIPT))) {
+        memset(src, fill, len);
+        CxLexInput in = {src, len, 0};
+        TSInput input = {&in, cx_lex_read, TSInputEncodingUTF8, NULL};
+        TSTree *tree = ts_parser_parse(parser, NULL, input);
+        if (tree) {
+            work = in.bytes_pulled;
+            ts_tree_delete(tree);
+        }
+    }
+    if (parser) {
+        ts_parser_delete(parser);
+    }
+    free(src);
+    return work;
+}
+
+TEST(complexity_rescript_error_recovery_lexing_is_linear) {
+    /* 0xFF: the reporter's binary bytes (invalid UTF-8). '~': plain ASCII text
+     * that ReScript cannot parse either — the defect is not binary-only. */
+    static const unsigned char fills[] = {0xFF, '~'};
+    for (size_t i = 0; i < sizeof(fills); i++) {
+        uint64_t base = cx_rescript_lex_work(fills[i], CX_LEX_BASE_BYTES);
+        uint64_t doubled = cx_rescript_lex_work(fills[i], 2 * CX_LEX_BASE_BYTES);
+        double r = cx_ratio((double)doubled, (double)base);
+        printf("    fill 0x%02x: lexer bytes %llu -> %llu  ratio %.2f (linear ~2, quadratic ~4)\n",
+               fills[i], (unsigned long long)base, (unsigned long long)doubled, r);
+        /* Non-vacuous: the lexer must at least have read the input once. */
+        ASSERT_GTE(base, (uint64_t)CX_LEX_BASE_BYTES);
+        ASSERT_TRUE(r >= CX_RATIO_LO && r <= CX_RATIO_HI);
+    }
+    PASS();
+}
+
 SUITE(complexity) {
+    RUN_TEST(complexity_rescript_error_recovery_lexing_is_linear);
     RUN_TEST(complexity_replicated_modules_scale_linearly);
     RUN_TEST(complexity_perfile_registry_work_is_linear);
     RUN_TEST(complexity_importance_scoring_is_linear);
