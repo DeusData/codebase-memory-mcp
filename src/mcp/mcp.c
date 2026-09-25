@@ -6788,6 +6788,7 @@ static char *handle_index_status(cbm_mcp_server_t *srv, const char *args) {
         }
         add_coverage_report(doc, root, store, project, have_proj_info ? proj_info.indexed_at : NULL,
                             coverage_samples);
+        (void)cbm_cross_repo_add_status_json(doc, root, store, project);
         safe_str_free(&proj_info.name);
         safe_str_free(&proj_info.indexed_at);
         safe_str_free(&proj_info.root_path);
@@ -9922,6 +9923,7 @@ static char *handle_cross_repo_mode(cbm_mcp_server_t *srv, const char *repo_path
     yyjson_doc_free(jdoc);
 
     if (result.failed) {
+        cbm_cross_repo_result_free(&result);
         free(project);
         return cbm_mcp_text_result(
             "cross-repo source or target project is missing, invalid, or not indexed", true);
@@ -9953,9 +9955,23 @@ static char *handle_cross_repo_mode(cbm_mcp_server_t *srv, const char *repo_path
     yyjson_mut_obj_add_int(doc, root, "cross_trpc_calls", result.trpc_edges);
     yyjson_mut_obj_add_int(doc, root, "total_cross_edges", total);
     yyjson_mut_obj_add_real(doc, root, "elapsed_ms", result.elapsed_ms);
+    /* ["*"] skips stores it cannot link (#2133); name them so a partial fleet
+     * is visible instead of silently smaller. Only emitted when non-empty. */
+    if (result.skipped_count > 0) {
+        yyjson_mut_val *skipped = yyjson_mut_arr(doc);
+        for (int i = 0; i < result.skipped_count; i++) {
+            yyjson_mut_val *item = yyjson_mut_obj(doc);
+            yyjson_mut_obj_add_strcpy(doc, item, "name", result.skipped_projects[i].project);
+            yyjson_mut_obj_add_str(doc, item, "reason", result.skipped_projects[i].reason);
+            yyjson_mut_obj_add_str(doc, item, "hint", "reindex this project");
+            yyjson_mut_arr_append(skipped, item);
+        }
+        yyjson_mut_obj_add_val(doc, root, "skipped_projects", skipped);
+    }
 
     char *json = yy_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
+    cbm_cross_repo_result_free(&result);
     free(project);
     char *out = cbm_mcp_text_result(json, result.cancelled);
     free(json);

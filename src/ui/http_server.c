@@ -19,6 +19,7 @@
 #include "ui/layout3d.h"
 #include "mcp/mcp.h"
 #include "store/store.h"
+#include "pipeline/pass_cross_repo.h"
 #include "watcher/watcher.h"
 #include "cli/cli.h"
 #include "git/git_context.h"
@@ -1730,6 +1731,9 @@ static void handle_layout(cbm_http_conn_t *c, const cbm_http_req_t *req) {
         free(linked[li]);
     }
 
+    /* Next to linked_projects: an empty list alone cannot tell "never linked"
+     * from "linked, nothing matched". */
+    (void)cbm_cross_repo_add_status_json(mdoc, mroot, store, project);
     cbm_store_close(store);
     yyjson_mut_obj_add_val(mdoc, mroot, "linked_projects", lp_arr);
 
