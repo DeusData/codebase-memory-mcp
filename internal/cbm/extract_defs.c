@@ -7454,6 +7454,38 @@ static void extract_typescript_namespace_def(CBMExtractCtx *ctx, TSNode node,
     cbm_defs_push(&ctx->result->defs, ctx->arena, def);
 }
 
+/* Dart `extension on T { ... }` has no name: there is no container def to hang
+ * its members on, and extract_class_def would bail before extract_class_methods,
+ * dropping every member (#1457). */
+static bool is_dart_unnamed_extension(const CBMExtractCtx *ctx, TSNode node) {
+    return ctx->language == CBM_LANG_DART &&
+           strcmp(ts_node_type(node), "extension_declaration") == 0 &&
+           ts_node_is_null(ts_node_child_by_field_name(node, TS_FIELD("name")));
+}
+
+/* Walk an unnamed Dart extension's members as file-level functions. A member is
+ * `method_signature > function_signature`; the wrapper carries no name of its
+ * own, so push the inner function_signature (which does) for the generic walk. */
+static void push_dart_unnamed_extension_members(TSNode node, wd_stack_t *s,
+                                                const char *enclosing_qn) {
+    TSNode body = ts_node_child_by_field_name(node, TS_FIELD("body"));
+    if (ts_node_is_null(body)) {
+        return;
+    }
+    uint32_t nc = ts_node_named_child_count(body);
+    for (int i = (int)nc - 1; i >= 0; i--) {
+        TSNode child = ts_node_named_child(body, (uint32_t)i);
+        if (strcmp(ts_node_type(child), "method_signature") == 0) {
+            TSNode sig = cbm_find_child_by_kind(child, "function_signature");
+            if (!ts_node_is_null(sig)) {
+                wd_push(s, sig, enclosing_qn);
+            }
+            continue;
+        }
+        wd_push(s, child, enclosing_qn);
+    }
+}
+
 // Push nested class children from a class body container onto the walk stack.
 static void push_class_body_children(TSNode node, const CBMLangSpec *spec, wd_stack_t *s,
                                      const char *new_enclosing, const CBMExtractCtx *ctx) {
@@ -8053,6 +8085,11 @@ static void walk_defs(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec, 
                 extract_typescript_namespace_def(ctx, node, frame.enclosing_class_qn);
             }
             wd_push_children_reverse(&s, node, new_enclosing);
+            continue;
+        }
+
+        if (is_dart_unnamed_extension(ctx, node)) {
+            push_dart_unnamed_extension_members(node, &s, frame.enclosing_class_qn);
             continue;
         }
 

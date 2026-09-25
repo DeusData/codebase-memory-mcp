@@ -594,8 +594,9 @@ static const char *swift_decorator_types[] = {"attribute", NULL};
 // ==================== DART ====================
 static const char *dart_func_types[] = {"function_signature", "method_signature",
                                         "lambda_expression", NULL};
-static const char *dart_class_types[] = {"class_definition", "enum_declaration",
-                                         "mixin_declaration", "type_alias", NULL};
+static const char *dart_class_types[] = {"class_definition",  "enum_declaration",
+                                         "mixin_declaration", "extension_declaration",
+                                         "type_alias",        NULL};
 static const char *dart_field_types[] = {"declaration", NULL};
 static const char *dart_module_types[] = {"program", NULL};
 static const char *dart_call_types[] = {"selector", "new_expression", NULL};
