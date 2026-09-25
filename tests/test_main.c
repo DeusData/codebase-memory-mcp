@@ -920,6 +920,9 @@ extern void suite_dump_verify_io(void);
 extern void cbm_kind_in_set_free_cache(void);
 
 int main(int argc, char **argv) {
+    /* #2003: never let a caller's GIT_DIR/GIT_INDEX_FILE/... redirect fixture
+     * git commands at the caller's real repository. */
+    th_clear_git_repo_env();
     /* Skip the multi-hundred-MB executable-image hash that computes the exact
      * build fingerprint: it is tens of seconds per spawned worker/daemon under
      * ASan on constrained CI runners and the sole cause of the daemon-family
