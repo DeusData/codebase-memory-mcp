@@ -19480,10 +19480,43 @@ TEST(autoindex_limit_guards_git_root_issue713) {
     PASS();
 }
 
-TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
+/* A servable project row is a committed index. user_version stays 0, so a
+ * later run cannot take the incremental no-op and skip recording workers. */
+static bool mcp_publish_committed_index(const char *root) {
+    char *project = root ? cbm_project_name_from_path(root) : NULL;
+    cbm_store_t *store = project ? cbm_store_open(project) : NULL;
+    bool published = store && cbm_store_upsert_project(store, project, root) == CBM_STORE_OK;
+    cbm_store_close(store);
+    free(project);
+    return published;
+}
+
+#ifdef CBM_ENABLE_TEST_SEAMS
+typedef struct {
+    const char *root;
+    bool published;
+} mcp_committed_seed_t;
+
+/* maybe_auto_index returns before the thread when <project>.db already
+ * exists. Publish the committed index from the count hook, which runs after
+ * that check and before autoindex_thread chooses a width. */
+static void mcp_autoindex_publish_committed(void *context) {
+    mcp_committed_seed_t *seed = context;
+    if (seed) {
+        seed->published = mcp_publish_committed_index(seed->root);
+    }
+}
+#endif
+
+/* First index, including one started automatically, uses every core. Headroom
+ * applies only once a servable project database already exists.
+ * automatic: in-process auto-index (initialize → autoindex_thread).
+ * Otherwise index_repository with _cbm_background, the daemon/watcher path. */
+static int mcp_assert_inprocess_worker_policy(bool committed, bool automatic) {
     char cache[256];
     char repo[512];
-    (void)snprintf(cache, sizeof(cache), "%s/cbm-autoindex-workers-XXXXXX", cbm_tmpdir());
+    (void)snprintf(cache, sizeof(cache), "%s/cbm-worker-policy-%d%d-XXXXXX", cbm_tmpdir(),
+                   committed ? 1 : 0, automatic ? 1 : 0);
     bool cache_ready = cbm_mkdtemp(cache) != NULL;
     (void)snprintf(repo, sizeof(repo), "%s/repo", cache);
     char source[640];
@@ -19503,24 +19536,57 @@ TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
         environment[i].value = value ? strdup(value) : NULL;
         environment_saved = environment_saved && (!value || environment[i].value);
     }
-    bool environment_ready =
-        environment_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
-        cbm_unsetenv("CBM_WORKERS") == 0 && cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") == 0;
+    bool environment_ready = environment_saved && cbm_setenv("CBM_CACHE_DIR", cache, 1) == 0 &&
+                             cbm_unsetenv("CBM_WORKERS") == 0 &&
+                             cbm_unsetenv("CBM_INDEX_SINGLE_THREAD") == 0;
 
+    bool seeded = !committed;
     char old_cwd[CBM_SZ_4K] = {0};
-    bool cwd_ready = repo_ready && environment_ready && cbm_getcwd(old_cwd, sizeof(old_cwd)) &&
-                     cbm_chdir(repo) == 0;
-    cbm_config_t *config = cwd_ready ? cbm_config_open(cache) : NULL;
-    bool config_ready = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
-                        cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
-    cbm_pipeline_worker_count_test_reset();
-    cbm_mcp_server_t *server = config_ready ? cbm_mcp_server_new(NULL) : NULL;
+    bool cwd_ready = true;
+    cbm_config_t *config = NULL;
+    bool config_ready = true;
+    cbm_mcp_server_t *server = NULL;
     char *response = NULL;
-    if (server) {
-        cbm_mcp_server_set_config(server, config);
-        response = cbm_mcp_server_handle(
-            server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
-        cbm_mcp_server_free(server); /* joins the automatic index thread */
+    if (automatic) {
+        cwd_ready = repo_ready && environment_ready && cbm_getcwd(old_cwd, sizeof(old_cwd)) &&
+                    cbm_chdir(repo) == 0;
+        config = cwd_ready ? cbm_config_open(cache) : NULL;
+        config_ready = config && cbm_config_set(config, CBM_CONFIG_AUTO_INDEX, "true") == 0 &&
+                       cbm_config_set(config, CBM_CONFIG_AUTO_WATCH, "false") == 0;
+        cbm_pipeline_worker_count_test_reset();
+        server = config_ready ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            cbm_mcp_server_set_config(server, config);
+#ifdef CBM_ENABLE_TEST_SEAMS
+            mcp_committed_seed_t seed = {.root = repo, .published = !committed};
+            if (committed) {
+                cbm_mcp_server_set_auto_index_count_test_hook(
+                    server, mcp_autoindex_publish_committed, &seed);
+            }
+#endif
+            response = cbm_mcp_server_handle(
+                server, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}");
+#ifdef CBM_ENABLE_TEST_SEAMS
+            seeded = seed.published;
+#endif
+            cbm_mcp_server_free(server); /* joins the automatic index thread */
+        }
+    } else {
+        if (committed && repo_ready && environment_ready) {
+            seeded = mcp_publish_committed_index(repo);
+        }
+        cbm_pipeline_worker_count_test_reset();
+        server = repo_ready && environment_ready && seeded ? cbm_mcp_server_new(NULL) : NULL;
+        if (server) {
+            char repo_json[512];
+            char args[CBM_SZ_1K];
+            (void)snprintf(repo_json, sizeof(repo_json), "%s", repo);
+            cbm_normalize_path_sep(repo_json);
+            (void)snprintf(args, sizeof(args), "{\"_cbm_background\":true,\"repo_path\":\"%s\"}",
+                           repo_json);
+            response = cbm_mcp_handle_tool(server, "index_repository", args);
+            cbm_mcp_server_free(server);
+        }
     }
     int selected_workers = cbm_pipeline_worker_count_test_last();
     bool server_ready = server != NULL;
@@ -19528,12 +19594,12 @@ TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
 
     free(response);
     cbm_config_close(config);
-    if (cwd_ready) {
+    if (automatic && cwd_ready) {
         (void)cbm_chdir(old_cwd);
     }
     /* Capture while CBM_WORKERS is still unset. Restoring first makes the
-     * expected count follow the lane override instead of the headroom policy. */
-    int expected = cbm_default_worker_count(false);
+     * expected count follow the lane override instead of this policy. */
+    int expected = cbm_default_worker_count(!committed);
     mcp_test_restore_env(environment, sizeof(environment) / sizeof(environment[0]));
     bool cleaned = !cache_ready || th_rmtree(cache) == 0;
 
@@ -19543,11 +19609,28 @@ TEST(mcp_auto_index_in_process_uses_background_worker_policy) {
     ASSERT_TRUE(environment_ready);
     ASSERT_TRUE(cwd_ready);
     ASSERT_TRUE(config_ready);
+    ASSERT_TRUE(seeded);
     ASSERT_TRUE(server_ready);
     ASSERT_TRUE(response_ready);
     ASSERT_EQ(selected_workers, expected);
     ASSERT_TRUE(cleaned);
     PASS();
+}
+
+TEST(mcp_auto_index_in_process_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, true);
+}
+
+TEST(mcp_auto_index_in_process_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, true);
+}
+
+TEST(mcp_background_flag_fresh_project_uses_full_width) {
+    return mcp_assert_inprocess_worker_policy(false, false);
+}
+
+TEST(mcp_background_flag_existing_index_keeps_headroom) {
+    return mcp_assert_inprocess_worker_policy(true, false);
 }
 
 /* ══════════════════════════════════════════════════════════════════
@@ -20836,7 +20919,10 @@ SUITE(mcp) {
     RUN_TEST(autoindex_limit_guards_non_git_root_issue713);
     RUN_TEST(autoindex_limit_admits_non_git_root_under_limit_issue713);
     RUN_TEST(autoindex_limit_guards_git_root_issue713);
-    RUN_TEST(mcp_auto_index_in_process_uses_background_worker_policy);
+    RUN_TEST(mcp_auto_index_in_process_fresh_project_uses_full_width);
+    RUN_TEST(mcp_auto_index_in_process_existing_index_keeps_headroom);
+    RUN_TEST(mcp_background_flag_fresh_project_uses_full_width);
+    RUN_TEST(mcp_background_flag_existing_index_keeps_headroom);
 }
 
 /* Kept separate so daemon-coordination regressions can be iterated without

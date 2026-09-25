@@ -11095,6 +11095,22 @@ static bool project_db_is_servable(const char *project, const char *db_path) {
     return servable;
 }
 
+/* Background CPU headroom is for a refresh of a graph that already serves.
+ * A project's first index keeps every core, even when it was started
+ * automatically: the caller is waiting on a graph that does not exist yet.
+ * An empty or unreadable file is not a committed index. Both sites that
+ * honour automatic indexing — handle_index_repository's _cbm_background
+ * flag and the in-process autoindex_thread — go through this so they
+ * cannot drift. */
+static bool project_has_committed_index(const char *project) {
+    if (!project || !project[0]) {
+        return false;
+    }
+    char db_path[CBM_SZ_1K];
+    project_db_path(project, db_path, sizeof(db_path));
+    return db_path[0] && project_db_is_servable(project, db_path);
+}
+
 /* The three heap strings handle_index_repository owns from
  * cbm_mcp_get_string_arg / resolved_repo_path_from_project_arg. One release
  * point keeps the dozen early-return paths in step; free(NULL) is a no-op, so
@@ -11243,7 +11259,6 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         free(repo_path);
         return cbm_mcp_text_result("failed to create pipeline", true);
     }
-    cbm_pipeline_set_background(p, background);
     if (name_override && name_override[0] && !cbm_pipeline_set_project_name(p, name_override)) {
         cbm_pipeline_free(p);
         mcp_project_mutation_end(srv, mutation_project);
@@ -11253,6 +11268,10 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         return cbm_mcp_text_result("invalid project name", true);
     }
     free(name_override);
+    /* Headroom follows the final project name, decided before artifact
+     * bootstrap can create the first local copy of this index. */
+    cbm_pipeline_set_background(p, background &&
+                                       project_has_committed_index(cbm_pipeline_project_name(p)));
     cbm_pipeline_set_persistence(p, persistence);
     cbm_pipeline_set_resource_policy(p, &resource_policy);
 
@@ -17629,7 +17648,7 @@ static void *autoindex_thread(void *arg) {
         cbm_log_warn("autoindex.err", "msg", "pipeline_create_failed");
         return NULL;
     }
-    cbm_pipeline_set_background(p, true);
+    cbm_pipeline_set_background(p, project_has_committed_index(cbm_pipeline_project_name(p)));
 
     /* Block until any concurrent pipeline finishes */
     cbm_pipeline_lock();
