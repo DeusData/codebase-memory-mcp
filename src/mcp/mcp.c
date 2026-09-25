@@ -15534,10 +15534,18 @@ static const char *detect_project_relative_path(const char *git_path, const char
     return git_path + prefix_length;
 }
 
-/* Read the `--show-prefix` record that follows the two resolved revisions:
- * empty at the repository root, otherwise a '/'-terminated relative directory.
- * Anything else is a malformed answer and fails the request closed. */
-static bool detect_read_git_prefix(FILE *stream, bool *oom, char out[CBM_SZ_4K]) {
+/* A `--show-prefix` answer: empty at the repository root, otherwise a
+ * '/'-terminated relative directory. */
+static bool detect_valid_git_prefix(const char *value) {
+    size_t length = strlen(value);
+    return length == 0 || value[length - 1] == '/';
+}
+
+/* Read one '\n'-terminated `git rev-parse` record (a trailing '\r' dropped)
+ * into out when it is terminated, fits, and passes `valid`. Anything else is
+ * a malformed answer and fails the request closed. */
+static bool detect_read_rev_parse_line(FILE *stream, bool *oom, char *out, size_t out_size,
+                                       bool (*valid)(const char *)) {
     bool terminated = false;
     char *record = detect_read_record(stream, '\n', oom, &terminated);
     if (!record) {
@@ -15547,12 +15555,12 @@ static bool detect_read_git_prefix(FILE *stream, bool *oom, char out[CBM_SZ_4K])
     if (length > 0 && record[length - 1] == '\r') {
         record[--length] = '\0';
     }
-    bool valid = terminated && length < CBM_SZ_4K && (length == 0 || record[length - 1] == '/');
-    if (valid) {
+    bool ok = terminated && length < out_size && valid(record);
+    if (ok) {
         memcpy(out, record, length + 1U);
     }
     free(record);
-    return valid;
+    return ok;
 }
 
 static int detect_changed_path_compare(const void *left, const void *right) {
@@ -15926,39 +15934,19 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         mcp_run_shell_command_cancellable(srv, resolve_cmd, resolve_output_path, &resolve_result);
     bool resolve_cancelled = resolve_result.cancellation_requested || mcp_request_cancelled(srv);
     bool resolve_oom = false;
-    char *resolved_head = NULL;
-    char *resolved_base = NULL;
     FILE *resolve_fp = resolve_run == 0 && resolve_result.exit_code == 0 && !resolve_cancelled
                            ? cbm_fopen(resolve_output_path, "rb")
                            : NULL;
     if (resolve_fp) {
-        bool head_terminated = false;
-        bool base_terminated = false;
-        resolved_head = detect_read_record(resolve_fp, '\n', &resolve_oom, &head_terminated);
-        resolved_base = detect_read_record(resolve_fp, '\n', &resolve_oom, &base_terminated);
-        if (resolved_head) {
-            size_t length = strlen(resolved_head);
-            if (length > 0 && resolved_head[length - 1] == '\r') {
-                resolved_head[--length] = '\0';
-            }
-            if (head_terminated && detect_valid_object_id(resolved_head)) {
-                memcpy(head_oid, resolved_head, length + 1U);
-            }
-        }
-        if (resolved_base) {
-            size_t length = strlen(resolved_base);
-            if (length > 0 && resolved_base[length - 1] == '\r') {
-                resolved_base[--length] = '\0';
-            }
-            if (base_terminated && detect_valid_object_id(resolved_base)) {
-                memcpy(base_oid, resolved_base, length + 1U);
-            }
-        }
-        git_prefix_valid = detect_read_git_prefix(resolve_fp, &resolve_oom, git_prefix);
+        /* Records in argument order: HEAD, base, then the --show-prefix line. */
+        (void)detect_read_rev_parse_line(resolve_fp, &resolve_oom, head_oid, sizeof(head_oid),
+                                         detect_valid_object_id);
+        (void)detect_read_rev_parse_line(resolve_fp, &resolve_oom, base_oid, sizeof(base_oid),
+                                         detect_valid_object_id);
+        git_prefix_valid = detect_read_rev_parse_line(resolve_fp, &resolve_oom, git_prefix,
+                                                      sizeof(git_prefix), detect_valid_git_prefix);
         (void)fclose(resolve_fp);
     }
-    free(resolved_head);
-    free(resolved_base);
     if (resolve_output_path[0]) {
         (void)cbm_unlink(resolve_output_path);
     }
