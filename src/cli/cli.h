@@ -122,6 +122,11 @@ typedef struct {
 /* Get the array of skill definitions. */
 const cbm_skill_t *cbm_get_skills(void);
 
+#ifdef CBM_CLI_ENABLE_TEST_API
+size_t cbm_cli_released_skill_content_count(void);
+const char *cbm_cli_released_skill_content_at(size_t index);
+#endif
+
 /* Install skills to skills_dir (e.g. ~/.claude/skills/).
  * If force is true, overwrite existing skills.
  * Returns count of skills written. */
