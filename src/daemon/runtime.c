@@ -36,6 +36,23 @@ static atomic_bool runtime_force_peer_image_mismatch_seam;
 void cbm_daemon_runtime_force_peer_image_mismatch_for_testing(bool force) {
     atomic_store(&runtime_force_peer_image_mismatch_seam, force);
 }
+/* #1955 test seam: make the active-image comparison miss, exactly as when the
+ * peer runs a DIFFERENT file with identical bytes (a second install path, a
+ * package-manager cache copy). Everything after that comparison - the full
+ * fingerprint fallback and the verified-image cache - still runs for real. The
+ * counter records every full-image fingerprint the HELLO path computes, so a
+ * test asserts how often the O(image size) hash runs instead of timing it. */
+static atomic_bool runtime_force_peer_image_distinct_copy_seam;
+static atomic_uint_fast64_t runtime_peer_image_hash_count_seam;
+void cbm_daemon_runtime_force_peer_image_distinct_copy_for_testing(bool force) {
+    atomic_store(&runtime_force_peer_image_distinct_copy_seam, force);
+}
+uint64_t cbm_daemon_runtime_peer_image_hashes_for_testing(void) {
+    return (uint64_t)atomic_load(&runtime_peer_image_hash_count_seam);
+}
+static void runtime_note_peer_image_hash(void) {
+    (void)atomic_fetch_add(&runtime_peer_image_hash_count_seam, 1);
+}
 /* The abandoned-request containment path ends in process termination, which an
  * in-process harness cannot observe. The timeout override makes the ceiling
  * reachable in test time; the hook replaces termination with a recordable
@@ -59,6 +76,8 @@ static _Atomic uint32_t runtime_ephemeral_linger_timeout_seam = UINT32_MAX;
 void cbm_daemon_runtime_service_set_ephemeral_linger_timeout_for_testing(uint32_t timeout_ms) {
     atomic_store(&runtime_ephemeral_linger_timeout_seam, timeout_ms);
 }
+#else
+static void runtime_note_peer_image_hash(void) {}
 #endif
 
 #ifdef _WIN32
@@ -88,6 +107,11 @@ enum {
     RUNTIME_ACCEPT_POLL_MS = 20,
     RUNTIME_WAIT_POLL_NS = 1000000,
     RUNTIME_WORKER_STACK_SIZE = 256 * 1024,
+    /* Distinct peer image files (install paths / identical copies) whose full
+     * fingerprint already matched this daemon. Each held entry pins one image
+     * inode, so the bound is small; a full table only means later copies are
+     * hashed per admission, exactly as before the table existed. */
+    RUNTIME_VERIFIED_PEER_IMAGE_CAPACITY = 8,
     /* Bounds the drain-before-close wait for a peer consuming its final
      * response; interrupted or already-poisoned connections skip it. */
     RUNTIME_WORKER_DRAIN_TIMEOUT_MS = 2000,
@@ -240,6 +264,10 @@ struct cbm_daemon_runtime_service {
     char build_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
     cbm_daemon_build_identity_t identity;
     runtime_process_image_reference_t active_image;
+    /* Guarded by mutex. Retained references keep each verified inode alive,
+     * so its stat identity cannot be reused by a different file. */
+    runtime_process_image_reference_t verified_peer_images[RUNTIME_VERIFIED_PEER_IMAGE_CAPACITY];
+    size_t verified_peer_image_count;
     char *conflict_log_path;
     size_t conflict_log_cap_bytes;
     uint64_t lease_timeout_ms;
@@ -916,6 +944,35 @@ static bool runtime_process_image_reference_acquire(
     return ok;
 }
 
+/* True when a retained reference is still the unchanged image it captured AND
+ * the freshly acquired peer maps that same image. Metadata only: no hashing. */
+static bool runtime_process_image_reference_same(const runtime_process_image_reference_t *held,
+                                                 const runtime_process_image_reference_t *peer) {
+    if (!held || !held->held || !peer || !peer->held) {
+        return false;
+    }
+#ifdef _WIN32
+    BY_HANDLE_FILE_INFORMATION held_now;
+    LARGE_INTEGER held_size_now;
+    return runtime_windows_file_snapshot(held->file, &held_now, &held_size_now) &&
+           runtime_windows_file_snapshot_same(&held->information, &held->size, &held_now,
+                                              &held_size_now) &&
+           runtime_windows_file_snapshot_same(&held->information, &held->size, &peer->information,
+                                              &peer->size);
+#elif defined(__APPLE__)
+    struct stat held_now;
+    return fstat(held->fd, &held_now) == 0 && runtime_mac_stat_same(&held->status, &held_now) &&
+           runtime_mac_stat_same(&held->status, &peer->status);
+#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
+    struct stat held_now;
+    return fstat(held->fd, &held_now) == 0 &&
+           runtime_posix_stat_same_image(&held->status, &held_now) &&
+           runtime_posix_stat_same_image(&held->status, &peer->status);
+#else
+    return false;
+#endif
+}
+
 /* A false result means only "not proven identical". The caller must use the
  * full fingerprint fallback before rejecting the peer. */
 static bool runtime_process_image_reference_matches_process(
@@ -923,43 +980,12 @@ static bool runtime_process_image_reference_matches_process(
     if (!active || !active->held || process_id == 0) {
         return false;
     }
-#ifdef _WIN32
     runtime_process_image_reference_t peer;
     runtime_process_image_reference_init(&peer);
-    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
-    BY_HANDLE_FILE_INFORMATION active_now;
-    LARGE_INTEGER active_size_now;
-    same = same && runtime_windows_file_snapshot(active->file, &active_now, &active_size_now) &&
-           runtime_windows_file_snapshot_same(&active->information, &active->size, &active_now,
-                                              &active_size_now) &&
-           runtime_windows_file_snapshot_same(&active->information, &active->size,
-                                              &peer.information, &peer.size);
+    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL) &&
+                runtime_process_image_reference_same(active, &peer);
     bool released = runtime_process_image_reference_release(&peer);
     return same && released;
-#elif defined(__APPLE__)
-    runtime_process_image_reference_t peer;
-    runtime_process_image_reference_init(&peer);
-    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
-    struct stat active_now;
-    same = same && fstat(active->fd, &active_now) == 0 &&
-           runtime_mac_stat_same(&active->status, &active_now) &&
-           runtime_mac_stat_same(&active->status, &peer.status);
-    bool released = runtime_process_image_reference_release(&peer);
-    return same && released;
-#elif defined(__linux__) || defined(__FreeBSD__) || defined(__NetBSD__)
-    runtime_process_image_reference_t peer;
-    runtime_process_image_reference_init(&peer);
-    bool same = runtime_process_image_reference_acquire(process_id, &peer, NULL);
-    struct stat active_now;
-    same = same && fstat(active->fd, &active_now) == 0 &&
-           runtime_posix_stat_same_image(&active->status, &active_now) &&
-           runtime_posix_stat_same_image(&active->status, &peer.status);
-    bool released = runtime_process_image_reference_release(&peer);
-    return same && released;
-#else
-    (void)process_id;
-    return false;
-#endif
 }
 
 bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
@@ -978,6 +1004,86 @@ bool cbm_daemon_runtime_process_build_fingerprint(uint64_t process_id,
         out[0] = '\0';
     }
     return ok;
+}
+
+typedef enum {
+    RUNTIME_PEER_IMAGE_VERIFIED,
+    RUNTIME_PEER_IMAGE_UNVERIFIABLE,
+    RUNTIME_PEER_IMAGE_MISMATCH,
+} runtime_peer_image_verdict_t;
+
+static bool runtime_verified_peer_image_known_locked(
+    const cbm_daemon_runtime_service_t *service, const runtime_process_image_reference_t *peer) {
+    for (size_t i = 0; i < service->verified_peer_image_count; i++) {
+        if (runtime_process_image_reference_same(&service->verified_peer_images[i], peer)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1955: the HELLO must prove the peer runs this daemon's build. The cheap
+ * proof is "same image file as the daemon"; a peer running a DIFFERENT file
+ * with identical bytes (a second install path, a package-manager copy) needs
+ * the full fingerprint, i.e. hashing the whole (~300 MB) image. That hash is
+ * slower than the client's HELLO budget, so the client abandoned it and every
+ * re-probe started it again - admission never completed against a healthy
+ * daemon. A copy is now hashed once: its verified reference is retained and
+ * later admissions of the same unchanged file match it by metadata, exactly
+ * like the active image. The accepted set of images is unchanged. */
+static runtime_peer_image_verdict_t runtime_peer_image_verify(cbm_daemon_runtime_service_t *service,
+                                                              uint64_t process_id,
+                                                              const char *requested_build) {
+    runtime_process_image_reference_t peer;
+    runtime_process_image_reference_init(&peer);
+    bool peer_held = runtime_process_image_reference_acquire(process_id, &peer, NULL);
+    bool known = false;
+    if (peer_held) {
+        known = runtime_process_image_reference_same(&service->active_image, &peer);
+#ifdef CBM_ENABLE_TEST_SEAMS
+        if (atomic_load(&runtime_force_peer_image_distinct_copy_seam)) {
+            known = false;
+        }
+#endif
+        if (!known) {
+            cbm_mutex_lock(&service->mutex);
+            known = runtime_verified_peer_image_known_locked(service, &peer);
+            cbm_mutex_unlock(&service->mutex);
+        }
+    }
+    bool released = runtime_process_image_reference_release(&peer);
+    if (known && released) {
+        return RUNTIME_PEER_IMAGE_VERIFIED;
+    }
+
+    char fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
+    runtime_process_image_reference_t hashed;
+    runtime_process_image_reference_init(&hashed);
+    runtime_note_peer_image_hash();
+    bool fingerprinted = runtime_process_image_reference_acquire(process_id, &hashed, fingerprint);
+    bool verified = fingerprinted && strcmp(fingerprint, requested_build) == 0 &&
+                    strcmp(fingerprint, service->identity.build_fingerprint) == 0;
+    if (verified) {
+        cbm_mutex_lock(&service->mutex);
+        if (service->verified_peer_image_count < RUNTIME_VERIFIED_PEER_IMAGE_CAPACITY &&
+            !runtime_verified_peer_image_known_locked(service, &hashed)) {
+            service->verified_peer_images[service->verified_peer_image_count++] = hashed;
+            runtime_process_image_reference_init(&hashed);
+        }
+        cbm_mutex_unlock(&service->mutex);
+    }
+    (void)runtime_process_image_reference_release(&hashed);
+    if (verified) {
+        return RUNTIME_PEER_IMAGE_VERIFIED;
+    }
+    return fingerprinted ? RUNTIME_PEER_IMAGE_MISMATCH : RUNTIME_PEER_IMAGE_UNVERIFIABLE;
+}
+
+static void runtime_verified_peer_images_release(cbm_daemon_runtime_service_t *service) {
+    for (size_t i = 0; i < service->verified_peer_image_count; i++) {
+        (void)runtime_process_image_reference_release(&service->verified_peer_images[i]);
+    }
+    service->verified_peer_image_count = 0;
 }
 
 static bool runtime_hello_response_encode(uint8_t out[CBM_DAEMON_RENDEZVOUS_RESPONSE_SIZE],
@@ -1950,17 +2056,10 @@ static void *runtime_connection_worker(void *opaque) {
         return NULL;
     }
 
-    bool peer_image_verified = runtime_process_image_reference_matches_process(
-        &service->active_image, worker->peer_process_id);
-    bool peer_image_fingerprinted = false;
-    if (!peer_image_verified) {
-        char peer_fingerprint[CBM_DAEMON_BUILD_FINGERPRINT_SIZE];
-        peer_image_fingerprinted =
-            cbm_daemon_runtime_process_build_fingerprint(worker->peer_process_id, peer_fingerprint);
-        peer_image_verified = peer_image_fingerprinted &&
-                              strcmp(peer_fingerprint, requested_build) == 0 &&
-                              strcmp(peer_fingerprint, service->identity.build_fingerprint) == 0;
-    }
+    runtime_peer_image_verdict_t peer_image =
+        runtime_peer_image_verify(service, worker->peer_process_id, requested_build);
+    bool peer_image_verified = peer_image == RUNTIME_PEER_IMAGE_VERIFIED;
+    bool peer_image_fingerprinted = peer_image != RUNTIME_PEER_IMAGE_UNVERIFIABLE;
 #ifdef CBM_ENABLE_TEST_SEAMS
     if (atomic_load(&runtime_force_peer_image_unverified_seam)) {
         peer_image_verified = false;
@@ -2378,6 +2477,7 @@ static void runtime_service_destroy_unstarted(cbm_daemon_runtime_service_t *serv
     cbm_daemon_ipc_listener_close(service->listener);
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
+    runtime_verified_peer_images_release(service);
     free(service->conflict_log_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
@@ -2727,6 +2827,7 @@ bool cbm_daemon_runtime_service_free(cbm_daemon_runtime_service_t *service) {
     }
     cbm_daemon_coordinator_free(service->coordinator);
     (void)runtime_process_image_reference_release(&service->active_image);
+    runtime_verified_peer_images_release(service);
     free(service->conflict_log_path);
     for (size_t i = 0; i < service->worker_mutexes_initialized; i++) {
         cbm_mutex_destroy(&service->workers[i].send_mutex);
