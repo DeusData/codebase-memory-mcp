@@ -1622,6 +1622,141 @@ static bool try_route_from_decorator_call(CBMArena *a, TSNode dchild, const char
     return true;
 }
 
+/* NestJS (and routing-controllers) method decorators: the verb is the bare,
+ * capitalized decorator name — @Get, @Post, ... @All. Returns NULL otherwise. */
+static const char *nest_decorator_method(const char *name) {
+    static const struct {
+        const char *decorator;
+        const char *method;
+    } verbs[] = {{"Get", "GET"},     {"Post", "POST"}, {"Put", "PUT"},         {"Delete", "DELETE"},
+                 {"Patch", "PATCH"}, {"Head", "HEAD"}, {"Options", "OPTIONS"}, {"All", "ANY"}};
+    for (size_t i = 0; name && i < sizeof(verbs) / sizeof(verbs[0]); i++) {
+        if (strcmp(name, verbs[i].decorator) == 0) {
+            return verbs[i].method;
+        }
+    }
+    return NULL;
+}
+
+/* Unquote a TS `string` literal node and root it at "/": Nest writes route
+ * segments without a leading slash (@Get(':id'), @Controller('users')). */
+static const char *nest_path_from_string(CBMArena *a, TSNode node, const char *source) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "string") != 0) {
+        return NULL;
+    }
+    char *text = cbm_node_text(a, node, source);
+    size_t len = text ? strlen(text) : 0;
+    if (len < PAIR_CHARS) {
+        return NULL;
+    }
+    const char *inner = cbm_arena_strndup(a, text + SKIP_CHAR, len - PAIR_CHARS);
+    if (!inner) {
+        return NULL;
+    }
+    return inner[0] == '/' ? inner : cbm_arena_sprintf(a, "/%s", inner);
+}
+
+/* The route path a Nest decorator's argument list carries. Accepted shapes:
+ *   ()                         -> "/"
+ *   ('users') / (['a', 'b'])   -> the (first) string literal
+ *   ({ path: 'users', ... })   -> the `path` property (Nest's options form)
+ * Any other first argument (a constant, a template) has no statically known
+ * path: NULL, so no Route is invented for it. */
+static const char *nest_path_from_args(CBMArena *a, TSNode args, const char *source) {
+    if (ts_node_is_null(args) || ts_node_named_child_count(args) == 0) {
+        return "/";
+    }
+    TSNode arg = ts_node_named_child(args, 0);
+    const char *kind = ts_node_type(arg);
+    if (strcmp(kind, "array") == 0 && ts_node_named_child_count(arg) > 0) {
+        return nest_path_from_string(a, ts_node_named_child(arg, 0), source);
+    }
+    if (strcmp(kind, "object") != 0) {
+        return nest_path_from_string(a, arg, source);
+    }
+    uint32_t nc = ts_node_named_child_count(arg);
+    for (uint32_t i = 0; i < nc; i++) {
+        TSNode pair = ts_node_named_child(arg, i);
+        if (strcmp(ts_node_type(pair), "pair") != 0) {
+            continue;
+        }
+        TSNode key = ts_node_child_by_field_name(pair, TS_FIELD("key"));
+        char *key_text = ts_node_is_null(key) ? NULL : cbm_node_text(a, key, source);
+        if (key_text && strcmp(key_text, "path") == 0) {
+            return nest_path_from_string(a, ts_node_child_by_field_name(pair, TS_FIELD("value")),
+                                         source);
+        }
+    }
+    return "/"; /* options object without `path` (e.g. only `host`) */
+}
+
+/* A TS decorator's call_expression as (bare name, argument list). Returns the
+ * name, or NULL when the callee is not a plain identifier. */
+static const char *ts_decorator_call_name(CBMArena *a, TSNode call, const char *source,
+                                          TSNode *out_args) {
+    if (ts_node_is_null(call) || strcmp(ts_node_type(call), "call_expression") != 0) {
+        return NULL;
+    }
+    TSNode fn = ts_node_child_by_field_name(call, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "identifier") != 0) {
+        return NULL;
+    }
+    *out_args = ts_node_child_by_field_name(call, TS_FIELD("arguments"));
+    return cbm_node_text(a, fn, source);
+}
+
+/* NestJS method route: @Get(':id') on a TS class method. The class-level
+ * @Controller prefix is composed by the caller (nest_class_route_prefix). */
+static bool try_route_from_ts_decorator_call(CBMArena *a, TSNode dchild, const char *source,
+                                             const char **out_path, const char **out_method) {
+    TSNode args = {0};
+    const char *method = nest_decorator_method(ts_decorator_call_name(a, dchild, source, &args));
+    if (!method) {
+        return false;
+    }
+    const char *path = nest_path_from_args(a, args, source);
+    if (!path) {
+        return false;
+    }
+    *out_path = path;
+    *out_method = method;
+    return true;
+}
+
+/* The @Controller('users') prefix of a NestJS controller, from `decorator`
+ * nodes that are children of the class node (`@X class C`) or its preceding
+ * siblings (`@X export class C`: the decorator belongs to export_statement).
+ * NULL when the class is not a controller. */
+static const char *nest_prefix_from_decorator(CBMArena *a, TSNode dec, const char *source) {
+    if (strcmp(ts_node_type(dec), "decorator") != 0) {
+        return NULL;
+    }
+    TSNode args = {0};
+    const char *name = ts_decorator_call_name(a, ts_node_named_child(dec, 0), source, &args);
+    if (!name || (strcmp(name, "Controller") != 0 && strcmp(name, "JsonController") != 0)) {
+        return NULL;
+    }
+    return nest_path_from_args(a, args, source);
+}
+
+static const char *nest_class_route_prefix(CBMArena *a, TSNode class_node, const char *source) {
+    uint32_t cc = ts_node_named_child_count(class_node);
+    for (uint32_t i = 0; i < cc; i++) {
+        const char *p = nest_prefix_from_decorator(a, ts_node_named_child(class_node, i), source);
+        if (p) {
+            return p;
+        }
+    }
+    for (TSNode prev = ts_node_prev_named_sibling(class_node); !ts_node_is_null(prev);
+         prev = ts_node_prev_named_sibling(prev)) {
+        const char *p = nest_prefix_from_decorator(a, prev, source);
+        if (p) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
 /* Resolve an annotation's name node across grammars. Java exposes a `name`
  * field; tree-sitter-kotlin does not — its annotation name lives in a nested
  * type_identifier:
@@ -1794,6 +1929,9 @@ static void extract_route_from_decorators(CBMArena *a, TSNode func_node, const c
         uint32_t dc = ts_node_named_child_count(prev);
         for (uint32_t di = 0; di < dc; di++) {
             TSNode dchild = ts_node_named_child(prev, di);
+            if (try_route_from_ts_decorator_call(a, dchild, source, out_path, out_method)) {
+                return;
+            }
             if (strcmp(ts_node_type(dchild), "call") != 0) {
                 continue;
             }
@@ -5150,6 +5288,12 @@ static void push_method_def(CBMExtractCtx *ctx, TSNode child, TSNode class_node,
     if (def.route_path && (ctx->language == CBM_LANG_JAVA || ctx->language == CBM_LANG_KOTLIN)) {
         const char *prefix = spring_class_route_prefix(a, class_node, ctx->source, spec);
         def.route_path = join_route_paths(a, prefix, def.route_path);
+    }
+    if (def.route_path && (ctx->language == CBM_LANG_TYPESCRIPT || ctx->language == CBM_LANG_TSX)) {
+        /* NestJS: a verb decorator only routes inside a @Controller class. */
+        const char *prefix = nest_class_route_prefix(a, class_node, ctx->source);
+        def.route_path = prefix ? join_route_paths(a, prefix, def.route_path) : NULL;
+        def.route_method = prefix ? def.route_method : NULL;
     }
     def.docstring = extract_docstring(a, child, ctx->source, ctx->language);
 
