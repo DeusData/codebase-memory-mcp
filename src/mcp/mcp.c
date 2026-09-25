@@ -15521,6 +15521,40 @@ static bool detect_add_changed_path(char ***files, int *file_count, int *file_ca
     return true;
 }
 
+/* Git status porcelain always reports paths relative to the Git ROOT, while
+ * graph file_paths are relative to the indexed project root, which may be a
+ * subdirectory of the repository (#1951). `prefix` is that subdirectory as
+ * `git rev-parse --show-prefix` prints it ("" at the root, else "dir/").
+ * Returns the project-relative tail, or NULL for a path outside the project. */
+static const char *detect_project_relative_path(const char *git_path, const char *prefix) {
+    size_t prefix_length = strlen(prefix);
+    if (strncmp(git_path, prefix, prefix_length) != 0) {
+        return NULL;
+    }
+    return git_path + prefix_length;
+}
+
+/* Read the `--show-prefix` record that follows the two resolved revisions:
+ * empty at the repository root, otherwise a '/'-terminated relative directory.
+ * Anything else is a malformed answer and fails the request closed. */
+static bool detect_read_git_prefix(FILE *stream, bool *oom, char out[CBM_SZ_4K]) {
+    bool terminated = false;
+    char *record = detect_read_record(stream, '\n', oom, &terminated);
+    if (!record) {
+        return false;
+    }
+    size_t length = strlen(record);
+    if (length > 0 && record[length - 1] == '\r') {
+        record[--length] = '\0';
+    }
+    bool valid = terminated && length < CBM_SZ_4K && (length == 0 || record[length - 1] == '/');
+    if (valid) {
+        memcpy(out, record, length + 1U);
+    }
+    free(record);
+    return valid;
+}
+
 static int detect_changed_path_compare(const void *left, const void *right) {
     const char *const *left_path = left;
     const char *const *right_path = right;
@@ -15871,15 +15905,20 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * HEAD advance cannot mix revisions within one answer. */
     char head_oid[65] = "";
     char base_oid[65] = "";
+    /* The project root may be a subdirectory of the Git worktree (#1951);
+     * --show-prefix names it so every changed path can be translated from the
+     * Git-root coordinate system into the graph's project-relative one. */
+    char git_prefix[CBM_SZ_4K] = "";
+    bool git_prefix_valid = false;
     char resolve_cmd[CBM_SZ_2K];
 #ifdef _WIN32
     snprintf(resolve_cmd, sizeof(resolve_cmd),
-             "git -C \"%s\" rev-parse \"HEAD^{commit}\" \"%s^{commit}\" 2>NUL", root_path,
-             base_branch);
+             "git -C \"%s\" rev-parse \"HEAD^{commit}\" \"%s^{commit}\" --show-prefix 2>NUL",
+             root_path, base_branch);
 #else
     snprintf(resolve_cmd, sizeof(resolve_cmd),
-             "git -C '%s' rev-parse 'HEAD^{commit}' '%s^{commit}' 2>/dev/null", root_path,
-             base_branch);
+             "git -C '%s' rev-parse 'HEAD^{commit}' '%s^{commit}' --show-prefix 2>/dev/null",
+             root_path, base_branch);
 #endif
     char resolve_output_path[CBM_SZ_2K] = {0};
     cbm_proc_result_t resolve_result = {0};
@@ -15915,6 +15954,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 memcpy(base_oid, resolved_base, length + 1U);
             }
         }
+        git_prefix_valid = detect_read_git_prefix(resolve_fp, &resolve_oom, git_prefix);
         (void)fclose(resolve_fp);
     }
     free(resolved_head);
@@ -15923,7 +15963,7 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         (void)cbm_unlink(resolve_output_path);
     }
     if (resolve_cancelled || resolve_run != 0 || resolve_result.exit_code != 0 || resolve_oom ||
-        !head_oid[0] || !base_oid[0]) {
+        !head_oid[0] || !base_oid[0] || !git_prefix_valid) {
         free(direction);
         free(root_path);
         free(project);
@@ -15935,6 +15975,12 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         if (resolve_run != 0) {
             return cbm_mcp_text_result(
                 "git revision resolution failed: the contained command could not complete", true);
+        }
+        if (head_oid[0] && base_oid[0] && !resolve_oom) {
+            return cbm_mcp_text_result(
+                "git revision resolution failed: the project root's path inside the Git "
+                "worktree could not be determined",
+                true);
         }
         return cbm_mcp_text_result(
             "git revision resolution failed: base_branch or HEAD is not a commit", true);
@@ -16035,7 +16081,9 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 free(record);
                 break;
             }
-            if (!detect_add_changed_path(&files, &file_count, &file_cap, record)) {
+            const char *project_path = detect_project_relative_path(record, git_prefix);
+            if (project_path &&
+                !detect_add_changed_path(&files, &file_count, &file_cap, project_path)) {
                 changed_path_oom = true;
                 free(record);
                 break;
@@ -16110,7 +16158,10 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                 free(record);
                 break;
             }
-            if (!detect_add_changed_path(&files, &file_count, &file_cap, record + PAIR_LEN + 1U)) {
+            const char *project_path =
+                detect_project_relative_path(record + PAIR_LEN + 1U, git_prefix);
+            if (project_path &&
+                !detect_add_changed_path(&files, &file_count, &file_cap, project_path)) {
                 changed_path_oom = true;
                 free(record);
                 break;
@@ -16227,20 +16278,22 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * index combined with insertions earlier in the file shifts the node lines
      * relative to the hunks and can mis-scope. The failure is bounded by
      * detect_collect_seeds' zero-overlap fallback: a file whose definitions all
-     * miss reverts to whole-file seeding rather than dropping out. */
+     * miss reverts to whole-file seeding rather than dropping out.
+     * --relative keeps hunk paths in the same project-relative coordinates as
+     * `files` when the project root is a repository subdirectory (#1951). */
     cbm_changed_hunk_t *hunks = NULL;
     int hunk_count = 0;
     if (want_symbols) {
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C \"%s\" diff --unified=0 \"%s\" \"%s\" -- 2>NUL && "
-                 "git -C \"%s\" diff --unified=0 -- 2>NUL",
+                 "git -C \"%s\" diff --relative --unified=0 \"%s\" \"%s\" -- 2>NUL && "
+                 "git -C \"%s\" diff --relative --unified=0 -- 2>NUL",
                  root_path, merge_base, head_oid, root_path);
 #else
         snprintf(hunk_cmd, sizeof(hunk_cmd),
-                 "git -C '%s' diff --unified=0 '%s' '%s' -- 2>/dev/null && "
-                 "git -C '%s' diff --unified=0 -- 2>/dev/null",
+                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
+                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
                  root_path, merge_base, head_oid, root_path);
 #endif
         char hunk_output_path[CBM_SZ_2K] = {0};

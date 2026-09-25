@@ -14127,6 +14127,146 @@ TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed) {
     PASS();
 }
 
+/* Issue #1951: the indexed project root is a SUBDIRECTORY of a normal Git
+ * repository. Git reports changed paths relative to the Git root
+ * ("game/src/math.c"), while graph file_paths are relative to the project
+ * root ("src/math.c"). detect_changes must translate Git-root paths into the
+ * project's coordinate system (diff, hunk and status records alike) and leave
+ * changes outside the project out, or the seed lookup finds nothing. */
+TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-subdir-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-subdir-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    char project_root[CBM_SZ_4K];
+    snprintf(project_root, sizeof(project_root), "%s/game", repo);
+    ASSERT_EQ(cbm_mkdir(project_root), 0);
+    char source_dir[CBM_SZ_4K];
+    snprintf(source_dir, sizeof(source_dir), "%s/src", project_root);
+    ASSERT_EQ(cbm_mkdir(source_dir), 0);
+    char math_source[CBM_SZ_4K];
+    snprintf(math_source, sizeof(math_source), "%s/math.c", source_dir);
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 1; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char use_source[CBM_SZ_4K];
+    snprintf(use_source, sizeof(use_source), "%s/use.c", source_dir);
+    ASSERT_EQ(
+        th_write_file(use_source, "int add_one(int x);\nint use_it(void) { return add_one(4); }\n"),
+        0);
+    char outside_source[CBM_SZ_4K];
+    snprintf(outside_source, sizeof(outside_source), "%s/outside.c", repo);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 0; }\n"), 0);
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+
+    /* Worktree edits: a tracked change inside the project (diff + hunk path),
+     * an untracked file inside it (status path) and a change outside it. */
+    ASSERT_EQ(th_write_file(math_source, "int add_one(int x) { return x + 2; }\n"
+                                         "int untouched(void) { return 0; }\n"),
+              0);
+    char fresh_source[CBM_SZ_4K];
+    snprintf(fresh_source, sizeof(fresh_source), "%s/fresh.c", source_dir);
+    ASSERT_EQ(th_write_file(fresh_source, "int fresh(void) { return 1; }\n"), 0);
+    ASSERT_EQ(th_write_file(outside_source, "int outside(void) { return 1; }\n"), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-subdir-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, project_root), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t seed = {.project = project,
+                       .label = "Function",
+                       .name = "add_one",
+                       .qualified_name = "fixture.src.math.add_one",
+                       .file_path = "src/math.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    int64_t seed_id = cbm_store_upsert_node(store, &seed);
+    ASSERT_GT(seed_id, 0);
+    /* Same file, untouched line: only hunk scoping (project-relative hunk
+     * paths) keeps it out of the seeds; whole-file fallback would add it. */
+    cbm_node_t untouched = {.project = project,
+                            .label = "Function",
+                            .name = "untouched",
+                            .qualified_name = "fixture.src.math.untouched",
+                            .file_path = "src/math.c",
+                            .start_line = 2,
+                            .end_line = 2};
+    ASSERT_GT(cbm_store_upsert_node(store, &untouched), 0);
+    cbm_node_t caller = {.project = project,
+                         .label = "Function",
+                         .name = "use_it",
+                         .qualified_name = "fixture.src.use.use_it",
+                         .file_path = "src/use.c",
+                         .start_line = 2,
+                         .end_line = 2};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t edge = {
+        .project = project, .source_id = caller_id, .target_id = seed_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    char *response =
+        cbm_mcp_handle_tool(srv, "detect_changes",
+                            "{\"project\":\"detect-subdir-project\",\"base_branch\":\"HEAD\","
+                            "\"scope\":\"impact\",\"depth\":2,\"max_output_tokens\":10000,"
+                            "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *changed_files = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    yyjson_val *first_path = changed_files ? yyjson_arr_get(changed_files, 0) : NULL;
+    yyjson_val *second_path = changed_files ? yyjson_arr_get(changed_files, 1) : NULL;
+    yyjson_val *impacted = root ? yyjson_obj_get(root, "impacted") : NULL;
+    yyjson_val *first_impact = impacted ? yyjson_arr_get(impacted, 0) : NULL;
+    bool project_relative_paths =
+        root && yyjson_get_int(yyjson_obj_get(root, "changed_total")) == 2 && first_path &&
+        second_path && strcmp(yyjson_get_str(first_path), "src/fresh.c") == 0 &&
+        strcmp(yyjson_get_str(second_path), "src/math.c") == 0;
+    bool seed_found = root && yyjson_get_int(yyjson_obj_get(root, "seed_symbols")) == 1;
+    bool impact_found = first_impact && strcmp(yyjson_get_str(yyjson_obj_get(first_impact, "qn")),
+                                               "fixture.src.use.use_it") == 0;
+    if (!project_relative_paths || !seed_found || !impact_found) {
+        fprintf(stderr, "  issue1951 response: %s\n", inner ? inner : "(null)");
+    }
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+
+    ASSERT_TRUE(project_relative_paths);
+    ASSERT_TRUE(seed_found);
+    ASSERT_TRUE(impact_found);
+    PASS();
+}
+
 TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json) {
 #ifdef _WIN32
     /* Win32 rejects control characters in filenames, so Windows cannot create
@@ -20697,6 +20837,7 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
+    RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
     RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
     RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);
     RUN_TEST(tool_detect_changes_contained_commands_clean_up_error_and_success);
