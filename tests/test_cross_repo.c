@@ -147,6 +147,84 @@ static bool cross_repo_seed_http_pair(const cross_repo_fixture_t *fixture,
     return ok;
 }
 
+/* Give the source project its own handler for the local Route the seeded
+ * HTTP_CALLS edge points at (caller-local HANDLES), as when a monorepo's
+ * client code calls the API the same repo serves. (#1459) */
+static bool cross_repo_seed_local_handler(const cross_repo_fixture_t *fixture,
+                                          const char *source_project, const char *suffix) {
+    char source_path[512];
+    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path))) {
+        return false;
+    }
+    cbm_store_t *source = cbm_store_open_path(source_path);
+    if (!source) {
+        return false;
+    }
+    char local_route_qn[256];
+    char handler_qn[256];
+    snprintf(local_route_qn, sizeof(local_route_qn), "%s.local-route.%s", source_project, suffix);
+    snprintf(handler_qn, sizeof(handler_qn), "%s.local-handle.%s", source_project, suffix);
+    cbm_node_t route = {0};
+    bool ok =
+        cbm_store_find_node_by_qn(source, source_project, local_route_qn, &route) == CBM_STORE_OK;
+    int64_t route_id = ok ? route.id : 0;
+    if (ok) {
+        cbm_node_free_fields(&route);
+    }
+    cbm_node_t handler = {.project = source_project,
+                          .label = "Function",
+                          .name = "handle_local",
+                          .qualified_name = handler_qn,
+                          .file_path = "server.c"};
+    int64_t handler_id = ok ? cbm_store_upsert_node(source, &handler) : 0;
+    cbm_edge_t handles = {.project = source_project,
+                          .source_id = handler_id,
+                          .target_id = route_id,
+                          .type = "HANDLES"};
+    ok = ok && route_id > 0 && handler_id > 0 && cbm_store_insert_edge(source, &handles) > 0;
+    cbm_store_close(source);
+    return ok;
+}
+
+/* Give the source project a canonical "__route__GET__<path>" Route with its
+ * own handler, distinct from the node the seeded HTTP_CALLS points at — the
+ * shape extraction produces for a method-less fetch() against a local
+ * app.get() route. (#1459) */
+static bool cross_repo_seed_local_get_route(const cross_repo_fixture_t *fixture,
+                                            const char *source_project, const char *route_path) {
+    char source_path[512];
+    if (!cross_repo_project_path(fixture, source_project, source_path, sizeof(source_path))) {
+        return false;
+    }
+    cbm_store_t *source = cbm_store_open_path(source_path);
+    if (!source) {
+        return false;
+    }
+    char route_qn[256];
+    char handler_qn[256];
+    snprintf(route_qn, sizeof(route_qn), "__route__GET__%s", route_path);
+    snprintf(handler_qn, sizeof(handler_qn), "%s.local-get-handler", source_project);
+    cbm_node_t route = {.project = source_project,
+                        .label = "Route",
+                        .name = route_path,
+                        .qualified_name = route_qn,
+                        .file_path = "server.c"};
+    cbm_node_t handler = {.project = source_project,
+                          .label = "Function",
+                          .name = "handle_local_get",
+                          .qualified_name = handler_qn,
+                          .file_path = "server.c"};
+    int64_t route_id = cbm_store_upsert_node(source, &route);
+    int64_t handler_id = cbm_store_upsert_node(source, &handler);
+    cbm_edge_t handles = {.project = source_project,
+                          .source_id = handler_id,
+                          .target_id = route_id,
+                          .type = "HANDLES"};
+    bool ok = route_id > 0 && handler_id > 0 && cbm_store_insert_edge(source, &handles) > 0;
+    cbm_store_close(source);
+    return ok;
+}
+
 static bool cross_repo_exec(const cross_repo_fixture_t *fixture, const char *project,
                             const char *sql) {
     char path[512];
@@ -519,7 +597,101 @@ TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609) {
     PASS();
 }
 
+/* #1459 floor: a caller whose own project handles the route it calls is
+ * calling itself — another project exposing the same path is not evidence of
+ * a cross-service call. Neither direction of the pass may link it. */
+TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "mono-1459", "api-1459", "/api/users", "mono") &&
+        cross_repo_seed_local_handler(&fixture, "mono-1459", "mono");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed caller-local route fixture");
+    }
+    const char *target = "api-1459";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("mono-1459", &target, 1);
+    const char *consumer = "mono-1459";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api-1459", &consumer, 1);
+    int mono_edges = cross_repo_count_edges(&fixture, "mono-1459", "CROSS_HTTP_CALLS");
+    int api_edges = cross_repo_count_edges(&fixture, "api-1459", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(fwd.http_edges, 0);
+    ASSERT_EQ(rev.http_edges, 0);
+    ASSERT_EQ(mono_edges, 0);
+    ASSERT_EQ(api_edges, 0);
+    PASS();
+}
+
+/* #1459 floor, real-world shape: a method-less client call points at the ANY
+ * Route node, while the caller's own handler sits on the GET node for the same
+ * path. The call is still served in-project and must not cross. */
+TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "mono2-1459", "api3-1459", "/api/users", "mono2") &&
+        cross_repo_exec(&fixture, "mono2-1459",
+                        "UPDATE edges SET properties = '{\"url_path\":\"/api/users\"}' "
+                        "WHERE type = 'HTTP_CALLS';") &&
+        cross_repo_seed_local_get_route(&fixture, "mono2-1459", "/api/users");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed method-less caller-local fixture");
+    }
+    const char *target = "api3-1459";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("mono2-1459", &target, 1);
+    const char *consumer = "mono2-1459";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api3-1459", &consumer, 1);
+    int mono_edges = cross_repo_count_edges(&fixture, "mono2-1459", "CROSS_HTTP_CALLS");
+    int api_edges = cross_repo_count_edges(&fixture, "api3-1459", "CROSS_HTTP_CALLS");
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(fwd.http_edges, 0);
+    ASSERT_EQ(rev.http_edges, 0);
+    ASSERT_EQ(mono_edges, 0);
+    ASSERT_EQ(api_edges, 0);
+    PASS();
+}
+
+/* Control for the #1459 floor: without a caller-local handler the path match
+ * still links the caller to the remote handler, in both run directions. */
+TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459) {
+    cross_repo_fixture_t fixture;
+    bool setup =
+        cross_repo_fixture_begin(&fixture) &&
+        cross_repo_seed_http_pair(&fixture, "client-1459", "api2-1459", "/api/users", "client");
+    if (!setup) {
+        cross_repo_fixture_end(&fixture);
+        FAIL("failed to seed remote-only route fixture");
+    }
+    const char *target = "api2-1459";
+    cbm_cross_repo_result_t fwd = cbm_cross_repo_match("client-1459", &target, 1);
+    int client_edges = cross_repo_count_edges(&fixture, "client-1459", "CROSS_HTTP_CALLS");
+    int api_edges = cross_repo_count_edges(&fixture, "api2-1459", "CROSS_HTTP_CALLS");
+    const char *consumer = "client-1459";
+    cbm_cross_repo_result_t rev = cbm_cross_repo_match("api2-1459", &consumer, 1);
+    cross_repo_fixture_end(&fixture);
+
+    ASSERT_FALSE(fwd.failed);
+    ASSERT_FALSE(rev.failed);
+    ASSERT_EQ(fwd.http_edges, 1);
+    ASSERT_EQ(rev.http_edges, 1);
+    ASSERT_EQ(client_edges, 1);
+    ASSERT_EQ(api_edges, 1);
+    PASS();
+}
+
 SUITE(cross_repo) {
+    RUN_TEST(cross_repo_caller_local_handler_blocks_cross_http_issue1459);
+    RUN_TEST(cross_repo_methodless_call_to_local_get_route_blocks_cross_http_issue1459);
+    RUN_TEST(cross_repo_caller_without_local_handler_keeps_cross_http_issue1459);
     RUN_TEST(cross_repo_accepts_project_with_missed_shadow_row_issue1609);
     RUN_TEST(cross_repo_null_target_fails_without_dereference);
     RUN_TEST(cross_repo_wildcard_keeps_projects_containing_internal_tokens);
