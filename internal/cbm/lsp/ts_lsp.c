@@ -5779,7 +5779,7 @@ void cbm_run_ts_lsp_cross_with_registry(CBMArena *arena, const char *source, int
             jsx_mode ? (js_mode ? tree_sitter_javascript() : tree_sitter_tsx())
                      : (js_mode ? tree_sitter_javascript() : tree_sitter_typescript());
         ts_parser_set_language(parser, lang);
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!tree)
             return;
@@ -5990,7 +5990,7 @@ void cbm_run_ts_lsp_cross(CBMArena *arena, const char *source, int source_len,
             jsx_mode ? (js_mode ? tree_sitter_javascript() : tree_sitter_tsx())
                      : (js_mode ? tree_sitter_javascript() : tree_sitter_typescript());
         ts_parser_set_language(parser, lang);
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         ts_parser_delete(parser);
         if (!tree)
             return;

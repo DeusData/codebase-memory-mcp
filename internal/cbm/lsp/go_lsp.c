@@ -3224,7 +3224,7 @@ void cbm_run_go_lsp_cross(CBMArena *arena, const char *source, int source_len,
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -3630,7 +3630,7 @@ void cbm_run_go_lsp_cross_with_registry(CBMArena *arena, const char *source, int
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_go());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);

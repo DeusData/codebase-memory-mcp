@@ -6377,7 +6377,7 @@ void cbm_run_rust_lsp_cross_with_registry(CBMArena *arena, const char *source, i
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_rust());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
@@ -6412,7 +6412,7 @@ void cbm_run_rust_lsp_cross_with_manifest(CBMArena *arena, const char *source, i
         if (!parser)
             return;
         ts_parser_set_language(parser, tree_sitter_rust());
-        tree = ts_parser_parse_string(parser, NULL, source, source_len);
+        tree = cbm_parse_source(parser, source, (uint32_t)source_len, (TSParseOptions){0});
         owns_tree = true;
         if (!tree) {
             ts_parser_delete(parser);
