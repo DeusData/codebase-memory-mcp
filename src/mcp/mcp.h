@@ -155,6 +155,22 @@ void cbm_mcp_server_free(cbm_mcp_server_t *srv);
 /* Set external watcher reference (for auto-index registration). Not owned. */
 void cbm_mcp_server_set_watcher(cbm_mcp_server_t *srv, struct cbm_watcher *w);
 
+/* Watch visibility for index_status (#2167). The daemon, which owns the one
+ * background watcher, answers whether `project` is currently watched. All
+ * strings are static. A server without a provider runs no watcher at all and
+ * reports watched=false with reason "no_watcher". */
+typedef struct {
+    bool watched;
+    const char *reason;       /* why not watched (set when !watched) */
+    const char *strategy;     /* "pending" | "git" | "none" (set when watched) */
+    int poll_interval_ms;     /* current adaptive cadence (when watched) */
+    int64_t last_scan_unix_s; /* last completed scan, wall clock; 0 = none yet */
+} cbm_mcp_watch_status_t;
+typedef void (*cbm_mcp_watch_status_fn)(void *context, const char *project,
+                                        cbm_mcp_watch_status_t *out);
+void cbm_mcp_server_set_watch_status_provider(cbm_mcp_server_t *srv, cbm_mcp_watch_status_fn fn,
+                                              void *context);
+
 /* Set external config store reference (for auto_index setting). Not owned. */
 void cbm_mcp_server_set_config(cbm_mcp_server_t *srv, struct cbm_config *cfg);
 

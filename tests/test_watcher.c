@@ -2168,6 +2168,44 @@ TEST(watcher_index_failure_count_unknown_project) {
     PASS();
 }
 
+/* #2167: index_status reads the watch state through cbm_watcher_project_info.
+ * A registered project starts "pending" at the base cadence with no scan;
+ * the first poll completes its baseline and publishes the strategy plus a
+ * wall-clock scan time. Unwatched projects report false with *out zeroed. */
+TEST(watcher_project_info_publishes_scan_issue2167) {
+    char root[256];
+    snprintf(root, sizeof(root), "%s/cbm_watcher_info_XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(root));
+    cbm_store_t *store = cbm_store_open_memory();
+    cbm_watcher_t *w = cbm_watcher_new(store, index_callback, NULL);
+
+    cbm_watcher_project_info_t info;
+    ASSERT_FALSE(cbm_watcher_project_info(w, "never-watched", &info));
+    ASSERT_EQ(info.poll_interval_ms, 0);
+    ASSERT_FALSE(cbm_watcher_project_info(NULL, "x", &info));
+
+    ASSERT_TRUE(cbm_watcher_watch(w, "info-proj", root));
+    ASSERT_TRUE(cbm_watcher_project_info(w, "info-proj", &info));
+    ASSERT_EQ(info.strategy, CBM_WATCHER_STRATEGY_PENDING);
+    ASSERT_EQ(info.poll_interval_ms, cbm_watcher_poll_interval_ms(0));
+    ASSERT_EQ(info.last_scan_unix_s, 0);
+
+    /* A plain directory (no git): the baseline decides it is never polled. */
+    int64_t before = (int64_t)time(NULL);
+    (void)cbm_watcher_poll_once(w);
+    ASSERT_TRUE(cbm_watcher_project_info(w, "info-proj", &info));
+    ASSERT_EQ(info.strategy, CBM_WATCHER_STRATEGY_NONE);
+    ASSERT_TRUE(info.last_scan_unix_s >= before);
+
+    cbm_watcher_unwatch(w, "info-proj");
+    ASSERT_FALSE(cbm_watcher_project_info(w, "info-proj", &info));
+
+    cbm_watcher_free(w);
+    cbm_store_close(store);
+    (void)cbm_rmdir(root);
+    PASS();
+}
+
 TEST(watcher_multiple_projects) {
     /* Create two temporary git repos */
     char tmpdirA[256];
@@ -3585,6 +3623,7 @@ SUITE(watcher) {
     RUN_TEST(watcher_index_failure_backoff_gates_repolling_issue2015);
     RUN_TEST(watcher_sustained_failure_logs_once_issue2015);
     RUN_TEST(watcher_index_failure_count_unknown_project);
+    RUN_TEST(watcher_project_info_publishes_scan_issue2167);
 
     /* Lifecycle */
     RUN_TEST(watcher_create_free);

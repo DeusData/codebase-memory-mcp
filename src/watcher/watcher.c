@@ -88,6 +88,12 @@ typedef struct {
      * from `rev-parse --show-cdup`. Porcelain paths are repository-relative, so
      * the signature needs this to stat them. Resolved once at baseline. */
     char repo_cdup[CBM_SZ_4K];
+    /* Published status for cbm_watcher_project_info (#2167). The poll path
+     * writes these while index_status reads them from a session thread, so
+     * they are atomics: the diagnostic read is never a data race. */
+    atomic_int status_strategy;         /* cbm_watcher_strategy_t */
+    atomic_int status_interval_ms;      /* mirrors interval_ms */
+    _Atomic int64_t status_last_scan_s; /* wall-clock seconds; 0 = none yet */
 } project_state_t;
 
 /* ── Watcher struct ─────────────────────────────────────────────── */
@@ -867,6 +873,9 @@ static project_state_t *state_new(const char *name, const char *root_path) {
     }
     atomic_init(&s->registered, true);
     s->interval_ms = POLL_BASE_MS;
+    atomic_init(&s->status_strategy, CBM_WATCHER_STRATEGY_PENDING);
+    atomic_init(&s->status_interval_ms, POLL_BASE_MS);
+    atomic_init(&s->status_last_scan_s, 0);
     return s;
 }
 
@@ -1200,6 +1209,25 @@ int cbm_watcher_index_failure_count(cbm_watcher_t *w, const char *project_name) 
     return failures;
 }
 
+bool cbm_watcher_project_info(cbm_watcher_t *w, const char *project_name,
+                              cbm_watcher_project_info_t *out) {
+    if (out) {
+        memset(out, 0, sizeof(*out));
+    }
+    if (!w || !project_name || !out) {
+        return false;
+    }
+    cbm_mutex_lock(&w->projects_lock);
+    project_state_t *s = cbm_ht_get(w->projects, project_name);
+    if (s) {
+        out->strategy = (cbm_watcher_strategy_t)atomic_load(&s->status_strategy);
+        out->poll_interval_ms = atomic_load(&s->status_interval_ms);
+        out->last_scan_unix_s = atomic_load(&s->status_last_scan_s);
+    }
+    cbm_mutex_unlock(&w->projects_lock);
+    return s != NULL;
+}
+
 int cbm_watcher_watch_count(cbm_watcher_t *w) {
     if (!w) {
         return 0;
@@ -1212,6 +1240,17 @@ int cbm_watcher_watch_count(cbm_watcher_t *w) {
 
 /* ── Single poll cycle ──────────────────────────────────────────── */
 
+/* Publish what index_status reports: the strategy, the current cadence and,
+ * when a check just completed, the wall-clock time of that scan. */
+static void publish_status(project_state_t *s, bool scanned) {
+    atomic_store(&s->status_strategy,
+                 s->is_git ? CBM_WATCHER_STRATEGY_GIT : CBM_WATCHER_STRATEGY_NONE);
+    atomic_store(&s->status_interval_ms, s->interval_ms);
+    if (scanned) {
+        atomic_store(&s->status_last_scan_s, (int64_t)time(NULL));
+    }
+}
+
 /* Init baseline for a project: check if git, get HEAD, count files */
 static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     struct stat st;
@@ -1219,6 +1258,7 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
         cbm_log_warn("watcher.root_gone", "project", s->project_name, "path", s->root_path);
         s->baseline_done = true;
         s->is_git = false;
+        publish_status(s, false);
         return true;
     }
 
@@ -1286,6 +1326,7 @@ static bool init_baseline(cbm_watcher_t *w, project_state_t *s) {
     }
 
     s->next_poll_ns = now_ns() + ((int64_t)s->interval_ms * US_PER_MS);
+    publish_status(s, true);
     return true;
 }
 
@@ -1482,6 +1523,7 @@ static void poll_project(const char *key, void *val, void *ud) {
     if (!check_changes(ctx->w, s, &changed)) {
         return;
     }
+    publish_status(s, true);
     if (!changed) {
         s->next_poll_ns = ctx->now + ((int64_t)s->interval_ms * US_PER_MS);
         return;
@@ -1513,6 +1555,7 @@ static void poll_project(const char *key, void *val, void *ud) {
             if (git_file_count(ctx->w, s, &file_count) == WATCHER_GIT_OK) {
                 s->file_count = file_count;
                 s->interval_ms = cbm_watcher_poll_interval_ms(s->file_count);
+                publish_status(s, false);
             }
         } else if (rc > 0) {
             /* Busy-skip: baseline stays uncommitted, next poll retries. */
