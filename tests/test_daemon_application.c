@@ -5634,6 +5634,495 @@ TEST(daemon_application_index_args_compare_repo_path_separator_equivalently) {
     PASS();
 }
 
+/* ── #2144: async index_repository + status polling ─────────────────────────
+ *
+ * A client with a per-call deadline (Copilot for IntelliJ) gives up on a long
+ * synchronous index; its cancel makes the daemon drop the job's last
+ * subscriber and cancel the worker, so every retry starts over and a large
+ * repository never finishes. async:true starts the job detached from the
+ * request and session; status:true polls it. Every wait below is a bounded
+ * observation of a held fake worker (never a timing assertion). */
+
+typedef struct {
+    app_fake_worker_context_t fake;
+    cbm_daemon_application_worker_ops_t ops;
+    cbm_daemon_application_t *application;
+    cbm_daemon_runtime_application_callbacks_t callbacks;
+    char root[APP_TEST_PATH_CAP];
+    char *project;
+    uint8_t *context;
+    uint32_t context_length;
+} app_async_fixture_t;
+
+static bool app_async_fixture_init(app_async_fixture_t *fixture, const char *label,
+                                   bool permanent) {
+    memset(fixture, 0, sizeof(*fixture));
+    app_fake_worker_context_init(&fixture->fake);
+    fixture->ops = (cbm_daemon_application_worker_ops_t){
+        .context = &fixture->fake,
+        .start = app_fake_worker_start,
+        .poll = app_fake_worker_poll,
+        .cancel = app_fake_worker_cancel,
+        .log_path = app_fake_worker_log_path,
+        .destroy = app_fake_worker_destroy,
+    };
+    cbm_daemon_application_config_t config = {.worker_ops = &fixture->ops};
+    fixture->application = cbm_daemon_application_new(&config);
+    if (!fixture->application) {
+        return false;
+    }
+    /* permanent mirrors `daemon start`; false is the temporary generation an
+     * MCP client or one-shot command spawns. */
+    cbm_daemon_application_set_permanent(fixture->application, permanent);
+    fixture->callbacks = cbm_daemon_application_runtime_callbacks(fixture->application);
+    (void)snprintf(fixture->root, sizeof(fixture->root), "%s/cbm-app-%s-XXXXXX", cbm_tmpdir(),
+                   label);
+    if (!cbm_mkdtemp(fixture->root)) {
+        fixture->root[0] = '\0';
+        return false;
+    }
+    fixture->project = cbm_project_name_from_path(fixture->root);
+    return fixture->project &&
+           app_test_context_request(fixture->root, fixture->root, &fixture->context,
+                                    &fixture->context_length);
+}
+
+static cbm_daemon_runtime_application_session_t *app_async_session(app_async_fixture_t *fixture,
+                                                                   cbm_daemon_client_id_t id) {
+    cbm_daemon_runtime_application_session_t *session = app_test_open(&fixture->callbacks, id);
+    uint8_t *empty = NULL;
+    uint32_t empty_length = 0;
+    bool ok = session && app_test_request(&fixture->callbacks, session, fixture->context,
+                                          fixture->context_length, &empty,
+                                          &empty_length) == CBM_DAEMON_RUNTIME_APPLICATION_OK;
+    free(empty);
+    if (!ok && session) {
+        fixture->callbacks.session_close(fixture->callbacks.context, session);
+        session = NULL;
+    }
+    return session;
+}
+
+/* One index_repository request on its own thread, so a call that (wrongly)
+ * blocks for the whole index cannot hang the suite: the caller observes
+ * `done` within the hang-detector budget, then always releases the worker
+ * before joining. */
+typedef struct {
+    app_request_thread_t request;
+    uint8_t *tool;
+    cbm_thread_t thread;
+    bool started;
+} app_async_call_t;
+
+static bool app_async_call_start(app_async_fixture_t *fixture, app_async_call_t *call,
+                                 cbm_daemon_runtime_application_session_t *session,
+                                 cbm_daemon_runtime_application_token_t token,
+                                 const char *extra_args) {
+    memset(call, 0, sizeof(*call));
+    char args[APP_TEST_PATH_CAP + 128];
+    (void)snprintf(args, sizeof(args), "{\"repo_path\":\"%s\"%s}", fixture->root,
+                   extra_args ? extra_args : "");
+    uint32_t tool_length = 0;
+    if (!app_test_tool_request("index_repository", args, &call->tool, &tool_length)) {
+        return false;
+    }
+    call->request.callbacks = fixture->callbacks;
+    call->request.session = session;
+    call->request.request_token = token;
+    call->request.request = call->tool;
+    call->request.request_length = tool_length;
+    atomic_init(&call->request.done, false);
+    call->started = cbm_thread_create(&call->thread, 0, app_request_thread, &call->request) == 0;
+    return call->started;
+}
+
+static const char *app_async_call_response(app_async_call_t *call) {
+    return call->request.response ? (const char *)call->request.response : "";
+}
+
+static void app_async_call_join(app_async_call_t *call) {
+    if (call->started) {
+        (void)cbm_thread_join(&call->thread);
+        call->started = false;
+    }
+}
+
+static void app_async_call_free(app_async_call_t *call) {
+    app_async_call_join(call);
+    free(call->request.response);
+    free(call->tool);
+    memset(call, 0, sizeof(*call));
+}
+
+/* A request that must return promptly (status, validation, async start). */
+static char *app_async_call_now(app_async_fixture_t *fixture,
+                                cbm_daemon_runtime_application_session_t *session,
+                                const char *extra_args) {
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    char *response = NULL;
+    if (app_async_call_start(fixture, &call, session, CBM_DAEMON_RUNTIME_APPLICATION_TOKEN_INVALID,
+                             extra_args) &&
+        app_wait_for_atomic_bool(&call.request.done, true)) {
+        response = strdup(app_async_call_response(&call));
+    }
+    /* Never strand a request thread that blocked on the held worker. */
+    if (call.started && !atomic_load(&call.request.done)) {
+        atomic_store(&fixture->fake.allow_completion, true);
+    }
+    app_async_call_free(&call);
+    return response;
+}
+
+static bool app_async_fixture_finish(app_async_fixture_t *fixture) {
+    atomic_store(&fixture->fake.allow_completion, true);
+    bool stopped = fixture->application &&
+                   cbm_daemon_application_shutdown(fixture->application, APP_TEST_TIMEOUT_MS);
+    cbm_daemon_application_free(fixture->application);
+    free(fixture->context);
+    free(fixture->project);
+    if (fixture->root[0]) {
+        (void)cbm_rmdir(fixture->root);
+    }
+    return stopped;
+}
+
+static bool app_async_contains(const char *text, const char *needle) {
+    return text && strstr(text, needle) != NULL;
+}
+
+TEST(daemon_application_async_index_returns_before_completion_and_status_polls) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-poll", true);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7101) : NULL;
+
+    /* The worker is held: a blocking call cannot return until it is released. */
+    char *started = session ? app_async_call_now(&fixture, session, ",\"async\":true") : NULL;
+    bool worker_running = started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    char *running =
+        worker_running ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool drained = running && app_wait_for_active_jobs(fixture.application, 0);
+    char *finished = drained ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    int cancels = atomic_load(&fixture.fake.cancels);
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_NOT_NULL(session);
+    ASSERT_NOT_NULL(started);
+    ASSERT_TRUE(app_async_contains(started, "\"async\":true"));
+    ASSERT_FALSE(app_async_contains(started, "\"isError\":true"));
+    ASSERT_TRUE(worker_running);
+    ASSERT_NOT_NULL(running);
+    ASSERT_TRUE(app_async_contains(running, "\"state\":\"running\""));
+    ASSERT_TRUE(drained);
+    ASSERT_NOT_NULL(finished);
+    ASSERT_TRUE(app_async_contains(finished, "\"state\":\"succeeded\""));
+    ASSERT_TRUE(app_async_contains(finished, "\"finished_at\""));
+    ASSERT_EQ(cancels, 0);
+    ASSERT_EQ(atomic_load(&fixture.fake.starts), 1);
+    ASSERT_TRUE(stopped);
+    free(started);
+    free(running);
+    free(finished);
+    PASS();
+}
+
+/* The async job belongs to the daemon, not to the session that started it:
+ * closing that session (the client gave up and went away) leaves the worker
+ * running while another session still keeps this daemon generation alive. */
+TEST(daemon_application_async_index_survives_requesting_session_close) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-survive", false);
+    cbm_daemon_runtime_application_session_t *starter =
+        setup ? app_async_session(&fixture, 7201) : NULL;
+    cbm_daemon_runtime_application_session_t *observer =
+        starter ? app_async_session(&fixture, 7202) : NULL;
+    char *started = observer ? app_async_call_now(&fixture, starter, ",\"async\":true") : NULL;
+    bool worker_running = started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    if (worker_running) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, starter);
+        fixture.callbacks.session_close(fixture.callbacks.context, starter);
+        starter = NULL;
+    }
+    int cancels_after_close = atomic_load(&fixture.fake.cancels);
+    size_t jobs_after_close = cbm_daemon_application_active_jobs(fixture.application);
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool drained = worker_running && app_wait_for_active_jobs(fixture.application, 0);
+    char *finished = drained ? app_async_call_now(&fixture, observer, ",\"status\":true") : NULL;
+    if (starter) {
+        fixture.callbacks.session_close(fixture.callbacks.context, starter);
+    }
+    if (observer) {
+        fixture.callbacks.session_close(fixture.callbacks.context, observer);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_NOT_NULL(observer);
+    ASSERT_TRUE(app_async_contains(started, "\"async\":true"));
+    ASSERT_TRUE(worker_running);
+    ASSERT_EQ(cancels_after_close, 0);
+    ASSERT_EQ(jobs_after_close, 1);
+    ASSERT_TRUE(drained);
+    ASSERT_TRUE(app_async_contains(finished, "\"state\":\"succeeded\""));
+    ASSERT_EQ(atomic_load(&fixture.fake.cancels), 0);
+    ASSERT_TRUE(stopped);
+    free(started);
+    free(finished);
+    PASS();
+}
+
+/* Regression guard for the unchanged synchronous contract, in the exact
+ * shape of the test above: the same close with a SYNC caller still cancels
+ * the worker once its last subscriber is gone, even though another session
+ * keeps the daemon generation alive. */
+TEST(daemon_application_sync_index_still_cancels_on_last_subscriber_close) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "sync-cancel", false);
+    cbm_daemon_runtime_application_session_t *starter =
+        setup ? app_async_session(&fixture, 7301) : NULL;
+    cbm_daemon_runtime_application_session_t *observer =
+        starter ? app_async_session(&fixture, 7302) : NULL;
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    bool call_started =
+        observer && app_async_call_start(&fixture, &call, starter, UINT64_C(7303), NULL);
+    bool worker_running = call_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    if (worker_running) {
+        fixture.callbacks.session_cancel(fixture.callbacks.context, starter);
+    }
+    bool cancelled = worker_running && app_wait_for_atomic_int(&fixture.fake.cancels, 1);
+    if (call_started) {
+        if (!atomic_load(&call.request.done)) {
+            atomic_store(&fixture.fake.allow_completion, true);
+        }
+        app_async_call_join(&call);
+    }
+    cbm_daemon_runtime_application_status_t status = call.request.status;
+    if (call_started) {
+        app_async_call_free(&call);
+    }
+    if (starter) {
+        fixture.callbacks.session_close(fixture.callbacks.context, starter);
+    }
+    if (observer) {
+        fixture.callbacks.session_close(fixture.callbacks.context, observer);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(call_started);
+    ASSERT_TRUE(worker_running);
+    ASSERT_TRUE(cancelled);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_CANCELLED);
+    ASSERT_TRUE(stopped);
+    PASS();
+}
+
+TEST(daemon_application_async_and_status_validation_errors) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-validate", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7401) : NULL;
+    char *both =
+        session ? app_async_call_now(&fixture, session, ",\"async\":true,\"status\":true") : NULL;
+    char *not_bool = session ? app_async_call_now(&fixture, session, ",\"async\":\"yes\"") : NULL;
+    char *cross = session
+                      ? app_async_call_now(&fixture, session,
+                                           ",\"async\":true,\"mode\":\"cross-repo-intelligence\"")
+                      : NULL;
+    /* Nothing was ever indexed here and no job ran: status must say so, not
+     * report an empty success. */
+    char *unknown = session ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    int starts = atomic_load(&fixture.fake.starts);
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(app_async_contains(both, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(both, "exclusive"));
+    ASSERT_TRUE(app_async_contains(not_bool, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(not_bool, "must be booleans"));
+    ASSERT_TRUE(app_async_contains(cross, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(cross, "cross-repo-intelligence"));
+    ASSERT_TRUE(app_async_contains(unknown, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(unknown, "no index job or index is known"));
+    ASSERT_EQ(starts, 0);
+    ASSERT_TRUE(stopped);
+    free(both);
+    free(not_bool);
+    free(cross);
+    free(unknown);
+    PASS();
+}
+
+/* Cut-short advice (a): a synchronous caller whose job is cancelled out from
+ * under it (here: the daemon stops) receives the async alternative in the
+ * cancellation text it is actually delivered. */
+TEST(daemon_application_cancelled_sync_index_reply_offers_async) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "sync-hint", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7501) : NULL;
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    bool call_started =
+        session && app_async_call_start(&fixture, &call, session, UINT64_C(7502), NULL);
+    bool worker_running = call_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    /* Shutdown cancels the job but not the waiting request, so the waiter is
+     * handed the job's cancellation reply. */
+    bool stopped =
+        worker_running && cbm_daemon_application_shutdown(fixture.application, APP_TEST_TIMEOUT_MS);
+    if (call_started && !atomic_load(&call.request.done)) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    if (call_started) {
+        app_async_call_join(&call);
+    }
+    cbm_daemon_runtime_application_status_t status = call.request.status;
+    char *reply = call_started ? strdup(app_async_call_response(&call)) : NULL;
+    if (call_started) {
+        app_async_call_free(&call);
+    }
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    (void)app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(worker_running);
+    ASSERT_TRUE(stopped);
+    ASSERT_EQ(status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(app_async_contains(reply, "cancelled"));
+    ASSERT_TRUE(app_async_contains(reply, "async: true"));
+    ASSERT_TRUE(app_async_contains(reply, "status: true"));
+    free(reply);
+    PASS();
+}
+
+/* Cut-short advice (b): the Copilot-deadline case. The client cancels its
+ * synchronous call, which never sees a reply; the NEXT status call and the
+ * NEXT index_repository call for that project carry the advice, once. */
+TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "sync-next", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7601) : NULL;
+    app_async_call_t call;
+    memset(&call, 0, sizeof(call));
+    cbm_daemon_runtime_application_token_t token = UINT64_C(7602);
+    bool call_started = session && app_async_call_start(&fixture, &call, session, token, NULL);
+    bool worker_running = call_started && app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    if (worker_running) {
+        fixture.callbacks.request_cancel(fixture.callbacks.context, session, token);
+    }
+    bool cancelled_returned = worker_running && app_wait_for_atomic_bool(&call.request.done, true);
+    if (call_started && !atomic_load(&call.request.done)) {
+        atomic_store(&fixture.fake.allow_completion, true);
+    }
+    if (call_started) {
+        app_async_call_free(&call);
+    }
+    bool drained = cancelled_returned && app_wait_for_active_jobs(fixture.application, 0);
+    char *status = drained ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+    /* Every later worker completes at once. */
+    atomic_store(&fixture.fake.allow_completion, true);
+    char *next = status ? app_async_call_now(&fixture, session, NULL) : NULL;
+    char *after = next ? app_async_call_now(&fixture, session, NULL) : NULL;
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+
+    ASSERT_TRUE(setup);
+    ASSERT_TRUE(worker_running);
+    ASSERT_TRUE(cancelled_returned);
+    ASSERT_TRUE(drained);
+    ASSERT_TRUE(app_async_contains(status, "\"state\":\"cancelled\""));
+    ASSERT_TRUE(app_async_contains(status, "\"notice\""));
+    ASSERT_TRUE(app_async_contains(status, "async: true"));
+    ASSERT_TRUE(app_async_contains(next, "indexed"));
+    ASSERT_TRUE(app_async_contains(next, "\"notice\""));
+    ASSERT_TRUE(app_async_contains(next, "cut short"));
+    ASSERT_TRUE(app_async_contains(after, "indexed"));
+    ASSERT_FALSE(app_async_contains(after, "\"notice\""));
+    ASSERT_TRUE(stopped);
+    free(status);
+    free(next);
+    free(after);
+    PASS();
+}
+
+/* #2144 user decision: on a temporary daemon, a one-shot `cli` request that is
+ * the daemon's only live session is refused async (the daemon would stop and
+ * cancel the job as soon as the command exits), while status stays allowed and
+ * a long-lived MCP session on the same temporary daemon remains a valid host. */
+TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon) {
+    app_async_fixture_t fixture;
+    bool setup = app_async_fixture_init(&fixture, "async-refuse", false);
+    cbm_daemon_runtime_application_session_t *session =
+        setup ? app_async_session(&fixture, 7701) : NULL;
+    char *refused = session ? app_async_call_now(&fixture, session, ",\"async\":true") : NULL;
+    int starts_after_refusal = atomic_load(&fixture.fake.starts);
+    char *status = refused ? app_async_call_now(&fixture, session, ",\"status\":true") : NULL;
+
+    /* Same temporary daemon, same lone session, but the MCP channel. */
+    char message[APP_TEST_PATH_CAP + 256];
+    (void)snprintf(message, sizeof(message),
+                   "{\"jsonrpc\":\"2.0\",\"id\":7702,\"method\":\"tools/call\",\"params\":{"
+                   "\"name\":\"index_repository\",\"arguments\":{\"repo_path\":\"%s\","
+                   "\"async\":true}}}",
+                   fixture.root);
+    uint8_t *mcp_request = NULL;
+    uint32_t mcp_request_length = 0;
+    uint8_t *mcp_response = NULL;
+    uint32_t mcp_response_length = 0;
+    cbm_daemon_runtime_application_status_t mcp_status =
+        status && app_test_text_request(CBM_DAEMON_APPLICATION_REQUEST_MCP, message, &mcp_request,
+                                        &mcp_request_length)
+            ? app_test_request(&fixture.callbacks, session, mcp_request, mcp_request_length,
+                               &mcp_response, &mcp_response_length)
+            : CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR;
+    bool worker_started = mcp_status == CBM_DAEMON_RUNTIME_APPLICATION_OK &&
+                          app_wait_for_atomic_int(&fixture.fake.starts, 1);
+    int cancels_while_hosted = atomic_load(&fixture.fake.cancels);
+    atomic_store(&fixture.fake.allow_completion, true);
+    bool drained = worker_started && app_wait_for_active_jobs(fixture.application, 0);
+    if (session) {
+        fixture.callbacks.session_close(fixture.callbacks.context, session);
+    }
+    bool stopped = app_async_fixture_finish(&fixture);
+    char *mcp_text = mcp_response ? strdup((const char *)mcp_response) : NULL;
+    free(mcp_response);
+    free(mcp_request);
+
+    ASSERT_TRUE(setup);
+    ASSERT_NOT_NULL(session);
+    ASSERT_TRUE(app_async_contains(refused, "\"isError\":true"));
+    ASSERT_TRUE(app_async_contains(refused, "daemon start"));
+    ASSERT_EQ(starts_after_refusal, 0);
+    ASSERT_NOT_NULL(status);
+    ASSERT_FALSE(app_async_contains(status, "daemon start"));
+    ASSERT_EQ(mcp_status, CBM_DAEMON_RUNTIME_APPLICATION_OK);
+    ASSERT_TRUE(app_async_contains(mcp_text, "\\\"async\\\":true"));
+    ASSERT_FALSE(app_async_contains(mcp_text, "daemon start"));
+    ASSERT_TRUE(worker_started);
+    ASSERT_EQ(cancels_while_hosted, 0);
+    ASSERT_TRUE(drained);
+    ASSERT_TRUE(stopped);
+    free(refused);
+    free(status);
+    free(mcp_text);
+    PASS();
+}
+
 SUITE(daemon_application) {
     RUN_TEST(daemon_application_oversized_reply_is_a_jsonrpc_error_not_a_death);
     RUN_TEST(daemon_application_new_session_does_not_retain_initial_store);
@@ -5653,6 +6142,13 @@ SUITE(daemon_application) {
     RUN_TEST(daemon_application_sensitive_root_blocks_auto_index_but_preserves_controls);
     RUN_TEST(daemon_application_sensitive_root_blocks_watch_but_preserves_controls);
     RUN_TEST(daemon_application_index_args_compare_repo_path_separator_equivalently);
+    RUN_TEST(daemon_application_async_index_returns_before_completion_and_status_polls);
+    RUN_TEST(daemon_application_async_index_survives_requesting_session_close);
+    RUN_TEST(daemon_application_sync_index_still_cancels_on_last_subscriber_close);
+    RUN_TEST(daemon_application_async_and_status_validation_errors);
+    RUN_TEST(daemon_application_cancelled_sync_index_reply_offers_async);
+    RUN_TEST(daemon_application_cut_short_sync_index_advice_reaches_next_call);
+    RUN_TEST(daemon_application_async_refused_for_lone_one_shot_client_of_temporary_daemon);
     RUN_TEST(daemon_application_programmatic_index_injects_resource_policy);
     RUN_TEST(daemon_application_auto_index_honors_tracked_file_limit);
     RUN_TEST(daemon_application_auto_index_file_count_handles_literal_metacharacter_path);

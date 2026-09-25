@@ -382,8 +382,26 @@ static bool frontend_write_response(FILE *out, const uint8_t *response, uint32_t
     return fflush(out) == 0 && written;
 }
 
+const char *cbm_daemon_frontend_cancelled_error_message(const char *request_message) {
+    static const char plain[] = "Request cancelled";
+    static const char index_call[] = "Request cancelled. " CBM_MCP_INDEX_ASYNC_HINT;
+    cbm_jsonrpc_request_t request = {0};
+    if (!request_message || cbm_jsonrpc_parse(request_message, &request) != 0) {
+        return plain;
+    }
+    char *tool = request.method && strcmp(request.method, "tools/call") == 0 && request.params_raw
+                     ? cbm_mcp_get_string_arg(request.params_raw, "name")
+                     : NULL;
+    bool index_repository = tool && strcmp(tool, "index_repository") == 0;
+    safe_free(tool);
+    cbm_jsonrpc_request_free(&request);
+    return index_repository ? index_call : plain;
+}
+
 static bool frontend_write_cancelled_response(FILE *out, const frontend_item_t *item) {
-    static const char cancelled_error[] = "{\"code\":-32800,\"message\":\"Request cancelled\"}";
+    char cancelled_error[512];
+    (void)snprintf(cancelled_error, sizeof(cancelled_error), "{\"code\":-32800,\"message\":\"%s\"}",
+                   cbm_daemon_frontend_cancelled_error_message(item->message));
     cbm_jsonrpc_response_t response = {
         .id = item->id,
         .id_str = item->id_str,

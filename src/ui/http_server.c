@@ -2065,10 +2065,11 @@ static void dispatch_request(cbm_http_server_t *srv, cbm_http_conn_t *c,
 /* ── Public API ───────────────────────────────────────────────── */
 
 static char *http_read_only_index_rejected(void *context, const char *repo_path,
-                                           const char *args_json) {
+                                           const char *args_json, bool async) {
     (void)context;
     (void)repo_path;
     (void)args_json;
+    (void)async;
     return cbm_mcp_text_result("UI RPC indexing is disabled; use the coordinated /api/index route",
                                true);
 }

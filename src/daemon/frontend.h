@@ -29,6 +29,12 @@ bool cbm_daemon_frontend_is_cancellation_notification(const char *message);
 bool cbm_daemon_frontend_cancellation_matches_request(const char *message, int64_t active_id,
                                                       const char *active_id_str);
 
+/* The JSON-RPC error message answered for a cancelled request (#2144). A
+ * cancelled index_repository call is usually a client deadline on a long
+ * index, so its reply names the async alternative; every other request keeps
+ * the plain message. Returns a static string free of JSON metacharacters. */
+const char *cbm_daemon_frontend_cancelled_error_message(const char *request_message);
+
 /* Start a temporary observer for a one-shot local CLI command or physical
  * supervised worker. manager and cancel_context are borrowed until stop. On
  * maintenance intent the observer invokes cancel once, permits a fixed bounded

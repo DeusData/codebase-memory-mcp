@@ -20397,7 +20397,70 @@ TEST(bm25_searches_legacy_four_column_fts_without_error_issue518) {
     PASS();
 }
 
+/* #2144: async/status need the daemon's job registry. An in-process server
+ * (index worker, embedder) has no process that outlives the call, so it must
+ * refuse both modes instead of silently running a blocking index. */
+TEST(index_repository_async_and_status_refused_without_daemon_issue2144) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *async_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                            "{\"repo_path\":\"/nonexistent-2144\","
+                                            "\"async\":true}");
+    char *status_reply = cbm_mcp_handle_tool(srv, "index_repository",
+                                             "{\"repo_path\":\"/nonexistent-2144\","
+                                             "\"status\":true}");
+    cbm_mcp_server_free(srv);
+    ASSERT_NOT_NULL(async_reply);
+    ASSERT_NOT_NULL(strstr(async_reply, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(async_reply, "daemon"));
+    ASSERT_NOT_NULL(status_reply);
+    ASSERT_NOT_NULL(strstr(status_reply, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(status_reply, "daemon"));
+    free(async_reply);
+    free(status_reply);
+    PASS();
+}
+
+/* #2144: the tool schema advertises both flags and the description explains
+ * the deadline problem and the polling pattern. */
+TEST(index_repository_schema_documents_async_polling_issue2144) {
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    char *resp =
+        cbm_mcp_server_handle(srv, "{\"jsonrpc\":\"2.0\",\"id\":2144,\"method\":\"tools/list\"}");
+    cbm_mcp_server_free(srv);
+    ASSERT_NOT_NULL(resp);
+    ASSERT_NOT_NULL(strstr(resp, "\"async\":{\"type\":\"boolean\""));
+    ASSERT_NOT_NULL(strstr(resp, "\"status\":{\"type\":\"boolean\""));
+    ASSERT_NOT_NULL(strstr(resp, "per-call deadline"));
+    ASSERT_NOT_NULL(strstr(resp, "poll with status:true"));
+    free(resp);
+    PASS();
+}
+
+/* #2144: a notice rides on a JSON payload as a key (content text and
+ * structuredContent together) and on a text payload as a paragraph. */
+TEST(tool_result_add_notice_keeps_payload_shape_issue2144) {
+    char *object = cbm_mcp_tool_result_add_notice(
+        cbm_mcp_text_result("{\"status\":\"indexed\"}", false), "retry async");
+    char *text =
+        cbm_mcp_tool_result_add_notice(cbm_mcp_text_result("plain failure", true), "retry async");
+    ASSERT_NOT_NULL(object);
+    ASSERT_NOT_NULL(strstr(object, "\"structuredContent\":{\"status\":\"indexed\","
+                                   "\"notice\":\"retry async\"}"));
+    ASSERT_NOT_NULL(strstr(object, "\"isError\":false"));
+    ASSERT_NOT_NULL(text);
+    ASSERT_NOT_NULL(strstr(text, "plain failure\\n\\nretry async"));
+    ASSERT_NOT_NULL(strstr(text, "\"isError\":true"));
+    free(object);
+    free(text);
+    PASS();
+}
+
 SUITE(mcp) {
+    RUN_TEST(index_repository_async_and_status_refused_without_daemon_issue2144);
+    RUN_TEST(index_repository_schema_documents_async_polling_issue2144);
+    RUN_TEST(tool_result_add_notice_keeps_payload_shape_issue2144);
     /* #518/#519 — BM25 prose search */
     RUN_TEST(bm25_finds_section_by_its_prose_issue518);
     RUN_TEST(bm25_finds_module_by_promoted_description_issue519);

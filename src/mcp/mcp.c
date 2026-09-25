@@ -428,6 +428,60 @@ char *cbm_mcp_text_result(const char *text, bool is_error) {
     return out;
 }
 
+/* Rebuild the payload text with the notice attached; NULL when the payload
+ * cannot be rewritten. The result is a memory-core block (class other) on
+ * both branches, so the caller has one release path. */
+static char *tool_result_payload_with_notice(const char *payload, const char *notice) {
+    yyjson_doc *payload_doc = yyjson_read(payload, strlen(payload), 0);
+    yyjson_val *payload_root = payload_doc ? yyjson_doc_get_root(payload_doc) : NULL;
+    char *rewritten = NULL;
+    if (payload_root && yyjson_is_obj(payload_root)) {
+        yyjson_mut_doc *copy = yyjson_doc_mut_copy(payload_doc, NULL);
+        yyjson_mut_val *copy_root = copy ? yyjson_mut_doc_get_root(copy) : NULL;
+        char *written = copy_root && yyjson_mut_obj_add_strcpy(copy, copy_root, "notice", notice)
+                            ? yy_doc_to_str(copy)
+                            : NULL;
+        rewritten = written ? cbm_mem_strdup(CBM_MEM_CLASS_OTHER, written) : NULL;
+        safe_free(written); /* yyjson's writer block, not a core block */
+        yyjson_mut_doc_free(copy);
+    } else {
+        size_t payload_len = strlen(payload);
+        size_t notice_len = strlen(notice);
+        rewritten = cbm_alloc(CBM_MEM_CLASS_OTHER, payload_len + notice_len + 3U);
+        if (rewritten) {
+            memcpy(rewritten, payload, payload_len);
+            memcpy(rewritten + payload_len, "\n\n", 2U);
+            memcpy(rewritten + payload_len + 2U, notice, notice_len + 1U);
+        }
+    }
+    yyjson_doc_free(payload_doc);
+    return rewritten;
+}
+
+char *cbm_mcp_tool_result_add_notice(char *result, const char *notice) {
+    if (!result || !notice || !notice[0]) {
+        return result;
+    }
+    yyjson_doc *doc = yyjson_read(result, strlen(result), 0);
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *content = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "content") : NULL;
+    yyjson_val *first = content && yyjson_is_arr(content) ? yyjson_arr_get_first(content) : NULL;
+    yyjson_val *text = first && yyjson_is_obj(first) ? yyjson_obj_get(first, "text") : NULL;
+    yyjson_val *is_error = root && yyjson_is_obj(root) ? yyjson_obj_get(root, "isError") : NULL;
+    char *payload = text && yyjson_is_str(text)
+                        ? tool_result_payload_with_notice(yyjson_get_str(text), notice)
+                        : NULL;
+    char *rebuilt =
+        payload ? cbm_mcp_text_result(payload, is_error && yyjson_get_bool(is_error)) : NULL;
+    cbm_free(CBM_MEM_CLASS_OTHER, payload);
+    yyjson_doc_free(doc);
+    if (!rebuilt) {
+        return result;
+    }
+    safe_free(result); /* the caller's tool result, not a core block */
+    return rebuilt;
+}
+
 bool cbm_mcp_cancel_request_matches(const char *params_json, int64_t active_id,
                                     const char *active_id_str) {
     if (!params_json) {
@@ -466,7 +520,11 @@ typedef struct {
 static const tool_def_t TOOLS[] = {
     {"index_repository",
      "Index a repository. full/moderate add semantics; fast omits them; cross-repo-intelligence "
-     "links services. Reports coverage gaps.",
+     "links services. Reports coverage gaps. Waits for the whole index by default; a large repo "
+     "can exceed a client's per-call deadline. async:true starts (or joins) the index in the "
+     "daemon and returns at once; poll with status:true (same repo_path) until state is "
+     "succeeded, failed or cancelled. async needs a daemon that outlives the call: an MCP session "
+     "or `daemon start`.",
      "{\"type\":\"object\",\"properties\":{\"repo_path\":{\"type\":\"string\",\"description\":"
      "\"Repository path\"},"
      "\"mode\":{\"type\":\"string\","
@@ -478,7 +536,14 @@ static const tool_def_t TOOLS[] = {
      "\"name\":{\"type\":\"string\",\"description\":"
      "\"Name override; Non-ASCII bytes are encoded; unsafe characters normalized.\"},"
      "\"persistence\":{\"type\":\"boolean\",\"default\":false,\"description\":"
-     "\"Write .codebase-memory/graph.db.zst.\"}"
+     "\"Write .codebase-memory/graph.db.zst.\"},"
+     "\"async\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Start the index in the background and return immediately; it keeps running if this "
+     "call is cancelled or times out. Not with status or cross-repo-intelligence. Refused for a "
+     "one-shot cli call that is the only client of a temporary daemon (run daemon start).\"},"
+     "\"status\":{\"type\":\"boolean\",\"default\":false,\"description\":"
+     "\"Report the running or last index job (queued/running/succeeded/failed/cancelled) "
+     "instead of indexing. Pass the same repo_path (and name, if any) as the index call.\"}"
      "},\"required\":[\"repo_path\"]}"},
 
     {"search_graph",
@@ -1660,6 +1725,8 @@ struct cbm_mcp_server {
     struct cbm_config *config;        /* external config ref (not owned) */
     cbm_mcp_index_executor_fn index_executor;
     void *index_executor_context;
+    cbm_mcp_index_status_fn index_status_provider; /* #2144; NULL outside the daemon */
+    void *index_status_context;
     cbm_proc_log_cb index_log_callback;
     void *index_log_context;
     cbm_mcp_project_mutation_begin_fn mutation_begin;
@@ -1812,6 +1879,14 @@ void cbm_mcp_server_set_index_executor(cbm_mcp_server_t *srv, cbm_mcp_index_exec
     if (srv) {
         srv->index_executor = executor;
         srv->index_executor_context = context;
+    }
+}
+
+void cbm_mcp_server_set_index_status_provider(cbm_mcp_server_t *srv,
+                                              cbm_mcp_index_status_fn provider, void *context) {
+    if (srv) {
+        srv->index_status_provider = provider;
+        srv->index_status_context = context;
     }
 }
 
@@ -10468,7 +10543,8 @@ static char *build_worker_unsafe_terminal_response(const char *args, cbm_proc_ou
     yyjson_mut_obj_add_str(
         doc, root, "hint",
         cancellation_requested
-            ? "Indexing worker was cancelled. No in-process retry was started."
+            ? "Indexing worker was cancelled. No in-process retry was "
+              "started. " CBM_MCP_INDEX_ASYNC_HINT
             : "Indexing worker process-tree containment failed. No in-process retry was "
               "started; inspect daemon logs.");
     if (repo_path) {
@@ -11044,6 +11120,16 @@ static char *index_args_with_repo_path(const char *args, const char *canonical_r
     while (yyjson_mut_obj_get(copy_root, "_cbm_index_policy")) {
         (void)yyjson_mut_obj_remove_key(copy_root, "_cbm_index_policy");
     }
+    /* #2144: async/status choose how the caller waits, not what is indexed.
+     * They never reach the worker, and an async request coalesces with an
+     * identical synchronous one instead of being refused as an options
+     * conflict. */
+    static const char *const call_mode_keys[] = {"async", "status"};
+    for (size_t i = 0; i < sizeof(call_mode_keys) / sizeof(call_mode_keys[0]); i++) {
+        while (yyjson_mut_obj_get(copy_root, call_mode_keys[i])) {
+            (void)yyjson_mut_obj_remove_key(copy_root, call_mode_keys[i]);
+        }
+    }
     if (!yyjson_mut_obj_add_strcpy(copy, copy_root, "repo_path", canonical_repo_path) ||
         !cbm_mcp_index_policy_add_to_args(copy, copy_root, policy)) {
         yyjson_mut_doc_free(copy);
@@ -11107,7 +11193,107 @@ static void index_args_free(char *repo_path, char *mode_str, char *name_override
     free(name_override);
 }
 
+/* #2144: async and status are strict booleans. A present non-boolean value is
+ * refused rather than read as false, so "async":"true" never silently blocks
+ * for the whole index. */
+static bool index_call_mode_arg(const char *args, const char *key, bool *value_out) {
+    *value_out = false;
+    yyjson_doc *doc = args ? yyjson_read(args, strlen(args), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *value = root && yyjson_is_obj(root) ? yyjson_obj_get(root, key) : NULL;
+    bool valid = !value || yyjson_is_bool(value);
+    *value_out = valid && value && yyjson_get_bool(value);
+    yyjson_doc_free(doc);
+    return valid;
+}
+
+/* The project key a status query names: an explicit name override wins (the
+ * key the index call used), then repo_path resolved exactly as for indexing
+ * (session root, canonical form, workspace boundary), then a known project
+ * alias. NULL with *error_out set when none identifies a project. */
+static char *index_status_project_key(cbm_mcp_server_t *srv, const char *args, char *error_out,
+                                      size_t error_size) {
+    char *name = cbm_mcp_get_string_arg(args, "name");
+    if (name && name[0]) {
+        char *key = cbm_project_name_from_path(name);
+        safe_free(name);
+        return key;
+    }
+    safe_free(name);
+    char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
+    if (!repo_path) {
+        char *project = get_project_arg(args);
+        if (!project) {
+            (void)snprintf(error_out, error_size,
+                           "status needs the repo_path (or name) the index call used");
+        }
+        return project;
+    }
+    cbm_normalize_path_sep(repo_path);
+    if (!resolve_session_repo_path(srv, &repo_path)) {
+        safe_free(repo_path);
+        (void)snprintf(error_out, error_size, "failed to resolve repo_path");
+        return NULL;
+    }
+    repo_path = canonicalize_repo_path_if_exists(repo_path);
+    const char *allowed_root =
+        srv->allowed_root_policy_set ? srv->allowed_root : getenv("CBM_ALLOWED_ROOT");
+    if (repo_path && repo_path[0] &&
+        !cbm_workspace_root_allowed(repo_path, cbm_workspace_home_dir(), cbm_workspace_cache_dir(),
+                                    allowed_root, error_out, error_size)) {
+        safe_free(repo_path);
+        return NULL;
+    }
+    char *key = repo_path ? cbm_project_name_from_path(repo_path) : NULL;
+    safe_free(repo_path);
+    if (!key) {
+        (void)snprintf(error_out, error_size, "could not resolve index project name");
+    }
+    return key;
+}
+
+/* index_repository(status: true): report the project's running or most recent
+ * index job without starting one. Job state lives in the daemon's job
+ * registry; a server without one (CLI index worker, embedder) has no job that
+ * could outlive a call, so it refuses instead of guessing. */
+static char *handle_index_repository_status(cbm_mcp_server_t *srv, const char *args) {
+    if (!srv->index_status_provider) {
+        return cbm_mcp_text_result("index_repository status needs the daemon-backed MCP server; "
+                                   "this in-process server tracks no index jobs",
+                                   true);
+    }
+    char error[CBM_SZ_1K] = {0};
+    char *project = index_status_project_key(srv, args, error, sizeof(error));
+    if (!project) {
+        return cbm_mcp_text_result(error[0] ? error : "could not resolve index project name", true);
+    }
+    char *result = srv->index_status_provider(srv->index_status_context, project);
+    safe_free(project);
+    return result ? result : cbm_mcp_text_result("index job status is unavailable", true);
+}
+
 static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
+    bool async_mode = false;
+    bool status_mode = false;
+    if (!index_call_mode_arg(args, "async", &async_mode) ||
+        !index_call_mode_arg(args, "status", &status_mode)) {
+        return cbm_mcp_text_result("async and status must be booleans", true);
+    }
+    if (async_mode && status_mode) {
+        return cbm_mcp_text_result(
+            "async and status are exclusive: start with async: true, then poll with status: true",
+            true);
+    }
+    if (status_mode) {
+        return handle_index_repository_status(srv, args);
+    }
+    if (async_mode && !srv->index_executor) {
+        return cbm_mcp_text_result("index_repository async needs the daemon-backed MCP server: "
+                                   "this in-process server has no process that outlives the call; "
+                                   "call without async",
+                                   true);
+    }
+
     char *repo_path = cbm_mcp_get_string_arg(args, "repo_path");
     char *mode_str = cbm_mcp_get_string_arg(args, "mode");
     char *name_override = cbm_mcp_get_string_arg(args, "name");
@@ -11149,6 +11335,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
     }
 
     if (mode_str && strcmp(mode_str, "cross-repo-intelligence") == 0) {
+        if (async_mode) {
+            index_args_free(repo_path, mode_str, name_override);
+            return cbm_mcp_text_result(
+                "async is not supported for mode cross-repo-intelligence (it runs no index job)",
+                true);
+        }
         char *result = handle_cross_repo_mode(srv, repo_path, name_override, args);
         index_args_free(repo_path, mode_str, name_override);
         return result;
@@ -11165,9 +11357,9 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
      * registry only after path canonicalization and workspace authorization. */
     if (srv->index_executor) {
         char *worker_args = index_args_with_repo_path(args, repo_path, &resource_policy);
-        char *coordinated =
-            worker_args ? srv->index_executor(srv->index_executor_context, repo_path, worker_args)
-                        : NULL;
+        char *coordinated = worker_args ? srv->index_executor(srv->index_executor_context,
+                                                              repo_path, worker_args, async_mode)
+                                        : NULL;
         free(worker_args);
         index_args_free(repo_path, mode_str, name_override);
         return coordinated ? coordinated
@@ -11223,7 +11415,8 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
         mcp_project_mutation_end(srv, mutation_project);
         free(mutation_project);
         index_args_free(repo_path, mode_str, name_override);
-        return cbm_mcp_text_result("index operation cancelled for this request", true);
+        return cbm_mcp_text_result(
+            "index operation cancelled for this request. " CBM_MCP_INDEX_ASYNC_HINT, true);
     }
 
     cbm_index_mode_t mode = CBM_MODE_FULL;
