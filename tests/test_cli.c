@@ -15084,6 +15084,40 @@ TEST(cli_config_watcher_enabled_default_and_persist) {
     PASS();
 }
 
+/* #1948: non-git roots are polled only when `watch_non_git` opts in. The key
+ * defaults OFF (behaviour unchanged, also for a NULL config) and is listed in
+ * the config-key table so `config list` / `config set` can find it. */
+TEST(cli_config_watch_non_git_default_off_and_listed_issue1948) {
+    char tmpdir[256];
+    snprintf(tmpdir, sizeof(tmpdir), "/tmp/cli-cfg-ng-XXXXXX");
+    if (!cbm_mkdtemp(tmpdir))
+        FAIL("cbm_mkdtemp failed");
+
+    ASSERT_FALSE(cbm_config_watch_non_git(NULL));
+    cbm_config_t *cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_FALSE(cbm_config_watch_non_git(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCH_NON_GIT, "true");
+    ASSERT_TRUE(cbm_config_watch_non_git(cfg));
+    cbm_config_close(cfg);
+    cfg = cbm_config_open(tmpdir);
+    ASSERT_NOT_NULL(cfg);
+    ASSERT_TRUE(cbm_config_watch_non_git(cfg));
+    cbm_config_set(cfg, CBM_CONFIG_WATCH_NON_GIT, "false");
+    ASSERT_FALSE(cbm_config_watch_non_git(cfg));
+    cbm_config_close(cfg);
+
+    bool listed = false;
+    for (size_t i = 0; i < cbm_cli_config_key_count_for_testing(); i++) {
+        const char *key = cbm_cli_config_key_at_for_testing(i);
+        listed = listed || (key && strcmp(key, CBM_CONFIG_WATCH_NON_GIT) == 0);
+    }
+    ASSERT_TRUE(listed);
+
+    test_rmdir_r(tmpdir);
+    PASS();
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  *  Group H: cbm_replace_binary (update command helper)
  * ═══════════════════════════════════════════════════════════════════ */
@@ -16373,6 +16407,7 @@ SUITE(cli) {
     RUN_TEST(cli_config_delete);
     RUN_TEST(cli_config_persists);
     RUN_TEST(cli_config_watcher_enabled_default_and_persist);
+    RUN_TEST(cli_config_watch_non_git_default_off_and_listed_issue1948);
 
     /* Replace binary (update command helper — group H) */
 #ifndef _WIN32

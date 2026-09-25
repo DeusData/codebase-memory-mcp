@@ -141,6 +141,7 @@ typedef struct {
     char *rel_path;       /* relative to repo root (heap-allocated) */
     CBMLanguage language; /* detected language */
     int64_t size;         /* file size in bytes */
+    int64_t mtime_ns;     /* modification time, ns (whole seconds on Windows) */
 } cbm_file_info_t;
 
 typedef struct {

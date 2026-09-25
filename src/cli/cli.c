@@ -7404,6 +7404,11 @@ bool cbm_config_watcher_enabled(cbm_config_t *cfg) {
     return cbm_config_get_bool(cfg, CBM_CONFIG_WATCHER_ENABLED, true);
 }
 
+/* Opt-in tree polling of non-git roots (#1948); see cli.h. */
+bool cbm_config_watch_non_git(cbm_config_t *cfg) {
+    return cbm_config_get_bool(cfg, CBM_CONFIG_WATCH_NON_GIT, false);
+}
+
 bool cbm_config_load_index_policy(cbm_config_t *cfg, cbm_index_resource_policy_t *policy,
                                   char *error, size_t error_size) {
     if (!cfg || !policy) {
@@ -7444,6 +7449,8 @@ static const config_key_def_t CONFIG_KEYS[] = {
     {CBM_CONFIG_AUTO_WATCH, "true", "Register background git watcher on session connect"},
     {CBM_CONFIG_WATCHER_ENABLED, "true",
      "Run the background watcher thread (auto-reindex); false to disable"},
+    {CBM_CONFIG_WATCH_NON_GIT, "false",
+     "Also poll non-git project roots for changes (file-tree scan); off by default"},
     {CBM_CONFIG_UI_LANG, "auto", "Pin graph UI language: en, zh, or auto"},
     {CBM_CONFIG_UI_ENABLED, "false", "Serve the graph UI on a loopback HTTP port"},
     {CBM_CONFIG_UI_PORT, "9749", "Port for the graph UI listener when enabled"},

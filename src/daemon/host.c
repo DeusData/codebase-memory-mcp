@@ -609,6 +609,12 @@ static bool host_state_prepare(host_state_t *host, const cbm_daemon_ipc_endpoint
     if (watcher_enabled) {
         host->watch_store = cbm_store_open_memory();
         host->watcher = cbm_watcher_new(host->watch_store, host_watcher_index, host);
+        /* #1948: non-git roots stay unwatched unless watch_non_git opts in.
+         * Same read-once-at-startup contract as watcher_enabled. */
+        if (host->watcher && cbm_config_watch_non_git(host->runtime_config)) {
+            cbm_watcher_set_poll_non_git(host->watcher, true);
+            cbm_log_info("watcher.non_git", "mode", "tree_poll");
+        }
     } else {
         cbm_log_info("watcher.disabled", "reason", "config");
     }

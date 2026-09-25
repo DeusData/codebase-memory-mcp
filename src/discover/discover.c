@@ -518,8 +518,23 @@ static void file_list_add_ignored(file_list_t *fl, const char *rel_path, const c
     fl->ignored_count++;
 }
 
+/* Nanosecond mtime from a stat result, per platform. Windows' wide_stat only
+ * carries whole seconds, so the value is seconds scaled to ns there. */
+#define DISCOVER_NS_PER_SEC 1000000000LL
+static int64_t discover_stat_mtime_ns(const struct stat *st) {
+#ifdef __APPLE__
+    return ((int64_t)st->st_mtimespec.tv_sec * DISCOVER_NS_PER_SEC) +
+           (int64_t)st->st_mtimespec.tv_nsec;
+#elif defined(_WIN32)
+    return (int64_t)st->st_mtime * DISCOVER_NS_PER_SEC;
+#else
+    return ((int64_t)st->st_mtim.tv_sec * DISCOVER_NS_PER_SEC) + (int64_t)st->st_mtim.tv_nsec;
+#endif
+}
+
 static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, CBMLanguage lang,
-                   int64_t size) {
+                   const struct stat *st) {
+    int64_t size = (int64_t)st->st_size;
     if (fl->max_files >= 0 && fl->count >= fl->max_files) {
         fl->limit_exceeded = true;
         return;
@@ -574,6 +589,7 @@ static void fl_add(file_list_t *fl, const char *abs_path, const char *rel_path, 
     fi->rel_path = relative_copy;
     fi->language = lang;
     fi->size = size;
+    fi->mtime_ns = discover_stat_mtime_ns(st);
 }
 
 /* ── Recursive walk ─────────────────────────────── */
@@ -878,9 +894,10 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
                                   const cbm_discover_opts_t *opts,
                                   const gitignore_link_t *ignore_chain,
                                   const cbm_gitignore_t *global_gi,
-                                  const cbm_gitignore_t *cbmignore, off_t size, file_list_t *out) {
+                                  const cbm_gitignore_t *cbmignore, const struct stat *st,
+                                  file_list_t *out) {
     const char *skip_reason =
-        file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, size);
+        file_skip_reason(name, rel_path, opts, ignore_chain, global_gi, cbmignore, st->st_size);
     if (skip_reason) {
         /* Deliberately not indexed (#963) — record so callers can surface it.
          * Unsupported-language files below are NOT recorded: "no grammar for
@@ -893,7 +910,7 @@ static void walk_dir_process_file(const char *abs_path, const char *rel_path, co
     if (lang == CBM_LANG_COUNT) {
         return;
     }
-    fl_add(out, abs_path, rel_path, lang, size);
+    fl_add(out, abs_path, rel_path, lang, st);
 }
 
 typedef struct {
@@ -1005,7 +1022,7 @@ static void walk_dir_process_entry(cbm_dirent_t *entry, const walk_frame_t *fram
         }
     } else if (S_ISREG(st.st_mode)) {
         walk_dir_process_file(abs_path, rel_path, entry->name, opts, frame->ignore_chain, global_gi,
-                              cbmignore, st.st_size, out);
+                              cbmignore, &st, out);
     }
 }
 
