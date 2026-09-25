@@ -1,0 +1,9 @@
+{
+  "name": "tree-sitter-pascal-cbm",
+  "version": "0.10.2-cbm.1",
+  "description": "cbm fork of tree-sitter-pascal @ 042119e (Unicode identifiers, #2211)",
+  "license": "MIT",
+  "devDependencies": {
+    "tree-sitter-cli": "0.25.10"
+  }
+}

@@ -983,6 +983,147 @@ TEST(coverage_gap_of_only_comments_is_not_a_miss) {
     PASS();
 }
 
+/* ── #2211: Pascal/Delphi identifiers with non-ASCII letters ─────────────────
+ * Delphi accepts non-ASCII letters in identifiers; 1C integrations call its
+ * OLE API through late-bound Variants with Cyrillic member names. Upstream
+ * tree-sitter-pascal's identifier token was ASCII-only, so every such name was
+ * an ERROR node and the unit came out parse_partial. The Cyrillic text is
+ * written as UTF-8 hex escapes (the source stays ASCII); a `" "` split follows
+ * an escape run whenever the next character is a hex digit. */
+
+/* The reporter's snippet (#2211), verbatim apart from the escaping:
+ * v8_Base.<Dokumenty>.<SchetNaOplatuPostavshchika>.<NaytiPoNomeru>(...),
+ * v8_dst.<Pustaya>(), v8_Base.<Spravochniki>.<Nomenklatura>.<NaytiPoKodu>(...),
+ * NM.<PoluchitObyekt>().<Zapisat>() -- <...> = the Cyrillic name, transliterated. */
+static const char *PAS_CYRILLIC_MEMBERS =
+    "unit Demo;\n"
+    "interface\n"
+    "procedure Demo1C;\n"
+    "implementation\n"
+    "procedure Demo1C;\n"
+    "var\n"
+    "  v8_Base, v8_dst, NM: Variant;\n"
+    "begin\n"
+    "  v8_dst := "
+    "v8_Base.\xd0\x94\xd0\xbe\xd0\xba\xd1\x83\xd0\xbc\xd0\xb5\xd0\xbd\xd1\x82\xd1\x8b."
+    "\xd0\xa1\xd1\x87\xd0\xb5\xd1\x82\xd0\x9d\xd0\xb0\xd0\x9e\xd0\xbf\xd0\xbb\xd0\xb0\xd1\x82\xd1"
+    "\x83\xd0\x9f\xd0\xbe\xd1\x81\xd1\x82\xd0\xb0\xd0\xb2\xd1\x89\xd0\xb8\xd0\xba\xd0\xb0."
+    "\xd0\x9d\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8\xd0\x9f\xd0\xbe\xd0\x9d\xd0\xbe\xd0\xbc\xd0\xb5\xd1"
+    "\x80\xd1\x83('1', Now);\n"
+    "  if v8_dst.\xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd1\x8f() then Exit;\n"
+    "  NM := "
+    "v8_Base.\xd0\xa1\xd0\xbf\xd1\x80\xd0\xb0\xd0\xb2\xd0\xbe\xd1\x87\xd0\xbd\xd0\xb8\xd0\xba\xd0"
+    "\xb8.\xd0\x9d\xd0\xbe\xd0\xbc\xd0\xb5\xd0\xbd\xd0\xba\xd0\xbb\xd0\xb0\xd1\x82\xd1\x83\xd1\x80"
+    "\xd0\xb0.\xd0\x9d\xd0\xb0\xd0\xb9\xd1\x82\xd0\xb8\xd0\x9f\xd0\xbe\xd0\x9a\xd0\xbe\xd0\xb4\xd1"
+    "\x83('123', 0);\n"
+    "  if not NM.\xd0\x9f\xd1\x83\xd1\x81\xd1\x82\xd0\xb0\xd1\x8f() then\n"
+    "    "
+    "NM."
+    "\xd0\x9f\xd0\xbe\xd0\xbb\xd1\x83\xd1\x87\xd0\xb8\xd1\x82\xd1\x8c\xd0\x9e\xd0\xb1\xd1\x8a\xd0"
+    "\xb5\xd0\xba\xd1\x82().\xd0\x97\xd0\xb0\xd0\xbf\xd0\xb8\xd1\x81\xd0\xb0\xd1\x82\xd1\x8c();\n"
+    "end;\n"
+    "end.\n";
+
+/* A procedure whose own name, parameter and locals are Cyrillic (<ObrabotatDokument>,
+ * <Imya>, <Schyotchik>2), plus the keyword-boundary cases the wider identifier token must
+ * not swallow: `begin<Znachenie>` is ONE identifier, `&begin` is an escaped
+ * identifier, and upper-case BEGIN/END still open and close a block. An ASCII
+ * neighbour follows, so a keyword lost to the identifier token would surface as
+ * a missing definition as well as an ERROR. */
+#define PAS_CYR_PROC_NAME                                                                          \
+    "\xd0\x9e\xd0\xb1\xd1\x80\xd0\xb0\xd0\xb1\xd0\xbe\xd1\x82\xd0\xb0\xd1\x82\xd1\x8c\xd0\x94\xd0" \
+    "\xbe\xd0\xba\xd1\x83\xd0\xbc\xd0\xb5\xd0\xbd\xd1\x82"
+#define PAS_CYR_COUNTER "\xd0\xa1\xd1\x87\xd1\x91\xd1\x82\xd1\x87\xd0\xb8\xd0\xba"
+#define PAS_CYR_VALUE "begin\xd0\x97\xd0\xbd\xd0\xb0\xd1\x87\xd0\xb5\xd0\xbd\xd0\xb8\xd0\xb5"
+static const char *PAS_CYRILLIC_PROC =
+    "unit Kw;\n"
+    "interface\n"
+    "implementation\n"
+    "procedure " PAS_CYR_PROC_NAME "(const \xd0\x98\xd0\xbc\xd1\x8f: string);\n"
+    "var\n"
+    "  " PAS_CYR_VALUE ", &begin: Integer;\n"
+    "  " PAS_CYR_COUNTER "2: Integer;\n"
+    "begin\n"
+    "  BEGIN " PAS_CYR_COUNTER "2 := 1; END;\n"
+    "  " PAS_CYR_VALUE " := " PAS_CYR_COUNTER "2;\n"
+    "end;\n"
+    "procedure AfterIt;\n"
+    "begin\n"
+    "end;\n"
+    "end.\n";
+
+/* ASCII control: the same shapes with ASCII names parsed before the fork and
+ * must still parse identically. */
+static const char *PAS_ASCII_CONTROL = "unit Plain;\n"
+                                       "interface\n"
+                                       "procedure Run;\n"
+                                       "implementation\n"
+                                       "procedure Run;\n"
+                                       "var\n"
+                                       "  Base, Doc: Variant;\n"
+                                       "begin\n"
+                                       "  Doc := Base.Documents.Invoice.FindByNumber('1', Now);\n"
+                                       "  if Doc.IsEmpty() then Exit;\n"
+                                       "  Doc.GetObject().Write();\n"
+                                       "end;\n"
+                                       "end.\n";
+
+/* Genuinely broken Pascal (a doubled `:=` and stray parens) must stay flagged:
+ * the wider identifier token must not make the parser accept garbage. */
+static const char *PAS_BROKEN = "unit Broken;\n"
+                                "interface\n"
+                                "implementation\n"
+                                "procedure Bad;\n"
+                                "begin\n"
+                                "  x := := 1 )) ;\n"
+                                "end;\n"
+                                "procedure Good;\n"
+                                "begin\n"
+                                "end;\n"
+                                "end.\n";
+
+TEST(pascal_cyrillic_member_calls_not_partial_issue2211) {
+    CBMFileResult *r = do_extract(PAS_CYRILLIC_MEMBERS, CBM_LANG_PASCAL, "Demo.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_NULL(r->error_ranges);
+    ASSERT_TRUE(has_def(r, "Demo1C"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_cyrillic_procedure_name_extracted_issue2211) {
+    CBMFileResult *r = do_extract(PAS_CYRILLIC_PROC, CBM_LANG_PASCAL, "Kw.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_TRUE(has_def(r, PAS_CYR_PROC_NAME));
+    ASSERT_TRUE(has_def(r, "AfterIt"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_ascii_control_still_clean_issue2211) {
+    CBMFileResult *r = do_extract(PAS_ASCII_CONTROL, CBM_LANG_PASCAL, "Plain.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->parse_incomplete);
+    ASSERT_EQ(r->error_region_count, 0);
+    ASSERT_TRUE(has_def(r, "Run"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(pascal_broken_source_still_flagged_issue2211) {
+    CBMFileResult *r = do_extract(PAS_BROKEN, CBM_LANG_PASCAL, "Broken.pas");
+    ASSERT_NOT_NULL(r);
+    ASSERT_TRUE(r->parse_incomplete);
+    ASSERT_GTE(r->error_region_count, 1);
+    ASSERT_TRUE(has_def(r, "Good"));
+    cbm_free_result(r);
+    PASS();
+}
+
 SUITE(parse_coverage) {
     RUN_TEST(c_ifdef_split_brace_sets_parse_incomplete);
     RUN_TEST(c_ifdef_split_brace_neighbors_still_extracted);
@@ -1023,4 +1164,8 @@ SUITE(parse_coverage) {
     RUN_TEST(coverage_range_never_ends_past_the_last_line_issue963);
     RUN_TEST(coverage_range_never_covers_an_extracted_definition);
     RUN_TEST(coverage_gap_of_only_comments_is_not_a_miss);
+    RUN_TEST(pascal_cyrillic_member_calls_not_partial_issue2211);
+    RUN_TEST(pascal_cyrillic_procedure_name_extracted_issue2211);
+    RUN_TEST(pascal_ascii_control_still_clean_issue2211);
+    RUN_TEST(pascal_broken_source_still_flagged_issue2211);
 }
