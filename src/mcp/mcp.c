@@ -11120,7 +11120,7 @@ static bool index_root_owner_append(char **list, size_t *len, size_t *cap, const
     size_t need = *len + strlen(name) + 3;
     if (need > *cap) {
         size_t grown_cap = need * 2;
-        char *grown = realloc(*list, grown_cap);
+        char *grown = cbm_realloc(CBM_MEM_CLASS_OTHER, *list, grown_cap);
         if (!grown) {
             return false;
         }
@@ -11141,14 +11141,14 @@ static bool index_root_owner_resolve(const char *repo_path, char **owner_out, ch
     char derived_db[CBM_SZ_1K];
     project_db_path(derived, derived_db, sizeof(derived_db));
     if (derived_db[0] && cbm_file_exists(derived_db)) {
-        free(derived);
+        safe_free(derived);
         return true; /* fast path: the path-derived project is already on disk */
     }
     char dir_path[CBM_SZ_1K];
     cache_dir(dir_path, sizeof(dir_path));
     cbm_dir_t *d = cbm_opendir(dir_path);
     if (!d) {
-        free(derived);
+        safe_free(derived);
         return true;
     }
     char *owner = NULL;
@@ -11187,16 +11187,16 @@ static bool index_root_owner_resolve(const char *repo_path, char **owner_out, ch
         project_record_clear(&record);
     }
     cbm_closedir(d);
-    free(derived);
+    safe_free(derived);
 
     if (ok && !derived_exists && owner_count == 1) {
-        free(owners);
+        cbm_free(CBM_MEM_CLASS_OTHER, owners);
         *owner_out = owner;
         return true;
     }
-    free(owner);
+    safe_free(owner);
     if (ok && (derived_exists || owner_count == 0)) {
-        free(owners);
+        cbm_free(CBM_MEM_CLASS_OTHER, owners);
         return true;
     }
     char msg[CBM_SZ_4K];
@@ -11209,7 +11209,7 @@ static bool index_root_owner_resolve(const char *repo_path, char **owner_out, ch
         snprintf(msg, sizeof(msg), "out of memory while resolving the project for root_path %s",
                  repo_path);
     }
-    free(owners);
+    cbm_free(CBM_MEM_CLASS_OTHER, owners);
     *error_out = heap_strdup(msg);
     return false;
 }
@@ -11272,12 +11272,12 @@ static char *handle_index_repository(cbm_mcp_server_t *srv, const char *args) {
             index_args_free(repo_path, mode_str, name_override);
             char *result = cbm_mcp_text_result(
                 owner_error ? owner_error : "could not resolve index project name", true);
-            free(owner_error);
+            safe_free(owner_error);
             return result;
         }
         if (owner) {
             cbm_log_info("index.root_owner_reused", "root", repo_path, "project", owner);
-            free(name_override);
+            safe_free(name_override);
             name_override = owner;
         }
     }
