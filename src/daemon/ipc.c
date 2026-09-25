@@ -3245,6 +3245,94 @@ void cbm_daemon_ipc_listener_close(cbm_daemon_ipc_listener_t *listener) {
     free(listener);
 }
 
+/* Touch results: 1 refreshed, 0 lost (the path no longer names the owned
+ * file), -1 transient (a still-valid file could not be refreshed). Touch
+ * through the held descriptor only after proving the path still names it:
+ * refreshing by path would keep a replacement inode fresh and hide the loss
+ * (#2178). */
+static int posix_touch_fold(int result, int next) {
+    return result == 0 || next == 0 ? 0 : (result < 0 || next < 0 ? -1 : 1);
+}
+
+/* Whether base_name still names the regular file (device, inode): 1 yes,
+ * 0 proven not (absent, another inode, a symlink or other non-regular
+ * entry), -1 undetermined (any other lookup failure, e.g. EIO or ESTALE). */
+static int posix_path_names_inode(int directory_fd, const char *base_name, dev_t device,
+                                  ino_t inode) {
+    struct stat by_path;
+    if (fstatat(directory_fd, base_name, &by_path, AT_SYMLINK_NOFOLLOW) != 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    return S_ISREG(by_path.st_mode) && by_path.st_dev == device && by_path.st_ino == inode ? 1 : 0;
+}
+
+static int posix_held_file_touch(int directory_fd, const char *base_name, int fd) {
+    struct stat by_handle;
+    if (fstat(fd, &by_handle) != 0) {
+        return -1;
+    }
+    int identity =
+        by_handle.st_nlink == 0
+            ? 0
+            : posix_path_names_inode(directory_fd, base_name, by_handle.st_dev, by_handle.st_ino);
+    if (identity <= 0) {
+        return identity;
+    }
+    return futimens(fd, NULL) == 0 ? 1 : -1;
+}
+
+static int posix_held_lock_touch(int directory_fd, const process_lock_entry_t *entry, int fd) {
+    return entry ? posix_held_file_touch(directory_fd, entry->lock_name, fd) : 0;
+}
+
+static int posix_identity_marker_touch(const cbm_daemon_ipc_listener_t *listener) {
+    /* The marker is not held open. Classify by path first, so a symlink or
+     * other replacement is loss; only then reopen it to refresh, where a
+     * failure (EMFILE, EACCES) says nothing about the file and is transient. */
+    int identity = posix_path_names_inode(listener->dir_fd, listener->socket_identity_name,
+                                          listener->identity_device, listener->identity_inode);
+    if (identity <= 0) {
+        return identity;
+    }
+    int marker_fd = openat(listener->dir_fd, listener->socket_identity_name,
+                           O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (marker_fd < 0) {
+        return errno == ENOENT ? 0 : -1;
+    }
+    struct stat marker_status;
+    int result = -1;
+    if (fstat(marker_fd, &marker_status) == 0) {
+        /* Replaced between the lookup and the open. */
+        result = marker_status.st_dev != listener->identity_device ||
+                         marker_status.st_ino != listener->identity_inode
+                     ? 0
+                     : (futimens(marker_fd, NULL) == 0 ? 1 : -1);
+    }
+    (void)close(marker_fd);
+    return result;
+}
+
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard) {
+    if (!listener || listener->dir_fd < 0 || listener->owner_pid != getpid() ||
+        !listener->lifetime_reservation) {
+        return 0;
+    }
+    int result =
+        posix_held_lock_touch(listener->dir_fd, listener->lifetime_reservation->process_entry,
+                              listener->lifetime_reservation->fd);
+    const cbm_daemon_ipc_participant_guard_t *guards[] = {listener->participant_guard,
+                                                          external_guard};
+    for (size_t i = 0; i < sizeof(guards) / sizeof(guards[0]); i++) {
+        if (guards[i]) {
+            result = posix_touch_fold(result, posix_held_lock_touch(listener->dir_fd,
+                                                                    guards[i]->legacy_process_entry,
+                                                                    guards[i]->legacy_fd));
+        }
+    }
+    return posix_touch_fold(result, posix_identity_marker_touch(listener));
+}
+
 int cbm_daemon_ipc_accept(cbm_daemon_ipc_listener_t *listener, uint32_t timeout_ms,
                           cbm_daemon_ipc_connection_t **connection_out) {
     if (connection_out) {
@@ -3626,6 +3714,14 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard) {
+    if (!endpoint || !guard || guard->owner_pid != getpid()) {
+        return 0;
+    }
+    return posix_held_lock_touch(endpoint->dir_fd, guard->legacy_process_entry, guard->legacy_fd);
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(
@@ -6818,6 +6914,19 @@ bool cbm_daemon_ipc_participant_guard_release(cbm_daemon_ipc_participant_guard_t
     free(guard);
     *guard_io = NULL;
     return true;
+}
+
+/* Windows has no age-based cleaner of the private runtime directory, and its
+ * held handles deny deletion; the #2178 heartbeat has nothing to refresh. */
+int cbm_daemon_ipc_listener_touch(cbm_daemon_ipc_listener_t *listener,
+                                  cbm_daemon_ipc_participant_guard_t *external_guard) {
+    (void)external_guard;
+    return listener ? 1 : 0;
+}
+
+int cbm_daemon_ipc_participant_guard_touch(const cbm_daemon_ipc_endpoint_t *endpoint,
+                                           cbm_daemon_ipc_participant_guard_t *guard) {
+    return endpoint && guard ? 1 : 0;
 }
 
 int cbm_daemon_ipc_local_transition_try_acquire(

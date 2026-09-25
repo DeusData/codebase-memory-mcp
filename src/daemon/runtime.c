@@ -2578,6 +2578,12 @@ size_t cbm_daemon_runtime_service_active_connections(cbm_daemon_runtime_service_
     return count;
 }
 
+int cbm_daemon_runtime_service_touch_listener(cbm_daemon_runtime_service_t *service) {
+    return service && service->listener
+               ? cbm_daemon_ipc_listener_touch(service->listener, service->owned_participant_guard)
+               : 0;
+}
+
 void cbm_daemon_runtime_service_reconcile_lifetime(cbm_daemon_runtime_service_t *service) {
     if (!service) {
         return;
