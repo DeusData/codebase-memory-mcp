@@ -285,10 +285,11 @@ int cbm_mkstemp(char *tmpl) {
         return CBM_NOT_FOUND;
     }
     static const wchar_t hex[] = L"0123456789abcdef";
+    int saved_errno = EEXIST;
     for (int attempt = 0; attempt < 128; attempt++) {
         unsigned int random_bits = 0;
         if (!cbm_secure_random(&random_bits, sizeof(random_bits))) {
-            errno = EIO;
+            saved_errno = EIO;
             break;
         }
         for (int digit = 0; digit < 6; digit++) {
@@ -299,10 +300,11 @@ int cbm_mkstemp(char *tmpl) {
         if (!expanded || !wide_open || strlen(expanded) >= sizeof(buf)) {
             free(expanded);
             free(wide_open);
-            errno = ENAMETOOLONG;
+            saved_errno = ENAMETOOLONG;
             break;
         }
         int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+        saved_errno = errno;
         free(wide_open);
         if (fd >= 0) {
             strcpy(tmpl, expanded);
@@ -311,11 +313,12 @@ int cbm_mkstemp(char *tmpl) {
             return fd;
         }
         free(expanded);
-        if (errno != EEXIST) {
+        if (saved_errno != EEXIST) {
             break;
         }
     }
     free(wide_template);
+    errno = saved_errno;
     return CBM_NOT_FOUND;
 }
 #endif
