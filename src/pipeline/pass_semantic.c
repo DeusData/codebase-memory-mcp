@@ -619,6 +619,7 @@ static void resolve_decorator(cbm_pipeline_ctx_t *ctx, const cbm_gbuf_node_t *no
 }
 
 static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def,
+                                  const cbm_file_info_t *fi, const CBMFileResult *result,
                                   const char *module_qn, const char **imp_keys,
                                   const char **imp_vals, int imp_count, int *inherits_count,
                                   int *decorates_count) {
@@ -633,8 +634,10 @@ static void sem_process_def_edges(cbm_pipeline_ctx_t *ctx, const CBMDefinition *
         for (int b = 0; def->base_classes[b]; b++) {
             const char *base_qn = resolve_as_class(ctx->registry, def->base_classes[b], module_qn,
                                                    imp_keys, imp_vals, imp_count);
-            if (!base_qn) {
-                continue;
+            if (!base_qn || cbm_python_external_base_contradicts(
+                                fi->language, &result->imports, def->base_classes[b], base_qn,
+                                ctx->gbuf, ctx->project_name, fi->rel_path)) {
+                continue; /* unresolved, or an external base (`unittest.TestCase`) */
             }
             const cbm_gbuf_node_t *base_node = cbm_gbuf_find_by_qn(ctx->gbuf, base_qn);
             if (base_node && node->id != base_node->id) {
@@ -744,8 +747,8 @@ int cbm_pipeline_pass_semantic(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *f
 
         /* ── INHERITS + DECORATES from definitions ──────────────── */
         for (int d = 0; d < result->defs.count; d++) {
-            sem_process_def_edges(ctx, &result->defs.items[d], module_qn, imp_keys, imp_vals,
-                                  imp_count, &inherits_count, &decorates_count);
+            sem_process_def_edges(ctx, &result->defs.items[d], &files[i], result, module_qn,
+                                  imp_keys, imp_vals, imp_count, &inherits_count, &decorates_count);
         }
 
         /* ── IMPLEMENTS from impl_traits (Rust) ─────────────────── */

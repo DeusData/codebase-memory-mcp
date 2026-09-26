@@ -752,6 +752,132 @@ TEST(ei_py_external_import_never_binds_project_symbol) {
     PASS();
 }
 
+/* Base-class helper: INHERITS edges out of the (single) Class named `src`
+ * (return value), and how many land on a node whose QN ends with
+ * `want_qn_suffix` (*to_want); -1 when the class is missing. */
+static int ei_inherits_out(cbm_store_t *store, const char *project, const char *src,
+                           const char *want_qn_suffix, int *to_want) {
+    *to_want = 0;
+    cbm_node_t *nodes = NULL;
+    int count = 0;
+    if (cbm_store_find_nodes_by_name(store, project, src, &nodes, &count) != CBM_STORE_OK) {
+        return -1;
+    }
+    int64_t id = 0;
+    for (int i = 0; i < count; i++) {
+        if (nodes[i].label && strcmp(nodes[i].label, "Class") == 0) {
+            id = nodes[i].id;
+        }
+    }
+    cbm_store_free_nodes(nodes, count);
+    if (id == 0) {
+        return -1;
+    }
+    cbm_edge_t *edges = NULL;
+    int n = 0;
+    if (cbm_store_find_edges_by_source_type(store, id, "INHERITS", &edges, &n) != CBM_STORE_OK) {
+        return -1;
+    }
+    size_t wl = strlen(want_qn_suffix);
+    for (int i = 0; i < n; i++) {
+        cbm_node_t tgt = {0};
+        if (cbm_store_find_node_by_id(store, edges[i].target_id, &tgt) == CBM_STORE_OK &&
+            tgt.qualified_name) {
+            size_t ql = strlen(tgt.qualified_name);
+            if (ql >= wl && strcmp(tgt.qualified_name + ql - wl, want_qn_suffix) == 0) {
+                (*to_want)++;
+            }
+        }
+        cbm_node_free_fields(&tgt);
+    }
+    cbm_store_free_edges(edges, n);
+    return n;
+}
+
+/* The django shape (django/test/testcases.py): `class SimpleTestCase(
+ * unittest.TestCase)` names the STDLIB base through `import unittest`, an
+ * external module. The registry fell through to a short-name strategy and
+ * bound it to the project's own `TestCase` -- which itself descends from
+ * SimpleTestCase, so the graph grew an inheritance CYCLE
+ * (SimpleTestCase -> TestCase -> TransactionTestCase -> SimpleTestCase) and a
+ * fabricated OVERRIDE (SimpleTestCase.setUp -> TestCase.setUp). Same family
+ * as #2127: a name bound by an external import can never denote a same-named
+ * project symbol. Controls: the project bases (same-module, relative
+ * `from .testcases import TestCase`, dotted `pkg.test.models.Base` through a
+ * project `import`) keep their edge. `pad` > MIN_FILES_FOR_PARALLEL(50) runs
+ * the parallel resolver; 0 the sequential one. */
+static int ei_py_external_base_case(int pad) {
+    enum { EI_BASE_FIXED = 7, EI_BASE_MAX = EI_BASE_FIXED + 64 };
+    static char names[EI_BASE_MAX][32];
+    EILangFile f[EI_BASE_MAX];
+    int n = 0;
+    f[n++] = (EILangFile){"pkg/__init__.py", ""};
+    f[n++] = (EILangFile){"pkg/test/__init__.py", ""};
+    f[n++] = (EILangFile){"pkg/test/testcases.py", "import unittest\n\n\n"
+                                                   "class SimpleTestCase(unittest.TestCase):\n"
+                                                   "    def setUp(self):\n        pass\n\n\n"
+                                                   "class TransactionTestCase(SimpleTestCase):\n"
+                                                   "    pass\n\n\n"
+                                                   "class TestCase(TransactionTestCase):\n"
+                                                   "    def setUp(self):\n        pass\n"};
+    f[n++] = (EILangFile){"pkg/test/models.py", "class Base:\n    pass\n"};
+    f[n++] = (EILangFile){"pkg/test/suite.py", "import pkg.test.models\n"
+                                               "from .testcases import TestCase\n\n\n"
+                                               "class RelativeUser(TestCase):\n    pass\n\n\n"
+                                               "class DottedLocal(pkg.test.models.Base):\n"
+                                               "    pass\n"};
+    f[n++] = (EILangFile){"pkg/test/stdbare.py", "from unittest import TestCase\n\n\n"
+                                                 "class BareStd(TestCase):\n    pass\n"};
+    f[n++] = (EILangFile){"pkg/test/stdalias.py", "import unittest as ut\n\n\n"
+                                                  "class AliasStd(ut.TestCase):\n    pass\n"};
+    for (int i = 0; i < pad && n < EI_BASE_MAX; i++) {
+        snprintf(names[n], sizeof(names[n]), "pad/mod_%02d.py", i);
+        f[n] = (EILangFile){names[n], "def filler():\n    return 0\n"};
+        n++;
+    }
+    EILangProj lp;
+    cbm_store_t *store = ei_index_files(&lp, f, n);
+    int w = 0;
+    int simple = store ? ei_inherits_out(store, lp.project, "SimpleTestCase", ".TestCase", &w) : -1;
+    int bare = store ? ei_inherits_out(store, lp.project, "BareStd", ".TestCase", &w) : -1;
+    int alias = store ? ei_inherits_out(store, lp.project, "AliasStd", ".TestCase", &w) : -1;
+    int w_tx = 0;
+    int w_tc = 0;
+    int w_rel = 0;
+    int w_dot = 0;
+    int tx = store ? ei_inherits_out(store, lp.project, "TransactionTestCase",
+                                     "testcases.SimpleTestCase", &w_tx)
+                   : -1;
+    int tc = store ? ei_inherits_out(store, lp.project, "TestCase", "testcases.TransactionTestCase",
+                                     &w_tc)
+                   : -1;
+    int rel = store
+                  ? ei_inherits_out(store, lp.project, "RelativeUser", "testcases.TestCase", &w_rel)
+                  : -1;
+    int dot = store ? ei_inherits_out(store, lp.project, "DottedLocal", "models.Base", &w_dot) : -1;
+    int overrides = store ? cbm_store_count_edges_by_type(store, lp.project, "OVERRIDE") : -1;
+    int ok = simple == 0 && bare == 0 && alias == 0 && tx == 1 && w_tx == 1 && tc == 1 &&
+             w_tc == 1 && rel == 1 && w_rel == 1 && dot == 1 && w_dot == 1 && overrides == 0;
+    if (!ok) {
+        fprintf(stderr,
+                "  [py-ext-base pad=%d] external bases SimpleTestCase=%d BareStd=%d AliasStd=%d "
+                "(want 0/0/0); project bases Transaction=%d/%d TestCase=%d/%d Relative=%d/%d "
+                "Dotted=%d/%d (want 1/1 each); OVERRIDE=%d (want 0)\n",
+                pad, simple, bare, alias, tx, w_tx, tc, w_tc, rel, w_rel, dot, w_dot, overrides);
+    }
+    ei_cleanup(&lp, store);
+    return ok;
+}
+
+TEST(ei_py_external_base_never_inherits_project_class) {
+    /* Both legs run before asserting so a failure diagnoses both drivers. */
+    int sequential_ok = ei_py_external_base_case(0);
+    int parallel_ok = ei_py_external_base_case(60);
+    ASSERT_TRUE(sequential_ok);
+    ASSERT_TRUE(parallel_ok);
+    PASS();
+}
+
 /* C++: header include should resolve to the header file node, not the same-stem
  * source node. Also exercises angle-bracket include resolution. */
 TEST(ei_cpp_header_include_targets_header_file) {
@@ -1467,6 +1593,7 @@ SUITE(edge_imports) {
     RUN_TEST(ei_go_two_consumers_same_package);
     RUN_TEST(ei_go_import_never_binds_symbol);
     RUN_TEST(ei_py_external_import_never_binds_project_symbol);
+    RUN_TEST(ei_py_external_base_never_inherits_project_class);
     RUN_TEST(ei_cpp_header_include_targets_header_file);
 
     /* ── RED REPRODUCTIONS — Rust (expected to FAIL until pipeline fixed) ── */

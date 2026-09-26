@@ -317,6 +317,17 @@ bool cbm_python_import_binding_contradicts(const CBMImportArray *imports, const 
                                            const char *resolved_qn, const cbm_gbuf_t *gbuf,
                                            const char *project_name, const char *rel_path);
 
+/* Base-class twin: true when a Python base spelling (`unittest.TestCase`,
+ * `TestCase` under `from unittest import TestCase`, `ut.TestCase` under
+ * `import unittest as ut`) is bound by an EXTERNAL import whose chain
+ * contradicts `base_qn` -- the INHERITS / embedded-type resolution must then
+ * leave the base unresolved. False for every other language. Shared by
+ * pass_semantic.c, pass_parallel.c and pass_lsp_cross.c. */
+bool cbm_python_external_base_contradicts(CBMLanguage lang, const CBMImportArray *imports,
+                                          const char *base_spelling, const char *base_qn,
+                                          const cbm_gbuf_t *gbuf, const char *project_name,
+                                          const char *rel_path);
+
 /* Check if a file path is worth tracking for git history analysis. */
 bool cbm_is_trackable_file(const char *path);
 
