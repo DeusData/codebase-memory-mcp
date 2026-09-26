@@ -325,6 +325,56 @@ TEST(resolve_qualified_ambiguous_tail_falls_through) {
     PASS();
 }
 
+/* cbm_registry_add used to discard its `name` argument and re-derive the
+ * lookup key from the QN's last dot segment. That made the QN's tail load
+ * bearing for the bare-name index every language shares: a Rust cfg twin,
+ * minted as "add#cfg(test)", was indexed under that literal string and no bare
+ * `add` callee could ever reach it. */
+TEST(registry_indexes_by_passed_name_not_qn_tail) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "add", "proj.lib.add#cfg(test)", "Function");
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "add", "proj.lib.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.lib.add#cfg(test)");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The derived key stays unconditional, and this pins that.
+ *
+ * A name may carry segments the QN's tail drops, and then the tail is the key
+ * callers actually spell. An HCL block is named "resource.aws_instance.web" by
+ * find_hcl_block_name while its QN tail is bare "web", which is how an
+ * `aws_instance.web.id` reference reaches it. Re-keying the index on the passed
+ * name would lose that lookup outright, so the fence gate above leaves these
+ * shapes exactly as they were.
+ *
+ * The Module row registers a shape production cannot produce: every caller of
+ * cbm_registry_add gates on cbm_label_is_registry_symbol, which does not admit
+ * "Module". It is here because the registry's own contract is per-label-string,
+ * not per-caller, and a future label change should not silently drop the stem
+ * lookup a bare module reference needs. */
+TEST(registry_indexes_a_dotted_name_under_its_tail_too) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "resource.aws_instance.web", "proj.main.resource.aws_instance.web",
+                     "Class");
+    cbm_registry_add(r, "helper.py", "proj.pkg.helper", "Module");
+
+    cbm_resolution_t tail = cbm_registry_resolve(r, "web", "proj.main", NULL, NULL, 0);
+    ASSERT_STR_EQ(tail.qualified_name, "proj.main.resource.aws_instance.web");
+
+    cbm_resolution_t whole =
+        cbm_registry_resolve(r, "resource.aws_instance.web", "proj.main", NULL, NULL, 0);
+    ASSERT_STR_EQ(whole.qualified_name, "proj.main.resource.aws_instance.web");
+
+    cbm_resolution_t stem = cbm_registry_resolve(r, "helper", "proj.pkg.caller", NULL, NULL, 0);
+    ASSERT_STR_EQ(stem.qualified_name, "proj.pkg.helper");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_import_map) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "Process", "proj.pkg.worker.Process", "Function");
@@ -1201,6 +1251,8 @@ SUITE(registry) {
     RUN_TEST(resolve_same_module);
     RUN_TEST(resolve_qualified_disambiguates_same_name);
     RUN_TEST(resolve_qualified_ambiguous_tail_falls_through);
+    RUN_TEST(registry_indexes_by_passed_name_not_qn_tail);
+    RUN_TEST(registry_indexes_a_dotted_name_under_its_tail_too);
     RUN_TEST(resolve_import_map);
     RUN_TEST(resolve_import_map_bare_function);
     RUN_TEST(resolve_import_map_bare_alias);

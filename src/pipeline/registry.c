@@ -858,9 +858,38 @@ void cbm_registry_free(cbm_registry_t *r) {
 
 /* ── Registration ────────────────────────────────────────────────── */
 
+/* Record `owned_qn` in the by-name bucket for `key`, keeping the bucket's
+ * is_test flags in step with its entries.
+ *
+ * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
+ * is new, and it calls this at most once per distinct key. */
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn) {
+    qn_array_t *arr = cbm_ht_get(r->by_name, key);
+    if (!arr) {
+        arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
+        cbm_ht_set(r->by_name, strdup(key), arr);
+    }
+    int before = arr->count;
+    cbm_da_push(arr, (char *)owned_qn);
+    if (arr->count == before) {
+        return; /* the name could not be recorded: no verdict to cache */
+    }
+    if (arr->count > arr->is_test_cap) {
+        int want = arr->cap > 0 ? arr->cap : arr->count;
+        uint8_t *grown =
+            cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test, (size_t)want * sizeof(uint8_t));
+        if (grown) {
+            arr->is_test = grown;
+            arr->is_test_cap = want;
+        }
+    }
+    if (arr->count <= arr->is_test_cap) {
+        arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
+    }
+}
+
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
-    (void)name;
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -893,30 +922,32 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
     cbm_ht_set(r->exact, strdup(qualified_name), (void *)interned);
     const char *owned_qn = cbm_ht_get_key(r->exact, qualified_name);
 
-    /* Index by simple name.
-     * No array dedup needed: exact-map check above guarantees uniqueness. */
-    const char *simple = simple_name(qualified_name);
-    qn_array_t *arr = cbm_ht_get(r->by_name, simple);
-    if (!arr) {
-        arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
-        cbm_ht_set(r->by_name, strdup(simple), arr);
-    }
-    int before = arr->count;
-    cbm_da_push(arr, (char *)owned_qn);
-    if (arr->count == before) {
-        return; /* the name could not be recorded: no verdict to cache */
-    }
-    if (arr->count > arr->is_test_cap) {
-        int want = arr->cap > 0 ? arr->cap : arr->count;
-        uint8_t *grown =
-            cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test, (size_t)want * sizeof(uint8_t));
-        if (grown) {
-            arr->is_test = grown;
-            arr->is_test_cap = want;
-        }
-    }
-    if (arr->count <= arr->is_test_cap) {
-        arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
+    /* Index the symbol under the QN's last dot segment, and additionally under
+     * the name its caller passed when that segment carries a '#' fence.
+     *
+     * The derived key is the one every language has always used and it stays
+     * unconditional, so a grammar whose QNs carry no '#' is byte-identical to
+     * before this commit. The second key exists for one shape: a fenced tail is
+     * a literal string no bare callee is ever written as. rust_cfg_qualified_name
+     * mints a `#[cfg(test)]` twin as "proj.lib.add#cfg(test)", simple_name() has
+     * no '#' handling, so the derived key filed that function under the whole
+     * string "add#cfg(test)" where no bare `add` callee could reach it.
+     *
+     * Gating on the fence rather than on the file's language is what makes
+     * "unchanged for every other grammar" checkable instead of asserted. Every
+     * by-name lookup keys through simple_name(), which splits on '.' and "::"
+     * only, so a passed name that differs from the derived key by anything
+     * OTHER than a fence is a key no lookup can reach: an HCL block's
+     * "resource.aws_instance.web" and a TOML table's "tool.poetry.dependencies"
+     * are both already indexed under the tail a reference spells, and adding
+     * their dotted form would only widen the bucket the scorer walks.
+     *
+     * `name` is NULL or empty only for callers that have no symbol name to
+     * give; those have the derived key and nothing else. */
+    const char *derived = simple_name(qualified_name);
+    index_under_name(r, derived, owned_qn);
+    if (name && name[0] && strchr(derived, '#') && strcmp(name, derived) != 0) {
+        index_under_name(r, name, owned_qn);
     }
 }
 

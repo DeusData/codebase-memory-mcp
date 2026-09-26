@@ -1147,6 +1147,60 @@ TEST(pipeline_nix_scoped_binding_calls_resolve) {
     PASS();
 }
 
+/* Terraform reference resolution, end to end.
+ *
+ * An HCL block names itself with its labels appended -- find_hcl_block_name
+ * mints "resource.aws_instance.web" -- while its QN's last dot segment is
+ * bare "web", and a reference written `aws_instance.web.id` reaches the
+ * by-name index through that tail. HCL is therefore a language where the
+ * definition name and the QN tail are different strings, and an index keyed on
+ * either one alone drops every cross-resource reference in the file.
+ *
+ * This has to be a pipeline test: the registry is shared by every language
+ * and nothing in the HCL extractor mentions the index key, so the two halves
+ * can disagree with every extraction-level assertion still green.
+ */
+TEST(pipeline_hcl_block_reference_resolves_to_its_block) {
+    if (setup_test_repo() != 0) {
+        FAIL("failed to create temp dir");
+    }
+
+    char tf_path[512];
+    snprintf(tf_path, sizeof(tf_path), "%s/main.tf", g_tmpdir);
+    FILE *tf = fopen(tf_path, "w");
+    if (!tf) {
+        teardown_test_repo();
+        FAIL("failed to write terraform fixture");
+    }
+    fprintf(tf, "resource \"aws_instance\" \"web\" {\n"
+                "  ami           = \"ami-0c55b159cbfafe1f0\"\n"
+                "  instance_type = \"t2.micro\"\n"
+                "}\n"
+                "\n"
+                "resource \"aws_eip\" \"ip\" {\n"
+                "  instance = aws_instance.web.id\n"
+                "}\n");
+    fclose(tf);
+
+    char tf_db[512];
+    snprintf(tf_db, sizeof(tf_db), "%s/test_hcl_refs.db", g_tmpdir);
+
+    cbm_pipeline_t *tp = cbm_pipeline_new(g_tmpdir, tf_db, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(tp);
+    ASSERT_EQ(cbm_pipeline_run(tp), 0);
+
+    cbm_store_t *ts = cbm_store_open_path(tf_db);
+    ASSERT_NOT_NULL(ts);
+    const char *tf_project = cbm_pipeline_project_name(tp);
+
+    ASSERT(cross_file_edge_exists(ts, tf_project, "main", "resource.aws_instance.web", "USAGE"));
+
+    cbm_store_close(ts);
+    cbm_pipeline_free(tp);
+    teardown_test_repo();
+    PASS();
+}
+
 /* Regression: incremental re-index of an edited file must NOT drop inbound
  * cross-file CALLS edges whose source lives in an UNCHANGED file.
  *
@@ -15129,6 +15183,7 @@ SUITE(pipeline) {
     /* Calls pass */
     RUN_TEST(pipeline_calls_resolution);
     RUN_TEST(pipeline_nix_scoped_binding_calls_resolve);
+    RUN_TEST(pipeline_hcl_block_reference_resolves_to_its_block);
     RUN_TEST(pipeline_incremental_preserves_cross_file_calls);
     RUN_TEST(pipeline_objectscript_export_preserves_calls_sequential_parallel);
     RUN_TEST(pipeline_objectscript_export_incremental_matches_full_relationships);
