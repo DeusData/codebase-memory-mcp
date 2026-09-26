@@ -602,6 +602,11 @@ static const char *compute_elixir_func_qn(CBMExtractCtx *ctx, TSNode node) {
     if (ts_node_is_null(first_arg)) {
         return NULL;
     }
+    /* A guard wraps the whole head in a `when` operator, so the head naming the
+     * function is its left operand. Left wrapped, this returns NULL and the def
+     * opens NO function scope: every call in a guarded body then sources to the
+     * FILE node and the function itself reports no outgoing edges. */
+    first_arg = cbm_elixir_def_head_unwrap_guard(first_arg);
     const char *fk = ts_node_type(first_arg);
     char *name = NULL;
     if (strcmp(fk, "call") == 0 && ts_node_child_count(first_arg) > 0) {
@@ -2036,6 +2041,111 @@ static bool is_unified_trivia_node(TSNode node) {
     return ts_node_is_extra(node);
 }
 
+static bool unified_node_text_equals(const CBMExtractCtx *ctx, TSNode node, const char *expected) {
+    if (ts_node_is_null(node) || !ctx->source || !expected) {
+        return false;
+    }
+    uint32_t start = ts_node_start_byte(node);
+    uint32_t end = ts_node_end_byte(node);
+    size_t len = strlen(expected);
+    return end >= start && (size_t)(end - start) == len &&
+           memcmp(ctx->source + start, expected, len) == 0;
+}
+
+/* An Elixir module attribute parses as `unary_operator(@, call(<attr>, args))`,
+ * so the typespec family reaches the unified walk in the shape real code has:
+ * `@spec foo(t) :: t` puts `foo(t)` in the same `call` node an invocation would
+ * occupy, and `@type entry :: String.t()` does the same to a type name. The
+ * walk then reads a declaration as code and mints reference edges from it.
+ *
+ * Measured on a fixture of three typespec lines (`@type state :: map()`, `@spec
+ * fetch(opts) :: state`, `@spec load(User.t()) :: :ok`) beside `def state`,
+ * `def opts` and a remote `MyApp.User.t/0`: seven edges, every one phantom and
+ * every one landing on a Function. CALLS onto each specified function;
+ * CALLS + USAGE + WRITES onto `state`, the WRITES asserting a mutation that
+ * does not exist; and USAGE onto `opts` and onto `MyApp.User.t/0`, because a
+ * bare or remote TYPE name resolves to the same-named FUNCTION. On a codebase
+ * whose convention is @spec on every public function, fan_in therefore never
+ * reaches 0 and "which exported functions nothing calls" is unanswerable.
+ *
+ * The whole subtree is skipped, not just the specified name. What that costs is
+ * not uniform across the six heads, and both halves were measured by indexing
+ * one fixture repo -- a declaring file per head plus the file each one reaches
+ * -- with the pristine binary and with this one:
+ *
+ *   spec, type, typep, opaque. A type reference resolves onto a FUNCTION or
+ *   onto nothing, never onto the type it names, because a type declaration
+ *   mints no node. `@spec build(MyApp.User.t())` where that module's `t` is a
+ *   `@type` produced no edge in either build, and `@type ext :: Ecto.Schema.t()`
+ *   naming a module outside the repo produced none either. The references that
+ *   do resolve land on a same-named Function, cross-file included -- `USAGE
+ *   lib/decl_type.ex -> Function type_target @lib/remote_type.ex`, and the
+ *   @typep and @opaque equivalents. A Function standing in for a Type is the
+ *   pollution rather than a record of it, so nothing correct is lost here.
+ *
+ *   callback, macrocallback. The declared name IS a function name, so it
+ *   resolves onto an implementation elsewhere in the corpus: pristine yields
+ *   `CALLS lib/decl_callback.ex -> Function callback_fun @lib/impl_callback.ex`
+ *   and the @macrocallback equivalent, both cross-file, and this build yields
+ *   neither. That edge does point at a real Behaviour-to-Impl relationship, and
+ *   nothing replaces it -- `@behaviour MyBehaviour` mints no edge of its own,
+ *   so after this change nothing in the graph links a behaviour to its
+ *   implementations. It is deleted anyway because it is name resolution and not
+ *   a behaviour model: on a fixture with one @callback and three same-named
+ *   `handle_it/1` defs, the single edge landed on the one module that
+ *   implements nothing, leaving both real implementors at fan_in 0. Recording
+ *   that relationship correctly means minting it from `@behaviour`, which is a
+ *   separate change and not a reason to keep an arbitrary edge.
+ *
+ * The other accepted cost: `unquote(...)` inside a typespec does execute at
+ * compile time, so `@type t :: unquote(build_type())` loses its genuine
+ * `build_type` call edge along with the phantoms.
+ *
+ * Only this family is skipped. Every other attribute VALUE is ordinary
+ * compile-time code -- `@timeout Application.compile_env(:app, :timeout)`
+ * really does call compile_env -- so those subtrees are walked exactly as
+ * before, and their attribute NAME is still emitted as a callee: `@behaviour
+ * GenServer`, `@timeout 5_000` and `@doc "x"` each still mint one phantom CALLS
+ * onto a same-named Function. That half of the defect class is untouched here
+ * and needs its own fix.
+ *
+ * This subtree skip is one of two mechanisms, and neither subsumes the other.
+ * It removes the phantom a typespec LINE mints; the def-head phantom is removed
+ * separately, by the calls walk recognising a `when`-wrapped head as a
+ * declaration (elixir_call_is_definition_role, extract_calls.c). A function
+ * carrying both an @spec and a `when` clause needs both: with only this one it
+ * keeps the def-head reference, with only the other it keeps the @spec one.
+ * `extract_elixir_typespec_attribute_is_not_code` pins that by asserting 0
+ * references onto such a function, so removing either mechanism fails it.
+ *
+ * Measured over forge-symphony-graph/lib (970 .ex files) by classifying the
+ * source line every CALLS/USAGE/WRITES edge records: a build without this skip
+ * anchors 4,565 CALLS edges on a typespec-attribute line, and this build
+ * anchors 0 -- with no USAGE or WRITES appearing in their place, which is what
+ * a relabel rather than a removal would look like. Total USAGE edges fall from
+ * 25,393 to 23,044 over the same corpus; they do not rise. */
+static bool is_elixir_typespec_attribute(const CBMExtractCtx *ctx, TSNode node) {
+    static const char *const typespec_heads[] = {
+        "spec", "callback", "macrocallback", "type", "typep", "opaque", NULL};
+    if (ctx->language != CBM_LANG_ELIXIR || strcmp(ts_node_type(node), "unary_operator") != 0 ||
+        !unified_node_text_equals(ctx, ts_node_child_by_field_name(node, TS_FIELD("operator")),
+                                  "@")) {
+        return false;
+    }
+    TSNode operand = ts_node_child_by_field_name(node, TS_FIELD("operand"));
+    if (ts_node_is_null(operand) || strcmp(ts_node_type(operand), "call") != 0 ||
+        ts_node_child_count(operand) == 0) {
+        return false;
+    }
+    TSNode head = ts_node_child(operand, 0);
+    for (const char *const *name = typespec_heads; *name; name++) {
+        if (unified_node_text_equals(ctx, head, *name)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // JS/TS `export_statement` appears in import_node_types so re-exports
 // (`export { X } from './m'`) are treated as an import boundary.  But it also
 // wraps exported *declarations* (`export function f(cfg: Config) {}`), and
@@ -2626,7 +2736,8 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
             break;
         }
         bool trivia = is_unified_trivia_node(node);
-        if (!trivia) {
+        bool typespec = is_elixir_typespec_attribute(ctx, node);
+        if (!trivia && !typespec) {
             /* Trivia consumes no semantic state. Scope expiry may be deferred
              * until the next code-bearing node; pop restores the displaced
              * tuple and push applies the new frame's effect, both O(1) --
@@ -2656,7 +2767,7 @@ void cbm_extract_unified(CBMExtractCtx *ctx) {
          * asking the cursor to construct a child iterator for every one of
          * hundreds of thousands of flat comment siblings. Structured extras
          * still descend normally. */
-        if ((!trivia || ts_node_child_count(node) > 0) &&
+        if (!typespec && (!trivia || ts_node_child_count(node) > 0) &&
             ts_tree_cursor_goto_first_child(&cursor)) {
             depth++;
             continue;

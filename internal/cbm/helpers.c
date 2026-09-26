@@ -1140,6 +1140,93 @@ const char *cbm_nix_qn_name(CBMArena *a, TSNode func_node, const char *source, c
     return scope ? cbm_arena_sprintf(a, "%s.%s", scope, name) : name;
 }
 
+/* ── Elixir def-head guards ─────────────────────────────────── */
+
+/* The guard sits on the head, not beside it: `def name(args) when guard` parses
+ * as a single `when` binary_operator whose left operand is `name(args)`. The
+ * operator field is an exact anonymous token, so the check is the token type
+ * rather than the node kind — `def a + b` is a binary_operator head too, and
+ * unwrapping it would name the function after its left parameter. */
+bool cbm_elixir_is_when_guard(TSNode node) {
+    if (ts_node_is_null(node) || strcmp(ts_node_type(node), "binary_operator") != 0) {
+        return false;
+    }
+    TSNode op = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    return !ts_node_is_null(op) && strcmp(ts_node_type(op), "when") == 0;
+}
+
+/* One `when` level off a def's first argument, or the node unchanged.
+ *
+ * There is deliberately no named-child fallback for a missing `left`. An infix
+ * operator cannot reduce without a left operand, so tree-sitter-elixir never
+ * builds a `when` binary_operator that lacks one: measured over every guarded
+ * shape in the suite plus a corpus of truncated heads (`def when true`,
+ * `def f(x) when`, `def f(x) when when is_x(x)`, `def when() when when`),
+ * `left` was present on all 66 unwraps, ERROR-recovered parses included, and
+ * every one had the left operand as named child 0. Where the left operand was
+ * genuinely absent the grammar produced no `when` operator at all -- it read
+ * `when` as the head identifier -- so the unwrap is never entered. A
+ * named-child fallback would therefore be dead on a well-formed tree and, on
+ * the hypothetical malformed one, would hand back named child 0 without
+ * knowing it is the left operand rather than the guard expression: naming the
+ * function after its own guard. Returning the node unchanged degrades to the
+ * pre-guard behaviour instead, which is the safe direction. */
+static TSNode elixir_unwrap_one_guard(TSNode first_arg) {
+    if (!cbm_elixir_is_when_guard(first_arg)) {
+        return first_arg;
+    }
+    TSNode lhs = ts_node_child_by_field_name(first_arg, TS_FIELD("left"));
+    return ts_node_is_null(lhs) ? first_arg : lhs;
+}
+
+/* The head under every guard a def's first argument carries, or first_arg
+ * unchanged when it carries none. Elixir admits more than one guard on a
+ * clause -- `def f(x) when is_atom(x) when is_binary(x)` -- and
+ * tree-sitter-elixir nests those RIGHT-associatively, measured on that exact
+ * source: `when(f(x), when(is_atom(x), is_binary(x)))`. The declared head is
+ * therefore the outer operator's left operand and one peel reaches it. The
+ * peel still runs to a fixed point: the extra iteration is one token compare,
+ * and it is what makes the helper's contract "the head under EVERY guard"
+ * rather than "the head under the first one", which is the property the three
+ * walks rely on.
+ *
+ * Left wrapped, the defs walk drops the clause, the unified walk opens no
+ * function scope (so every call in a guarded body sources to the FILE node),
+ * the calls walk stops recognising the head and emits it as an invocation of
+ * the very function being defined, and the usages walk swallows every
+ * identifier in the guard as part of the binding. Four walks read this same
+ * argument, which is why the unwrap lives here rather than in any one of
+ * them. */
+TSNode cbm_elixir_def_head_unwrap_guard(TSNode first_arg) {
+    for (;;) {
+        TSNode next = elixir_unwrap_one_guard(first_arg);
+        if (ts_node_eq(next, first_arg)) {
+            return first_arg;
+        }
+        first_arg = next;
+    }
+}
+
+/* True when `node` is the head a def declares, or any of the `when` guard
+ * operators wrapping it. The calls walk needs the whole chain, not just its
+ * ends: each member reaches that walk by its own route -- `def f(x) when g`
+ * arrives as the inner `f(x)` call, `def f when g` has no inner call at all and
+ * the operator itself falls through to extract_callee_name's first-identifier
+ * last resort -- and a member it fails to recognise as a declaration is emitted
+ * as an invocation of the function being defined. */
+bool cbm_elixir_def_head_is(TSNode signature, TSNode node) {
+    for (;;) {
+        if (ts_node_eq(signature, node)) {
+            return true;
+        }
+        TSNode next = elixir_unwrap_one_guard(signature);
+        if (ts_node_eq(next, signature)) {
+            return false;
+        }
+        signature = next;
+    }
+}
+
 static const char *func_node_name(CBMArena *a, TSNode func_node, const char *source,
                                   CBMLanguage lang) {
     // Wolfram: set_delayed_top/set_top/set_delayed/set — LHS is apply(user_symbol("f"), ...)

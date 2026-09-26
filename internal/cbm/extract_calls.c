@@ -708,6 +708,61 @@ static bool elixir_call_head_in(TSNode call, const char *source, const char *con
            call_node_text_in(ts_node_child(call, 0), source, heads);
 }
 
+/* A definition's head declares a name; it is never a call to it. The head under
+ * a guard is not the def's first argument -- `def f(x) when g` parses its whole
+ * head as a `when` binary_operator -- so the plain node comparison below stopped
+ * recognising it, and the inner `f(x)` was recorded as a call to `f`. Under the
+ * widened span that phantom lands inside the function's own node, and cbm.c
+ * decides self-recursion by line containment, so an ordinary two-clause guarded
+ * function reported itself recursive. `recursive` is a queryable node property
+ * and seeds the cycle detection in pass_complexity, so that is a load-bearing
+ * signal, not a cosmetic one. The suppression therefore travels with the fold
+ * rather than following it.
+ *
+ * The head comes from cbm_elixir_def_head_is (helpers.c) rather than a private
+ * peel here, because three files read this same node and all three have to
+ * agree on which node is the head, or a node one of them is treating as a
+ * definition name is recorded by another as a reference to that very name:
+ *   - extract_defs.c, extract_elixir_func_def, unwraps it to NAME the
+ *     definition. It and this file disagreeing mints the phantom above.
+ *   - extract_usages.c, is_elixir_def_binding, treats the whole first argument
+ *     as a binding occurrence rather than a reference, which is what keeps a
+ *     head suppressed here from re-emerging as a USAGE edge. It is deliberately
+ *     WIDER than the unwrap -- it covers the guard expression too -- and that
+ *     width is load-bearing: a suppression in one extractor of the unified walk
+ *     only REMOVES a phantom if the others also decline the node.
+ *   - extract_unified.c, compute_elixir_func_qn, resolves a def's QN for call
+ *     scope tracking and does NOT unwrap, so a guarded clause pushes no
+ *     function scope and its call edges are sourced from the File rather than
+ *     from the enclosing Function. Pre-existing, independent of the two above
+ *     (it decides edge SOURCE, not edge existence), and fixed separately.
+ *
+ * Suppressing the head does not only delete edges; it moves metadata on edges
+ * that SURVIVE, and that is worth stating because a caller reading an edge's
+ * `line` will see a different number than before. `edges` is UNIQUE on
+ * (source, target, type), so where the def-head phantom happened to be the
+ * dedup survivor for a pair, deleting it promotes some other row for that same
+ * pair and the surviving edge takes that row's `line`.
+ *
+ * Measured by indexing one 970-file Elixir lib tree with the binary built from
+ * e783f73d and with this one and diffing the `edges` rows out of the two
+ * SQLite stores, keyed on (source QN, target QN, type): 2,303 edges go and
+ * NONE is added -- 1,990 CALLS, 312 USAGE, and one CONFIGURES minted from
+ * `defp tls_unconfigured(%{tls_port: port, trust_anchor: anchor})`, whose head
+ * was read as a configuration call. Of the 116,591 surviving edges, 777 record
+ * a different `line` and none changes its source, target or type.
+ *
+ * The typespec attributes -- `@spec f(t) :: u` and the @callback / @type family
+ * -- put the declared name in a `call` node too, and are deliberately NOT
+ * suppressed here. A def head can be, because extract_usages.c already treats a
+ * def's first argument as a binding. Nothing there treats a typespec subject as
+ * one, so declining it in this walk would not remove its phantom, it would
+ * RELABEL it: handle_usages reaches the bare identifier handle_calls just
+ * declined and mints a USAGE onto the same function, which under
+ * UNIQUE(source, target, type) is a separate row that no longer collides with
+ * the real call it used to hide behind, and which pass_importance then counts.
+ * A typespec phantom has to be removed before any extractor sees it, by
+ * skipping the whole subtree in the unified walk. */
 static bool elixir_call_is_definition_role(TSNode node, const char *source) {
     static const char *const structural_heads[] = {"def", "defp", "defmacro", "defmodule", NULL};
     static const char *const function_heads[] = {"def", "defp", "defmacro", NULL};
@@ -725,7 +780,7 @@ static bool elixir_call_is_definition_role(TSNode node, const char *source) {
         TSNode signature = ts_node_named_child_count(arguments) > 0
                                ? ts_node_named_child(arguments, 0)
                                : arguments;
-        return ts_node_eq(signature, node);
+        return cbm_elixir_def_head_is(signature, node);
     }
     return false;
 }
@@ -747,7 +802,23 @@ static bool call_node_is_definition_container(CBMLanguage lang, TSNode node, con
     if (lang == CBM_LANG_AGDA && strcmp(kind, "expr") == 0) {
         return agda_expr_is_definition_role(node);
     }
-    return lang == CBM_LANG_ELIXIR && strcmp(kind, "call") == 0 &&
+    /* A guarded head is a `when` binary_operator, not a `call`, and Elixir's
+     * call node types include binary_operator -- so the head reaches this walk
+     * and must be able to answer that it is a definition. A paren-less clause
+     * (`def f when g`) has no inner call at all, so the operator node itself
+     * reaches extract_callee_name and, with no callee of its own, takes that
+     * function's last resort -- the first identifier child -- minting a phantom
+     * CALLS edge onto the very function being defined.
+     *
+     * That last resort overrides a deliberate NULL for every Elixir
+     * binary_operator extract_scripting_callee declines (`=`, `<-`, `->`, `\\`,
+     * `::`, `when`), so `def g(c \\ 2)` still emits a phantom `c` and
+     * `e = target(d)` a phantom `e`. That is the pre-existing behaviour for
+     * those operators and is untouched here: only a `when` operator is
+     * admitted, so an operator definition's own head (`def a + b`) stays an
+     * ordinary node, as it was before guards were handled at all. */
+    return lang == CBM_LANG_ELIXIR &&
+           (strcmp(kind, "call") == 0 || cbm_elixir_is_when_guard(node)) &&
            elixir_call_is_definition_role(node, source);
 }
 
