@@ -3187,10 +3187,11 @@ int main(int argc, char **argv) {
      * starting" and the whole MAIN_MCP_STARTUP_TIMEOUT_MS budget is spent
      * retrying it before the client gives up.
      *
-     * Opt-in via CBM_IN_PROCESS so default behaviour is unchanged. The store is
-     * resolved from CBM_CACHE_DIR exactly as a daemon session does
-     * (cbm_mcp_server_new(NULL), as in daemon/application.c and
-     * ui/http_server.c), so this reads the same index the daemon builds.
+     * Opt-in via CBM_IN_PROCESS (1 or true, as for CBM_DIAGNOSTICS) so default
+     * behaviour is unchanged. The store is resolved from CBM_CACHE_DIR exactly
+     * as a daemon session does (cbm_mcp_server_new(NULL), as in
+     * daemon/application.c and ui/http_server.c), so this reads the same index
+     * the daemon builds.
      *
      * The session is READ-ONLY, and deliberately so. Without a daemon there is
      * no cross-session mutation lease, no index executor and no exact-build
@@ -3202,7 +3203,7 @@ int main(int argc, char **argv) {
         char inproc_buf[MAIN_PATH_CAP];
         const char *inproc =
             cbm_safe_getenv("CBM_IN_PROCESS", inproc_buf, sizeof(inproc_buf), NULL);
-        if (inproc && inproc[0] && strcmp(inproc, "0") != 0) {
+        if (inproc && (strcmp(inproc, "1") == 0 || strcmp(inproc, "true") == 0)) {
             cbm_mem_init(cbm_mem_ram_fraction_for_total(cbm_system_info().total_ram));
             cbm_mcp_server_t *inproc_srv = cbm_mcp_server_new(NULL);
             if (!inproc_srv) {
