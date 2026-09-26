@@ -56,6 +56,17 @@ static int __attribute__((unused)) has_import(CBMFileResult *r, const char *path
     return 0;
 }
 
+static const CBMImport *find_import(CBMFileResult *r, const char *local, const char *path) {
+    for (int i = 0; i < r->imports.count; i++) {
+        const CBMImport *imp = &r->imports.items[i];
+        if (imp->local_name && imp->module_path && strcmp(imp->local_name, local) == 0 &&
+            strcmp(imp->module_path, path) == 0) {
+            return imp;
+        }
+    }
+    return NULL;
+}
+
 /* Count definitions with a given label. */
 /* Check for a definition with the given qualified name. Distinct from
  * find_def_by_name, which returns the first match by NAME and so cannot tell two
@@ -4624,10 +4635,11 @@ TEST(swift_non_url_constructor_untouched_issue1892) {
  * the per-file constant map and resolved at the call site, for both return
  * statements and arrow expression bodies. */
 TEST(extract_ts_await_generic_call_issue2210) {
-    CBMFileResult *r = extract("function parseJsonBody<T>() { return {} as T; }\n"
-                               "async function plain() { return await parseJsonBody(); }\n"
-                               "async function generic() { return await parseJsonBody<string>(); }\n",
-                               CBM_LANG_TYPESCRIPT, "t", "await.ts");
+    CBMFileResult *r =
+        extract("function parseJsonBody<T>() { return {} as T; }\n"
+                "async function plain() { return await parseJsonBody(); }\n"
+                "async function generic() { return await parseJsonBody<string>(); }\n",
+                CBM_LANG_TYPESCRIPT, "t", "await.ts");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     ASSERT_EQ(count_calls_named(r, "parseJsonBody"), 2);
@@ -5769,6 +5781,94 @@ TEST(extract_ts_member_call_flags_is_method) {
     }
     ASSERT_TRUE(member >= 1); /* re.test() flagged */
     ASSERT_TRUE(bare >= 1);   /* helper() not flagged */
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_companion_owners_are_distinct) {
+    CBMFileResult *r = extract("case class Rational private (n: Int, d: Int) {\n"
+                               "  lazy val isWhole: Boolean = d == 1\n"
+                               "  def reciprocal: Rational = Rational(d, n)\n"
+                               "}\n"
+                               "case object Rational {\n"
+                               "  val zero: Rational = Rational(0, 1)\n"
+                               "  def apply(n: Int, d: Int): Rational = new Rational(n, d)\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Rational.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational.reciprocal"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.Rational$.apply"));
+    /* Class-body vals keep their module-level QN like every other language;
+     * parent_class tells the two owners apart. */
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.isWhole"));
+    ASSERT_TRUE(has_def_qn(r, "t.Rational.zero"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_trait_companion_and_standalone_object) {
+    CBMFileResult *r = extract("trait Codec {\n"
+                               "  def encode(s: String): Array[Byte]\n"
+                               "}\n"
+                               "object Codec {\n"
+                               "  def utf8: Codec = ???\n"
+                               "}\n"
+                               "object Registry {\n"
+                               "  def lookup(name: String): Option[Codec] = None\n"
+                               "}\n",
+                               CBM_LANG_SCALA, "t", "Codec.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+
+    /* Trait companions collide just like class companions. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec.encode"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Codec$.utf8"));
+    /* A standalone object has nothing to collide with and keeps its plain QN. */
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry"));
+    ASSERT_FALSE(has_def_qn(r, "t.Codec.Registry$"));
+    ASSERT_TRUE(has_def_qn(r, "t.Codec.Registry.lookup"));
+
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_import_selectors_and_aliases) {
+    CBMFileResult *r = extract("import foo.Direct\n"
+                               "import foo.{Selected, Original => Alias, Hidden => _, _}\n"
+                               "import modern.{Source as ModernAlias, *}\n"
+                               "import alpha.One, beta.Two\n",
+                               CBM_LANG_SCALA, "t", "Imports.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(find_import(r, "Direct", "foo.Direct"));
+    ASSERT_NOT_NULL(find_import(r, "Selected", "foo.Selected"));
+    ASSERT_NOT_NULL(find_import(r, "Alias", "foo.Original"));
+    ASSERT_NULL(find_import(r, "Hidden", "foo.Hidden"));
+    ASSERT_NOT_NULL(find_import(r, "*", "foo"));
+    ASSERT_NOT_NULL(find_import(r, "ModernAlias", "modern.Source"));
+    ASSERT_NOT_NULL(find_import(r, "*", "modern"));
+    ASSERT_NOT_NULL(find_import(r, "One", "alpha.One"));
+    ASSERT_NOT_NULL(find_import(r, "Two", "beta.Two"));
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(extract_scala_package_namespace) {
+    CBMFileResult *r = extract("package com.example.app.account\n"
+                               "import com.example.app.model.Target\n"
+                               "object Consumer\n",
+                               CBM_LANG_SCALA, "t", "modules/client/Consumer.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_NOT_NULL(r->namespace_name);
+    ASSERT_STR_EQ(r->namespace_name, "com.example.app.account");
     cbm_free_result(r);
     PASS();
 }
@@ -8277,6 +8377,10 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_companion_owners_are_distinct);
+    RUN_TEST(extract_scala_trait_companion_and_standalone_object);
+    RUN_TEST(extract_scala_import_selectors_and_aliases);
+    RUN_TEST(extract_scala_package_namespace);
     RUN_TEST(extract_ts_this_super_receiver_not_flagged);
     RUN_TEST(extract_js_member_call_flags_is_method);
 

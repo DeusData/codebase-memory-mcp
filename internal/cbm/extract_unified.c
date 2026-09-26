@@ -1156,12 +1156,20 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const WalkS
      * scope QN matches the def-side class QN (extract_defs.c compute_class_qn /
      * extract_class_def), which the lsp_resolve join requires for nested types. */
     if (state && state->enclosing_class_qn) {
-        return cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+        const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", state->enclosing_class_qn, name);
+        return ctx->language == CBM_LANG_SCALA &&
+                       cbm_scala_is_companion_object(ctx->arena, node, ctx->source)
+                   ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
+                   : qn;
     }
 
     /* Java/Go: directory-based module (see compute_func_qn). */
-    return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name,
-                                       ctx->language);
+    const char *qn =
+        cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, name, ctx->language);
+    return ctx->language == CBM_LANG_SCALA &&
+                   cbm_scala_is_companion_object(ctx->arena, node, ctx->source)
+               ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
+               : qn;
 }
 
 /* Forward declaration */

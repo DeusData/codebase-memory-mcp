@@ -881,6 +881,9 @@ void cbm_impltrait_push(CBMImplTraitArray *arr, CBMArena *a, CBMImplTrait it);
 void cbm_resolvedcall_push(CBMResolvedCallArray *arr, CBMArena *a, CBMResolvedCall rc);
 void cbm_channels_push(CBMChannelArray *arr, CBMArena *a, CBMChannel ch);
 
+/* True for a Scala object_definition with a same-named class/trait/enum sibling. */
+bool cbm_scala_is_companion_object(CBMArena *a, TSNode node, const char *source);
+
 // --- Sub-extractor entry points ---
 
 void cbm_extract_definitions(CBMExtractCtx *ctx);

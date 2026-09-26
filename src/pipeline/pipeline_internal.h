@@ -217,7 +217,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
  *   1. Module-path resolution (relative / pkgmap / fqn_module) → existing node.
  *      This preserves the behavior for Python/TS/Go whose module path maps
  *      directly to a sibling Module/File QN.
- *   2. namespace_map[module_path-prefix] → File node QN (Java/Kotlin/C#/PHP
+ *   2. namespace_map[module_path-prefix] → File/symbol node QN (Java/Kotlin/Scala/C#/PHP
  *      `using`/`import` of a NAMESPACE that the path-based QN cannot express).
  *   3. Symbol-name fallback: the import's last path segment matched against an
  *      in-graph definition node of the same simple name in a different file
@@ -228,7 +228,7 @@ char *cbm_pipeline_resolve_module(const cbm_pipeline_ctx_t *ctx, const char *sou
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
+                                                        CBMLanguage language, const CBMImport *imp,
                                                         CBMHashTable *namespace_map);
 
 /* Build a namespace → File-node-QN map from a set of extraction results.
