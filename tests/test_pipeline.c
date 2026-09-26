@@ -14674,6 +14674,107 @@ TEST(pipeline_ensemble_routing_method_scoping) {
     PASS();
 }
 
+/* #1260: CALLS edges from the function named `func` whose target qn ends
+ * with ".<target_suffix>" (segment-anchored). A NULL suffix counts every
+ * CALLS edge to a node named "Run". */
+static int iris_cls_calls(cbm_store_t *s, const char *project, const char *func,
+                          const char *target_suffix) {
+    cbm_node_t *fn = NULL;
+    int fn_count = 0;
+    cbm_store_find_nodes_by_name(s, project, func, &fn, &fn_count);
+    int n = 0;
+    for (int fi = 0; fi < fn_count; fi++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, fn[fi].id, "CALLS", &edges, &ec);
+        for (int ei = 0; ei < ec; ei++) {
+            cbm_node_t tgt = {0};
+            if (cbm_store_find_node_by_id(s, edges[ei].target_id, &tgt) != 0) {
+                continue;
+            }
+            if (!target_suffix) {
+                if (tgt.name && strcmp(tgt.name, "Run") == 0) {
+                    n++;
+                }
+            } else if (tgt.qualified_name) {
+                size_t ql = strlen(tgt.qualified_name);
+                size_t sl = strlen(target_suffix);
+                if (ql > sl && tgt.qualified_name[ql - sl - 1] == '.' &&
+                    strcmp(tgt.qualified_name + ql - sl, target_suffix) == 0) {
+                    n++;
+                }
+            }
+            cbm_node_free_fields(&tgt);
+        }
+        cbm_store_free_edges(edges, ec);
+    }
+    cbm_store_free_nodes(fn, fn_count);
+    return n;
+}
+
+TEST(pipeline_python_iris_cls_class_aware_calls) {
+    /* The #1260 repro: two ObjectScript classes share a method name. Python
+     * callers must reach the class named in iris.cls("<literal>"), and a call
+     * that names no indexed class must not borrow an edge from one that does. */
+    char *tmp = th_mktempdir("cbm_iris_cls");
+    ASSERT_NOT_NULL(tmp);
+    const char *run_body = "{\n"
+                           "ClassMethod Run(x As %String) As %String\n"
+                           "{\n"
+                           "    Quit x\n"
+                           "}\n"
+                           "}\n";
+    char cls[256];
+    snprintf(cls, sizeof(cls), "Class Pkg.A Extends %%RegisteredObject\n%s", run_body);
+    write_temp_file(tmp, "A.cls", cls);
+    snprintf(cls, sizeof(cls), "Class Pkg.B Extends %%RegisteredObject\n%s", run_body);
+    write_temp_file(tmp, "B.cls", cls);
+    write_temp_file(tmp, "caller.py",
+                    "import iris\n"
+                    "\n"
+                    "def want_a():\n"
+                    "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
+                    "\n"
+                    "def want_b():\n"
+                    "    return iris.cls(\"Pkg.B\").Run(\"x\")\n"
+                    "\n"
+                    "def want_nonexistent():\n"
+                    "    return iris.cls(\"Pkg.DoesNotExist\").Run(\"x\")\n"
+                    "\n"
+                    "def unrelated_receiver():\n"
+                    "    return some_random_thing.Run(\"x\")\n"
+                    "\n"
+                    "def via_classmethodvalue(db):\n"
+                    "    return db.classMethodValue(\"Pkg.B\", \"Run\", \"x\")\n"
+                    "\n"
+                    "def via_invoke(db):\n"
+                    "    return db.invokeClassMethod(\"Pkg.A\", \"Run\", \"x\")\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/iris_cls.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    const char *project = cbm_pipeline_project_name(p);
+
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", "Pkg.A.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_a", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", "Pkg.B.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_b", NULL), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "want_nonexistent", NULL), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "unrelated_receiver", NULL), 0);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_classmethodvalue", "Pkg.B.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_invoke", "Pkg.A.Run"), 1);
+    ASSERT_EQ(iris_cls_calls(s, project, "via_invoke", NULL), 1);
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* #518/#519 item-7 regression: the DELTA merge is the warm path most users
  * hit. It used to write nodes_fts with a hand-rolled four-column INSERT of
  * its own; with a fifth `body` column that literal leaves prose NULL for every
@@ -15428,6 +15529,7 @@ SUITE(pipeline) {
     /* Ensemble routing pass */
     RUN_TEST(pipeline_ensemble_routing_edges);
     RUN_TEST(pipeline_ensemble_routing_method_scoping);
+    RUN_TEST(pipeline_python_iris_cls_class_aware_calls);
     RUN_TEST(pipeline_ensemble_routing_attr_does_not_leak_across_items);
     RUN_TEST(pipeline_ensemble_routing_settings_targets);
     RUN_TEST(pipeline_ensemble_routing_unterminated_item_is_safe);

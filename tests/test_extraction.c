@@ -3265,6 +3265,67 @@ TEST(python_iris_classMethodValue) {
     PASS();
 }
 
+/* #1260: count calls with an exact callee whose enclosing function qn ends
+ * with ".<func>". has_call() is a substring match, which cannot tell
+ * "Pkg.A.Run" emitted from want_a apart from the same callee in want_b. */
+static int count_calls_in_func(CBMFileResult *r, const char *callee, const char *func) {
+    int n = 0;
+    size_t flen = strlen(func);
+    for (int i = 0; i < r->calls.count; i++) {
+        const CBMCall *c = &r->calls.items[i];
+        if (!c->callee_name || strcmp(c->callee_name, callee) != 0 || !c->enclosing_func_qn) {
+            continue;
+        }
+        size_t qlen = strlen(c->enclosing_func_qn);
+        if (qlen > flen && c->enclosing_func_qn[qlen - flen - 1] == '.' &&
+            strcmp(c->enclosing_func_qn + qlen - flen, func) == 0) {
+            n++;
+        }
+    }
+    return n;
+}
+
+TEST(python_iris_cls_receiver_is_class_aware) {
+    CBMFileResult *r = extract("import iris\n"
+                               "def want_a():\n"
+                               "    return iris.cls(\"Pkg.A\").Run(\"x\")\n"
+                               "def want_b():\n"
+                               "    return iris.cls('Pkg.B').Run('x')\n"
+                               "def dynamic(name):\n"
+                               "    return iris.cls(name).Run('x')\n"
+                               "def fstring(n):\n"
+                               "    return iris.cls(f'Pkg.{n}').Run('x')\n"
+                               "def unrelated_receiver():\n"
+                               "    return some_random_thing.Run('x')\n",
+                               CBM_LANG_PYTHON, "t", "caller.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_a"), 1);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "want_b"), 1);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "want_b"), 0);
+    /* A non-literal class argument names nothing: no class-qualified callee. */
+    ASSERT_EQ(count_calls_in_func(r, "name.Run", "dynamic"), 0);
+    /* An f-string is a Python "string" node but not a class name. */
+    ASSERT_EQ(count_calls_in_func(r, "f'Pkg.{n}'.Run", "fstring"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.{n}.Run", "fstring"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.A.Run", "unrelated_receiver"), 0);
+    ASSERT_EQ(count_calls_in_func(r, "Pkg.B.Run", "unrelated_receiver"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(python_iris_invokeClassMethod) {
+    CBMFileResult *r =
+        extract("def call(db):\n"
+                "    return db.invokeClassMethod('MyApp.Service', 'SomeClassMethod', 1)\n",
+                CBM_LANG_PYTHON, "t", "svc.py");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT_EQ(count_calls_in_func(r, "MyApp.Service.SomeClassMethod", "call"), 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(go_calls) {
     CBMFileResult *r =
         extract("package main\nimport \"fmt\"\nfunc main() { fmt.Println(\"hello\") }\n",
@@ -8535,6 +8596,8 @@ SUITE(extraction) {
     /* Cross-cutting */
     RUN_TEST(python_calls);
     RUN_TEST(python_iris_classMethodValue);
+    RUN_TEST(python_iris_cls_receiver_is_class_aware);
+    RUN_TEST(python_iris_invokeClassMethod);
     RUN_TEST(go_calls);
     RUN_TEST(python_imports);
     RUN_TEST(js_imports);
