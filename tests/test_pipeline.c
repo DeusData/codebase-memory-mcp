@@ -8981,9 +8981,10 @@ static int branch_head_match_count(cbm_store_t *store, const char *project, cons
     return matches;
 }
 
-/* Git context is graph input even when every repository file is unchanged.
- * Construct the second pipeline before moving HEAD so the test also proves
- * that run start refreshes the snapshot captured by cbm_pipeline_new(). */
+/* Regression for #1213: index A, re-index B after a tracked source change,
+ * then re-index C after an empty commit. Each successful run publishes its
+ * run-start HEAD. Construct the final pipeline before moving HEAD to also
+ * cover refreshing the snapshot captured by cbm_pipeline_new(). */
 TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     if (!git_available()) {
         FAIL("git unavailable");
@@ -9026,6 +9027,42 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     snprintf(project, sizeof(project), "%s", cbm_pipeline_project_name(baseline));
     cbm_pipeline_free(baseline);
 
+    cbm_store_t *initial_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(initial_store);
+    int initial_matches = branch_head_match_count(initial_store, project, initial_head);
+    cbm_store_close(initial_store);
+    ASSERT_EQ(initial_matches, 1);
+
+    /* B: a committed source change must advance the existing project's HEAD. */
+    ASSERT_EQ(th_write_file(TH_PATH(repo, "stable.py"), "def StableGitContext():\n    return 2\n"),
+              0);
+    snprintf(cmd, sizeof(cmd),
+             "git -C \"%s\" -c user.name=\"CBM Test\" "
+             "-c user.email=\"cbm@example.invalid\" commit -am \"source change\" >%s 2>&1",
+             repo, null_dev);
+    ASSERT_EQ(run_cmd(cmd), 0);
+    cbm_git_context_t source_ctx = {0};
+    ASSERT_EQ(cbm_git_context_resolve(repo, &source_ctx), 0);
+    ASSERT_NOT_NULL(source_ctx.head_sha);
+    char source_head[128];
+    snprintf(source_head, sizeof(source_head), "%s", source_ctx.head_sha);
+    cbm_git_context_free(&source_ctx);
+    ASSERT_TRUE(strcmp(initial_head, source_head) != 0);
+
+    cbm_pipeline_t *after_source_change = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
+    ASSERT_NOT_NULL(after_source_change);
+    int source_rc = cbm_pipeline_run(after_source_change);
+    cbm_pipeline_free(after_source_change);
+    ASSERT_EQ(source_rc, 0);
+    cbm_store_t *source_store = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(source_store);
+    int source_matches = branch_head_match_count(source_store, project, source_head);
+    int initial_stale_matches = branch_head_match_count(source_store, project, initial_head);
+    cbm_store_close(source_store);
+    ASSERT_EQ(source_matches, 1);
+    ASSERT_EQ(initial_stale_matches, 0);
+
+    /* C: no file hashes change, but the empty commit must still advance HEAD. */
     cbm_pipeline_t *after_head_move = cbm_pipeline_new(repo, db_path, CBM_MODE_FAST);
     ASSERT_NOT_NULL(after_head_move);
     snprintf(cmd, sizeof(cmd),
@@ -9040,7 +9077,7 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
     char changed_head[128];
     snprintf(changed_head, sizeof(changed_head), "%s", changed_ctx.head_sha);
     cbm_git_context_free(&changed_ctx);
-    ASSERT_TRUE(strcmp(initial_head, changed_head) != 0);
+    ASSERT_TRUE(strcmp(source_head, changed_head) != 0);
 
     cbm_pipeline_incremental_test_reset_faults();
     int changed_rc = cbm_pipeline_run(after_head_move);
@@ -9049,7 +9086,7 @@ TEST(pipeline_git_context_change_forces_full_and_refreshes_branch) {
 
     cbm_store_t *store = cbm_store_open_path(db_path);
     int changed_branch_matches = store ? branch_head_match_count(store, project, changed_head) : -1;
-    int stale_branch_matches = store ? branch_head_match_count(store, project, initial_head) : -1;
+    int stale_branch_matches = store ? branch_head_match_count(store, project, source_head) : -1;
     cbm_file_hash_t git_input = {0};
     int git_input_rc =
         store ? cbm_store_get_file_hash(
