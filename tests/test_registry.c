@@ -1328,6 +1328,24 @@ TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged) {
     PASS();
 }
 
+/* The Scala member guard's exemption keeps unique_name / field_type_hint
+ * matches only when the target sits in the caller's own file; suffix_match
+ * and cross-file targets stay suppressed, and other languages never qualify. */
+TEST(weak_member_same_file_exempt_is_scala_local_and_specific_only) {
+    ASSERT_TRUE(
+        cbm_weak_member_same_file_exempt(true, "unique_name", "a/Zoo.scala", "a/Zoo.scala"));
+    ASSERT_TRUE(
+        cbm_weak_member_same_file_exempt(true, "field_type_hint", "a/Zoo.scala", "a/Zoo.scala"));
+    ASSERT_FALSE(
+        cbm_weak_member_same_file_exempt(true, "suffix_match", "a/Zoo.scala", "a/Zoo.scala"));
+    ASSERT_FALSE(
+        cbm_weak_member_same_file_exempt(true, "unique_name", "a/Zoo.scala", "b/Other.scala"));
+    ASSERT_FALSE(cbm_weak_member_same_file_exempt(false, "unique_name", "a/zoo.py", "a/zoo.py"));
+    ASSERT_FALSE(cbm_weak_member_same_file_exempt(true, "unique_name", "a/Zoo.scala", NULL));
+    ASSERT_FALSE(cbm_weak_member_same_file_exempt(true, NULL, "a/Zoo.scala", "a/Zoo.scala"));
+    PASS();
+}
+
 SUITE(registry) {
     /* FQN */
     RUN_TEST(fqn_simple);
@@ -1368,6 +1386,7 @@ SUITE(registry) {
     RUN_TEST(resolve_scala_companion_owner_matches_class_name);
     RUN_TEST(resolve_dollar_owner_is_companion_only_when_registered_from_scala);
     RUN_TEST(resolve_java_ts_dollar_class_next_to_class_is_unchanged);
+    RUN_TEST(weak_member_same_file_exempt_is_scala_local_and_specific_only);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
