@@ -55,7 +55,7 @@ src/
   foundation/       Arena allocator, hash table, string utils, platform compat
   store/            SQLite graph storage (WAL mode, FTS5)
   cypher/           Cypher query → SQL translation
-  mcp/              MCP server (JSON-RPC 2.0 over stdio, 14 tools)
+  mcp/              MCP server (JSON-RPC 2.0 over stdio, 17 tools)
   pipeline/         Multi-pass indexing pipeline
     pass_*.c        Individual pipeline passes (definitions, calls, usages, etc.)
     httplink.c      HTTP route extraction (Go/Express/Laravel/Ktor/Python)
@@ -148,6 +148,25 @@ If in doubt, open an issue and ask.
 - Include tests for new functionality
 - Run `scripts/test.sh` and `scripts/lint.sh` before submitting
 - Keep PRs focused — avoid unrelated reformatting or refactoring
+
+## AI-assisted and AI-authored contributions
+
+Contributions written with the help of an AI tool, or written by an AI agent acting for a person, are welcome here on the same terms as any other. What we review is the change, not who or what typed it. Three things make that work:
+
+- **Say so.** If an agent wrote the PR or is answering in the thread, disclose it — a line in the PR description or at the top of a comment is enough ("written with X", "this account is operated by an AI agent on behalf of Y"). Disclosure is never held against a contribution. Finding out later is.
+- **A person is accountable.** The [DCO sign-off](#license-and-sign-off-dco--required-on-every-commit) is a legal certification, and only a person can make it. The human behind the account certifies every commit, answers for it, and is who we talk to if something goes wrong. An agent may carry the conversation; it cannot carry the responsibility.
+- **The bar does not move.** Every claim in a PR must be something a reviewer can check: the failing test, the command that was run, the numbers and the machine they came from. "The model says it works" is not evidence, and a confident description does not replace a test that fails without the fix. We read AI-written PRs exactly as carefully as human-written ones — no more suspiciously, and no less.
+
+Two practical notes:
+
+- `Co-authored-by:` trailers naming a tool are fine. Links to private chat or agent sessions are not — they are dead to everyone else and do not belong in permanent history; we will ask you to remove them.
+- High-volume, low-effort submissions — many near-identical PRs, changes nobody ran, replies that do not engage with the review — will be closed, whoever or whatever produced them. One careful PR is worth more than twenty generated ones.
+
+### Who speaks for the project
+
+Only the maintainer account ([@DeusData](https://github.com/DeusData)) speaks for this project. A review, an approval, a "this will be merged" or a "this is a duplicate" from any other account is that person's opinion, however official it sounds — helpful reviews from the community are very welcome, and that is what they are.
+
+**Impersonating a maintainer is not acceptable**, by a person or by an agent: presenting yourself as part of the maintainer team, posting approvals or change requests styled as maintainer decisions, or telling other contributors what the project has decided. We dismiss such reviews, hide the comments, say publicly in the affected threads that they were not ours, and report and block the account. If you are unsure whether a response you received is from the project, check the account name — and ask.
 
 ## Security
 

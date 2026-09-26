@@ -272,6 +272,9 @@ bash "$ROOT/tests/test_release_gate_chain_contract.sh"
 echo "=== Step 0t: test runtime isolation contract (#1691) ==="
 bash "$ROOT/tests/test_runtime_isolation_contract.sh"
 
+echo "=== Step 0t2: smoke harness runtime isolation contract (#1696) ==="
+bash "$ROOT/tests/test_smoke_runtime_isolation_contract.sh"
+
 echo "=== Step 0u: shell line-ending contract ==="
 bash "$ROOT/tests/test_shell_line_endings.sh"
 

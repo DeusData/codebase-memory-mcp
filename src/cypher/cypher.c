@@ -5014,8 +5014,107 @@ static void execute_return_clause(cbm_query_t *q, cbm_return_clause_t *ret, bind
                         limit_is_engine_budget);
 }
 
+/* ── Planner: seed a single-hop pattern from its selective end ──────────────
+ *
+ * The executor scans pattern node 0 and expands from there. Written as
+ * `MATCH (a)-[:CALLS]->(b) WHERE b.name = '_printk'`, that scans every node
+ * in the store before the filter on `b` can discard any — on an 8.5 M node
+ * kernel graph the query hit the execution-time limit while the anchored
+ * spelling `MATCH (b:Function {name:'_printk'})<-[:CALLS]-(a)` answered in
+ * seconds (2026-09-16 probe). A reader should not have to know which end to
+ * write first: when the far node carries an equality on name/qualified_name,
+ * an inline property, or a label and the near node carries less, the pattern
+ * is walked from the far end with the relationship direction inverted. The
+ * result set is identical; only the enumeration order changes. Restricted to
+ * one single-relationship pattern with an explicit RETURN, and never to an
+ * OPTIONAL MATCH, whose anchor is part of its meaning. */
+static int cypher_cond_selectivity(const cbm_condition_t *c, const char *var) {
+    if (!c || !c->variable || !var || strcmp(c->variable, var) != 0 || c->negated) {
+        return 0;
+    }
+    if (!c->op || strcmp(c->op, "=") != 0 || !c->property) {
+        return 0;
+    }
+    return (strcmp(c->property, "name") == 0 || strcmp(c->property, "qualified_name") == 0) ? 3 : 2;
+}
+
+static int cypher_expr_selectivity(const cbm_expr_t *e, const char *var) {
+    if (!e) {
+        return 0;
+    }
+    if (e->type == EXPR_CONDITION) {
+        return cypher_cond_selectivity(&e->cond, var);
+    }
+    if (e->type == EXPR_AND) {
+        int l = cypher_expr_selectivity(e->left, var);
+        int r = cypher_expr_selectivity(e->right, var);
+        return l > r ? l : r;
+    }
+    return 0; /* OR / NOT / XOR: no single equality to seed from */
+}
+
+static int cypher_node_selectivity(const cbm_node_pattern_t *n, const cbm_where_clause_t *w) {
+    int s = 0;
+    for (int i = 0; i < n->prop_count; i++) {
+        const char *k = n->props[i].key;
+        int v = (k && (strcmp(k, "name") == 0 || strcmp(k, "qualified_name") == 0)) ? 3 : 2;
+        if (v > s) {
+            s = v;
+        }
+    }
+    if (w && n->variable) {
+        int v = 0;
+        if (w->root) {
+            v = cypher_expr_selectivity(w->root, n->variable);
+        } else if (!w->op || strcmp(w->op, "AND") == 0) {
+            for (int i = 0; i < w->count; i++) {
+                int c = cypher_cond_selectivity(&w->conditions[i], n->variable);
+                if (c > v) {
+                    v = c;
+                }
+            }
+        }
+        if (v > s) {
+            s = v;
+        }
+    }
+    if (s == 0 && n->label) {
+        s = 1;
+    }
+    return s;
+}
+
+static void cypher_plan_seed_from_selective_end(cbm_query_t *q) {
+    if (!q || q->pattern_count != 1 || !q->ret || (q->pattern_optional && q->pattern_optional[0])) {
+        return;
+    }
+    cbm_pattern_t *p = &q->patterns[0];
+    if (p->rel_count != 1 || p->node_count != 2) {
+        return;
+    }
+    if (cypher_node_selectivity(&p->nodes[1], q->where) <=
+        cypher_node_selectivity(&p->nodes[0], q->where)) {
+        return;
+    }
+    cbm_node_pattern_t tmp = p->nodes[0];
+    p->nodes[0] = p->nodes[1];
+    p->nodes[1] = tmp;
+    cbm_rel_pattern_t *r = &p->rels[0];
+    const char *inverted = NULL;
+    if (r->direction && strcmp(r->direction, "outbound") == 0) {
+        inverted = "inbound";
+    } else if (r->direction && strcmp(r->direction, "inbound") == 0) {
+        inverted = "outbound";
+    }
+    if (inverted) {
+        safe_str_free(&r->direction);
+        r->direction = heap_strdup(inverted);
+    }
+}
+
 static int execute_single(cbm_store_t *store, cbm_query_t *q, const char *project, int max_rows,
                           result_builder_t *rb) {
+    cypher_plan_seed_from_selective_end(q);
     cbm_pattern_t *pat0 = &q->patterns[0];
 
     /* Step 1: Scan initial nodes */

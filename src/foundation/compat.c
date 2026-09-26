@@ -269,36 +269,54 @@ int cbm_mkstemp(char *tmpl) {
         errno = ENAMETOOLONG;
         return CBM_NOT_FOUND;
     }
-    /* Wide-API expansion and open: worker staging files land inside
-     * CBM_CACHE_DIR, which users may place at non-ASCII paths; the ANSI CRT
-     * (_mktemp/_open) mangles those bytes in the local codepage. */
+    /* Keep the six-character mkstemp contract, but do not use _wmktemp:
+     * that CRT helper has a tiny name space on Windows and retained worker
+     * logs can exhaust it during recovery. The exclusive open closes races
+     * with other processes; collisions simply draw another random name. */
     wchar_t *wide_template = cbm_utf8_to_wide(buf);
-    if (!wide_template || !_wmktemp(wide_template)) {
-        free(wide_template);
+    if (!wide_template) {
+        errno = EINVAL;
         return CBM_NOT_FOUND;
     }
-    char *expanded_for_open = cbm_wide_to_utf8(wide_template);
-    wchar_t *wide_open = expanded_for_open ? cbm_path_to_wide(expanded_for_open) : NULL;
-    free(expanded_for_open);
-    if (!wide_open) {
+    size_t wide_len = wcslen(wide_template);
+    if (wide_len < 6 || wcscmp(wide_template + wide_len - 6, L"XXXXXX") != 0) {
         free(wide_template);
+        errno = EINVAL;
         return CBM_NOT_FOUND;
     }
-    int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
-    free(wide_open);
-    if (fd >= 0) {
+    static const wchar_t hex[] = L"0123456789abcdef";
+    for (int attempt = 0; attempt < 128; attempt++) {
+        unsigned int random_bits = 0;
+        if (!cbm_secure_random(&random_bits, sizeof(random_bits))) {
+            errno = EIO;
+            break;
+        }
+        for (int digit = 0; digit < 6; digit++) {
+            wide_template[wide_len - 6 + digit] = hex[(random_bits >> (digit * 4)) & 0xf];
+        }
         char *expanded = cbm_wide_to_utf8(wide_template);
-        if (!expanded || strlen(expanded) >= sizeof(buf)) {
+        wchar_t *wide_open = expanded ? cbm_path_to_wide(expanded) : NULL;
+        if (!expanded || !wide_open || strlen(expanded) >= sizeof(buf)) {
+            free(expanded);
+            free(wide_open);
+            errno = ENAMETOOLONG;
+            break;
+        }
+        int fd = _wopen(wide_open, _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY, _S_IREAD | _S_IWRITE);
+        free(wide_open);
+        if (fd >= 0) {
+            strcpy(tmpl, expanded);
             free(expanded);
             free(wide_template);
-            (void)_close(fd);
-            return CBM_NOT_FOUND;
+            return fd;
         }
-        strcpy(tmpl, expanded);
         free(expanded);
+        if (errno != EEXIST) {
+            break;
+        }
     }
     free(wide_template);
-    return fd;
+    return CBM_NOT_FOUND;
 }
 #endif
 

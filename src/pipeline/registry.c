@@ -229,6 +229,37 @@ static int candidate_score(const char *candidate_qn, const char *module_qn, int 
     return score;
 }
 
+/* Number of '.'-separated segments in a QN: how deeply the definition is
+ * nested (file depth + enclosing types). */
+static int qn_depth(const char *qn) {
+    int depth = 1;
+    for (const char *p = qn; *p; p++) {
+        if (*p == '.') {
+            depth++;
+        }
+    }
+    return depth;
+}
+
+/* Total order among candidates that tie on candidate_score. The registry's
+ * by-name bucket is in registration order, which follows the file list; a
+ * tie broken by bucket position made the resolved target a function of
+ * that order (kernel: 632 CALLS edges differed between two indexes of the
+ * same tree, `dev_name` flipping between twenty same-named struct fields
+ * and unresolved, `sg_set_buf` between include/linux and tools/virtio).
+ * The rule: the least nested definition wins (a top-level function over a
+ * same-named member two types deep, include/linux over tools/virtio/linux),
+ * then the lexicographically smaller QN — a pure function of the candidate
+ * set, never of the order it was built in (O9). */
+static bool candidate_outranks_on_tie(const char *candidate, const char *best) {
+    int cd = qn_depth(candidate);
+    int bd = qn_depth(best);
+    if (cd != bd) {
+        return cd < bd;
+    }
+    return strcmp(candidate, best) < 0;
+}
+
 /* Pick candidate with highest composite score (test-deprioritization + namespace
  * proximity). `is_test_flags` is the candidates' cached test verdicts, or NULL
  * when the caller has none (a filtered subset carries its own copy). */
@@ -239,7 +270,8 @@ static const char *best_by_import_distance(const char **candidates, const uint8_
     for (int i = 0; i < count; i++) {
         int score =
             candidate_score(candidates[i], module_qn, is_test_flags ? (int)is_test_flags[i] : -1);
-        if (score > best_score) {
+        if (score > best_score ||
+            (score == best_score && best && candidate_outranks_on_tie(candidates[i], best))) {
             best_score = score;
             best = candidates[i];
         }
@@ -559,6 +591,84 @@ bool cbm_suppress_weak_member_match(bool enabled, bool is_method, const char *st
     return weak_short_name_strategy(strategy);
 }
 
+/* ── Python builtin-type members ─────────────────────────────────────────
+ * Methods of Python's builtin types (str, bytes, list, dict, set, file objects)
+ * plus the builtin functions that appear as attribute calls. Like PERL_BUILTINS
+ * this is a fact about the LANGUAGE, not about corpus fashion: a member call
+ * whose name is a builtin's own method — `parts.extend(...)`, `line.strip()`,
+ * `d.items()` — is that builtin's method whenever the receiver is untyped, so a
+ * project symbol that merely shares the spelling must not bind. MUST stay
+ * sorted ASCII-ascending for bsearch. */
+static const char *const PYTHON_BUILTIN_MEMBERS[] = {
+    "add",        "append",       "capitalize",
+    "casefold",   "center",       "clear",
+    "close",      "copy",         "count",
+    "decode",     "difference",   "discard",
+    "encode",     "endswith",     "expandtabs",
+    "extend",     "fileno",       "find",
+    "flush",      "format",       "get",
+    "index",      "insert",       "intersection",
+    "isalnum",    "isalpha",      "isdecimal",
+    "isdigit",    "isidentifier", "islower",
+    "isnumeric",  "isprintable",  "isspace",
+    "istitle",    "isupper",      "issubset",
+    "issuperset", "items",        "join",
+    "keys",       "ljust",        "lower",
+    "lstrip",     "partition",    "pop",
+    "popitem",    "print",        "read",
+    "readable",   "readline",     "readlines",
+    "remove",     "replace",      "reverse",
+    "rfind",      "rindex",       "rjust",
+    "rpartition", "rsplit",       "rstrip",
+    "seek",       "setdefault",   "sort",
+    "split",      "splitlines",   "startswith",
+    "strip",      "swapcase",     "symmetric_difference",
+    "tell",       "title",        "truncate",
+    "union",      "update",       "upper",
+    "values",     "writable",     "write",
+    "writelines", "zfill",
+};
+
+static int python_builtin_member_cmp(const void *key, const void *elem) {
+    return strcmp((const char *)key, *(const char *const *)elem);
+}
+
+bool cbm_python_is_builtin_member(const char *name) {
+    if (!name || !name[0]) {
+        return false;
+    }
+    return bsearch(name, PYTHON_BUILTIN_MEMBERS,
+                   sizeof(PYTHON_BUILTIN_MEMBERS) / sizeof(PYTHON_BUILTIN_MEMBERS[0]),
+                   sizeof(PYTHON_BUILTIN_MEMBERS[0]), python_builtin_member_cmp) != NULL;
+}
+
+/* The member guard's one exemption. A Python member call whose receiver could
+ * not be typed still carries real evidence when three facts line up: the callee
+ * name has exactly ONE definition in the whole project (strategy unique_name),
+ * the receiver is an attribute chain rooted at self/cls — an object the class
+ * owns, not a parameter handed in — and the name is not a builtin type's own
+ * method. `self.compiler.apply_converters()` names the only apply_converters in
+ * django and nothing else it could mean exists. Measured on django/django
+ * (v0.10.8 → v0.11.0 A/B, 2026-09-16): the unconditional guard dropped 800 such
+ * self-rooted edges, every sampled one a real call in the source. A bare
+ * parameter receiver (`accelerator.backward()`, #1276's own case) carries no
+ * ownership evidence and stays suppressed, as does every builtin-member name
+ * (`self.parts.extend()`). Python only: the JS/TS family keeps the TS-LSP trade
+ * recorded in the resolution probe. Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
+                                        const char *callee_name, const char *strategy) {
+    if (!is_python || !receiver_is_self_attribute) {
+        return false;
+    }
+    if (!strategy || strcmp(strategy, "unique_name") != 0) {
+        return false;
+    }
+    if (!callee_name || !callee_name[0]) {
+        return false;
+    }
+    return !cbm_python_is_builtin_member(simple_name(callee_name));
+}
+
 /* Bare-call counterpart of the member guard above. A Python call `foo()` whose
  * callee identifier is bound as a parameter of an enclosing scope cannot be the
  * module-level `foo`: the parameter shadows it for the whole body. Binding such
@@ -611,13 +721,30 @@ static const char *path_basename(const char *path) {
     return slash ? slash + 1 : path;
 }
 
+/* Build and configuration languages have no cross-language call semantics: a
+ * Makefile's `$(eval ...)` or a CMake `function(...)` names nothing in a C
+ * file, so a bare-name bind into another language is always a collision
+ * (2026-09-16 probe: kernel Makefile targets bound to `sk_psock.eval`). */
+static bool build_config_language(CBMLanguage lang) {
+    return lang == CBM_LANG_MAKEFILE || lang == CBM_LANG_CMAKE || lang == CBM_LANG_YAML ||
+           lang == CBM_LANG_TOML || lang == CBM_LANG_JSON || lang == CBM_LANG_INI ||
+           lang == CBM_LANG_DOCKERFILE;
+}
+
 bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const char *target_file_path,
                                               const char *strategy) {
     /* Two same-named symbols in different languages: suffix_match picks one
      * winner by import-distance and attaches every bare-name call to it
      * (#725, Bash/Python main, JS/Python commit). unique_name is the
-     * candidates==1 case (#1572) and is not this guard. */
-    if (!strategy || strcmp(strategy, "suffix_match") != 0) {
+     * candidates==1 case (#1572) and is not this guard — except for a build
+     * or configuration caller, where even a unique match into another
+     * language is a collision by construction. */
+    if (!strategy) {
+        return false;
+    }
+    bool config_caller = build_config_language(caller_lang);
+    if (strcmp(strategy, "suffix_match") != 0 &&
+        !(config_caller && strcmp(strategy, "unique_name") == 0)) {
         return false;
     }
     if (caller_lang == CBM_LANG_COUNT || !target_file_path || !target_file_path[0]) {
@@ -1088,27 +1215,37 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
         return true;
     }
 
-    /* The candidate's parent segment: the one before its final name. */
+    /* The candidate's ancestry: every segment before its final name. */
     const char *cand_last = strrchr(candidate_qn, '.');
     if (!cand_last || cand_last == candidate_qn) {
-        return true; /* top-level candidate — no parent to look for */
+        return true; /* top-level candidate — no ancestry to look for */
     }
-    const char *parent = cand_last;
-    while (parent > candidate_qn && parent[-1] != '.') {
-        parent--;
-    }
-    size_t parent_len = (size_t)(cand_last - parent);
 
     /* Walk the chain — every segment before the final callee name. A trailing
-     * "()" is dropped so JSONEncoder().encode reads as JSONEncoder. */
+     * "()" is dropped so JSONEncoder().encode reads as JSONEncoder. A chain
+     * segment admits the candidate when it names ANY segment of the candidate's
+     * ancestry, not only the immediate parent: Settings.builder().putList binds
+     * settings.Settings.Builder.putList because Settings owns Builder, and
+     * RequestOptions.DEFAULT.toBuilder().setWarningsHandler binds
+     * RequestOptions.Builder.setWarningsHandler the same way. Measured on
+     * elastic/elasticsearch: the parent-only rule refused 9,473 unique-name
+     * calls, most of them exactly these factory chains into a nested Builder.
+     * A foreign root still finds nothing in the ancestry — Base64.getEncoder
+     * does not admit DocOffsetsCodec.getEncoder, URLSession.shared.data does
+     * not admit PickedFile.data — so the #1893 refusals hold. */
     for (const char *seg = dotted; seg < last_dot;) {
         const char *end = strchr(seg, '.');
         size_t len = (size_t)(end - seg);
         if (len >= 2 && seg[len - 2] == '(' && seg[len - 1] == ')') {
             len -= 2; /* an empty "()" — JSONEncoder().encode names JSONEncoder */
         }
-        if (len == parent_len && strncmp(seg, parent, parent_len) == 0) {
-            return true;
+        for (const char *anc = candidate_qn; anc < cand_last;) {
+            const char *anc_end = strchr(anc, '.');
+            size_t anc_len = (size_t)(anc_end - anc);
+            if (anc_len == len && len > 0 && strncmp(seg, anc, len) == 0) {
+                return true;
+            }
+            anc = anc_end + SKIP_ONE;
         }
         seg = end + SKIP_ONE;
     }
