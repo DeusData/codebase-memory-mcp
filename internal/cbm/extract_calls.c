@@ -79,8 +79,9 @@ static const char *strip_quotes(CBMArena *a, const char *text) {
 
 // Callee suffixes for IRIS Python interop string-dispatch. Kept at file scope
 // (not inside the function) to satisfy cppcheck variableScope.
-static const char *s_py_dispatch_suffixes[] = {".classMethodValue", ".classMethodVoid",
-                                               ".classMethodBoolean", ".classMethodObject", NULL};
+static const char *s_py_dispatch_suffixes[] = {".classMethodValue",   ".classMethodVoid",
+                                               ".classMethodBoolean", ".classMethodObject",
+                                               ".invokeClassMethod",  NULL};
 
 // Per-language callee-suffix dispatch table — returns a NULL-terminated list of
 // method-name suffixes whose calls should be resolved by extracting class+method
@@ -2039,6 +2040,49 @@ static const char *extract_nth_string_arg(CBMExtractCtx *ctx, TSNode args, uint3
     return NULL;
 }
 
+// IRIS embedded Python names the target class in the receiver:
+// iris.cls("Pkg.Class").Method(...) calls ClassMethod Pkg.Class.Method.
+// Returns "Pkg.Class.Method", or NULL unless the receiver is iris.cls() with
+// a string-literal first argument. A non-literal class names nothing, so it
+// gets no class-qualified callee rather than a guessed one.
+static const char *python_iris_cls_callee(CBMExtractCtx *ctx, TSNode call_node) {
+    TSNode fn = ts_node_child_by_field_name(call_node, TS_FIELD("function"));
+    if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "attribute") != 0) {
+        return NULL;
+    }
+    TSNode recv = ts_node_child_by_field_name(fn, TS_FIELD("object"));
+    TSNode meth = ts_node_child_by_field_name(fn, TS_FIELD("attribute"));
+    if (ts_node_is_null(recv) || ts_node_is_null(meth) || strcmp(ts_node_type(recv), "call") != 0) {
+        return NULL;
+    }
+    TSNode recv_fn = ts_node_child_by_field_name(recv, TS_FIELD("function"));
+    TSNode recv_args = ts_node_child_by_field_name(recv, TS_FIELD("arguments"));
+    if (ts_node_is_null(recv_fn) || ts_node_is_null(recv_args) ||
+        ts_node_named_child_count(recv_args) == 0) {
+        return NULL;
+    }
+    const char *recv_text = cbm_node_text(ctx->arena, recv_fn, ctx->source);
+    if (!recv_text || strcmp(recv_text, "iris.cls") != 0) {
+        return NULL;
+    }
+    TSNode cls_arg = ts_node_named_child(recv_args, 0);
+    if (!is_string_like(ts_node_type(cls_arg))) {
+        return NULL;
+    }
+    // Plain quoted literals only: an f-string or other prefixed string is a
+    // "string" node too, but its text is not a class name.
+    char *cls_text = cbm_node_text(ctx->arena, cls_arg, ctx->source);
+    if (!cls_text || (cls_text[0] != '"' && cls_text[0] != '\'')) {
+        return NULL;
+    }
+    const char *cls = strip_and_validate_string_arg(ctx->arena, cls_text);
+    const char *mth = cbm_node_text(ctx->arena, meth, ctx->source);
+    if (!cls || !cls[0] || !mth || !mth[0]) {
+        return NULL;
+    }
+    return cbm_arena_sprintf(ctx->arena, "%s.%s", cls, mth);
+}
+
 // --- Unified handler: called once per node by the cursor walk ---
 
 // Process a keyword argument (keyword_argument or pair node).
@@ -3909,6 +3953,17 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                         break;
                     }
+                }
+            }
+            if (ctx->language == CBM_LANG_PYTHON) {
+                const char *iris_callee = python_iris_cls_callee(ctx, node);
+                if (iris_callee) {
+                    CBMCall xcall = {0};
+                    xcall.callee_name = iris_callee;
+                    xcall.enclosing_func_qn = call.enclosing_func_qn;
+                    xcall.site_start_byte = call.site_start_byte;
+                    xcall.site_end_byte = call.site_end_byte;
+                    cbm_calls_push(&ctx->result->calls, ctx->arena, xcall);
                 }
             }
         }
