@@ -1149,6 +1149,19 @@ TEST(jsonrpc_format_response) {
     PASS();
 }
 
+TEST(jsonrpc_format_response_rejects_missing_or_malformed_payload) {
+    cbm_jsonrpc_response_t resp = {.id = 2};
+    ASSERT_NULL(cbm_jsonrpc_format_response(&resp));
+
+    resp.result_json = "{broken";
+    ASSERT_NULL(cbm_jsonrpc_format_response(&resp));
+
+    resp.result_json = NULL;
+    resp.error_json = "{broken";
+    ASSERT_NULL(cbm_jsonrpc_format_response(&resp));
+    PASS();
+}
+
 TEST(jsonrpc_format_error) {
     char *json = cbm_jsonrpc_format_error(5, -32600, "Invalid Request");
     ASSERT_NOT_NULL(json);
@@ -2225,6 +2238,10 @@ TEST(server_handle_logs_request_without_params) {
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "protocol=jsonrpc"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "method=tools/list"));
     ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=ok"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
     ASSERT_NULL(strstr(mcp_log_buf, "token"));
     ASSERT_NULL(strstr(mcp_log_buf, "secret"));
     PASS();
@@ -10665,14 +10682,27 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     };
     cbm_mcp_server_set_command_test_hook(srv, mcp_search_command_hook_probe, &probe);
 
-    char *response =
-        cbm_mcp_handle_tool(srv, "search_code",
-                            "{\"pattern\":\"HandleRequest\",\"project\":\"prefilter-search\","
-                            "\"file_pattern\":\"*.go\"}");
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\",\"file_pattern\":"
+             "\"*.go\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
     ASSERT_NOT_NULL(response);
     ASSERT_TRUE(probe.cancel_accepted);
     ASSERT_NOT_NULL(strstr(response, "cancelled"));
     ASSERT_NOT_NULL(strstr(response, "\"isError\":true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "tool=search_code"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=false"));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
 
     char logs[640];
     snprintf(logs, sizeof(logs), "%s/logs", cache.path);
@@ -10682,6 +10712,39 @@ TEST(search_code_cancel_cleans_supervised_scan) {
     cbm_mcp_server_free(srv);
     cleanup_prefilter_dir(tmp, src_path, vendor_path);
     ASSERT_TRUE(mcp_search_cache_close(&cache));
+    PASS();
+}
+
+TEST(server_handle_logs_timeout_without_query) {
+    char tmp[512], src_path[768], vendor_path[768];
+    cbm_mcp_server_t *srv = setup_prefilter_server(tmp, sizeof(tmp), src_path, sizeof(src_path),
+                                                   vendor_path, sizeof(vendor_path));
+    ASSERT_NOT_NULL(srv);
+    cbm_mcp_server_set_search_scan_timeout_for_test(srv, 0, true);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_INFO);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    char *response = cbm_mcp_server_handle(
+        srv, "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+             "\"params\":{\"name\":\"search_code\",\"arguments\":{\"pattern\":"
+             "\"HandleRequest\",\"project\":\"prefilter-search\"}}}");
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    ASSERT_NOT_NULL(response);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "status=timeout"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "timed_out=true"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "cancelled=false"));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "handler_duration_ms="));
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "response_serialization_ms="));
+    ASSERT_NULL(strstr(mcp_log_buf, "HandleRequest"));
+    ASSERT_NULL(strstr(mcp_log_buf, "prefilter-search"));
+
+    free(response);
+    cbm_mcp_server_free(srv);
+    cleanup_prefilter_dir(tmp, src_path, vendor_path);
     PASS();
 }
 
@@ -16631,14 +16694,24 @@ TEST(jsonrpc_parse_empty_string) {
 }
 
 TEST(jsonrpc_parse_missing_jsonrpc_field) {
-    /* jsonrpc field absent — parser defaults to "2.0" if method present */
+    /* JSON-RPC requests must declare their protocol version. */
     const char *line = "{\"id\":1,\"method\":\"initialize\",\"params\":{}}";
     cbm_jsonrpc_request_t req = {0};
     int rc = cbm_jsonrpc_parse(line, &req);
-    ASSERT_EQ(rc, 0);
-    ASSERT_STR_EQ(req.jsonrpc, "2.0");
-    ASSERT_STR_EQ(req.method, "initialize");
-    ASSERT_TRUE(req.has_id);
+    ASSERT_EQ(rc, -1);
+    cbm_jsonrpc_request_free(&req);
+    PASS();
+}
+
+TEST(jsonrpc_parse_rejects_invalid_version_and_id) {
+    cbm_jsonrpc_request_t req = {0};
+    ASSERT_EQ(cbm_jsonrpc_parse(
+                  "{\"jsonrpc\":\"1.0\",\"id\":1,\"method\":\"ping\"}", &req),
+              -1);
+    cbm_jsonrpc_request_free(&req);
+    ASSERT_EQ(cbm_jsonrpc_parse(
+                  "{\"jsonrpc\":\"2.0\",\"id\":null,\"method\":\"ping\"}", &req),
+              -1);
     cbm_jsonrpc_request_free(&req);
     PASS();
 }
@@ -16967,6 +17040,75 @@ TEST(mcp_server_run_rapid_messages) {
     fclose(in_fp);
     PASS();
 }
+
+#ifdef __linux__
+TEST(mcp_server_run_reports_output_failure) {
+    int fds[2];
+    ASSERT_EQ(pipe(fds), 0);
+    const char message[] = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}\n";
+    ASSERT_EQ(write(fds[1], message, sizeof(message) - 1), (ssize_t)(sizeof(message) - 1));
+    close(fds[1]);
+
+    FILE *in_fp = fdopen(fds[0], "r");
+    FILE *out_fp = fopen("/dev/full", "w");
+    ASSERT_NOT_NULL(in_fp);
+    ASSERT_NOT_NULL(out_fp);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_ERROR);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+    bool output_error_logged = strstr(mcp_log_buf, "stage=write") != NULL ||
+                               strstr(mcp_log_buf, "stage=flush") != NULL;
+
+    cbm_mcp_server_free(srv);
+    fclose(in_fp);
+    fclose(out_fp);
+
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.response.write"));
+    ASSERT_TRUE(output_error_logged);
+    PASS();
+}
+
+TEST(mcp_server_run_reports_input_failure) {
+    FILE *in_fp = tmpfile();
+    FILE *out_fp = tmpfile();
+    ASSERT_NOT_NULL(in_fp);
+    ASSERT_NOT_NULL(out_fp);
+    ASSERT_TRUE(fputs("Content-Length: nope\r\n\r\n", in_fp) >= 0);
+    rewind(in_fp);
+
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    mcp_log_buf[0] = '\0';
+    CBMLogLevel previous_level = cbm_log_get_level();
+    cbm_log_set_level(CBM_LOG_ERROR);
+    cbm_log_set_sink_ex(mcp_capture_log, CBM_LOG_SINK_REPLACE);
+    int rc = cbm_mcp_server_run(srv, in_fp, out_fp);
+    cbm_log_set_sink(NULL);
+    cbm_log_set_level(previous_level);
+
+    cbm_mcp_server_free(srv);
+    fclose(in_fp);
+    fclose(out_fp);
+    ASSERT_TRUE(rc != 0);
+    ASSERT_NOT_NULL(strstr(mcp_log_buf, "msg=mcp.request.read"));
+    PASS();
+}
+#else
+TEST(mcp_server_run_reports_output_failure) {
+    SKIP_PLATFORM("/dev/full is Linux-specific");
+}
+TEST(mcp_server_run_reports_input_failure) {
+    SKIP_PLATFORM("tmpfile poll behavior is Unix-specific");
+}
+#endif
 #endif /* !_WIN32 */
 
 /* Issue #235: passing an unrecognised project name to a tool crashed the
@@ -20428,6 +20570,7 @@ SUITE(mcp) {
     /* JSON-RPC parsing — edge cases */
     RUN_TEST(jsonrpc_parse_empty_string);
     RUN_TEST(jsonrpc_parse_missing_jsonrpc_field);
+    RUN_TEST(jsonrpc_parse_rejects_invalid_version_and_id);
     RUN_TEST(jsonrpc_parse_missing_method);
     RUN_TEST(jsonrpc_parse_string_id);
     RUN_TEST(jsonrpc_parse_no_params);
@@ -20436,6 +20579,7 @@ SUITE(mcp) {
 
     /* JSON-RPC formatting */
     RUN_TEST(jsonrpc_format_response);
+    RUN_TEST(jsonrpc_format_response_rejects_missing_or_malformed_payload);
     RUN_TEST(jsonrpc_format_error);
 
     /* MCP protocol helpers */
@@ -20639,6 +20783,7 @@ SUITE(mcp) {
     RUN_TEST(search_code_file_pattern_prefilter_boundaries);
     RUN_TEST(search_code_windows_scope_prefilter_removes_pipeline_filter);
     RUN_TEST(search_code_cancel_cleans_supervised_scan);
+    RUN_TEST(server_handle_logs_timeout_without_query);
     RUN_TEST(search_code_output_limit_fails_closed_and_cleans_scan);
     RUN_TEST(search_code_scan_deadline_fails_closed_and_resets);
     RUN_TEST(search_code_scan_deadline_override_is_per_server);
@@ -20736,6 +20881,8 @@ SUITE(mcp) {
     /* Poll/getline FILE* buffering fix */
 #ifndef _WIN32
     RUN_TEST(mcp_server_run_rapid_messages);
+    RUN_TEST(mcp_server_run_reports_output_failure);
+    RUN_TEST(mcp_server_run_reports_input_failure);
 #endif
 
     /* Snippet resolution (port of snippet_test.go) */

@@ -128,6 +128,7 @@ enum {
 
 /* JSON-RPC 2.0 standard error codes */
 #define JSONRPC_PARSE_ERROR (-32700)
+#define MCP_INPUT_CLOSED (-2)
 #define JSONRPC_METHOD_NOT_FOUND (-32601)
 #define JSONRPC_INVALID_PARAMS (-32602)
 #define JSONRPC_INTERNAL_ERROR (-32603)
@@ -245,28 +246,45 @@ int cbm_jsonrpc_parse(const char *line, cbm_jsonrpc_request_t *out) {
     yyjson_val *v_id = yyjson_obj_get(root, "id");
     yyjson_val *v_params = yyjson_obj_get(root, "params");
 
-    if (!v_method || !yyjson_is_str(v_method)) {
+    if (!v_jsonrpc || !yyjson_is_str(v_jsonrpc) ||
+        strcmp(yyjson_get_str(v_jsonrpc), "2.0") != 0 || !v_method ||
+        !yyjson_is_str(v_method) ||
+        (v_id && !yyjson_is_int(v_id) && !yyjson_is_str(v_id))) {
         yyjson_doc_free(doc);
         return CBM_NOT_FOUND;
     }
 
-    out->jsonrpc =
-        heap_strdup(v_jsonrpc && yyjson_is_str(v_jsonrpc) ? yyjson_get_str(v_jsonrpc) : "2.0");
+    out->jsonrpc = heap_strdup(yyjson_get_str(v_jsonrpc));
     out->method = heap_strdup(yyjson_get_str(v_method));
+    if (!out->jsonrpc || !out->method) {
+        yyjson_doc_free(doc);
+        cbm_jsonrpc_request_free(out);
+        return CBM_NOT_FOUND;
+    }
 
     if (v_id) {
         out->has_id = true;
         if (yyjson_is_int(v_id)) {
             out->id = yyjson_get_int(v_id);
-        } else if (yyjson_is_str(v_id)) {
+        } else {
             /* JSON-RPC 2.0 §4 permits string ids (Claude Desktop uses them).
              * Preserve verbatim instead of coercing via strtol (issue #253). */
             out->id_str = heap_strdup(yyjson_get_str(v_id));
+            if (!out->id_str) {
+                yyjson_doc_free(doc);
+                cbm_jsonrpc_request_free(out);
+                return CBM_NOT_FOUND;
+            }
         }
     }
 
     if (v_params) {
         out->params_raw = yyjson_val_write(v_params, 0, NULL);
+        if (!out->params_raw) {
+            yyjson_doc_free(doc);
+            cbm_jsonrpc_request_free(out);
+            return CBM_NOT_FOUND;
+        }
     }
 
     yyjson_doc_free(doc);
@@ -289,36 +307,62 @@ void cbm_jsonrpc_request_free(cbm_jsonrpc_request_t *r) {
  * ══════════════════════════════════════════════════════════════════ */
 
 char *cbm_jsonrpc_format_response(const cbm_jsonrpc_response_t *resp) {
+    if (!resp) {
+        return NULL;
+    }
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    bool added = yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
     if (resp->id_str) {
-        yyjson_mut_obj_add_str(doc, root, "id", resp->id_str);
+        added = added && yyjson_mut_obj_add_str(doc, root, "id", resp->id_str);
     } else {
-        yyjson_mut_obj_add_int(doc, root, "id", resp->id);
+        added = added && yyjson_mut_obj_add_int(doc, root, "id", resp->id);
+    }
+    if (!added) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
     }
 
     if (resp->error_json) {
         /* Parse the error JSON and embed */
         yyjson_doc *err_doc = yyjson_read(resp->error_json, strlen(resp->error_json), 0);
-        if (err_doc) {
-            yyjson_mut_val *err_val = yyjson_val_mut_copy(doc, yyjson_doc_get_root(err_doc));
-            yyjson_mut_obj_add_val(doc, root, "error", err_val);
-            yyjson_doc_free(err_doc);
+        if (!err_doc) {
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
+        yyjson_mut_val *err_val = yyjson_val_mut_copy(doc, yyjson_doc_get_root(err_doc));
+        bool added = err_val && yyjson_mut_obj_add_val(doc, root, "error", err_val);
+        yyjson_doc_free(err_doc);
+        if (!added) {
+            yyjson_mut_doc_free(doc);
+            return NULL;
         }
     } else if (resp->result_json) {
         /* Parse the result JSON and embed */
         yyjson_doc *res_doc = yyjson_read(resp->result_json, strlen(resp->result_json), 0);
-        if (res_doc) {
-            yyjson_mut_val *res_val = yyjson_val_mut_copy(doc, yyjson_doc_get_root(res_doc));
-            yyjson_mut_obj_add_val(doc, root, "result", res_val);
-            yyjson_doc_free(res_doc);
+        if (!res_doc) {
+            yyjson_mut_doc_free(doc);
+            return NULL;
+        }
+        yyjson_mut_val *res_val = yyjson_val_mut_copy(doc, yyjson_doc_get_root(res_doc));
+        bool added = res_val && yyjson_mut_obj_add_val(doc, root, "result", res_val);
+        yyjson_doc_free(res_doc);
+        if (!added) {
+            yyjson_mut_doc_free(doc);
+            return NULL;
         }
     } else {
-        /* JSON-RPC 2.0 spec: response MUST contain "result" or "error" */
-        yyjson_mut_obj_add_null(doc, root, "result");
+        yyjson_mut_doc_free(doc);
+        return NULL;
     }
 
     char *out = yy_final_doc_to_str(doc);
@@ -326,13 +370,44 @@ char *cbm_jsonrpc_format_response(const cbm_jsonrpc_response_t *resp) {
     return out;
 }
 
+static char *mcp_format_response_or_error(const cbm_jsonrpc_response_t *resp,
+                                          bool *serialization_failed) {
+    if (serialization_failed) {
+        *serialization_failed = false;
+    }
+    char *formatted = cbm_jsonrpc_format_response(resp);
+    if (formatted) {
+        return formatted;
+    }
+    if (serialization_failed) {
+        *serialization_failed = true;
+    }
+    cbm_jsonrpc_response_t error_resp = {
+        .id = resp->id,
+        .id_str = resp->id_str,
+        .error_json = "{\"code\":-32603,\"message\":\"Failed to serialize the server response\"}",
+    };
+    return cbm_jsonrpc_format_response(&error_resp);
+}
+
 char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message) {
     yyjson_mut_doc *doc = yyjson_mut_doc_new(NULL);
+    if (!doc) {
+        return NULL;
+    }
     yyjson_mut_val *root = yyjson_mut_obj(doc);
+    if (!root) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
     yyjson_mut_doc_set_root(doc, root);
 
-    yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
-    yyjson_mut_obj_add_int(doc, root, "id", id);
+    bool added = yyjson_mut_obj_add_str(doc, root, "jsonrpc", "2.0");
+    added = added && yyjson_mut_obj_add_int(doc, root, "id", id);
+    if (!added) {
+        yyjson_mut_doc_free(doc);
+        return NULL;
+    }
 
     char *encoded_message = NULL;
     size_t encoded_message_len = 0;
@@ -340,13 +415,21 @@ char *cbm_jsonrpc_format_error(int64_t id, int code, const char *message) {
     if (!cbm_output_encode_text(raw_message, strlen(raw_message), &encoded_message,
                                 &encoded_message_len)) {
         yyjson_mut_doc_free(doc);
+        free(encoded_message);
         return NULL;
     }
 
     yyjson_mut_val *err = yyjson_mut_obj(doc);
-    yyjson_mut_obj_add_int(doc, err, "code", code);
-    yyjson_mut_obj_add_str(doc, err, "message", encoded_message ? encoded_message : raw_message);
-    yyjson_mut_obj_add_val(doc, root, "error", err);
+    added = err && yyjson_mut_obj_add_int(doc, err, "code", code);
+    added = added &&
+            yyjson_mut_obj_add_str(doc, err, "message", encoded_message ? encoded_message
+                                                                          : raw_message);
+    added = added && yyjson_mut_obj_add_val(doc, root, "error", err);
+    if (!added) {
+        yyjson_mut_doc_free(doc);
+        free(encoded_message);
+        return NULL;
+    }
 
     char *out = yy_final_doc_to_str(doc);
     yyjson_mut_doc_free(doc);
@@ -2933,7 +3016,9 @@ static char *handle_list_projects(cbm_mcp_server_t *srv, const char *args) {
         free(records);
         return cbm_mcp_text_result("out of memory while listing projects", true);
     }
-    qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+    if (record_count > 1) {
+        qsort(records, (size_t)record_count, sizeof(*records), project_record_compare);
+    }
 
     int limit = cbm_mcp_get_int_arg(args, "limit", 50);
     int offset = cbm_mcp_get_int_arg(args, "offset", 0);
@@ -17796,6 +17881,11 @@ bool cbm_mcp_jsonrpc_response_prepend_notice(char **response_io, const char *not
     return true;
 }
 
+static long long mcp_elapsed_us(struct timespec start, struct timespec end) {
+    return ((long long)(end.tv_sec - start.tv_sec) * MCP_S_TO_US) +
+           ((long long)(end.tv_nsec - start.tv_nsec) / MCP_MS_TO_US);
+}
+
 char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_jsonrpc_request_t req = {0};
     if (cbm_jsonrpc_parse(line, &req) < 0) {
@@ -17826,7 +17916,11 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
     cbm_clock_gettime(CLOCK_MONOTONIC, &req_t0);
     char *result_json = NULL;
     char *request_error_json = NULL;
-    bool request_logged = false;
+    char *request_tool_name = NULL;
+    long long handler_duration_us = 0;
+    bool request_is_error = false;
+    bool request_cancelled = false;
+    bool request_timed_out = false;
 
     if (strcmp(req.method, "initialize") == 0) {
         result_json = cbm_mcp_initialize_response_for_profile(req.params_raw, srv->tool_profile);
@@ -17853,6 +17947,7 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         char *tool_name = req.params_raw ? cbm_mcp_get_tool_name(req.params_raw) : NULL;
         char *tool_args =
             req.params_raw ? cbm_mcp_get_arguments(req.params_raw) : heap_strdup("{}");
+        request_tool_name = tool_name;
         srv->active_request_id = req.id;
         free(srv->active_request_id_str);
         srv->active_request_id_str = req.id_str ? heap_strdup(req.id_str) : NULL;
@@ -17865,16 +17960,15 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         srv->active_request_id_str = NULL;
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - t0.tv_nsec) / MCP_MS_TO_US);
+        long long dur_us = mcp_elapsed_us(t0, t1);
         bool is_err = (result_json != NULL) && (strstr(result_json, "\"isError\":true") != NULL);
         cbm_diag_record_query(dur_us, is_err);
-        long long request_dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                                   ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, tool_name, is_err, request_dur_us);
-        request_logged = true;
+        handler_duration_us = mcp_elapsed_us(req_t0, t1);
+        request_is_error = is_err;
+        request_cancelled = mcp_request_cancelled(srv);
+        request_timed_out = result_json &&
+                            strstr(result_json, "\"code\":\"request_timeout\"") != NULL;
 
-        free(tool_name);
         free(tool_args);
     } else {
         /* Echo the original id (string or numeric, issue #253) on the error. */
@@ -17886,12 +17980,18 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .id_str = req.id_str,
             .error_json = err_obj,
         };
-        char *err = cbm_jsonrpc_format_response(&err_resp);
         struct timespec t1;
         cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        long long handler_us = mcp_elapsed_us(req_t0, t1);
+        struct timespec serialize_t0;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
+        char *err = mcp_format_response_or_error(&err_resp, NULL);
+        struct timespec serialize_t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+        long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+        long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+        cbm_log_mcp_request(req.method, NULL, true, duration_us, handler_us, serialization_us,
+                            false, false);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
@@ -17903,24 +18003,20 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
             .id_str = req.id_str,
             .error_json = request_error_json,
         };
-        char *err = cbm_jsonrpc_format_response(&err_resp);
-        struct timespec t1;
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, true, dur_us);
+        struct timespec serialize_t0;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
+        char *err = mcp_format_response_or_error(&err_resp, NULL);
+        struct timespec serialize_t1;
+        cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+        long long handler_us = mcp_elapsed_us(req_t0, serialize_t0);
+        long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+        long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+        cbm_log_mcp_request(req.method, NULL, true, duration_us, handler_us, serialization_us,
+                            false, false);
         free(request_error_json);
         cbm_mcp_server_request_scope_end(srv);
         cbm_jsonrpc_request_free(&req);
         return err;
-    }
-
-    if (!request_logged) {
-        struct timespec t1;
-        cbm_clock_gettime(CLOCK_MONOTONIC, &t1);
-        long long dur_us = ((long long)(t1.tv_sec - req_t0.tv_sec) * MCP_S_TO_US) +
-                           ((long long)(t1.tv_nsec - req_t0.tv_nsec) / MCP_MS_TO_US);
-        cbm_log_mcp_request(req.method, NULL, false, dur_us);
     }
 
     cbm_jsonrpc_response_t resp = {
@@ -17928,7 +18024,22 @@ char *cbm_mcp_server_handle(cbm_mcp_server_t *srv, const char *line) {
         .id_str = req.id_str,
         .result_json = result_json,
     };
-    char *out = cbm_jsonrpc_format_response(&resp);
+    struct timespec serialize_t0;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t0);
+    bool serialization_failed = false;
+    char *out = mcp_format_response_or_error(&resp, &serialization_failed);
+    struct timespec serialize_t1;
+    cbm_clock_gettime(CLOCK_MONOTONIC, &serialize_t1);
+    long long serialization_us = mcp_elapsed_us(serialize_t0, serialize_t1);
+    long long duration_us = mcp_elapsed_us(req_t0, serialize_t1);
+    request_is_error = request_is_error || serialization_failed || out == NULL;
+    if (!request_tool_name) {
+        handler_duration_us = duration_us - serialization_us;
+    }
+    cbm_log_mcp_request(req.method, request_tool_name, request_is_error, duration_us,
+                        handler_duration_us, serialization_us, request_cancelled,
+                        request_timed_out);
+    free(request_tool_name);
     free(result_json);
     cbm_mcp_server_request_scope_end(srv);
     cbm_jsonrpc_request_free(&req);
@@ -18123,8 +18234,7 @@ int cbm_mcp_read_message(FILE *in, char **message, bool *content_length_framed) 
 }
 
 #ifndef _WIN32
-/* Unix 3-phase poll: non-blocking fd check, FILE* buffer peek, blocking poll.
- * Returns: 1 = data ready, 0 = timeout (evicted idle stores), -1 = error/EOF. */
+/* Unix 3-phase poll: non-blocking fd check, FILE* buffer peek, blocking poll. */
 static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
     struct pollfd pfd = {.fd = fd, .events = POLLIN};
     int pr = poll(&pfd, SKIP_ONE, 0); /* Phase 1: non-blocking */
@@ -18139,26 +18249,28 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
     /* Phase 2: peek FILE* buffer */
     int saved_flags = fcntl(fd, F_GETFL);
     if (saved_flags < 0) {
-        /* fcntl failed — fall through to a short blocking poll (see the Phase-3
-         * note below on why the interval is bounded, not the full idle timeout) */
-        pr = poll(&pfd, SKIP_ONE, MCP_TIMEOUT_MS);
-        if (pr < 0) {
-            return CBM_NOT_FOUND;
-        }
-        if (pr == 0) {
-            cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
-            return 0;
-        }
-        return SKIP_ONE;
+        return CBM_NOT_FOUND;
     }
 
-    (void)fcntl(fd, F_SETFL, saved_flags | O_NONBLOCK);
+    if (fcntl(fd, F_SETFL, saved_flags | O_NONBLOCK) < 0) {
+        return CBM_NOT_FOUND;
+    }
+    errno = 0;
     int c = fgetc(in);
-    (void)fcntl(fd, F_SETFL, saved_flags);
+    int read_errno = errno;
+    bool read_failed = ferror(in) != 0;
+    bool reached_eof = feof(in) != 0;
+    int restore_result = fcntl(fd, F_SETFL, saved_flags);
+    if (restore_result < 0) {
+        return CBM_NOT_FOUND;
+    }
 
     if (c == EOF) {
-        if (feof(in)) {
-            return CBM_NOT_FOUND; /* true EOF */
+        if (reached_eof) {
+            return MCP_INPUT_CLOSED;
+        }
+        if (!read_failed || (read_errno != EAGAIN && read_errno != EWOULDBLOCK)) {
+            return CBM_NOT_FOUND;
         }
         clearerr(in);
         /* Phase 3: blocking poll, bounded to a SHORT interval (not the full idle
@@ -18180,7 +18292,9 @@ static int poll_for_input_unix(cbm_mcp_server_t *srv, int fd, FILE *in) {
         return SKIP_ONE;
     }
 
-    (void)ungetc(c, in);
+    if (ungetc(c, in) == EOF) {
+        return CBM_NOT_FOUND;
+    }
     return SKIP_ONE;
 }
 #endif
@@ -18221,7 +18335,8 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         HANDLE hStdin = (HANDLE)_get_osfhandle(fd);
         DWORD wr = WaitForSingleObject(hStdin, STORE_IDLE_TIMEOUT_S * MCP_TIMEOUT_MS);
         if (wr == WAIT_FAILED) {
-            break;
+            cbm_log_error("mcp.input.poll", "status", "error");
+            return 1;
         }
         if (wr == WAIT_TIMEOUT) {
             cbm_mcp_server_evict_idle(srv, STORE_IDLE_TIMEOUT_S);
@@ -18229,8 +18344,12 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
         }
 #else
         int pr = poll_for_input_unix(srv, fd, in);
-        if (pr < 0) {
+        if (pr == MCP_INPUT_CLOSED) {
             break;
+        }
+        if (pr < 0) {
+            cbm_log_error("mcp.input.poll", "status", "error");
+            return 1;
         }
         if (pr == 0) {
             continue; /* timeout — idle stores evicted */
@@ -18239,21 +18358,46 @@ int cbm_mcp_server_run(cbm_mcp_server_t *srv, FILE *in, FILE *out) {
 
         char *message = NULL;
         bool content_length_framed = false;
-        if (cbm_mcp_read_message(in, &message, &content_length_framed) <= 0) {
+        int read_status = cbm_mcp_read_message(in, &message, &content_length_framed);
+        if (read_status == 0) {
             break;
+        }
+        if (read_status < 0) {
+            cbm_log_error("mcp.request.read", "status", "error");
+            return 1;
         }
 
         char *resp = cbm_mcp_server_handle(srv, message);
+        bool notification = false;
+        if (!resp) {
+            cbm_jsonrpc_request_t request = {0};
+            notification = cbm_jsonrpc_parse(message, &request) == 0 && !request.has_id;
+            cbm_jsonrpc_request_free(&request);
+        }
         free(message);
-        if (resp) {
-            if (content_length_framed) {
-                size_t response_len = strlen(resp);
-                (void)fprintf(out, "Content-Length: %zu\r\n\r\n%s", response_len, resp);
-            } else {
-                (void)fprintf(out, "%s\n", resp);
+        if (!resp) {
+            if (!notification) {
+                cbm_log_error("mcp.response.missing", "protocol", "jsonrpc", "status", "error");
+                return 1;
             }
-            (void)fflush(out);
-            free(resp);
+            continue;
+        }
+
+        int write_result;
+        if (content_length_framed) {
+            size_t response_len = strlen(resp);
+            write_result = fprintf(out, "Content-Length: %zu\r\n\r\n%s", response_len, resp);
+        } else {
+            write_result = fprintf(out, "%s\n", resp);
+        }
+        free(resp);
+        if (write_result < 0) {
+            cbm_log_error("mcp.response.write", "protocol", "jsonrpc", "stage", "write");
+            return 1;
+        }
+        if (fflush(out) != 0) {
+            cbm_log_error("mcp.response.write", "protocol", "jsonrpc", "stage", "flush");
+            return 1;
         }
     }
 

@@ -207,15 +207,10 @@ TEST(log_operational_helpers) {
     cbm_log_set_level(CBM_LOG_DEBUG);
     cbm_log_set_format(CBM_LOG_FORMAT_TEXT);
     capture_start();
-    cbm_log_mcp_request("tools/call", "search_graph", false, 1250);
     cbm_log_http_request("graph_ui", "GET", "/api/layout", 200, 7, 0, 42);
     const char *output = capture_end();
     cbm_log_set_level(CBM_LOG_INFO);
 
-    ASSERT(cbm_str_contains_raw(output, "msg=mcp.request"));
-    ASSERT(cbm_str_contains_raw(output, "protocol=jsonrpc"));
-    ASSERT(cbm_str_contains_raw(output, "method=tools/call"));
-    ASSERT(cbm_str_contains_raw(output, "tool=search_graph"));
     ASSERT(cbm_str_contains_raw(output, "msg=http.request"));
     ASSERT(cbm_str_contains_raw(output, "method=GET"));
     ASSERT(cbm_str_contains_raw(output, "path=/api/layout"));
