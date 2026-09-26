@@ -3142,7 +3142,7 @@ static const char *resolve_objectscript_callee(CBMExtractCtx *ctx, TSNode node, 
     }
 
     const char *kind = ts_node_type(node);
-    if ((!callee || !callee[0]) && strcmp(kind, "method_call") == 0) {
+    if ((!callee || !callee[0]) && cbm_objectscript_is_instance_call(node)) {
         callee =
             resolve_objectscript_instance_call(ctx->arena, node, ctx->source, &state->os_type_map);
     }
@@ -3404,7 +3404,7 @@ static TSNode objectscript_callee_expr(TSNode node) {
     if (strcmp(kind, "class_method_call") == 0) {
         return cbm_find_child_by_kind(node, "method_name");
     }
-    if (strcmp(kind, "method_call") == 0 || strcmp(kind, "relative_dot_method") == 0) {
+    if (cbm_objectscript_is_instance_call(node) || strcmp(kind, "relative_dot_method") == 0) {
         TSNode oref = cbm_find_child_by_kind(node, "oref_method");
         return ts_node_is_null(oref) ? (TSNode){0} : cbm_find_child_by_kind(oref, "method_name");
     }
@@ -3739,7 +3739,7 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
     }
 
     if (!callable_reference && spec->call_node_types && spec->call_node_types[0] &&
-        cbm_kind_in_set(node, spec->call_node_types)) {
+        cbm_is_call_site(ctx->language, node, spec->call_node_types)) {
         CBMPrimaryCalleeSelection callee = select_primary_callee(ctx, node, state);
         // Keyword-filter callees, but keep builtins we mint a node for (len, str,
         // ...) so the LSP-resolved builtin call still forms a CALLS edge.

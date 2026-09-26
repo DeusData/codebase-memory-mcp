@@ -2563,7 +2563,7 @@ static void walk_usages(CBMExtractCtx *ctx, TSNode root, const CBMLangSpec *spec
         UsageFrame *f = &frames[top - 1];
         if (entering) {
             try_emit_usage(ctx, f->node, spec, call_depth > 0, import_depth > 0);
-            f->counts_call = cbm_kind_in_set(f->node, spec->call_node_types);
+            f->counts_call = cbm_is_call_site(ctx->language, f->node, spec->call_node_types);
             f->counts_import =
                 (has_imports && cbm_kind_in_set(f->node, spec->import_node_types)) ||
                 (has_from_imports && cbm_kind_in_set(f->node, spec->import_from_types));

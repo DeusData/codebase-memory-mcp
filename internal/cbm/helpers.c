@@ -466,6 +466,24 @@ TSNode cbm_find_child_by_kind(TSNode parent, const char *kind) {
     return null_node;
 }
 
+bool cbm_objectscript_is_instance_call(TSNode node) {
+    const char *kind = ts_node_type(node);
+    if (strcmp(kind, "method_call") == 0) {
+        return true;
+    }
+    if (strcmp(kind, "do_parameter") != 0 && strcmp(kind, "job_argument") != 0) {
+        return false;
+    }
+    return !ts_node_is_null(cbm_find_child_by_kind(node, "oref_method"));
+}
+
+bool cbm_is_call_site(CBMLanguage lang, TSNode node, const char **call_types) {
+    if (cbm_kind_in_set(node, call_types)) {
+        return true;
+    }
+    return lang == CBM_LANG_OBJECTSCRIPT_UDL && cbm_objectscript_is_instance_call(node);
+}
+
 int cbm_find_children_by_kind(TSNode parent, const char *kind, TSNode *out, int max) {
     int n = 0;
     uint32_t count = ts_node_child_count(parent);

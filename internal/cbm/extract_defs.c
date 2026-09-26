@@ -86,8 +86,9 @@ static bool try_append_ident(const char *source, uint32_t s, int len, uint32_t *
 }
 
 /* Walk AST body, collect unique identifier text as space-separated string.
+ * Subtrees ending at or before from_byte are skipped (0 = whole body).
  * Returns arena-allocated string or NULL. */
-static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+static char *extract_ident_tokens_from(CBMExtractCtx *ctx, TSNode body, uint32_t from_byte) {
     enum { BT_STACK = 512, BT_BUF = 2048, BT_MAX_IDENTS = 128, BT_SEEN = 256, BT_SEEN_MASK = 255 };
     TSNode bt_stack[BT_STACK];
     int bt_top = 0;
@@ -100,6 +101,9 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
 
     while (bt_top > 0 && bt_count < BT_MAX_IDENTS) {
         TSNode nd = bt_stack[--bt_top];
+        if (ts_node_end_byte(nd) <= from_byte) {
+            continue;
+        }
         uint32_t nc = ts_node_child_count(nd);
         if (nc == 0) {
             const char *k = ts_node_type(nd);
@@ -129,6 +133,10 @@ static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
         return cbm_arena_strdup(ctx->arena, bt_buf);
     }
     return NULL;
+}
+
+static char *extract_body_ident_tokens(CBMExtractCtx *ctx, TSNode body) {
+    return extract_ident_tokens_from(ctx, body, 0);
 }
 
 /* Compute MinHash fingerprint for a function body node and store in def.
@@ -6936,6 +6944,10 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
 
                         if (strcmp(member_label, "Storage") == 0) {
                             TSNode sbody = cbm_find_child_by_kind(child, "storage_body");
+                            if (ts_node_is_null(sbody)) {
+                                sbody =
+                                    cbm_find_child_by_kind(child, "external_method_body_content");
+                            }
                             if (!ts_node_is_null(sbody)) {
                                 char *xml = cbm_node_text(a, sbody, ctx->source);
                                 if (xml) {
@@ -7037,13 +7049,27 @@ static void extract_class_fields(CBMExtractCtx *ctx, TSNode class_node, const ch
                         }
 
                         if (strcmp(member_label, "Trigger") == 0) {
+                            /* Grammar v1.9.15+ hides the core_trigger /
+                             * external_trigger wrapper; the body is then
+                             * everything after trigger_name. */
                             TSNode tbody = cbm_find_child_by_kind(child, "core_trigger");
                             if (ts_node_is_null(tbody)) {
                                 tbody = cbm_find_child_by_kind(child, "external_trigger");
                             }
+                            uint32_t body_from = 0;
+                            if (ts_node_is_null(tbody)) {
+                                tbody = child;
+                                body_from = ts_node_end_byte(nname);
+                            }
                             if (!ts_node_is_null(tbody)) {
-                                mdef.body_tokens = extract_body_ident_tokens(ctx, tbody);
+                                mdef.body_tokens = extract_ident_tokens_from(ctx, tbody, body_from);
                                 char *raw = cbm_node_text(a, tbody, ctx->source);
+                                if (raw && body_from > ts_node_start_byte(tbody)) {
+                                    raw += body_from - ts_node_start_byte(tbody);
+                                    while (*raw == ' ' || *raw == '\t') {
+                                        raw++;
+                                    }
+                                }
                                 if (raw && raw[0]) {
                                     char esc[CBM_SZ_512];
                                     int ei = 0;

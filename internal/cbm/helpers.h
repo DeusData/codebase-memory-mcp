@@ -122,6 +122,12 @@ char *cbm_cpp_out_of_line_parent_class(CBMArena *a, TSNode node, const char *sou
 // Find a child node by kind string.
 TSNode cbm_find_child_by_kind(TSNode parent, const char *kind);
 
+// ObjectScript `Do obj.M()` / `Job obj.M()`: grammar v1.9.15+ hides the old
+// `method_call` wrapper, so its receiver and `oref_method` sit directly under
+// `do_parameter` / `job_argument`. True for `method_call` itself or for one of
+// those parents carrying a direct `oref_method` child.
+bool cbm_objectscript_is_instance_call(TSNode node);
+
 // Find every child node matching `kind` (unlike cbm_find_child_by_kind,
 // which stops at the first match). Writes up to `max` nodes into `out`;
 // returns how many were found. Repeated sibling nodes of the same kind are
@@ -161,6 +167,11 @@ bool cbm_chialisp_is_def_head(const char *t);
 
 // Check if node kind matches a set of types (NULL-terminated array of strings).
 bool cbm_kind_in_set(TSNode node, const char **types);
+
+// cbm_kind_in_set over a language's call_node_types, plus the ObjectScript UDL
+// `Do obj.M()` sites that no longer have a dedicated node kind (see
+// cbm_objectscript_is_instance_call).
+bool cbm_is_call_site(CBMLanguage lang, TSNode node, const char **call_types);
 
 /* Namespace/module declarations that extend a qualified-name scope without
  * turning their children into class methods. Shared by definition and unified
