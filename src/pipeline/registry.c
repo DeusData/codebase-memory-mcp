@@ -31,6 +31,7 @@ enum { REG_MAX_CANDIDATES = 256 };
 #include "foundation/dyn_array.h"
 #include "foundation/platform.h"
 
+#include <ctype.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -693,6 +694,241 @@ bool cbm_suppress_weak_local_binding_call(bool enabled, bool callee_is_locally_b
         return false;
     }
     return weak_short_name_strategy(strategy);
+}
+
+/* A module specifier that names a path inside the indexed tree ("./x", "../x",
+ * "/abs/x", and on Windows "C:\x", "C:/x", "\\server\share\x") rather than an
+ * external package. Package specifiers are everything else — "drizzle-orm",
+ * "rxjs/operators", "@scope/pkg". Windows paths must count as in-tree here:
+ * pr-smoke runs this pipeline on Windows, and misclassifying a drive-letter or
+ * UNC specifier as "external" is exactly the false-external edge this guard
+ * exists to prevent (#1355). */
+static bool specifier_is_relative(const char *module_path) {
+    if (!module_path || !module_path[0]) {
+        return false;
+    }
+    if (module_path[0] == '.' || module_path[0] == '/') {
+        return true;
+    }
+    /* UNC share: \\server\share\... */
+    if (module_path[0] == '\\' && module_path[1] == '\\') {
+        return true;
+    }
+    /* Drive-letter absolute path: C:\repo\... or C:/repo/... */
+    if (isalpha((unsigned char)module_path[0]) && module_path[1] == ':' &&
+        (module_path[2] == '\\' || module_path[2] == '/')) {
+        return true;
+    }
+    return false;
+}
+
+/* True when the specifier names a package that the indexed tree DECLARES —
+ * a workspace sibling, not a third-party dependency. `indexed_packages` is the
+ * pipeline's package map, keyed by the `name` of every manifest found in the
+ * tree (package.json, go.mod, Cargo.toml, ...), so a pnpm/npm/cargo workspace
+ * registers each of its own packages here.
+ *
+ * The key is the bare package name, so a subpath specifier is walked back one
+ * slash at a time: "drizzle-orm/pg-core" -> "drizzle-orm". Scoped names keep
+ * their leading segment ("@scope/pkg/sub" -> "@scope/pkg" -> "@scope").
+ *
+ * Deliberately a NAME test, not a resolution test. A workspace package usually
+ * points `main`/`module` at a build artifact ("./index.cjs") that is not
+ * checked in, so asking whether the entry file exists in the graph answers
+ * "no" for exactly the monorepos this has to protect. Whether the tree claims
+ * the name is decidable from the manifest alone. */
+static bool specifier_names_indexed_package(const CBMHashTable *indexed_packages,
+                                            const char *module_path) {
+    if (!indexed_packages || !module_path || !module_path[0]) {
+        return false;
+    }
+    if (cbm_ht_has(indexed_packages, module_path)) {
+        return true;
+    }
+    char buf[CBM_SZ_512];
+    if (strlen(module_path) >= sizeof(buf)) {
+        return false;
+    }
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    for (char *slash = strrchr(buf, '/'); slash != NULL; slash = strrchr(buf, '/')) {
+        *slash = '\0';
+        if (cbm_ht_has(indexed_packages, buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* True when the specifier is a package PATH the indexed tree itself DECLARES.
+ * `declared_packages` is the pipeline's namespace map, keyed by the
+ * dot-normalized `package` / `namespace` / `use` declaration of every indexed
+ * file (cbm_pipeline_namespace_map_build), so this is the JVM/CLR/PHP
+ * counterpart of the manifest-name test above: those languages have no
+ * specifier shape that separates in-tree from third-party, and their manifests
+ * (pom.xml, build.gradle) name artifacts, not packages.
+ *
+ * A package-path specifier names a member inside a package, so the trailing
+ * segment is walked off one at a time, exactly like the namespace-map lookup in
+ * cbm_pipeline_resolve_import_node: `org.jetbrains.exposed.v1.tests.shared
+ * .assertEquals` -> `org.jetbrains.exposed.v1.tests.shared`, which Exposed's
+ * own Assert.kt declares, so the call keeps its edge. `java.net.URL` walks to
+ * `java.net` then `java`, which no project file declares, so it stays external
+ * and the guard still cuts its bind to an in-tree `URL` class.
+ *
+ * Separator normalization mirrors the map builder's: PHP writes `\`, some
+ * grammars `::` or `/`. NULL disables the check. */
+static bool specifier_names_declared_package(const CBMHashTable *declared_packages,
+                                             const char *module_path) {
+    if (!declared_packages || !module_path || !module_path[0]) {
+        return false;
+    }
+    char buf[CBM_SZ_512];
+    if (strlen(module_path) >= sizeof(buf)) {
+        return false;
+    }
+    snprintf(buf, sizeof(buf), "%s", module_path);
+    char *brace = strchr(buf, '{');
+    if (brace) {
+        *brace = '\0'; /* grouped import — the prefix is the package */
+    }
+    char *alias = strstr(buf, " as ");
+    if (alias) {
+        *alias = '\0';
+    }
+    for (char *p = buf; *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    /* Collapse the empty segments "::" just produced, then strip glob/
+     * separator noise off the tail. */
+    for (;;) {
+        char *dd = strstr(buf, "..");
+        if (!dd) {
+            break;
+        }
+        memmove(dd, dd + 1, strlen(dd + 1) + 1);
+    }
+    size_t len = strlen(buf);
+    while (len > 0 && (buf[len - 1] == '*' || buf[len - 1] == '.' || buf[len - 1] == ' ')) {
+        buf[--len] = '\0';
+    }
+    if (buf[0] == '\0') {
+        return false;
+    }
+    if (cbm_ht_has(declared_packages, buf)) {
+        return true;
+    }
+    /* The walk has no floor, and that is a deliberate false-NEGATIVE: once the
+     * tree declares `com.example`, EVERY specifier under `com.example.**` reads
+     * as in-tree, including a third-party library that happens to publish under
+     * a declared prefix. Such a call keeps the same-name fallback it has on
+     * main, so the cost is a fabricated edge this guard could have removed —
+     * never a real edge lost. Stopping earlier would need a rule for where a
+     * package path ends and a type begins, and getting that wrong fails the
+     * other way. Pinned by external_import_shadow_declared_prefix_is_permissive
+     * in test_registry.c. */
+    for (char *dot = strrchr(buf, '.'); dot != NULL; dot = strrchr(buf, '.')) {
+        *dot = '\0';
+        if (cbm_ht_has(declared_packages, buf)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool import_map_binds(const char **import_map_keys, int import_map_count,
+                             const char *local_name) {
+    if (!import_map_keys || import_map_count <= 0) {
+        return false;
+    }
+    for (int i = 0; i < import_map_count; i++) {
+        if (import_map_keys[i] && strcmp(import_map_keys[i], local_name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* #1355: a bare call whose name the calling file binds to an EXTERNAL package
+ * import must not fall back to a project-wide same-name guess.
+ *
+ * `import { eq } from "drizzle-orm"` binds `eq` in this file's scope. When the
+ * package is not part of the indexed tree it materializes no IMPORTS edge, so
+ * the import map has no entry, strategies 1-2 miss, and strategy 3/4 attach
+ * `eq(users.id, id)` to whatever project symbol happens to share the simple
+ * name — a CALLS edge into an unrelated local helper. The explicit import
+ * statement is positive evidence, taken from the caller's own source, that the
+ * identifier does NOT denote that symbol.
+ *
+ * Fires only when ALL of:
+ *   - the callee is a BARE identifier: member (`x.foo()`) and package/namespace
+ *     qualified callees are the receiver-aware guards' business, not this one;
+ *   - the match came from a project-wide guess (suffix_match / unique_name;
+ *     field_type_hint / fuzzy listed for the same defensive reason as the TS/JS
+ *     guard) — every import-, receiver- or module-aware strategy is KEPT;
+ *   - the file imports that exact local name from a NON-RELATIVE specifier;
+ *   - no import-map key binds the name, i.e. that import resolved to nothing in
+ *     the graph. A name the map does bind already had its chance at strategy 1
+ *     and is import-aware by construction.
+ *
+ * Relative specifiers are deliberately excluded: they name a path inside the
+ * indexed tree, so a missing IMPORTS edge is an in-project resolution gap and
+ * the same-name fallback can still be right. A name imported from both a
+ * relative and a package specifier keeps the edge — the relative binding wins
+ * the tie explicitly, so the outcome does not depend on import order.
+ *
+ * `indexed_packages` extends that same reasoning to workspace monorepos, where
+ * a BARE specifier also names in-tree code: `import { eq } from "drizzle-orm"`
+ * inside the drizzle-orm repository is a sibling package, not a dependency. A
+ * specifier the tree's own manifests claim is treated exactly like a relative
+ * one. NULL disables the check and restores the specifier-shape-only contract.
+ *
+ * `declared_packages` closes the same hole for the package-path languages,
+ * where NO specifier shape says in-tree: `import
+ * org.jetbrains.exposed.v1.tests.shared.assertEquals` is spelled exactly like
+ * `import kotlin.test.assertEquals`, and only the tree's own `package`
+ * declarations tell them apart. It is permissive by construction — any
+ * specifier UNDER a declared package prefix counts as in-tree, see the note on
+ * the walk — so it can leave a fabricated edge in place, never remove a real
+ * one. NULL disables the check.
+ *
+ * Pure + side-effect-free so the contract is unit-testable without a pipeline. */
+bool cbm_suppress_external_import_shadow(const char *callee_name, const char *strategy,
+                                         const CBMImportArray *file_imports,
+                                         const char **import_map_keys, int import_map_count,
+                                         const CBMHashTable *indexed_packages,
+                                         const CBMHashTable *declared_packages) {
+    if (!callee_name || !callee_name[0] || !strategy || !strategy[0]) {
+        return false;
+    }
+    if (strcmp(strategy, "suffix_match") != 0 && strcmp(strategy, "unique_name") != 0 &&
+        strcmp(strategy, "field_type_hint") != 0 && strcmp(strategy, "fuzzy") != 0) {
+        return false;
+    }
+    if (strchr(callee_name, '.') != NULL || strstr(callee_name, "::") != NULL) {
+        return false;
+    }
+    if (!file_imports || file_imports->count <= 0) {
+        return false;
+    }
+    if (import_map_binds(import_map_keys, import_map_count, callee_name)) {
+        return false;
+    }
+    bool external_binding = false;
+    for (int i = 0; i < file_imports->count; i++) {
+        const CBMImport *imp = &file_imports->items[i];
+        if (!imp->local_name || !imp->module_path || strcmp(imp->local_name, callee_name) != 0) {
+            continue;
+        }
+        if (specifier_is_relative(imp->module_path) ||
+            specifier_names_indexed_package(indexed_packages, imp->module_path) ||
+            specifier_names_declared_package(declared_packages, imp->module_path)) {
+            return false; /* an in-tree binding for this name — never suppress */
+        }
+        external_binding = true;
+    }
+    return external_binding;
 }
 
 static bool js_ts_family(CBMLanguage lang) {

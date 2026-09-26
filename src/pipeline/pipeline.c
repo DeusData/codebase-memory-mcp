@@ -273,6 +273,18 @@ void cbm_pipeline_set_pkgmap(CBMHashTable *map) {
     g_pkgmap = map;
 }
 
+/* ── Global declared-package map (one active pipeline at a time) ── */
+
+static CBMHashTable *g_nsmap = NULL;
+
+CBMHashTable *cbm_pipeline_get_nsmap(void) {
+    return g_nsmap;
+}
+
+void cbm_pipeline_set_nsmap(CBMHashTable *map) {
+    g_nsmap = map;
+}
+
 bool cbm_pipeline_had_format_migration(const cbm_pipeline_t *p) {
     return p && p->format_migration;
 }
@@ -2870,6 +2882,8 @@ static int cbm_pipeline_run_staged(cbm_pipeline_t *p) {
 cleanup:
     cbm_pkgmap_free(cbm_pipeline_get_pkgmap());
     cbm_pipeline_set_pkgmap(NULL);
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(NULL);
     cbm_discover_free(files, file_count);
     cbm_pipeline_free_semantic_manifest(baseline_manifest, baseline_count);
     cbm_gbuf_free(p->gbuf);

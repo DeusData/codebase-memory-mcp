@@ -1753,7 +1753,11 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
         }
     }
 
-    cbm_pipeline_namespace_map_free(namespace_map);
+    /* Publish instead of free: the call pass needs the same declared-package
+     * set to tell an in-tree package path from a third-party one (#1355).
+     * The pipeline owns it from here and frees it in its cleanup. */
+    cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+    cbm_pipeline_set_nsmap(namespace_map);
 
     cbm_log_info("parallel.registry.done", "entries", itoa_log(reg_entries), "defines",
                  itoa_log(defines_edges), "imports", itoa_log(imports_edges));
@@ -2951,13 +2955,21 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
         /* The member guard's one exemption — MUST match pass_calls.c exactly. */
+        /* #1355: same guard as pass_calls.c, and joined to drop_plain_call for
+         * the same reason — a `continue` here would also skip route/HTTP/CONFIG
+         * classification, and a static-import route registration is a bare call
+         * bound by a package specifier. Suppress only the plain-CALLS
+         * fall-through so every Route node stays main-identical. */
         bool drop_plain_call =
             (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
              !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                                  call->receiver_is_self_attribute,
                                                  call->callee_name, res.strategy)) ||
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
-                                                 call->callee_is_locally_bound, res.strategy);
+                                                 call->callee_is_locally_bound, res.strategy) ||
+            cbm_suppress_external_import_shadow(call->callee_name, res.strategy, &result->imports,
+                                                imp_keys, imp_count, cbm_pipeline_get_pkgmap(),
+                                                cbm_pipeline_get_nsmap());
 
         /* Service-pattern HTTP/ASYNC client call (`requests.get(url)`): the
          * service signal lives in the callee_name. The registry can mis-resolve

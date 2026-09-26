@@ -911,7 +911,9 @@ int cbm_pipeline_pass_definitions(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             create_channel_edges_for_file(ctx, result, files[i].rel_path);
             cbm_pipeline_create_env_configures_for_file(ctx, result, files[i].rel_path);
         }
-        cbm_pipeline_namespace_map_free(namespace_map);
+        /* Publish instead of free — see the twin in pass_parallel.c (#1355). */
+        cbm_pipeline_namespace_map_free(cbm_pipeline_get_nsmap());
+        cbm_pipeline_set_nsmap(namespace_map);
         if (owns_local_cache) {
             for (int i = 0; i < file_count; i++) {
                 if (local_cache[i]) {
