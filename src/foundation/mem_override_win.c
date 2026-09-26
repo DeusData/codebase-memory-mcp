@@ -161,53 +161,6 @@ void __wrap__aligned_free(void *block) {
     __real__aligned_free(block);
 }
 
-#if defined(CBM_MEM_GLOBAL_OVERRIDE) && CBM_MEM_GLOBAL_OVERRIDE
-/* LLVM-MinGW's static C++ runtime calls _aligned_malloc through the linker's
- * wrapper but its aligned operator delete can call the CRT import pointer
- * __imp__aligned_free directly. --wrap=_aligned_free does not rewrite that
- * import-pointer reference. Provide the six C++ ABI delete entry points so
- * every aligned new/delete pair reaches the same owner-aware deallocator. */
-void cbm_cxx_aligned_delete(void *block) __asm__("_ZdlPvSt11align_val_t");
-void cbm_cxx_aligned_delete(void *block) {
-    __wrap__aligned_free(block);
-}
-
-void cbm_cxx_aligned_delete_nothrow(void *block,
-                                    const void *tag) __asm__("_ZdlPvSt11align_val_tRKSt9nothrow_t");
-void cbm_cxx_aligned_delete_nothrow(void *block, const void *tag) {
-    (void)tag;
-    __wrap__aligned_free(block);
-}
-
-void cbm_cxx_aligned_delete_sized(void *block, size_t size,
-                                  size_t alignment) __asm__("_ZdlPvySt11align_val_t");
-void cbm_cxx_aligned_delete_sized(void *block, size_t size, size_t alignment) {
-    (void)size;
-    (void)alignment;
-    __wrap__aligned_free(block);
-}
-
-void cbm_cxx_aligned_array_delete(void *block) __asm__("_ZdaPvSt11align_val_t");
-void cbm_cxx_aligned_array_delete(void *block) {
-    __wrap__aligned_free(block);
-}
-
-void cbm_cxx_aligned_array_delete_nothrow(void *block, const void *tag) __asm__(
-    "_ZdaPvSt11align_val_tRKSt9nothrow_t");
-void cbm_cxx_aligned_array_delete_nothrow(void *block, const void *tag) {
-    (void)tag;
-    __wrap__aligned_free(block);
-}
-
-void cbm_cxx_aligned_array_delete_sized(void *block, size_t size,
-                                        size_t alignment) __asm__("_ZdaPvySt11align_val_t");
-void cbm_cxx_aligned_array_delete_sized(void *block, size_t size, size_t alignment) {
-    (void)size;
-    (void)alignment;
-    __wrap__aligned_free(block);
-}
-#endif
-
 void *__wrap_realloc(void *block, size_t size) {
     if (!block) {
         void *fresh = mi_malloc(size);
