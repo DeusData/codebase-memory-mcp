@@ -2568,6 +2568,46 @@ static const char **extract_julia_base_classes(CBMArena *a, TSNode node, const c
     return result;
 }
 
+/* IEC 61131-3 ST: `FUNCTION_BLOCK A EXTENDS B IMPLEMENTS I1, I2` and
+ * `INTERFACE I EXTENDS J, K` tag EVERY base name with a repeated `extends` /
+ * `implements` field (the separating ',' tokens carry the field too), so the
+ * first-match field probe of extract_base_classes would keep only one base.
+ * Collect every named child in either field — identifier or
+ * qualified_identifier. Whether an edge becomes IMPLEMENTS or INHERITS is
+ * decided later from the target's label. */
+static const char **st_base_classes(CBMArena *a, TSNode node, const char *source) {
+    const char *pbases[MAX_BASES];
+    int pc = 0;
+    uint32_t nc = ts_node_child_count(node);
+    for (uint32_t i = 0; i < nc && pc < MAX_BASES_MINUS_1; i++) {
+        const char *fn = ts_node_field_name_for_child(node, i);
+        if (!fn || (strcmp(fn, "extends") != 0 && strcmp(fn, "implements") != 0)) {
+            continue;
+        }
+        TSNode bn_node = ts_node_child(node, i);
+        if (!ts_node_is_named(bn_node)) {
+            continue;
+        }
+        char *bn = cbm_node_text(a, bn_node, source);
+        if (bn && bn[0]) {
+            pbases[pc++] = bn;
+        }
+    }
+    if (pc == 0) {
+        return NULL;
+    }
+    const char **result =
+        (const char **)cbm_arena_alloc(a, (pc + NULL_TERM) * sizeof(const char *));
+    if (!result) {
+        return NULL;
+    }
+    for (int i = 0; i < pc; i++) {
+        result[i] = pbases[i];
+    }
+    result[pc] = NULL;
+    return result;
+}
+
 static const char **extract_base_classes(CBMArena *a, TSNode node, const char *source,
                                          CBMLanguage lang) {
     // ObjectScript: `Class X Extends (A, B)` — bases are class_name children of
@@ -2851,6 +2891,16 @@ static const char **extract_base_classes(CBMArena *a, TSNode node, const char *s
                                        "inheritance_specifier",
                                        NULL};
     return find_base_from_children(a, node, source, base_types);
+}
+
+/* Base names of a class-like definition: ST collects its repeated fields in
+ * st_base_classes, every other language goes through extract_base_classes. */
+static const char **class_base_names(CBMArena *a, TSNode node, const char *source,
+                                     CBMLanguage lang) {
+    if (lang == CBM_LANG_ST) {
+        return st_base_classes(a, node, source);
+    }
+    return extract_base_classes(a, node, source, lang);
 }
 
 // Classify class label from AST node kind
@@ -4813,7 +4863,7 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     def.end_line = ts_node_end_point(node).row + TS_LINE_OFFSET;
     def.lines = (int)(def.end_line - def.start_line + TS_LINE_OFFSET);
     def.is_exported = cbm_is_exported(name, ctx->language);
-    def.base_classes = extract_base_classes(a, node, ctx->source, ctx->language);
+    def.base_classes = class_base_names(a, node, ctx->source, ctx->language);
     def.decorators = extract_decorators(a, node, ctx->source, ctx->language, spec);
     def.docstring = extract_docstring(a, node, ctx->source, ctx->language);
 
@@ -4884,6 +4934,18 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
 
 // Find the body/members node inside a class node
 static TSNode find_class_body(TSNode class_node, CBMLanguage lang) {
+    /* Structured Text must be answered BEFORE the generic field-name probe
+     * below. A FUNCTION_BLOCK / PROGRAM / INTERFACE keeps its METHOD, PROPERTY
+     * and VAR members as DIRECT children, but the ST grammar also tags a
+     * trailing body statement with the field name "body". The probe would grab
+     * that single statement and return it as if it were the member container,
+     * so every member of a block that ends in a statement would be lost.
+     * Iterate the declaration itself, as ObjC/Squirrel/Smali do below - those
+     * simply never expose a "body" field, which is why answering them after
+     * the probe is harmless. */
+    if (lang == CBM_LANG_ST) {
+        return class_node;
+    }
     // Try field names first
     static const char *body_fields[] = {"body", "members", "class_body", "declaration_list", NULL};
     for (const char **f = body_fields; *f; f++) {
