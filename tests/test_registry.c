@@ -1008,9 +1008,11 @@ TEST(cross_language_unique_name_drops_py_vs_tsx) {
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_JAVASCRIPT, "frontend/Panel.tsx",
                                                           "unique_name"));
     /* C/C++, JVM, and Vue→TS families stay exempt for unique_name. */
-    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_C, "bpf/probe.h", "unique_name"));
     ASSERT_FALSE(
-        cbm_suppress_cross_language_suffix_match(CBM_LANG_GROOVY, "buildSrc/Foo.java", "unique_name"));
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_C, "bpf/probe.h", "unique_name"));
+    ASSERT_FALSE(
+        cbm_suppress_cross_language_suffix_match(CBM_LANG_GROOVY, "buildSrc/Foo.java",
+                                                 "unique_name"));
     ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_VUE, "services/Queue.ts",
                                                           "unique_name"));
     PASS();
