@@ -2699,21 +2699,24 @@ static int main_run_daemon_ctl(int argc, char **argv, const cbm_daemon_ipc_endpo
     return ui_result;
 }
 
-/* In-process sessions are read-only, and these two are what enforce it.
+/* In-process sessions are read-only. The analysis/scout tool allowlist set in
+ * main() keeps every mutating tool out: dispatch_tool() refuses it before any
+ * handler runs. That allowlist is not a read-only contract (mcp.h: internal
+ * cache maintenance may still write), so these guards are the second line —
+ * a write that gets past it fails closed at the lease instead of proceeding
+ * uncoordinated. They cannot stop work a handler does before it reaches the
+ * lease, which is why the allowlist comes first.
  *
- * Without a mutation guard the enforcement would be absent rather than lax:
- * mcp_project_mutation_begin() is `!srv->mutation_begin || srv->mutation_begin(...)`,
- * so an unset guard fails OPEN and every mutation proceeds. The daemon
- * (daemon/application.c), the UI (ui/http_server.c) and the local CLI above all
- * install one; an in-process session has no daemon to acquire a cross-session
- * lease from, so it must refuse the mutation instead of taking it unguarded.
- * Otherwise an in-process index_repository would write the shared cache under
- * CBM_CACHE_DIR while a daemon session on the same machine mutates the same
- * project — the exact race the lease exists to prevent.
+ * An unset guard would be no line at all: mcp_project_mutation_begin() is
+ * `!srv->mutation_begin || srv->mutation_begin(...)`, so an unset guard fails
+ * OPEN and every mutation proceeds. The daemon (daemon/application.c), the UI
+ * (ui/http_server.c) and the local CLI above all install one; an in-process
+ * session has no daemon to acquire a cross-session lease from, so it must
+ * refuse the mutation instead of taking it unguarded.
  *
- * Leaving the try-guard unset is deliberate and load-bearing: with
- * mutation_begin set and mutation_try_begin NULL, mcp_project_mutation_try_begin()
- * also returns false, so opportunistic writes during a read are refused too. */
+ * Leaving the try-guard unset is deliberate: with mutation_begin set and
+ * mutation_try_begin NULL, mcp_project_mutation_try_begin() also returns false,
+ * so opportunistic writes during a read are refused too. */
 static bool main_in_process_mutation_refused(void *context, const char *project) {
     (void)context;
     (void)project;
@@ -3196,9 +3199,10 @@ int main(int argc, char **argv) {
      * The session is READ-ONLY, and deliberately so. Without a daemon there is
      * no cross-session mutation lease, no index executor and no exact-build
      * admission, so a write here could not be coordinated against a daemon
-     * session touching the same project. See the guards above main() for how
-     * that is enforced and why an unset guard would have been worse than a
-     * refusing one. Indexing stays with the daemon, outside the sandbox. */
+     * session touching the same project. It therefore serves only the
+     * analysis/scout tool allowlist, backed by the refusing guards above main()
+     * — see there for why an unset guard would have been worse than a refusing
+     * one. Indexing stays with the daemon, outside the sandbox. */
     if (role == CBM_DAEMON_PROCESS_MCP_CLIENT) {
         char inproc_buf[MAIN_PATH_CAP];
         const char *inproc =
@@ -3210,11 +3214,21 @@ int main(int argc, char **argv) {
                 (void)fprintf(stderr, "codebase-memory-mcp: cannot create in-process MCP server\n");
                 return EXIT_FAILURE;
             }
-            cbm_mcp_server_set_tool_profile(inproc_srv, tool_profile);
-            /* Read-only: no daemon means no cross-session lease, index executor
-             * or exact-build admission, so every write path must refuse rather
-             * than proceed unguarded. background_tasks off also stops
-             * maybe_auto_index() from indexing on the initialize path. */
+            /* Serve only the analysis allowlist (scout stays scout; anything
+             * else becomes analysis). dispatch_tool() refuses a tool outside it
+             * before its handler runs, which the guards below cannot do: they
+             * sit inside the handlers, and handler work before them still
+             * reaches shared state — index_repository loads the index policy
+             * first, and with no server config that creates or opens
+             * ${CBM_CACHE_DIR}/_config.db before the executor could refuse. */
+            cbm_mcp_server_set_tool_profile(inproc_srv, tool_profile == CBM_MCP_TOOL_PROFILE_SCOUT
+                                                            ? CBM_MCP_TOOL_PROFILE_SCOUT
+                                                            : CBM_MCP_TOOL_PROFILE_ANALYSIS);
+            /* The second line (see the guards above main()): no daemon means no
+             * cross-session lease, index executor or exact-build admission, so a
+             * write that got past the allowlist must fail closed rather than
+             * proceed uncoordinated. background_tasks off keeps
+             * maybe_auto_index() off the initialize path. */
             cbm_mcp_server_set_background_tasks(inproc_srv, false);
             cbm_mcp_server_set_index_executor(inproc_srv, main_in_process_index_rejected, NULL);
             cbm_mcp_server_set_project_mutation_guard(inproc_srv, main_in_process_mutation_refused,
