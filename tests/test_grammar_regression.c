@@ -186,6 +186,26 @@ const GrammarCase CBM_GRAMMAR_CASES[] = {
      ")\n",
      3,
      {"square", "TWO", "twice", NULL}},
+    /* Structured Text: a FUNCTION_BLOCK is class-like and owns its METHOD. */
+    {"st",
+     CBM_LANG_ST,
+     "a.st",
+     "FUNCTION_BLOCK FB_Pump\n"
+     "VAR\n"
+     "  on : BOOL;\n"
+     "END_VAR\n"
+     "METHOD Start : BOOL\n"
+     "Start := TRUE;\n"
+     "END_METHOD\n"
+     "END_FUNCTION_BLOCK\n"
+     "FUNCTION Twice : INT\n"
+     "VAR_INPUT\n"
+     "  n : INT;\n"
+     "END_VAR\n"
+     "Twice := n * 2;\n"
+     "END_FUNCTION\n",
+     3,
+     {"FB_Pump", "Start", "Twice", NULL}},
     {"slang", CBM_LANG_SLANG, "a.slang", "void foo() {}\nvoid bar() {}\n", 1, {NULL}},
     {"squirrel", CBM_LANG_SQUIRREL, "a.nut", "function foo() {}\nfunction bar() {}\n", 1, {NULL}},
     {"starlark",
