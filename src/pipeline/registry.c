@@ -669,6 +669,23 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
     return !cbm_python_is_builtin_member(simple_name(callee_name));
 }
 
+/* Scala counterpart of the exemption above. Scala has no LSP resolver, so every
+ * receiver call reaches the registry; a unique_name / field_type_hint match
+ * whose target sits in the caller's own file is far more often the inherited or
+ * sibling method the file declares than a coincidence (measured on
+ * twitter/finagle, see #2155). suffix_match — several same-named candidates,
+ * picked by distance — stays suppressed even when it lands nearby. */
+bool cbm_weak_member_same_file_exempt(bool is_scala, const char *strategy, const char *caller_file,
+                                      const char *target_file) {
+    if (!is_scala || !strategy || !caller_file || !target_file) {
+        return false;
+    }
+    if (strcmp(strategy, "unique_name") != 0 && strcmp(strategy, "field_type_hint") != 0) {
+        return false;
+    }
+    return strcmp(caller_file, target_file) == 0;
+}
+
 /* Bare-call counterpart of the member guard above. A Python call `foo()` whose
  * callee identifier is bound as a parameter of an enclosing scope cannot be the
  * module-level `foo`: the parameter shadows it for the whole body. Binding such

@@ -5785,6 +5785,57 @@ TEST(extract_ts_member_call_flags_is_method) {
     PASS();
 }
 
+/* Returns the is_method flag of the first call named `callee`, or -1 when no
+ * such call was extracted. */
+static int scala_call_flag(CBMFileResult *r, const char *callee) {
+    for (int i = 0; i < r->calls.count; i++) {
+        if (strcmp(r->calls.items[i].callee_name, callee) == 0) {
+            return r->calls.items[i].is_method ? 1 : 0;
+        }
+    }
+    return -1;
+}
+
+TEST(extract_scala_member_call_flags_is_method) {
+    CBMFileResult *r =
+        extract("class Runner(base: Runner) {\n"
+                "  def helper(): Int = 1\n"
+                "  def run(xs: Seq[AnyRef], values: Map[String, String], n: Int): Int = {\n"
+                "    xs.foreach(_.register())\n"
+                "    values.get(\"id\")\n"
+                "    values.getOrElse(\"id\")(\"none\")\n"
+                "    xs contains n\n"
+                "    n + 1\n"
+                "    this.helper()\n"
+                "    super.finish()\n"
+                "    Utils.helper()\n"
+                "    Bijections.finagle.toStack(n)\n"
+                "    http.param.Streaming(n)\n"
+                "    helper()\n"
+                "  }\n"
+                "}\n",
+                CBM_LANG_SCALA, "t", "Runner.scala");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    /* Value receivers — flagged, so weak short-name matches are suppressed. */
+    ASSERT_EQ(scala_call_flag(r, "xs.foreach"), 1);
+    ASSERT_EQ(scala_call_flag(r, "_.register"), 1);
+    ASSERT_EQ(scala_call_flag(r, "values.get"), 1);
+    ASSERT_EQ(scala_call_flag(r, "values.getOrElse"), 1); /* curried */
+    ASSERT_EQ(scala_call_flag(r, "contains"), 1);         /* named infix */
+    /* this/super, object and type paths, symbolic infix and bare calls — left to
+     * the registry's receiver-chain check. */
+    ASSERT_EQ(scala_call_flag(r, "this.helper"), 0);
+    ASSERT_EQ(scala_call_flag(r, "super.finish"), 0);
+    ASSERT_EQ(scala_call_flag(r, "Utils.helper"), 0);
+    ASSERT_EQ(scala_call_flag(r, "Bijections.finagle.toStack"), 0);
+    ASSERT_EQ(scala_call_flag(r, "http.param.Streaming"), 0);
+    ASSERT_EQ(scala_call_flag(r, "helper"), 0);
+    ASSERT(scala_call_flag(r, "+") != 1);
+    cbm_free_result(r);
+    PASS();
+}
+
 TEST(extract_scala_companion_owners_are_distinct) {
     CBMFileResult *r = extract("case class Rational private (n: Int, d: Int) {\n"
                                "  lazy val isWhole: Boolean = d == 1\n"
@@ -8377,6 +8428,7 @@ SUITE(extraction) {
     RUN_TEST(extract_python_bare_call_flags_locally_bound_callee);
     RUN_TEST(extract_python_bare_call_flag_is_depth_independent);
     RUN_TEST(extract_ts_member_call_flags_is_method);
+    RUN_TEST(extract_scala_member_call_flags_is_method);
     RUN_TEST(extract_scala_companion_owners_are_distinct);
     RUN_TEST(extract_scala_trait_companion_and_standalone_object);
     RUN_TEST(extract_scala_import_selectors_and_aliases);

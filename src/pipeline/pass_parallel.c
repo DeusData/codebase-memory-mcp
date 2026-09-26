@@ -2928,7 +2928,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
-        /* Dynamic-language weak-member suppression (#592/#606/#1276). The
+        /* Receiver-aware weak-member suppression (#592/#606/#1276). The
          * receiver-aware guard must NOT drop this call here: doing so would also
          * skip the #523 callee-name service bypass below, emit_service_edge's
          * route/gRPC/config branches, and its unconditional detect_url_in_args
@@ -2947,16 +2947,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     lang == CBM_LANG_ARKTS ||
                                     /* embedded-script hosts — see pass_calls.c */
                                     lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                    /* Scala — see pass_calls.c (#2155) */
+                                    lang == CBM_LANG_SCALA;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
-        /* The member guard's one exemption — MUST match pass_calls.c exactly. */
+        /* The member guard's exemptions — MUST match pass_calls.c exactly. */
+        const char *weak_target_file = NULL;
+        if (lang == CBM_LANG_SCALA && call->is_method && res.qualified_name &&
+            res.qualified_name[0]) {
+            const cbm_gbuf_node_t *t = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            weak_target_file = t ? t->file_path : NULL;
+        }
         bool drop_plain_call =
             (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
              !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                                  call->receiver_is_self_attribute,
-                                                 call->callee_name, res.strategy)) ||
+                                                 call->callee_name, res.strategy) &&
+             !cbm_weak_member_same_file_exempt(lang == CBM_LANG_SCALA, res.strategy, rel,
+                                               weak_target_file)) ||
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
                                                  call->callee_is_locally_bound, res.strategy);
 
