@@ -2144,13 +2144,19 @@ static void application_update_notice_inject(cbm_daemon_application_session_t *s
                                              char **response_io) {
     cbm_daemon_application_t *application = session->application;
     cbm_mutex_lock(&application->mutex);
-    if (session->background_eligible && !session->update_notice_delivered &&
-        !session->pending_update_notice && application->update_thread_done &&
-        application->update_notice[0] &&
-        cbm_mcp_jsonrpc_response_prepend_notice(response_io, application->update_notice)) {
+    bool should_inject = session->background_eligible && !session->update_notice_delivered &&
+                         !session->pending_update_notice && application->update_thread_done &&
+                         application->update_notice[0];
+    bool injected = should_inject &&
+                    cbm_mcp_jsonrpc_response_prepend_notice(response_io,
+                                                             application->update_notice);
+    if (injected) {
         session->pending_update_notice = true;
     }
     cbm_mutex_unlock(&application->mutex);
+    if (should_inject && !injected) {
+        cbm_log_warn("daemon.update_notice.inject_failed", "status", "omitted");
+    }
 }
 
 static bool application_watch_job_subscription_exists_locked(
@@ -2556,6 +2562,13 @@ static cbm_daemon_runtime_application_status_t application_mcp_request(
         parsed_ok && parsed.has_id && parsed.method && strcmp(parsed.method, "tools/call") == 0;
     char *response = cbm_mcp_server_handle(session->mcp, message);
     free(message);
+    if (!response && (!parsed_ok || parsed.has_id)) {
+        cbm_log_error("daemon.mcp.response_missing", "status", "error");
+        if (parsed_ok) {
+            cbm_jsonrpc_request_free(&parsed);
+        }
+        return CBM_DAEMON_RUNTIME_APPLICATION_HANDLER_ERROR;
+    }
     if (initialize_request && application_jsonrpc_success(response)) {
         cbm_mutex_lock(&session->application->mutex);
         session->pending_background_initialize = true;

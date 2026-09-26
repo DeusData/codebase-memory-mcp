@@ -1803,7 +1803,30 @@ static void handle_rpc(cbm_http_conn_t *c, const cbm_http_req_t *req, cbm_mcp_se
         cbm_http_replyf(c, 200, g_cors_json, "%s", response);
         free(response);
     } else {
-        cbm_http_replyf(c, 204, g_cors, "%s", "");
+        cbm_jsonrpc_request_t parsed = {0};
+        bool parsed_ok = cbm_jsonrpc_parse(req->body, &parsed) == 0;
+        bool notification = parsed_ok && !parsed.has_id;
+        char *error_response = NULL;
+        if (parsed_ok && parsed.has_id) {
+            cbm_jsonrpc_response_t error = {
+                .id = parsed.id,
+                .id_str = parsed.id_str,
+                .error_json = "{\"code\":-32603,\"message\":\"Failed to produce a response\"}",
+            };
+            error_response = cbm_jsonrpc_format_response(&error);
+        }
+        cbm_jsonrpc_request_free(&parsed);
+        if (notification) {
+            cbm_http_replyf(c, 204, g_cors, "%s", "");
+        } else {
+            cbm_log_error("http.rpc.response_missing", "status", "error");
+            if (error_response) {
+                cbm_http_replyf(c, 500, g_cors_json, "%s", error_response);
+            } else {
+                cbm_http_replyf(c, 500, g_cors, "%s", "Failed to produce a response");
+            }
+        }
+        free(error_response);
     }
 }
 
