@@ -2749,18 +2749,34 @@ TEST(elixir_complexity_and_fingerprint) {
                                "    end\n"
                                "  end\n"
                                "  def plain(a), do: a\n"
+                               "  def summarize(orders, currency) do\n"
+                               "    totals = Enum.map(orders, fn order -> order.amount * order.rate end)\n"
+                               "    count = length(totals)\n"
+                               "    sum = Enum.reduce(totals, 0, fn value, acc -> acc + value end)\n"
+                               "    average = if count > 0, do: sum / count, else: 0\n"
+                               "    label = String.upcase(currency) <> \" total\"\n"
+                               "    %{label: label, sum: sum, count: count, average: average}\n"
+                               "  end\n"
                                "end\n",
                                CBM_LANG_ELIXIR, "t", "cx.ex");
     ASSERT_NOT_NULL(r);
     ASSERT_FALSE(r->has_error);
     CBMDefinition *cls = NULL;
     CBMDefinition *plain = NULL;
+    CBMDefinition *summarize = NULL;
     for (int i = 0; i < r->defs.count; i++) {
         if (strcmp(r->defs.items[i].name, "classify") == 0)
             cls = &r->defs.items[i];
         if (strcmp(r->defs.items[i].name, "plain") == 0)
             plain = &r->defs.items[i];
+        if (strcmp(r->defs.items[i].name, "summarize") == 0)
+            summarize = &r->defs.items[i];
     }
+    /* A body past the MinHash size gate gets a fingerprint (Elixir used to emit
+     * none at all); a one-expression body stays below the gate and gets none. */
+    ASSERT_NOT_NULL(summarize);
+    ASSERT(summarize->fingerprint_k > 0);
+    ASSERT_NOT_NULL(summarize->fingerprint);
     ASSERT_NOT_NULL(cls);
     /* The `case` itself + its 3 arms + the second arm's own `when` guard. */
     ASSERT_EQ(5, cls->complexity);
@@ -2771,6 +2787,7 @@ TEST(elixir_complexity_and_fingerprint) {
     ASSERT_NOT_NULL(plain);
     ASSERT_EQ(0, plain->complexity);
     ASSERT(plain->lines > 0);
+    ASSERT_EQ(0, plain->fingerprint_k);
     cbm_free_result(r);
     PASS();
 }
