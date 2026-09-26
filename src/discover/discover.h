@@ -63,6 +63,14 @@ CBMLanguage cbm_disambiguate_res(const char *path);
  * On read failure, defaults to CBM_LANG_BITBAKE. */
 CBMLanguage cbm_disambiguate_inc(const char *path);
 
+/* Gate .st files by reading the first 16KB of content. The extension is
+ * shared by IEC 61131-3 Structured Text, Smalltalk and StringTemplate.
+ * Returns CBM_LANG_ST when the first token past a BOM, comments and pragmas
+ * is an IEC declaration keyword (PROGRAM, FUNCTION_BLOCK, FUNCTION, TYPE,
+ * INTERFACE, ...) followed by a name, otherwise CBM_LANG_COUNT (not indexed).
+ * On read failure, returns CBM_LANG_COUNT. */
+CBMLanguage cbm_disambiguate_st(const char *path);
+
 /* Detect a supported script language from a file's shebang (#!...) first line.
  * Conservative fallback used only when filename/extension detection is unknown
  * (see detect_file_language); it never overrides extension or special-filename

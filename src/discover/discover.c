@@ -793,6 +793,11 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
     return global_ignored ? "gitignore" : NULL;
 }
 
+/* A file mapped to Structured Text stays ST only when its content says so. */
+static CBMLanguage gate_structured_text(CBMLanguage lang, const char *abs_path) {
+    return lang == CBM_LANG_ST ? cbm_disambiguate_st(abs_path) : lang;
+}
+
 /* Detect language for a file, handling .m disambiguation and JSON filtering. */
 static CBMLanguage detect_file_language(const char *entry_name, const char *abs_path) {
     CBMLanguage lang = cbm_language_for_filename(entry_name);
@@ -828,6 +833,8 @@ static CBMLanguage detect_file_language(const char *entry_name, const char *abs_
     if (dot && strcmp(dot, ".res") == 0) {
         lang = cbm_disambiguate_res(abs_path);
     }
+    /* Special: .st is shared by Structured Text, Smalltalk and StringTemplate */
+    lang = gate_structured_text(lang, abs_path);
     /* Special: ObjectScript Studio Export XML (<Export generator="...">) is
      * detected by content; otherwise .xml stays XML. */
     if (lang == CBM_LANG_XML) {

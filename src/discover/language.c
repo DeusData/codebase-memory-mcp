@@ -635,6 +635,9 @@ static const ext_entry_t EXT_TABLE[] = {
     /* Scheme */
     {".ss", CBM_LANG_SCHEME},
 
+    /* Structured Text */
+    {".st", CBM_LANG_ST},
+
     /* Starlark */
     {".star", CBM_LANG_STARLARK},
 
@@ -913,6 +916,7 @@ static const char *LANG_NAMES[CBM_LANG_COUNT] = {
     [CBM_LANG_OBJECTSCRIPT_EXPORT] = "ObjectScript Export XML",
     [CBM_LANG_ARKTS] = "ArkTS",
     [CBM_LANG_PLSQL] = "PL/SQL",
+    [CBM_LANG_ST] = "Structured Text",
 
 };
 
@@ -1486,4 +1490,108 @@ CBMLanguage cbm_disambiguate_cfc(const char *path) {
         return starts_with_ci(p, "<cfscript") ? CBM_LANG_CFSCRIPT : CBM_LANG_CFML;
     }
     return CBM_LANG_CFSCRIPT;
+}
+
+/* ── .st file gating (IEC 61131-3 Structured Text) ─────────────────── */
+
+/* True for a character that can continue an IEC identifier. */
+static bool st_ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+/* End of the IEC comment ("(* ... *)", "//" or C-style block comment) or, when
+ * skip_pragmas is set, the "{...}" pragma that opens at p; the end of the
+ * buffer when it is unterminated, so the caller sees no token; NULL when p
+ * opens neither. */
+static const char *st_trivia_end(const char *p, bool skip_pragmas) {
+    const char *close = NULL;
+    size_t close_len = PAIR_LEN;
+    if (p[0] == '(' && p[SKIP_ONE] == '*') {
+        close = strstr(p + PAIR_LEN, "*)");
+    } else if (p[0] == '/' && p[SKIP_ONE] == '*') {
+        close = strstr(p + PAIR_LEN, "*/");
+    } else if (p[0] == '/' && p[SKIP_ONE] == '/') {
+        close = strchr(p, '\n');
+        close_len = SKIP_ONE;
+    } else if (skip_pragmas && p[0] == '{') {
+        close = strchr(p, '}');
+        close_len = SKIP_ONE;
+    } else {
+        return NULL;
+    }
+    return close ? close + close_len : p + strlen(p);
+}
+
+/* Skip whitespace, comments and (when skip_pragmas is set) pragmas. */
+static const char *st_skip_trivia(const char *p, bool skip_pragmas) {
+    for (;;) {
+        while (*p && isspace((unsigned char)*p)) {
+            p++;
+        }
+        const char *end = st_trivia_end(p, skip_pragmas);
+        if (!end) {
+            return p;
+        }
+        p = end;
+    }
+}
+
+/* Declaration keywords a Structured Text source file can open with (the
+ * grammar's top-level items plus CLASS and the ABSTRACT/FINAL/INTERNAL
+ * modifiers that may precede them). Only VAR_GLOBAL may be followed by a
+ * pragma: after the others comes a name or another keyword. */
+typedef struct {
+    const char *keyword;
+    bool pragma_may_follow;
+} st_head_keyword_t;
+
+static const st_head_keyword_t ST_HEAD_KEYWORDS[] = {
+    {"PROGRAM", false},   {"FUNCTION_BLOCK", false}, {"FUNCTION", false},  {"INTERFACE", false},
+    {"CLASS", false},     {"TYPE", false},           {"NAMESPACE", false}, {"CONFIGURATION", false},
+    {"USING", false},     {"ABSTRACT", false},       {"FINAL", false},     {"INTERNAL", false},
+    {"VAR_GLOBAL", true},
+};
+
+/* True when p opens with an IEC declaration keyword (case-insensitive, whole
+ * word) followed by an identifier. The identifier requirement keeps out
+ * "Class {" (Pharo/Tonel) and "program(x) ::=" (StringTemplate). */
+static bool st_head_is_declaration(const char *p) {
+    for (size_t i = 0; i < sizeof(ST_HEAD_KEYWORDS) / sizeof(ST_HEAD_KEYWORDS[0]); i++) {
+        const char *kw = ST_HEAD_KEYWORDS[i].keyword;
+        size_t len = strlen(kw);
+        if (!starts_with_ci(p, kw) || st_ident_char(p[len])) {
+            continue;
+        }
+        const char *next = st_skip_trivia(p + len, ST_HEAD_KEYWORDS[i].pragma_may_follow);
+        return isalpha((unsigned char)*next) || *next == '_';
+    }
+    return false;
+}
+
+/* Gate .st files by content: the extension is shared by IEC 61131-3
+ * Structured Text, Smalltalk (Pharo/Tonel class files, GNU Smalltalk) and
+ * StringTemplate. A file is Structured Text only when its first token, past a
+ * UTF-8 BOM, comments and pragmas, is an IEC declaration keyword; anything
+ * else, including a read failure, is left unindexed (CBM_LANG_COUNT). */
+CBMLanguage cbm_disambiguate_st(const char *path) {
+    if (!path) {
+        return CBM_LANG_COUNT;
+    }
+
+    FILE *f = cbm_fopen(path, "rb");
+    if (!f) {
+        return CBM_LANG_COUNT;
+    }
+
+    /* Library sources often open with a long license/revision comment. */
+    char buf[CBM_SZ_16K + SKIP_ONE];
+    size_t n = fread(buf, SKIP_ONE, CBM_SZ_16K, f);
+    buf[n] = '\0';
+    (void)fclose(f);
+
+    const char *p = buf;
+    if (strncmp(p, "\xEF\xBB\xBF", SLEN("\xEF\xBB\xBF")) == 0) {
+        p += SLEN("\xEF\xBB\xBF");
+    }
+    return st_head_is_declaration(st_skip_trivia(p, true)) ? CBM_LANG_ST : CBM_LANG_COUNT;
 }
