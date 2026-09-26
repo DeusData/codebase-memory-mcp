@@ -1230,6 +1230,42 @@ TEST(python_import_binding_contradicts_only_foreign_chains) {
     PASS();
 }
 
+/* Base-class twin: the django shapes. Every spelling of the stdlib base must
+ * contradict the same-named project class; project bases never do, and the
+ * gate is Python-only. */
+TEST(python_external_base_contradicts_django_shapes) {
+    CBMImport items[] = {
+        {.local_name = "unittest", .module_path = "unittest"},
+        {.local_name = "ut", .module_path = "unittest"},
+        {.local_name = "TestCase", .module_path = "unittest.TestCase"},
+        {.local_name = "pkg", .module_path = "pkg.test.models"},
+    };
+    CBMImportArray imps = {.items = items, .count = 4, .cap = 4};
+    const char *project_tc = "proj.django.test.testcases.TestCase";
+    ASSERT_TRUE(cbm_python_external_base_contradicts(CBM_LANG_PYTHON, &imps, "unittest.TestCase",
+                                                     project_tc, NULL, NULL, NULL));
+    ASSERT_TRUE(cbm_python_external_base_contradicts(CBM_LANG_PYTHON, &imps, "TestCase", project_tc,
+                                                     NULL, NULL, NULL));
+    /* `import unittest as ut`: `ut.TestCase` spells `unittest.TestCase`. */
+    ASSERT_TRUE(cbm_python_external_base_contradicts(CBM_LANG_PYTHON, &imps, "ut.TestCase",
+                                                     project_tc, NULL, NULL, NULL));
+    /* A target that does spell the chain (vendored/src-layout unittest). */
+    ASSERT_FALSE(cbm_python_external_base_contradicts(
+        CBM_LANG_PYTHON, &imps, "ut.TestCase", "proj.src.unittest.TestCase", NULL, NULL, NULL));
+    /* Dotted project base through `import pkg.test.models`. */
+    ASSERT_FALSE(
+        cbm_python_external_base_contradicts(CBM_LANG_PYTHON, &imps, "pkg.test.models.Base",
+                                             "proj.pkg.test.models.Base", NULL, NULL, NULL));
+    /* Not import-bound: a same-module base is never judged. */
+    ASSERT_FALSE(cbm_python_external_base_contradicts(CBM_LANG_PYTHON, &imps, "SimpleTestCase",
+                                                      "proj.django.test.testcases.SimpleTestCase",
+                                                      NULL, NULL, NULL));
+    /* Python only. */
+    ASSERT_FALSE(cbm_python_external_base_contradicts(CBM_LANG_JAVA, &imps, "unittest.TestCase",
+                                                      project_tc, NULL, NULL, NULL));
+    PASS();
+}
+
 TEST(weak_call_guards_share_one_drop_list) {
     /* The member guard and the local-binding guard must agree on what "weak"
      * means. They share a single static predicate for exactly this reason; if
@@ -1371,5 +1407,6 @@ SUITE(registry) {
     RUN_TEST(local_binding_suppress_keeps_unshadowed_and_strong_strategies);
     RUN_TEST(import_binding_suppress_drops_only_weak_contradicted_calls);
     RUN_TEST(python_import_binding_contradicts_only_foreign_chains);
+    RUN_TEST(python_external_base_contradicts_django_shapes);
     RUN_TEST(weak_call_guards_share_one_drop_list);
 }
