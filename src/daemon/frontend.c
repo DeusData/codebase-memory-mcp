@@ -580,6 +580,12 @@ static bool frontend_recover_client(frontend_state_t *state, frontend_item_t *it
     return usable;
 }
 
+static void frontend_response_reset(uint8_t **response, uint32_t *response_length) {
+    free(*response);
+    *response = NULL;
+    *response_length = 0;
+}
+
 static void *frontend_worker(void *opaque) {
     frontend_state_t *state = opaque;
     for (;;) {
@@ -606,9 +612,7 @@ static void *frontend_worker(void *opaque) {
                     state->client, item.request_token, item.message, &response, &response_length,
                     &request_sent, FRONTEND_REQUEST_TIMEOUT_MS);
             if (status == CBM_DAEMON_RUNTIME_APPLICATION_TRANSPORT_ERROR && !request_sent) {
-                free(response);
-                response = NULL;
-                response_length = 0;
+                frontend_response_reset(&response, &response_length);
                 bool cancelled = false;
                 if (frontend_recover_client(state, &item, &cancelled)) {
                     if (cancelled) {
@@ -632,7 +636,7 @@ static void *frontend_worker(void *opaque) {
                                                   item.content_length_framed);
             }
         }
-        free(response);
+        frontend_response_reset(&response, &response_length);
         bool expected_stop = failed && frontend_should_stop(state);
         frontend_end_request(state, failed && !expected_stop);
         frontend_item_free(&item);
