@@ -7014,6 +7014,77 @@ TEST(objectscript_udl_methods_after_goto_label) {
     PASS();
 }
 
+/* #1261: a brace inside a Language = python body (string, comment, triple
+ * quote) must not desynchronize the body lexer. Before the grammar fix the
+ * first such body swallowed every later method in the class, together with
+ * their CALLS, and extraction still reported no error. */
+static void assert_python_body_is_contained(const char *py_body, int *failed) {
+    char src[1024];
+    snprintf(src, sizeof(src),
+             "Class My.Brace Extends %%RegisteredObject\n"
+             "{\n"
+             "ClassMethod PyBad() As %%String [ Language = python ]\n"
+             "{\n"
+             "%s"
+             "}\n"
+             "ClassMethod RealOne() As %%String\n"
+             "{\n"
+             "    Do ##class(My.Tgt).Hit()\n"
+             "    Quit \"one\"\n"
+             "}\n"
+             "ClassMethod RealTwo() As %%String\n"
+             "{\n"
+             "    Do ##class(My.Tgt).Hit()\n"
+             "    Quit \"two\"\n"
+             "}\n"
+             "}\n",
+             py_body);
+    CBMFileResult *r = extract(src, CBM_LANG_OBJECTSCRIPT_UDL, "t", "Brace.cls");
+    int ok = r && !r->has_error && has_def(r, "Method", "PyBad") &&
+             has_def(r, "Method", "RealOne") && has_def(r, "Method", "RealTwo") &&
+             count_calls_named(r, "My.Tgt.Hit") == 2;
+    if (ok) {
+        /* PyBad must end at its own closing brace, before RealOne starts. */
+        const CBMDefinition *bad = find_def(r, "PyBad");
+        const CBMDefinition *one = find_def(r, "RealOne");
+        ok = bad && one && bad->end_line < one->start_line;
+    }
+    if (!ok) {
+        fprintf(stderr, "    python body not contained: %s", py_body);
+        (*failed)++;
+    }
+    if (r) {
+        cbm_free_result(r);
+    }
+}
+
+TEST(objectscript_udl_python_body_braces_do_not_swallow_class) {
+    int failed = 0;
+    /* The #1261 repro. */
+    assert_python_body_is_contained("    s = \"dict literal { unbalanced\"\n"
+                                    "    return s\n",
+                                    &failed);
+    assert_python_body_is_contained("    s = 'closing } first'\n"
+                                    "    return s\n",
+                                    &failed);
+    assert_python_body_is_contained("    # a { in a comment\n"
+                                    "    return 1\n",
+                                    &failed);
+    assert_python_body_is_contained("    s = \"\"\"triple {\n"
+                                    "    still inside\"\"\"\n"
+                                    "    return s\n",
+                                    &failed);
+    assert_python_body_is_contained("    s = 'escaped \\' {'\n"
+                                    "    return s\n",
+                                    &failed);
+    /* Balanced braces in real Python syntax keep working. */
+    assert_python_body_is_contained("    d = {'k': {'n': 1}}\n"
+                                    "    return str(d)\n",
+                                    &failed);
+    ASSERT_EQ(failed, 0);
+    PASS();
+}
+
 TEST(objectscript_udl_methods) {
     CBMFileResult *r = extract("Class MyApp.Utils Extends %RegisteredObject\n"
                                "{\n"
@@ -7216,6 +7287,37 @@ TEST(objectscript_udl_trigger_body_tokens) {
             ASSERT(strstr(r->defs.items[i].body_tokens, "Log") != NULL ||
                    strstr(r->defs.items[i].body_tokens, "Audit") != NULL ||
                    strstr(r->defs.items[i].body_tokens, "id") != NULL);
+            break;
+        }
+    }
+    cbm_free_result(r);
+    PASS();
+}
+
+TEST(objectscript_udl_storage_docstring) {
+    CBMFileResult *r = extract("Class MyApp.Patient Extends %Persistent\n"
+                               "{\n"
+                               "Storage Default\n"
+                               "{\n"
+                               "<Data name=\"PatientDefaultData\">\n"
+                               "<Value name=\"1\"><Value>%classname</Value></Value>\n"
+                               "</Data>\n"
+                               "<DataLocation>^MyApp.PatientD</DataLocation>\n"
+                               "<IdLocation>^MyApp.PatientD</IdLocation>\n"
+                               "<Type>%Storage.Persistent</Type>\n"
+                               "}\n"
+                               "}\n",
+                               CBM_LANG_OBJECTSCRIPT_UDL, "t", "Patient.cls");
+    ASSERT_NOT_NULL(r);
+    ASSERT_FALSE(r->has_error);
+    ASSERT(has_def(r, "Storage", "Default"));
+    for (int i = 0; i < r->defs.count; i++) {
+        if (strcmp(r->defs.items[i].label, "Storage") == 0 &&
+            strcmp(r->defs.items[i].name, "Default") == 0) {
+            ASSERT_NOT_NULL(r->defs.items[i].docstring);
+            ASSERT(strstr(r->defs.items[i].docstring, "\"data_global\":\"^MyApp.PatientD\"") !=
+                   NULL);
+            ASSERT(strstr(r->defs.items[i].docstring, "\"id_global\"") != NULL);
             break;
         }
     }
@@ -8283,6 +8385,7 @@ SUITE(extraction) {
     /* InterSystems ObjectScript (UDL / routine / Export XML). */
     RUN_TEST(objectscript_udl_class);
     RUN_TEST(objectscript_udl_methods_after_goto_label);
+    RUN_TEST(objectscript_udl_python_body_braces_do_not_swallow_class);
     RUN_TEST(objectscript_udl_methods);
     RUN_TEST(objectscript_udl_base_classes);
     RUN_TEST(objectscript_udl_multiple_bases);
@@ -8294,6 +8397,7 @@ SUITE(extraction) {
     RUN_TEST(objectscript_udl_trigger_member);
     RUN_TEST(objectscript_udl_trigger_body_quit);
     RUN_TEST(objectscript_udl_trigger_body_tokens);
+    RUN_TEST(objectscript_udl_storage_docstring);
     RUN_TEST(objectscript_udl_ensemble_production_def_parses_items);
     RUN_TEST(objectscript_udl_ensemble_production_def_hs_settings);
     RUN_TEST(objectscript_udl_ensemble_production_def_absent_no_error);
