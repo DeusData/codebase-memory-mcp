@@ -166,11 +166,9 @@ static inline int cbm_setenv(const char *name, const char *value, int overwrite)
         free(wide_value);
         return EINVAL;
     }
-    /* Keep the CRT's narrow environment useful for legacy getenv callers,
-     * then repair the process-wide Windows environment with the actual UTF-16
-     * value. _putenv_s alone routes UTF-8 path bytes through the active ANSI
-     * code page, which corrupts non-ASCII cache roots inherited by children. */
-    int status = _putenv_s(name, value);
+    /* _putenv_s can reject UTF-8 bytes outside the active ANSI code page.
+     * Narrow getenv returns bytes in that code page after this wide update. */
+    int status = _wputenv_s(wide_name, wide_value);
     if (status == 0 && !SetEnvironmentVariableW(wide_name, wide_value)) {
         status = EINVAL;
     }

@@ -759,7 +759,9 @@ static bool cli_activation_production_context_init(cli_activation_production_con
     context->cleanup_ok = true;
     context->deadline_ms = cli_activation_deadline_after(CLI_ACTIVATION_DRAIN_TIMEOUT_MS);
     context->control_deadline_ms = cli_activation_deadline_after(CLI_ACTIVATION_CONTROL_TIMEOUT_MS);
-    const char *original_cache_environment = getenv("CBM_CACHE_DIR");
+    char original_cache_buffer[CLI_BUF_4K];
+    const char *original_cache_environment = cbm_safe_getenv("CBM_CACHE_DIR", original_cache_buffer,
+                                                             sizeof(original_cache_buffer), NULL);
     context->original_cache_environment_present = original_cache_environment != NULL;
     if (context->original_cache_environment_present) {
         context->original_cache_environment = strdup(original_cache_environment);

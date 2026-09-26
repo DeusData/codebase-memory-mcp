@@ -25,6 +25,7 @@
 #include "foundation/compat_fs.h"  // cbm_fopen — crash-supervisor per-file marker write
 #include "foundation/hash_table.h" // CBMHashTable — crash-supervisor quarantine set
 #include "tree_sitter/api.h" // TSParser, TSNode, TSTree, TSInput, TSLanguage, TSPoint, TSParseOptions, TSParseState
+#include "foundation/platform.h"
 #include "foundation/constants.h"
 #include "mimalloc.h" // mi_malloc/mi_calloc/mi_realloc/mi_free/mi_usable_size — bind 3rd-party allocators (#424)
 #if defined(CBM_BIND_TS_ALLOCATOR) && CBM_BIND_TS_ALLOCATOR
@@ -969,7 +970,9 @@ static int count_params_from_signature(const char *sig) {
  * unlucky in-flight file is never quarantined alone. The env var is set
  * solely by the supervisor during recovery — a no-op on normal runs. */
 static void cbm_index_mark(const char *rel_path, char event) {
-    const char *mf = getenv("CBM_INDEX_MARKER_FILE");
+    char marker_path[CBM_SZ_4K];
+    const char *mf =
+        cbm_safe_getenv("CBM_INDEX_MARKER_FILE", marker_path, sizeof(marker_path), NULL);
     if (!mf || !mf[0] || !rel_path || !rel_path[0]) {
         return;
     }
@@ -1006,7 +1009,9 @@ enum { CBM_QSET_UNINIT = 0, CBM_QSET_INITING = 1, CBM_QSET_INITED = 2 };
 static atomic_int g_quarantine_state = CBM_QSET_UNINIT;
 
 static void cbm_quarantine_load(void) {
-    const char *qf = getenv("CBM_INDEX_QUARANTINE_FILE");
+    char quarantine_path[CBM_SZ_4K];
+    const char *qf = cbm_safe_getenv("CBM_INDEX_QUARANTINE_FILE", quarantine_path,
+                                     sizeof(quarantine_path), NULL);
     if (!qf || !qf[0]) {
         return; /* normal path: empty set */
     }
