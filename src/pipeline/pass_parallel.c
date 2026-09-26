@@ -1607,7 +1607,8 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
 
 /* Create IMPORTS edges for one file's imports (parallel path). */
 static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *result,
-                                const char *rel, CBMHashTable *namespace_map) {
+                                const char *rel, CBMLanguage language,
+                                CBMHashTable *namespace_map) {
     int count = 0;
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *source_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);
@@ -1621,7 +1622,7 @@ static int create_imports_edges(cbm_pipeline_ctx_t *ctx, const CBMFileResult *re
             continue;
         }
         const cbm_gbuf_node_t *target =
-            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, imp, namespace_map);
+            cbm_pipeline_resolve_import_node(ctx, rel, file_qn, language, imp, namespace_map);
         if (target && target->id != source_node->id) {
             char esc_ln[CBM_SZ_128];
             cbm_json_escape(esc_ln, sizeof(esc_ln), imp->local_name ? imp->local_name : "");
@@ -1745,7 +1746,7 @@ int cbm_build_registry_from_cache(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t
             }
         }
 
-        imports_edges += create_imports_edges(ctx, result, rel, namespace_map);
+        imports_edges += create_imports_edges(ctx, result, rel, files[i].language, namespace_map);
         create_channel_edges(ctx, result, rel);
         cbm_pipeline_create_env_configures_for_file(ctx, result, rel);
         if (loaded) {
@@ -2927,7 +2928,7 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             continue;
         }
 
-        /* Dynamic-language weak-member suppression (#592/#606/#1276). The
+        /* Receiver-aware weak-member suppression (#592/#606/#1276). The
          * receiver-aware guard must NOT drop this call here: doing so would also
          * skip the #523 callee-name service bypass below, emit_service_edge's
          * route/gRPC/config branches, and its unconditional detect_url_in_args
@@ -2946,16 +2947,26 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
                                     lang == CBM_LANG_ARKTS ||
                                     /* embedded-script hosts — see pass_calls.c */
                                     lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                    lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                    /* Scala — see pass_calls.c (#2155) */
+                                    lang == CBM_LANG_SCALA;
         /* Bare-call local-binding suppression — see the note in pass_calls.c.
          * This gate MUST stay identical to the one there. */
         bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
-        /* The member guard's one exemption — MUST match pass_calls.c exactly. */
+        /* The member guard's exemptions — MUST match pass_calls.c exactly. */
+        const char *weak_target_file = NULL;
+        if (lang == CBM_LANG_SCALA && call->is_method && res.qualified_name &&
+            res.qualified_name[0]) {
+            const cbm_gbuf_node_t *t = cbm_gbuf_find_by_qn(rc->main_gbuf, res.qualified_name);
+            weak_target_file = t ? t->file_path : NULL;
+        }
         bool drop_plain_call =
             (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
              !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                                  call->receiver_is_self_attribute,
-                                                 call->callee_name, res.strategy)) ||
+                                                 call->callee_name, res.strategy) &&
+             !cbm_weak_member_same_file_exempt(lang == CBM_LANG_SCALA, res.strategy, rel,
+                                               weak_target_file)) ||
             cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
                                                  call->callee_is_locally_bound, res.strategy);
 

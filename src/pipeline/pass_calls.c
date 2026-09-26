@@ -107,7 +107,7 @@ static char *extract_local_name_from_json(const char *props_json) {
     return cbm_strndup(start, end - start);
 }
 
-static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
+static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path, CBMLanguage language,
                             const CBMFileResult *result, const char ***out_keys,
                             const char ***out_vals, int *out_count) {
     *out_keys = NULL;
@@ -130,7 +130,7 @@ static int build_import_map(cbm_pipeline_ctx_t *ctx, const char *rel_path,
                 continue;
             }
             const cbm_gbuf_node_t *target =
-                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, imp, NULL);
+                cbm_pipeline_resolve_import_node(ctx, rel_path, file_qn, language, imp, NULL);
             if (!target) {
                 continue;
             }
@@ -606,7 +606,7 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
         return 0;
     }
 
-    /* Dynamic-language weak-member suppression (#592/#606/#1276). A member call
+    /* Receiver-aware weak-member suppression (#592/#606/#1276). A member call
      * x.foo() only reaches the registry when the language's LSP could not
      * resolve the receiver type (the LSP block above already returned for
      * type-resolved calls, including the "resolved but target out of gbuf"
@@ -634,21 +634,33 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call,
                                  * to a docs bundle (2026-09-16 probe: 4,207 junk
                                  * edges on JetBrains/Exposed). */
                                 lang == CBM_LANG_HTML || lang == CBM_LANG_VUE ||
-                                lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO;
+                                lang == CBM_LANG_SVELTE || lang == CBM_LANG_ASTRO ||
+                                /* Scala has no LSP resolver; receiver calls are
+                                 * flagged by extract_calls.c (#2155). */
+                                lang == CBM_LANG_SCALA;
     /* Bare-call local-binding suppression. A member call has a receiver the
      * guard above can reason about; a bare `run()` has none, so that guard
      * cannot see this class at all. Python-only today because the extraction
      * flag is set only for Python — this gate MUST match pass_parallel.c's
      * exactly, for the same divergence reason noted above. */
     bool suppress_weak_local_binding = lang == CBM_LANG_PYTHON;
-    /* The member guard's one exemption (Python, self/cls-rooted receiver,
-     * unique_name, not a builtin type's method) — see
-     * cbm_weak_member_unique_name_exempt. MUST match pass_parallel.c exactly. */
+    /* The member guard's exemptions (Python: self/cls-rooted receiver,
+     * unique_name, not a builtin type's method; Scala: unique_name /
+     * field_type_hint target in the caller's own file) — see
+     * cbm_weak_member_unique_name_exempt / cbm_weak_member_same_file_exempt.
+     * MUST match pass_parallel.c exactly. */
+    const char *weak_target_file = NULL;
+    if (lang == CBM_LANG_SCALA && call->is_method && res.qualified_name && res.qualified_name[0]) {
+        const cbm_gbuf_node_t *t = cbm_gbuf_find_by_qn(ctx->gbuf, res.qualified_name);
+        weak_target_file = t ? t->file_path : NULL;
+    }
     bool drop_plain_call =
         (cbm_suppress_weak_member_match(suppress_weak_member, call->is_method, res.strategy) &&
          !cbm_weak_member_unique_name_exempt(lang == CBM_LANG_PYTHON,
                                              call->receiver_is_self_attribute, call->callee_name,
-                                             res.strategy)) ||
+                                             res.strategy) &&
+         !cbm_weak_member_same_file_exempt(lang == CBM_LANG_SCALA, res.strategy, rel,
+                                           weak_target_file)) ||
         cbm_suppress_weak_local_binding_call(suppress_weak_local_binding,
                                              call->callee_is_locally_bound, res.strategy);
 
@@ -827,7 +839,7 @@ int cbm_pipeline_pass_calls(cbm_pipeline_ctx_t *ctx, const cbm_file_info_t *file
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, rel, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, rel, files[i].language, result, &imp_keys, &imp_vals, &imp_count);
 
         /* Compute module QN for same-module resolution (directory-based for
          * Java/Go so it matches their def-node QNs in the registry). */
@@ -985,7 +997,8 @@ void cbm_pipeline_pass_fastapi_depends(cbm_pipeline_ctx_t *ctx, const cbm_file_i
         const char **imp_keys = NULL;
         const char **imp_vals = NULL;
         int imp_count = 0;
-        build_import_map(ctx, files[i].rel_path, result, &imp_keys, &imp_vals, &imp_count);
+        build_import_map(ctx, files[i].rel_path, files[i].language, result, &imp_keys, &imp_vals,
+                         &imp_count);
 
         for (int d = 0; d < result->defs.count; d++) {
             CBMDefinition *def = &result->defs.items[d];

@@ -669,6 +669,23 @@ bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_at
     return !cbm_python_is_builtin_member(simple_name(callee_name));
 }
 
+/* Scala counterpart of the exemption above. Scala has no LSP resolver, so every
+ * receiver call reaches the registry; a unique_name / field_type_hint match
+ * whose target sits in the caller's own file is far more often the inherited or
+ * sibling method the file declares than a coincidence (measured on
+ * twitter/finagle, see #2155). suffix_match — several same-named candidates,
+ * picked by distance — stays suppressed even when it lands nearby. */
+bool cbm_weak_member_same_file_exempt(bool is_scala, const char *strategy, const char *caller_file,
+                                      const char *target_file) {
+    if (!is_scala || !strategy || !caller_file || !target_file) {
+        return false;
+    }
+    if (strcmp(strategy, "unique_name") != 0 && strcmp(strategy, "field_type_hint") != 0) {
+        return false;
+    }
+    return strcmp(caller_file, target_file) == 0;
+}
+
 /* Bare-call counterpart of the member guard above. A Python call `foo()` whose
  * callee identifier is bound as a parameter of an enclosing scope cannot be the
  * module-level `foo`: the parameter shadows it for the whole body. Binding such
@@ -1017,6 +1034,16 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
     }
+    /* Scala: an import binds the class, but `Foo.method()` on a class name is a
+     * call into the companion object, whose QN carries a trailing `$`. No other
+     * language emits `$`-suffixed owner QNs, so the probe is a no-op for them. */
+    if (suffix && suffix[0]) {
+        snprintf(candidate, sizeof(candidate), "%s$.%s", resolved, suffix);
+        stored_key = cbm_ht_get_key(r->exact, candidate);
+        if (stored_key) {
+            return (cbm_resolution_t){stored_key, "import_map", CONF_IMPORT_MAP, REG_RESOLVED};
+        }
+    }
 
     /* import_map_suffix fallback: find a QN starting with resolved+"." and
      * ending with "."+suffix. Any such QN's last segment equals the last
@@ -1026,17 +1053,24 @@ static cbm_resolution_t resolve_import_map(const cbm_registry_t *r, const char *
      * phase (94% of samples: 700k-entry foreach + strlen per entry). */
     if (suffix && suffix[0]) {
         char resolved_dot[CBM_SZ_512];
+        char companion_dot[CBM_SZ_512];
         char dot_suffix[CBM_SZ_256];
         snprintf(resolved_dot, sizeof(resolved_dot), "%s.", resolved);
+        snprintf(companion_dot, sizeof(companion_dot), "%s$.", resolved);
         snprintf(dot_suffix, sizeof(dot_suffix), ".%s", suffix);
         qn_array_t *arr = cbm_ht_get(r->by_name, simple_name(suffix));
         if (arr) {
             size_t rd_len = strlen(resolved_dot);
+            size_t cd_len = strlen(companion_dot);
             size_t ds_len = strlen(dot_suffix);
             for (int i = 0; i < arr->count; i++) {
                 const char *qn = arr->items[i];
                 size_t klen = strlen(qn);
-                if (klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0 &&
+                bool under_owner =
+                    klen >= rd_len + ds_len && strncmp(qn, resolved_dot, rd_len) == 0;
+                bool under_companion =
+                    klen >= cd_len + ds_len && strncmp(qn, companion_dot, cd_len) == 0;
+                if ((under_owner || under_companion) &&
                     strcmp(qn + klen - ds_len, dot_suffix) == 0) {
                     return (cbm_resolution_t){qn, "import_map_suffix", CONF_IMPORT_MAP_SUFFIX,
                                               REG_RESOLVED};
@@ -1055,6 +1089,16 @@ static cbm_resolution_t resolve_same_module(const cbm_registry_t *r, const char 
     const char *stored_key = cbm_ht_get_key(r->exact, candidate);
     if (stored_key) {
         return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+    }
+    /* Scala `Owner.member` in the declaring file: the member may live under
+     * the companion `Owner$`. Try each owner segment with the suffix once. */
+    for (const char *dot = strchr(callee_name, '.'); dot; dot = strchr(dot + 1, '.')) {
+        snprintf(candidate, sizeof(candidate), "%s.%.*s$%s", module_qn, (int)(dot - callee_name),
+                 callee_name, dot);
+        stored_key = cbm_ht_get_key(r->exact, candidate);
+        if (stored_key) {
+            return (cbm_resolution_t){stored_key, "same_module", CONF_SAME_MODULE, REG_RESOLVED};
+        }
     }
     if (suffix && suffix[0]) {
         snprintf(candidate, sizeof(candidate), "%s.%s", module_qn, suffix);
@@ -1109,6 +1153,45 @@ static cbm_resolution_t resolve_multi_with_imports(const qn_array_t *arr, const 
  * as trustworthy as a same-module hit. */
 #define CONF_QUALIFIED_SUFFIX 0.90
 
+/* Segment equality that lets a Scala companion object stand in for its class:
+ * a call written `Foo.make` reaches the method declared under `Foo$`. Every
+ * other language never emits a `$`-terminated segment, so this is exact
+ * equality for them. */
+static bool qn_seg_matches(const char *seg, size_t seg_len, const char *cand, size_t cand_len) {
+    if (cand_len == seg_len) {
+        return strncmp(seg, cand, seg_len) == 0;
+    }
+    return cand_len == seg_len + 1 && cand[seg_len] == '$' && strncmp(seg, cand, seg_len) == 0;
+}
+
+/* True when `qn` equals `dotted` or ends with ".<dotted>", compared segment by
+ * segment from the right so companion segments (`Foo$`) match `Foo`. */
+static bool qn_tail_matches(const char *qn, const char *dotted) {
+    const char *q_end = qn + strlen(qn);
+    const char *d_end = dotted + strlen(dotted);
+    for (;;) {
+        const char *q_dot = q_end;
+        while (q_dot > qn && q_dot[-1] != '.') {
+            q_dot--;
+        }
+        const char *d_dot = d_end;
+        while (d_dot > dotted && d_dot[-1] != '.') {
+            d_dot--;
+        }
+        if (!qn_seg_matches(d_dot, (size_t)(d_end - d_dot), q_dot, (size_t)(q_end - q_dot))) {
+            return false;
+        }
+        if (d_dot == dotted) {
+            return true; /* every callee segment matched at a segment boundary */
+        }
+        if (q_dot == qn) {
+            return false; /* callee has more segments than the candidate */
+        }
+        q_end = q_dot - 1;
+        d_end = d_dot - 1;
+    }
+}
+
 /* When a callee is package/namespace-qualified (Foo::Bar::sub or Foo.Bar.sub),
  * disambiguate among same-simple-name candidates by matching the FULL qualified
  * tail against each candidate QN at a segment boundary. Returns the sole
@@ -1141,16 +1224,7 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
     const char *match = NULL;
     for (int i = 0; i < arr->count; i++) {
         const char *qn = arr->items[i];
-        size_t qlen = strlen(qn);
-        if (qlen < w) {
-            continue;
-        }
-        const char *tail = qn + (qlen - w);
-        if (strcmp(tail, dotted) != 0) {
-            continue;
-        }
-        /* Segment boundary: tail is the whole QN or is preceded by '.'. */
-        if (tail != qn && tail[-1] != '.') {
+        if (!qn_tail_matches(qn, dotted)) {
             continue;
         }
         if (match) {
@@ -1242,7 +1316,7 @@ static bool receiver_chain_admits(const char *callee_name, const char *candidate
         for (const char *anc = candidate_qn; anc < cand_last;) {
             const char *anc_end = strchr(anc, '.');
             size_t anc_len = (size_t)(anc_end - anc);
-            if (anc_len == len && len > 0 && strncmp(seg, anc, len) == 0) {
+            if (len > 0 && qn_seg_matches(seg, len, anc, anc_len)) {
                 return true;
             }
             anc = anc_end + SKIP_ONE;

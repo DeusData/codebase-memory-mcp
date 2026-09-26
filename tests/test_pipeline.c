@@ -1052,6 +1052,44 @@ static bool cross_file_call_exists(cbm_store_t *s, const char *project, const ch
     return cross_file_edge_exists(s, project, src_name, tgt_name, "CALLS");
 }
 
+static bool cross_file_call_to_owner_has_strategy(cbm_store_t *s, const char *project,
+                                                  const char *src_name, const char *tgt_name,
+                                                  const char *owner_fragment,
+                                                  const char *strategy_fragment) {
+    cbm_node_t *srcs = NULL;
+    cbm_node_t *tgts = NULL;
+    int sc = 0;
+    int tc = 0;
+    cbm_store_find_nodes_by_name(s, project, src_name, &srcs, &sc);
+    cbm_store_find_nodes_by_name(s, project, tgt_name, &tgts, &tc);
+    bool found = false;
+    for (int i = 0; i < sc && !found; i++) {
+        cbm_edge_t *edges = NULL;
+        int ec = 0;
+        cbm_store_find_edges_by_source_type(s, srcs[i].id, "CALLS", &edges, &ec);
+        for (int j = 0; j < ec && !found; j++) {
+            for (int k = 0; k < tc; k++) {
+                if (edges[j].target_id == tgts[k].id && tgts[k].qualified_name &&
+                    strstr(tgts[k].qualified_name, owner_fragment) && edges[j].properties_json &&
+                    strstr(edges[j].properties_json, strategy_fragment)) {
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (edges) {
+            cbm_store_free_edges(edges, ec);
+        }
+    }
+    if (srcs) {
+        cbm_store_free_nodes(srcs, sc);
+    }
+    if (tgts) {
+        cbm_store_free_nodes(tgts, tc);
+    }
+    return found;
+}
+
 /* True iff the exact named CALLS edge exists and its serialized strategy
  * contains `strategy_fragment`. Parallel synthetic-carrier regressions use
  * this on a separate ordinary-call control: it proves the cross-file LSP ran
@@ -6118,6 +6156,283 @@ TEST(pipeline_go_bare_ref_never_binds_field_parallel) {
     PASS();
 }
 
+/* Scala receiver calls on untyped values (`_.register()`, `values.get(k)`,
+ * `xs contains n`) must not bind an arbitrary project method that shares the
+ * short name. Controls: a bare call still binds a cross-file helper by unique
+ * name, and a receiver call whose unique target is declared in the caller's own
+ * file (the inherited-method shape) keeps its edge via the same-file exemption. */
+static void write_scala_weak_member_fixture(const char *tmp) {
+    write_temp_file(tmp, "targets.scala",
+                    "package targets\n"
+                    "class LedgerEntry { def register(): Unit = () }\n"
+                    "class AuditEntry { def register(): Unit = () }\n"
+                    "class SettingsStore { def get(key: String): String = key }\n"
+                    "class Inventory { def contains(n: Int): Boolean = true }\n");
+    write_temp_file(tmp, "helpers.scala",
+                    "package helpers\n"
+                    "object Helpers { def localHelper(): Int = 1 }\n");
+    write_temp_file(tmp, "caller.scala",
+                    "package caller\n"
+                    "object Calls {\n"
+                    "  def registerAll(xs: Seq[AnyRef]): Unit = xs.foreach(_.register())\n"
+                    "  def lookup(values: Map[String, String]) = values.get(\"id\")\n"
+                    "  def has(xs: Seq[Int], n: Int): Boolean = xs contains n\n"
+                    "  def callsLocal(): Int = localHelper()\n"
+                    "}\n");
+    write_temp_file(tmp, "zoo.scala",
+                    "package zoo\n"
+                    "class Animal { def describe(): String = \"animal\" }\n"
+                    "class Dog extends Animal\n"
+                    "object Zoo { def show(d: Dog): String = d.describe() }\n");
+}
+
+static bool scala_weak_member_edges_are_clean(cbm_store_t *s, const char *project) {
+    return !cross_file_call_exists(s, project, "registerAll", "register") &&
+           !cross_file_call_exists(s, project, "lookup", "get") &&
+           !cross_file_call_exists(s, project, "has", "contains") &&
+           cross_file_call_exists(s, project, "callsLocal", "localHelper") &&
+           cross_file_call_exists(s, project, "show", "describe");
+}
+
+TEST(pipeline_scala_receiver_suppresses_weak_method_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_recv_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_weak_member_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_recv.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_weak_member_edges_are_clean(s, project));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_scala_receiver_parallel_suppresses_weak_method_edges) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_weak_member_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "filler%d.scala", i);
+        snprintf(body, sizeof(body), "object Filler%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    const char *project = cbm_pipeline_project_name(p);
+
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_weak_member_edges_are_clean(s, project));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
+static void write_scala_import_alias_fixture(const char *tmp) {
+    write_temp_file(tmp, "alias_targets.scala",
+                    "package alias_targets\n"
+                    "object CorrectObject { def execute(): Int = 1 }\n"
+                    "object WrongObject { def execute(): Int = 2 }\n"
+                    "object ExternalStateRef { def make(): Int = 3 }\n");
+    write_temp_file(tmp, "alias_caller.scala",
+                    "package alias_caller\n"
+                    "import alias_targets.{CorrectObject => ImportedAlias}\n"
+                    "import outside.library.ExternalStateRef\n"
+                    "object AliasCalls {\n"
+                    "  def invokeAlias(): Int = ImportedAlias.execute()\n"
+                    "  def invokeExternal(): Int = ExternalStateRef.make()\n"
+                    "}\n");
+}
+
+static bool scala_import_alias_edge_is_exact(cbm_store_t *s, const char *project) {
+    cbm_edge_t *imports = NULL;
+    int import_count = 0;
+    bool exact_call = cross_file_call_to_owner_has_strategy(s, project, "invokeAlias", "execute",
+                                                            "CorrectObject.execute", "import_map");
+    cbm_store_find_edges_by_type(s, project, "IMPORTS", &imports, &import_count);
+    if (imports) {
+        cbm_store_free_edges(imports, import_count);
+    }
+    return exact_call && import_count == 1;
+}
+
+TEST(pipeline_scala_import_alias_resolves_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_import_alias_fixture(tmp);
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_alias.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_import_alias_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* `import pkg.Owner.member` when the package is split across modules and a
+ * second file in the same package declares a same-named member: the import
+ * must bind to Owner.member, not degrade to the owner (which would drop the
+ * unqualified `member()` call). */
+TEST(pipeline_scala_member_import_in_split_package_binds_owner_member) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_member_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(tmp, "main_parser.scala",
+                    "package split_pkg\n"
+                    "object Parser { def check(s: String): Boolean = true }\n");
+    write_temp_file(tmp, "bench_parser.scala",
+                    "package split_pkg\n"
+                    "class ParserBench { def check(s: String): Boolean = false }\n");
+    write_temp_file(tmp, "member_caller.scala",
+                    "package member_caller\n"
+                    "import split_pkg.Parser.check\n"
+                    "object Decoder { def validate(s: String): Boolean = check(s) }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_member.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_to_owner_has_strategy(s, cbm_pipeline_project_name(p), "validate",
+                                                      "check", "Parser.check", "import_map"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+/* A class with a companion object is one importable name. `import pkg.Foo`
+ * must not fail closed as ambiguous now that class and companion have
+ * distinct QNs, `Foo.factory()` must bind into the companion (`Foo$`), and
+ * `import pkg.Foo.member` must bind the companion member. */
+TEST(pipeline_scala_companion_import_and_factory_call) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_companion_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_temp_file(
+        tmp, "rational.scala",
+        "package numeric\n"
+        "class Rational(n: Int, d: Int) { def reciprocal: Rational = Rational.make(d, n) }\n"
+        "object Rational {\n"
+        "  def make(n: Int, d: Int): Rational = new Rational(n, d)\n"
+        "  def fromInt(n: Int): Rational = make(n, 1)\n"
+        "}\n");
+    write_temp_file(tmp, "factory_user.scala",
+                    "package app\n"
+                    "import numeric.Rational\n"
+                    "object FactoryUser { def half: Rational = Rational.make(1, 2) }\n");
+    write_temp_file(tmp, "member_user.scala",
+                    "package app\n"
+                    "import numeric.Rational.fromInt\n"
+                    "object MemberUser { def two: Rational = fromInt(2) }\n");
+
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_companion.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(cross_file_call_to_owner_has_strategy(s, cbm_pipeline_project_name(p), "half",
+                                                      "make", "Rational$.make", "import_map"));
+    ASSERT_TRUE(cross_file_call_to_owner_has_strategy(
+        s, cbm_pipeline_project_name(p), "two", "fromInt", "Rational$.fromInt", "import_map"));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    th_rmtree(tmp);
+    PASS();
+}
+
+TEST(pipeline_scala_import_alias_parallel_resolves_exact_method) {
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "/tmp/cbm_scala_alias_par_XXXXXX");
+    if (!cbm_mkdtemp(tmp)) {
+        FAIL("tmpdir");
+    }
+    write_scala_import_alias_fixture(tmp);
+    for (int i = 0; i < 52; i++) {
+        char name[64];
+        char body[128];
+        snprintf(name, sizeof(name), "alias_filler%d.scala", i);
+        snprintf(body, sizeof(body), "object AliasFiller%d { def value: Int = %d }\n", i, i);
+        write_temp_file(tmp, name, body);
+    }
+
+    char *old_workers = getenv("CBM_WORKERS");
+    char *saved = old_workers ? strdup(old_workers) : NULL;
+    cbm_setenv("CBM_WORKERS", "4", 1);
+    char db_path[512];
+    snprintf(db_path, sizeof(db_path), "%s/scala_alias_par.db", tmp);
+    cbm_pipeline_t *p = cbm_pipeline_new(tmp, db_path, CBM_MODE_FULL);
+    ASSERT_NOT_NULL(p);
+    ASSERT_EQ(cbm_pipeline_run(p), 0);
+    cbm_store_t *s = cbm_store_open_path(db_path);
+    ASSERT_NOT_NULL(s);
+    ASSERT_TRUE(scala_import_alias_edge_is_exact(s, cbm_pipeline_project_name(p)));
+
+    cbm_store_close(s);
+    cbm_pipeline_free(p);
+    if (saved) {
+        cbm_setenv("CBM_WORKERS", saved, 1);
+        free(saved);
+    } else {
+        cbm_unsetenv("CBM_WORKERS");
+    }
+    th_rmtree(tmp);
+    PASS();
+}
+
 /* Count nodes with the given exact name in the project (e.g. a Route path). */
 static int count_nodes_named(cbm_store_t *s, const char *project, const char *name) {
     cbm_node_t *ns = NULL;
@@ -7813,8 +8128,8 @@ static const cbm_gbuf_node_t *resolve_device_h_from(cbm_gbuf_t *gb) {
     CBMImport imp = {0};
     imp.module_path = "linux/device.h";
     imp.local_name = "h";
-    return cbm_pipeline_resolve_import_node(&ctx, "arch/x/bugs.c", "p.arch.x.bugs.c.__file__", &imp,
-                                            NULL);
+    return cbm_pipeline_resolve_import_node(&ctx, "arch/x/bugs.c", "p.arch.x.bugs.c.__file__",
+                                            CBM_LANG_C, &imp, NULL);
 }
 
 TEST(pipeline_header_include_target_is_independent_of_registration_order) {
@@ -15157,6 +15472,12 @@ SUITE(pipeline) {
     RUN_TEST(pipeline_python_receiver_parallel_suppresses_weak_method_edges);
     RUN_TEST(pipeline_python_bare_local_binding_suppresses_weak_edge);
     RUN_TEST(pipeline_python_bare_local_binding_parallel_suppresses_weak_edge);
+    RUN_TEST(pipeline_scala_import_alias_resolves_exact_method);
+    RUN_TEST(pipeline_scala_member_import_in_split_package_binds_owner_member);
+    RUN_TEST(pipeline_scala_companion_import_and_factory_call);
+    RUN_TEST(pipeline_scala_receiver_suppresses_weak_method_edges);
+    RUN_TEST(pipeline_scala_receiver_parallel_suppresses_weak_method_edges);
+    RUN_TEST(pipeline_scala_import_alias_parallel_resolves_exact_method);
     RUN_TEST(pipeline_parallel_python_cross_only_dunder_gets_synthetic_carrier);
     RUN_TEST(pipeline_parallel_rust_cross_only_macro_hidden_gets_synthetic_carrier);
     RUN_TEST(pipeline_arg_url_rejects_non_http_slash_arguments);

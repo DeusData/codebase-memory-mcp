@@ -170,6 +170,37 @@ bool cbm_label_is_type_like(const char *label) {
            strcmp(label, "Type") == 0 || strcmp(label, "Trait") == 0;
 }
 
+bool cbm_scala_is_companion_object(CBMArena *a, TSNode node, const char *source) {
+    if (!a || !source || strcmp(ts_node_type(node), "object_definition") != 0) {
+        return false;
+    }
+    TSNode name_node = ts_node_child_by_field_name(node, TS_FIELD("name"));
+    TSNode parent = ts_node_parent(node);
+    if (ts_node_is_null(name_node) || ts_node_is_null(parent)) {
+        return false;
+    }
+    char *name = cbm_node_text(a, name_node, source);
+    if (!name || !name[0]) {
+        return false;
+    }
+    uint32_t count = ts_node_named_child_count(parent);
+    for (uint32_t i = 0; i < count; i++) {
+        TSNode sibling = ts_node_named_child(parent, i);
+        const char *kind = ts_node_type(sibling);
+        if (strcmp(kind, "class_definition") != 0 && strcmp(kind, "trait_definition") != 0 &&
+            strcmp(kind, "enum_definition") != 0) {
+            continue;
+        }
+        TSNode sibling_name = ts_node_child_by_field_name(sibling, TS_FIELD("name"));
+        char *candidate =
+            ts_node_is_null(sibling_name) ? NULL : cbm_node_text(a, sibling_name, source);
+        if (candidate && strcmp(candidate, name) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // True when `label` names a data relation: SQL CREATE TABLE / CREATE VIEW, and
 // a dbt Model (a Jinja-templated .sql file, which materializes as a warehouse
 // table or view). Relations live in the registry so FROM/JOIN and dbt ref()

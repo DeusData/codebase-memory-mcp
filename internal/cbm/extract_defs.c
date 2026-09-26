@@ -4703,6 +4703,12 @@ static void extract_class_def(CBMExtractCtx *ctx, TSNode node, const CBMLangSpec
     } else {
         class_qn = cbm_fqn_compute_source_lang(a, ctx->project, ctx->rel_path, name, ctx->language);
     }
+    /* A Scala class and its companion object are distinct owners despite sharing
+     * the source-level name. Use Scala's conventional singleton-class suffix so
+     * neither container nor their methods overwrite each other in the graph. */
+    if (ctx->language == CBM_LANG_SCALA && cbm_scala_is_companion_object(a, node, ctx->source)) {
+        class_qn = cbm_arena_sprintf(a, "%s$", class_qn);
+    }
     const char *label = class_label_for_kind(kind);
 
     // Sway/WGSL: label struct defs as "Struct" and Sway `abi` blocks as
@@ -7420,12 +7426,20 @@ static const char *compute_class_qn(CBMExtractCtx *ctx, TSNode node, const char 
         char *cname = cbm_node_text(ctx->arena, name_node, ctx->source);
         if (cname && cname[0]) {
             if (saved_enclosing) {
-                return cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
+                const char *qn = cbm_arena_sprintf(ctx->arena, "%s.%s", saved_enclosing, cname);
+                return ctx->language == CBM_LANG_SCALA &&
+                               cbm_scala_is_companion_object(ctx->arena, node, ctx->source)
+                           ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
+                           : qn;
             }
             /* Top-level: language-aware module so Java/Go don't double the
              * filename stem (matches extract_class_def above). */
-            return cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path, cname,
-                                               ctx->language);
+            const char *qn = cbm_fqn_compute_source_lang(ctx->arena, ctx->project, ctx->rel_path,
+                                                         cname, ctx->language);
+            return ctx->language == CBM_LANG_SCALA &&
+                           cbm_scala_is_companion_object(ctx->arena, node, ctx->source)
+                       ? cbm_arena_sprintf(ctx->arena, "%s$", qn)
+                       : qn;
         }
     }
     return saved_enclosing;

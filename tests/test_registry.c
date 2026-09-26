@@ -1171,6 +1171,62 @@ TEST(resolve_import_map_alias_with_suffix_hits_method) {
     PASS();
 }
 
+/* Scala companion objects carry a `$` suffix on their QN. A call written on
+ * the class name (`Rational.make`) must reach the companion member through
+ * every strategy that compares owner segments: import_map, same_module and
+ * the qualified-tail disambiguator. Non-`$` QNs are matched exactly as before. */
+TEST(resolve_scala_companion_owner_matches_class_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "Rational", "proj.num.Rational.Rational", "Class");
+    cbm_registry_add(r, "Rational", "proj.num.Rational.Rational$", "Class");
+    cbm_registry_add(r, "make", "proj.num.Rational.Rational$.make", "Method");
+    cbm_registry_add(r, "make", "proj.other.Builder.Builder.make", "Method");
+
+    /* import_map: the import binds the class; the method lives in Rational$ */
+    const char *keys[] = {"Rational"};
+    const char *vals[] = {"proj.num.Rational.Rational"};
+    cbm_resolution_t res = cbm_registry_resolve(r, "Rational.make", "proj.app.Main", keys, vals, 1);
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational$.make");
+    ASSERT_STR_EQ(res.strategy, "import_map");
+
+    /* same_module: called from the declaring file */
+    res = cbm_registry_resolve(r, "Rational.make", "proj.num.Rational", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational$.make");
+    ASSERT_STR_EQ(res.strategy, "same_module");
+
+    /* qualified_suffix: two `make` candidates, the owner segment picks Rational$ */
+    res = cbm_registry_resolve(r, "Rational.make", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.num.Rational.Rational$.make");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+
+    /* A plain owner does not match a `$`-less candidate any more loosely. */
+    res = cbm_registry_resolve(r, "Builder.make", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.other.Builder.Builder.make");
+    ASSERT_STR_EQ(res.strategy, "qualified_suffix");
+    res = cbm_registry_resolve(r, "Other.make", "proj.elsewhere.X", NULL, NULL, 0);
+    ASSERT(res.strategy == NULL || strcmp(res.strategy, "qualified_suffix") != 0);
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The Scala member guard's exemption keeps unique_name / field_type_hint
+ * matches only when the target sits in the caller's own file; suffix_match
+ * and cross-file targets stay suppressed, and other languages never qualify. */
+TEST(weak_member_same_file_exempt_is_scala_local_and_specific_only) {
+    ASSERT_TRUE(
+        cbm_weak_member_same_file_exempt(true, "unique_name", "a/Zoo.scala", "a/Zoo.scala"));
+    ASSERT_TRUE(
+        cbm_weak_member_same_file_exempt(true, "field_type_hint", "a/Zoo.scala", "a/Zoo.scala"));
+    ASSERT_FALSE(
+        cbm_weak_member_same_file_exempt(true, "suffix_match", "a/Zoo.scala", "a/Zoo.scala"));
+    ASSERT_FALSE(
+        cbm_weak_member_same_file_exempt(true, "unique_name", "a/Zoo.scala", "b/Other.scala"));
+    ASSERT_FALSE(cbm_weak_member_same_file_exempt(false, "unique_name", "a/zoo.py", "a/zoo.py"));
+    ASSERT_FALSE(cbm_weak_member_same_file_exempt(true, "unique_name", "a/Zoo.scala", NULL));
+    ASSERT_FALSE(cbm_weak_member_same_file_exempt(true, NULL, "a/Zoo.scala", "a/Zoo.scala"));
+    PASS();
+}
+
 SUITE(registry) {
     /* FQN */
     RUN_TEST(fqn_simple);
@@ -1206,6 +1262,8 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_bare_alias);
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
+    RUN_TEST(resolve_scala_companion_owner_matches_class_name);
+    RUN_TEST(weak_member_same_file_exempt_is_scala_local_and_specific_only);
     RUN_TEST(resolve_unique_name);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);

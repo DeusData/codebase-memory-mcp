@@ -1818,10 +1818,199 @@ static const cbm_gbuf_node_t *resolve_sibling_file(const cbm_pipeline_ctx_t *ctx
     return found;
 }
 
+static bool node_file_in_namespace(const cbm_pipeline_ctx_t *ctx, const char *file_qn_list,
+                                   const cbm_gbuf_node_t *candidate) {
+    if (!ctx || !file_qn_list || !candidate || !candidate->file_path) {
+        return false;
+    }
+    for (const char *seg = file_qn_list; seg && *seg;) {
+        const char *eol = strchr(seg, '\n');
+        size_t len = eol ? (size_t)(eol - seg) : strlen(seg);
+        if (len > 0 && len < PKGMAP_PATH_BUF) {
+            char qn[PKGMAP_PATH_BUF];
+            memcpy(qn, seg, len);
+            qn[len] = '\0';
+            const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+            if (file_node && file_node->file_path &&
+                strcmp(file_node->file_path, candidate->file_path) == 0) {
+                return true;
+            }
+        }
+        seg = eol ? eol + 1 : NULL;
+    }
+    return false;
+}
+
+static const cbm_gbuf_node_t *first_namespace_file(const cbm_pipeline_ctx_t *ctx,
+                                                   const char *file_qn_list,
+                                                   const char *source_file_qn) {
+    for (const char *seg = file_qn_list; seg && *seg;) {
+        const char *eol = strchr(seg, '\n');
+        size_t len = eol ? (size_t)(eol - seg) : strlen(seg);
+        if (len > 0 && len < PKGMAP_PATH_BUF) {
+            char qn[PKGMAP_PATH_BUF];
+            memcpy(qn, seg, len);
+            qn[len] = '\0';
+            const cbm_gbuf_node_t *node = cbm_gbuf_find_by_qn(ctx->gbuf, qn);
+            if (node && (!source_file_qn || !node->qualified_name ||
+                         strcmp(node->qualified_name, source_file_qn) != 0)) {
+                return node;
+            }
+        }
+        seg = eol ? eol + 1 : NULL;
+    }
+    return NULL;
+}
+
+/* A Scala companion object carries the class QN plus a trailing `$`. Returns
+ * true when `a` is the companion of `b` (a == b + "$"). */
+static bool scala_qn_is_companion_of(const char *a, const char *b) {
+    size_t la = strlen(a);
+    size_t lb = strlen(b);
+    return la == lb + 1 && a[lb] == '$' && strncmp(a, b, lb) == 0;
+}
+
+static const cbm_gbuf_node_t *scala_symbol_in_namespace(const cbm_pipeline_ctx_t *ctx,
+                                                        const char *file_qn_list,
+                                                        const char *symbol,
+                                                        const char *source_file_qn) {
+    const cbm_gbuf_node_t **hits = NULL;
+    int hit_count = 0;
+    if (!symbol || !symbol[0] || cbm_gbuf_find_by_name(ctx->gbuf, symbol, &hits, &hit_count) != 0 ||
+        !hits) {
+        return NULL;
+    }
+    const cbm_gbuf_node_t *match = NULL;
+    for (int i = 0; i < hit_count; i++) {
+        const cbm_gbuf_node_t *candidate = hits[i];
+        if (!candidate || !candidate->label || !import_targetable_label(candidate->label) ||
+            !node_file_in_namespace(ctx, file_qn_list, candidate) ||
+            (source_file_qn && candidate->qualified_name &&
+             strcmp(candidate->qualified_name, source_file_qn) == 0)) {
+            continue;
+        }
+        if (match && match->qualified_name && candidate->qualified_name &&
+            strcmp(match->qualified_name, candidate->qualified_name) != 0) {
+            /* A class and its companion object are one importable name; the
+             * class stands for the pair. */
+            if (scala_qn_is_companion_of(candidate->qualified_name, match->qualified_name)) {
+                continue;
+            }
+            if (scala_qn_is_companion_of(match->qualified_name, candidate->qualified_name)) {
+                match = candidate;
+                continue;
+            }
+            return NULL; /* ambiguous within a split package */
+        }
+        match = candidate;
+    }
+    return match;
+}
+
+/* Scala source packages are independent of the repository layout. Resolve the
+ * longest declared package prefix first, then the imported top-level symbol.
+ * This deliberately fails closed: generic suffix fallback is unsafe for JVM
+ * FQNs because common names such as api/get/app occur throughout a monorepo. */
+static const cbm_gbuf_node_t *resolve_scala_namespace_import(const cbm_pipeline_ctx_t *ctx,
+                                                             const char *source_file_qn,
+                                                             const CBMImport *imp,
+                                                             CBMHashTable *namespace_map) {
+    if (!namespace_map || !imp || !imp->module_path || !imp->module_path[0]) {
+        return NULL;
+    }
+    char full[PKGMAP_PATH_BUF];
+    snprintf(full, sizeof(full), "%s", imp->module_path);
+    for (char *p = full; *p; p++) {
+        if (*p == '\\' || *p == ':' || *p == '/') {
+            *p = '.';
+        }
+    }
+    size_t full_len = strlen(full);
+    while (full_len > 0 && (full[full_len - 1] == '*' || full[full_len - 1] == '.')) {
+        full[--full_len] = '\0';
+    }
+
+    bool wildcard = imp->local_name && strcmp(imp->local_name, "*") == 0;
+    const char *exact_package = (const char *)cbm_ht_get(namespace_map, full);
+    if (wildcard && exact_package) {
+        return first_namespace_file(ctx, exact_package, source_file_qn);
+    }
+
+    char package[PKGMAP_PATH_BUF];
+    snprintf(package, sizeof(package), "%s", full);
+    for (;;) {
+        char *dot = strrchr(package, '.');
+        if (!dot) {
+            break;
+        }
+        *dot = '\0';
+        const char *files = (const char *)cbm_ht_get(namespace_map, package);
+        if (!files) {
+            continue;
+        }
+        const char *remainder = full + strlen(package) + 1;
+        char top_level[CBM_SZ_256];
+        size_t top_len = strcspn(remainder, ".");
+        if (top_len == 0 || top_len >= sizeof(top_level)) {
+            return NULL;
+        }
+        memcpy(top_level, remainder, top_len);
+        top_level[top_len] = '\0';
+        const cbm_gbuf_node_t *owner =
+            scala_symbol_in_namespace(ctx, files, top_level, source_file_qn);
+        if (wildcard || !strchr(remainder, '.')) {
+            return owner;
+        }
+        /* `import pkg.Owner.member`: the member lives under the owner's QN, so
+         * look it up there first. A namespace-wide name search would be
+         * ambiguous whenever a split package (main + benchmark module) has two
+         * same-named members and would then fall back to the owner. Only
+         * object members are importable, so when Owner has a companion the
+         * `Owner$` scope is tried before the class. */
+        if (owner && owner->qualified_name) {
+            const char *scopes[2] = {"$", ""};
+            for (int si = 0; si < 2; si++) {
+                char member_qn[CBM_SZ_512];
+                snprintf(member_qn, sizeof(member_qn), "%s%s.%s", owner->qualified_name, scopes[si],
+                         remainder + top_len + 1);
+                const cbm_gbuf_node_t *scoped = cbm_gbuf_find_by_qn(ctx->gbuf, member_qn);
+                if (scoped && scoped->label && import_targetable_label(scoped->label)) {
+                    return scoped;
+                }
+            }
+        }
+        const char *leaf = strrchr(remainder, '.');
+        const cbm_gbuf_node_t *member =
+            scala_symbol_in_namespace(ctx, files, leaf ? leaf + 1 : remainder, source_file_qn);
+        if (member && (!owner || !owner->file_path || !member->file_path ||
+                       strcmp(owner->file_path, member->file_path) == 0)) {
+            return member;
+        }
+        return owner;
+    }
+    return NULL;
+}
+
+/* Scala `package` clauses are resolved only by the fail-closed resolver above.
+ * Letting them feed the generic first-declaring-file walk would bind Java or
+ * Kotlin imports of a shared package prefix to an arbitrary Scala file. */
+static bool declaring_file_is_scala(const cbm_gbuf_node_t *node) {
+    if (!node || !node->file_path) {
+        return false;
+    }
+    const char *base = node->file_path;
+    for (const char *p = base; *p; p++) {
+        if (*p == '/' || *p == '\\') {
+            base = p + SKIP_ONE;
+        }
+    }
+    return cbm_language_for_filename(base) == CBM_LANG_SCALA;
+}
+
 const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t *ctx,
                                                         const char *source_rel,
                                                         const char *source_file_qn,
-                                                        const CBMImport *imp,
+                                                        CBMLanguage language, const CBMImport *imp,
                                                         CBMHashTable *namespace_map) {
     if (!ctx || !imp || !imp->module_path) {
         return NULL;
@@ -1898,6 +2087,10 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
         }
     }
 
+    if (language == CBM_LANG_SCALA) {
+        return resolve_scala_namespace_import(ctx, source_file_qn, imp, namespace_map);
+    }
+
     /* Strategy 2: namespace map.  `using App.Utils`, `import com.example.Foo`,
      * `use App\Utils\Helper` name a NAMESPACE (or a member of it) that the
      * path-based QN cannot express.  Try the full module path and progressively
@@ -1951,7 +2144,8 @@ const cbm_gbuf_node_t *cbm_pipeline_resolve_import_node(const cbm_pipeline_ctx_t
                     memcpy(qbuf, seg, len);
                     qbuf[len] = '\0';
                     const cbm_gbuf_node_t *n = cbm_gbuf_find_by_qn(ctx->gbuf, qbuf);
-                    if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0)) {
+                    if (n && (!source_file_qn || strcmp(n->qualified_name, source_file_qn) != 0) &&
+                        !declaring_file_is_scala(n)) {
                         return n;
                     }
                 }

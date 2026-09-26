@@ -308,6 +308,14 @@ bool cbm_python_is_builtin_member(const char *name);
 bool cbm_weak_member_unique_name_exempt(bool is_python, bool receiver_is_self_attribute,
                                         const char *callee_name, const char *strategy);
 
+/* The Scala member guard's exemption (#2155): a receiver call whose weak match
+ * (unique_name / field_type_hint, NOT suffix_match) lands in the CALLER'S OWN
+ * FILE keeps its edge — an inherited or sibling method the file itself
+ * declares is the likely target. Combine as `suppress && !exempt` in both
+ * pass_calls.c and pass_parallel.c. Pure; unit-tested in test_registry.c. */
+bool cbm_weak_member_same_file_exempt(bool is_scala, const char *strategy, const char *caller_file,
+                                      const char *target_file);
+
 /* Bare-call counterpart of the guard above. True when a resolved BARE call edge
  * binds a callee that is shadowed by an enclosing parameter, and the match came
  * from a weak short-name strategy — so the edge is fabricated by construction

@@ -24,6 +24,7 @@ static void parse_go_imports(CBMExtractCtx *ctx);
 static void parse_python_imports(CBMExtractCtx *ctx);
 static void parse_es_imports(CBMExtractCtx *ctx);
 static void parse_java_imports(CBMExtractCtx *ctx);
+static void parse_scala_imports(CBMExtractCtx *ctx);
 static void parse_rust_imports(CBMExtractCtx *ctx);
 static void parse_c_imports(CBMExtractCtx *ctx);
 static void parse_ruby_imports(CBMExtractCtx *ctx);
@@ -984,6 +985,146 @@ static void parse_generic_imports(CBMExtractCtx *ctx, const char *node_type) {
     ts_tree_cursor_delete(&cursor);
 }
 
+// --- Scala imports ---
+
+static char *scala_trim_span(CBMArena *a, const char *start, const char *end) {
+    while (start < end && isspace((unsigned char)*start)) {
+        start++;
+    }
+    while (end > start && isspace((unsigned char)end[-1])) {
+        end--;
+    }
+    return cbm_arena_strndup(a, start, (size_t)(end - start));
+}
+
+static void scala_emit_import(CBMExtractCtx *ctx, const char *path, const char *local) {
+    if (!path || !path[0] || !local || !local[0]) {
+        return;
+    }
+    CBMImport imp = {.local_name = cbm_arena_strdup(ctx->arena, local),
+                     .module_path = cbm_arena_strdup(ctx->arena, path)};
+    cbm_imports_push(&ctx->result->imports, ctx->arena, imp);
+}
+
+static void scala_parse_selector(CBMExtractCtx *ctx, const char *prefix, const char *start,
+                                 const char *end) {
+    char *selector = scala_trim_span(ctx->arena, start, end);
+    if (!selector || !selector[0] ||
+        (strncmp(selector, "given", 5) == 0 &&
+         (selector[5] == '\0' || isspace((unsigned char)selector[5])))) {
+        return;
+    }
+    if (strcmp(selector, "*") == 0 || strcmp(selector, "_") == 0) {
+        scala_emit_import(ctx, prefix, "*");
+        return;
+    }
+
+    char *rename = strstr(selector, "=>");
+    size_t op_len = 2;
+    if (!rename) {
+        rename = strstr(selector, " as ");
+        op_len = 4;
+    }
+    char *name = selector;
+    char *local = selector;
+    if (rename) {
+        local = scala_trim_span(ctx->arena, rename + op_len, selector + strlen(selector));
+        name = scala_trim_span(ctx->arena, selector, rename);
+        if (strcmp(local, "_") == 0 || strcmp(local, "*") == 0) {
+            return; // Scala 2 hidden selector: `Name => _`
+        }
+    }
+    if (!name[0] || !local[0]) {
+        return;
+    }
+    const char *path =
+        prefix && prefix[0] ? cbm_arena_sprintf(ctx->arena, "%s.%s", prefix, name) : name;
+    scala_emit_import(ctx, path, local);
+}
+
+static void scala_parse_import_expr(CBMExtractCtx *ctx, const char *start, const char *end) {
+    char *expr = scala_trim_span(ctx->arena, start, end);
+    if (!expr || !expr[0]) {
+        return;
+    }
+    char *open = strchr(expr, '{');
+    char *close = strrchr(expr, '}');
+    if (open && close && close > open) {
+        char *prefix = scala_trim_span(ctx->arena, expr, open);
+        size_t plen = strlen(prefix);
+        while (plen > 0 && (prefix[plen - 1] == '.' || isspace((unsigned char)prefix[plen - 1]))) {
+            prefix[--plen] = '\0';
+        }
+        const char *part = open + 1;
+        for (const char *p = part;; p++) {
+            if (p == close || *p == ',') {
+                scala_parse_selector(ctx, prefix, part, p);
+                if (p == close) {
+                    break;
+                }
+                part = p + 1;
+            }
+        }
+        return;
+    }
+
+    char *rename = strstr(expr, " as ");
+    if (rename) {
+        char *path = scala_trim_span(ctx->arena, expr, rename);
+        char *local = scala_trim_span(ctx->arena, rename + 4, expr + strlen(expr));
+        scala_emit_import(ctx, path, local);
+        return;
+    }
+    size_t len = strlen(expr);
+    if ((len > 2 && strcmp(expr + len - 2, ".*") == 0) ||
+        (len > 2 && strcmp(expr + len - 2, "._") == 0)) {
+        expr[len - 2] = '\0';
+        scala_emit_import(ctx, expr, "*");
+        return;
+    }
+    if (len > 6 && strcmp(expr + len - 6, ".given") == 0) {
+        expr[len - 6] = '\0';
+        scala_emit_import(ctx, expr, "*");
+        return;
+    }
+    scala_emit_import(ctx, expr, path_last(ctx->arena, expr));
+}
+
+static void parse_scala_imports(CBMExtractCtx *ctx) {
+    TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
+    if (!ts_tree_cursor_goto_first_child(&cursor)) {
+        ts_tree_cursor_delete(&cursor);
+        return;
+    }
+    do {
+        TSNode node = ts_tree_cursor_current_node(&cursor);
+        if (strcmp(ts_node_type(node), "import_declaration") != 0) {
+            continue;
+        }
+        char *text = cbm_node_text(ctx->arena, node, ctx->source);
+        if (!text || strncmp(text, "import", 6) != 0) {
+            continue;
+        }
+        const char *part = text + 6;
+        int brace_depth = 0;
+        for (const char *p = part;; p++) {
+            if (*p == '{') {
+                brace_depth++;
+            } else if (*p == '}') {
+                brace_depth--;
+            }
+            if (*p == '\0' || (*p == ',' && brace_depth == 0)) {
+                scala_parse_import_expr(ctx, part, p);
+                if (*p == '\0') {
+                    break;
+                }
+                part = p + 1;
+            }
+        }
+    } while (ts_tree_cursor_goto_next_sibling(&cursor));
+    ts_tree_cursor_delete(&cursor);
+}
+
 // --- Kotlin imports ---
 // tree-sitter-kotlin nests imports: source_file -> import_list -> import_header*.
 // parse_generic_imports only scans the DIRECT children of root, and "import" is
@@ -1646,6 +1787,7 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
                                      "file_scoped_namespace_declaration", // C# 10
                                      "package_declaration",               // Java / Kotlin
                                      "package_header",                    // Kotlin
+                                     "package_clause",                    // Scala
                                      "namespace_definition",              // PHP
                                      NULL};
     TSTreeCursor cursor = ts_tree_cursor_new(ctx->root);
@@ -1662,6 +1804,7 @@ static void capture_namespace_decl(CBMExtractCtx *ctx) {
         // The namespace name is the first qualified_name / scoped_identifier /
         // namespace_name / identifier descendant.
         static const char *name_kinds[] = {"qualified_name",
+                                           "package_identifier",
                                            "scoped_identifier",
                                            "namespace_name",
                                            "identifier",
@@ -2945,6 +3088,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
     switch (ctx->language) {
     case CBM_LANG_JAVA:
     case CBM_LANG_KOTLIN:
+    case CBM_LANG_SCALA:
     case CBM_LANG_CSHARP:
     case CBM_LANG_PHP:
         capture_namespace_decl(ctx);
@@ -2972,7 +3116,7 @@ void cbm_extract_imports(CBMExtractCtx *ctx) {
         parse_kotlin_imports(ctx);
         break;
     case CBM_LANG_SCALA:
-        parse_generic_imports(ctx, "import_declaration");
+        parse_scala_imports(ctx);
         break;
     case CBM_LANG_CSHARP:
         parse_csharp_imports(ctx);

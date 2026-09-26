@@ -3129,6 +3129,79 @@ static bool python_callee_is_bound_parameter(CBMExtractCtx *ctx, WalkState *stat
     return cbm_walk_python_param_is_bound(state, callee_name);
 }
 
+/* Scala receiver-aware guard (#2155; same intent as the Python and TS/JS flags).
+ * Scala has no LSP resolver, so `map.get(k)` or `xs.foreach(_.register())`
+ * reach the registry and bind an arbitrary project-wide `get` / `register` by
+ * short name. Flag a call that names a lower-case method on a VALUE receiver —
+ * `recv.m(...)`, curried `recv.m(a)(b)` and named infix `recv m arg` — so the
+ * call-resolution pass can suppress weak short-name
+ * matches for it. Unflagged, because the registry's receiver-chain check already
+ * judges them: `this`/`super` receivers, and chains rooted at an upper-case name
+ * (`Utils.helper`, `Bijections.finagle.m`) or applying an upper-case symbol
+ * through a package path (`http.param.Streaming(x)`). */
+static bool scala_call_is_value_member(CBMExtractCtx *ctx, TSNode node) {
+    const char *kind = ts_node_type(node);
+    TSNode receiver;
+    TSNode method;
+    if (strcmp(kind, "infix_expression") == 0) {
+        receiver = ts_node_child_by_field_name(node, TS_FIELD("left"));
+        method = ts_node_child_by_field_name(node, TS_FIELD("operator"));
+    } else if (strcmp(kind, "call_expression") == 0) {
+        TSNode fn = ts_node_child_by_field_name(node, TS_FIELD("function"));
+        while (!ts_node_is_null(fn) && strcmp(ts_node_type(fn), "call_expression") == 0) {
+            fn = ts_node_child_by_field_name(fn, TS_FIELD("function")); /* curried */
+        }
+        if (ts_node_is_null(fn) || strcmp(ts_node_type(fn), "field_expression") != 0) {
+            return false;
+        }
+        receiver = ts_node_child_by_field_name(fn, TS_FIELD("value"));
+        method = ts_node_child_by_field_name(fn, TS_FIELD("field"));
+    } else {
+        return false;
+    }
+    if (ts_node_is_null(receiver) || ts_node_is_null(method)) {
+        return false;
+    }
+    /* Only an alphabetic lower-case member is a method name; `a + b` and
+     * `Foo(x)` applies are not receiver calls in this sense. */
+    const char *m = cbm_node_text(ctx->arena, method, ctx->source);
+    if (!m || m[0] < 'a' || m[0] > 'z') {
+        return false;
+    }
+    /* Walk the receiver chain down to its root. */
+    TSNode root = receiver;
+    for (;;) {
+        const char *rk = ts_node_type(root);
+        if (strcmp(rk, "field_expression") == 0) {
+            root = ts_node_child_by_field_name(root, TS_FIELD("value"));
+        } else if (strcmp(rk, "call_expression") == 0 || strcmp(rk, "generic_function") == 0) {
+            root = ts_node_child_by_field_name(root, TS_FIELD("function"));
+        } else {
+            break;
+        }
+        if (ts_node_is_null(root)) {
+            return false;
+        }
+    }
+    const char *rk = ts_node_type(root);
+    if (strcmp(rk, "this") == 0) {
+        return false;
+    }
+    if (strcmp(rk, "wildcard") == 0) {
+        return true; /* placeholder receiver `_.m()` — a value of unknown type */
+    }
+    if (strcmp(rk, "identifier") == 0 || strcmp(rk, "operator_identifier") == 0) {
+        const char *name = cbm_node_text(ctx->arena, root, ctx->source);
+        if (!name || !name[0] || strcmp(name, "this") == 0 || strcmp(name, "super") == 0) {
+            return false;
+        }
+        return !(name[0] >= 'A' && name[0] <= 'Z');
+    }
+    /* Literals, parenthesized/tuple/instance expressions, lambdas, strings: a
+     * value whose type the resolver does not know. */
+    return true;
+}
+
 static bool is_objectscript_language(CBMLanguage language) {
     return language == CBM_LANG_OBJECTSCRIPT_UDL || language == CBM_LANG_OBJECTSCRIPT_ROUTINE;
 }
@@ -3804,6 +3877,10 @@ CBMInvocationDescriptor handle_calls(CBMExtractCtx *ctx, TSNode node, const CBML
                         }
                     }
                 }
+            }
+            // Scala receiver-aware guard — see scala_call_is_value_member.
+            if (ctx->language == CBM_LANG_SCALA) {
+                call.is_method = scala_call_is_value_member(ctx, node);
             }
 
             TSNode args = ts_node_child_by_field_name(node, TS_FIELD("arguments"));
